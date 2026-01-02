@@ -1,0 +1,34 @@
+# TypeScript GitHub Action Template
+
+> A production-ready TypeScript template for creating GitHub Actions with modern tooling, comprehensive testing, and automated CI/CD workflows.
+
+This repository serves as a template for developers who want to create GitHub Actions using TypeScript. It provides a complete development environment with modern tooling including ESLint, Prettier, Vitest for testing, and automated building with tsup. The template includes a working example action that demonstrates input handling, async operations, output setting, and error handling patterns.
+
+## Documentation
+
+- [Main README](README.md): Complete getting started guide, development workflow, and publishing instructions
+- [License](LICENSE): MIT license terms and copyright information
+
+## Specifications
+
+- [Action Metadata](action.yaml): GitHub Action configuration defining inputs, outputs, and runtime specifications
+- [Package Configuration](package.json): Node.js package metadata, dependencies, and build scripts
+- [TypeScript Configuration](tsconfig.json): TypeScript compiler settings and project configuration
+
+## Source Code
+
+- [Main Action](src/main.ts): Primary action entry point demonstrating GitHub Actions best practices
+- [Wait Utility](src/wait.ts): Example utility function showing async promise handling
+- [Test Suite](__tests__/main.test.ts): Comprehensive test examples for action functionality
+
+## Build Configuration
+
+- [Build Configuration](tsup.config.ts): Modern bundling configuration using tsup with license generation
+- [Linting Configuration](eslint.config.ts): ESLint configuration for TypeScript and testing
+- [CI Workflow](.github/workflows/ci.yaml): GitHub Actions CI/CD pipeline for testing and validation
+
+## Optional
+
+- [CodeQL Analysis](.github/workflows/codeql-analysis.yaml): Security analysis workflow configuration
+- [Renovate Configuration](.github/renovate.json5): Automated dependency updates configuration
+- [Repository Settings](.github/settings.yml): GitHub repository configuration as code

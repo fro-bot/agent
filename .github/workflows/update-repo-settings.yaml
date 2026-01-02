@@ -1,0 +1,16 @@
+# Update repository settings to match the definitions in .github/settings.yml.
+---
+name: Update Repo Settings
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '15 16 * * *' # Every day at 16:15 UTC
+  workflow_dispatch:
+
+jobs:
+  update-repo-settings:
+    name: Update Repo Settings
+    secrets: inherit
+    uses: bfra-me/.github/.github/workflows/update-repo-settings.yaml@d0292beab56e427953869aa556c7a22b53ff98d7 # v4.3.15

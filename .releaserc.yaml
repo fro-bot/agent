@@ -1,0 +1,57 @@
+branches: ['v[0-9]+']
+
+plugins:
+  - '@semantic-release/commit-analyzer'
+
+  - '@semantic-release/release-notes-generator'
+
+  - '@semantic-release/npm'
+
+  - - '@semantic-release/git'
+    - assets: [dist, package.json]
+      message: 'ci(release): build action for ${nextRelease.version} [skip ci]'
+
+  - - '@semantic-release/github'
+    - releasedLabels: false
+      successComment: false
+
+analyzeCommits:
+  releaseRules:
+    - type: build
+      release: patch
+    - type: docs
+      release: patch
+      scope: readme.md
+    - type: skip
+      release: false
+
+preset: conventionalcommits
+
+presetConfig:
+  types:
+    - type: feat
+      section: Features
+    - type: features
+      section: Features
+    - type: build
+      section: Build System
+    - type: fix
+      section: Bug Fixes
+    - type: docs
+      section: Documentation
+    - type: test
+      section: Tests
+    - type: ci
+      section: Continuous Integration
+    - type: style
+      section: Styles
+    - type: refactor
+      section: Code Refactoring
+    - type: perf
+      section: Performance Improvements
+    - type: revert
+      section: Reverts
+    - type: chore
+      section: Miscellaneous Chores
+    - type: skip
+      hidden: true

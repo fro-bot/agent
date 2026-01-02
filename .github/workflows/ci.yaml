@@ -1,0 +1,217 @@
+---
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: 'bash -Eeuxo pipefail {0}'
+
+jobs:
+  setup:
+    name: Setup
+    outputs:
+      dist-changed: ${{ contains(steps.filter.outputs.changes, 'dist-changed') }}
+      node-version: ${{ steps.set-node-version.outputs.node-version }}
+      should-lint: ${{ contains(steps.filter.outputs.changes, 'should-lint') }}
+      src-changed: ${{ contains(steps.filter.outputs.changes, 'src-changed') }}
+    permissions:
+      pull-requests: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: 📦 Setup PNPM
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          run_install: false
+      - id: set-node-version
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          cache: pnpm
+          node-version-file: .node-version
+      - run: pnpm bootstrap
+      - id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            config: &config
+              - .github/**
+              - '**.json5?'
+              - '**.md'
+              - '**.yaml'
+              - '**.yml'
+            dist-changed:
+              - added|modified: 'dist/**'
+            src-changed: &src-changed
+              - __tests__/**
+              - src/**
+              - action.yaml
+              - package.json
+            should-lint:
+              - added|modified: *config
+              - added|modified: *src-changed
+
+  lint:
+    if: ${{ needs.setup.outputs.should-lint == 'true' }}
+    name: Lint
+    needs: [setup]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: 📦 Setup PNPM
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          run_install: false
+      - name: Setup Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          cache: pnpm
+          node-version: ${{ needs.setup.outputs.node-version }}
+      - run: pnpm bootstrap
+      - run: pnpm lint
+
+  build:
+    if: ${{ github.event_name == 'push' || needs.setup.outputs.src-changed == 'true' }}
+    name: Build
+    needs: [setup]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: 📦 Setup PNPM
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          run_install: false
+      - name: Setup Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          cache: pnpm
+          node-version: ${{ needs.setup.outputs.node-version }}
+      - name: Install dependencies
+        run: pnpm bootstrap
+      - name: Check types
+        run: pnpm check-types
+      - name: Rebuild the dist/ directory
+        run: pnpm build-release
+      - if: ${{ needs.setup.outputs.dist-changed == 'true' }}
+        name: Compare the expected and actual dist/ directories
+        run: |
+          if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
+            echo "Detected uncommitted changes after build.  See status below:"
+            git diff --text
+            exit 1
+          fi
+        id: diff
+      # If index.js was different than expected, upload the expected version as an artifact
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: ${{ failure() && steps.diff.conclusion == 'failure' }}
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    name: Test
+    needs: [setup]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: 📦 Setup PNPM
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          run_install: false
+      - name: Setup Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          cache: pnpm
+          node-version: ${{ needs.setup.outputs.node-version }}
+      - name: Install dependencies
+        run: pnpm bootstrap
+      - run: pnpm test
+
+      - uses: ./
+        with:
+          milliseconds: 1000
+
+  dependency-review:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Dependency Review
+        uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261 # v4.8.2
+
+  release:
+    env:
+      DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
+      RELEASE_BRANCH: v2
+    name: Release
+    needs: [setup, lint, test, build]
+    outputs:
+      commit: ${{ steps.merge.outputs.commit }}
+      version: ${{ steps.semantic-release.outputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - id: get-workflow-access-token
+        name: Get Workflow Access Token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Setup Git user
+        run: |
+          git config --global user.email '118100583+bfra-me[bot]@users.noreply.github.com'
+          git config --global user.name 'bfra-me[bot]'
+      - name: Checkout `${{ env.RELEASE_BRANCH }}` release branch
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_BRANCH }}
+          token: ${{ steps.get-workflow-access-token.outputs.token }}
+      - if: ${{ github.event_name == 'pull_request' }}
+        name: Fetch PR
+        run: git fetch origin +${{ github.sha }}:${{ github.ref }}
+      - id: merge
+        name: Merge `main` into `${{ env.RELEASE_BRANCH }}` release
+        run: |
+          git merge --no-ff -Xtheirs -m 'skip: merge (${{ github.sha }}) [skip release]' ${{ github.sha }}
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - if: env.DRY_RUN != 'true'
+        name: Push `${{ env.RELEASE_BRANCH }}` release branch
+        run: git push origin ${{ env.RELEASE_BRANCH }}:${{ env.RELEASE_BRANCH }}
+      - name: 📦 Setup PNPM
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          run_install: false
+      - name: Setup Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          cache: pnpm
+          node-version: ${{ needs.setup.outputs.node-version }}
+      - name: Install dependencies
+        run: pnpm bootstrap
+      - if: env.DRY_RUN != 'true'
+        name: Build release
+        run: pnpm build-release
+      - env:
+          GIT_AUTHOR_EMAIL: '118100583+bfra-me[bot]@users.noreply.github.com'
+          GIT_AUTHOR_NAME: 'bfra-me[bot]'
+          GIT_COMMITTER_EMAIL: '118100583+bfra-me[bot]@users.noreply.github.com'
+          GIT_COMMITTER_NAME: 'bfra-me[bot]'
+          GITHUB_TOKEN: ${{ steps.get-workflow-access-token.outputs.token }}
+        id: semantic-release
+        name: Semantic Release
+        run: |
+          export GITHUB_REF=refs/heads/${{ env.RELEASE_BRANCH }} GITHUB_SHA=${{ steps.merge.outputs.commit }}
+          pnpm semantic-release --dry-run ${{ env.DRY_RUN }} --ci ${{ env.DRY_RUN != 'true' }}

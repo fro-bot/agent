@@ -1,0 +1,16 @@
+autoInstallPeers: true
+
+ignoreWorkspaceRootCheck: true
+
+onlyBuiltDependencies:
+  - esbuild
+  - simple-git-hooks
+  - unrs-resolver
+
+savePrefix: ''
+
+shamefullyHoist: true
+
+shellEmulator: true
+
+strictPeerDependencies: true

@@ -1,0 +1,9 @@
+* text=auto
+
+dist/** -diff linguist-generated=true
+
+*.json text linguist-language=JSON-with-comments
+
+pnpm-lock.yaml -diff linguist-generated=true
+
+llms.txt text linguist-language=Markdown

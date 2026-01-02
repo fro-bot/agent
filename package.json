@@ -1,0 +1,66 @@
+{
+  "name": "github-action",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "GitHub Action template repository for bfra.me.",
+  "keywords": [
+    "github-actions",
+    "nodejs",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bfra-me/github-action.git"
+  },
+  "license": "MIT",
+  "author": "Marcus R. Brown <git@mrbro.dev>",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "bootstrap": "pnpm install --prefer-offline --loglevel warn",
+    "build": "tsup",
+    "build-release": "tsup --minify",
+    "check-types": "tsc --noEmit",
+    "fix": "eslint --fix",
+    "postinstall": "simple-git-hooks",
+    "lint": "eslint",
+    "test": "vitest run"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "pnpm exec lint-staged"
+  },
+  "lint-staged": {
+    "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
+      "pnpm run fix"
+    ]
+  },
+  "prettier": "@bfra.me/prettier-config/120-proof",
+  "dependencies": {
+    "@actions/core": "1.11.1"
+  },
+  "devDependencies": {
+    "@bfra.me/eslint-config": "0.47.6",
+    "@bfra.me/prettier-config": "0.16.6",
+    "@bfra.me/tsconfig": "0.12.1",
+    "@semantic-release/git": "10.0.1",
+    "@types/node": "24.10.4",
+    "@vitest/eslint-plugin": "1.6.4",
+    "conventional-changelog-conventionalcommits": "9.1.0",
+    "esbuild-plugin-license": "1.2.3",
+    "eslint": "9.39.2",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-no-only-tests": "3.3.0",
+    "eslint-plugin-prettier": "5.5.4",
+    "jiti": "2.6.1",
+    "js-yaml": "4.1.1",
+    "lint-staged": "16.2.7",
+    "prettier": "3.7.4",
+    "semantic-release": "25.0.2",
+    "simple-git-hooks": "2.13.1",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.51.0",
+    "vitest": "4.0.16"
+  },
+  "packageManager": "pnpm@10.26.2"
+}

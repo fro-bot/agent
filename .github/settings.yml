@@ -1,0 +1,35 @@
+---
+_extends: .github:common-settings.yaml
+
+repository:
+  name: github-action
+  description: GitHub Action template repository for @bfra-me.
+  topics: template, actions, nodejs, typescript, github-actions
+  is_template: true
+
+teams:
+  - name: actioneers
+    permission: push
+  - name: services
+    permission: maintain
+  - name: owners
+    permission: admin
+
+branches:
+  - name: main
+    protection:
+      enforce_admins: true
+      required_linear_history: true
+      required_pull_request_reviews: null
+      required_status_checks:
+        strict: false
+        contexts: [Build, Lint, Release, Test, Setup, Renovate / Renovate, Analyze]
+      restrictions: null
+
+  - name: v?
+    protection:
+      enforce_admins: true
+      required_linear_history: false
+      required_pull_request_reviews: null
+      required_status_checks: null
+      restrictions: null

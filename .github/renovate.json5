@@ -1,0 +1,38 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['github>bfra-me/renovate-config#v4'],
+  packageRules: [
+    {
+      matchFileNames: ['.github/workflows/**'],
+      semanticCommitType: 'ci',
+    },
+    {
+      matchDatasources: ['docker'],
+      semanticCommitType: 'build',
+    },
+    {
+      matchPackageNames: ['conventional-changelog-conventionalcommits', 'semantic-release', 'tsup', 'typescript'],
+      semanticCommitType: 'build',
+    },
+    {
+      matchUpdateTypes: ['lockFileMaintenance'],
+      semanticCommitType: 'build',
+    },
+    {
+      matchPackageNames: ['conventional-changelog-conventionalcommits', 'semantic-release'],
+      matchUpdateTypes: ['major'],
+      groupName: 'semantic-release and conventionalcommits',
+      semanticCommitType: 'feat',
+    },
+    {
+      description: 'Keep the bfra-me/renovate-config preset pinned.',
+      matchPackageNames: ['bfra-me/renovate-config'],
+      rangeStrategy: 'pin',
+      updatePinnedDependencies: false,
+    },
+  ],
+  postUpgradeTasks: {
+    commands: ['pnpm run bootstrap', 'pnpm run build-release', 'pnpm run fix'],
+    executionMode: 'branch',
+  },
+}

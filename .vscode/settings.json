@@ -1,0 +1,40 @@
+{
+    "cSpell.words": ["actioneers", "automerge", "bfra", "conventionalcommits", "Parens", "yarnpkg"],
+
+    "editor.codeActionsOnSave": {
+        "source.fixAll.eslint": "explicit",
+        "source.organizeImports": "never"
+    },
+    "editor.formatOnSave": false,
+
+    "eslint.format.enable": true,
+    // Silent the stylistic rules in you IDE, but still auto fix them
+    "eslint.rules.customizations": [
+        {
+            "rule": "prettier/prettier",
+            "severity": "off",
+            "fixable": true
+        }
+    ],
+    "eslint.useFlatConfig": true,
+    "eslint.validate": [
+        "javascript",
+        "javascriptreact",
+        "typescript",
+        "typescriptreact",
+        "vue",
+        "html",
+        "markdown",
+        "json",
+        "json5",
+        "jsonc",
+        "yaml",
+        "toml",
+        "xml"
+    ],
+
+    "prettier.enable": false,
+
+    "typescript.enablePromptUseWorkspaceTsdk": true,
+    "typescript.tsdk": "node_modules/typescript/lib"
+}
