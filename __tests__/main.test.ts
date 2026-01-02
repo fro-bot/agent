@@ -21,7 +21,7 @@ test('wait 500 ms', async () => {
 test('test runs', () => {
   process.env['INPUT_MILLISECONDS'] = '500'
   const np = process.execPath
-  const ip = path.join(__dirname, '..', 'dist', 'index.js')
+  const ip = path.join(__dirname, '..', 'dist', 'index.mjs')
   const options: cp.ExecFileSyncOptions = {
     env: process.env,
   }

@@ -1,15 +1,17 @@
-import type {Options} from 'tsup'
 // @ts-expect-error - Could not find a declaration file for module 'esbuild-plugin-license'. '/Users/mrbrown/src/github.com/bfra-me/github-action/node_modules/.pnpm/esbuild-plugin-license@1.2.3_esbuild@0.25.8/node_modules/esbuild-plugin-license/dist/index.mjs' implicitly has an 'any' type.
 import esbuildPluginLicense, {type Dependency} from 'esbuild-plugin-license'
+import {defineConfig} from 'tsdown'
 
-const config: Options = {
+export default defineConfig({
   banner: {
     js: "import {createRequire} from 'node:module';const require=createRequire(import.meta.url);",
   },
   entry: {
     index: 'src/main.ts',
   },
-  esbuildPlugins: [
+  clean: false, // Workaround for esbuild-plugin-license issue
+  minify: true,
+  plugins: [
     // eslint-disable-next-line @typescript-eslint/no-unsafe-call
     esbuildPluginLicense({
       thirdParty: {
@@ -24,8 +26,5 @@ const config: Options = {
       },
     }),
   ],
-  format: 'esm',
   noExternal: ['@actions/core'],
-}
-
-export default config
+})
