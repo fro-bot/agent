@@ -162,23 +162,31 @@ jobs:
       version: ${{ steps.semantic-release.outputs.version }}
     runs-on: ubuntu-latest
     steps:
-      - id: get-workflow-access-token
-        name: Get Workflow Access Token
+      - id: get-app-token
+        name: Get GitHub App Installation Token
         uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
         with:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-      - name: Setup Git user
+          owner: ${{ github.repository_owner}}
+      - id: get-user-id
+        name: Get GitHub App User ID and Setup Git user
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
-          git config --global user.email '118100583+bfra-me[bot]@users.noreply.github.com'
-          git config --global user.name 'bfra-me[bot]'
+          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          user_id=$(gh api "/users/${name}" --jq .id)
+          email="${user_id}+${name}@users.noreply.github.com"
+          echo "user-email=${email}" >> "$GITHUB_OUTPUT"
+          echo "user-name=${name}" >> "$GITHUB_OUTPUT"
+          git config --global user.email "${email}"
+          git config --global user.name "${name}"
       - name: Checkout `${{ env.RELEASE_BRANCH }}` release branch
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_BRANCH }}
-          token: ${{ steps.get-workflow-access-token.outputs.token }}
+          token: ${{ steps.get-app-token.outputs.token }}
       - if: ${{ github.event_name == 'pull_request' }}
         name: Fetch PR
         run: git fetch origin +${{ github.sha }}:${{ github.ref }}
@@ -205,11 +213,11 @@ jobs:
         name: Build release
         run: pnpm build-release
       - env:
-          GIT_AUTHOR_EMAIL: '118100583+bfra-me[bot]@users.noreply.github.com'
-          GIT_AUTHOR_NAME: 'bfra-me[bot]'
-          GIT_COMMITTER_EMAIL: '118100583+bfra-me[bot]@users.noreply.github.com'
-          GIT_COMMITTER_NAME: 'bfra-me[bot]'
-          GITHUB_TOKEN: ${{ steps.get-workflow-access-token.outputs.token }}
+          GIT_AUTHOR_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
+          GIT_AUTHOR_NAME: ${{ steps.get-user-id.outputs.user-name }}
+          GIT_COMMITTER_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
+          GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
+          GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
         id: semantic-release
         name: Semantic Release
         run: |
