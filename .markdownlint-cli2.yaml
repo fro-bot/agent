@@ -9,4 +9,4 @@ globs:
   - '**/*.md'
   - '!node_modules'
   - '!.ai/**'
-  - '!.github/copilot-instructions.md'
+  - '!AGENTS.md'
