@@ -154,7 +154,7 @@ jobs:
   release:
     env:
       DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
-      RELEASE_BRANCH: v2
+      RELEASE_BRANCH: v0
     name: Release
     needs: [setup, lint, test, build]
     outputs:
