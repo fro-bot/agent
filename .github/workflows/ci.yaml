@@ -101,7 +101,7 @@ jobs:
       - name: Check types
         run: pnpm check-types
       - name: Rebuild the dist/ directory
-        run: pnpm build-release
+        run: pnpm build
       - if: ${{ needs.setup.outputs.dist-changed == 'true' }}
         name: Compare the expected and actual dist/ directories
         run: |
@@ -111,7 +111,7 @@ jobs:
             exit 1
           fi
         id: diff
-      # If index.js was different than expected, upload the expected version as an artifact
+      # If index.mjs was different than expected, upload the expected version as an artifact
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ failure() && steps.diff.conclusion == 'failure' }}
         with:
@@ -211,7 +211,7 @@ jobs:
         run: pnpm bootstrap
       - if: env.DRY_RUN != 'true'
         name: Build release
-        run: pnpm build-release
+        run: pnpm build
       - env:
           GIT_AUTHOR_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
           GIT_AUTHOR_NAME: ${{ steps.get-user-id.outputs.user-name }}

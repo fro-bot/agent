@@ -32,7 +32,7 @@
     },
   ],
   postUpgradeTasks: {
-    commands: ['pnpm run bootstrap', 'pnpm run build-release', 'pnpm run fix'],
+    commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],
     executionMode: 'branch',
   },
 }
