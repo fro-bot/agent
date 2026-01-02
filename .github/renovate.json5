@@ -1,6 +1,6 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
-  extends: ['github>bfra-me/.github'],
+  extends: ['github>fro-bot/.github'],
   packageRules: [
     {
       matchFileNames: ['.github/workflows/**'],
