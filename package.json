@@ -1,8 +1,8 @@
 {
-  "name": "github-action",
+  "name": "@fro-bot/agent",
   "version": "0.0.0-development",
   "private": true,
-  "description": "GitHub Action template repository for bfra.me.",
+  "description": "@fro-bot Agent",
   "keywords": [
     "github-actions",
     "nodejs",
@@ -10,10 +10,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bfra-me/github-action.git"
+    "url": "git+https://github.com/fro-bot/agent.git"
   },
   "license": "MIT",
-  "author": "Marcus R. Brown <git@mrbro.dev>",
+  "author": "Fro Bot <agent@fro.bot>",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

@@ -1,233 +1,159 @@
-# TypeScript GitHub Action Template
+# Fro Bot Agent
 
-[![CI](https://img.shields.io/github/actions/workflow/status/bfra-me/github-action/ci.yaml?branch=main&style=for-the-badge&logo=github-actions&logoColor=white&label=ci)](https://github.com/bfra-me/github-action/actions?query=workflow%3Aci) [![TypeScript](https://img.shields.io/badge/TypeScript-blue?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org) [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+A work-in-progress GitHub + Discord “agent harness” intended to run [OpenCode](https://opencode.ai/) with an [Oh My OpenCode (oMo)](https://github.com/code-yeongyu/oh-my-opencode) style workflow (think “Sisyphus”) and keep long-lived agent state across runs.
 
-> A production-ready TypeScript template for creating GitHub Actions with modern tooling and best practices.
+> [!IMPORTANT]
+>
+> This repository currently contains a minimal template GitHub Action (a "wait" action) while the agent features described below are being built.
 
-This template provides everything you need to build, test, and publish TypeScript-based GitHub Actions. It includes comprehensive tooling for development, testing, linting, and automated publishing workflows.
+## What this project is for
 
-## Features
+The end goal is two interchangeable entrypoints that share the same brain and memory:
 
-- **TypeScript First** - Full TypeScript support with strict type checking
-- **Modern Tooling** - ESLint, Prettier, and Vitest for development workflow
-- **Automated Building** - Uses `tsup` for fast, optimized bundling
-- **Comprehensive Testing** - Unit tests with Vitest and integration testing setup
-- **CI/CD Ready** - GitHub Actions workflow for testing and validation
-- **Zero Dependencies Runtime** - Only uses `@actions/core` for minimal footprint
+- **GitHub agent**: a reusable workflow/action that can “chat” on issues, discussions, and pull requests.
+- **Discord agent**: a Discord bot connected to OpenCode through a reverse proxy.
 
-## Quick Start
+The Discord bot functionality will either leverage shared code from this repo or be based on [Kimaki](https://github.com/remorses/kimaki) (a Discord bot/CLI for controlling OpenCode sessions).
 
-### 1. Use This Template
+In both cases, **Fro Bot** should have access to the relevant context (PR diff, issue thread, repo files, Discord conversation) _and_ preserve what it learned from prior runs.
 
-Click **"Use this template"** to create a new repository from this template, or clone it directly:
+## Key differentiator: persistent sessions
 
-```bash
-git clone https://github.com/bfra-me/github-action.git my-action
-cd my-action
-```
+Most “agent in CI” implementations run statelessly: they boot, do a thing, and throw away everything they learned.
 
-### 2. Install Dependencies
+This project is explicitly designed to **persist OpenCode + oMo state between runs**, so the agent can:
 
-```bash
-pnpm install
-```
+- recall prior investigations and fixes,
+- avoid repeating the same expensive exploration,
+- build up repo-specific and org-specific operational knowledge.
 
-### 3. Customize Your Action
+### What gets persisted
 
-Update `action.yaml` with your action's metadata:
+OpenCode stores session and application data under its XDG data directory:
+
+- `$XDG_DATA_HOME/opencode/` (typically `~/.local/share/opencode/`)
+
+This directory can include:
+
+- `storage/` (primary persisted data for sessions, plugins, and other runtime state)
+- `log/` (logs)
+- `auth.json` (authentication data such as API keys and OAuth tokens)
+
+The intent is to persist only what is safe and useful for continuity (the `storage/` subtree), and avoid caching secrets.
+
+> [!WARNING]
+>
+> Be careful what you cache. GitHub warns not to store sensitive information (tokens, credentials) inside cache paths, because caches can be accessible to pull request workflows depending on repository settings and cache scoping. See the GitHub docs on dependency caching: [Caching dependencies to speed up workflows](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows)
+
+### How persistence works (planned)
+
+1. **Restore** the OpenCode state directory at the start of each run using GitHub Actions cache.
+2. Run the agent.
+3. **Save** the updated state directory at the end of the run.
+4. Optionally, do a write-through backup to object storage (S3-compatible) to survive cache eviction and enable cross-runner portability.
+
+#### Example: cache the OpenCode state directory
 
 ```yaml
-name: Your Action Name
-description: Your action description
-author: Your Name
-inputs:
-  your-input:
-    description: Input description
-    required: true
-    default: default value
-outputs:
-  your-output:
-    description: Output description
-runs:
-  using: node20
-  main: dist/index.js
+- name: Restore OpenCode state
+  uses: actions/cache/restore@v4
+  with:
+    path: |
+      ~/.local/share/opencode/storage
+    key: opencode-state-${{ runner.os }}-${{ github.repository }}
+    restore-keys: |
+      opencode-state-${{ runner.os }}-
+
+# ... run the agent here ...
+
+- name: Save OpenCode state
+  if: always()
+  uses: actions/cache/save@v4
+  with:
+    path: |
+      ~/.local/share/opencode/storage
+    key: opencode-state-${{ runner.os }}-${{ github.repository }}-${{ github.run_id }}
 ```
 
-### 4. Implement Your Logic
+> [!NOTE]
+>
+> The cache key strategy above is intentionally simple. In practice you’ll likely want keys that include an “agent identity” (GitHub vs Discord), plus optional scoping (repo-only vs repo+PR) depending on how much cross-thread memory you want.
 
-Replace the example code in `src/main.ts`:
+#### Optional: write-through to S3-compatible storage
 
-```javascript
-import * as core from '@actions/core'
+If you back state with object storage, keep the workflow generic and store credentials in GitHub Secrets.
 
-async function run() {
-  try {
-    const input = core.getInput('your-input')
+```yaml
+- name: Backup OpenCode state (optional)
+  if: always()
+  run: |
+    aws s3 sync ~/.local/share/opencode/storage "s3://${S3_BUCKET}/opencode-state/${GITHUB_REPOSITORY}/" --delete
+  env:
+    S3_BUCKET: ${{ vars.S3_BUCKET }}
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    AWS_REGION: ${{ vars.AWS_REGION }}
+```
 
-    // Your action logic here
-    const result = `Processed: ${input}`
+## Required behavior: use `session_*` tools
 
-    core.setOutput('your-output', result)
-  } catch (error) {
-    if (error instanceof Error) {
-      core.setFailed(error.message)
-    }
-  }
-}
+When running under oMo, the agent should explicitly use the **session management tool family** (`session_*`) to recover and reuse prior work.
 
-await run()
+Concrete expectations for the agent:
+
+- **On startup**: list and restore the most relevant prior session for the current repo/context.
+- **Before re-investigating**: search session history for similar errors or past fixes.
+- **When closing a loop**: record the key decision/fix so it can be found later.
+
+oMo documents these tools (names and exact behavior may evolve):
+
+- `session_list`: enumerate sessions
+- `session_read`: read a session’s history
+- `session_search`: full-text search across sessions
+- `session_info`: metadata/stats about a session
+
+Reference: [code-yeongyu/oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) (see “Session Management” in the README)
+
+## Current implementation (template action)
+
+Right now this repo builds a simple Node.js GitHub Action that waits for a specified duration.
+
+- **Input**: `milliseconds` (required)
+- **Output**: `time`
+
+Example workflow usage:
+
+```yaml
+name: Example
+on:
+  workflow_dispatch:
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: fro-bot/agent@v0
+        with:
+          milliseconds: 1000
 ```
 
 ## Development
 
-### Building
+### Prerequisites
 
-```bash
-# Development build
-pnpm run build
+- Node.js `24.12.0` (see `.node-version`)
+- pnpm (recommended; repo uses a pnpm workspace)
 
-# Production build with minification
-pnpm run build-release
-```
+### Common commands
 
-### Testing
+- Install dependencies: `pnpm bootstrap`
+- Build: `pnpm build`
+- Typecheck: `pnpm check-types`
+- Lint: `pnpm lint`
+- Test: `pnpm test`
 
-```bash
-# Run all tests
-pnpm test
+## References
 
-# Type checking
-pnpm run check-types
-
-# Linting
-pnpm run lint
-
-# Auto-fix linting issues
-pnpm run fix
-```
-
-### Local Testing
-
-Test your action locally by setting environment variables and running the built code:
-
-```bash
-# Build the action
-pnpm run build
-
-# Set input environment variables
-export INPUT_MILLISECONDS=1000
-
-# Run the action
-node dist/index.js
-```
-
-## Example Usage
-
-Once published, your action can be used in workflows like this:
-
-```yaml
-name: Example Workflow
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run Custom Action
-        uses: your-username/your-action@v1
-        with:
-          milliseconds: 2000
-```
-
-## Publishing Your Action
-
-### 1. Update Package Metadata
-
-Update `package.json` with your action's information:
-
-```json
-{
-  "name": "your-action-name",
-  "description": "Your action description",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/your-username/your-action.git"
-  }
-}
-```
-
-### 2. Build and Commit Distribution
-
-```bash
-# Build for production
-pnpm run build-release
-
-# Commit the dist folder
-git add dist/
-git commit -m "Add distribution files"
-git push
-```
-
-### 3. Create a Release
-
-```bash
-# Tag your release
-git tag -a v1.0.0 -m "Initial release"
-git push origin v1.0.0
-
-# Create major version tag for easier referencing
-git tag -a v1 -m "Version 1"
-git push origin v1
-```
-
-> [!TIP]
->
-> Users can reference your action using `@v1` for the latest v1.x.x release, or `@v1.0.0` for a specific version.
-
-## Project Structure
-
-```text
-├── src/
-│   ├── main.ts          # Main action entry point
-│   └── wait.ts          # Example utility function
-├── __tests__/
-│   └── main.test.ts     # Test files
-├── dist/               # Built distribution files (auto-generated)
-├── action.yaml         # Action metadata
-├── package.json        # Node.js dependencies and scripts
-├── tsconfig.json       # TypeScript configuration
-├── tsup.config.ts      # Build configuration
-└── eslint.config.ts    # ESLint configuration
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes and add tests
-4. Run the test suite: `pnpm test`
-5. Commit your changes: `git commit -m "Add my feature"`
-6. Push to the branch: `git push origin feature/my-feature`
-7. Submit a pull request
-
-## Example Action (Included)
-
-This template includes a simple example action that waits for a specified number of milliseconds. This demonstrates:
-
-- Input handling with `@actions/core`
-- Async operations
-- Output setting
-- Error handling
-- TypeScript best practices
-
-You can test it immediately:
-
-```yaml
-- name: Wait Example
-  uses: ./
-  with:
-    milliseconds: 1000
-```
+- OpenCode tool configuration: [opencode.ai/docs/tools](https://opencode.ai/docs/tools/)
+- GitHub Actions cache action: [actions/cache](https://github.com/actions/cache)

@@ -2,18 +2,16 @@
 _extends: .github:common-settings.yaml
 
 repository:
-  name: github-action
-  description: GitHub Action template repository for @bfra-me.
-  topics: template, actions, nodejs, typescript, github-actions
-  is_template: true
-
-teams:
-  - name: actioneers
-    permission: push
-  - name: services
-    permission: maintain
-  - name: owners
-    permission: admin
+  name: agent
+  description: '@fro-bot Agent'
+  topics:
+    - fro-bot
+    - agent
+    - automation
+    - actions
+    - github-actions
+    - github-app
+    - bot
 
 branches:
   - name: main
