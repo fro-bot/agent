@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-01-02
-**Commit:** 513088c
-**Branch:** v0
+**Commit:** 0bd3bb6
+**Branch:** main
 
 ## OVERVIEW
 
@@ -51,7 +51,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ### Build
 
-- **tsdown**: esbuild wrapper bundling to `dist/index.mjs`
+- **tsdown**: esbuild wrapper bundling to `dist/main.js`
 - **ESM shim**: Banner injects `createRequire` for CJS compatibility
 - **Bundle deps**: `@actions/core` bundled via `noExternal`
 - **Licenses**: Auto-extracted to `dist/licenses.txt`
@@ -59,7 +59,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ### Testing
 
 - **Vitest**: Run with `pnpm test`
-- **Integration test**: Executes bundled `dist/index.mjs` with env injection
+- **Integration test**: Executes bundled `dist/main.js` with env injection
 - **No mocking libs**: Direct functional testing
 
 ### Release
