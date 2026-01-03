@@ -3,9 +3,6 @@ import esbuildPluginLicense, {type Dependency} from 'esbuild-plugin-license'
 import {defineConfig} from 'tsdown'
 
 export default defineConfig({
-  banner: {
-    js: "import {createRequire} from 'node:module';const require=createRequire(import.meta.url);",
-  },
   entry: 'src/main.ts',
   fixedExtension: false,
   clean: false, // Workaround for esbuild-plugin-license issue

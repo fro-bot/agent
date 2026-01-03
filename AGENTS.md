@@ -13,7 +13,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ```
 ./
 ├── src/              # TypeScript source (main.ts, wait.ts)
-├── __tests__/        # Vitest tests
+├── src/**/*.test.ts  # Vitest tests
 ├── dist/             # Bundled output (committed, must stay in sync)
 ├── .github/          # CI, Renovate, repo settings, CodeQL
 ├── action.yaml       # GitHub Action definition (node24 runtime)

@@ -6,6 +6,6 @@
     "moduleResolution": "Bundler",
     "noEmit": true
   },
-  "include": ["**/*.ts", "tsup.config.ts"],
+  "include": ["**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }
