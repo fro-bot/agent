@@ -10,3 +10,7 @@ globs:
   - '!node_modules'
   - '!.ai/**'
   - '!AGENTS.md'
+  - '!PRD*.md'
+  - '!FEATURES.md'
+  - '!RULES.md'
+  - '!RFCs/**'
