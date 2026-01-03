@@ -35,7 +35,8 @@
   },
   "prettier": "@bfra.me/prettier-config/120-proof",
   "dependencies": {
-    "@actions/core": "2.0.1"
+    "@actions/core": "2.0.1",
+    "@bfra.me/es": "0.1.0"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.47.6",

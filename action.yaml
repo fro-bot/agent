@@ -1,15 +1,38 @@
 ---
 name: Fro Bot Agent
-description: Template action (wait) for the Fro Bot Agent harness (WIP)
+description: GitHub Action harness for OpenCode + oMo agents with persistent session state
 author: Fro Bot <agent@fro.bot>
 inputs:
-  milliseconds:
+  github-token:
     required: true
-    description: Time to wait (in milliseconds)
-    default: '1000'
+    description: GitHub token for API access (GITHUB_TOKEN or PAT)
+  opencode-model:
+    required: false
+    description: OpenCode model to use for agent interactions
+    default: claude-sonnet-4-20250514
+  session-retention-days:
+    required: false
+    description: Number of days to retain session data
+    default: '30'
+  max-comment-length:
+    required: false
+    description: Maximum length for GitHub comments
+    default: '65536'
+  safe-mode:
+    required: false
+    description: Enable safe mode (restricts dangerous operations)
+    default: 'false'
+  debug:
+    required: false
+    description: Enable debug logging
+    default: 'false'
 outputs:
-  time:
-    description: Current time (runner local time)
+  session-id:
+    description: The session ID used for this run (if any)
+  cache-status:
+    description: Cache status (hit, miss, or corrupted)
+  duration:
+    description: Total run duration in milliseconds
 runs:
   using: node24
   main: dist/main.js
