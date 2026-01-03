@@ -6,9 +6,8 @@ export default defineConfig({
   banner: {
     js: "import {createRequire} from 'node:module';const require=createRequire(import.meta.url);",
   },
-  entry: {
-    index: 'src/main.ts',
-  },
+  entry: 'src/main.ts',
+  fixedExtension: false,
   clean: false, // Workaround for esbuild-plugin-license issue
   minify: true,
   plugins: [

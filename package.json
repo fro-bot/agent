@@ -15,7 +15,7 @@
   "license": "MIT",
   "author": "Fro Bot <agent@fro.bot>",
   "type": "module",
-  "main": "dist/index.mjs",
+  "main": "dist/main.js",
   "scripts": {
     "bootstrap": "pnpm install --prefer-offline --loglevel warn",
     "build": "tsdown",
