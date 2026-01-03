@@ -21,7 +21,7 @@ analyzeCommits:
       release: patch
     - type: docs
       release: patch
-      scope: readme.md
+      scope: readme
     - type: skip
       release: false
 
