@@ -22,5 +22,5 @@ export default defineConfig({
       },
     }),
   ],
-  noExternal: ['@actions/core', '@bfra.me/es'],
+  noExternal: ['@actions/cache', '@actions/core', '@bfra.me/es'],
 })
