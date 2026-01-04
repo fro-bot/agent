@@ -39,6 +39,11 @@ it('runs successfully with valid inputs', async () => {
     'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
     'INPUT_SESSION-RETENTION': '50',
     GITHUB_OUTPUT: '/dev/null',
+    GITHUB_REPOSITORY: 'test/repo',
+    GITHUB_REF_NAME: 'main',
+    GITHUB_RUN_ID: '12345',
+    RUNNER_OS: 'Linux',
+    SKIP_CACHE: 'true',
   })
 
   expect(code).toBe(0)
