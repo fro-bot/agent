@@ -3,7 +3,7 @@ import esbuildPluginLicense, {type Dependency} from 'esbuild-plugin-license'
 import {defineConfig} from 'tsdown'
 
 export default defineConfig({
-  entry: 'src/main.ts',
+  entry: ['src/main.ts', 'src/setup.ts'],
   fixedExtension: false,
   clean: false, // Workaround for esbuild-plugin-license issue
   minify: true,
@@ -22,5 +22,13 @@ export default defineConfig({
       },
     }),
   ],
-  noExternal: ['@actions/cache', '@actions/core', '@actions/github', '@bfra.me/es', '@octokit/auth-app'],
+  noExternal: [
+    '@actions/cache',
+    '@actions/core',
+    '@actions/exec',
+    '@actions/github',
+    '@actions/tool-cache',
+    '@bfra.me/es',
+    '@octokit/auth-app',
+  ],
 })
