@@ -382,15 +382,15 @@ export default defineConfig({
 
 ## Acceptance Criteria
 
-- [ ] `@actions/github` dependency added and bundled
-- [ ] Octokit client factory creates clients with logging
+- [x] `@actions/github` dependency added and bundled
+- [x] Octokit client factory creates clients with logging
 - [ ] GitHub App client creation works (when credentials provided)
-- [ ] Context parsing extracts event type, repo, and payload
-- [ ] Issue vs PR detection works correctly
-- [ ] Author association is extracted from payloads
-- [ ] Bot login detection handles both users and apps
-- [ ] All types are properly exported
-- [ ] Unit tests cover client creation and context parsing
+- [x] Context parsing extracts event type, repo, and payload
+- [x] Issue vs PR detection works correctly
+- [x] Author association is extracted from payloads
+- [x] Bot login detection handles both users and apps
+- [x] All types are properly exported
+- [x] Unit tests cover client creation and context parsing
 
 ## Test Cases
 
