@@ -50,7 +50,6 @@ export interface SaveCacheOptions {
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
   const {components, logger, storagePath, authPath, cacheAdapter = defaultCacheAdapter} = options
 
-  // Skip cache operations in test environments
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache restore (SKIP_CACHE=true)')
     await fs.mkdir(storagePath, {recursive: true})
@@ -72,7 +71,6 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
     if (restoredKey == null) {
       logger.info('Cache miss - starting with fresh state')
-      // Ensure storage directory exists for fresh start
       await fs.mkdir(storagePath, {recursive: true})
       return {
         hit: false,
@@ -84,9 +82,8 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
     logger.info('Cache restored', {restoredKey})
 
-    // Check for corruption
     const isCorrupted = await checkStorageCorruption(storagePath, logger)
-    if (isCorrupted) {
+    if (isCorrupted === true) {
       logger.warning('Cache corruption detected - proceeding with clean state')
       await cleanStorage(storagePath)
       return {
@@ -97,9 +94,8 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
       }
     }
 
-    // Verify storage version
     const versionMatch = await checkStorageVersion(storagePath, logger)
-    if (!versionMatch) {
+    if (versionMatch === false) {
       logger.warning('Storage version mismatch - proceeding with clean state')
       await cleanStorage(storagePath)
       return {
@@ -110,8 +106,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
       }
     }
 
-    // Delete auth.json if it somehow got cached
-    await deleteAuthJson(authPath, logger)
+    await deleteAuthJson(authPath, storagePath, logger)
 
     return {
       hit: true,
@@ -120,7 +115,6 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
       corrupted: false,
     }
   } catch (error) {
-    // Cache restore failure should not fail the run
     logger.warning('Cache restore failed', {
       error: error instanceof Error ? error.message : String(error),
     })
@@ -142,7 +136,6 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   const {components, runId, logger, storagePath, authPath, cacheAdapter = defaultCacheAdapter} = options
 
-  // Skip cache operations in test environments
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache save (SKIP_CACHE=true)')
     return true
@@ -153,17 +146,14 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   logger.info('Saving cache', {saveKey})
 
   try {
-    // Ensure auth.json is not in storage before saving
-    await deleteAuthJson(authPath, logger)
+    await deleteAuthJson(authPath, storagePath, logger)
 
-    // Check if storage exists and has content
     const storageExists = await directoryHasContent(storagePath)
-    if (!storageExists) {
+    if (storageExists === false) {
       logger.info('No storage content to cache')
       return false
     }
 
-    // Write storage version marker
     await writeStorageVersion(storagePath)
 
     await cacheAdapter.saveCache([storagePath], saveKey)
@@ -171,7 +161,6 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
     return true
   } catch (error) {
     if (error instanceof Error && error.message.includes('already exists')) {
-      // Cache with this key already exists - not an error
       logger.info('Cache key already exists, skipping save')
       return true
     }
@@ -184,14 +173,32 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 }
 
 /**
- * Delete auth.json to prevent credential caching.
+ * Check if a file path is inside a directory.
+ * Prevents accidental deletion of files outside the cache scope.
  */
-async function deleteAuthJson(authPath: string, logger: Logger): Promise<void> {
+function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
+  const resolvedFile = path.resolve(filePath)
+  const resolvedDir = path.resolve(directoryPath)
+  return resolvedFile.startsWith(resolvedDir + path.sep)
+}
+
+/**
+ * Delete auth.json to prevent credential caching.
+ * Only deletes if the file is inside the storage path being cached.
+ */
+async function deleteAuthJson(authPath: string, storagePath: string, logger: Logger): Promise<void> {
+  if (!isPathInsideDirectory(authPath, storagePath)) {
+    logger.debug('auth.json is outside storage path - skipping deletion', {
+      authPath,
+      storagePath,
+    })
+    return
+  }
+
   try {
     await fs.unlink(authPath)
-    logger.debug('Deleted auth.json before cache operation')
+    logger.debug('Deleted auth.json from cache storage')
   } catch (error) {
-    // File doesn't exist - that's fine
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       logger.warning('Failed to delete auth.json', {
         error: error instanceof Error ? error.message : String(error),
@@ -206,11 +213,10 @@ async function deleteAuthJson(authPath: string, logger: Logger): Promise<void> {
 async function checkStorageCorruption(storagePath: string, logger: Logger): Promise<boolean> {
   try {
     const stat = await fs.stat(storagePath)
-    if (!stat.isDirectory()) {
+    if (stat.isDirectory() === false) {
       return true
     }
 
-    // Check if directory is readable
     await fs.readdir(storagePath)
     return false
   } catch {
@@ -233,7 +239,6 @@ async function checkStorageVersion(storagePath: string, logger: Logger): Promise
     }
     return true
   } catch {
-    // No version file - treat as compatible (first run or legacy)
     logger.debug('No version file found - treating as compatible')
     return true
   }
@@ -248,16 +253,11 @@ async function writeStorageVersion(storagePath: string): Promise<void> {
   await fs.writeFile(versionFile, String(STORAGE_VERSION), 'utf8')
 }
 
-/**
- * Clean storage directory for fresh start.
- */
 async function cleanStorage(storagePath: string): Promise<void> {
   try {
     await fs.rm(storagePath, {recursive: true, force: true})
     await fs.mkdir(storagePath, {recursive: true})
-  } catch {
-    // Best effort - continue even if cleanup fails
-  }
+  } catch {}
 }
 
 /**
