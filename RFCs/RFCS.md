@@ -1,8 +1,8 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-03
-**Total RFCs:** 11
-**Implementation Strategy:** Sequential (RFC-001 → RFC-011)
+**Generated:** 2026-01-04
+**Total RFCs:** 12
+**Implementation Strategy:** Sequential (RFC-001 → RFC-012)
 
 ---
 
@@ -29,6 +29,7 @@ The agent harness enables OpenCode with oMo "Sisyphus-style" workflow to act as 
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending   |
 | RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending   |
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Pending   |
+| RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Pending   |
 
 ---
 
@@ -40,7 +41,11 @@ RFC-001 (Foundation)
     ├── RFC-011 (Setup Action) ─────────┐
     │       │                           │
     │       └── [OpenCode, oMo, gh]     │
-    │                                   │
+    │               │                   │
+    │               └── RFC-012 (Agent Execution)
+    │                       │
+    │                       └── [Run OpenCode, reactions, context]
+    │
     ├── RFC-002 (Cache) ──────────────┐ │
     │       │                         │ │
     │       └── RFC-004 (Sessions) ───┼─┼── RFC-007 (Observability)
@@ -76,8 +81,9 @@ RFC-001 (Foundation)
 | RFC-002 | Cache restore/save, auth.json exclusion  | 9-12 hours       |
 | RFC-003 | Octokit client, context parsing          | 6-9 hours        |
 | RFC-011 | Setup action, OpenCode/oMo install, gh   | 14-20 hours      |
+| RFC-012 | Agent execution, reactions, context      | 16-22 hours      |
 
-**Phase 1 Total:** ~35-50 hours
+**Phase 1 Total:** ~51-72 hours
 
 **Milestone:** Action can restore/save cache, parse GitHub context, and bootstrap OpenCode/oMo environment.
 
@@ -118,12 +124,12 @@ RFC-001 (Foundation)
 
 ## Total Estimated Effort
 
-| Phase     | Effort Range     |
-| --------- | ---------------- |
-| Phase 1   | 35-50 hours      |
-| Phase 2   | 29-41 hours      |
-| Phase 3   | 33-42 hours      |
-| **Total** | **97-133 hours** |
+| Phase     | Effort Range      |
+| --------- | ----------------- |
+| Phase 1   | 51-72 hours       |
+| Phase 2   | 29-41 hours       |
+| Phase 3   | 33-42 hours       |
+| **Total** | **113-155 hours** |
 
 ---
 
@@ -144,7 +150,7 @@ RFC-001 (Foundation)
    - Run project-adaptive validation (tests, build, lint)
    - Update this document's Status column to "Completed"
 
-3. **Implement RFCs strictly in numerical order** (001 → 002 → ... → 010)
+3. **Implement RFCs strictly in numerical order** (001 → 002 → ... → 012)
 
 ---
 
@@ -179,10 +185,10 @@ RFC-001 (Foundation)
 | F33: Error Message Format              | RFC-008          | Pending |
 | F10: Setup Action Entrypoint           | RFC-011          | Pending |
 | F37: Action Inputs Configuration       | RFC-001, RFC-011 | Pending |
-| F41: Agent Prompt Context Injection    | RFC-011          | Pending |
-| F42: gh CLI Operation Instructions     | RFC-011          | Pending |
-| F43: Reactions & Labels Acknowledgment | RFC-008          | Pending |
-| F44: Issue vs PR Context Detection     | RFC-005          | Pending |
+| F41: Agent Prompt Context Injection    | RFC-012          | Pending |
+| F42: gh CLI Operation Instructions     | RFC-012          | Pending |
+| F43: Reactions & Labels Acknowledgment | RFC-012          | Pending |
+| F44: Issue vs PR Context Detection     | RFC-012          | Pending |
 
 ### P1 Features (Should-Have) - Future RFCs
 

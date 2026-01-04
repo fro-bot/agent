@@ -15,6 +15,9 @@ Implement a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that boots
 
 - **Builds Upon:** RFC-001 (Foundation & Core Types), RFC-002 (Cache Infrastructure)
 - **Enables:** All agent execution RFCs (RFC-004 through RFC-010)
+- **Uses:** RFC-003 (GitHub API Client) - `createAppClient()` for GitHub App token generation
+
+> **Note:** GitHub App authentication (`app-id`, `private-key` inputs) is optional. Setup works with `GITHUB_TOKEN` alone for read-only operations. App token enables elevated permissions (push, PR creation).
 
 ## Features Addressed
 
@@ -98,6 +101,10 @@ outputs:
     description: "Whether gh CLI was authenticated with App token"
   setup-duration:
     description: "Setup duration in seconds"
+  cache-status:
+    description: "Cache restore status (hit, miss, corrupted)"
+  omo-installed:
+    description: "Whether oMo plugin was installed successfully"
 
 runs:
   using: "node24"
@@ -120,6 +127,8 @@ export interface SetupResult {
   readonly opencodeVersion: string
   readonly ghAuthenticated: boolean
   readonly omoInstalled: boolean
+  readonly omoError: string | null
+  readonly cacheStatus: "hit" | "miss" | "corrupted"
   readonly duration: number
 }
 
@@ -127,6 +136,12 @@ export interface OpenCodeInstallResult {
   readonly path: string
   readonly version: string
   readonly cached: boolean
+}
+
+export interface OmoInstallResult {
+  readonly installed: boolean
+  readonly version: string | null
+  readonly error: string | null
 }
 
 export interface GhAuthResult {
@@ -168,12 +183,14 @@ export type AuthConfig = Record<string, AuthInfo>
 ```typescript
 import * as tc from "@actions/tool-cache"
 import * as core from "@actions/core"
+import * as exec from "@actions/exec"
 import * as os from "node:os"
 import * as path from "node:path"
 import type {OpenCodeInstallResult, Logger} from "./types.js"
 
 const TOOL_NAME = "opencode"
 const DOWNLOAD_BASE_URL = "https://github.com/opencode-ai/opencode/releases/download"
+const FALLBACK_VERSION = "1.0.204" // Known stable version for fallback
 
 interface PlatformInfo {
   readonly os: string
@@ -209,7 +226,51 @@ function buildDownloadUrl(version: string, info: PlatformInfo): string {
   return `${DOWNLOAD_BASE_URL}/${versionTag}/${filename}`
 }
 
-export async function installOpenCode(version: string, logger: Logger): Promise<OpenCodeInstallResult> {
+/**
+ * Validate downloaded archive is not corrupted.
+ * Uses `file` command on Unix to check file type.
+ */
+async function validateDownload(downloadPath: string, ext: string, logger: Logger): Promise<boolean> {
+  if (process.platform === "win32") {
+    // Skip validation on Windows - trust HTTP response
+    return true
+  }
+
+  try {
+    let output = ""
+    await exec.exec("file", [downloadPath], {
+      listeners: {
+        stdout: (data: Buffer) => {
+          output += data.toString()
+        },
+      },
+      silent: true,
+    })
+
+    const expectedTypes = ext === ".zip" ? ["Zip archive", "ZIP"] : ["gzip", "tar", "compressed"]
+    const isValid = expectedTypes.some(type => output.includes(type))
+
+    if (!isValid) {
+      logger.warning("Download validation failed", {output: output.trim()})
+    }
+    return isValid
+  } catch {
+    logger.debug("Could not validate download (file command unavailable)")
+    return true // Assume valid if we can't check
+  }
+}
+
+/**
+ * Install OpenCode CLI with version fallback.
+ *
+ * Tries requested version first, falls back to known stable version on failure.
+ * Pattern from oMo Sisyphus workflow.
+ */
+export async function installOpenCode(
+  version: string,
+  logger: Logger,
+  fallbackVersion: string = FALLBACK_VERSION,
+): Promise<OpenCodeInstallResult> {
   const platformInfo = getPlatformInfo()
 
   // Check cache first
@@ -220,10 +281,49 @@ export async function installOpenCode(version: string, logger: Logger): Promise<
     return {path: toolPath, version, cached: true}
   }
 
+  // Try primary version
+  try {
+    const result = await downloadAndInstall(version, platformInfo, logger)
+    return result
+  } catch (error) {
+    logger.warning("Primary version install failed, trying fallback", {
+      requestedVersion: version,
+      fallbackVersion,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  // Fallback to known stable version
+  if (version !== fallbackVersion) {
+    try {
+      const result = await downloadAndInstall(fallbackVersion, platformInfo, logger)
+      logger.info("Installed fallback version", {version: fallbackVersion})
+      return result
+    } catch (error) {
+      throw new Error(
+        `Failed to install OpenCode (tried ${version} and ${fallbackVersion}): ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  throw new Error(`Failed to install OpenCode version ${version}`)
+}
+
+async function downloadAndInstall(
+  version: string,
+  platformInfo: PlatformInfo,
+  logger: Logger,
+): Promise<OpenCodeInstallResult> {
   // Download
   logger.info("Downloading OpenCode", {version})
   const downloadUrl = buildDownloadUrl(version, platformInfo)
   const downloadPath = await tc.downloadTool(downloadUrl)
+
+  // Validate download
+  const isValid = await validateDownload(downloadPath, platformInfo.ext, logger)
+  if (!isValid) {
+    throw new Error("Downloaded archive appears corrupted")
+  }
 
   // Extract
   logger.info("Extracting OpenCode")
@@ -236,7 +336,7 @@ export async function installOpenCode(version: string, logger: Logger): Promise<
 
   // Cache
   logger.info("Caching OpenCode")
-  toolPath = await tc.cacheDir(extractedPath, TOOL_NAME, version, platformInfo.arch)
+  const toolPath = await tc.cacheDir(extractedPath, TOOL_NAME, version, platformInfo.arch)
 
   // Add to PATH
   core.addPath(toolPath)
@@ -267,12 +367,17 @@ import type {Logger} from "./types.js"
 export interface OmoInstallResult {
   readonly installed: boolean
   readonly version: string | null
+  readonly error: string | null
 }
 
 /**
  * Install Oh My OpenCode (oMo) plugin.
  *
  * This adds Sisyphus agent capabilities to OpenCode.
+ *
+ * NOTE: oh-my-opencode is Bun-targeted with native bindings and cannot be
+ * imported as a library. Must use npx/bunx to run as CLI tool.
+ * See RFC-011-RESEARCH-SUMMARY.md for details.
  */
 export async function installOmo(logger: Logger): Promise<OmoInstallResult> {
   logger.info("Installing Oh My OpenCode plugin")
@@ -293,8 +398,9 @@ export async function installOmo(logger: Logger): Promise<OmoInstallResult> {
     })
 
     if (exitCode !== 0) {
-      logger.warning("oMo installation returned non-zero exit code", {exitCode})
-      return {installed: false, version: null}
+      const errorMsg = `oMo installation returned exit code ${exitCode}`
+      logger.warning(errorMsg, {output: output.slice(0, 500)})
+      return {installed: false, version: null, error: errorMsg}
     }
 
     // Extract version from output if available
@@ -302,12 +408,32 @@ export async function installOmo(logger: Logger): Promise<OmoInstallResult> {
     const version = versionMatch != null ? versionMatch[1] : null
 
     logger.info("oMo plugin installed", {version})
-    return {installed: true, version}
+    return {installed: true, version, error: null}
   } catch (error) {
-    logger.error("Failed to install oMo plugin", {
-      error: error instanceof Error ? error.message : String(error),
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    logger.error("Failed to install oMo plugin", {error: errorMsg})
+    return {installed: false, version: null, error: errorMsg}
+  }
+}
+
+/**
+ * Verify oMo plugin is functional.
+ *
+ * Checks that OpenCode recognizes the plugin by looking for config file.
+ */
+export async function verifyOmoInstallation(logger: Logger): Promise<boolean> {
+  try {
+    // Check if oh-my-opencode.json config exists (created on successful install)
+    const {stdout} = await exec.getExecOutput("ls", ["-la", "~/.config/opencode/oh-my-opencode.json"], {
+      silent: true,
+      ignoreReturnCode: true,
     })
-    return {installed: false, version: null}
+    const exists = !stdout.includes("No such file")
+    logger.debug("oMo config file check", {exists})
+    return exists
+  } catch {
+    logger.debug("Could not verify oMo installation")
+    return false
   }
 }
 ```
@@ -634,13 +760,14 @@ export function extractPromptContext(): PromptContext {
 ```typescript
 import * as core from "@actions/core"
 import {createLogger} from "./lib/logger.js"
+import {createAppClient} from "./lib/github/client.js"
 import {installOpenCode, getLatestVersion} from "./lib/setup/opencode.js"
-import {installOmo} from "./lib/setup/omo.js"
+import {installOmo, verifyOmoInstallation} from "./lib/setup/omo.js"
 import {configureGhAuth, configureGitIdentity, getBotUserId} from "./lib/setup/gh-auth.js"
 import {populateAuthJson, parseAuthJsonInput} from "./lib/setup/auth-json.js"
 import {restoreCache} from "./lib/cache.js"
 import {getRunnerOS} from "./utils/env.js"
-import type {SetupInputs} from "./lib/setup/types.js"
+import type {SetupInputs, SetupResult} from "./lib/setup/types.js"
 
 async function run(): Promise<void> {
   const startTime = Date.now()
@@ -650,13 +777,16 @@ async function run(): Promise<void> {
     // 1. Parse inputs
     const inputs = parseInputs()
 
-    // 2. Install OpenCode
+    // 2. Install OpenCode (with fallback)
     const opencodeVersion =
       inputs.opencodeVersion === "latest" ? await getLatestVersion(logger) : inputs.opencodeVersion
     const opencode = await installOpenCode(opencodeVersion, logger)
 
-    // 3. Install oMo plugin
+    // 3. Install oMo plugin (non-fatal on failure)
     const omo = await installOmo(logger)
+    if (!omo.installed) {
+      core.warning(`oMo plugin installation failed: ${omo.error}. Agent may have limited functionality.`)
+    }
 
     // 4. Restore cache (early, for session continuity)
     const cacheResult = await restoreCache({
@@ -673,19 +803,35 @@ async function run(): Promise<void> {
     const authConfig = parseAuthJsonInput(inputs.authJson)
     await populateAuthJson(authConfig, logger)
 
-    // 6. Configure GitHub App authentication
-    let ghAuth = await configureGhAuth(
-      inputs.appId != null && inputs.privateKey != null
-        ? await generateAppToken(inputs.appId, inputs.privateKey)
-        : null,
-      process.env["GITHUB_TOKEN"] ?? "",
-      logger,
-    )
+    // 6. Configure GitHub authentication
+    // Use createAppClient from RFC-003 for GitHub App token generation
+    // Falls back to GITHUB_TOKEN when App credentials not provided or auth fails
+    let appToken: string | null = null
+    if (inputs.appId != null && inputs.privateKey != null) {
+      const appClient = await createAppClient({
+        appId: inputs.appId,
+        privateKey: inputs.privateKey,
+        logger,
+      })
+      if (appClient != null) {
+        // Extract token from authenticated client for gh CLI
+        // Note: createAppClient returns Octokit, we need the raw token for GH_TOKEN
+        appToken = await extractTokenFromAppClient(inputs.appId, inputs.privateKey, logger)
+      } else {
+        core.warning("GitHub App authentication failed, falling back to GITHUB_TOKEN")
+      }
+    }
+
+    const ghAuth = await configureGhAuth(appToken, process.env["GITHUB_TOKEN"] ?? "", logger)
 
     // 7. Configure git identity
     if (ghAuth.botLogin != null) {
-      const userId = await getBotUserId(ghAuth.botLogin.replace("[bot]", ""), process.env["GH_TOKEN"] ?? "", logger)
-      await configureGitIdentity(ghAuth.botLogin.replace("[bot]", ""), userId, logger)
+      const appSlug = ghAuth.botLogin.replace("[bot]", "")
+      const userId = await getBotUserId(appSlug, process.env["GH_TOKEN"] ?? "", logger)
+      await configureGitIdentity(appSlug, userId, logger)
+    } else {
+      // Fallback to generic bot identity when no App credentials
+      await configureGitIdentity(null, null, logger)
     }
 
     // 8. Set outputs
@@ -695,12 +841,14 @@ async function run(): Promise<void> {
     core.setOutput("gh-authenticated", String(ghAuth.authenticated))
     core.setOutput("setup-duration", String(duration))
     core.setOutput("cache-status", cacheResult.corrupted ? "corrupted" : cacheResult.hit ? "hit" : "miss")
+    core.setOutput("omo-installed", String(omo.installed))
 
     logger.info("Setup complete", {
       duration,
       opencodeVersion: opencode.version,
       omoInstalled: omo.installed,
       ghAuthenticated: ghAuth.authenticated,
+      ghAuthMethod: ghAuth.method,
       cacheHit: cacheResult.hit,
     })
   } catch (error) {
@@ -720,11 +868,31 @@ function parseInputs(): SetupInputs {
   }
 }
 
-async function generateAppToken(appId: string, privateKey: string): Promise<string> {
-  // This would use @octokit/auth-app or actions/create-github-app-token
-  // For now, return null to fall back to GITHUB_TOKEN
-  // Implementation details in RFC-006 (Security & Permission Gating)
-  return ""
+/**
+ * Extract raw installation token from GitHub App credentials.
+ *
+ * This is needed because createAppClient() returns an Octokit instance,
+ * but we need the raw token for GH_TOKEN environment variable.
+ *
+ * Uses same auth mechanism as createAppClient() from RFC-003.
+ */
+async function extractTokenFromAppClient(
+  appId: string,
+  privateKey: string,
+  logger: Logger,
+): Promise<string | null> {
+  try {
+    const {createAppAuth} = await import("@octokit/auth-app")
+    const auth = createAppAuth({appId, privateKey})
+    const {token} = await auth({type: "installation"})
+    logger.debug("Extracted GitHub App installation token")
+    return token
+  } catch (error) {
+    logger.error("Failed to extract App token", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return null
+  }
 }
 
 await run()
@@ -755,19 +923,46 @@ export default defineConfig({
 
 ## Acceptance Criteria
 
+### Core Installation
+
 - [ ] Setup action installs OpenCode CLI with version caching
+- [ ] OpenCode installation has fallback to pinned version (1.0.204) on failure
+- [ ] Downloaded archives are validated before extraction (corruption check)
 - [ ] Setup action installs oMo plugin via npx
+- [ ] Setup continues if oMo install fails (with warning logged)
+- [ ] oMo installation includes error details in result
+
+### Authentication & Configuration
+
 - [ ] Setup action configures gh CLI with GH_TOKEN
 - [ ] Setup action populates auth.json from secrets (not cached)
 - [ ] Setup action configures git identity for App bot
+- [ ] Setup works without GitHub App credentials (fallback to GITHUB_TOKEN)
+
+### Cache Integration
+
 - [ ] Setup action restores session cache
+- [ ] Cache key includes agent identity, repo, ref, os
+
+### System Dependencies
+
 - [ ] Setup action verifies required system dependencies for the chosen log strategy:
   - [ ] `tmux` available (or setup documents the requirement)
   - [ ] `stdbuf` available (or setup documents the requirement)
+- [ ] stdbuf command documented with exact syntax for main action
+
+### Outputs
+
 - [ ] Setup action outputs all relevant paths and status
+- [ ] All setup operations are logged with structured JSON
+
+### Build Integration
+
 - [ ] Build produces both `dist/main.js` and `dist/setup.js`
 - [ ] `setup/action.yaml` references correct entrypoint
-- [ ] All setup operations are logged with structured JSON
+
+### Agent Prompt
+
 - [ ] Agent prompt includes repository name
 - [ ] Agent prompt includes branch/ref
 - [ ] Agent prompt includes event type
@@ -782,8 +977,45 @@ export default defineConfig({
 
 To match the oMo/Sisyphus UX expectations, OpenCode execution logs should be visible in near real-time in the Actions log stream.
 
-- Preferred approach (Linux): run the OpenCode entrypoint with `stdbuf -oL -eL` so output is line-buffered.
-- If `tmux` is used to manage process lifetime, the implementation must still ensure logs are streamed (not only flushed at the end).
+### Required Command Pattern
+
+The main action (not setup) MUST wrap OpenCode execution with `stdbuf` for real-time streaming:
+
+```bash
+# Pattern from Sisyphus workflow
+stdbuf -oL -eL opencode run "$PROMPT"
+```
+
+**Flags:**
+
+- `-oL`: Line-buffered stdout
+- `-eL`: Line-buffered stderr
+
+Without this, output will be block-buffered and only appear when the process exits.
+
+### Implementation in TypeScript
+
+```typescript
+import * as exec from "@actions/exec"
+
+async function executeOpenCode(prompt: string, logger: Logger): Promise<void> {
+  // On Linux, use stdbuf for real-time streaming
+  if (process.platform === "linux") {
+    await exec.exec("stdbuf", ["-oL", "-eL", "opencode", "run", prompt])
+  } else {
+    // macOS/Windows: best-effort without stdbuf
+    await exec.exec("opencode", ["run", prompt])
+  }
+}
+```
+
+### Platform Considerations
+
+| Platform              | stdbuf Available    | Fallback                          |
+| --------------------- | ------------------- | --------------------------------- |
+| Linux (ubuntu-latest) | Yes (GNU coreutils) | N/A                               |
+| macOS                 | No (BSD coreutils)  | Direct execution, buffered output |
+| Windows               | No                  | Direct execution, buffered output |
 
 If real-time streaming cannot be guaranteed on a given runner, the limitation must be documented and the action should fall back to best-effort logging.
 
@@ -876,6 +1108,31 @@ If alternate runners (macOS/Windows or self-hosted) are supported later, the set
 2. **@actions/exec**: Required for running npx, gh, and git commands
 3. **Parallel execution**: OpenCode install and cache restore can run in parallel
 4. **Graceful degradation**: oMo install failure should warn, not fail the run
+5. **Version fallback**: OpenCode installation tries latest, falls back to pinned version (1.0.204)
+6. **Download validation**: Archives validated with `file` command on Linux before extraction
+7. **App token via RFC-003**: Uses `createAppClient()` from `src/lib/github/client.ts` for GitHub App authentication
+8. **GITHUB_TOKEN fallback**: When App credentials missing or auth fails, falls back to `GITHUB_TOKEN` for basic operations
+
+---
+
+## SDK vs CLI Decision
+
+RFC-011 uses **CLI invocation** (`opencode run`) rather than the SDK (`@opencode-ai/sdk`).
+
+### Rationale
+
+| Factor                    | CLI                  | SDK                      |
+| ------------------------- | -------------------- | ------------------------ |
+| Proven in production      | ✅ Sisyphus workflow | ❌ Newer, less tested    |
+| Implementation complexity | ✅ Simple spawn      | ⚠️ Server lifecycle mgmt |
+| Type safety               | ❌ Parse stdout      | ✅ Typed responses       |
+| Session management        | ❌ Manual            | ✅ `session.*` methods   |
+
+**Decision:** CLI for v1. SDK provides advantages for RFC-004 (Session Management) but adds complexity. Revisit for v2.
+
+**Note:** The SDK still spawns CLI internally (`opencode serve`), so CLI is not less capable, just simpler to integrate.
+
+See `RFC-011-RESEARCH-SUMMARY.md` for detailed analysis.
 
 ---
 

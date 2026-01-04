@@ -650,17 +650,25 @@ pnpm test         # Run tests
 | `FEATURES.md`      | Feature specifications   |
 | `AGENTS.md`        | Project conventions      |
 
-### Session Tools (Required Usage)
+### Session Tools: Action vs Agent
 
-```typescript
-// On startup - search for prior work
-await session_search(query)
-await session_read(sessionId)
+**Two layers of session management exist:**
 
-// On completion - record for future
-await session_info(sessionId)
-await session_list()
-```
+1. **oMo Session Tools (Agent-side)** - LLM tools provided by Oh My OpenCode plugin to AI agents during runtime:
+   - `session_search` - Full-text search across sessions
+   - `session_read` - Read session messages and history
+   - `session_info` - Get session metadata and statistics
+   - `session_list` - List available sessions
+
+   These are invoked by the agent through natural language via the LLM tool-calling interface. The agent prompt MUST instruct use of these tools before re-investigating.
+
+2. **RFC-004 Utilities (Action-side)** - TypeScript functions used by the GitHub Action harness:
+   - `listSessions()` - Startup introspection
+   - `searchSessions()` - Find relevant prior sessions
+   - `pruneSessions()` - Retention policy enforcement
+   - `writeSessionSummary()` - Close-the-loop writeback
+
+   These run before/after agent execution in the action lifecycle.
 
 ### GitHub CLI Authentication
 
