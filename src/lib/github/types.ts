@@ -1,0 +1,83 @@
+import type {GitHub} from '@actions/github/lib/utils'
+
+export type Octokit = InstanceType<typeof GitHub>
+
+// Event payloads
+export interface IssueCommentPayload {
+  readonly action: string
+  readonly issue: {
+    readonly number: number
+    readonly title: string
+    readonly body: string | null
+    readonly state: string
+    readonly user: {readonly login: string}
+    readonly pull_request?: {readonly url: string}
+    readonly locked: boolean
+  }
+  readonly comment: {
+    readonly id: number
+    readonly body: string
+    readonly user: {readonly login: string}
+    readonly author_association: string
+  }
+  readonly repository: {
+    readonly owner: {readonly login: string}
+    readonly name: string
+    readonly full_name: string
+  }
+  readonly sender: {readonly login: string}
+}
+
+export interface DiscussionCommentPayload {
+  readonly action: string
+  readonly discussion: {
+    readonly number: number
+    readonly title: string
+    readonly body: string
+    readonly category: {readonly name: string}
+  }
+  readonly comment?: {
+    readonly id: number
+    readonly body: string
+    readonly user: {readonly login: string}
+    readonly author_association: string
+  }
+  readonly repository: {
+    readonly owner: {readonly login: string}
+    readonly name: string
+  }
+}
+
+// Context types
+export type EventType = 'discussion' | 'issue_comment' | 'unknown' | 'workflow_dispatch'
+
+export interface GitHubContext {
+  readonly eventName: string
+  readonly eventType: EventType
+  readonly repo: {readonly owner: string; readonly repo: string}
+  readonly ref: string
+  readonly sha: string
+  readonly runId: number
+  readonly actor: string
+  readonly payload: unknown
+}
+
+// Comment types
+export interface CommentTarget {
+  readonly type: 'discussion' | 'issue' | 'pr'
+  readonly number: number
+  readonly owner: string
+  readonly repo: string
+}
+
+export interface Comment {
+  readonly id: number
+  readonly body: string
+  readonly author: string
+  readonly authorAssociation: string
+  readonly createdAt: string
+  readonly updatedAt: string
+}
+
+// Bot identification
+export const BOT_COMMENT_MARKER = '<!-- fro-bot-agent -->' as const
