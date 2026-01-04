@@ -151,8 +151,32 @@ describe('restoreCache', () => {
     expect(result.corrupted).toBe(true)
   })
 
-  it('deletes auth.json if present after restore', async () => {
-    // #given auth.json exists after cache restore
+  it('deletes auth.json if present inside storage after restore', async () => {
+    // #given auth.json exists inside storage directory after cache restore
+    const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
+    const adapter = createMockCacheAdapter({restoreResult: restoredKey})
+
+    await fs.mkdir(storagePath, {recursive: true})
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+    await fs.writeFile(authInsideStorage, '{"token": "secret"}')
+
+    const options: RestoreCacheOptions = {
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    }
+
+    // #when restoring cache
+    await restoreCache(options)
+
+    // #then auth.json inside storage is deleted
+    await expect(fs.access(authInsideStorage)).rejects.toThrow()
+  })
+
+  it('does NOT delete auth.json if outside storage path', async () => {
+    // #given auth.json exists outside storage directory
     const restoredKey = 'opencode-storage-github-owner-repo-main-Linux'
     const adapter = createMockCacheAdapter({restoreResult: restoredKey})
 
@@ -170,8 +194,8 @@ describe('restoreCache', () => {
     // #when restoring cache
     await restoreCache(options)
 
-    // #then auth.json is deleted
-    await expect(fs.access(authPath)).rejects.toThrow()
+    // #then auth.json outside storage is NOT deleted
+    await expect(fs.access(authPath)).resolves.toBeUndefined()
   })
 
   it('handles restore errors gracefully without throwing', async () => {
@@ -376,8 +400,32 @@ describe('saveCache', () => {
     expect(result).toBe(false)
   })
 
-  it('deletes auth.json before save', async () => {
-    // #given storage with content and auth.json present
+  it('deletes auth.json inside storage before save', async () => {
+    // #given storage with content and auth.json inside storage
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const authInsideStorage = path.join(storagePath, 'auth.json')
+    await fs.writeFile(authInsideStorage, '{"token": "secret"}')
+
+    const adapter = createMockCacheAdapter({saveResult: 12345})
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath: authInsideStorage,
+      cacheAdapter: adapter,
+    }
+
+    // #when saving cache
+    await saveCache(options)
+
+    // #then auth.json inside storage is deleted
+    await expect(fs.access(authInsideStorage)).rejects.toThrow()
+  })
+
+  it('does NOT delete auth.json outside storage before save', async () => {
+    // #given storage with content and auth.json outside storage
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
     await fs.writeFile(authPath, '{"token": "secret"}')
@@ -395,8 +443,8 @@ describe('saveCache', () => {
     // #when saving cache
     await saveCache(options)
 
-    // #then auth.json is deleted
-    await expect(fs.access(authPath)).rejects.toThrow()
+    // #then auth.json outside storage is NOT deleted
+    await expect(fs.access(authPath)).resolves.toBeUndefined()
   })
 
   it('writes version marker before save', async () => {
