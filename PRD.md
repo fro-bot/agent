@@ -28,8 +28,9 @@ This leads to:
 Fro Bot addresses this by:
 
 1. Persisting OpenCode's stateful storage directory between runs.
-2. Requiring explicit use of **session management tools** (`session_list`, `session_read`, `session_search`, `session_info`) to revive/search prior work.
-3. Producing auditable "run summaries" in GitHub comments and action logs.
+2. **Action-side utilities (RFC-004)**: The GitHub Action harness uses TypeScript utilities (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`) to manage sessions at the infrastructure level.
+3. **Agent-side tools (oMo)**: The AI agent uses oMo session tools (`session_list`, `session_read`, `session_search`, `session_info`) during runtime to discover and reuse prior work.
+4. Producing auditable "run summaries" in GitHub comments and action logs.
 
 ---
 
@@ -219,23 +220,31 @@ Fro Bot addresses this by:
 
 #### C. Shared memory & session tool usage
 
+**Important: Two layers of session management exist:**
+
+| Layer | Tools/Functions | Used By | When |
+| --- | --- | --- | --- |
+| **Action-side (RFC-004)** | `listSessions()`, `searchSessions()`, `pruneSessions()`, `writeSessionSummary()` | GitHub Action harness | Before/after agent execution |
+| **Agent-side (oMo)** | `session_list`, `session_read`, `session_search`, `session_info` | AI agent via LLM tool calls | During agent execution |
+
+Both layers operate on the same OpenCode storage directory (`~/.local/share/opencode/storage/`).
+
 1. **What to persist**
    - Persist the entire OpenCode storage subtree:
      - `$XDG_DATA_HOME/opencode/storage/`
 
 2. **Startup behavior: revive + search**
-   - On startup, the agent must:
-     - Locate relevant prior sessions for the repo/context.
-     - Use `session_search` before re-investigating likely repeats.
+   - **Action harness**: Calls RFC-004 `listSessions()` and optionally `searchSessions()` to gather context for the agent prompt.
+   - **Agent**: Must use oMo `session_search` before re-investigating likely repeats.
 
 3. **Close-the-loop writeback**
-   - Before finishing, the agent must produce a durable summary that is discoverable later (e.g., a final message in the OpenCode session and a GitHub comment summary).
+   - **Action harness**: Calls RFC-004 `writeSessionSummary()` to append run metadata.
+   - **Agent**: Must produce a durable summary message (final message in session, GitHub comment).
 
 4. **Session pruning (required for MVP)**
-   - Implement a retention policy to prevent unbounded storage growth:
-     - Default: keep last 50 sessions per repo, or sessions from last 30 days (whichever is larger).
-     - Pruning runs at end of each agent run.
-     - Configurable via action input.
+   - **Action harness only**: Calls RFC-004 `pruneSessions()` at end of each run.
+   - Default: keep last 50 sessions per repo, or sessions from last 30 days (whichever is larger).
+   - Configurable via action input.
 
 ### P0-B: Setup Action & Environment Bootstrap
 

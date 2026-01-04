@@ -293,12 +293,18 @@ Provide a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstr
 **Dependencies:** F13
 
 **Description:**
-On startup, agent uses session tools to find relevant prior work.
+On startup, the agent uses oMo session tools to find relevant prior work. The action harness also performs startup introspection using RFC-004 utilities to provide context.
+
+**Two layers involved:**
+1. **Action-side (RFC-004)**: `listSessions()` and `searchSessions()` utilities run at startup to gather session context for the agent prompt
+2. **Agent-side (oMo)**: Agent uses `session_search` and `session_read` LLM tools during execution to query prior work
 
 **Acceptance Criteria:**
-- [ ] Agent calls `session_search` before re-investigating
+- [ ] Action harness calls RFC-004 `listSessions()` to discover prior sessions
+- [ ] Agent prompt includes session context from startup introspection
+- [ ] Agent is instructed to call oMo `session_search` before re-investigating
 - [ ] Search queries based on current context (issue title, error messages, file paths)
-- [ ] Agent reads relevant prior sessions when found
+- [ ] Agent reads relevant prior sessions when found via `session_read`
 - [ ] Evidence of session search appears in logs
 
 ---
@@ -498,12 +504,17 @@ Every agent comment includes collapsed details block with run metadata.
 **Dependencies:** F11, F18
 
 **Description:**
-Before finishing, agent produces durable summary discoverable later.
+Before finishing, the action produces a durable summary discoverable by future sessions.
+
+**Two layers involved:**
+1. **Action-side (RFC-004)**: `writeSessionSummary()` utility appends run metadata to the session in OpenCode storage format
+2. **Agent-side (oMo)**: Agent is instructed to leave a searchable summary message before completing
 
 **Acceptance Criteria:**
-- [ ] Final message recorded in OpenCode session
-- [ ] Summary searchable via `session_search`
-- [ ] Key decisions/fixes documented for future reference
+- [ ] Action harness calls RFC-004 `writeSessionSummary()` at end of run
+- [ ] Written summary is in valid OpenCode message format (discoverable by oMo tools)
+- [ ] Agent is instructed to document key decisions/fixes before completing
+- [ ] Summary searchable via `session_search` in future runs
 
 ---
 
@@ -514,13 +525,18 @@ Before finishing, agent produces durable summary discoverable later.
 **Dependencies:** F17, F18
 
 **Description:**
-Retention policy prevents unbounded storage growth.
+Retention policy prevents unbounded storage growth. This is an **action-side** operation using RFC-004 utilities.
+
+**Implementation:**
+The GitHub Action harness calls RFC-004 `pruneSessions()` at the end of each run. This utility operates directly on OpenCode storage (JSON files at `~/.local/share/opencode/storage/`).
 
 **Acceptance Criteria:**
+- [ ] Action harness calls RFC-004 `pruneSessions()` at end of each run
 - [ ] Default: keep last 50 sessions per repo OR sessions from last 30 days (whichever larger)
-- [ ] Pruning runs at end of each agent run
+- [ ] Pruning also removes child sessions (those with `parentID`) of pruned parents
 - [ ] Retention policy configurable via action input
 - [ ] Pruned sessions logged in run summary
+- [ ] Freed storage space reported in metrics
 
 ---
 
@@ -944,7 +960,7 @@ Agent provides visual feedback via reactions and labels to acknowledge work stat
 **Acceptance Criteria:**
 - [ ] Agent adds 👀 (eyes) reaction to triggering comment on receipt
 - [ ] Agent adds "agent: working" label to issue/PR when starting work
-- [ ] Agent replaces 👀 with ✌🏽 (peace sign in random skin tone or ☮️) reaction on successful completion
+- [ ] Agent replaces 👀 with success reaction on completion (🎉 hooray - GitHub API doesn't support peace sign)
 - [ ] Agent removes "agent: working" label on completion (success or failure)
 - [ ] "agent: working" label is created automatically if it doesn't exist
 - [ ] All reaction/label operations are non-fatal (warn on failure, don't fail run)

@@ -136,7 +136,9 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 - **@bfra.me ecosystem**: ESLint, Prettier, TSConfig all from `@bfra.me/*` packages
 - **Bleeding-edge Node**: Targets Node 24 (`action.yaml`, `.node-version`)
 - **Persistent sessions (planned)**: Cache `~/.local/share/opencode/storage` across runs
-- **Session tools**: Agent must use `session_list`, `session_read`, `session_search`, `session_info`
+- **Two-layer session management**:
+  - **Action-side (RFC-004)**: TypeScript utilities (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`) for infrastructure-level operations
+  - **Agent-side (oMo)**: LLM tools (`session_list`, `session_read`, `session_search`, `session_info`) for runtime introspection
 - **RFC-driven development**: All major features documented in `RFCs/` before implementation
 - **Black-box integration test**: `main.test.ts` spawns Node process to test bundled `dist/main.js`
 
