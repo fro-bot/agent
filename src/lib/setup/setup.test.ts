@@ -100,9 +100,11 @@ describe('setup', () => {
         if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
           return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
         }
-        // Mock file validation (returns Zip for macOS/Windows, gzip for Linux)
+        // Mock file validation - return appropriate type based on actual platform
         if (cmd === 'file') {
-          return {exitCode: 0, stdout: 'Zip archive data', stderr: ''}
+          const isZipPlatform = process.platform === 'darwin' || process.platform === 'win32'
+          const output = isZipPlatform ? 'Zip archive data' : 'gzip compressed data'
+          return {exitCode: 0, stdout: output, stderr: ''}
         }
         return {exitCode: 0, stdout: '', stderr: ''}
       })
