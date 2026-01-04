@@ -136,7 +136,16 @@ jobs:
         run: pnpm bootstrap
       - run: pnpm test
 
-      - uses: ./
+      - name: Test setup action
+        uses: ./setup/
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auth-json: '{"user":"ci-test@example.com","tokens":{"anthropic":"sk-test-key"}}'
+          opencode-version: latest
+          skip-cache: 'true'
+
+      - name: Test main action
+        uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
