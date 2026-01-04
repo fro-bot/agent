@@ -1,0 +1,42 @@
+name: Setup Fro Bot Agent
+description: Bootstrap environment for OpenCode agent execution
+author: fro-bot
+
+inputs:
+  auth-json:
+    description: JSON object with OpenCode credentials (auth.json format)
+    required: true
+  github-token:
+    description: GitHub token for API access and gh CLI authentication
+    required: false
+    default: ${{ github.token }}
+  app-id:
+    description: GitHub App ID for elevated permissions
+    required: false
+  private-key:
+    description: GitHub App private key (PEM format)
+    required: false
+  opencode-version:
+    description: 'OpenCode CLI version to install (default: latest)'
+    required: false
+    default: latest
+  skip-cache:
+    description: Skip session cache restore
+    required: false
+    default: 'false'
+
+outputs:
+  opencode-path:
+    description: Path to the installed OpenCode CLI binary
+  opencode-version:
+    description: Installed OpenCode CLI version
+  storage-path:
+    description: Path to OpenCode storage directory
+  cache-status:
+    description: Cache restore status (hit/miss/none)
+  bot-login:
+    description: GitHub bot login name for commit attribution
+
+runs:
+  using: node24
+  main: ../dist/setup.js
