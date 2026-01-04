@@ -2,10 +2,6 @@
 
 A work-in-progress GitHub + Discord “agent harness” intended to run [OpenCode](https://opencode.ai/) with an [Oh My OpenCode (oMo)](https://github.com/code-yeongyu/oh-my-opencode) style workflow (think “Sisyphus”) and keep long-lived agent state across runs.
 
-> [!IMPORTANT]
->
-> This repository currently contains a minimal template GitHub Action (a "wait" action) while the agent features described below are being built.
-
 ## What this project is for
 
 The end goal is two interchangeable entrypoints that share the same brain and memory:
@@ -113,30 +109,6 @@ oMo documents these tools (names and exact behavior may evolve):
 - `session_info`: metadata/stats about a session
 
 Reference: [code-yeongyu/oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) (see “Session Management” in the README)
-
-## Current implementation (template action)
-
-Right now this repo builds a simple Node.js GitHub Action that waits for a specified duration.
-
-- **Input**: `milliseconds` (required)
-- **Output**: `time`
-
-Example workflow usage:
-
-```yaml
-name: Example
-on:
-  workflow_dispatch:
-
-jobs:
-  demo:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: fro-bot/agent@v0
-        with:
-          milliseconds: 1000
-```
 
 ## Development
 
