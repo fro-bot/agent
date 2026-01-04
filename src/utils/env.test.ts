@@ -1,6 +1,14 @@
 import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
-import {getOpenCodeAuthPath, getOpenCodeStoragePath, getRunnerOS, getXdgDataHome} from './env.js'
+import {
+  getGitHubRefName,
+  getGitHubRepository,
+  getGitHubRunId,
+  getOpenCodeAuthPath,
+  getOpenCodeStoragePath,
+  getRunnerOS,
+  getXdgDataHome,
+} from './env.js'
 
 describe('getXdgDataHome', () => {
   const originalEnv = process.env
@@ -114,5 +122,86 @@ describe('getRunnerOS', () => {
     process.env.RUNNER_OS = ''
     const result = getRunnerOS()
     expect(['Linux', 'macOS', 'Windows']).toContain(result)
+  })
+})
+
+describe('getGitHubRepository', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_REPOSITORY when set', () => {
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    expect(getGitHubRepository()).toBe('owner/repo')
+  })
+
+  it('returns default when GITHUB_REPOSITORY not set', () => {
+    delete process.env.GITHUB_REPOSITORY
+    expect(getGitHubRepository()).toBe('unknown/unknown')
+  })
+
+  it('returns default when GITHUB_REPOSITORY is empty', () => {
+    process.env.GITHUB_REPOSITORY = ''
+    expect(getGitHubRepository()).toBe('unknown/unknown')
+  })
+})
+
+describe('getGitHubRefName', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_REF_NAME when set', () => {
+    process.env.GITHUB_REF_NAME = 'feature-branch'
+    expect(getGitHubRefName()).toBe('feature-branch')
+  })
+
+  it('returns default when GITHUB_REF_NAME not set', () => {
+    delete process.env.GITHUB_REF_NAME
+    expect(getGitHubRefName()).toBe('main')
+  })
+
+  it('returns default when GITHUB_REF_NAME is empty', () => {
+    process.env.GITHUB_REF_NAME = ''
+    expect(getGitHubRefName()).toBe('main')
+  })
+})
+
+describe('getGitHubRunId', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_RUN_ID as number when set', () => {
+    process.env.GITHUB_RUN_ID = '12345678'
+    expect(getGitHubRunId()).toBe(12345678)
+  })
+
+  it('returns 0 when GITHUB_RUN_ID not set', () => {
+    delete process.env.GITHUB_RUN_ID
+    expect(getGitHubRunId()).toBe(0)
+  })
+
+  it('returns 0 when GITHUB_RUN_ID is empty', () => {
+    process.env.GITHUB_RUN_ID = ''
+    expect(getGitHubRunId()).toBe(0)
   })
 })

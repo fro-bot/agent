@@ -34,7 +34,7 @@ Add to `package.json`:
 ```json
 {
   "dependencies": {
-    "@actions/cache": "^4.0.0"
+    "@actions/cache": "^5.0.0"
   }
 }
 ```

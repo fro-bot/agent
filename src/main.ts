@@ -5,10 +5,22 @@
  * This is the entry point that orchestrates the agent workflow.
  */
 
+import type {CacheKeyComponents} from './lib/cache-key.js'
+
+import type {CacheResult} from './lib/types.js'
 import * as core from '@actions/core'
+import {restoreCache, saveCache} from './lib/cache.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {setActionOutputs} from './lib/outputs.js'
+import {
+  getGitHubRefName,
+  getGitHubRepository,
+  getGitHubRunId,
+  getOpenCodeAuthPath,
+  getOpenCodeStoragePath,
+  getRunnerOS,
+} from './utils/env.js'
 
 /**
  * Main action entry point.
@@ -45,7 +57,29 @@ async function run(): Promise<void> {
       hasPrompt: inputs.prompt != null,
     })
 
-    // TODO: RFC-002 - Cache restore
+    // Build cache key components from environment
+    const cacheComponents: CacheKeyComponents = {
+      agentIdentity: 'github',
+      repo: getGitHubRepository(),
+      ref: getGitHubRefName(),
+      os: getRunnerOS(),
+    }
+
+    // Restore cache (early in run)
+    const cacheLogger = createLogger({phase: 'cache'})
+    const cacheResult: CacheResult = await restoreCache({
+      components: cacheComponents,
+      logger: cacheLogger,
+      storagePath: getOpenCodeStoragePath(),
+      authPath: getOpenCodeAuthPath(),
+    })
+
+    logger.info('Cache restore completed', {
+      hit: cacheResult.hit,
+      corrupted: cacheResult.corrupted,
+      key: cacheResult.key,
+    })
+
     // TODO: RFC-003 - GitHub client initialization
     // TODO: RFC-004 - Session management
     // TODO: RFC-005 - Event handling
@@ -59,7 +93,7 @@ async function run(): Promise<void> {
 
     setActionOutputs({
       sessionId: null, // Will be set by RFC-004
-      cacheStatus: 'miss', // Will be set by RFC-002
+      cacheStatus: cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss',
       duration,
     })
 
@@ -80,6 +114,27 @@ async function run(): Promise<void> {
     } else {
       bootstrapLogger.error('Agent failed with unknown error')
       core.setFailed('An unknown error occurred')
+    }
+  } finally {
+    // Save cache (always, even on failure)
+    try {
+      const cacheComponents: CacheKeyComponents = {
+        agentIdentity: 'github',
+        repo: getGitHubRepository(),
+        ref: getGitHubRefName(),
+        os: getRunnerOS(),
+      }
+
+      const cacheLogger = createLogger({phase: 'cache-save'})
+      await saveCache({
+        components: cacheComponents,
+        runId: getGitHubRunId(),
+        logger: cacheLogger,
+        storagePath: getOpenCodeStoragePath(),
+        authPath: getOpenCodeAuthPath(),
+      })
+    } catch {
+      // Cache save failure should not mask the original error
     }
   }
 }

@@ -4,7 +4,7 @@ import process from 'node:process'
 
 export function getXdgDataHome(): string {
   const xdgDataHome = process.env.XDG_DATA_HOME
-  if (xdgDataHome != null && xdgDataHome.length > 0) {
+  if (xdgDataHome != null && xdgDataHome.trim().length > 0) {
     return xdgDataHome
   }
   return path.join(os.homedir(), '.local', 'share')
@@ -20,7 +20,7 @@ export function getOpenCodeAuthPath(): string {
 
 export function getRunnerOS(): string {
   const runnerOs = process.env.RUNNER_OS
-  if (runnerOs != null && runnerOs.length > 0) {
+  if (runnerOs != null && runnerOs.trim().length > 0) {
     return runnerOs
   }
   // Fallback for local testing
@@ -41,4 +41,28 @@ export function getRunnerOS(): string {
     case 'netbsd':
       return 'Linux'
   }
+}
+
+export function getGitHubRepository(): string {
+  const repo = process.env.GITHUB_REPOSITORY
+  if (repo != null && repo.trim().length > 0) {
+    return repo
+  }
+  return 'unknown/unknown'
+}
+
+export function getGitHubRefName(): string {
+  const refName = process.env.GITHUB_REF_NAME
+  if (refName != null && refName.trim().length > 0) {
+    return refName
+  }
+  return 'main'
+}
+
+export function getGitHubRunId(): number {
+  const runId = process.env.GITHUB_RUN_ID
+  if (runId != null && runId.trim().length > 0) {
+    return Number(runId)
+  }
+  return 0
 }
