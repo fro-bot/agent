@@ -9,8 +9,6 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 
 The core differentiator is **durable memory across runs**: OpenCode session/application state is restored at the start of each run and saved at the end, so the agent can pick up work without repeating expensive investigation.
 
-This repo currently ships a minimal "wait" template GitHub Action, but the intended product is the agent harness described here.
-
 ---
 
 ## Problem Statement
