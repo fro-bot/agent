@@ -1,174 +1,192 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-03
-**Commit:** d11e763
+**Generated:** 2026-01-04
+**Commit:** 8fc7482
 **Branch:** main
 
 ## OVERVIEW
 
-GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://github.com/code-yeongyu/oh-my-opencode) agents with **persistent session state** across CI runs.
+GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://github.com/code-yeongyu/oh-my-opencode) agents with **persistent session state** across CI runs. TypeScript, ESM-only, Node 24.
 
 ## STRUCTURE
 
 ```
 ./
-├── src/              # TypeScript source (main.ts, wait.ts, *.test.ts)
-│   ├── lib/          # Core libraries (cache, logger, inputs, outputs, types)
-│   │   └── github/   # GitHub API client and context utilities
-│   └── utils/        # Validation and environment utilities
-├── dist/             # Bundled output (committed, must stay in sync)
-├── RFCs/             # 11 RFC documents defining planned features
-├── .github/          # CI, Renovate, repo settings, CodeQL
-├── action.yaml       # GitHub Action definition (node24 runtime)
-└── tsdown.config.ts  # Build config (esbuild + license extraction)
+├── src/                  # TypeScript source
+│   ├── main.ts           # Entry point (executes run() with top-level await)
+│   ├── index.ts          # Public API re-exports
+│   ├── lib/              # Core libraries
+│   │   ├── github/       # Octokit client, context parsing
+│   │   ├── cache.ts      # Cache restore/save with corruption detection
+│   │   ├── cache-key.ts  # Branch-scoped key generation
+│   │   ├── logger.ts     # JSON logging with auto-redaction
+│   │   ├── inputs.ts     # Action input parsing (Result type)
+│   │   ├── outputs.ts    # Action output setting
+│   │   ├── types.ts      # Core interfaces
+│   │   └── constants.ts  # Config values
+│   └── utils/            # Pure utility functions
+│       ├── env.ts        # Environment variable getters
+│       └── validation.ts # Input validators
+├── dist/                 # Bundled output (COMMITTED, must stay in sync)
+├── RFCs/                 # 12 RFC documents (architecture specs)
+├── .github/              # CI workflows, Renovate, settings
+├── action.yaml           # GitHub Action definition (node24)
+└── tsdown.config.ts      # esbuild bundler config
 ```
 
 ## WHERE TO LOOK
 
-| Task                  | Location                    | Notes                                              |
-| --------------------- | --------------------------- | -------------------------------------------------- |
-| Add action logic      | `src/main.ts`               | Uses `@actions/core`, orchestrates full run        |
-| Cache operations      | `src/lib/cache.ts`          | `restoreCache()`, `saveCache()`, corruption checks |
-| GitHub API calls      | `src/lib/github/client.ts`  | `createClient()`, `getBotLogin()`                  |
-| Input parsing         | `src/lib/inputs.ts`         | `parseActionInputs()` with validation              |
-| Output setting        | `src/lib/outputs.ts`        | `setActionOutputs()`                               |
-| Logging               | `src/lib/logger.ts`         | `createLogger()` with sensitive field redaction    |
-| Core types            | `src/lib/types.ts`          | `ActionInputs`, `CacheResult`, `RunContext`        |
-| Modify build          | `tsdown.config.ts`          | ESM shim for CJS compat                            |
-| Action inputs/outputs | `action.yaml`               | `node24` runtime                                   |
-| CI pipeline           | `.github/workflows/ci.yaml` | Path-filtered, v-branch release                    |
-| Lint config           | `eslint.config.ts`          | Extends `@bfra.me/eslint-config`                   |
-| Type config           | `tsconfig.json`             | Extends `@bfra.me/tsconfig`, Bundler resolution    |
-| Planned features      | `RFCs/`                     | 11 RFCs: sessions, cache, security, setup          |
+| Task             | Location                    | Notes                                                       |
+| ---------------- | --------------------------- | ----------------------------------------------------------- |
+| Add action logic | `src/main.ts`               | Orchestrates full run lifecycle                             |
+| Cache operations | `src/lib/cache.ts`          | `restoreCache()`, `saveCache()`, corruption checks          |
+| GitHub API       | `src/lib/github/client.ts`  | `createClient()`, `createAppClient()`, `getBotLogin()`      |
+| Event parsing    | `src/lib/github/context.ts` | `parseGitHubContext()`, `classifyEventType()`               |
+| Input parsing    | `src/lib/inputs.ts`         | `parseActionInputs()` returns `Result<ActionInputs, Error>` |
+| Output setting   | `src/lib/outputs.ts`        | `setActionOutputs()`                                        |
+| Logging          | `src/lib/logger.ts`         | `createLogger()` with sensitive field redaction             |
+| Core types       | `src/lib/types.ts`          | `ActionInputs`, `CacheResult`, `RunContext`, `RunSummary`   |
+| Build config     | `tsdown.config.ts`          | ESM shim, bundled deps, license extraction                  |
+| Action I/O       | `action.yaml`               | Inputs, outputs, node24 runtime                             |
+| CI pipeline      | `.github/workflows/ci.yaml` | Path-filtered jobs, v-branch release                        |
+| Planned features | `RFCs/`                     | 12 RFCs: sessions, cache, security, setup                   |
 
 ## CODE MAP
 
-| Symbol              | Type      | Location                      | Role                                            |
-| ------------------- | --------- | ----------------------------- | ----------------------------------------------- |
-| `run`               | Function  | `src/main.ts:29`              | Main entry point, orchestrates action lifecycle |
-| `restoreCache`      | Function  | `src/lib/cache.ts:50`         | Restore OpenCode state from GitHub cache        |
-| `saveCache`         | Function  | `src/lib/cache.ts:142`        | Persist OpenCode state to GitHub cache          |
-| `createClient`      | Function  | `src/lib/github/client.ts:14` | Create Octokit instance with logging            |
-| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`        | Parse and validate action inputs                |
-| `createLogger`      | Function  | `src/lib/logger.ts:108`       | Create logger with auto-redaction               |
-| `ActionInputs`      | Interface | `src/lib/types.ts:39`         | Input schema (token, prompt, s3, etc.)          |
-| `CacheResult`       | Interface | `src/lib/types.ts:11`         | Cache restore result (hit, key, corrupted)      |
-| `RunContext`        | Interface | `src/lib/types.ts:19`         | GitHub event context (repo, ref, actor)         |
+| Symbol               | Type      | Location                      | Role                                      |
+| -------------------- | --------- | ----------------------------- | ----------------------------------------- |
+| `run`                | Function  | `src/main.ts:29`              | Main entry, orchestrates action lifecycle |
+| `restoreCache`       | Function  | `src/lib/cache.ts:50`         | Restore OpenCode state from GitHub cache  |
+| `saveCache`          | Function  | `src/lib/cache.ts:136`        | Persist OpenCode state to cache           |
+| `createClient`       | Function  | `src/lib/github/client.ts:30` | Create Octokit with logging               |
+| `createAppClient`    | Function  | `src/lib/github/client.ts:63` | Create GitHub App Octokit                 |
+| `getBotLogin`        | Function  | `src/lib/github/client.ts:44` | Get authenticated user login              |
+| `parseGitHubContext` | Function  | `src/lib/github/context.ts`   | Parse event payload                       |
+| `parseActionInputs`  | Function  | `src/lib/inputs.ts:14`        | Parse/validate inputs                     |
+| `createLogger`       | Function  | `src/lib/logger.ts:108`       | Logger with auto-redaction                |
+| `ActionInputs`       | Interface | `src/lib/types.ts:39`         | Input schema                              |
+| `CacheResult`        | Interface | `src/lib/types.ts:11`         | Cache restore result                      |
+| `RunContext`         | Interface | `src/lib/types.ts:19`         | GitHub event context                      |
+| `RunSummary`         | Interface | `src/lib/types.ts:63`         | Run result summary                        |
 
 ## TDD (Test-Driven Development)
 
 **MANDATORY for new features and bug fixes.** Follow RED-GREEN-REFACTOR:
 
-```
-1. RED    - Write failing test first (test MUST fail)
-2. GREEN  - Write MINIMAL code to pass (nothing more)
-3. REFACTOR - Clean up while tests stay GREEN
-4. REPEAT - Next test case
-```
-
-| Phase        | Action                                   | Verification                         |
-| ------------ | ---------------------------------------- | ------------------------------------ |
-| **RED**      | Write test describing expected behavior  | `pnpm test` → FAIL (expected)        |
-| **GREEN**    | Implement minimum code to pass           | `pnpm test` → PASS                   |
-| **REFACTOR** | Improve code quality, remove duplication | `pnpm test` → PASS (must stay green) |
+| Phase        | Action                     | Verification                  |
+| ------------ | -------------------------- | ----------------------------- |
+| **RED**      | Write failing test first   | `pnpm test` → FAIL (expected) |
+| **GREEN**    | Write MINIMAL code to pass | `pnpm test` → PASS            |
+| **REFACTOR** | Clean up, keep tests green | `pnpm test` → PASS            |
 
 **Rules:**
 
 - NEVER write implementation before test
-- NEVER delete failing tests to "pass" - fix the code
-- One test at a time - don't batch
-- Test file naming: `*.test.ts` alongside source in `src/`
+- NEVER delete failing tests - fix the code
+- One test at a time
+- Test naming: `*.test.ts` colocated with source
+
+**Test patterns:**
+
+- `vi.mock()` ONLY for external deps (`@actions/core`, `@actions/github`)
+- Create inline mock helpers for internal types (Logger, CacheAdapter)
+- Use `// #given`, `// #when`, `// #then` comments
+- `beforeEach`/`afterEach` for env cleanup
+
+**Integration test:** `main.test.ts` spawns bundled `dist/main.js` as child process (black-box)
 
 ## CONVENTIONS
 
 ### TypeScript
 
-- **ESM-only**: `"type": "module"` in package.json
-- **Function-based**: Prefer functions over ES6 classes
-- **Strict booleans**: Use explicit `!= null` or `Boolean()` checks, never implicit falsy
+- **ESM-only**: `"type": "module"`, use `.js` extensions in imports
+- **Function-based**: No ES6 classes, pure functions only
+- **Strict booleans**: Use `!= null` or `Boolean()`, never implicit falsy (`if (!value)`)
 - **Const assertions**: Use `as const` for fixed values
-- **No suppressions**: Never use `as any`, `@ts-ignore`, `@ts-expect-error`
-- **ESM imports**: Use `.js` extension in imports (e.g., `import {wait} from './wait.js'`)
+- **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
+- **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
 
 ### Build
 
 - **tsdown**: esbuild wrapper bundling to `dist/main.js`
-- **ESM shim**: Banner injects `createRequire` for CJS compatibility
-- **Bundle deps**: `@actions/core` bundled via `noExternal`
+- **ESM shim**: Banner injects `createRequire` for CJS compat
+- **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@bfra.me/es` (not external)
 - **Licenses**: Auto-extracted to `dist/licenses.txt`
+- **dist/ committed**: MUST run `pnpm build` after src changes; CI fails if out of sync
 
 ### Testing
 
-- **Vitest**: Run with `pnpm test`
-- **Colocated tests**: `src/*.test.ts` alongside source files
-- **Integration test**: `main.test.ts` executes bundled `dist/main.js` via child process spawn
-- **No mocking libs**: Direct functional testing only
-- **Anti-.only**: `eslint-plugin-no-only-tests` prevents committing `.only` blocks
+- **Vitest**: `pnpm test` runs all `*.test.ts`
+- **Colocated**: Tests live alongside source
+- **No mocking libs**: vi.mock for externals only, functional testing otherwise
+- **Anti-.only**: `eslint-plugin-no-only-tests` blocks committing `.only`
 
 ### Release
 
-- **v-branch strategy**: `main` merges to `v0` branch for stable refs
-- **Semantic release**: Runs on `v[0-9]+` branches
-- **Patch triggers**: `build` and `docs(readme)` commits trigger patch releases
+- **v-branch strategy**: `main` merges to `v0` for stable refs (`@v0`, `@v0.3.2`)
+- **Semantic release**: Conventional commits drive versioning
+- **Patch triggers**: `build:` and `docs(readme):` commits
 
 ### Security
 
-- **Credential handling**: `auth.json` written with `0o600` permissions, deleted before cache save
-- **No secrets in cache**: Never persist `.env`, `*.key`, `*.pem`, `auth.json`
-- **Log redaction**: Logger auto-redacts `token`, `password`, `secret`, `key`, `auth` fields
-- **Authorization gating**: Only `OWNER`, `MEMBER`, `COLLABORATOR` can trigger; bots blocked (anti-loop)
+- **Credential handling**: `auth.json` with `0o600`, deleted before cache save
+- **No secrets in cache**: Never `.env`, `*.key`, `*.pem`, `auth.json`
+- **Log redaction**: Auto-redacts `token`, `password`, `secret`, `key`, `auth`
+- **Authorization gating**: Only `OWNER`, `MEMBER`, `COLLABORATOR`; bots blocked
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
-| Forbidden                             | Reason                              |
-| ------------------------------------- | ----------------------------------- |
-| ES6 classes                           | Use functions for composability     |
-| Implicit falsy checks (`if (!value)`) | Violates strict-boolean-expressions |
-| Type suppressions (`as any`, etc.)    | Maintain type safety                |
-| Manual dist edits                     | Rebuilt by CI; will be overwritten  |
-| Committing without build              | CI validates `dist/` is in sync     |
-| Mocking libraries                     | Use functional testing              |
-| CommonJS `require()`                  | ESM-only project                    |
-| Caching secrets                       | Security risk                       |
+| Forbidden                                  | Reason                              |
+| ------------------------------------------ | ----------------------------------- |
+| ES6 classes                                | Use functions for composability     |
+| `if (!value)` (implicit falsy)             | Violates strict-boolean-expressions |
+| `as any`, `@ts-ignore`, `@ts-expect-error` | Maintain type safety                |
+| Manual dist edits                          | Rebuilt by CI; will be overwritten  |
+| Committing without `pnpm build`            | CI validates dist/ in sync          |
+| Mocking libraries (jest, sinon)            | Functional testing only             |
+| CommonJS `require()`                       | ESM-only project                    |
+| Caching secrets                            | Security risk                       |
+| Empty catch blocks                         | Log or rethrow errors               |
+| Global mutable state                       | Use dependency injection            |
 
 ## UNIQUE STYLES
 
-- **@bfra.me ecosystem**: ESLint, Prettier, TSConfig all from `@bfra.me/*` packages
-- **Bleeding-edge Node**: Targets Node 24 (`action.yaml`, `.node-version`)
-- **Persistent sessions (planned)**: Cache `~/.local/share/opencode/storage` across runs
-- **Two-layer session management**:
-  - **Action-side (RFC-004)**: TypeScript utilities (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`) for infrastructure-level operations
-  - **Agent-side (oMo)**: LLM tools (`session_list`, `session_read`, `session_search`, `session_info`) for runtime introspection
-- **RFC-driven development**: All major features documented in `RFCs/` before implementation
-- **Black-box integration test**: `main.test.ts` spawns Node process to test bundled `dist/main.js`
+- **@bfra.me ecosystem**: ESLint, Prettier, TSConfig from `@bfra.me/*`
+- **Bleeding-edge Node 24**: `action.yaml`, `.node-version`
+- **Top-level await**: `main.ts` executes `await run()` at module scope
+- **Result type pattern**: `parseActionInputs()` returns `Result<T, E>` not throws
+- **RFC-driven development**: Major features documented in `RFCs/` first
+- **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
+- **v-branch releases**: Main merges to `v0` for major version pinning
+- **Path-filtered CI**: Jobs run conditionally based on changed files
 
 ## COMMANDS
 
 ```bash
 pnpm bootstrap        # Install dependencies
-pnpm build            # Bundle to dist/
+pnpm build            # Bundle to dist/ (REQUIRED before commit)
 pnpm check-types      # TypeScript validation
 pnpm lint             # ESLint
 pnpm fix              # ESLint --fix
-pnpm test             # Vitest
+pnpm test             # Vitest (133 tests)
 ```
 
 ## NOTES
 
-- **dist/ committed**: Must run `pnpm build` after src changes; CI fails if out of sync
+- **dist/ committed**: CI fails if `git diff dist/` shows changes after build
 - **GitHub App releases**: CI uses app token to push to protected `v0` branch
-- **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review active
-- **Pre-commit hook**: `simple-git-hooks` runs `lint-staged` automatically
-- **Dual identity**: Planned support for both GitHub Action and Discord bot entry points
-- **RFCs 001-003 complete**: Start new implementation at RFC-004 (Session Management)
+- **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review
+- **Pre-commit hook**: `simple-git-hooks` runs `lint-staged`
+- **RFCs 001-003 implemented**: Current work at RFC-004 (Session Management)
+- **12 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution
 
 ## EXTERNAL RESOURCES
 
-> Generated by /init-resources. Librarian uses this for focused searches.
+> For librarian agent searches.
 
 ### Dependencies (from package.json)
 
-@actions/core, @actions/cache, @actions/github, @bfra.me/es, vitest, tsdown, typescript
+@actions/core, @actions/cache, @actions/github, @bfra.me/es, @octokit/auth-app, vitest, tsdown, typescript
 
 ### Context7 IDs
 
@@ -185,6 +203,7 @@ pnpm test             # Vitest
 - actions/toolkit - GitHub Actions SDK (@actions/core, @actions/cache, @actions/github)
 - vitest-dev/vitest - Test framework
 - rolldown/tsdown - Build bundler (esbuild wrapper)
+- octokit/auth-app.js - GitHub App authentication
 
 ### Documentation
 
