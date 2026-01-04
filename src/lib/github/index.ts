@@ -1,5 +1,5 @@
-export {createClient, getBotLogin} from './client.js'
-export type {ClientOptions} from './client.js'
+export {createAppClient, createClient, getBotLogin} from './client.js'
+export type {AppClientOptions, ClientOptions} from './client.js'
 export {
   classifyEventType,
   getAuthorAssociation,
