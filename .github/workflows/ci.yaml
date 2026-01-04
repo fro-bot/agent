@@ -138,7 +138,8 @@ jobs:
 
       - uses: ./
         with:
-          milliseconds: 1000
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auth-json: '{"test":{"type":"api","key":"test-key"}}'
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}

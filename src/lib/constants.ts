@@ -5,11 +5,9 @@ export const OPENCODE_AUTH_PATH = '~/.local/share/opencode/auth.json' as const
 // Files to exclude from cache (security-sensitive)
 export const CACHE_EXCLUSIONS = ['auth.json', '.env', '*.key', '*.pem'] as const
 
-// Default configuration
-export const DEFAULT_SESSION_RETENTION_DAYS = 30
+// Default configuration - per RFC-001
+export const DEFAULT_SESSION_RETENTION = 50
 export const DEFAULT_MAX_AGE_DAYS = 30
-export const DEFAULT_MODEL = 'claude-sonnet-4-20250514'
-export const DEFAULT_MAX_COMMENT_LENGTH = 65536
 
 // Retry configuration
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const

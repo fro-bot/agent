@@ -1,38 +1,41 @@
 ---
 name: Fro Bot Agent
-description: GitHub Action harness for OpenCode + oMo agents with persistent session state
+description: AI agent with persistent memory for GitHub automation
 author: Fro Bot <agent@fro.bot>
+
 inputs:
   github-token:
+    description: GitHub token (App installation token or PAT) with write permissions
     required: true
-    description: GitHub token for API access (GITHUB_TOKEN or PAT)
-  opencode-model:
+  auth-json:
+    description: JSON object mapping provider IDs to auth configs
+    required: true
+  prompt:
+    description: Custom prompt for the agent
     required: false
-    description: OpenCode model to use for agent interactions
-    default: claude-sonnet-4-20250514
-  session-retention-days:
+  session-retention:
+    description: Number of sessions to retain (default 50)
     required: false
-    description: Number of days to retain session data
-    default: '30'
-  max-comment-length:
+    default: '50'
+  s3-backup:
+    description: Enable S3 write-through backup
     required: false
-    description: Maximum length for GitHub comments
-    default: '65536'
-  safe-mode:
-    required: false
-    description: Enable safe mode (restricts dangerous operations)
     default: 'false'
-  debug:
+  s3-bucket:
+    description: S3 bucket for backup (required if s3-backup is true)
     required: false
-    description: Enable debug logging
-    default: 'false'
+  aws-region:
+    description: AWS region for S3 bucket
+    required: false
+
 outputs:
   session-id:
-    description: The session ID used for this run (if any)
+    description: OpenCode session ID used for this run
   cache-status:
-    description: Cache status (hit, miss, or corrupted)
+    description: Cache restore status (hit/miss/corrupted)
   duration:
-    description: Total run duration in milliseconds
+    description: Run duration in seconds
+
 runs:
   using: node24
   main: dist/main.js

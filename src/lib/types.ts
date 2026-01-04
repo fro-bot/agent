@@ -35,14 +35,15 @@ export interface PruningConfig {
   readonly maxAgeDays: number
 }
 
-// Action inputs (parsed and validated)
+// Action inputs (parsed and validated) - per RFC-001
 export interface ActionInputs {
   readonly githubToken: string
-  readonly opencodeModel: string
-  readonly sessionRetentionDays: number
-  readonly maxCommentLength: number
-  readonly safeMode: boolean
-  readonly debug: boolean
+  readonly authJson: string
+  readonly prompt: string | null
+  readonly sessionRetention: number
+  readonly s3Backup: boolean
+  readonly s3Bucket: string | null
+  readonly awsRegion: string | null
 }
 
 // Action outputs

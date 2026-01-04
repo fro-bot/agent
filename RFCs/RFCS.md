@@ -1,6 +1,8 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-03 **Total RFCs:** 11 **Implementation Strategy:** Sequential (RFC-001 → RFC-011)
+**Generated:** 2026-01-03
+**Total RFCs:** 11
+**Implementation Strategy:** Sequential (RFC-001 → RFC-011)
 
 ---
 

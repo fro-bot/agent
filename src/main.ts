@@ -27,23 +27,22 @@ async function run(): Promise<void> {
     const inputsResult = parseActionInputs()
 
     if (!inputsResult.success) {
-      core.setFailed(`Invalid inputs: ${inputsResult.error}`)
+      core.setFailed(`Invalid inputs: ${inputsResult.error.message}`)
       return
     }
 
     const inputs = inputsResult.data
 
-    // Create main logger with debug context
+    // Create main logger with run context
     const logger = createLogger({
-      debug: inputs.debug,
       phase: 'main',
     })
 
     logger.info('Action inputs parsed successfully', {
-      model: inputs.opencodeModel,
-      sessionRetentionDays: inputs.sessionRetentionDays,
-      safeMode: inputs.safeMode,
-      debug: inputs.debug,
+      sessionRetention: inputs.sessionRetention,
+      s3Backup: inputs.s3Backup,
+      hasGithubToken: inputs.githubToken.length > 0,
+      hasPrompt: inputs.prompt != null,
     })
 
     // TODO: RFC-002 - Cache restore

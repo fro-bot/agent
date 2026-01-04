@@ -322,6 +322,7 @@ function isSelfComment(context: Context, botLogin: string): boolean {
 | **REFACTOR** | Improve code quality, remove duplication | `pnpm test` → PASS (must stay green) |
 
 **Rules:**
+
 - NEVER write implementation before test
 - NEVER delete failing tests to "pass" - fix the code
 - One test at a time - don't batch
@@ -430,14 +431,11 @@ name: "Fro Bot Agent"
 description: "AI agent with persistent memory for GitHub automation"
 
 inputs:
+  github-token:
+    description: "GitHub token (App installation token or PAT) with write permissions"
+    required: true
   auth-json:
     description: "JSON object or path with OpenCode credentials (auth.json format)"
-    required: true
-  app-id:
-    description: "GitHub App ID"
-    required: true
-  private-key:
-    description: "GitHub App private key"
     required: true
   prompt:
     description: "Custom prompt"
@@ -712,13 +710,12 @@ git config --global user.email "<user-id>+fro-bot[bot]@users.noreply.github.com"
   uses: fro-bot/agent/setup@v0
   with:
     auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-    app-id: ${{ secrets.APP_ID }}
-    private-key: ${{ secrets.APP_PRIVATE_KEY }}
     opencode-version: "latest" # optional
 
 - name: Run Fro Bot Agent
   uses: fro-bot/agent@v0
   with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
     prompt: "Respond to the issue comment"
 ```
 
