@@ -80,9 +80,8 @@ export interface PruningConfig {
 
 // Action inputs (parsed and validated)
 export interface ActionInputs {
+  readonly githubToken: string
   readonly authJson: string
-  readonly appId: string | null
-  readonly privateKey: string | null
   readonly prompt: string | null
   readonly sessionRetention: number
   readonly s3Backup: boolean
@@ -147,11 +146,11 @@ import {DEFAULT_SESSION_RETENTION} from "./constants.js"
 import {validatePositiveInteger, validateJsonString} from "../utils/validation.js"
 
 export function parseActionInputs(): ActionInputs {
+  const githubToken = core.getInput("github-token", {required: true})
+
   const authJson = core.getInput("auth-json", {required: true})
   validateJsonString(authJson, "auth-json")
 
-  const appId = core.getInput("app-id") || null
-  const privateKey = core.getInput("private-key") || null
   const prompt = core.getInput("prompt") || null
 
   const sessionRetentionRaw = core.getInput("session-retention")
@@ -165,9 +164,8 @@ export function parseActionInputs(): ActionInputs {
   const awsRegion = core.getInput("aws-region") || null
 
   return {
+    githubToken,
     authJson,
-    appId,
-    privateKey,
     prompt,
     sessionRetention,
     s3Backup,
@@ -325,6 +323,13 @@ description: "AI agent with persistent memory for GitHub automation"
 author: "Fro Bot <agent@fro.bot>"
 
 inputs:
+  github-token:
+    description: |
+      GitHub token for API operations. Can be either:
+      - GitHub App installation token (recommended for elevated operations)
+      - Personal access token (PAT)
+      The token is treated as having necessary permissions for GitHub write operations.
+    required: true
   auth-json:
     description: |
       JSON object mapping provider IDs to auth configs. Supports three auth types:
@@ -333,12 +338,6 @@ inputs:
       - wellknown: { "type": "wellknown", "key": "...", "token": "..." }
       Example: { "anthropic": { "type": "api", "key": "sk-ant-..." } }
     required: true
-  app-id:
-    description: "GitHub App ID for elevated operations"
-    required: false
-  private-key:
-    description: "GitHub App private key for elevated operations"
-    required: false
   prompt:
     description: "Custom prompt for the agent"
     required: false
