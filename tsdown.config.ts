@@ -22,5 +22,5 @@ export default defineConfig({
       },
     }),
   ],
-  noExternal: ['@actions/cache', '@actions/core', '@actions/github', '@bfra.me/es'],
+  noExternal: ['@actions/cache', '@actions/core', '@actions/github', '@bfra.me/es', '@octokit/auth-app'],
 })

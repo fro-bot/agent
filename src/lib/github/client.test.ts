@@ -1,7 +1,7 @@
 import type {Logger} from '../logger.js'
 import type {Octokit} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createClient, getBotLogin} from './client.js'
+import {createAppClient, createClient, getBotLogin} from './client.js'
 
 function createMockLogger(): Logger {
   return {
@@ -64,5 +64,70 @@ describe('getBotLogin', () => {
 
     expect(login).toBe('fro-bot[bot]')
     expect(logger.debug).toHaveBeenCalledWith('Failed to get authenticated user, may be app token')
+  })
+})
+
+describe('createAppClient', () => {
+  it('returns null when appId is empty', async () => {
+    const logger = createMockLogger()
+    const result = await createAppClient({
+      appId: '',
+      privateKey: 'test-key',
+      logger,
+    })
+
+    expect(result).toBeNull()
+    expect(logger.debug).toHaveBeenCalledWith('GitHub App credentials not provided')
+  })
+
+  it('returns null when privateKey is empty', async () => {
+    const logger = createMockLogger()
+    const result = await createAppClient({
+      appId: '12345',
+      privateKey: '',
+      logger,
+    })
+
+    expect(result).toBeNull()
+    expect(logger.debug).toHaveBeenCalledWith('GitHub App credentials not provided')
+  })
+
+  it('returns null and logs error when auth fails with invalid credentials', async () => {
+    const logger = createMockLogger()
+    const result = await createAppClient({
+      appId: '12345',
+      privateKey: 'invalid-key-format',
+      installationId: 67890,
+      logger,
+    })
+
+    expect(result).toBeNull()
+    expect(logger.error).toHaveBeenCalledWith(
+      'Failed to create GitHub App client',
+      expect.objectContaining({error: expect.any(String) as unknown as string}),
+    )
+  })
+
+  it('does not log privateKey in any log calls', async () => {
+    const logger = createMockLogger()
+    const sensitiveKey = 'super-secret-private-key-content'
+
+    await createAppClient({
+      appId: '12345',
+      privateKey: sensitiveKey,
+      installationId: 67890,
+      logger,
+    })
+
+    const allCalls = [
+      ...vi.mocked(logger.debug).mock.calls,
+      ...vi.mocked(logger.info).mock.calls,
+      ...vi.mocked(logger.error).mock.calls,
+    ]
+
+    for (const call of allCalls) {
+      const stringified = JSON.stringify(call)
+      expect(stringified).not.toContain(sensitiveKey)
+    }
   })
 })
