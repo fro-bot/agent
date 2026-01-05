@@ -1,7 +1,15 @@
-import type {ExecAdapter, Logger} from './types.js'
+import type {OmoInstallDeps} from './omo.js'
+import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
-import {describe, expect, it, vi} from 'vitest'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {installBun, isBunAvailable} from './bun.js'
 import {installOmo, verifyOmoInstallation} from './omo.js'
+
+// Mock the bun module
+vi.mock('./bun.js', () => ({
+  isBunAvailable: vi.fn(),
+  installBun: vi.fn(),
+}))
 
 // Mock logger
 function createMockLogger(): Logger {
@@ -22,25 +30,56 @@ function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapte
   }
 }
 
+// Mock tool cache adapter
+function createMockToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
+  return {
+    downloadTool: vi.fn().mockResolvedValue('/tmp/bun.zip'),
+    extractTar: vi.fn().mockResolvedValue('/tmp/bun-extracted'),
+    extractZip: vi.fn().mockResolvedValue('/tmp/bun-extracted'),
+    cacheDir: vi.fn().mockResolvedValue('/cached/bun'),
+    find: vi.fn().mockReturnValue(''),
+    ...overrides,
+  }
+}
+
+// Create mock deps object
+function createMockDeps(overrides: Partial<OmoInstallDeps> = {}): OmoInstallDeps {
+  return {
+    logger: createMockLogger(),
+    execAdapter: createMockExecAdapter(),
+    toolCache: createMockToolCache(),
+    addPath: vi.fn(),
+    ...overrides,
+  }
+}
+
 describe('omo', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    // Default: Bun is available
+    vi.mocked(isBunAvailable).mockResolvedValue(true)
+    vi.mocked(installBun).mockResolvedValue({path: '/cached/bun', version: '1.2.5', cached: false})
+  })
+
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
       // #given
-      const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter({
-        exec: vi
-          .fn()
-          .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
-            // Simulate successful output with version
-            if (options?.listeners?.stdout != null) {
-              options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
-            }
-            return 0
-          }),
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({
+          exec: vi
+            .fn()
+            .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
+              // Simulate successful output with version
+              if (options?.listeners?.stdout != null) {
+                options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
+              }
+              return 0
+            }),
+        }),
       })
 
       // #when
-      const result = await installOmo(mockLogger, mockExec)
+      const result = await installOmo(mockDeps)
 
       // #then
       expect(result.installed).toBe(true)
@@ -50,20 +89,21 @@ describe('omo', () => {
 
     it('returns success without version when version not in output', async () => {
       // #given
-      const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter({
-        exec: vi
-          .fn()
-          .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
-            if (options?.listeners?.stdout != null) {
-              options.listeners.stdout(Buffer.from('Installation complete\n'))
-            }
-            return 0
-          }),
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({
+          exec: vi
+            .fn()
+            .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
+              if (options?.listeners?.stdout != null) {
+                options.listeners.stdout(Buffer.from('Installation complete\n'))
+              }
+              return 0
+            }),
+        }),
       })
 
       // #when
-      const result = await installOmo(mockLogger, mockExec)
+      const result = await installOmo(mockDeps)
 
       // #then
       expect(result.installed).toBe(true)
@@ -73,13 +113,14 @@ describe('omo', () => {
 
     it('returns failure on non-zero exit code', async () => {
       // #given
-      const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter({
-        exec: vi.fn().mockResolvedValue(1),
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({
+          exec: vi.fn().mockResolvedValue(1),
+        }),
       })
 
       // #when
-      const result = await installOmo(mockLogger, mockExec)
+      const result = await installOmo(mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -90,12 +131,15 @@ describe('omo', () => {
     it('returns failure on exception', async () => {
       // #given
       const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter({
-        exec: vi.fn().mockRejectedValue(new Error('Command not found')),
+      const mockDeps = createMockDeps({
+        logger: mockLogger,
+        execAdapter: createMockExecAdapter({
+          exec: vi.fn().mockRejectedValue(new Error('Command not found')),
+        }),
       })
 
       // #when
-      const result = await installOmo(mockLogger, mockExec)
+      const result = await installOmo(mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -106,45 +150,47 @@ describe('omo', () => {
     it('logs info on successful installation', async () => {
       // #given
       const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter()
+      const mockDeps = createMockDeps({logger: mockLogger})
 
       // #when
-      await installOmo(mockLogger, mockExec)
+      await installOmo(mockDeps)
 
       // #then
       expect(mockLogger.info).toHaveBeenCalledWith('Installing Oh My OpenCode plugin', expect.any(Object))
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('calls npx with headless options using defaults', async () => {
+    it('calls bunx with headless options using defaults', async () => {
       // #given
-      const mockLogger = createMockLogger()
       const execMock = vi.fn().mockResolvedValue(0)
-      const mockExec = createMockExecAdapter({exec: execMock})
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
 
       // #when
-      await installOmo(mockLogger, mockExec)
+      await installOmo(mockDeps)
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'npx',
+        'bunx',
         ['oh-my-opencode', 'install', '--no-tui', '--claude=max20', '--chatgpt=no', '--gemini=no'],
         expect.objectContaining({silent: true}),
       )
     })
 
-    it('calls npx with custom options when provided', async () => {
+    it('calls bunx with custom options when provided', async () => {
       // #given
-      const mockLogger = createMockLogger()
       const execMock = vi.fn().mockResolvedValue(0)
-      const mockExec = createMockExecAdapter({exec: execMock})
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
 
       // #when
-      await installOmo(mockLogger, mockExec, {claude: 'yes', chatgpt: 'yes', gemini: 'yes'})
+      await installOmo(mockDeps, {claude: 'yes', chatgpt: 'yes', gemini: 'yes'})
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'npx',
+        'bunx',
         ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
         expect.objectContaining({silent: true}),
       )
@@ -153,28 +199,31 @@ describe('omo', () => {
     it('captures both stdout and stderr', async () => {
       // #given
       const mockLogger = createMockLogger()
-      const mockExec = createMockExecAdapter({
-        exec: vi
-          .fn()
-          .mockImplementation(
-            async (
-              _cmd,
-              _args,
-              options: {listeners?: {stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void}},
-            ) => {
-              if (options?.listeners?.stdout != null) {
-                options.listeners.stdout(Buffer.from('stdout output'))
-              }
-              if (options?.listeners?.stderr != null) {
-                options.listeners.stderr(Buffer.from('stderr output'))
-              }
-              return 1 // Non-zero to trigger warning
-            },
-          ),
+      const mockDeps = createMockDeps({
+        logger: mockLogger,
+        execAdapter: createMockExecAdapter({
+          exec: vi
+            .fn()
+            .mockImplementation(
+              async (
+                _cmd,
+                _args,
+                options: {listeners?: {stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void}},
+              ) => {
+                if (options?.listeners?.stdout != null) {
+                  options.listeners.stdout(Buffer.from('stdout output'))
+                }
+                if (options?.listeners?.stderr != null) {
+                  options.listeners.stderr(Buffer.from('stderr output'))
+                }
+                return 1 // Non-zero to trigger warning
+              },
+            ),
+        }),
       })
 
       // #when
-      const result = await installOmo(mockLogger, mockExec)
+      const result = await installOmo(mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -185,6 +234,57 @@ describe('omo', () => {
       expect(lastCall?.[1]).toBeDefined()
       expect(typeof lastCall?.[1]).toBe('object')
       expect((lastCall?.[1] as {output?: string}).output).toContain('stdout output')
+    })
+
+    it('installs Bun when not available', async () => {
+      // #given
+      vi.mocked(isBunAvailable).mockResolvedValueOnce(false)
+      const mockLogger = createMockLogger()
+      const mockDeps = createMockDeps({logger: mockLogger})
+
+      // #when
+      await installOmo(mockDeps)
+
+      // #then
+      expect(isBunAvailable).toHaveBeenCalled()
+      expect(installBun).toHaveBeenCalledWith(
+        mockDeps.logger,
+        mockDeps.toolCache,
+        mockDeps.execAdapter,
+        mockDeps.addPath,
+      )
+      expect(mockLogger.info).toHaveBeenCalledWith('Bun not found, installing...')
+    })
+
+    it('skips Bun installation when already available', async () => {
+      // #given
+      vi.mocked(isBunAvailable).mockResolvedValueOnce(true)
+      const mockLogger = createMockLogger()
+      const mockDeps = createMockDeps({logger: mockLogger})
+
+      // #when
+      await installOmo(mockDeps)
+
+      // #then
+      expect(isBunAvailable).toHaveBeenCalled()
+      expect(installBun).not.toHaveBeenCalled()
+    })
+
+    it('returns failure when Bun installation fails', async () => {
+      // #given
+      vi.mocked(isBunAvailable).mockResolvedValueOnce(false)
+      vi.mocked(installBun).mockRejectedValueOnce(new Error('Download failed'))
+      const mockLogger = createMockLogger()
+      const mockDeps = createMockDeps({logger: mockLogger})
+
+      // #when
+      const result = await installOmo(mockDeps)
+
+      // #then
+      expect(result.installed).toBe(false)
+      expect(result.error).toContain('Bun installation failed')
+      expect(result.error).toContain('Download failed')
+      expect(mockLogger.error).toHaveBeenCalledWith('Failed to install Bun runtime', expect.any(Object))
     })
   })
 

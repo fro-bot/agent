@@ -33,13 +33,14 @@ Implement a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that boots
 The Sisyphus agent workflow (reference: `oh-my-opencode/.github/workflows/sisyphus-agent.yml`) performs these setup steps:
 
 1. **Install OpenCode CLI** - Downloads and installs the OpenCode binary
-2. **Install oMo plugin** - Runs `npx oh-my-opencode install` to add Sisyphus agent capabilities
-3. **Copy configuration** - Places `opencode.json` config in the correct location
-4. **Configure git identity** - Sets up git user for commits
-5. **Configure gh CLI** - Authenticates `gh` with GitHub App token for elevated operations
-6. **Populate auth.json** - Writes LLM provider credentials from secrets
-7. **Build prompt** - Constructs the agent prompt with GitHub context
-8. **Launch OpenCode** - Executes OpenCode with the prompt
+2. **Install Bun runtime** - Downloads and installs Bun (required for oMo)
+3. **Install oMo plugin** - Runs `bunx oh-my-opencode install` to add Sisyphus agent capabilities
+4. **Copy configuration** - Places `opencode.json` config in the correct location
+5. **Configure git identity** - Sets up git user for commits
+6. **Configure gh CLI** - Authenticates `gh` with GitHub App token for elevated operations
+7. **Populate auth.json** - Writes LLM provider credentials from secrets
+8. **Build prompt** - Constructs the agent prompt with GitHub context
+9. **Launch OpenCode** - Executes OpenCode with the prompt
 
 The Fro Bot setup action must replicate this functionality.
 
@@ -58,7 +59,8 @@ src/
 │   ├── setup/
 │   │   ├── types.ts      # Setup-specific types
 │   │   ├── opencode.ts   # OpenCode installation
-│   │   ├── omo.ts        # oMo plugin installation
+│   │   ├── bun.ts        # Bun runtime installation
+│   │   ├── omo.ts        # oMo plugin installation (uses bunx)
 │   │   ├── gh-auth.ts    # GitHub CLI authentication
 │   │   ├── auth-json.ts  # auth.json population
 │   │   ├── prompt.ts     # Prompt construction
@@ -105,6 +107,8 @@ outputs:
     description: "Cache restore status (hit, miss, corrupted)"
   omo-installed:
     description: "Whether oMo plugin was installed successfully"
+  bun-version:
+    description: "Installed Bun version (if oMo installed)"
 
 runs:
   using: "node24"
@@ -358,16 +362,166 @@ export async function getLatestVersion(logger: Logger): Promise<string> {
 }
 ```
 
-### 5. oMo Plugin Installation (`src/lib/setup/omo.ts`)
+### 5. Bun Runtime Installation (`src/lib/setup/bun.ts`)
 
 ```typescript
-import * as exec from "@actions/exec"
-import type {Logger} from "./types.js"
+import * as core from "@actions/core"
+import * as os from "node:os"
+import * as path from "node:path"
+import type {Logger} from "../logger.js"
+
+const TOOL_NAME = "bun"
+const DEFAULT_VERSION = "latest"
+
+export interface ToolCacheAdapter {
+  find: (toolName: string, version: string, arch?: string) => string
+  downloadTool: (url: string) => Promise<string>
+  extractTar: (file: string) => Promise<string>
+  extractZip: (file: string) => Promise<string>
+  cacheDir: (sourceDir: string, tool: string, version: string, arch?: string) => Promise<string>
+}
+
+export interface BunInstallResult {
+  readonly installed: boolean
+  readonly path: string | null
+  readonly version: string
+  readonly cached: boolean
+  readonly error: string | null
+}
+
+interface PlatformInfo {
+  readonly os: "darwin" | "linux" | "windows"
+  readonly arch: "x64" | "aarch64"
+  readonly ext: ".zip" | ".tar.gz"
+}
+
+function getPlatformInfo(): PlatformInfo {
+  const platform = os.platform()
+  const arch = os.arch()
+
+  const osMap: Record<string, "darwin" | "linux" | "windows"> = {
+    darwin: "darwin",
+    linux: "linux",
+    win32: "windows",
+  }
+
+  const archMap: Record<string, "x64" | "aarch64"> = {
+    x64: "x64",
+    arm64: "aarch64",
+  }
+
+  return {
+    os: osMap[platform] ?? "linux",
+    arch: archMap[arch] ?? "x64",
+    ext: platform === "darwin" || platform === "linux" ? ".zip" : ".zip",
+  }
+}
+
+export function getBunDownloadUrl(version: string, info: PlatformInfo): string {
+  const baseUrl = "https://github.com/oven-sh/bun/releases"
+  const versionPath = version === "latest" ? "latest/download" : `download/bun-v${version}`
+  const filename = `bun-${info.os}-${info.arch}.zip`
+  return `${baseUrl}/${versionPath}/${filename}`
+}
+
+/**
+ * Install Bun runtime for oMo plugin execution.
+ *
+ * Bun is required because oh-my-opencode is built with `--target bun`
+ * and has native bindings that only work with Bun runtime.
+ */
+export async function installBun(
+  version: string,
+  logger: Logger,
+  toolCache: ToolCacheAdapter,
+  addPath: (inputPath: string) => void,
+): Promise<BunInstallResult> {
+  const platformInfo = getPlatformInfo()
+  const resolvedVersion = version === "latest" ? DEFAULT_VERSION : version
+
+  logger.info("Installing Bun runtime", {version: resolvedVersion})
+
+  // Check cache first
+  const cachedPath = toolCache.find(TOOL_NAME, resolvedVersion, platformInfo.arch)
+  if (cachedPath.length > 0) {
+    const bunBinPath = path.join(cachedPath, "bun")
+    addPath(cachedPath)
+    logger.info("Bun found in cache", {version: resolvedVersion, path: cachedPath})
+    return {installed: true, path: bunBinPath, version: resolvedVersion, cached: true, error: null}
+  }
+
+  try {
+    // Download
+    const downloadUrl = getBunDownloadUrl(resolvedVersion, platformInfo)
+    logger.info("Downloading Bun", {url: downloadUrl})
+    const downloadPath = await toolCache.downloadTool(downloadUrl)
+
+    // Extract
+    logger.info("Extracting Bun")
+    const extractedPath = await toolCache.extractZip(downloadPath)
+
+    // Find bun binary in extracted folder
+    const bunDir = path.join(extractedPath, `bun-${platformInfo.os}-${platformInfo.arch}`)
+
+    // Cache
+    logger.info("Caching Bun")
+    const cachedDir = await toolCache.cacheDir(bunDir, TOOL_NAME, resolvedVersion, platformInfo.arch)
+
+    // Add to PATH
+    addPath(cachedDir)
+
+    const bunBinPath = path.join(cachedDir, "bun")
+    logger.info("Bun installed", {version: resolvedVersion, path: bunBinPath})
+
+    return {installed: true, path: bunBinPath, version: resolvedVersion, cached: false, error: null}
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    logger.error("Failed to install Bun", {error: errorMsg})
+    return {installed: false, path: null, version: resolvedVersion, cached: false, error: errorMsg}
+  }
+}
+
+/**
+ * Check if Bun is available in PATH.
+ */
+export async function isBunAvailable(execAdapter: {
+  exec: (cmd: string, args: string[]) => Promise<number>
+}): Promise<boolean> {
+  try {
+    const exitCode = await execAdapter.exec("bun", ["--version"])
+    return exitCode === 0
+  } catch {
+    return false
+  }
+}
+```
+
+### 7. oMo Plugin Installation (`src/lib/setup/omo.ts`)
+
+```typescript
+import type {Logger} from "../logger.js"
+import {installBun, isBunAvailable, type ToolCacheAdapter} from "./bun.js"
 
 export interface OmoInstallResult {
   readonly installed: boolean
   readonly version: string | null
   readonly error: string | null
+  readonly bunVersion: string | null
+}
+
+export interface OmoInstallDeps {
+  readonly toolCache: ToolCacheAdapter
+  readonly addPath: (inputPath: string) => void
+}
+
+export interface OmoInstallOptions {
+  readonly claude?: string
+  readonly chatgpt?: string
+  readonly gemini?: string
+}
+
+export interface ExecAdapter {
+  exec: (command: string, args: string[]) => Promise<number>
 }
 
 /**
@@ -376,69 +530,70 @@ export interface OmoInstallResult {
  * This adds Sisyphus agent capabilities to OpenCode.
  *
  * NOTE: oh-my-opencode is Bun-targeted with native bindings and cannot be
- * imported as a library. Must use npx/bunx to run as CLI tool.
- * See RFC-011-RESEARCH-SUMMARY.md for details.
+ * imported as a library. Must use bunx to run as CLI tool.
+ * Bun is automatically installed if not available.
  */
-export async function installOmo(logger: Logger): Promise<OmoInstallResult> {
-  logger.info("Installing Oh My OpenCode plugin")
+export async function installOmo(
+  deps: OmoInstallDeps,
+  options: OmoInstallOptions,
+  logger: Logger,
+  execAdapter: ExecAdapter,
+): Promise<OmoInstallResult> {
+  logger.info("Installing Oh My OpenCode plugin", {
+    claude: options.claude ?? "no",
+    chatgpt: options.chatgpt ?? "no",
+    gemini: options.gemini ?? "no",
+  })
+
+  // Check if Bun is available, install if needed
+  let bunVersion: string | null = null
+  const bunAvailable = await isBunAvailable(execAdapter)
+
+  if (!bunAvailable) {
+    logger.info("Bun not found, installing...")
+    const bunResult = await installBun("latest", logger, deps.toolCache, deps.addPath)
+    if (!bunResult.installed) {
+      const errorMsg = `Failed to install Bun: ${bunResult.error}`
+      logger.error(errorMsg)
+      return {installed: false, version: null, error: errorMsg, bunVersion: null}
+    }
+    bunVersion = bunResult.version
+  }
 
   try {
-    // Use npx to run the installer
-    let output = ""
-    const exitCode = await exec.exec("npx", ["oh-my-opencode", "install"], {
-      listeners: {
-        stdout: (data: Buffer) => {
-          output += data.toString()
-        },
-        stderr: (data: Buffer) => {
-          output += data.toString()
-        },
-      },
-      silent: true,
-    })
+    // Build args for bunx oh-my-opencode install
+    const args = ["oh-my-opencode", "install", "--no-tui"]
+
+    if (options.claude != null && options.claude.length > 0) {
+      args.push("--claude", options.claude)
+    }
+    if (options.chatgpt != null && options.chatgpt.length > 0) {
+      args.push("--chatgpt", options.chatgpt)
+    }
+    if (options.gemini != null && options.gemini.length > 0) {
+      args.push("--gemini", options.gemini)
+    }
+
+    // Use bunx to run the installer
+    const exitCode = await execAdapter.exec("bunx", args)
 
     if (exitCode !== 0) {
       const errorMsg = `oMo installation returned exit code ${exitCode}`
-      logger.warning(errorMsg, {output: output.slice(0, 500)})
-      return {installed: false, version: null, error: errorMsg}
+      logger.warning(errorMsg)
+      return {installed: false, version: null, error: errorMsg, bunVersion}
     }
 
-    // Extract version from output if available
-    const versionMatch = /oh-my-opencode@(\d+\.\d+\.\d+)/i.exec(output)
-    const version = versionMatch != null ? versionMatch[1] : null
-
-    logger.info("oMo plugin installed", {version})
-    return {installed: true, version, error: null}
+    logger.info("oMo plugin installed successfully")
+    return {installed: true, version: null, error: null, bunVersion}
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
     logger.error("Failed to install oMo plugin", {error: errorMsg})
-    return {installed: false, version: null, error: errorMsg}
-  }
-}
-
-/**
- * Verify oMo plugin is functional.
- *
- * Checks that OpenCode recognizes the plugin by looking for config file.
- */
-export async function verifyOmoInstallation(logger: Logger): Promise<boolean> {
-  try {
-    // Check if oh-my-opencode.json config exists (created on successful install)
-    const {stdout} = await exec.getExecOutput("ls", ["-la", "~/.config/opencode/oh-my-opencode.json"], {
-      silent: true,
-      ignoreReturnCode: true,
-    })
-    const exists = !stdout.includes("No such file")
-    logger.debug("oMo config file check", {exists})
-    return exists
-  } catch {
-    logger.debug("Could not verify oMo installation")
-    return false
+    return {installed: false, version: null, error: errorMsg, bunVersion}
   }
 }
 ```
 
-### 6. GitHub CLI Authentication (`src/lib/setup/gh-auth.ts`)
+### 8. GitHub CLI Authentication (`src/lib/setup/gh-auth.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
@@ -546,7 +701,7 @@ export async function getBotUserId(appSlug: string, token: string, logger: Logge
 }
 ```
 
-### 7. auth.json Population (`src/lib/setup/auth-json.ts`)
+### 9. auth.json Population (`src/lib/setup/auth-json.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -594,7 +749,7 @@ export function parseAuthJsonInput(input: string): AuthConfig {
 }
 ```
 
-### 8. Prompt Construction (`src/lib/setup/prompt.ts`)
+### 10. Prompt Construction (`src/lib/setup/prompt.ts`)
 
 ```typescript
 import type {Logger} from "./types.js"
@@ -755,7 +910,7 @@ export function extractPromptContext(): PromptContext {
 }
 ```
 
-### 9. Setup Entry Point (`src/setup.ts`)
+### 11. Setup Entry Point (`src/setup.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -876,11 +1031,7 @@ function parseInputs(): SetupInputs {
  *
  * Uses same auth mechanism as createAppClient() from RFC-003.
  */
-async function extractTokenFromAppClient(
-  appId: string,
-  privateKey: string,
-  logger: Logger,
-): Promise<string | null> {
+async function extractTokenFromAppClient(appId: string, privateKey: string, logger: Logger): Promise<string | null> {
   try {
     const {createAppAuth} = await import("@octokit/auth-app")
     const auth = createAppAuth({appId, privateKey})
@@ -898,7 +1049,7 @@ async function extractTokenFromAppClient(
 await run()
 ```
 
-### 10. Build Configuration Update
+### 12. Build Configuration Update
 
 Update `tsdown.config.ts`:
 
@@ -928,7 +1079,9 @@ export default defineConfig({
 - [ ] Setup action installs OpenCode CLI with version caching
 - [ ] OpenCode installation has fallback to pinned version (1.0.204) on failure
 - [ ] Downloaded archives are validated before extraction (corruption check)
-- [ ] Setup action installs oMo plugin via npx
+- [ ] Setup action installs Bun runtime via `@actions/tool-cache` (auto-installed for oMo)
+- [ ] Setup action installs oMo plugin via `bunx oh-my-opencode install`
+- [ ] Users do NOT need to manually install Bun (e.g., `oven-sh/setup-bun`)
 - [ ] Setup continues if oMo install fails (with warning logged)
 - [ ] oMo installation includes error details in result
 
