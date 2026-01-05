@@ -57,8 +57,8 @@ However, RFC-011 stops at environment preparation. The **main action** (`src/mai
 src/
 ├── main.ts                    # Updated main entry point
 ├── lib/
-│   ├── execution/
-│   │   ├── types.ts           # Execution types
+│   ├── agent/
+│   │   ├── types.ts           # Agent types
 │   │   ├── opencode.ts        # OpenCode CLI execution
 │   │   ├── context.ts         # GitHub context collection
 │   │   ├── prompt.ts          # Prompt construction
@@ -66,10 +66,10 @@ src/
 │   │   └── index.ts           # Public exports
 ```
 
-### 2. Execution Types (`src/lib/execution/types.ts`)
+### 2. Agent Types (`src/lib/agent/types.ts`)
 
 ```typescript
-export interface ExecutionContext {
+export interface AgentContext {
   readonly eventName: string
   readonly repo: string
   readonly ref: string
@@ -84,7 +84,7 @@ export interface ExecutionContext {
   readonly defaultBranch: string
 }
 
-export interface ExecutionResult {
+export interface AgentResult {
   readonly success: boolean
   readonly exitCode: number
   readonly duration: number
@@ -101,7 +101,7 @@ export interface ReactionContext {
 }
 
 export interface PromptOptions {
-  readonly context: ExecutionContext
+  readonly context: AgentContext
   readonly customPrompt: string | null
   readonly cacheStatus: "hit" | "miss" | "corrupted"
 }
@@ -109,11 +109,11 @@ export interface PromptOptions {
 export type AcknowledgmentState = "pending" | "acknowledged" | "completed" | "failed"
 ```
 
-### 3. GitHub Context Collection (`src/lib/execution/context.ts`)
+### 3. GitHub Context Collection (`src/lib/agent/context.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
-import type {ExecutionContext, Logger} from "./types.js"
+import type {AgentContext, Logger} from "./types.js"
 
 /**
  * Collect GitHub context from environment and event payload.
@@ -121,7 +121,7 @@ import type {ExecutionContext, Logger} from "./types.js"
  * Determines if the trigger is an issue or PR, extracts comment details,
  * and gathers all context needed for prompt construction.
  */
-export async function collectExecutionContext(logger: Logger): Promise<ExecutionContext> {
+export async function collectAgentContext(logger: Logger): Promise<AgentContext> {
   const eventName = process.env["GITHUB_EVENT_NAME"] ?? "unknown"
   const repo = process.env["GITHUB_REPOSITORY"] ?? ""
   const ref = process.env["GITHUB_REF_NAME"] ?? "main"
@@ -146,7 +146,7 @@ export async function collectExecutionContext(logger: Logger): Promise<Execution
     defaultBranch = typeInfo.defaultBranch
   }
 
-  logger.info("Collected execution context", {
+  logger.info("Collected agent context", {
     eventName,
     repo,
     issueNumber,
@@ -211,7 +211,7 @@ function parseIntOrNull(value: string | undefined): number | null {
 }
 ```
 
-### 4. Prompt Construction (`src/lib/execution/prompt.ts`)
+### 4. Prompt Construction (`src/lib/agent/prompt.ts`)
 
 ```typescript
 import type {PromptOptions, Logger} from "./types.js"
@@ -365,7 +365,7 @@ Execute the requested operation for repository ${context.repo}. Follow all instr
 }
 ```
 
-### 5. Reactions & Labels (`src/lib/execution/reactions.ts`)
+### 5. Reactions & Labels (`src/lib/agent/reactions.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
@@ -605,11 +605,11 @@ export async function completeAcknowledgment(ctx: ReactionContext, success: bool
 }
 ```
 
-### 6. OpenCode CLI Execution (`src/lib/execution/opencode.ts`)
+### 6. OpenCode CLI Execution (`src/lib/agent/opencode.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
-import type {ExecutionResult, Logger} from "./types.js"
+import type {AgentResult, Logger} from "./types.js"
 
 /**
  * Execute OpenCode CLI with the given prompt.
@@ -620,13 +620,13 @@ import type {ExecutionResult, Logger} from "./types.js"
  * @param prompt - The complete agent prompt
  * @param opencodePath - Path to OpenCode binary (from setup action)
  * @param logger - Logger instance
- * @returns Execution result with exit code and duration
+ * @returns Agent result with exit code and duration
  */
 export async function executeOpenCode(
   prompt: string,
   opencodePath: string | null,
   logger: Logger,
-): Promise<ExecutionResult> {
+): Promise<AgentResult> {
   const startTime = Date.now()
 
   // Determine OpenCode command - use PATH if not explicitly provided
@@ -730,16 +730,16 @@ export async function verifyOpenCodeAvailable(
 
 import type {CacheKeyComponents} from "./lib/cache-key.js"
 import type {CacheResult} from "./lib/types.js"
-import type {ReactionContext} from "./lib/execution/types.js"
+import type {ReactionContext} from "./lib/agent/types.js"
 import * as core from "@actions/core"
 import {restoreCache, saveCache} from "./lib/cache.js"
 import {parseActionInputs} from "./lib/inputs.js"
 import {createLogger} from "./lib/logger.js"
 import {setActionOutputs} from "./lib/outputs.js"
-import {collectExecutionContext} from "./lib/execution/context.js"
-import {buildAgentPrompt} from "./lib/execution/prompt.js"
-import {executeOpenCode, verifyOpenCodeAvailable} from "./lib/execution/opencode.js"
-import {acknowledgeReceipt, completeAcknowledgment} from "./lib/execution/reactions.js"
+import {collectAgentContext} from "./lib/agent/context.js"
+import {buildAgentPrompt} from "./lib/agent/prompt.js"
+import {executeOpenCode, verifyOpenCodeAvailable} from "./lib/agent/opencode.js"
+import {acknowledgeReceipt, completeAcknowledgment} from "./lib/agent/reactions.js"
 import {
   getGitHubRefName,
   getGitHubRepository,
@@ -757,9 +757,9 @@ async function run(): Promise<void> {
   const startTime = Date.now()
   const bootstrapLogger = createLogger({phase: "bootstrap"})
 
-  // Track execution state for cleanup
+  // Track agent state for cleanup
   let reactionCtx: ReactionContext | null = null
-  let executionSuccess = false
+  let agentSuccess = false
 
   try {
     bootstrapLogger.info("Starting Fro Bot Agent")
@@ -795,15 +795,15 @@ async function run(): Promise<void> {
 
     // 3. Collect GitHub context
     const contextLogger = createLogger({phase: "context"})
-    const executionContext = await collectExecutionContext(contextLogger)
+    const agentContext = await collectAgentContext(contextLogger)
 
     // 4. Build reaction context for acknowledgment
     const botLogin = process.env["BOT_LOGIN"] ?? null
     reactionCtx = {
-      repo: executionContext.repo,
-      commentId: executionContext.commentId,
-      issueNumber: executionContext.issueNumber,
-      issueType: executionContext.issueType,
+      repo: agentContext.repo,
+      commentId: agentContext.commentId,
+      issueNumber: agentContext.issueNumber,
+      issueType: agentContext.issueType,
       botLogin,
     }
 
@@ -834,7 +834,7 @@ async function run(): Promise<void> {
     const promptLogger = createLogger({phase: "prompt"})
     const prompt = buildAgentPrompt(
       {
-        context: executionContext,
+        context: agentContext,
         customPrompt: inputs.prompt,
         cacheStatus,
       },
@@ -845,7 +845,7 @@ async function run(): Promise<void> {
     const execLogger = createLogger({phase: "execution"})
     const result = await executeOpenCode(prompt, opencodePath, execLogger)
 
-    executionSuccess = result.success
+    agentSuccess = result.success
 
     // 9. Calculate duration and set outputs
     const duration = Date.now() - startTime
@@ -883,7 +883,7 @@ async function run(): Promise<void> {
       // Complete acknowledgment (update reaction, remove label)
       if (reactionCtx != null) {
         const cleanupLogger = createLogger({phase: "cleanup"})
-        await completeAcknowledgment(reactionCtx, executionSuccess, cleanupLogger)
+        await completeAcknowledgment(reactionCtx, agentSuccess, cleanupLogger)
       }
 
       // Save cache
@@ -911,14 +911,14 @@ async function run(): Promise<void> {
 await run()
 ```
 
-### 8. Index Exports (`src/lib/execution/index.ts`)
+### 8. Index Exports (`src/lib/agent/index.ts`)
 
 ```typescript
 // Types
-export type {ExecutionContext, ExecutionResult, ReactionContext, PromptOptions, AcknowledgmentState} from "./types.js"
+export type {AgentContext, AgentResult, ReactionContext, PromptOptions, AcknowledgmentState} from "./types.js"
 
 // Context collection
-export {collectExecutionContext} from "./context.js"
+export {collectAgentContext} from "./context.js"
 
 // Prompt construction
 export {buildAgentPrompt} from "./prompt.js"
@@ -1003,13 +1003,13 @@ export {
 ### Context Collection
 
 ```typescript
-describe("collectExecutionContext", () => {
+describe("collectAgentContext", () => {
   it("extracts all environment variables", async () => {
     process.env["GITHUB_EVENT_NAME"] = "issue_comment"
     process.env["GITHUB_REPOSITORY"] = "owner/repo"
     process.env["COMMENT_BODY"] = "Hello agent"
 
-    const ctx = await collectExecutionContext(mockLogger)
+    const ctx = await collectAgentContext(mockLogger)
 
     expect(ctx.eventName).toBe("issue_comment")
     expect(ctx.repo).toBe("owner/repo")
@@ -1020,7 +1020,7 @@ describe("collectExecutionContext", () => {
     delete process.env["COMMENT_BODY"]
     delete process.env["ISSUE_NUMBER"]
 
-    const ctx = await collectExecutionContext(mockLogger)
+    const ctx = await collectAgentContext(mockLogger)
 
     expect(ctx.commentBody).toBeNull()
     expect(ctx.issueNumber).toBeNull()
@@ -1181,5 +1181,5 @@ Real-time streaming is a UX improvement, not a functional requirement. The actio
 1. **Setup action prerequisite**: Main action assumes setup action has run (OpenCode installed, gh authenticated)
 2. **Parallel operations**: Acknowledge and cache restore could run in parallel for faster startup
 3. **Non-blocking reactions**: All reaction operations are fire-and-forget with warning on failure
-4. **Session integration placeholder**: ExecutionResult.sessionId is null until RFC-004 integration
+4. **Session integration placeholder**: AgentResult.sessionId is null until RFC-004 integration
 5. **Prompt size**: Monitor prompt length - very long custom prompts could exceed model context
