@@ -1,21 +1,30 @@
 import type {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
-import {mkdtempSync, rmSync} from 'node:fs'
+import {existsSync, mkdtempSync, rmSync} from 'node:fs'
 import {tmpdir} from 'node:os'
-import {join} from 'node:path'
+import * as path from 'node:path'
 import process from 'node:process'
+import {fileURLToPath, pathToFileURL} from 'node:url'
 import {afterAll, beforeAll, expect, it} from 'vitest'
 
 // Isolated temp directory for test data (prevents access to local dev files)
 let testDataDir: string
 
 beforeAll(() => {
-  testDataDir = mkdtempSync(join(tmpdir(), 'fro-bot-test-'))
+  testDataDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-test-'))
 })
 
 afterAll(() => {
   rmSync(testDataDir, {recursive: true, force: true})
 })
+
+const projectRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..')
+const distMainPath = path.join(projectRoot, 'dist', 'main.js')
+
+function assertDistBundle(): void {
+  if (existsSync(distMainPath)) return
+  throw new Error('dist/main.js is missing. Run pnpm build to generate the action bundle before testing.')
+}
 
 /**
  * Spawn node and import the main module, returning stdout/stderr.
@@ -26,10 +35,13 @@ afterAll(() => {
  * from accessing or modifying local development OpenCode data.
  */
 async function runMain(env: Record<string, string>): Promise<{stdout: string; stderr: string; code: number | null}> {
+  assertDistBundle()
+
+  const importTarget = pathToFileURL(distMainPath).href
   return new Promise((resolve, reject) => {
-    const child = spawn('node', ['--input-type=module', '-e', "import('./dist/main.js');"], {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `import(${JSON.stringify(importTarget)});`], {
       env: {...process.env, ...env, XDG_DATA_HOME: testDataDir},
-      cwd: process.cwd(),
+      cwd: projectRoot,
       shell: false,
     })
 
