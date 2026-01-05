@@ -146,6 +146,9 @@ jobs:
 
       - name: Test main action
         uses: ./
+        env:
+          SKIP_CACHE: 'true'
+          SKIP_AGENT_EXECUTION: 'true'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'

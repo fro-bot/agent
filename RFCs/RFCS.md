@@ -29,7 +29,7 @@ The agent harness enables OpenCode with oMo "Sisyphus-style" workflow to act as 
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending   |
 | RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending   |
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed |
-| RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Pending   |
+| RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Completed |
 
 ---
 
@@ -158,37 +158,37 @@ RFC-001 (Foundation)
 
 ### P0 Features (Must-Have)
 
-| Feature                                | RFC              | Status  |
-| -------------------------------------- | ---------------- | ------- |
-| F1: GitHub Action Triggers             | RFC-005          | Pending |
-| F2: Issue Comment Interaction          | RFC-008          | Pending |
-| F3: Discussion Comment Interaction     | RFC-008          | Pending |
-| F4: PR Conversation Comments           | RFC-008          | Pending |
-| F5: PR Review Comments                 | RFC-009          | Pending |
-| F6: Delegated Work - Push Commits      | RFC-010          | Pending |
-| F7: Delegated Work - Open PRs          | RFC-010          | Pending |
-| F8: Comment Idempotency                | RFC-008          | Pending |
-| F9: Anti-Loop Protection               | RFC-005          | Pending |
-| F11: Session Search on Startup         | RFC-004          | Pending |
-| F17: OpenCode Storage Cache Restore    | RFC-002          | Pending |
-| F18: OpenCode Storage Cache Save       | RFC-002          | Pending |
-| F20: Run Summary in Comments           | RFC-007          | Pending |
-| F21: Close-the-Loop Session Writeback  | RFC-004          | Pending |
-| F22: Session Pruning                   | RFC-004          | Pending |
-| F25: auth.json Exclusion               | RFC-002, RFC-006 | Pending |
-| F26: Fork PR Permission Gating         | RFC-006          | Pending |
-| F27: Credential Strategy               | RFC-003, RFC-006 | Pending |
-| F28: Branch-Scoped Caching             | RFC-002          | Pending |
-| F30: GitHub Actions Job Summary        | RFC-007          | Pending |
-| F31: Structured Logging                | RFC-001, RFC-007 | Pending |
-| F32: Token Usage Reporting             | RFC-007          | Pending |
-| F33: Error Message Format              | RFC-008          | Pending |
-| F10: Setup Action Entrypoint           | RFC-011          | Pending |
-| F37: Action Inputs Configuration       | RFC-001, RFC-011 | Pending |
-| F41: Agent Prompt Context Injection    | RFC-012          | Pending |
-| F42: gh CLI Operation Instructions     | RFC-012          | Pending |
-| F43: Reactions & Labels Acknowledgment | RFC-012          | Pending |
-| F44: Issue vs PR Context Detection     | RFC-012          | Pending |
+| Feature                                | RFC              | Status    |
+| -------------------------------------- | ---------------- | --------- |
+| F1: GitHub Action Triggers             | RFC-005          | Pending   |
+| F2: Issue Comment Interaction          | RFC-008          | Pending   |
+| F3: Discussion Comment Interaction     | RFC-008          | Pending   |
+| F4: PR Conversation Comments           | RFC-008          | Pending   |
+| F5: PR Review Comments                 | RFC-009          | Pending   |
+| F6: Delegated Work - Push Commits      | RFC-010          | Pending   |
+| F7: Delegated Work - Open PRs          | RFC-010          | Pending   |
+| F8: Comment Idempotency                | RFC-008          | Pending   |
+| F9: Anti-Loop Protection               | RFC-005          | Pending   |
+| F11: Session Search on Startup         | RFC-004          | Pending   |
+| F17: OpenCode Storage Cache Restore    | RFC-002          | Pending   |
+| F18: OpenCode Storage Cache Save       | RFC-002          | Pending   |
+| F20: Run Summary in Comments           | RFC-007          | Pending   |
+| F21: Close-the-Loop Session Writeback  | RFC-004          | Pending   |
+| F22: Session Pruning                   | RFC-004          | Pending   |
+| F25: auth.json Exclusion               | RFC-002, RFC-006 | Pending   |
+| F26: Fork PR Permission Gating         | RFC-006          | Pending   |
+| F27: Credential Strategy               | RFC-003, RFC-006 | Pending   |
+| F28: Branch-Scoped Caching             | RFC-002          | Pending   |
+| F30: GitHub Actions Job Summary        | RFC-007          | Pending   |
+| F31: Structured Logging                | RFC-001, RFC-007 | Pending   |
+| F32: Token Usage Reporting             | RFC-007          | Pending   |
+| F33: Error Message Format              | RFC-008          | Pending   |
+| F10: Setup Action Entrypoint           | RFC-011          | Pending   |
+| F37: Action Inputs Configuration       | RFC-001, RFC-011 | Pending   |
+| F41: Agent Prompt Context Injection    | RFC-012          | Completed |
+| F42: gh CLI Operation Instructions     | RFC-012          | Completed |
+| F43: Reactions & Labels Acknowledgment | RFC-012          | Completed |
+| F44: Issue vs PR Context Detection     | RFC-012          | Completed |
 
 ### P1 Features (Should-Have) - Future RFCs
 

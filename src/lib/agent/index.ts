@@ -1,0 +1,34 @@
+/**
+ * Agent module public exports for RFC-012.
+ *
+ * Provides the core agent execution primitives:
+ * - Context collection from GitHub Actions
+ * - Prompt construction with session/CLI instructions
+ * - Reactions and labels for acknowledgment UX
+ * - OpenCode CLI execution
+ */
+
+// Context collection
+export {collectAgentContext, fetchDefaultBranch} from './context.js'
+
+// OpenCode execution
+export {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+
+// Prompt construction
+export {buildAgentPrompt} from './prompt.js'
+
+// Reactions & labels
+export {
+  acknowledgeReceipt,
+  addEyesReaction,
+  addWorkingLabel,
+  completeAcknowledgment,
+  removeWorkingLabel,
+  updateReactionOnFailure,
+  updateReactionOnSuccess,
+} from './reactions.js'
+
+// Types
+export type {AcknowledgmentState, AgentContext, AgentResult, PromptOptions, ReactionContext} from './types.js'
+
+export {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from './types.js'

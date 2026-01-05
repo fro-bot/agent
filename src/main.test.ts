@@ -1,17 +1,34 @@
 import type {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
+import {mkdtempSync, rmSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
 import process from 'node:process'
-import {expect, it} from 'vitest'
+import {afterAll, beforeAll, expect, it} from 'vitest'
+
+// Isolated temp directory for test data (prevents access to local dev files)
+let testDataDir: string
+
+beforeAll(() => {
+  testDataDir = mkdtempSync(join(tmpdir(), 'fro-bot-test-'))
+})
+
+afterAll(() => {
+  rmSync(testDataDir, {recursive: true, force: true})
+})
 
 /**
  * Spawn node and import the main module, returning stdout/stderr.
  * Uses spawn instead of exec to avoid shell escaping issues with
  * environment variable names containing hyphens.
+ *
+ * Sets XDG_DATA_HOME to an isolated temp directory to prevent tests
+ * from accessing or modifying local development OpenCode data.
  */
 async function runMain(env: Record<string, string>): Promise<{stdout: string; stderr: string; code: number | null}> {
   return new Promise((resolve, reject) => {
     const child = spawn('node', ['--input-type=module', '-e', "import('./dist/main.js');"], {
-      env: {...process.env, ...env},
+      env: {...process.env, ...env, XDG_DATA_HOME: testDataDir},
       cwd: process.cwd(),
       shell: false,
     })
@@ -44,6 +61,7 @@ it('runs successfully with valid inputs', async () => {
     GITHUB_RUN_ID: '12345',
     RUNNER_OS: 'Linux',
     SKIP_CACHE: 'true',
+    SKIP_AGENT_EXECUTION: 'true',
   })
 
   expect(code).toBe(0)
