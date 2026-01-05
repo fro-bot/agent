@@ -258,8 +258,10 @@ The agent requires a dedicated setup phase that mirrors the oMo Sisyphus workflo
    - Add OpenCode to PATH for subsequent steps.
 
 2. **Oh My OpenCode (oMo) plugin installation**
-   - Run `npx oh-my-opencode install` to add Sisyphus agent capabilities.
+   - Automatically installs Bun runtime (required dependency) via `@actions/tool-cache`.
+   - Runs `bunx oh-my-opencode install` to add Sisyphus agent capabilities.
    - Graceful degradation: warn on failure, do not fail the run.
+   - Users do NOT need to manually install Bun or use `oven-sh/setup-bun`.
 
 3. **GitHub CLI (`gh`) authentication**
    - Configure `gh` with `GH_TOKEN` environment variable.
@@ -587,7 +589,7 @@ The project uses **Node.js 24** as the GitHub Actions runtime. This aligns with:
 - Existing `package.json` and `tsdown` bundler setup
 - Broader ecosystem compatibility
 
-**Note:** The oMo Sisyphus reference implementation uses **Bun** in its reusable workflow. This project intentionally targets Node.js for maximum compatibility with the GitHub Actions toolkit and the existing TypeScript action ecosystem.
+**Note:** The oMo Sisyphus reference implementation uses **Bun** in its reusable workflow. This project targets Node.js for the action runtime but **automatically installs Bun** when needed for oMo plugin installation, providing seamless compatibility without requiring users to configure Bun separately.
 
 ### Multiple Entrypoints
 

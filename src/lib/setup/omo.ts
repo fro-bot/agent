@@ -1,6 +1,7 @@
 import type {Buffer} from 'node:buffer'
 
-import type {ExecAdapter, Logger, OmoInstallResult} from './types.js'
+import type {ExecAdapter, Logger, OmoInstallResult, ToolCacheAdapter} from './types.js'
+import {installBun, isBunAvailable} from './bun.js'
 
 export interface OmoInstallOptions {
   claude?: 'no' | 'yes' | 'max20'
@@ -8,23 +9,40 @@ export interface OmoInstallOptions {
   gemini?: 'no' | 'yes'
 }
 
+export interface OmoInstallDeps {
+  logger: Logger
+  execAdapter: ExecAdapter
+  toolCache: ToolCacheAdapter
+  addPath: (inputPath: string) => void
+}
+
 /**
  * Install Oh My OpenCode (oMo) plugin in headless mode.
  *
  * Adds Sisyphus agent capabilities to OpenCode with configurable model providers.
+ * Automatically installs Bun runtime if not available, since oh-my-opencode
+ * is built with `--target bun` and requires Bun runtime.
  *
- * NOTE: oh-my-opencode is Bun-targeted with native bindings and cannot be
- * imported as a library. Must use npx/bunx to run as CLI tool.
  * See RFC-011-RESEARCH-SUMMARY.md for details.
  */
-export async function installOmo(
-  logger: Logger,
-  execAdapter: ExecAdapter,
-  options: OmoInstallOptions = {},
-): Promise<OmoInstallResult> {
+export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOptions = {}): Promise<OmoInstallResult> {
+  const {logger, execAdapter, toolCache, addPath} = deps
   const {claude = 'max20', chatgpt = 'no', gemini = 'no'} = options
 
   logger.info('Installing Oh My OpenCode plugin', {claude, chatgpt, gemini})
+
+  // Ensure Bun is available (install if needed)
+  const bunAvailable = await isBunAvailable(execAdapter)
+  if (!bunAvailable) {
+    logger.info('Bun not found, installing...')
+    try {
+      await installBun(logger, toolCache, execAdapter, addPath)
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      logger.error('Failed to install Bun runtime', {error: errorMsg})
+      return {installed: false, version: null, error: `Bun installation failed: ${errorMsg}`}
+    }
+  }
 
   const args = [
     'oh-my-opencode',
@@ -37,7 +55,7 @@ export async function installOmo(
 
   try {
     let output = ''
-    const exitCode = await execAdapter.exec('npx', args, {
+    const exitCode = await execAdapter.exec('bunx', args, {
       listeners: {
         stdout: (data: Buffer) => {
           output += data.toString()

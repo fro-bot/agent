@@ -46,6 +46,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Output setting   | `src/lib/outputs.ts`        | `setActionOutputs()`                                        |
 | Logging          | `src/lib/logger.ts`         | `createLogger()` with sensitive field redaction             |
 | Core types       | `src/lib/types.ts`          | `ActionInputs`, `CacheResult`, `RunContext`, `RunSummary`   |
+| Bun installation | `src/lib/setup/bun.ts`      | `installBun()` - auto-installs Bun for oMo plugin           |
+| oMo installation | `src/lib/setup/omo.ts`      | `installOmo()` - installs oMo via `bunx`                    |
 | Build config     | `tsdown.config.ts`          | ESM shim, bundled deps, license extraction                  |
 | Action I/O       | `action.yaml`               | Inputs, outputs, node24 runtime                             |
 | CI pipeline      | `.github/workflows/ci.yaml` | Path-filtered jobs, v-branch release                        |
@@ -64,6 +66,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | `parseGitHubContext` | Function  | `src/lib/github/context.ts`   | Parse event payload                       |
 | `parseActionInputs`  | Function  | `src/lib/inputs.ts:14`        | Parse/validate inputs                     |
 | `createLogger`       | Function  | `src/lib/logger.ts:108`       | Logger with auto-redaction                |
+| `installBun`         | Function  | `src/lib/setup/bun.ts`        | Auto-install Bun runtime for oMo          |
+| `installOmo`         | Function  | `src/lib/setup/omo.ts`        | Install oMo plugin via bunx               |
 | `ActionInputs`       | Interface | `src/lib/types.ts:39`         | Input schema                              |
 | `CacheResult`        | Interface | `src/lib/types.ts:11`         | Cache restore result                      |
 | `RunContext`         | Interface | `src/lib/types.ts:19`         | GitHub event context                      |
