@@ -55,7 +55,7 @@
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-no-only-tests": "3.3.0",
     "eslint-plugin-prettier": "5.5.4",
-    "generate-license-file": "3.7.0",
+    "generate-license-file": "3.8.1",
     "jiti": "2.6.1",
     "js-yaml": "4.1.1",
     "lint-staged": "16.2.7",
