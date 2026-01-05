@@ -260,7 +260,9 @@ Provide a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstr
 - [ ] `uses: fro-bot/agent/setup` available as separate action
 - [ ] Installs OpenCode CLI via `@actions/tool-cache` with cross-run caching
 - [ ] Supports `opencode-version` input (default: `latest`)
-- [ ] Installs oMo plugin via `npx oh-my-opencode install`
+- [ ] Automatically installs Bun runtime via `@actions/tool-cache` (required for oMo)
+- [ ] Installs oMo plugin via `bunx oh-my-opencode install`
+- [ ] Bun installation is automatic - users do NOT need `oven-sh/setup-bun`
 - [ ] Configures `gh` CLI with `GH_TOKEN` environment variable
 - [ ] Supports GitHub App token generation from `app-id` + `private-key` inputs
 - [ ] Falls back to `GITHUB_TOKEN` when App credentials not provided
