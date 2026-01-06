@@ -1,8 +1,6 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-04
-**Total RFCs:** 12
-**Implementation Strategy:** Sequential (RFC-001 → RFC-012)
+**Generated:** 2026-01-04 **Total RFCs:** 12 **Implementation Strategy:** Sequential (RFC-001 → RFC-012)
 
 ---
 
@@ -21,7 +19,7 @@ The agent harness enables OpenCode with oMo "Sisyphus-style" workflow to act as 
 | RFC-001 | Foundation & Core Types              | MUST     | Medium     | 1     | Completed |
 | RFC-002 | Cache Infrastructure                 | MUST     | High       | 1     | Completed |
 | RFC-003 | GitHub API Client Layer              | MUST     | Medium     | 1     | Completed |
-| RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Pending   |
+| RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed |
 | RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Pending   |
 | RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Pending   |
 | RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending   |
