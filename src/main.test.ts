@@ -1,21 +1,29 @@
 import type {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
-import {existsSync, mkdtempSync, rmSync} from 'node:fs'
+import {chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 import {afterAll, beforeAll, expect, it} from 'vitest'
 
-// Isolated temp directory for test data (prevents access to local dev files)
+// Isolated temp directories for test data and mock tools
 let testDataDir: string
+let mockBinDir: string
 
 beforeAll(() => {
   testDataDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-test-'))
+  mockBinDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-mock-bin-'))
+
+  // Create mock opencode binary that responds to --version
+  const mockOpenCode = path.join(mockBinDir, 'opencode')
+  writeFileSync(mockOpenCode, '#!/bin/sh\necho "OpenCode 1.1.2"', 'utf8')
+  chmodSync(mockOpenCode, 0o755)
 })
 
 afterAll(() => {
   rmSync(testDataDir, {recursive: true, force: true})
+  rmSync(mockBinDir, {recursive: true, force: true})
 })
 
 const projectRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..')
@@ -39,8 +47,11 @@ async function runMain(env: Record<string, string>): Promise<{stdout: string; st
 
   const importTarget = pathToFileURL(distMainPath).href
   return new Promise((resolve, reject) => {
+    // Prepend mock bin dir to PATH so opencode is found
+    const pathEnv = mockBinDir + path.delimiter + (process.env.PATH ?? '')
+
     const child = spawn(process.execPath, ['--input-type=module', '-e', `import(${JSON.stringify(importTarget)});`], {
-      env: {...process.env, ...env, XDG_DATA_HOME: testDataDir},
+      env: {...process.env, ...env, XDG_DATA_HOME: testDataDir, PATH: pathEnv},
       cwd: projectRoot,
       shell: false,
     })
