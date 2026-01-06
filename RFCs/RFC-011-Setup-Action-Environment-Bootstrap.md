@@ -63,7 +63,6 @@ src/
 │   │   ├── omo.ts        # oMo plugin installation (uses bunx)
 │   │   ├── gh-auth.ts    # GitHub CLI authentication
 │   │   ├── auth-json.ts  # auth.json population
-│   │   ├── prompt.ts     # Prompt construction
 │   │   └── index.ts      # Public exports
 ```
 
@@ -749,168 +748,7 @@ export function parseAuthJsonInput(input: string): AuthConfig {
 }
 ```
 
-### 10. Prompt Construction (`src/lib/setup/prompt.ts`)
-
-```typescript
-import type {Logger} from "./types.js"
-
-export interface PromptContext {
-  readonly eventName: string
-  readonly repo: string
-  readonly ref: string
-  readonly actor: string
-  readonly issueNumber: number | null
-  readonly issueTitle: string | null
-  readonly commentBody: string | null
-  readonly prNumber: number | null
-}
-
-/**
- * Build the agent prompt with GitHub context.
- *
- * The prompt instructs the agent to:
- * 1. Use session tools to search prior work
- * 2. Use gh CLI for GitHub operations
- * 3. Include run summary in comments
- */
-export function buildAgentPrompt(context: PromptContext, customPrompt: string | null, logger: Logger): string {
-  const parts: string[] = []
-
-  // System context
-  parts.push(`# Agent Context
-
-You are the Fro Bot Agent running in GitHub Actions.
-
-## Environment
-- **Repository:** ${context.repo}
-- **Branch/Ref:** ${context.ref}
-- **Event:** ${context.eventName}
-- **Actor:** ${context.actor}
-`)
-
-  // Event-specific context
-  if (context.issueNumber != null) {
-    parts.push(`## Issue/PR Context
-- **Number:** #${context.issueNumber}
-- **Title:** ${context.issueTitle ?? "N/A"}
-`)
-  }
-
-  if (context.commentBody != null) {
-    parts.push(`## Trigger Comment
-\`\`\`
-${context.commentBody}
-\`\`\`
-`)
-  }
-
-  // Session instructions
-  parts.push(`## Session Management (REQUIRED)
-
-Before investigating any issue:
-1. Use \`session_search\` to find relevant prior sessions
-2. Use \`session_read\` to review prior work if found
-3. Avoid repeating investigation already done
-
-Before completing:
-1. Ensure session contains a summary of work done
-2. This summary will be searchable in future runs
-`)
-
-  // GitHub CLI instructions
-  parts.push(`## GitHub Operations (Use gh CLI)
-
-For all GitHub operations, use the \`gh\` CLI which is pre-authenticated:
-
-### Commenting
-\`\`\`bash
-gh issue comment <number> --body "message"
-gh pr comment <number> --body "message"
-\`\`\`
-
-### Creating PRs
-\`\`\`bash
-gh pr create --title "title" --body "description" --base main --head feature-branch
-\`\`\`
-
-### Pushing Commits
-\`\`\`bash
-git add .
-git commit -m "type(scope): description"
-git push origin HEAD
-\`\`\`
-
-### API Calls
-\`\`\`bash
-gh api repos/{owner}/{repo}/issues --jq '.[].title'
-\`\`\`
-`)
-
-  // Run summary requirement
-  parts.push(`## Run Summary (REQUIRED)
-
-Every comment you post MUST include a collapsed details block:
-
-\`\`\`markdown
-<details>
-<summary>Run Summary</summary>
-
-| Field | Value |
-|-------|-------|
-| Event | ${context.eventName} |
-| Repo | ${context.repo} |
-| Session | <session_id> |
-| Cache | hit/miss |
-
-</details>
-\`\`\`
-`)
-
-  // Custom prompt if provided
-  if (customPrompt != null && customPrompt.length > 0) {
-    parts.push(`## Custom Instructions
-
-${customPrompt}
-`)
-  }
-
-  // Task
-  if (context.commentBody != null) {
-    parts.push(`## Task
-
-Respond to the trigger comment above. Follow all instructions and requirements.
-`)
-  }
-
-  const prompt = parts.join("\n")
-  logger.debug("Built agent prompt", {length: prompt.length})
-  return prompt
-}
-
-/**
- * Extract prompt context from GitHub Actions environment.
- */
-export function extractPromptContext(): PromptContext {
-  const eventName = process.env["GITHUB_EVENT_NAME"] ?? "unknown"
-  const repo = process.env["GITHUB_REPOSITORY"] ?? "unknown/unknown"
-  const ref = process.env["GITHUB_REF_NAME"] ?? "main"
-  const actor = process.env["GITHUB_ACTOR"] ?? "unknown"
-
-  // These would be extracted from the event payload in the actual implementation
-  return {
-    eventName,
-    repo,
-    ref,
-    actor,
-    issueNumber: null,
-    issueTitle: null,
-    commentBody: null,
-    prNumber: null,
-  }
-}
-```
-
-### 11. Setup Entry Point (`src/setup.ts`)
+### 10. Setup Entry Point (`src/setup.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -1049,7 +887,7 @@ async function extractTokenFromAppClient(appId: string, privateKey: string, logg
 await run()
 ```
 
-### 12. Build Configuration Update
+### 11. Build Configuration Update
 
 Update `tsdown.config.ts`:
 
@@ -1113,64 +951,6 @@ export default defineConfig({
 
 - [ ] Build produces both `dist/main.js` and `dist/setup.js`
 - [ ] `setup/action.yaml` references correct entrypoint
-
-### Agent Prompt
-
-- [ ] Agent prompt includes repository name
-- [ ] Agent prompt includes branch/ref
-- [ ] Agent prompt includes event type
-- [ ] Agent prompt includes actor (triggering user)
-- [ ] Agent prompt includes issue/PR number and title (when applicable)
-- [ ] Agent prompt includes triggering comment body (when applicable)
-- [ ] Agent prompt includes session tool instructions (session_search, session_read)
-- [ ] Agent prompt includes gh CLI examples (comment, PR create, API calls)
-- [ ] Agent prompt includes run summary requirement with template
-
-## Real-time Log Streaming Requirement
-
-To match the oMo/Sisyphus UX expectations, OpenCode execution logs should be visible in near real-time in the Actions log stream.
-
-### Required Command Pattern
-
-The main action (not setup) MUST wrap OpenCode execution with `stdbuf` for real-time streaming:
-
-```bash
-# Pattern from Sisyphus workflow
-stdbuf -oL -eL opencode run "$PROMPT"
-```
-
-**Flags:**
-
-- `-oL`: Line-buffered stdout
-- `-eL`: Line-buffered stderr
-
-Without this, output will be block-buffered and only appear when the process exits.
-
-### Implementation in TypeScript
-
-```typescript
-import * as exec from "@actions/exec"
-
-async function executeOpenCode(prompt: string, logger: Logger): Promise<void> {
-  // On Linux, use stdbuf for real-time streaming
-  if (process.platform === "linux") {
-    await exec.exec("stdbuf", ["-oL", "-eL", "opencode", "run", prompt])
-  } else {
-    // macOS/Windows: best-effort without stdbuf
-    await exec.exec("opencode", ["run", prompt])
-  }
-}
-```
-
-### Platform Considerations
-
-| Platform              | stdbuf Available    | Fallback                          |
-| --------------------- | ------------------- | --------------------------------- |
-| Linux (ubuntu-latest) | Yes (GNU coreutils) | N/A                               |
-| macOS                 | No (BSD coreutils)  | Direct execution, buffered output |
-| Windows               | No                  | Direct execution, buffered output |
-
-If real-time streaming cannot be guaranteed on a given runner, the limitation must be documented and the action should fall back to best-effort logging.
 
 ---
 
