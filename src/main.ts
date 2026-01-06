@@ -3,12 +3,32 @@
  *
  * GitHub Action harness for OpenCode + oMo agents with persistent session state.
  * This is the entry point that orchestrates the agent workflow.
+ *
+ * Lifecycle (RFC-012):
+ * 1. Parse inputs, verify OpenCode available
+ * 2. Collect GitHub context
+ * 3. Acknowledge receipt (eyes reaction + working label)
+ * 4. Restore cache
+ * 5. Build agent prompt
+ * 6. Execute OpenCode agent
+ * 7. Complete acknowledgment (update reaction, remove label)
+ * 8. Save cache (always, in finally block)
  */
 
+import type {ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
-
 import type {CacheResult} from './lib/types.js'
+import process from 'node:process'
 import * as core from '@actions/core'
+import {
+  acknowledgeReceipt,
+  buildAgentPrompt,
+  collectAgentContext,
+  completeAcknowledgment,
+  executeOpenCode,
+  fetchDefaultBranch,
+  verifyOpenCodeAvailable,
+} from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
@@ -24,18 +44,20 @@ import {
 
 /**
  * Main action entry point.
- * Parses inputs, initializes logging, and runs the agent workflow.
+ * Orchestrates: acknowledge → collect context → execute agent → complete acknowledgment
  */
 async function run(): Promise<void> {
   const startTime = Date.now()
-
-  // Create a bootstrap logger for early startup
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
+
+  // Track agent state for cleanup
+  let reactionCtx: ReactionContext | null = null
+  let agentSuccess = false
 
   try {
     bootstrapLogger.info('Starting Fro Bot Agent')
 
-    // Parse and validate action inputs
+    // 1. Parse and validate action inputs
     const inputsResult = parseActionInputs()
 
     if (!inputsResult.success) {
@@ -44,20 +66,49 @@ async function run(): Promise<void> {
     }
 
     const inputs = inputsResult.data
+    const logger = createLogger({phase: 'main'})
 
-    // Create main logger with run context
-    const logger = createLogger({
-      phase: 'main',
-    })
-
-    logger.info('Action inputs parsed successfully', {
+    logger.info('Action inputs parsed', {
       sessionRetention: inputs.sessionRetention,
       s3Backup: inputs.s3Backup,
       hasGithubToken: inputs.githubToken.length > 0,
       hasPrompt: inputs.prompt != null,
     })
 
-    // Build cache key components from environment
+    // 2. Verify OpenCode is available (from setup action)
+    const opencodePath = process.env.OPENCODE_PATH ?? null
+    const opencodeCheck = await verifyOpenCodeAvailable(opencodePath, logger)
+
+    if (!opencodeCheck.available) {
+      core.setFailed('OpenCode is not available. Did you run the setup action first?')
+      return
+    }
+
+    logger.info('OpenCode verified', {version: opencodeCheck.version})
+
+    // 3. Collect GitHub context
+    const contextLogger = createLogger({phase: 'context'})
+    const agentContext = collectAgentContext(contextLogger)
+
+    // Fetch default branch asynchronously (non-blocking enhancement)
+    const defaultBranch = await fetchDefaultBranch(agentContext.repo, contextLogger)
+    const contextWithBranch = {...agentContext, defaultBranch}
+
+    // 4. Build reaction context for acknowledgment
+    const botLogin = process.env.BOT_LOGIN ?? null
+    reactionCtx = {
+      repo: agentContext.repo,
+      commentId: agentContext.commentId,
+      issueNumber: agentContext.issueNumber,
+      issueType: agentContext.issueType,
+      botLogin,
+    }
+
+    // 5. Acknowledge receipt immediately (eyes reaction + working label)
+    const ackLogger = createLogger({phase: 'acknowledgment'})
+    await acknowledgeReceipt(reactionCtx, ackLogger)
+
+    // 6. Build cache key components and restore cache
     const cacheComponents: CacheKeyComponents = {
       agentIdentity: 'github',
       repo: getGitHubRepository(),
@@ -65,7 +116,6 @@ async function run(): Promise<void> {
       os: getRunnerOS(),
     }
 
-    // Restore cache (early in run)
     const cacheLogger = createLogger({phase: 'cache'})
     const cacheResult: CacheResult = await restoreCache({
       components: cacheComponents,
@@ -74,34 +124,51 @@ async function run(): Promise<void> {
       authPath: getOpenCodeAuthPath(),
     })
 
-    logger.info('Cache restore completed', {
-      hit: cacheResult.hit,
-      corrupted: cacheResult.corrupted,
-      key: cacheResult.key,
-    })
+    const cacheStatus = cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss'
+    logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
 
-    // TODO: RFC-003 - GitHub client initialization
-    // TODO: RFC-004 - Session management
-    // TODO: RFC-005 - Event handling
-    // TODO: RFC-006 - Permission gating
+    // 7. Build agent prompt
+    const promptLogger = createLogger({phase: 'prompt'})
+    const prompt = buildAgentPrompt(
+      {
+        context: contextWithBranch,
+        customPrompt: inputs.prompt,
+        cacheStatus,
+      },
+      promptLogger,
+    )
 
-    // For now, just log that we're ready
-    logger.info('Agent infrastructure initialized')
+    // 8. Execute OpenCode agent (skip in test mode)
+    const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'
+    let result: {success: boolean; exitCode: number; sessionId: string | null; error: string | null}
 
-    // Calculate duration and set outputs
+    if (skipExecution) {
+      logger.info('Skipping agent execution (SKIP_AGENT_EXECUTION=true)')
+      result = {success: true, exitCode: 0, sessionId: null, error: null}
+    } else {
+      const execLogger = createLogger({phase: 'execution'})
+      result = await executeOpenCode(prompt, opencodePath, execLogger)
+    }
+
+    agentSuccess = result.success
+
+    // 9. Calculate duration and set outputs
     const duration = Date.now() - startTime
 
     setActionOutputs({
-      sessionId: null, // Will be set by RFC-004
-      cacheStatus: cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss',
+      sessionId: result.sessionId,
+      cacheStatus,
       duration,
     })
 
-    logger.info('Agent run completed', {durationMs: duration})
+    if (result.success) {
+      logger.info('Agent run completed successfully', {durationMs: duration})
+    } else {
+      core.setFailed(`Agent execution failed with exit code ${result.exitCode}`)
+    }
   } catch (error) {
     const duration = Date.now() - startTime
 
-    // Ensure we always set outputs even on failure
     setActionOutputs({
       sessionId: null,
       cacheStatus: 'miss',
@@ -116,8 +183,15 @@ async function run(): Promise<void> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
-    // Save cache (always, even on failure)
+    // Always cleanup: update reactions and save cache
     try {
+      // Complete acknowledgment (update reaction, remove label)
+      if (reactionCtx != null) {
+        const cleanupLogger = createLogger({phase: 'cleanup'})
+        await completeAcknowledgment(reactionCtx, agentSuccess, cleanupLogger)
+      }
+
+      // Save cache
       const cacheComponents: CacheKeyComponents = {
         agentIdentity: 'github',
         repo: getGitHubRepository(),
@@ -133,8 +207,10 @@ async function run(): Promise<void> {
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
       })
-    } catch {
-      // Cache save failure should not mask the original error
+    } catch (cleanupError) {
+      bootstrapLogger.warning('Cleanup failed (non-fatal)', {
+        error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      })
     }
   }
 }
