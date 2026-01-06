@@ -6,7 +6,6 @@ export {configureGhAuth, configureGitIdentity, getBotUserId} from './gh-auth.js'
 export {installOmo, verifyOmoInstallation} from './omo.js'
 export type {OmoInstallDeps, OmoInstallOptions} from './omo.js'
 export {getLatestVersion, installOpenCode} from './opencode.js'
-export {buildAgentPrompt, extractPromptContext} from './prompt.js'
 
 // Types
 export type {
