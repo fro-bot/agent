@@ -173,7 +173,7 @@ describe('omo', () => {
       // #then
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=max20', '--chatgpt=no', '--gemini=no'],
+        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
         expect.objectContaining({silent: true}),
       )
     })

@@ -27,7 +27,7 @@ export interface OmoInstallDeps {
  */
 export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOptions = {}): Promise<OmoInstallResult> {
   const {logger, execAdapter, toolCache, addPath} = deps
-  const {claude = 'max20', chatgpt = 'no', gemini = 'no'} = options
+  const {claude = 'no', chatgpt = 'no', gemini = 'no'} = options
 
   logger.info('Installing Oh My OpenCode plugin', {claude, chatgpt, gemini})
 
