@@ -1,6 +1,6 @@
 # RFC-012: Agent Execution & Main Action Lifecycle
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 1
@@ -111,103 +111,83 @@ export type AcknowledgmentState = "pending" | "acknowledged" | "completed" | "fa
 
 ### 3. GitHub Context Collection (`src/lib/agent/context.ts`)
 
+**Note:** This module leverages RFC-003's `parseGitHubContext()` and related utilities from `src/lib/github/context.ts` to extract all context from the GitHub Actions event payload. No workflow-level environment variables are needed for comment/issue data.
+
 ```typescript
+import type {Logger} from "../logger.js"
+import type {GitHubContext, IssueCommentPayload} from "../github/types.js"
+import type {AgentContext} from "./types.js"
 import * as exec from "@actions/exec"
-import type {AgentContext, Logger} from "./types.js"
+import {parseGitHubContext, getCommentTarget, getCommentAuthor, isPullRequest} from "../github/context.js"
 
 /**
- * Collect GitHub context from environment and event payload.
+ * Collect GitHub context from @actions/github event payload.
  *
- * Determines if the trigger is an issue or PR, extracts comment details,
- * and gathers all context needed for prompt construction.
+ * Uses RFC-003 utilities (parseGitHubContext, getCommentTarget, etc.)
+ * to extract all context from the GitHub Actions event payload.
+ * No workflow-level environment variables needed for comment/issue data.
  */
-export async function collectAgentContext(logger: Logger): Promise<AgentContext> {
-  const eventName = process.env["GITHUB_EVENT_NAME"] ?? "unknown"
-  const repo = process.env["GITHUB_REPOSITORY"] ?? ""
-  const ref = process.env["GITHUB_REF_NAME"] ?? "main"
-  const actor = process.env["GITHUB_ACTOR"] ?? "unknown"
-  const runId = process.env["GITHUB_RUN_ID"] ?? "0"
+export function collectAgentContext(logger: Logger): AgentContext {
+  const ghContext = parseGitHubContext(logger)
+  const repo = `${ghContext.repo.owner}/${ghContext.repo.repo}`
 
-  // Event payload provides comment context
-  const commentBody = process.env["COMMENT_BODY"] ?? null
-  const commentAuthor = process.env["COMMENT_AUTHOR"] ?? null
-  const commentId = parseIntOrNull(process.env["COMMENT_ID"])
-  const issueNumber = parseIntOrNull(process.env["ISSUE_NUMBER"])
+  // Extract comment target (issue/PR number and type)
+  const target = getCommentTarget(ghContext)
 
-  // Determine issue vs PR and get title
-  let issueType: "issue" | "pr" | null = null
+  // Extract comment details from payload (for issue_comment events)
+  let commentBody: string | null = null
+  let commentAuthor: string | null = null
+  let commentId: number | null = null
   let issueTitle: string | null = null
-  let defaultBranch = "main"
 
-  if (issueNumber != null && repo.length > 0) {
-    const typeInfo = await detectIssueType(repo, issueNumber, logger)
-    issueType = typeInfo.type
-    issueTitle = typeInfo.title
-    defaultBranch = typeInfo.defaultBranch
+  if (ghContext.eventType === "issue_comment") {
+    const payload = ghContext.payload as IssueCommentPayload
+    commentBody = payload.comment.body
+    commentAuthor = getCommentAuthor(payload)
+    commentId = payload.comment.id
+    issueTitle = payload.issue.title
   }
 
   logger.info("Collected agent context", {
-    eventName,
+    eventName: ghContext.eventName,
     repo,
-    issueNumber,
-    issueType,
+    issueNumber: target?.number ?? null,
+    issueType: target?.type ?? null,
     hasComment: commentBody != null,
   })
 
   return {
-    eventName,
+    eventName: ghContext.eventName,
     repo,
-    ref,
-    actor,
-    runId,
-    issueNumber,
+    ref: ghContext.ref,
+    actor: ghContext.actor,
+    runId: String(ghContext.runId),
+    issueNumber: target?.number ?? null,
     issueTitle,
-    issueType,
+    issueType: target?.type ?? null,
     commentBody,
     commentAuthor,
     commentId,
-    defaultBranch,
+    defaultBranch: "main", // Will be fetched via gh CLI if needed
   }
 }
 
-interface IssueTypeInfo {
-  type: "issue" | "pr"
-  title: string | null
-  defaultBranch: string
-}
-
-async function detectIssueType(repo: string, issueNumber: number, logger: Logger): Promise<IssueTypeInfo> {
+/**
+ * Fetch repository default branch via gh CLI.
+ * Called separately to avoid blocking context collection.
+ */
+export async function fetchDefaultBranch(repo: string, logger: Logger): Promise<string> {
   try {
-    const {stdout} = await exec.getExecOutput(
-      "gh",
-      ["api", `/repos/${repo}/issues/${issueNumber}`, "--jq", "{title: .title, has_pr: (.pull_request != null)}"],
-      {silent: true},
-    )
-
-    const data = JSON.parse(stdout) as {title: string | null; has_pr: boolean}
-
-    // Also get default branch
-    const {stdout: repoStdout} = await exec.getExecOutput("gh", ["api", `/repos/${repo}`, "--jq", ".default_branch"], {
+    const {stdout} = await exec.getExecOutput("gh", ["api", `/repos/${repo}`, "--jq", ".default_branch"], {
       silent: true,
     })
-
-    return {
-      type: data.has_pr ? "pr" : "issue",
-      title: data.title,
-      defaultBranch: repoStdout.trim() || "main",
-    }
+    return stdout.trim() || "main"
   } catch (error) {
-    logger.warning("Failed to detect issue/PR type", {
+    logger.warning("Failed to fetch default branch", {
       error: error instanceof Error ? error.message : String(error),
     })
-    return {type: "issue", title: null, defaultBranch: "main"}
+    return "main"
   }
-}
-
-function parseIntOrNull(value: string | undefined): number | null {
-  if (value == null || value.length === 0) return null
-  const parsed = parseInt(value, 10)
-  return Number.isNaN(parsed) ? null : parsed
 }
 ```
 
@@ -1150,21 +1130,18 @@ Real-time streaming is a UX improvement, not a functional requirement. The actio
 
 ## Environment Variables Consumed
 
-| Variable          | Source       | Purpose                         |
-| ----------------- | ------------ | ------------------------------- |
-| GITHUB_EVENT_NAME | GitHub       | Event type identification       |
-| GITHUB_REPOSITORY | GitHub       | Repository context              |
-| GITHUB_REF_NAME   | GitHub       | Branch/ref context              |
-| GITHUB_ACTOR      | GitHub       | Triggering user                 |
-| GITHUB_RUN_ID     | GitHub       | Run identification              |
-| COMMENT_BODY      | Workflow     | Triggering comment content      |
-| COMMENT_AUTHOR    | Workflow     | Comment author username         |
-| COMMENT_ID        | Workflow     | Comment ID for reactions        |
-| ISSUE_NUMBER      | Workflow     | Issue/PR number                 |
-| DEFAULT_BRANCH    | Workflow     | Repository default branch       |
-| OPENCODE_PATH     | Setup Action | Path to OpenCode binary         |
-| BOT_LOGIN         | Setup Action | Authenticated bot username      |
-| GH_TOKEN          | Setup Action | GitHub CLI authentication token |
+| Variable          | Source         | Purpose                         |
+| ----------------- | -------------- | ------------------------------- |
+| GITHUB_EVENT_NAME | GitHub Actions | Event type identification       |
+| GITHUB_REPOSITORY | GitHub Actions | Repository context              |
+| GITHUB_REF        | GitHub Actions | Branch/ref context              |
+| GITHUB_ACTOR      | GitHub Actions | Triggering user                 |
+| GITHUB_RUN_ID     | GitHub Actions | Run identification              |
+| OPENCODE_PATH     | Setup Action   | Path to OpenCode binary         |
+| BOT_LOGIN         | Setup Action   | Authenticated bot username      |
+| GH_TOKEN          | Setup Action   | GitHub CLI authentication token |
+
+**Note:** Comment details (body, author, ID) and issue/PR context are extracted from the GitHub Actions event payload via RFC-003 utilities (`parseGitHubContext`, `getCommentTarget`, etc.), not from workflow environment variables.
 
 ---
 
