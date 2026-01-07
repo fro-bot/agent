@@ -5,6 +5,8 @@
  * reactions/labels management, and OpenCode execution.
  */
 
+import type {SessionSearchResult, SessionSummary} from '../session/types.js'
+
 /**
  * Context collected from GitHub Actions for agent prompt construction.
  * Extracted from @actions/github event payload via RFC-003 utilities.
@@ -47,12 +49,22 @@ export interface ReactionContext {
 }
 
 /**
+ * Session context for prompt building (RFC-004 integration).
+ * Provides prior session metadata and relevant search results.
+ */
+export interface SessionContext {
+  readonly recentSessions: readonly SessionSummary[]
+  readonly priorWorkContext: readonly SessionSearchResult[]
+}
+
+/**
  * Options for building the agent prompt.
  */
 export interface PromptOptions {
   readonly context: AgentContext
   readonly customPrompt: string | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
+  readonly sessionContext?: SessionContext
 }
 
 /**

@@ -17,14 +17,19 @@ export const DEFAULT_PRUNING_CONFIG: PruningConfig = {
  * - Within maxAgeDays of the current date
  * - Within the most recent maxSessions (by updatedAt)
  *
- * This ensures we always keep at least maxSessions, even if they're older than maxAgeDays.
+ * This dual-condition approach ensures we:
+ * 1. Keep recent active sessions regardless of total count (time-based)
+ * 2. Always keep minimum history even during low activity (count-based)
+ * 3. Prevent cache explosion during high-frequency periods (both limits)
+ *
+ * Cache size is a critical concern: sessions accumulate 1-10MB each, and without
+ * pruning, cache restore/save becomes the workflow bottleneck.
  */
 export async function pruneSessions(directory: string, config: PruningConfig, logger: Logger): Promise<PruneResult> {
   const {maxSessions, maxAgeDays} = config
 
   logger.info('Starting session pruning', {directory, maxSessions, maxAgeDays})
 
-  // Find project
   const project = await findProjectByDirectory(directory, logger)
   if (project == null) {
     logger.debug('No project found for pruning', {directory})
@@ -36,10 +41,8 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  // Get all sessions (including child sessions for cleanup)
   const allSessions = await listSessionsForProject(project.id, logger)
 
-  // Filter to main sessions only for retention calculation
   const mainSessions = allSessions.filter(s => s.parentID == null)
 
   if (mainSessions.length === 0) {
@@ -51,25 +54,20 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  // Sort by updatedAt descending (most recent first)
   const sortedSessions = [...mainSessions].sort((a, b) => b.time.updated - a.time.updated)
 
-  // Calculate cutoff date
   const cutoffDate = new Date()
   cutoffDate.setDate(cutoffDate.getDate() - maxAgeDays)
   const cutoffTime = cutoffDate.getTime()
 
-  // Determine which sessions to keep
   const sessionsToKeep = new Set<string>()
 
-  // Keep sessions within age limit
   for (const session of sortedSessions) {
     if (session.time.updated >= cutoffTime) {
       sessionsToKeep.add(session.id)
     }
   }
 
-  // Ensure we keep at least maxSessions (most recent)
   for (let i = 0; i < Math.min(maxSessions, sortedSessions.length); i++) {
     const session = sortedSessions[i]
     if (session != null) {
@@ -77,14 +75,11 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  // Determine sessions to prune (main sessions not in keep set)
   const mainSessionsToPrune = sortedSessions.filter(s => !sessionsToKeep.has(s.id))
 
-  // Also find child sessions of sessions being pruned
   const allSessionsToPrune = new Set<string>()
   for (const session of mainSessionsToPrune) {
     allSessionsToPrune.add(session.id)
-    // Add child sessions
     for (const child of allSessions) {
       if (child.parentID === session.id) {
         allSessionsToPrune.add(child.id)
@@ -102,7 +97,6 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  // Prune sessions
   let freedBytes = 0
   const prunedIds: string[] = []
 

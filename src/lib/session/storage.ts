@@ -6,8 +6,9 @@ import * as path from 'node:path'
 import process from 'node:process'
 
 /**
- * Get the OpenCode storage directory path.
- * Uses XDG_DATA_HOME or falls back to ~/.local/share/opencode/storage
+ * Get the OpenCode storage directory path following XDG Base Directory Specification.
+ * OpenCode stores session data in JSON files under this path, not in SQLite.
+ * This must match OpenCode's own storage path to ensure compatibility.
  */
 export function getOpenCodeStoragePath(): string {
   const xdgDataHome = process.env.XDG_DATA_HOME
@@ -16,7 +17,9 @@ export function getOpenCodeStoragePath(): string {
 }
 
 /**
- * Read a JSON file from storage, returning null if not found or invalid.
+ * Read and parse a JSON file from OpenCode storage.
+ * Returns null on any error to avoid throwing in normal file-not-found scenarios.
+ * OpenCode creates files lazily, so absence is expected during initial runs.
  */
 async function readJson<T>(filePath: string): Promise<T | null> {
   try {
@@ -29,6 +32,8 @@ async function readJson<T>(filePath: string): Promise<T | null> {
 
 /**
  * List all JSON files in a directory, returning parsed contents.
+ * Returns empty array if directory doesn't exist - this is expected behavior
+ * since OpenCode creates directories on-demand during first session creation.
  */
 async function listJsonFiles<T>(dirPath: string): Promise<readonly T[]> {
   try {
@@ -100,7 +105,8 @@ export async function getSession(projectID: string, sessionID: string, logger: L
 }
 
 /**
- * Get all messages for a session.
+ * Get all messages for a session, sorted chronologically.
+ * Sorting ensures messages appear in conversation order for session_read tool.
  */
 export async function getSessionMessages(sessionID: string, logger: Logger): Promise<readonly Message[]> {
   const storagePath = getOpenCodeStoragePath()
@@ -109,7 +115,6 @@ export async function getSessionMessages(sessionID: string, logger: Logger): Pro
   logger.debug('Reading session messages', {sessionID, messageDir})
   const messages = await listJsonFiles<Message>(messageDir)
 
-  // Sort by creation time (ascending)
   return [...messages].sort((a, b) => a.time.created - b.time.created)
 }
 
@@ -151,6 +156,9 @@ async function deleteFile(filePath: string): Promise<number> {
 
 /**
  * Delete a directory recursively, returning bytes freed.
+ * Calculates size before deletion for metrics. Failures are silent since
+ * pruning is opportunistic - we don't want to fail the entire action if
+ * a single session directory is locked or missing.
  */
 async function deleteDirectoryRecursive(dirPath: string): Promise<number> {
   let totalSize = 0
@@ -171,7 +179,7 @@ async function deleteDirectoryRecursive(dirPath: string): Promise<number> {
 
     await fs.rm(dirPath, {recursive: true, force: true})
   } catch {
-    // Directory doesn't exist or can't be deleted
+    // Silently ignore: pruning is opportunistic, shouldn't fail entire action
   }
 
   return totalSize
@@ -209,4 +217,53 @@ export async function deleteSession(projectID: string, sessionID: string, logger
 
   logger.debug('Deleted session', {sessionID, freedBytes})
   return freedBytes
+}
+
+/**
+ * Find the most recently created session across all projects.
+ *
+ * This is needed because OpenCode CLI doesn't return the session ID directly.
+ * We infer which session was created by comparing timestamps - the newest session
+ * created after execution start time is assumed to be the result.
+ *
+ * This approach works because:
+ * 1. Each GitHub Action run is isolated (no concurrent OpenCode executions)
+ * 2. Session IDs contain hex timestamps making them monotonic
+ * 3. We record execution start time before calling OpenCode
+ *
+ * @param afterTimestamp - Only consider sessions created after this timestamp (ms)
+ * @param logger - Logger instance
+ * @returns The most recent session, or null if none found
+ */
+export async function findLatestSession(
+  afterTimestamp: number,
+  logger: Logger,
+): Promise<{projectID: string; session: SessionInfo} | null> {
+  const projects = await listProjects(logger)
+
+  let latestSession: {projectID: string; session: SessionInfo} | null = null
+
+  for (const project of projects) {
+    const sessions = await listSessionsForProject(project.id, logger)
+
+    for (const session of sessions) {
+      if (session.time.created <= afterTimestamp) {
+        continue
+      }
+
+      if (latestSession == null || session.time.created > latestSession.session.time.created) {
+        latestSession = {projectID: project.id, session}
+      }
+    }
+  }
+
+  if (latestSession != null) {
+    logger.debug('Found latest session', {
+      sessionId: latestSession.session.id,
+      projectId: latestSession.projectID,
+      createdAt: latestSession.session.time.created,
+    })
+  }
+
+  return latestSession
 }
