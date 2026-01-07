@@ -6,7 +6,7 @@
  */
 
 import type {Logger} from '../logger.js'
-import type {PromptOptions} from './types.js'
+import type {PromptOptions, SessionContext} from './types.js'
 
 /**
  * Build the complete agent prompt with GitHub context and instructions.
@@ -15,13 +15,14 @@ import type {PromptOptions} from './types.js'
  * - Environment context (repo, branch, event, actor)
  * - Issue/PR context when applicable
  * - Triggering comment when applicable
+ * - Prior session context (if available)
  * - Session management instructions
  * - gh CLI operation examples
  * - Run summary requirement
  * - Custom prompt if provided
  */
 export function buildAgentPrompt(options: PromptOptions, logger: Logger): string {
-  const {context, customPrompt, cacheStatus} = options
+  const {context, customPrompt, cacheStatus, sessionContext} = options
   const parts: string[] = []
 
   // System context header
@@ -57,6 +58,11 @@ You are the Fro Bot Agent running in GitHub Actions.
 ${context.commentBody}
 \`\`\`
 `)
+  }
+
+  // Prior session context (RFC-004 integration)
+  if (sessionContext != null) {
+    parts.push(buildSessionContextSection(sessionContext))
   }
 
   // Session management instructions (REQUIRED)
@@ -153,6 +159,58 @@ Respond to the trigger comment above. Follow all instructions and requirements l
   }
 
   const prompt = parts.join('\n')
-  logger.debug('Built agent prompt', {length: prompt.length, hasCustom: customPrompt != null})
+  logger.debug('Built agent prompt', {
+    length: prompt.length,
+    hasCustom: customPrompt != null,
+    hasSessionContext: sessionContext != null,
+  })
   return prompt
+}
+
+/**
+ * Build the session context section for the prompt.
+ * Provides lightweight metadata and search excerpts to avoid prompt bloat.
+ */
+function buildSessionContextSection(sessionContext: SessionContext): string {
+  const lines: string[] = ['## Prior Session Context']
+
+  // Recent sessions (lightweight metadata only)
+  if (sessionContext.recentSessions.length > 0) {
+    lines.push('')
+    lines.push('### Recent Sessions')
+    lines.push('| ID | Title | Updated | Messages | Agents |')
+    lines.push('|----|-------|---------|----------|--------|')
+
+    for (const session of sessionContext.recentSessions.slice(0, 5)) {
+      const updatedDate = new Date(session.updatedAt).toISOString().split('T')[0]
+      const agents = session.agents.join(', ') || 'N/A'
+      const title = session.title || 'Untitled'
+      lines.push(`| ${session.id} | ${title} | ${updatedDate} | ${session.messageCount} | ${agents} |`)
+    }
+
+    lines.push('')
+    lines.push('Use `session_read` to review any of these sessions in detail.')
+  }
+
+  // Prior work context (search results)
+  if (sessionContext.priorWorkContext.length > 0) {
+    lines.push('')
+    lines.push('### Relevant Prior Work')
+    lines.push('')
+    lines.push('The following sessions contain content related to this issue:')
+    lines.push('')
+
+    for (const result of sessionContext.priorWorkContext.slice(0, 3)) {
+      lines.push(`**Session ${result.sessionId}:**`)
+      for (const match of result.matches.slice(0, 2)) {
+        lines.push(`- ${match.excerpt}`)
+      }
+      lines.push('')
+    }
+
+    lines.push('Use `session_read` to review full context before starting new investigation.')
+  }
+
+  lines.push('')
+  return lines.join('\n')
 }

@@ -4,20 +4,23 @@
  * GitHub Action harness for OpenCode + oMo agents with persistent session state.
  * This is the entry point that orchestrates the agent workflow.
  *
- * Lifecycle (RFC-012):
+ * Lifecycle (RFC-012 + RFC-004 integration):
  * 1. Parse inputs, verify OpenCode available
  * 2. Collect GitHub context
  * 3. Acknowledge receipt (eyes reaction + working label)
  * 4. Restore cache
- * 5. Build agent prompt
- * 6. Execute OpenCode agent
- * 7. Complete acknowledgment (update reaction, remove label)
- * 8. Save cache (always, in finally block)
+ * 5. Session introspection (list recent, search prior work)
+ * 6. Build agent prompt (with session context)
+ * 7. Execute OpenCode agent
+ * 8. Write session summary (if sessionId available)
+ * 9. Complete acknowledgment (update reaction, remove label)
+ * 10. Prune old sessions (before cache save)
+ * 11. Save cache (always, in finally block)
  */
 
 import type {ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
-import type {CacheResult} from './lib/types.js'
+import type {CacheResult, RunSummary} from './lib/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {
@@ -33,6 +36,14 @@ import {restoreCache, saveCache} from './lib/cache.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {setActionOutputs} from './lib/outputs.js'
+import {
+  DEFAULT_PRUNING_CONFIG,
+  findLatestSession,
+  listSessions,
+  pruneSessions,
+  searchSessions,
+  writeSessionSummary,
+} from './lib/session/index.js'
 import {
   getGitHubRefName,
   getGitHubRepository,
@@ -124,8 +135,27 @@ async function run(): Promise<void> {
       authPath: getOpenCodeAuthPath(),
     })
 
-    const cacheStatus = cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss'
+    const cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted
+      ? 'corrupted'
+      : cacheResult.hit
+        ? 'hit'
+        : 'miss'
     logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
+
+    // 6b. Session introspection (RFC-004) - gather prior session context
+    const sessionLogger = createLogger({phase: 'session'})
+    const storagePath = getOpenCodeStoragePath()
+
+    const recentSessions = await listSessions(storagePath, {limit: 10}, sessionLogger)
+    sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
+
+    // Search for prior work related to current issue (if applicable)
+    const searchQuery = contextWithBranch.issueTitle ?? contextWithBranch.repo
+    const priorWorkContext = await searchSessions(searchQuery, storagePath, {limit: 5}, sessionLogger)
+    sessionLogger.debug('Searched prior sessions', {
+      query: searchQuery,
+      resultCount: priorWorkContext.length,
+    })
 
     // 7. Build agent prompt
     const promptLogger = createLogger({phase: 'prompt'})
@@ -134,6 +164,10 @@ async function run(): Promise<void> {
         context: contextWithBranch,
         customPrompt: inputs.prompt,
         cacheStatus,
+        sessionContext: {
+          recentSessions,
+          priorWorkContext,
+        },
       },
       promptLogger,
     )
@@ -141,16 +175,45 @@ async function run(): Promise<void> {
     // 8. Execute OpenCode agent (skip in test mode)
     const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'
     let result: {success: boolean; exitCode: number; sessionId: string | null; error: string | null}
+    const executionStartTime = Date.now()
 
     if (skipExecution) {
       logger.info('Skipping agent execution (SKIP_AGENT_EXECUTION=true)')
       result = {success: true, exitCode: 0, sessionId: null, error: null}
     } else {
       const execLogger = createLogger({phase: 'execution'})
-      result = await executeOpenCode(prompt, opencodePath, execLogger)
+      const execResult = await executeOpenCode(prompt, opencodePath, execLogger)
+
+      // Try to find the session created by this execution (RFC-004)
+      let sessionId: string | null = null
+      const latestSession = await findLatestSession(executionStartTime, sessionLogger)
+      if (latestSession != null) {
+        sessionId = latestSession.session.id
+        sessionLogger.debug('Identified session from execution', {sessionId})
+      }
+
+      result = {...execResult, sessionId}
     }
 
     agentSuccess = result.success
+
+    // 8b. Write session summary (RFC-004) if we have a sessionId
+    if (result.sessionId != null) {
+      const runSummary: RunSummary = {
+        eventType: contextWithBranch.eventName,
+        repo: contextWithBranch.repo,
+        ref: contextWithBranch.ref,
+        runId: Number(contextWithBranch.runId),
+        cacheStatus,
+        sessionIds: [result.sessionId],
+        createdPRs: [],
+        createdCommits: [],
+        duration: Math.round((Date.now() - startTime) / 1000),
+        tokenUsage: null,
+      }
+      await writeSessionSummary(result.sessionId, runSummary, sessionLogger)
+      sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
+    }
 
     // 9. Calculate duration and set outputs
     const duration = Date.now() - startTime
@@ -183,12 +246,23 @@ async function run(): Promise<void> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
-    // Always cleanup: update reactions and save cache
+    // Always cleanup: update reactions, prune sessions, and save cache
     try {
       // Complete acknowledgment (update reaction, remove label)
       if (reactionCtx != null) {
         const cleanupLogger = createLogger({phase: 'cleanup'})
         await completeAcknowledgment(reactionCtx, agentSuccess, cleanupLogger)
+      }
+
+      // Prune old sessions (RFC-004) before cache save
+      const pruneLogger = createLogger({phase: 'prune'})
+      const storagePath = getOpenCodeStoragePath()
+      const pruneResult = await pruneSessions(storagePath, DEFAULT_PRUNING_CONFIG, pruneLogger)
+      if (pruneResult.prunedCount > 0) {
+        pruneLogger.info('Pruned old sessions', {
+          pruned: pruneResult.prunedCount,
+          remaining: pruneResult.remainingCount,
+        })
       }
 
       // Save cache
