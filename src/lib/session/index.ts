@@ -7,6 +7,7 @@ export {getSessionInfo, listSessions, searchSessions} from './search.js'
 // Storage utilities
 export {
   deleteSession,
+  findLatestSession,
   findProjectByDirectory,
   getMessageParts,
   getOpenCodeStoragePath,

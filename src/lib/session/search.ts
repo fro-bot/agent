@@ -11,7 +11,10 @@ import {
 
 /**
  * List all main sessions (excluding child/branched sessions) for a directory.
- * Returns sessions sorted by updatedAt descending (most recent first).
+ *
+ * Returns sessions sorted by updatedAt descending (most recent first) to show
+ * the user the latest work context. Child sessions are excluded because they
+ * represent temporary branches/experiments that should not clutter the list.
  */
 export async function listSessions(
   directory: string,
@@ -22,7 +25,6 @@ export async function listSessions(
 
   logger.debug('Listing sessions', {directory, limit})
 
-  // Find project by directory
   const project = await findProjectByDirectory(directory, logger)
   if (project == null) {
     logger.debug('No project found for directory', {directory})
@@ -32,22 +34,17 @@ export async function listSessions(
   // Get all sessions for this project
   const sessions = await listSessionsForProject(project.id, logger)
 
-  // Filter to main sessions only (no parentID) and apply date filters
   const filtered = sessions.filter(session => {
-    // Exclude child sessions
     if (session.parentID != null) return false
 
-    // Apply date filters
     if (fromDate != null && session.time.created < fromDate.getTime()) return false
     if (toDate != null && session.time.created > toDate.getTime()) return false
 
     return true
   })
 
-  // Sort by updatedAt descending
   const sorted = [...filtered].sort((a, b) => b.time.updated - a.time.updated)
 
-  // Build summaries with message counts
   const summaries: SessionSummary[] = []
   const sessionsToProcess = limit == null ? sorted : sorted.slice(0, limit)
 
@@ -88,7 +85,11 @@ function extractAgentsFromMessages(messages: readonly Message[]): readonly strin
 }
 
 /**
- * Search session content for matching text.
+ * Search session content for matching text across messages and tool outputs.
+ *
+ * Searches text parts, reasoning blocks, and tool outputs to find relevant prior work.
+ * This powers the "relevant prior work" feature in agent prompts, helping agents
+ * avoid re-investigating already-solved issues.
  */
 export async function searchSessions(
   query: string,
@@ -104,7 +105,6 @@ export async function searchSessions(
   const results: SessionSearchResult[] = []
   let totalMatches = 0
 
-  // If specific session, search only that one
   if (sessionId != null) {
     const matches = await searchSessionContent(sessionId, searchPattern, caseSensitive, logger)
     if (matches.length > 0) {
@@ -113,7 +113,6 @@ export async function searchSessions(
     return results
   }
 
-  // Otherwise search all sessions for the directory
   const sessions = await listSessions(directory, {}, logger)
 
   for (const session of sessions) {
@@ -137,6 +136,8 @@ export async function searchSessions(
 
 /**
  * Search within a single session's content.
+ * Extracts 50-character context windows around matches to provide enough context
+ * for agents to determine relevance without overwhelming the prompt.
  */
 async function searchSessionContent(
   sessionId: string,
@@ -157,7 +158,6 @@ async function searchSessionContent(
       const searchText = caseSensitive ? text : text.toLowerCase()
 
       if (searchText.includes(pattern)) {
-        // Extract excerpt around match
         const index = searchText.indexOf(pattern)
         const start = Math.max(0, index - 50)
         const end = Math.min(text.length, index + pattern.length + 50)

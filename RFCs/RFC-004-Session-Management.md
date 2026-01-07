@@ -1,6 +1,9 @@
 # RFC-004: Session Management Integration
 
-**Status:** Pending **Priority:** MUST **Complexity:** Medium **Phase:** 2
+**Status:** Completed
+**Priority:** MUST
+**Complexity:** Medium
+**Phase:** 2
 
 ---
 
@@ -1374,3 +1377,236 @@ describe("OpenCode storage format compatibility", () => {
 **Tests:** 48 new tests covering all acceptance criteria
 
 **Deviations:** None - implementation follows RFC specification exactly
+
+---
+
+## Integration with Main Action (RFC-012)
+
+RFC-012 defines the canonical main action lifecycle. This section specifies how RFC-004 session utilities integrate into that lifecycle.
+
+### Lifecycle Integration Points
+
+The 9-step lifecycle in RFC-012 expands to include session operations:
+
+| Step    | Phase                 | RFC-004 Integration                                                        |
+| ------- | --------------------- | -------------------------------------------------------------------------- |
+| 4       | After cache restore   | **Session Introspection**: `listSessions()`, optionally `searchSessions()` |
+| 6       | Build agent prompt    | Pass session context (recent sessions, search results) to prompt builder   |
+| 8       | After agent execution | **Session Writeback**: `writeSessionSummary()` (requires sessionId)        |
+| finally | Before cache save     | **Session Pruning**: `pruneSessions()`                                     |
+
+### Required Imports in main.ts
+
+```typescript
+import {
+  listSessions,
+  searchSessions,
+  pruneSessions,
+  writeSessionSummary,
+  DEFAULT_PRUNING_CONFIG,
+  type SessionSummary,
+  type PruningConfig,
+} from "./lib/session/index.js"
+```
+
+### Session Introspection (After Cache Restore)
+
+After cache restore and before prompt building:
+
+```typescript
+// Get working directory
+const workingDirectory = process.env.GITHUB_WORKSPACE ?? process.cwd()
+
+// List recent sessions (lightweight metadata only)
+const sessionLogger = createLogger({phase: "session"})
+const recentSessions = await listSessions(
+  workingDirectory,
+  {limit: 10}, // Cap at 10 to avoid prompt bloat
+  sessionLogger,
+)
+
+// Optionally search for relevant prior work
+let priorWorkContext: SessionSearchResult[] = []
+if (agentContext.issueTitle != null && agentContext.issueTitle.length > 0) {
+  priorWorkContext = await searchSessions(
+    agentContext.issueTitle,
+    workingDirectory,
+    {limit: 5}, // Cap excerpts to avoid prompt bloat
+    sessionLogger,
+  )
+}
+
+sessionLogger.info("Session introspection complete", {
+  recentSessionCount: recentSessions.length,
+  priorWorkMatches: priorWorkContext.length,
+})
+```
+
+### Session Context in Prompt
+
+Pass session context to `buildAgentPrompt()`:
+
+```typescript
+interface PromptOptions {
+  // ... existing fields
+  sessionContext?: {
+    recentSessions: readonly SessionSummary[]
+    priorWorkContext: readonly SessionSearchResult[]
+  }
+}
+```
+
+**Prompt injection policy** (per Oracle guidance):
+
+- Inject **lightweight session metadata**: `(id, title, updatedAt, messageCount, agents)`
+- Inject **limited search excerpts**: top 3-5 matches with session ID pointers
+- **Do NOT** dump full session histories—instruct agent to use `session_read` for deep dives
+
+### Session Writeback (After Agent Execution)
+
+After agent execution, before acknowledgment completion:
+
+```typescript
+// Only write summary if we have a valid sessionId
+if (result.sessionId != null) {
+  const runSummary: RunSummary = {
+    eventType: agentContext.eventName,
+    repo: agentContext.repo,
+    ref: getGitHubRefName(),
+    runId: getGitHubRunId(),
+    cacheStatus,
+    sessionIds: [result.sessionId],
+    createdPRs: [], // TODO: extract from agent output
+    createdCommits: [], // TODO: extract from agent output
+    duration: Math.round((Date.now() - startTime) / 1000),
+    tokenUsage: null, // TODO: extract from OpenCode output
+  }
+
+  await writeSessionSummary(result.sessionId, runSummary, sessionLogger)
+}
+```
+
+**Important**: Writeback happens **after** execution because it requires `sessionId` from the agent result.
+
+### Session Pruning (Before Cache Save)
+
+In the `finally` block, **before** `saveCache()`:
+
+```typescript
+finally {
+  // ... acknowledgment cleanup
+
+  // Prune sessions before saving cache
+  const sessionLogger = createLogger({phase: 'session-prune'})
+  const pruneConfig: PruningConfig = {
+    maxSessions: agentSuccess
+      ? inputs.sessionRetention
+      : Math.max(inputs.sessionRetention, 10),  // Keep more on failure for debugging
+    maxAgeDays: 30,
+  }
+
+  try {
+    const pruneResult = await pruneSessions(workingDirectory, pruneConfig, sessionLogger)
+    sessionLogger.info('Session pruning complete', {
+      prunedCount: pruneResult.prunedCount,
+      remainingCount: pruneResult.remainingCount,
+      freedBytes: pruneResult.freedBytes,
+    })
+  } catch (pruneError) {
+    sessionLogger.warning('Session pruning failed (non-fatal)', {
+      error: pruneError instanceof Error ? pruneError.message : String(pruneError),
+    })
+  }
+
+  // Save cache (always runs)
+  await saveCache({...})
+}
+```
+
+**Pruning behavior** (per Oracle guidance):
+
+- Prune **before cache save** so cache never re-inflates
+- Prune on **both success and failure** (caches are the size/time bomb)
+- **Failure-mode conservatism**: Keep more sessions on failure (`maxSessions >= 10`) for post-mortem debugging
+- Pruning must happen **after writeback** to avoid pruning the session we just annotated
+
+### Execution Order Constraints
+
+```
+1. restoreCache()
+2. listSessions() / searchSessions()  ← Session introspection
+3. buildAgentPrompt()                 ← Include session context
+4. executeOpenCode()                  ← Agent runs
+5. writeSessionSummary()              ← Requires sessionId from step 4
+6. pruneSessions()                    ← Must be after writeback
+7. saveCache()                        ← Always last
+```
+
+### SessionId Extraction
+
+**Known limitation**: `AgentResult.sessionId` is currently `null` (placeholder). Full integration requires:
+
+1. Parsing OpenCode CLI output for session ID, OR
+2. Reading latest session from storage by timestamp after execution
+
+Until sessionId extraction is implemented, `writeSessionSummary()` will be skipped.
+
+### Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     main.ts Lifecycle                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────────┐                                           │
+│  │ restoreCache │                                           │
+│  └──────┬───────┘                                           │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌──────────────────────────────────┐                       │
+│  │ listSessions() / searchSessions()│ ◄── RFC-004           │
+│  └──────────────┬───────────────────┘                       │
+│                 │ SessionSummary[]                          │
+│                 │ SessionSearchResult[]                     │
+│                 ▼                                            │
+│  ┌──────────────────────────────────┐                       │
+│  │ buildAgentPrompt()               │                       │
+│  │   - Include session context      │                       │
+│  │   - Instruct agent on tools      │                       │
+│  └──────────────┬───────────────────┘                       │
+│                 │ prompt: string                            │
+│                 ▼                                            │
+│  ┌──────────────────────────────────┐                       │
+│  │ executeOpenCode()                │                       │
+│  └──────────────┬───────────────────┘                       │
+│                 │ AgentResult { sessionId }                 │
+│                 ▼                                            │
+│  ┌──────────────────────────────────┐                       │
+│  │ writeSessionSummary()            │ ◄── RFC-004           │
+│  │   (if sessionId available)       │                       │
+│  └──────────────┬───────────────────┘                       │
+│                 │                                            │
+│         ┌───────┴───────┐                                   │
+│         │    finally    │                                   │
+│         └───────┬───────┘                                   │
+│                 ▼                                            │
+│  ┌──────────────────────────────────┐                       │
+│  │ pruneSessions()                  │ ◄── RFC-004           │
+│  └──────────────┬───────────────────┘                       │
+│                 │                                            │
+│                 ▼                                            │
+│  ┌──────────────────────────────────┐                       │
+│  │ saveCache()                      │                       │
+│  └──────────────────────────────────┘                       │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Related RFCs
+
+| RFC     | Relationship                                            |
+| ------- | ------------------------------------------------------- |
+| RFC-012 | **Canonical lifecycle** - defines main.ts orchestration |
+| RFC-007 | Consumes session context for run summary metrics        |
+| RFC-002 | Cache restore/save brackets session operations          |
+| RFC-011 | Setup action ensures storage directory exists           |

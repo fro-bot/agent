@@ -7,7 +7,9 @@ import * as path from 'node:path'
 import {getOpenCodeStoragePath} from './storage.js'
 
 /**
- * Generate random base62 string (matching OpenCode ID format).
+ * Generate random base62 string matching OpenCode's ID format.
+ * OpenCode IDs use base62 to pack more entropy into shorter strings
+ * (62 chars vs 16 for hex), reducing storage overhead.
  */
 function generateRandomBase62(length: number): string {
   const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -54,23 +56,24 @@ function formatSummaryForSession(summary: RunSummary): string {
 /**
  * Append a run summary to a session's message history.
  *
- * This creates a synthetic "user" message containing the run summary,
- * making it discoverable in future session searches.
+ * Creates a synthetic "user" message to make GitHub Action metadata searchable.
+ * This enables close-the-loop functionality: agents can discover which GitHub
+ * runs created which PRs/commits, avoiding duplicate work and enabling
+ * follow-up coordination.
  *
- * NOTE: This directly writes to the OpenCode storage format. The message
- * will appear in session_read and session_search results.
+ * The synthetic message uses role="user" so it appears in conversation context
+ * but uses special agent="fro-bot" and modelID="run-summary" to identify it
+ * as GitHub Action metadata rather than human input.
  */
 export async function writeSessionSummary(sessionId: string, summary: RunSummary, logger: Logger): Promise<void> {
   const storagePath = getOpenCodeStoragePath()
   const messageDir = path.join(storagePath, 'message', sessionId)
   const partDir = path.join(storagePath, 'part')
 
-  // Generate IDs matching OpenCode format (hex timestamp + random base62)
   const timestamp = Date.now()
   const messageId = `msg_${timestamp.toString(16)}${generateRandomBase62(14)}`
   const partId = `prt_${timestamp.toString(16)}${generateRandomBase62(14)}`
 
-  // Create message metadata
   const messageMetadata = {
     id: messageId,
     sessionID: sessionId,
@@ -89,7 +92,6 @@ export async function writeSessionSummary(sessionId: string, summary: RunSummary
     },
   }
 
-  // Create text part with summary content
   const summaryText = formatSummaryForSession(summary)
   const partMetadata = {
     id: partId,
@@ -104,11 +106,9 @@ export async function writeSessionSummary(sessionId: string, summary: RunSummary
   }
 
   try {
-    // Ensure directories exist
     await fs.mkdir(messageDir, {recursive: true})
     await fs.mkdir(path.join(partDir, messageId), {recursive: true})
 
-    // Write message and part files
     const messagePath = path.join(messageDir, `${messageId}.json`)
     const partPath = path.join(partDir, messageId, `${partId}.json`)
 
