@@ -45,6 +45,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
   }
 
   const args = [
+    'x',
     'oh-my-opencode',
     'install',
     '--no-tui',
@@ -55,7 +56,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
 
   try {
     let output = ''
-    const exitCode = await execAdapter.exec('bunx', args, {
+    const exitCode = await execAdapter.exec('bun', args, {
       listeners: {
         stdout: (data: Buffer) => {
           output += data.toString()
