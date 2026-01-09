@@ -115,7 +115,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     // Install oMo (graceful failure)
     const omoResult = await installOmo(
       {logger, execAdapter, toolCache, addPath: core.addPath},
-      {claude: 'max20', chatgpt: 'no', gemini: 'no'},
+      {claude: 'no', chatgpt: 'no', gemini: 'no'},
     )
     if (omoResult.installed) {
       logger.info('oMo installed', {version: omoResult.version})
