@@ -8,7 +8,7 @@
 
 This document indexes all RFCs for the Fro Bot Agent project. RFCs are organized in **strict implementation order** - each RFC should be fully implemented before proceeding to the next.
 
-The agent harness enables OpenCode with oMo "Sisyphus-style" workflow to act as an autonomous collaborator on GitHub Issues, Discussions, and Pull Requests with **persistent memory across runs**.
+The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an autonomous collaborator on GitHub Issues, Discussions, and Pull Requests with **persistent memory across runs**.
 
 ---
 
