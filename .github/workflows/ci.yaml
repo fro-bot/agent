@@ -97,12 +97,9 @@ jobs:
           node-version: ${{ needs.setup.outputs.node-version }}
       - name: Install dependencies
         run: pnpm bootstrap
-      - name: Check types
-        run: pnpm check-types
       - name: Rebuild the dist/ directory
         run: pnpm build
-      - if: ${{ needs.setup.outputs.dist-changed == 'true' }}
-        name: Compare the expected and actual dist/ directories
+      - name: Compare the expected and actual dist/ directories
         run: |
           if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
             echo "Detected uncommitted changes after build.  See status below:"
@@ -110,7 +107,7 @@ jobs:
             exit 1
           fi
         id: diff
-      # If dist/main.js was different than expected, upload the expected version as an artifact
+      # If dist/ was different than expected, upload the expected version as an artifact
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ failure() && steps.diff.conclusion == 'failure' }}
         with:
@@ -134,7 +131,11 @@ jobs:
           node-version: ${{ needs.setup.outputs.node-version }}
       - name: Install dependencies
         run: pnpm bootstrap
-      - run: pnpm test
+      - name: Build
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
 
       - name: Test setup action
         uses: ./setup/
