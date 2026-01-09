@@ -2,7 +2,7 @@
 
 ## Overview
 
-Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) "Sisyphus-style" workflow to act as an autonomous collaborator on:
+Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on:
 
 - **GitHub**: Issues, Discussions, and Pull Requests (PRs) via GitHub Actions.
 - **Discord**: A long-running bot (Kimaki-like UX) connected to OpenCode through a reverse proxy / daemon model.
