@@ -116,7 +116,7 @@ jobs:
 
   test:
     name: Test
-    needs: [setup]
+    needs: [setup, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -131,11 +131,16 @@ jobs:
           node-version: ${{ needs.setup.outputs.node-version }}
       - name: Install dependencies
         run: pnpm bootstrap
-      - name: Build
-        run: pnpm build
 
       - name: Run tests
         run: pnpm test
+
+  test-actions:
+    name: Test GitHub Actions
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Test setup action
         uses: ./setup/
@@ -143,12 +148,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: '{"user":"ci-test@example.com","tokens":{"anthropic":"sk-test-key"}}'
           opencode-version: latest
-          skip-cache: 'true'
 
       - name: Test main action
         uses: ./
         env:
-          SKIP_CACHE: 'true'
           SKIP_AGENT_EXECUTION: 'true'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
