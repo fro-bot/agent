@@ -90,13 +90,13 @@ export default defineConfig({
   fixedExtension: false,
   minify: true,
   plugins: [licenseCollectorPlugin()],
-  noExternal: [
-    '@actions/cache',
-    '@actions/core',
-    '@actions/exec',
-    '@actions/github',
-    '@actions/tool-cache',
-    '@bfra.me/es',
-    '@octokit/auth-app',
-  ] as const,
+  noExternal: id => {
+    // Bundle all @bfra.me/es subpaths
+    if (id.startsWith('@bfra.me/es')) return true
+    // Bundle all @actions/* packages
+    if (id.startsWith('@actions/')) return true
+    // Bundle @octokit/auth-app
+    if (id.startsWith('@octokit/auth-app')) return true
+    return false
+  },
 })
