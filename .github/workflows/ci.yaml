@@ -142,19 +142,25 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
+      - id: get-app-token
+        name: Get GitHub App Installation Token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner}}
+
       - name: Test setup action
         uses: ./setup/
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auth-json: '{"user":"ci-test@example.com","tokens":{"anthropic":"sk-test-key"}}'
+          github-token: ${{ steps.get-app-token.outputs.token }}
+          auth-json: '{"test":{"type":"api","key":"test-key"}}'
           opencode-version: latest
 
       - name: Test main action
         uses: ./
-        env:
-          SKIP_AGENT_EXECUTION: 'true'
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
 
   dependency-review:
