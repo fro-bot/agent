@@ -7,6 +7,7 @@ import {buildBunDownloadUrl, DEFAULT_BUN_VERSION, getBunPlatformInfo, installBun
 vi.mock('node:fs/promises', () => ({
   default: {
     readdir: vi.fn(),
+    symlink: vi.fn().mockResolvedValue(undefined),
   },
 }))
 

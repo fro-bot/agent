@@ -86,6 +86,7 @@ export async function installBun(
   if (cachedPath.length > 0) {
     logger.info('Bun found in cache', {version, path: cachedPath})
     addPath(cachedPath)
+    await createBunXSymlink(cachedPath)
     return {path: cachedPath, version, cached: true}
   }
 
@@ -113,6 +114,7 @@ export async function installBun(
 
     // Add to PATH so bunx is available
     addPath(toolPath)
+    await createBunXSymlink(toolPath)
 
     logger.info('Bun installed', {version, path: toolPath})
     return {path: toolPath, version, cached: false}
@@ -140,6 +142,18 @@ async function extractBun(inputPath: string, toolCache: ToolCacheAdapter): Promi
     }
   }
   throw new Error('Could not find executable: bun')
+}
+
+async function createBunXSymlink(binPath: string): Promise<void> {
+  const exe = (name: string) => (process.platform === 'win32' ? `${name}.exe` : name)
+  const bunPath = path.join(binPath, exe('bun'))
+  try {
+    await fs.symlink(bunPath, path.join(binPath, exe('bunx')))
+  } catch (error) {
+    if (typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw error
+    }
+  }
 }
 
 /**
