@@ -182,14 +182,9 @@ describe('omo', () => {
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'bun',
-        ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
-        expect.objectContaining({
-          listeners: {
-            stdout: expect.any(Function) as (chunk: Buffer) => void,
-            stderr: expect.any(Function) as (chunk: Buffer) => void,
-          },
-        }),
+        'bunx',
+        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
+        expect.objectContaining({silent: true}),
       )
     })
 
@@ -205,14 +200,9 @@ describe('omo', () => {
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'bun',
-        ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
-        expect.objectContaining({
-          listeners: {
-            stdout: expect.any(Function) as (chunk: Buffer) => void,
-            stderr: expect.any(Function) as (chunk: Buffer) => void,
-          },
-        }),
+        'bunx',
+        ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
+        expect.objectContaining({silent: true}),
       )
     })
 
