@@ -172,8 +172,8 @@ describe('omo', () => {
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
+        'bun',
+        ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
         expect.objectContaining({silent: true}),
       )
     })
@@ -190,8 +190,8 @@ describe('omo', () => {
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
-        'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
+        'bun',
+        ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
         expect.objectContaining({silent: true}),
       )
     })
