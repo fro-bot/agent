@@ -11,7 +11,10 @@ vi.mock('./bun.js', () => ({
   installBun: vi.fn(),
 }))
 
-// Mock logger
+/**
+ * Create a mock Logger for testing.
+ * All methods are vi.fn() mocks that can be verified with toHaveBeenCalled.
+ */
 function createMockLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -42,7 +45,10 @@ function createMockToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCac
   }
 }
 
-// Create mock deps object
+/**
+ * Create mock dependencies for installOmo function testing.
+ * Provides all required dependencies with sensible defaults that can be overridden.
+ */
 function createMockDeps(overrides: Partial<OmoInstallDeps> = {}): OmoInstallDeps {
   return {
     logger: createMockLogger(),
@@ -68,13 +74,15 @@ describe('omo', () => {
         execAdapter: createMockExecAdapter({
           exec: vi
             .fn()
-            .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
-              // Simulate successful output with version
-              if (options?.listeners?.stdout != null) {
-                options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
-              }
-              return 0
-            }),
+            .mockImplementation(
+              async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
+                // Simulate successful output with version
+                if (options?.listeners?.stdout != null) {
+                  options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
+                }
+                return 0
+              },
+            ),
         }),
       })
 
@@ -93,12 +101,14 @@ describe('omo', () => {
         execAdapter: createMockExecAdapter({
           exec: vi
             .fn()
-            .mockImplementation(async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}) => {
-              if (options?.listeners?.stdout != null) {
-                options.listeners.stdout(Buffer.from('Installation complete\n'))
-              }
-              return 0
-            }),
+            .mockImplementation(
+              async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
+                if (options?.listeners?.stdout != null) {
+                  options.listeners.stdout(Buffer.from('Installation complete\n'))
+                }
+                return 0
+              },
+            ),
         }),
       })
 
@@ -174,7 +184,12 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bun',
         ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
-        expect.objectContaining({silent: true}),
+        expect.objectContaining({
+          listeners: {
+            stdout: expect.any(Function) as (chunk: Buffer) => void,
+            stderr: expect.any(Function) as (chunk: Buffer) => void,
+          },
+        }),
       )
     })
 
@@ -192,7 +207,12 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bun',
         ['x', 'oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
-        expect.objectContaining({silent: true}),
+        expect.objectContaining({
+          listeners: {
+            stdout: expect.any(Function) as (chunk: Buffer) => void,
+            stderr: expect.any(Function) as (chunk: Buffer) => void,
+          },
+        }),
       )
     })
 
@@ -209,14 +229,14 @@ describe('omo', () => {
                 _cmd,
                 _args,
                 options: {listeners?: {stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void}},
-              ) => {
+              ): Promise<number> => {
                 if (options?.listeners?.stdout != null) {
                   options.listeners.stdout(Buffer.from('stdout output'))
                 }
                 if (options?.listeners?.stderr != null) {
                   options.listeners.stderr(Buffer.from('stderr output'))
                 }
-                return 1 // Non-zero to trigger warning
+                return 1
               },
             ),
         }),
