@@ -1,4 +1,5 @@
 import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
+import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -7,7 +8,7 @@ const TOOL_NAME = 'bun'
 const DOWNLOAD_BASE_URL = 'https://github.com/oven-sh/bun/releases/download'
 
 /** Default Bun version to install */
-export const DEFAULT_BUN_VERSION = '1.2.5'
+export const DEFAULT_BUN_VERSION = '1.3.5'
 
 /**
  * Bun installation result
@@ -103,11 +104,9 @@ export async function installBun(
     }
 
     logger.info('Extracting Bun')
-    const extractedPath = await toolCache.extractZip(downloadPath)
-
-    // Bun extracts to a subdirectory like bun-linux-x64/
-    const bunSubdir = `bun-${platformInfo.os}-${platformInfo.arch}`
-    const bunBinPath = path.join(extractedPath, bunSubdir)
+    const extractedZipPath = await toolCache.extractZip(downloadPath)
+    const extractedBunPath = await extractBun(extractedZipPath, toolCache)
+    const bunBinPath = path.dirname(extractedBunPath)
 
     logger.info('Caching Bun')
     const toolPath = await toolCache.cacheDir(bunBinPath, TOOL_NAME, version, platformInfo.arch)
@@ -121,6 +120,26 @@ export async function installBun(
     const errorMsg = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to install Bun ${version}: ${errorMsg}`)
   }
+}
+
+async function extractBun(inputPath: string, toolCache: ToolCacheAdapter): Promise<string> {
+  for (const entry of await fs.readdir(inputPath, {withFileTypes: true})) {
+    const {name} = entry
+    const entryPath = path.join(inputPath, name)
+    if (entry.isFile()) {
+      if (name === 'bun' || name === 'bun.exe') {
+        return entryPath
+      }
+      if (/^bun.*\.zip/.test(name)) {
+        const extractedPath = await toolCache.extractZip(entryPath)
+        return extractBun(extractedPath, toolCache)
+      }
+    }
+    if (name.startsWith('bun') && entry.isDirectory()) {
+      return extractBun(entryPath, toolCache)
+    }
+  }
+  throw new Error('Could not find executable: bun')
 }
 
 /**
