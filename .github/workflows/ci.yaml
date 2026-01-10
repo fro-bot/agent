@@ -50,7 +50,7 @@ jobs:
               - '**.yaml'
               - '**.yml'
             dist-changed: &dist-changed
-              - added|modified: 'dist/**'
+              - dist/**
             src-changed: &src-changed
               - src/**
               - action.yaml
