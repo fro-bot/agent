@@ -1,5 +1,17 @@
 # Product Requirements Document (PRD): Fro Bot Agent Harness
 
+**Version:** 1.1
+**Last Updated:** 2026-01-10
+
+### Version History
+
+| Version | Date | Changes |
+| --- | --- | --- |
+| 1.1 | 2026-01-10 | SDK execution model (replaces CLI), GraphQL context hydration, file attachments, model/agent config, mock event support, enhanced prompt construction |
+| 1.0 | 2026-01-02 | Initial PRD |
+
+---
+
 ## Overview
 
 Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on:
@@ -309,6 +321,205 @@ The agent prompt must include sufficient context and instructions for GitHub ope
 4. **Run summary requirement**
    - Every comment MUST include collapsed `<details>` block with run metadata.
 
+#### F. OpenCode SDK Execution (P0 - PRIMARY)
+
+> **Note:** This replaces the previous CLI execution model (`opencode run "$PROMPT"`). RFC-012 is superseded by this specification. A new RFC-013 will detail the SDK implementation.
+
+1. **SDK-based execution** (replaces CLI as default)
+   - Use `@opencode-ai/sdk` with `createOpencode()` for automatic server lifecycle.
+   - Server started automatically, managed via AbortController.
+   - No manual port management required.
+
+2. **Session lifecycle**
+   - Create session: `client.session.create({ body: { title } })`
+   - Send prompt: `client.session.promptAsync()` (non-blocking)
+   - Track session ID throughout execution.
+
+3. **Event subscription and processing**
+   - Subscribe: `client.event.subscribe()` returns async stream.
+   - Track state: `mainSessionIdle`, `mainSessionError`, `lastError`.
+   - Process tool calls, text updates, session events.
+
+4. **Completion detection**
+   - Poll every 500ms for idle state.
+   - Check completion conditions (todos complete, no pending work).
+   - Handle session errors with proper exit codes.
+
+5. **Timeout and cancellation**
+   - Configurable timeout via `timeout` input (0 = no timeout, default: 30 minutes).
+   - AbortController for clean cancellation.
+   - SIGINT handling for graceful shutdown.
+
+6. **Cleanup**
+   - `server.close()` on completion, error, or signal.
+   - Restore any modified git config.
+   - Proper exit codes (0=success, 1=error, 130=interrupted).
+
+#### G. Local Development & Testing (P0)
+
+1. **Mock event support**
+   - `MOCK_EVENT` environment variable accepts JSON payload matching GitHub webhook schema.
+   - `MOCK_TOKEN` provides authentication token for local testing.
+   - Only enabled when `CI` env var is not `true` OR `allow-mock-event: true` input is set.
+
+2. **Mock payload schema**
+   - Must include: `eventName`, `payload`, `repo`, `actor`.
+   - Validated on parse; clear error messages for malformed input.
+
+3. **Share URL behavior**
+   - Mock mode uses `https://dev.opencode.ai` for share links.
+   - Production uses `https://opencode.ai`.
+
+4. **Security guard**
+   - Mock mode MUST be explicitly disabled in production workflows.
+   - Log warning when mock mode is active.
+
+#### H. File Attachment Processing (P0)
+
+1. **Attachment detection**
+   - Parse comment body for GitHub user-attachment URLs:
+     - Markdown images: `![alt](https://github.com/user-attachments/assets/...)`
+     - HTML images: `<img ... src="https://github.com/user-attachments/assets/..." />`
+     - File links: `[filename](https://github.com/user-attachments/files/...)`
+   - Regex pattern: `/!?\[.*?\]\((https:\/\/github\.com\/user-attachments\/[^)]+)\)/gi`
+
+2. **Download and processing**
+   - Authenticate with GitHub token for private repo attachments.
+   - Download to temp storage.
+   - Determine MIME type from response headers.
+
+3. **Prompt injection** (SDK mode)
+   - Replace original markdown with `@filename` reference.
+   - Pass as `type: "file"` parts with base64 content.
+
+4. **Limits and policy**
+   - Max 5 attachments per comment.
+   - Max 5MB per attachment, 15MB total.
+   - Allowed types: `image/*`, `text/*`, `application/json`, `application/pdf`.
+
+5. **Security**
+   - Validate URLs are from `github.com/user-attachments/` only.
+   - Attachments NOT persisted to cache.
+   - Log attachment metadata (filename, size, type) but not content.
+
+#### I. Model and Agent Configuration (P0)
+
+1. **Action inputs**
+
+   ```yaml
+   agent:
+     description: "Agent to use (default: Sisyphus). Must be primary agent, not subagent."
+     required: false
+     default: "Sisyphus"
+   model:
+     description: "Model override (format: provider/model). If not set, uses agent's configured model."
+     required: false
+   ```
+
+2. **Agent configuration**
+   - Default agent: `"Sisyphus"` (oMo's default agent).
+   - Agent validated against `client.agent.list()`.
+   - Non-primary agents (subagents) fall back to Sisyphus with warning.
+   - Missing agents fall back to Sisyphus with warning.
+
+3. **Model parsing and validation** (when provided)
+   - Format: `{providerID}/{modelID}` (e.g., `anthropic/claude-sonnet-4-20250514`).
+   - Both segments must be non-empty.
+   - Error if format invalid.
+
+4. **Execution**
+   - Pass to `client.session.chat()` or `client.session.promptAsync()`:
+     ```typescript
+     // Agent is always provided (defaults to "Sisyphus")
+     // Model override is optional
+     {
+       agent: agentName,
+       ...(model != null && {
+         providerID: model.providerID,
+         modelID: model.modelID,
+       }),
+       parts: [...]
+     }
+     ```
+
+5. **Auditability**
+   - Include agent (and model if overridden) in run summary footer.
+   - Log agent/model selection at start of execution.
+
+#### J. Enhanced GitHub Context Hydration (P0)
+
+1. **Issue context** (via GraphQL)
+   - Title, body, author, state, created date.
+   - Last 50 comments with author, timestamp, body.
+   - Labels and assignees.
+
+2. **Pull request context** (via GraphQL)
+   - Base data: title, body, author, state, baseRefName, headRefName, headRefOid.
+   - Stats: additions, deletions, commits.totalCount.
+   - Repository info: baseRepository.nameWithOwner, headRepository.nameWithOwner.
+   - Commits: last 100 with oid, message, author.
+   - Files: last 100 with path, additions, deletions, changeType.
+   - Comments: last 100 with full metadata.
+   - Reviews: last 100 with state, body, and inline comments (path, line).
+
+3. **Context budgeting**
+   - Max 50 comments per thread.
+   - Max 100 changed files.
+   - Truncate bodies > 10KB with note.
+   - Total context budget: ~100KB before prompt injection.
+
+4. **Fork PR detection**
+   - Compare `headRepository.nameWithOwner` vs `baseRepository.nameWithOwner`.
+   - Different handling for local vs fork PRs (branch checkout strategy).
+
+5. **Fallback behavior**
+   - If GraphQL fails, fall back to REST API with reduced context.
+   - Log warning when context is degraded.
+
+#### K. Agent Prompt Construction (P0)
+
+1. **Prompt structure**
+
+   ```
+   [mode-instructions]     # analyze-mode, ultrawork-mode (from config)
+
+   [identity]              # Bot username, mentioned by whom, in which repo
+
+   [context]               # Type, number, title, repo, default branch
+
+   [user-request]          # The triggering comment body
+
+   [mandatory-reading]     # Instructions to read full conversation first
+
+   [issue/pr-data]         # GraphQL-hydrated context (from J above)
+
+   [action-instructions]   # Create todos, investigate, report results
+   ```
+
+2. **Mandatory context reading instructions**
+   - For issues: `gh issue view NUMBER --comments`
+   - For PRs: THREE commands required:
+     - `gh pr view NUMBER --comments`
+     - `gh api repos/OWNER/REPO/pulls/NUMBER/comments`
+     - `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`
+   - Extract: original description, previous attempts, decisions, feedback, linked references.
+
+3. **GitHub comment formatting guidance**
+   - ALWAYS use heredoc syntax for comments with backticks:
+     ```bash
+     gh issue comment NUMBER --body "$(cat <<'EOF'
+     Content with `code` preserved
+     EOF
+     )"
+     ```
+   - Code blocks MUST have exactly 3 backticks + language identifier.
+   - Every opening triple-backtick must have a closing triple-backtick on its own line.
+
+4. **Session tool instructions** (preserved from current PRD)
+   - Use `session_search` before re-investigating.
+   - Use `session_read` when prior work found.
+   - Leave searchable summary before completing.
+
 ### P1 (should-have)
 
 1. **Setup action refinements**
@@ -327,6 +538,33 @@ The agent prompt must include sufficient context and instructions for GitHub ope
 4. **Storage versioning**
    - Include a version marker in the storage directory.
    - On version mismatch: warn and proceed with clean state (do not fail).
+
+5. **Pull request review comment support**
+   - Handle `pull_request_review_comment` event type.
+   - Extract inline context: file path, line number, diff hunk, commit ID.
+   - Include in prompt as `<review_comment_context>` block.
+   - Agent can respond with targeted fixes to the specific code location.
+
+6. **Session sharing** (SDK mode)
+   - Optional `share` input: `true`, `false`, or unset (auto).
+   - Auto behavior: share for public repos, don't share for private.
+   - Call `client.session.share({ path: session })` to create public link.
+   - Include share link in comment footer with optional social card image.
+   - Output `share-url` from action.
+
+7. **Automatic branch management**
+   - **Issue workflow**: Create new branch → make changes → push → create PR.
+   - **Local PR workflow**: Checkout existing branch → make changes → push.
+   - **Fork PR workflow**: Add fork remote → checkout → push to fork.
+   - Branch naming: `opencode/{issue|pr}{number}-{timestamp}`.
+   - Commit format with co-author attribution.
+   - Dirty check: `git status --porcelain` before attempting push.
+
+8. **Event streaming and progress logging**
+   - Subscribe to SSE events from OpenCode server.
+   - Log tool calls with color-coded output (todo: yellow, bash: red, edit: green, etc.).
+   - Log text completions when finished.
+   - Track session state updates in real-time.
 
 ### P2 (nice-to-have)
 
@@ -531,17 +769,59 @@ The agent prompt must include sufficient context and instructions for GitHub ope
 
 The MVP is considered complete when:
 
+**SDK Execution (F)**
+
+- [ ] Agent execution uses `@opencode-ai/sdk` with `createOpencode()` for server lifecycle.
+- [ ] Session created via `client.session.create()` and prompt sent via `client.session.promptAsync()`.
+- [ ] Event subscription via `client.event.subscribe()` for progress tracking.
+- [ ] Completion detection via polling for idle state.
+- [ ] Timeout configurable via `timeout` input (default: 30 minutes).
+- [ ] Clean shutdown on completion, error, or signal (SIGINT).
+
+**Mock Event Support (G)**
+
+- [ ] `MOCK_EVENT` and `MOCK_TOKEN` env vars enable local testing.
+- [ ] Mock mode disabled in production unless `allow-mock-event: true`.
+
+**File Attachments (H)**
+
+- [ ] GitHub user-attachment URLs parsed from comment body.
+- [ ] Attachments downloaded and passed as `type: "file"` parts to SDK.
+- [ ] Limits enforced: 5 files max, 5MB each, 15MB total.
+
+**Model/Agent Config (I)**
+
+- [ ] `agent` input optional, defaults to `"Sisyphus"`.
+- [ ] `model` input optional; if not provided, uses agent's configured model.
+- [ ] Model format validated as `provider/model` when provided.
+- [ ] Agent validated against available agents.
+- [ ] Agent/model included in run summary.
+
+**GraphQL Context (J)**
+
+- [ ] Full issue context fetched via GraphQL (title, body, comments, labels).
+- [ ] Full PR context fetched via GraphQL (commits, files, reviews, inline comments).
+- [ ] Context budgeting enforced (50 comments, 100 files, 10KB body truncation).
+- [ ] Fallback to REST API on GraphQL failure.
+
+**Prompt Construction (K)**
+
+- [ ] Multi-section prompt structure with mode instructions, identity, context, user request.
+- [ ] Mandatory reading instructions for issues and PRs.
+- [ ] Heredoc guidance for GitHub comment formatting.
+- [ ] Session tool instructions included.
+
+**Core Functionality (existing)**
+
 - [ ] GitHub Action runs on issue/PR/discussion events per oMo Sisyphus parity.
 - [ ] Setup action installs OpenCode via `@actions/tool-cache` caching pattern.
-- [ ] Setup action installs oMo plugins via `npx oh-my-opencode install`.
+- [ ] Setup action installs oMo plugins via `bunx oh-my-opencode install`.
 - [ ] Setup action configures `gh` CLI with GitHub App token or GITHUB_TOKEN.
 - [ ] Agent adds 👀 reaction to triggering comment and "agent: working" label on start.
-- [ ] Agent replaces 👀 with ✌🏽 (random skin tone) or ☮️ and removes label on completion.
+- [ ] Agent replaces 👀 with success reaction and removes label on completion.
 - [ ] Cache restore/save works for `$XDG_DATA_HOME/opencode/storage/`.
 - [ ] `auth.json` is never persisted.
 - [ ] Agent uses `session_search` on startup (evidence in logs).
-- [ ] Agent prompt includes full GitHub context (repo, event, issue/PR details).
-- [ ] Agent prompt instructs use of `gh` CLI for all GitHub operations.
 - [ ] Every comment includes collapsed run summary.
 - [ ] Fork PRs handled securely via `issue_comment` with permission gating.
 - [ ] Session pruning runs at end of each run.
@@ -553,12 +833,13 @@ The MVP is considered complete when:
 
 ## Timeline (high-level)
 
-| Phase                         | Deliverables                                                  | Estimated Duration |
-| ----------------------------- | ------------------------------------------------------------- | ------------------ |
-| 1. MVP GitHub memory plumbing | Cache restore/save, auth.json exclusion, run summary format   | 2 weeks            |
-| 2. GitHub interaction parity  | Issue/PR/Discussion triggers, review comments, delegated work | 3 weeks            |
-| 3. Discord daemon MVP         | Channel=repo, thread=session, reverse proxy, S3 sync          | 3 weeks            |
-| 4. Hardening                  | Concurrency handling, pruning, error handling, docs           | 2 weeks            |
+| Phase                        | Deliverables                                                  | Estimated Duration |
+| ---------------------------- | ------------------------------------------------------------- | ------------------ |
+| 1. SDK Execution Foundation  | SDK integration, model/agent config, mock event support       | 2 weeks            |
+| 2. Enhanced Context          | GraphQL hydration, file attachments, prompt construction      | 2 weeks            |
+| 3. GitHub Interaction Parity | Issue/PR/Discussion triggers, review comments, delegated work | 3 weeks            |
+| 4. Discord Daemon MVP        | Channel=repo, thread=session, reverse proxy, S3 sync          | 3 weeks            |
+| 5. Hardening                 | Concurrency handling, pruning, error handling, docs           | 2 weeks            |
 
 ---
 
@@ -577,9 +858,48 @@ The MVP is considered complete when:
      - Implement session pruning (default: 50 sessions or 30 days) in v1.
      - Emit storage size in run summary; warn when exceeding a configurable threshold.
 
+3. **@opencode-ai/sdk stability** (NEW)
+   - Risk: External SDK dependency with unknown API stability.
+   - Mitigation:
+     - Pin SDK version in package.json.
+     - Comprehensive integration tests for SDK interactions.
+     - Monitor SDK releases for breaking changes.
+
+4. **GraphQL rate limits** (NEW)
+   - Risk: Large PRs with many comments/files could hit rate limits.
+   - Mitigation:
+     - Implement pagination with limits (50 comments, 100 files).
+     - Cache GraphQL responses within a run.
+     - Fall back to REST API on GraphQL failure.
+
+5. **File attachment security** (NEW)
+   - Risk: Malicious attachments (malware, oversized files, unexpected MIME types).
+   - Mitigation:
+     - Strict URL allowlist (`github.com/user-attachments/` only).
+     - Size limits (5MB per file, 15MB total).
+     - MIME type validation.
+     - Attachments never persisted to cache.
+
 ---
 
 ## Appendix: Technical Notes
+
+### Execution Model Decision
+
+**v1.1 Change:** The project uses **SDK-based execution** via `@opencode-ai/sdk` as the primary execution model. This replaces the previous CLI execution model (`opencode run "$PROMPT"`).
+
+**Rationale:**
+
+- Enables structured file attachments as typed parts
+- Provides session event streaming for real-time progress
+- Supports agent validation before execution
+- Aligns with OpenCode GitHub Action and oh-my-opencode patterns
+
+**RFC Impact:**
+
+- RFC-012 (Agent Execution - Main Action) is superseded by this specification
+- RFC-013 (SDK Execution Mode) will detail the implementation
+- RFC-011 (Setup Action) decision table updated to reflect SDK choice
 
 ### Runtime Decision
 
@@ -607,3 +927,10 @@ Include a `.version` file in `$XDG_DATA_HOME/opencode/storage/`:
 ```
 
 Increment on breaking changes. Agent checks on restore and warns if mismatch.
+
+### New Dependencies (v1.1)
+
+| Dependency         | Purpose                        | Version Strategy               |
+| ------------------ | ------------------------------ | ------------------------------ |
+| `@opencode-ai/sdk` | SDK client for OpenCode server | Pin to specific version        |
+| GraphQL client     | GitHub context hydration       | Use Octokit's built-in GraphQL |

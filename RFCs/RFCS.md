@@ -1,6 +1,8 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-04 **Total RFCs:** 12 **Implementation Strategy:** Sequential (RFC-001 → RFC-012)
+**Generated:** 2026-01-10
+**Total RFCs:** 13
+**Implementation Strategy:** Sequential (RFC-001 → RFC-013)
 
 ---
 
@@ -14,20 +16,21 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 
 ## RFC Summary Table
 
-| RFC ID  | Title                                | Priority | Complexity | Phase | Status    |
-| ------- | ------------------------------------ | -------- | ---------- | ----- | --------- |
-| RFC-001 | Foundation & Core Types              | MUST     | Medium     | 1     | Completed |
-| RFC-002 | Cache Infrastructure                 | MUST     | High       | 1     | Completed |
-| RFC-003 | GitHub API Client Layer              | MUST     | Medium     | 1     | Completed |
-| RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed |
-| RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Pending   |
-| RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Pending   |
-| RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending   |
-| RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending   |
-| RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending   |
-| RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending   |
-| RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed |
-| RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Completed |
+| RFC ID  | Title                                | Priority | Complexity | Phase | Status     |
+| ------- | ------------------------------------ | -------- | ---------- | ----- | ---------- |
+| RFC-001 | Foundation & Core Types              | MUST     | Medium     | 1     | Completed  |
+| RFC-002 | Cache Infrastructure                 | MUST     | High       | 1     | Completed  |
+| RFC-003 | GitHub API Client Layer              | MUST     | Medium     | 1     | Completed  |
+| RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed  |
+| RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Pending    |
+| RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Pending    |
+| RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending    |
+| RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending    |
+| RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending    |
+| RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending    |
+| RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed  |
+| RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Superseded |
+| RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Pending    |
 
 ---
 
@@ -40,9 +43,11 @@ RFC-001 (Foundation)
     │       │                           │
     │       └── [OpenCode, oMo, gh]     │
     │               │                   │
-    │               └── RFC-012 (Agent Execution)
+    │               └── RFC-012 (Agent Execution) ──[SUPERSEDED: execution layer]
     │                       │
-    │                       └── [Run OpenCode, reactions, context]
+    │                       └── RFC-013 (SDK Execution Mode)
+    │                               │
+    │                               └── [@opencode-ai/sdk, sessions, events]
     │
     ├── RFC-002 (Cache) ──────────────┐ │
     │       │                         │ │
@@ -73,17 +78,18 @@ RFC-001 (Foundation)
 
 **Goal:** Establish foundational infrastructure
 
-| RFC     | Description                              | Estimated Effort |
-| ------- | ---------------------------------------- | ---------------- |
-| RFC-001 | Types, utilities, logging, action inputs | 6-9 hours        |
-| RFC-002 | Cache restore/save, auth.json exclusion  | 9-12 hours       |
-| RFC-003 | Octokit client, context parsing          | 6-9 hours        |
-| RFC-011 | Setup action, OpenCode/oMo install, gh   | 14-20 hours      |
-| RFC-012 | Agent execution, reactions, context      | 16-22 hours      |
+| RFC     | Description                              | Estimated Effort                          |
+| ------- | ---------------------------------------- | ----------------------------------------- |
+| RFC-001 | Types, utilities, logging, action inputs | 6-9 hours                                 |
+| RFC-002 | Cache restore/save, auth.json exclusion  | 9-12 hours                                |
+| RFC-003 | Octokit client, context parsing          | 6-9 hours                                 |
+| RFC-011 | Setup action, OpenCode/oMo install, gh   | 14-20 hours                               |
+| RFC-012 | Agent execution, reactions, context      | 16-22 hours (SUPERSEDED: execution layer) |
+| RFC-013 | SDK Execution Mode                       | 18-26 hours                               |
 
-**Phase 1 Total:** ~51-72 hours
+**Phase 1 Total:** ~69-92 hours
 
-**Milestone:** Action can restore/save cache, parse GitHub context, and bootstrap OpenCode/oMo environment.
+**Milestone:** Action can restore/save cache, parse GitHub context, bootstrap OpenCode/oMo environment, and execute agent via `@opencode-ai/sdk` with session tracking and event subscription.
 
 ---
 

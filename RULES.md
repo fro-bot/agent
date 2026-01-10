@@ -1,7 +1,7 @@
 # Development Rules: Fro Bot Agent
 
-**Version:** 1.0
-**Last Updated:** 2026-01-03
+**Version:** 1.1
+**Last Updated:** 2026-01-10
 **Applies to:** All contributors and AI assistants
 
 ---
@@ -10,11 +10,12 @@
 
 - [Project Overview](#project-overview)
 - [Technology Stack](#technology-stack)
-- [Code Style & Conventions](#code-style--conventions)
+- [Code Style \& Conventions](#code-style--conventions)
 - [Architecture Patterns](#architecture-patterns)
+- [SDK Execution Patterns](#sdk-execution-patterns)
 - [Security Requirements](#security-requirements)
 - [Testing Standards](#testing-standards)
-- [Build & Release](#build--release)
+- [Build \& Release](#build--release)
 - [GitHub Action Specifics](#github-action-specifics)
 - [Documentation Standards](#documentation-standards)
 - [Anti-Patterns (Forbidden)](#anti-patterns-forbidden)
@@ -32,6 +33,11 @@ Fro Bot Agent is a GitHub Action + Discord bot harness for OpenCode with persist
 - GitHub Action (TypeScript, Node.js 24)
 - Discord daemon (long-running bot)
 - Shared OpenCode storage (persisted via cache + S3)
+- SDK-based execution (`@opencode-ai/sdk`)
+- GraphQL context hydration for issues/PRs
+- File attachment support
+- Explicit model/agent configuration
+- Mock event support for local testing
 
 ---
 
@@ -47,11 +53,13 @@ Fro Bot Agent is a GitHub Action + Discord bot harness for OpenCode with persist
 
 ### Core Dependencies
 
-| Package           | Purpose            | Bundle Strategy      |
-| ----------------- | ------------------ | -------------------- |
-| `@actions/core`   | GitHub Actions SDK | Bundled (noExternal) |
-| `@actions/cache`  | Cache restore/save | To be added          |
-| `@actions/github` | GitHub API client  | To be added          |
+| Package             | Purpose                   | Bundle Strategy      |
+| ------------------- | ------------------------- | -------------------- |
+| `@actions/core`     | GitHub Actions SDK        | Bundled (noExternal) |
+| `@actions/cache`    | Cache restore/save        | Bundled              |
+| `@actions/github`   | GitHub API client         | Bundled              |
+| `@opencode-ai/sdk`  | OpenCode SDK execution    | Bundled              |
+| `@octokit/auth-app` | GitHub App authentication | Bundled              |
 
 ### Development Dependencies
 
@@ -83,6 +91,7 @@ All tooling extends `@bfra.me/*` shared configs:
 
 // CORRECT: ESM imports
 import {getInput, setOutput} from "@actions/core"
+import {createOpencodeClient} from "@opencode-ai/sdk"
 import {wait} from "./wait.js"
 
 // WRONG: CommonJS
@@ -184,14 +193,24 @@ function parseConfig(input: string): Result<Config, ParseError> {
 ```
 src/
 ├── main.ts              # Action entry point (top-level await)
+├── setup.ts             # Setup action entry point
 ├── lib/
+│   ├── agent/           # Agent execution
+│   │   ├── opencode.ts  # SDK executor (executeOpenCode)
+│   │   ├── context.ts   # GitHub context collection
+│   │   ├── prompt.ts    # Prompt construction
+│   │   ├── reactions.ts # Reactions and labels
+│   │   └── types.ts     # Agent-specific types
+│   ├── github/          # GitHub API
+│   │   ├── client.ts    # Octokit client creation
+│   │   └── context.ts   # Event parsing
+│   ├── setup/           # Setup action modules
 │   ├── cache.ts         # Cache restore/save logic
-│   ├── github.ts        # GitHub API interactions
-│   ├── session.ts       # Session management
-│   ├── summary.ts       # Run summary generation
-│   └── types.ts         # Shared type definitions
+│   ├── logger.ts        # JSON logging with redaction
+│   ├── types.ts         # Shared type definitions
+│   └── constants.ts     # Shared constants
 ├── utils/
-│   ├── retry.ts         # Retry with backoff
+│   ├── env.ts           # Environment variable getters
 │   └── validation.ts    # Input validation
 └── constants.ts         # Shared constants
 ```
@@ -239,6 +258,190 @@ async function postComment(body: string, options: {octokit: Octokit; context: Co
 
 // WRONG: Global imports for testability issues
 import {octokit} from "./global-client" // Avoid
+```
+
+---
+
+## SDK Execution Patterns
+
+### OpenCode SDK Usage (v1.1)
+
+The agent uses `@opencode-ai/sdk` for execution. Follow these canonical patterns:
+
+#### Server Lifecycle Management
+
+```typescript
+import {createOpencode} from "@opencode-ai/sdk"
+
+// RECOMMENDED: Auto server + client (single function)
+const {server, client} = await createOpencode({
+  port: 4096,
+  timeout: 5000,
+})
+
+try {
+  // Use the client
+  const session = await client.session.create()
+  // ...
+} finally {
+  // ALWAYS clean up
+  server.close()
+}
+```
+
+#### Alternative: Manual Server + Client
+
+```typescript
+import {createOpencodeServer, createOpencodeClient} from "@opencode-ai/sdk"
+
+// For more control over server lifecycle
+const server = await createOpencodeServer({
+  hostname: "127.0.0.1",
+  port: 4096,
+  timeout: 5000,
+})
+
+const client = createOpencodeClient({
+  baseUrl: server.url,
+})
+
+// Remember to clean up
+server.close()
+```
+
+#### Session Creation
+
+```typescript
+// Create session with title
+const session = await client.session.create({
+  body: {title: `GitHub Action: ${repo}`},
+})
+const sessionId = session.data.id
+
+// Create child session (for background tasks)
+const childSession = await client.session.create({
+  body: {
+    parentID: parentSessionId,
+    title: "Background Task",
+  },
+})
+```
+
+#### Sending Prompts
+
+```typescript
+// Send text prompt with agent (agent is always provided, defaults to "Sisyphus")
+await client.session.prompt({
+  path: {id: sessionId},
+  body: {
+    agent: agentName, // Required, default "Sisyphus"
+    parts: [{type: "text", text: promptText}],
+  },
+})
+
+// Send with optional model override
+// If model is not provided, uses the agent's configured model
+await client.session.prompt({
+  path: {id: sessionId},
+  body: {
+    agent: agentName,
+    ...(model != null && {
+      providerID: model.providerID,
+      modelID: model.modelID,
+    }),
+    parts: [{type: "text", text: promptText}],
+  },
+})
+
+// Send with file attachments
+await client.session.prompt({
+  path: {id: sessionId},
+  body: {
+    agent: agentName,
+    parts: [
+      {
+        type: "file",
+        mime: "image/png",
+        url: "file:///path/to/image.png",
+      },
+      {type: "text", text: "Analyze this image"},
+    ],
+  },
+})
+```
+
+#### Event Subscription
+
+```typescript
+// Subscribe to events
+const events = await client.event.subscribe()
+
+// Process events in async loop
+for await (const event of events.stream) {
+  switch (event.type) {
+    case "session.idle":
+      if (event.properties.sessionID === sessionId) {
+        console.log("Session completed")
+        break
+      }
+      break
+
+    case "session.error":
+      console.error("Error:", event.properties.error)
+      break
+
+    case "message.part.updated":
+      const part = event.properties.part
+      if (part.type === "text" && part.time?.end != null) {
+        console.log("AI response completed")
+      }
+      if (part.type === "tool" && part.state.status === "completed") {
+        console.log(`Tool used: ${part.tool}`)
+      }
+      break
+  }
+}
+
+// Cancel subscription
+events.controller.abort()
+```
+
+### Model Configuration
+
+If provided, format: `provider/model`. If not provided, uses agent's configured model.
+
+```typescript
+// Parse model input (returns null if not provided)
+function parseModelInput(input: string): ModelConfig {
+  const [providerID, ...rest] = input.split("/")
+  const modelID = rest.join("/")
+
+  if (providerID == null || providerID.length === 0 || modelID.length === 0) {
+    throw new Error(`Invalid model format: "${input}". Expected "provider/model"`)
+  }
+
+  return {providerID, modelID}
+}
+
+// Valid examples (when model override is desired)
+parseModelInput("anthropic/claude-sonnet-4-20250514")
+parseModelInput("openai/gpt-4o")
+parseModelInput("google/gemini-2.0-flash")
+```
+
+### Agent Validation
+
+Agent validation happens **server-side**. The SDK client passes the agent name, and the server validates:
+
+```typescript
+// Send prompt with agent (server validates)
+await client.session.prompt({
+  path: {id: sessionId},
+  body: {
+    agent: agentName, // Server validates and falls back if invalid
+    parts: [...],
+  },
+})
 ```
 
 ---
@@ -292,6 +495,25 @@ function isSelfComment(context: Context, botLogin: string): boolean {
 - **S3 prefix isolation** by agent identity + repo
 - **Never cache secrets** - explicit exclusion list
 
+### File Attachment Security
+
+```typescript
+// Validate attachment URLs - ONLY from github.com/user-attachments/
+const ATTACHMENT_URL_PATTERN = /^https:\/\/github\.com\/user-attachments\/(assets|files)\//
+
+function isValidAttachmentUrl(url: string): boolean {
+  return ATTACHMENT_URL_PATTERN.test(url)
+}
+
+// Enforce limits
+const ATTACHMENT_LIMITS = {
+  maxFiles: 5,
+  maxFileSizeBytes: 5 * 1024 * 1024, // 5MB
+  maxTotalSizeBytes: 15 * 1024 * 1024, // 15MB
+  allowedMimeTypes: ["image/*", "text/*", "application/json", "application/pdf"],
+} as const
+```
+
 ---
 
 ## Testing Standards
@@ -328,53 +550,31 @@ function isSelfComment(context: Context, botLogin: string): boolean {
 - One test at a time - don't batch
 - Test file naming: `*.test.ts` alongside source
 
-### Test File Structure
+### SDK Mocking Pattern
 
 ```typescript
-// src/lib/cache.test.ts
-import {describe, it, expect} from "vitest"
-import {buildCacheKey, validateCacheResult} from "./cache.js"
+// Mock @opencode-ai/sdk for tests
+vi.mock("@opencode-ai/sdk", () => ({
+  createOpencode: vi.fn(),
+  createOpencodeClient: vi.fn(),
+  createOpencodeServer: vi.fn(),
+}))
 
-describe("buildCacheKey", () => {
-  it("includes all required components", () => {
-    const key = buildCacheKey({
-      agentIdentity: "github",
-      repo: "owner/repo",
-      ref: "main",
-      os: "Linux",
-    })
-
-    expect(key).toBe("opencode-storage-github-owner/repo-main-Linux")
-  })
-
-  it("handles special characters in repo name", () => {
-    // ...
-  })
-})
-```
-
-### Integration Test Pattern
-
-```typescript
-// src/main.test.ts
-import {exec} from "node:child_process"
-import {promisify} from "node:util"
-
-const execAsync = promisify(exec)
-
-describe("GitHub Action", () => {
-  it("runs successfully with valid inputs", async () => {
-    const {stdout, stderr} = await execAsync("node dist/main.js", {
-      env: {
-        ...process.env,
-        INPUT_MILLISECONDS: "100",
-        GITHUB_OUTPUT: "/dev/null",
-      },
-    })
-
-    expect(stderr).toBe("")
-  })
-})
+// Create mock client
+function createMockClient(options: {sessionIdle?: boolean; sessionError?: boolean}) {
+  return {
+    session: {
+      create: vi.fn().mockResolvedValue({data: {id: "ses_123"}}),
+      prompt: vi.fn().mockResolvedValue({}),
+    },
+    event: {
+      subscribe: vi.fn().mockResolvedValue({
+        stream: createMockEventStream(options),
+        controller: {abort: vi.fn()},
+      }),
+    },
+  }
+}
 ```
 
 ### Coverage Expectations
@@ -437,6 +637,17 @@ inputs:
   auth-json:
     description: "JSON object or path with OpenCode credentials (auth.json format)"
     required: true
+  agent:
+    description: "Agent to use (default: Sisyphus). Must be primary agent, not subagent."
+    required: false
+    default: "Sisyphus"
+  model:
+    description: "Model override (format: provider/model). If not set, uses agent's configured model."
+    required: false
+  timeout:
+    description: "Execution timeout in milliseconds (0 = no timeout, default: 1800000)"
+    required: false
+    default: "1800000"
   prompt:
     description: "Custom prompt"
     required: false
@@ -454,6 +665,8 @@ outputs:
     description: "OpenCode session ID used for this run"
   cache-status:
     description: "Cache restore status (hit/miss/corrupted)"
+  share-url:
+    description: "Session share URL (if sharing enabled)"
 
 runs:
   using: "node24"
@@ -478,16 +691,18 @@ Every comment must include:
 <details>
 <summary>Run Summary</summary>
 
-| Field    | Value              |
-| -------- | ------------------ |
-| Event    | issue_comment      |
-| Repo     | owner/repo         |
-| Ref      | main               |
-| Run ID   | 12345678           |
-| Cache    | hit                |
-| Session  | ses_abc123         |
-| Duration | 45s                |
-| Tokens   | 1,234 in / 567 out |
+| Field    | Value                              |
+| -------- | ---------------------------------- |
+| Event    | issue_comment                      |
+| Repo     | owner/repo                         |
+| Ref      | main                               |
+| Run ID   | 12345678                           |
+| Cache    | hit                                |
+| Session  | ses_abc123                         |
+| Model    | anthropic/claude-sonnet-4-20250514 |
+| Agent    | Sisyphus                           |
+| Duration | 45s                                |
+| Tokens   | 1,234 in / 567 out                 |
 
 </details>
 ```
@@ -519,13 +734,20 @@ counter++
 
 ```typescript
 /**
- * Restore OpenCode storage from cache.
+ * Execute OpenCode agent via SDK.
  *
- * @param options - Cache configuration
- * @returns Cache result with hit/miss status and restored path
- * @throws {CacheError} If cache is corrupted and cannot be recovered
+ * Spawns OpenCode server, creates session, sends prompt, and waits for completion.
+ *
+ * @param prompt - The prompt text to send to the agent
+ * @param opencodePath - Path to opencode binary (null uses PATH)
+ * @param logger - Logger instance
+ * @returns AgentResult with success status and sessionId
  */
-export async function restoreCache(options: CacheOptions): Promise<CacheResult> {
+export async function executeOpenCode(
+  prompt: string,
+  opencodePath: string | null,
+  logger: Logger,
+): Promise<AgentResult> {
   // ...
 }
 ```
@@ -546,12 +768,33 @@ export async function restoreCache(options: CacheOptions): Promise<CacheResult> 
 | Empty catch blocks       | Swallows errors silently            | Log or rethrow                     |
 | Global mutable state     | Testing difficulties                | Dependency injection               |
 | Committing without build | CI will fail                        | Always `pnpm build` first          |
+| Caching auth.json        | Security risk                       | Populate fresh each run            |
+| Polling without timeout  | Resource exhaustion                 | Always set max timeout             |
 
 ---
 
 ## Implementation Priorities
 
 ### P0 (Must Have for MVP)
+
+**SDK Execution (F32-F37)**
+
+1. SDK-based execution via `@opencode-ai/sdk`
+2. Session creation and prompt sending
+3. Event subscription and completion detection
+4. Timeout and cancellation support
+5. Model input (optional, format: `provider/model`)
+6. Agent input (optional, validated server-side)
+
+**Context & Prompt (F38-F45)**
+
+1. Mock event support for local testing
+2. File attachment detection and download
+3. GraphQL context hydration for issues/PRs
+4. Multi-section prompt construction
+5. Context budgeting (50 comments, 100 files)
+
+**Core Functionality**
 
 1. Cache restore/save for OpenCode storage
 2. auth.json exclusion from persistence
@@ -568,6 +811,10 @@ export async function restoreCache(options: CacheOptions): Promise<CacheResult> 
 2. Corruption detection
 3. Concurrency handling (last-write-wins)
 4. Storage versioning
+5. Pull request review comment support
+6. Session sharing
+7. Automatic branch management
+8. Event streaming and progress logging
 
 ### P2 (Nice to Have)
 
@@ -618,9 +865,9 @@ type(scope): description
 
 # Types: feat, fix, docs, style, refactor, test, build, ci, chore
 # Examples:
-feat(cache): add session pruning at end of run
-fix(github): handle locked issue gracefully
-docs(readme): add S3 backup configuration
+feat(sdk): add session event subscription
+fix(cache): handle corrupted storage gracefully
+docs(readme): add SDK execution configuration
 ```
 
 ---
@@ -640,15 +887,17 @@ pnpm test         # Run tests
 
 ### Key Files
 
-| File               | Purpose                  |
-| ------------------ | ------------------------ |
-| `src/main.ts`      | Action entry point       |
-| `action.yaml`      | GitHub Action definition |
-| `tsdown.config.ts` | Build configuration      |
-| `eslint.config.ts` | Lint rules               |
-| `PRD.md`           | Product requirements     |
-| `FEATURES.md`      | Feature specifications   |
-| `AGENTS.md`        | Project conventions      |
+| File                        | Purpose                  |
+| --------------------------- | ------------------------ |
+| `src/main.ts`               | Action entry point       |
+| `src/setup.ts`              | Setup action entry point |
+| `src/lib/agent/opencode.ts` | SDK executor             |
+| `action.yaml`               | GitHub Action definition |
+| `tsdown.config.ts`          | Build configuration      |
+| `eslint.config.ts`          | Lint rules               |
+| `PRD.md`                    | Product requirements     |
+| `FEATURES.md`               | Feature specifications   |
+| `AGENTS.md`                 | Project conventions      |
 
 ### Session Tools: Action vs Agent
 
@@ -724,7 +973,43 @@ git config --global user.email "<user-id>+fro-bot[bot]@users.noreply.github.com"
   uses: fro-bot/agent@v0
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
+    agent: "Sisyphus" # Optional, defaults to Sisyphus
+    # model: "anthropic/claude-sonnet-4-20250514" # Optional, overrides agent's configured model
     prompt: "Respond to the issue comment"
+```
+
+### SDK Quick Reference
+
+```typescript
+import {createOpencode} from "@opencode-ai/sdk"
+
+// 1. Start server + client
+const {server, client} = await createOpencode({port: 4096})
+
+// 2. Create session
+const session = await client.session.create({body: {title: "My Task"}})
+
+// 3. Subscribe to events (background)
+const events = await client.event.subscribe()
+
+// 4. Send prompt (agent always provided, model override optional)
+await client.session.prompt({
+  path: {id: session.data.id},
+  body: {
+    agent: "Sisyphus", // Default agent
+    // model override only if specified:
+    // providerID: "anthropic", modelID: "claude-sonnet-4-20250514",
+    parts: [{type: "text", text: "Your prompt here"}],
+  },
+})
+
+// 5. Wait for completion
+for await (const event of events.stream) {
+  if (event.type === "session.idle") break
+}
+
+// 6. Clean up
+server.close()
 ```
 
 ---

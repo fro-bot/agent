@@ -1050,22 +1050,34 @@ If alternate runners (macOS/Windows or self-hosted) are supported later, the set
 
 ## SDK vs CLI Decision
 
-RFC-011 uses **CLI invocation** (`opencode run`) rather than the SDK (`@opencode-ai/sdk`).
+> **Updated (PRD v1.1, 2026-01-10):** The decision has been revised. SDK execution is now the PRIMARY model, replacing CLI.
 
-### Rationale
+RFC-011 originally chose **CLI invocation** (`opencode run`). As of PRD v1.1, the project uses **SDK execution** (`@opencode-ai/sdk`).
 
-| Factor                    | CLI                  | SDK                      |
-| ------------------------- | -------------------- | ------------------------ |
-| Proven in production      | ✅ Sisyphus workflow | ❌ Newer, less tested    |
-| Implementation complexity | ✅ Simple spawn      | ⚠️ Server lifecycle mgmt |
-| Type safety               | ❌ Parse stdout      | ✅ Typed responses       |
-| Session management        | ❌ Manual            | ✅ `session.*` methods   |
+### Rationale (Updated)
 
-**Decision:** CLI for v1. SDK provides advantages for RFC-004 (Session Management) but adds complexity. Revisit for v2.
+| Factor                    | CLI                  | SDK                      | v1.1 Decision  |
+| ------------------------- | -------------------- | ------------------------ | -------------- |
+| Proven in production      | ✅ Sisyphus workflow | ✅ OpenCode Action       | SDK            |
+| Implementation complexity | ✅ Simple spawn      | ⚠️ Server lifecycle mgmt | SDK (worth it) |
+| Type safety               | ❌ Parse stdout      | ✅ Typed responses       | SDK            |
+| Session management        | ❌ Manual            | ✅ `session.*` methods   | SDK            |
+| File attachments          | ❌ Not supported     | ✅ `type: "file"` parts  | SDK            |
+| Event streaming           | ⚠️ stdbuf workaround | ✅ Native SSE            | SDK            |
+| Model/agent selection     | ⚠️ Env vars only     | ✅ Explicit API params   | SDK            |
 
-**Note:** The SDK still spawns CLI internally (`opencode serve`), so CLI is not less capable, just simpler to integrate.
+**Original Decision (v1.0):** CLI for v1. SDK provides advantages for RFC-004 (Session Management) but adds complexity. Revisit for v2.
 
-See `RFC-011-RESEARCH-SUMMARY.md` for detailed analysis.
+**Revised Decision (v1.1):** SDK is now PRIMARY. The additional complexity is justified by:
+
+- File attachment support (P0 requirement)
+- Explicit model/agent configuration (P0 requirement)
+- Session event streaming for progress logging
+- Alignment with OpenCode GitHub Action and oh-my-opencode patterns
+
+**Note:** RFC-013 (SDK Execution Mode) will detail the implementation. The CLI may be reintroduced medium-term as a fro-bot-specific harness built on top of the SDK.
+
+See `RFC-011-RESEARCH-SUMMARY.md` for original detailed analysis.
 
 ---
 
