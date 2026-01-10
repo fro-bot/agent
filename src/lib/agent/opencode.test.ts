@@ -58,7 +58,9 @@ describe('executeOpenCode', () => {
     await executeOpenCode('Test prompt', null, mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalledWith('stdbuf', ['-oL', '-eL', 'opencode', 'run', 'Test prompt'])
+    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
+    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
+    expect(exec.exec).toHaveBeenCalledWith('stdbuf', ['-oL', '-eL', 'opencode', 'run', '"$PROMPT"'], expectedOptions)
   })
 
   it('executes directly on macOS without stdbuf', async () => {
@@ -70,7 +72,9 @@ describe('executeOpenCode', () => {
     await executeOpenCode('Test prompt', null, mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalledWith('opencode', ['run', 'Test prompt'])
+    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
+    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
+    expect(exec.exec).toHaveBeenCalledWith('opencode', ['run', '"$PROMPT"'], expectedOptions)
   })
 
   it('executes directly on Windows without stdbuf', async () => {
@@ -82,7 +86,12 @@ describe('executeOpenCode', () => {
     await executeOpenCode('Test prompt', null, mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalledWith('opencode', ['run', 'Test prompt'])
+    expect(exec.exec).toHaveBeenCalledWith(
+      'opencode',
+      ['run', '"$PROMPT"'],
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      expect.objectContaining({env: expect.objectContaining({PROMPT: 'Test prompt'})}),
+    )
   })
 
   it('uses provided opencodePath instead of default', async () => {
@@ -94,7 +103,9 @@ describe('executeOpenCode', () => {
     await executeOpenCode('Test prompt', '/custom/path/opencode', mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalledWith('/custom/path/opencode', ['run', 'Test prompt'])
+    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
+    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
+    expect(exec.exec).toHaveBeenCalledWith('/custom/path/opencode', ['run', '"$PROMPT"'], expectedOptions)
   })
 
   it('returns failure result on non-zero exit code', async () => {
@@ -134,14 +145,14 @@ describe('executeOpenCode', () => {
       'Executing OpenCode agent',
       expect.objectContaining({
         promptLength: 11,
-        platform: expect.any(String) as unknown,
+        platform: expect.any(String) as string,
       }),
     )
     expect(mockLogger.info).toHaveBeenCalledWith(
       'OpenCode execution completed',
       expect.objectContaining({
         exitCode: 0,
-        durationMs: expect.any(Number) as unknown,
+        durationMs: expect.any(Number) as number,
       }),
     )
   })
@@ -158,12 +169,12 @@ describe('executeOpenCode', () => {
       'OpenCode execution failed',
       expect.objectContaining({
         error: 'Failed',
-        durationMs: expect.any(Number) as unknown,
+        durationMs: expect.any(Number) as number,
       }),
     )
   })
 
-  it('sessionId is null (placeholder for RFC-004)', async () => {
+  it('returns null sessionId', async () => {
     // #given
     vi.mocked(exec.exec).mockResolvedValue(0)
 
