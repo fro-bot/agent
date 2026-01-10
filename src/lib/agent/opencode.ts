@@ -28,8 +28,6 @@ export async function executeOpenCode(
   logger: Logger,
 ): Promise<AgentResult> {
   const startTime = Date.now()
-
-  // Determine OpenCode command - use PATH if not explicitly provided
   const opencodeCmd = opencodePath ?? 'opencode'
 
   logger.info('Executing OpenCode agent', {
@@ -39,17 +37,13 @@ export async function executeOpenCode(
   })
 
   try {
-    let exitCode: number
-
-    if (process.platform === 'linux') {
-      // Use stdbuf for real-time log streaming on Linux
-      // -oL: line-buffered stdout
-      // -eL: line-buffered stderr
-      exitCode = await exec.exec('stdbuf', ['-oL', '-eL', opencodeCmd, 'run', prompt])
-    } else {
-      // macOS/Windows: direct execution (buffered output)
-      exitCode = await exec.exec(opencodeCmd, ['run', prompt])
+    const options: exec.ExecOptions = {
+      env: {...process.env, PROMPT: prompt},
     }
+    const exitCode =
+      process.platform === 'linux'
+        ? await exec.exec('stdbuf', ['-oL', '-eL', opencodeCmd, 'run', '"$PROMPT"'], options)
+        : await exec.exec(opencodeCmd, ['run', '"$PROMPT"'], options)
 
     const duration = Date.now() - startTime
 
@@ -62,7 +56,7 @@ export async function executeOpenCode(
       success: exitCode === 0,
       exitCode,
       duration,
-      sessionId: null, // Will be populated by RFC-004 session integration
+      sessionId: null,
       error: null,
     }
   } catch (error) {

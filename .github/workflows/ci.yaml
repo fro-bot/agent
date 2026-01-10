@@ -21,10 +21,9 @@ jobs:
   setup:
     name: Setup
     outputs:
-      dist-changed: ${{ contains(steps.filter.outputs.changes, 'dist-changed') }}
       node-version: ${{ steps.set-node-version.outputs.node-version }}
+      should-build: ${{ contains(steps.filter.outputs.changes, 'should-build') }}
       should-lint: ${{ contains(steps.filter.outputs.changes, 'should-lint') }}
-      src-changed: ${{ contains(steps.filter.outputs.changes, 'src-changed') }}
     permissions:
       pull-requests: read
     runs-on: ubuntu-latest
@@ -50,14 +49,18 @@ jobs:
               - '**.md'
               - '**.yaml'
               - '**.yml'
-            dist-changed:
-              - added|modified: 'dist/**'
+            dist-changed: &dist-changed
+              - dist/**
             src-changed: &src-changed
               - src/**
               - action.yaml
               - package.json
             should-lint:
               - added|modified: *config
+              - added|modified: *src-changed
+            should-build:
+              - added|modified: *config
+              - added|modified: *dist-changed
               - added|modified: *src-changed
 
   lint:
@@ -80,7 +83,7 @@ jobs:
       - run: pnpm lint
 
   build:
-    if: ${{ github.event_name == 'push' || needs.setup.outputs.src-changed == 'true' }}
+    if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
     name: Build
     needs: [setup]
     runs-on: ubuntu-latest
@@ -136,17 +139,26 @@ jobs:
         run: pnpm test
 
   test-actions:
+    if: ${{ github.event_name != 'push' }}
     name: Test GitHub Actions
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
+      - id: get-app-token
+        name: Get GitHub App Installation Token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner}}
+
       - name: Test setup action
         uses: ./setup/
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auth-json: '{"user":"ci-test@example.com","tokens":{"anthropic":"sk-test-key"}}'
+          github-token: ${{ steps.get-app-token.outputs.token }}
+          auth-json: '{"test":{"type":"api","key":"test-key"}}'
           opencode-version: latest
 
       - name: Test main action
@@ -154,7 +166,7 @@ jobs:
         env:
           SKIP_AGENT_EXECUTION: 'true'
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
 
   dependency-review:
