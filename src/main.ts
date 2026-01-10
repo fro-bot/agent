@@ -4,21 +4,21 @@
  * GitHub Action harness for OpenCode + oMo agents with persistent session state.
  * This is the entry point that orchestrates the agent workflow.
  *
- * Lifecycle (RFC-012 + RFC-004 integration):
+ * Lifecycle (RFC-012 + RFC-004 + RFC-013 integration):
  * 1. Parse inputs, verify OpenCode available
  * 2. Collect GitHub context
  * 3. Acknowledge receipt (eyes reaction + working label)
  * 4. Restore cache
  * 5. Session introspection (list recent, search prior work)
  * 6. Build agent prompt (with session context)
- * 7. Execute OpenCode agent
+ * 7. Execute OpenCode agent (SDK mode - RFC-013)
  * 8. Write session summary (if sessionId available)
  * 9. Complete acknowledgment (update reaction, remove label)
  * 10. Prune old sessions (before cache save)
  * 11. Save cache (always, in finally block)
  */
 
-import type {ReactionContext} from './lib/agent/types.js'
+import type {ExecutionConfig, ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import process from 'node:process'
@@ -84,6 +84,9 @@ async function run(): Promise<void> {
       s3Backup: inputs.s3Backup,
       hasGithubToken: inputs.githubToken.length > 0,
       hasPrompt: inputs.prompt != null,
+      agent: inputs.agent,
+      hasModelOverride: inputs.model != null,
+      timeoutMs: inputs.timeoutMs,
     })
 
     // 2. Verify OpenCode is available (from setup action)
@@ -182,14 +185,25 @@ async function run(): Promise<void> {
       result = {success: true, exitCode: 0, sessionId: null, error: null}
     } else {
       const execLogger = createLogger({phase: 'execution'})
-      const execResult = await executeOpenCode(prompt, opencodePath, execLogger)
 
-      // Try to find the session created by this execution (RFC-004)
-      let sessionId: string | null = null
-      const latestSession = await findLatestSession(executionStartTime, sessionLogger)
-      if (latestSession != null) {
-        sessionId = latestSession.session.id
-        sessionLogger.debug('Identified session from execution', {sessionId})
+      // RFC-013: Build execution config from parsed inputs
+      const executionConfig: ExecutionConfig = {
+        agent: inputs.agent,
+        model: inputs.model,
+        timeoutMs: inputs.timeoutMs,
+      }
+
+      const execResult = await executeOpenCode(prompt, opencodePath, execLogger, executionConfig)
+
+      // SDK mode returns sessionId directly (RFC-013)
+      // Fall back to session discovery for backward compatibility
+      let sessionId: string | null = execResult.sessionId
+      if (sessionId == null) {
+        const latestSession = await findLatestSession(executionStartTime, sessionLogger)
+        if (latestSession != null) {
+          sessionId = latestSession.session.id
+          sessionLogger.debug('Identified session from execution', {sessionId})
+        }
       }
 
       result = {...execResult, sessionId}

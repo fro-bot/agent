@@ -1,11 +1,12 @@
 /**
- * Agent-specific type definitions for RFC-012.
+ * Agent-specific type definitions for RFC-012 and RFC-013.
  *
  * These types are used for agent context collection, prompt construction,
  * reactions/labels management, and OpenCode execution.
  */
 
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
+import type {ModelConfig} from '../types.js'
 
 /**
  * Context collected from GitHub Actions for agent prompt construction.
@@ -27,7 +28,7 @@ export interface AgentContext {
 }
 
 /**
- * Result of OpenCode CLI execution.
+ * Result of OpenCode SDK execution.
  */
 export interface AgentResult {
   readonly success: boolean
@@ -78,3 +79,24 @@ export type AcknowledgmentState = 'acknowledged' | 'completed' | 'failed' | 'pen
 export const WORKING_LABEL = 'agent: working' as const
 export const WORKING_LABEL_COLOR = 'fcf2e1' as const
 export const WORKING_LABEL_DESCRIPTION = 'Agent is currently working on this' as const
+
+/**
+ * Execution configuration for SDK mode (RFC-013).
+ * Passed from parsed action inputs to executeOpenCode.
+ */
+export interface ExecutionConfig {
+  readonly agent: string
+  readonly model: ModelConfig | null
+  readonly timeoutMs: number
+}
+
+/**
+ * Prompt part for SDK execution (RFC-013).
+ * Supports text and file attachments.
+ */
+export interface PromptPart {
+  readonly type: 'file' | 'text'
+  readonly content: string
+  readonly filename?: string
+  readonly mimeType?: string
+}

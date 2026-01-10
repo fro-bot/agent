@@ -460,6 +460,10 @@ SOFTWARE.
 MIT
 MIT
 
+@opencode-ai/sdk@1.1.11
+MIT
+MIT
+
 @fastify/busboy@2.1.1
 MIT
 Copyright Brian White. All rights reserved.

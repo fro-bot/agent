@@ -9,6 +9,10 @@ export const CACHE_EXCLUSIONS = ['auth.json', '.env', '*.key', '*.pem'] as const
 export const DEFAULT_SESSION_RETENTION = 50
 export const DEFAULT_MAX_AGE_DAYS = 30
 
+// SDK execution defaults - per RFC-013
+export const DEFAULT_AGENT = 'Sisyphus'
+export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
+
 // Retry configuration
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const
 export const LLM_RETRY_DELAY_MS = 10_000

@@ -1,8 +1,10 @@
 import type {Logger} from '../logger.js'
+import type {ExecutionConfig} from './types.js'
 import {Buffer} from 'node:buffer'
-import process from 'node:process'
+import {spawn} from 'node:child_process'
 import * as exec from '@actions/exec'
 
+import {createOpencodeClient} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
 
@@ -10,6 +12,16 @@ import {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
 vi.mock('@actions/exec', () => ({
   exec: vi.fn(),
   getExecOutput: vi.fn(),
+}))
+
+// Mock @opencode-ai/sdk
+vi.mock('@opencode-ai/sdk', () => ({
+  createOpencodeClient: vi.fn(),
+}))
+
+// Mock node:child_process
+vi.mock('node:child_process', () => ({
+  spawn: vi.fn(),
 }))
 
 function createMockLogger(): Logger {
@@ -21,23 +33,295 @@ function createMockLogger(): Logger {
   }
 }
 
+interface MockProcess {
+  stdout: {
+    on: ReturnType<typeof vi.fn>
+  }
+  stderr: {
+    on: ReturnType<typeof vi.fn>
+  }
+  on: ReturnType<typeof vi.fn>
+  kill: ReturnType<typeof vi.fn>
+  killed: boolean
+}
+
+function createMockProcess(): MockProcess {
+  const stdoutCallbacks: Map<string, (data: Buffer) => void> = new Map()
+  const stderrCallbacks: Map<string, (data: Buffer) => void> = new Map()
+  const processCallbacks: Map<string, (...args: unknown[]) => void> = new Map()
+
+  const proc: MockProcess = {
+    stdout: {
+      on: vi.fn((event: string, callback: (data: Buffer) => void) => {
+        stdoutCallbacks.set(event, callback)
+      }),
+    },
+    stderr: {
+      on: vi.fn((event: string, callback: (data: Buffer) => void) => {
+        stderrCallbacks.set(event, callback)
+      }),
+    },
+    on: vi.fn((event: string, callback: (...args: unknown[]) => void) => {
+      processCallbacks.set(event, callback)
+    }),
+    kill: vi.fn(() => {
+      proc.killed = true
+      return true
+    }),
+    killed: false,
+  }
+
+  // Helper to emit events
+  ;(proc as MockProcess & {emit: (target: string, event: string, ...args: unknown[]) => void}).emit = (
+    target: string,
+    event: string,
+    ...args: unknown[]
+  ) => {
+    if (target === 'stdout') {
+      stdoutCallbacks.get(event)?.(args[0] as Buffer)
+    } else if (target === 'stderr') {
+      stderrCallbacks.get(event)?.(args[0] as Buffer)
+    } else if (target === 'process') {
+      processCallbacks.get(event)?.(...args)
+    }
+  }
+
+  return proc
+}
+
+function createMockClient(options: {
+  promptResponse?: {parts: {type: string; text?: string}[]}
+  throwOnPrompt?: boolean
+  throwOnCreate?: boolean
+  throwOnLog?: boolean
+}) {
+  return {
+    app: {
+      log: options.throwOnLog
+        ? vi.fn().mockRejectedValue(new Error('Connection failed'))
+        : vi.fn().mockResolvedValue({}),
+    },
+    session: {
+      create: options.throwOnCreate
+        ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
+        : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
+      prompt: options.throwOnPrompt
+        ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
+        : vi.fn().mockResolvedValue({data: options.promptResponse}),
+    },
+  }
+}
+
+type MockProcessWithEmit = MockProcess & {emit: (target: string, event: string, ...args: unknown[]) => void}
+
 describe('executeOpenCode', () => {
   let mockLogger: Logger
-  const originalPlatform = process.platform
+  let mockProcess: MockProcessWithEmit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockProcess = createMockProcess() as MockProcessWithEmit
     vi.clearAllMocks()
+
+    // Default spawn mock
+    vi.mocked(spawn).mockReturnValue(mockProcess as unknown as ReturnType<typeof spawn>)
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    Object.defineProperty(process, 'platform', {value: originalPlatform})
   })
 
-  it('executes opencode with prompt and returns success result', async () => {
+  it('spawns opencode server with correct arguments', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    // Simulate server ready after spawn
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('opencode server listening on http://127.0.0.1:4096'))
+    }, 10)
+
+    // #when
+    const result = await executeOpenCode('Test prompt', null, mockLogger)
+
+    // #then
+    expect(spawn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname=127.0.0.1', '--port=4096'],
+      expect.objectContaining({
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+    )
+    expect(result.success).toBe(true)
+  })
+
+  it('uses custom opencodePath when provided', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    // #when
+    await executeOpenCode('Test prompt', '/custom/opencode', mockLogger)
+
+    // #then
+    expect(spawn).toHaveBeenCalledWith('/custom/opencode', expect.arrayContaining(['serve']), expect.any(Object))
+  })
+
+  it('creates SDK client with server URL', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger)
+
+    // #then
+    expect(createOpencodeClient).toHaveBeenCalledWith({
+      baseUrl: 'http://127.0.0.1:4096',
+    })
+  })
+
+  it('creates session and sends prompt', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    // #when
+    const result = await executeOpenCode('Test prompt', null, mockLogger)
+
+    // #then
+    expect(mockClient.session.create).toHaveBeenCalled()
+    expect(mockClient.session.prompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_123'},
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        body: expect.objectContaining({
+          agent: 'Sisyphus',
+          parts: [{type: 'text', text: 'Test prompt'}],
+        }),
+      }),
+    )
+    expect(result.sessionId).toBe('ses_123')
+  })
+
+  it('passes model configuration when provided', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    const config: ExecutionConfig = {
+      agent: 'Sisyphus',
+      model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
+      timeoutMs: 1800000,
+    }
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger, config)
+
+    // #then
+    expect(mockClient.session.prompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        body: expect.objectContaining({
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet-4-20250514',
+          },
+        }),
+      }),
+    )
+  })
+
+  it('does not include model when not configured', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    const config: ExecutionConfig = {
+      agent: 'Sisyphus',
+      model: null,
+      timeoutMs: 1800000,
+    }
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger, config)
+
+    // #then
+    const promptCalls = vi.mocked(mockClient.session.prompt).mock.calls
+    const firstCall = promptCalls[0] as [{body?: {model?: unknown}}] | undefined
+    const promptCall = firstCall?.[0]
+    expect(promptCall?.body?.model).toBeUndefined()
+  })
+
+  it('uses custom agent from config', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    const config: ExecutionConfig = {
+      agent: 'CustomAgent',
+      model: null,
+      timeoutMs: 1800000,
+    }
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger, config)
+
+    // #then
+    const callArgs = vi.mocked(mockClient.session.prompt).mock.calls[0]?.[0] as {
+      body?: {agent?: string}
+    }
+    expect(callArgs?.body?.agent).toBe('CustomAgent')
+  })
+
+  it('returns success result on successful execution', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Agent response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
 
     // #when
     const result = await executeOpenCode('Test prompt', null, mockLogger)
@@ -49,68 +333,14 @@ describe('executeOpenCode', () => {
     expect(result.duration).toBeGreaterThanOrEqual(0)
   })
 
-  it('uses stdbuf wrapper on Linux for real-time streaming', async () => {
+  it('returns failure result when prompt fails', async () => {
     // #given
-    Object.defineProperty(process, 'platform', {value: 'linux', configurable: true})
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    const mockClient = createMockClient({throwOnPrompt: true})
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
 
-    // #when
-    await executeOpenCode('Test prompt', null, mockLogger)
-
-    // #then
-    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
-    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
-    expect(exec.exec).toHaveBeenCalledWith('stdbuf', ['-oL', '-eL', 'opencode', 'run', '"$PROMPT"'], expectedOptions)
-  })
-
-  it('executes directly on macOS without stdbuf', async () => {
-    // #given
-    Object.defineProperty(process, 'platform', {value: 'darwin', configurable: true})
-    vi.mocked(exec.exec).mockResolvedValue(0)
-
-    // #when
-    await executeOpenCode('Test prompt', null, mockLogger)
-
-    // #then
-    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
-    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
-    expect(exec.exec).toHaveBeenCalledWith('opencode', ['run', '"$PROMPT"'], expectedOptions)
-  })
-
-  it('executes directly on Windows without stdbuf', async () => {
-    // #given
-    Object.defineProperty(process, 'platform', {value: 'win32', configurable: true})
-    vi.mocked(exec.exec).mockResolvedValue(0)
-
-    // #when
-    await executeOpenCode('Test prompt', null, mockLogger)
-
-    // #then
-    expect(exec.exec).toHaveBeenCalledWith(
-      'opencode',
-      ['run', '"$PROMPT"'],
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-      expect.objectContaining({env: expect.objectContaining({PROMPT: 'Test prompt'})}),
-    )
-  })
-
-  it('uses provided opencodePath instead of default', async () => {
-    // #given
-    Object.defineProperty(process, 'platform', {value: 'darwin', configurable: true})
-    vi.mocked(exec.exec).mockResolvedValue(0)
-
-    // #when
-    await executeOpenCode('Test prompt', '/custom/path/opencode', mockLogger)
-
-    // #then
-    const expectedEnv = expect.objectContaining({PROMPT: 'Test prompt'}) as Record<string, string>
-    const expectedOptions = expect.objectContaining({env: expectedEnv}) as exec.ExecOptions
-    expect(exec.exec).toHaveBeenCalledWith('/custom/path/opencode', ['run', '"$PROMPT"'], expectedOptions)
-  })
-
-  it('returns failure result on non-zero exit code', async () => {
-    // #given
-    vi.mocked(exec.exec).mockResolvedValue(1)
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
 
     // #when
     const result = await executeOpenCode('Test prompt', null, mockLogger)
@@ -118,11 +348,17 @@ describe('executeOpenCode', () => {
     // #then
     expect(result.success).toBe(false)
     expect(result.exitCode).toBe(1)
+    expect(result.error).toContain('Prompt failed')
   })
 
-  it('returns failure result on execution error', async () => {
+  it('returns failure result when session creation fails', async () => {
     // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('Command not found'))
+    const mockClient = createMockClient({throwOnCreate: true})
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
 
     // #when
     const result = await executeOpenCode('Test prompt', null, mockLogger)
@@ -130,59 +366,79 @@ describe('executeOpenCode', () => {
     // #then
     expect(result.success).toBe(false)
     expect(result.exitCode).toBe(1)
-    expect(result.error).toBe('Command not found')
+    expect(result.error).toContain('Session creation failed')
   })
 
-  it('logs execution info and completion', async () => {
+  it('cleans up server process on completion', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger)
+
+    // #then
+    expect(mockProcess.kill).toHaveBeenCalled()
+  })
+
+  it('cleans up server process on error', async () => {
+    // #given
+    const mockClient = createMockClient({throwOnPrompt: true})
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
+
+    // #when
+    await executeOpenCode('Test prompt', null, mockLogger)
+
+    // #then
+    expect(mockProcess.kill).toHaveBeenCalled()
+  })
+
+  it('logs execution info', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    vi.mocked(createOpencodeClient).mockReturnValue(mockClient as unknown as ReturnType<typeof createOpencodeClient>)
+
+    setTimeout(() => {
+      mockProcess.emit('stdout', 'data', Buffer.from('listening'))
+    }, 10)
 
     // #when
     await executeOpenCode('Test prompt', null, mockLogger)
 
     // #then
     expect(mockLogger.info).toHaveBeenCalledWith(
-      'Executing OpenCode agent',
+      'Executing OpenCode agent (SDK mode)',
       expect.objectContaining({
         promptLength: 11,
-        platform: expect.any(String) as string,
-      }),
-    )
-    expect(mockLogger.info).toHaveBeenCalledWith(
-      'OpenCode execution completed',
-      expect.objectContaining({
-        exitCode: 0,
-        durationMs: expect.any(Number) as number,
+        agent: 'Sisyphus',
       }),
     )
   })
 
-  it('logs error on execution failure', async () => {
+  it('returns failure when server fails to start', async () => {
     // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('Failed'))
-
-    // #when
-    await executeOpenCode('Test prompt', null, mockLogger)
-
-    // #then
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      'OpenCode execution failed',
-      expect.objectContaining({
-        error: 'Failed',
-        durationMs: expect.any(Number) as number,
-      }),
-    )
-  })
-
-  it('returns null sessionId', async () => {
-    // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    setTimeout(() => {
+      mockProcess.emit('process', 'error', new Error('Spawn failed'))
+    }, 10)
 
     // #when
     const result = await executeOpenCode('Test prompt', null, mockLogger)
 
     // #then
-    expect(result.sessionId).toBeNull()
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Spawn failed')
   })
 })
 
