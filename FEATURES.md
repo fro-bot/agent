@@ -1,8 +1,8 @@
 # Features: Fro Bot Agent
 
 **Extracted from:** PRD.md
-**Date:** 2026-01-02
-**Version:** v1 MVP
+**Date:** 2026-01-10
+**Version:** v1.1 MVP
 
 ---
 
@@ -10,22 +10,27 @@
 
 - [Product Overview](#product-overview)
 - [Feature Summary](#feature-summary)
-- [Category A: GitHub Agent](#category-a-github-agent)
+- [Category A: GitHub Agent Interactions](#category-a-github-agent-interactions)
 - [Category B: Discord Agent](#category-b-discord-agent)
 - [Category C: Shared Memory & Persistence](#category-c-shared-memory--persistence)
-- [Category D: Security & Access Control](#category-d-security--access-control)
-- [Category E: Observability & Auditability](#category-e-observability--auditability)
-- [Category F: Error Handling & Reliability](#category-f-error-handling--reliability)
-- [Category G: Configuration & Deployment](#category-g-configuration--deployment)
+- [Category D: Setup Action & Environment Bootstrap](#category-d-setup-action--environment-bootstrap)
+- [Category E: SDK Execution](#category-e-sdk-execution)
+- [Category F: Context & Prompt](#category-f-context--prompt)
+- [Category G: Security & Access Control](#category-g-security--access-control)
+- [Category H: Observability & Auditability](#category-h-observability--auditability)
+- [Category I: Error Handling & Reliability](#category-i-error-handling--reliability)
+- [Category J: Configuration & Deployment](#category-j-configuration--deployment)
 - [Dependency Graph](#dependency-graph)
 
 ---
 
 ## Product Overview
 
-Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
+Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
 
 **Core Differentiator:** Durable memory across runs - OpenCode session/application state is restored at start and saved at end, enabling the agent to pick up work without repeating expensive investigation.
+
+**v1.1 Changes:** SDK-based execution replaces CLI, GraphQL context hydration, file attachment support, explicit model/agent configuration, mock event support for local testing.
 
 **Target Personas:**
 - Repo Maintainer (Primary) - wants reliable "extra engineer"
@@ -39,23 +44,26 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 
 | Priority             | Count | Categories                                     |
 | -------------------- | ----- | ---------------------------------------------- |
-| **Must Have (P0)**   | 24    | Core functionality for MVP                     |
-| **Should Have (P1)** | 6     | Important but not critical for initial release |
-| **Could Have (P2)**  | 3     | Desirable, can be deferred                     |
+| **Must Have (P0)**   | 44    | Core functionality for MVP                     |
+| **Should Have (P1)** | 12    | Important but not critical for initial release |
+| **Could Have (P2)**  | 2     | Desirable, can be deferred                     |
 
 | Category                     | Feature Count |
 | ---------------------------- | ------------- |
-| GitHub Agent                 | 11            |
+| GitHub Agent Interactions    | 11            |
 | Discord Agent                | 5             |
 | Shared Memory & Persistence  | 8             |
+| Setup Action & Bootstrap     | 7             |
+| SDK Execution (NEW)          | 6             |
+| Context & Prompt (NEW)       | 8             |
 | Security & Access Control    | 5             |
-| Observability & Auditability | 3             |
+| Observability & Auditability | 4             |
 | Error Handling & Reliability | 4             |
 | Configuration & Deployment   | 4             |
 
 ---
 
-## Category A: GitHub Agent
+## Category A: GitHub Agent Interactions
 
 ### F1: GitHub Action Trigger Support
 
@@ -70,16 +78,12 @@ The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting 
 - [ ] Supports `workflow_dispatch` for manual invocation
 - [ ] Supports `issue_comment` `created` as primary trigger for Issues and PRs
 - [ ] Runtime detection distinguishes Issue vs PR context
-- [ ] Supports `discussion` with `types: [created]` on comments trigger for Discussions (document gaps as known limitations)
+- [ ] Supports `discussion` with `types: [created]` (document gaps as known limitations)
 - [ ] Action invocable via `uses: fro-bot/agent@v0`
 
 **Technical Considerations:**
 - Must detect fork PRs at runtime to apply security gates
 - Event context parsing from `github.event.*` payloads
-
-**Edge Cases:**
-- Fork PR from untrusted contributor triggers `issue_comment` (not `pull_request_review_comment`)
-- Discussion events may have different payload structure
 
 ---
 
@@ -96,7 +100,7 @@ Agent can read issue context and post in-thread comments.
 - [ ] Agent reads full issue body and comment thread
 - [ ] Agent posts new comments in issue threads
 - [ ] Agent can update existing "agent comments" for idempotent reruns
-- [ ] Comments include collapsed run summary (see F20)
+- [ ] Comments include collapsed run summary (see F35)
 
 **Edge Cases:**
 - Very long issue threads (pagination handling)
@@ -107,20 +111,21 @@ Agent can read issue context and post in-thread comments.
 ### F3: Discussion Comment Interaction
 
 **Priority:** Must Have (P0)
-**Complexity:** Low
-**Dependencies:** F1
+**Complexity:** Medium
+**Dependencies:** F1, F28 (GraphQL)
 
 **Description:**
 Agent can participate in GitHub Discussions threads.
 
 **Acceptance Criteria:**
-- [ ] Agent reads discussion body and comment thread
+- [ ] Agent reads discussion body and comment thread via GraphQL
 - [ ] Agent posts in-thread discussion comments
 - [ ] Agent can update existing agent comments
 - [ ] Comments include collapsed run summary
 
 **Technical Considerations:**
-- Discussion API differs from Issues API; verify GraphQL vs REST requirements
+- Discussion API requires GraphQL (not REST)
+- Uses same GraphQL client as F28
 
 ---
 
@@ -131,7 +136,7 @@ Agent can participate in GitHub Discussions threads.
 **Dependencies:** F1
 
 **Description:**
-Agent can post comments in PR conversation thread (not review comments).
+Agent can post comments in PR conversation thread.
 
 **Acceptance Criteria:**
 - [ ] Agent reads PR description and conversation thread
@@ -166,7 +171,7 @@ Agent can post line-level review comments on PR diffs.
 
 **Priority:** Must Have (P0)
 **Complexity:** High
-**Dependencies:** F1, F17
+**Dependencies:** F1, F18
 
 **Description:**
 When requested, the agent can push commits to branches.
@@ -177,15 +182,6 @@ When requested, the agent can push commits to branches.
 - [ ] Agent can push to remote (non-protected branches)
 - [ ] Uses elevated credentials (GitHub App token or PAT) only when needed
 - [ ] Never pushes directly to protected branches without explicit PR
-
-**Technical Considerations:**
-- Requires `contents: write` permission
-- Must configure git user identity for commits
-- GitHub App token recommended for elevated operations
-
-**Edge Cases:**
-- Branch protection rules block push (handle gracefully, report in summary)
-- Merge conflicts with target branch
 
 ---
 
@@ -203,10 +199,6 @@ When requested, the agent can open pull requests.
 - [ ] PR includes meaningful title and description
 - [ ] PR references original issue/discussion if applicable
 - [ ] Agent posts confirmation comment with PR link
-
-**Technical Considerations:**
-- Requires `pull-requests: write` permission
-- PR template support desirable
 
 ---
 
@@ -247,67 +239,39 @@ Agent ignores comments from its own account to prevent infinite loops.
 
 ---
 
-### F10: Setup Action Entrypoint
+### F10: Reactions & Labels Acknowledgment
 
 **Priority:** Must Have (P0)
-**Complexity:** High
-**Dependencies:** F1, F17
+**Complexity:** Low
+**Dependencies:** F1
 
 **Description:**
-Provide a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment, mirroring oMo Sisyphus workflow functionality.
+Agent provides visual feedback via reactions and labels to acknowledge work status.
 
 **Acceptance Criteria:**
-- [ ] `uses: fro-bot/agent/setup` available as separate action
-- [ ] Installs OpenCode CLI via `@actions/tool-cache` with cross-run caching
-- [ ] Supports `opencode-version` input (default: `latest`)
-- [ ] Automatically installs Bun runtime via `@actions/tool-cache` (required for oMo)
-- [ ] Installs oMo plugin via `bunx oh-my-opencode install`
-- [ ] Bun installation is automatic - users do NOT need `oven-sh/setup-bun`
-- [ ] Configures `gh` CLI with `GH_TOKEN` environment variable
-- [ ] Supports GitHub App token generation from `app-id` + `private-key` inputs
-- [ ] Falls back to `GITHUB_TOKEN` when App credentials not provided
-- [ ] Configures git identity for commits (`<app-slug>[bot]` format)
-- [ ] Populates `auth.json` from secrets (mode 0600, never cached)
-- [ ] Restores session cache early in setup phase
-- [ ] Ensures required system utilities for Sisyphus-style execution and UX:
-  - [ ] `tmux` available
-  - [ ] `stdbuf` available
-- [ ] Real-time log streaming is supported (best-effort): agent/OpenCode output should appear while it runs, not only at the end
-- [ ] Outputs: `opencode-path`, `opencode-version`, `gh-authenticated`, `setup-duration`, `cache-status`
-
-**Technical Considerations:**
-- Requires `@actions/tool-cache` for binary caching
-- Requires `@actions/exec` for running npx, gh, git commands
-- `setup/action.yaml` must reference `dist/setup.js` entrypoint
-- Build must produce both `dist/main.js` and `dist/setup.js`
-
-**Edge Cases:**
-- OpenCode download failure (retry with backoff)
-- oMo installation failure (warn, don't fail)
-- GitHub App token generation failure (fall back to GITHUB_TOKEN)
+- [ ] Agent adds 👀 (eyes) reaction to triggering comment on receipt
+- [ ] Agent adds "agent: working" label to issue/PR when starting work
+- [ ] Agent replaces 👀 with success reaction on completion
+- [ ] Agent removes "agent: working" label on completion (success or failure)
+- [ ] "agent: working" label is created automatically if it doesn't exist
+- [ ] All reaction/label operations are non-fatal (warn on failure)
 
 ---
 
-### F11: Session Search on Startup
+### F11: Issue vs PR Context Detection
 
 **Priority:** Must Have (P0)
-**Complexity:** Medium
-**Dependencies:** F13
+**Complexity:** Low
+**Dependencies:** F1
 
 **Description:**
-On startup, the agent uses oMo session tools to find relevant prior work. The action harness also performs startup introspection using RFC-004 utilities to provide context.
-
-**Two layers involved:**
-1. **Action-side (RFC-004)**: `listSessions()` and `searchSessions()` utilities run at startup to gather session context for the agent prompt
-2. **Agent-side (oMo)**: Agent uses `session_search` and `session_read` LLM tools during execution to query prior work
+Agent accurately detects whether it's operating on an issue or PR from `issue_comment` events.
 
 **Acceptance Criteria:**
-- [ ] Action harness calls RFC-004 `listSessions()` to discover prior sessions
-- [ ] Agent prompt includes session context from startup introspection
-- [ ] Agent is instructed to call oMo `session_search` before re-investigating
-- [ ] Search queries based on current context (issue title, error messages, file paths)
-- [ ] Agent reads relevant prior sessions when found via `session_read`
-- [ ] Evidence of session search appears in logs
+- [ ] Agent queries GitHub API to determine if issue has associated PR
+- [ ] Detection works for both standalone issues and PRs
+- [ ] Context type ("issue" or "pr") included in prompt and run summary
+- [ ] PR-specific operations (review comments) only attempted on PRs
 
 ---
 
@@ -377,7 +341,7 @@ Discord bot runs as long-lived daemon with reverse proxy boundary.
 
 **Priority:** Must Have (P0)
 **Complexity:** High
-**Dependencies:** F12, F13, F16, F18
+**Dependencies:** F12, F13, F16, F20
 
 **Description:**
 For the same project, Discord and GitHub share OpenCode storage.
@@ -454,11 +418,33 @@ Save OpenCode storage directory at end of GitHub Action run.
 - [ ] Save `$XDG_DATA_HOME/opencode/storage/` at job end
 - [ ] Save runs even if job fails (via `if: always()`)
 - [ ] Cache key unique per run to enable versioning
-- [ ] Save excludes `auth.json` (see F23)
+- [ ] Save excludes `auth.json` (see F34)
 
 ---
 
-### F19: S3 Write-Through Backup
+### F19: Session Search on Startup
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F17
+
+**Description:**
+On startup, the agent uses oMo session tools to find relevant prior work.
+
+**Two layers involved:**
+1. **Action-side (RFC-004)**: `listSessions()` and `searchSessions()` utilities run at startup
+2. **Agent-side (oMo)**: Agent uses `session_search` and `session_read` LLM tools during execution
+
+**Acceptance Criteria:**
+- [ ] Action harness calls RFC-004 `listSessions()` to discover prior sessions
+- [ ] Agent prompt includes session context from startup introspection
+- [ ] Agent is instructed to call oMo `session_search` before re-investigating
+- [ ] Agent reads relevant prior sessions when found via `session_read`
+- [ ] Evidence of session search appears in logs
+
+---
+
+### F20: S3 Write-Through Backup
 
 **Priority:** Must Have (P0)
 **Complexity:** High
@@ -480,41 +466,18 @@ Optional S3 backup for cross-runner portability and Discord support.
 
 ---
 
-### F20: Run Summary in Comments
-
-**Priority:** Must Have (P0)
-**Complexity:** Medium
-**Dependencies:** F2, F3, F4
-
-**Description:**
-Every agent comment includes collapsed details block with run metadata.
-
-**Acceptance Criteria:**
-- [ ] Summary includes: event type, repo, ref/branch, run ID
-- [ ] Summary includes: cache status (hit/miss/corrupted)
-- [ ] Summary includes: session IDs used/created
-- [ ] Summary includes: links to PRs/commits created
-- [ ] Summary includes: duration and token usage (if available)
-- [ ] Summary formatted as collapsed `<details>` block
-
----
-
 ### F21: Close-the-Loop Session Writeback
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
-**Dependencies:** F11, F18
+**Dependencies:** F19, F18
 
 **Description:**
 Before finishing, the action produces a durable summary discoverable by future sessions.
 
-**Two layers involved:**
-1. **Action-side (RFC-004)**: `writeSessionSummary()` utility appends run metadata to the session in OpenCode storage format
-2. **Agent-side (oMo)**: Agent is instructed to leave a searchable summary message before completing
-
 **Acceptance Criteria:**
 - [ ] Action harness calls RFC-004 `writeSessionSummary()` at end of run
-- [ ] Written summary is in valid OpenCode message format (discoverable by oMo tools)
+- [ ] Written summary is in valid OpenCode message format
 - [ ] Agent is instructed to document key decisions/fixes before completing
 - [ ] Summary searchable via `session_search` in future runs
 
@@ -527,18 +490,14 @@ Before finishing, the action produces a durable summary discoverable by future s
 **Dependencies:** F17, F18
 
 **Description:**
-Retention policy prevents unbounded storage growth. This is an **action-side** operation using RFC-004 utilities.
-
-**Implementation:**
-The GitHub Action harness calls RFC-004 `pruneSessions()` at the end of each run. This utility operates directly on OpenCode storage (JSON files at `~/.local/share/opencode/storage/`).
+Retention policy prevents unbounded storage growth.
 
 **Acceptance Criteria:**
 - [ ] Action harness calls RFC-004 `pruneSessions()` at end of each run
-- [ ] Default: keep last 50 sessions per repo OR sessions from last 30 days (whichever larger)
-- [ ] Pruning also removes child sessions (those with `parentID`) of pruned parents
+- [ ] Default: keep last 50 sessions OR sessions from last 30 days (whichever larger)
+- [ ] Pruning also removes child sessions of pruned parents
 - [ ] Retention policy configurable via action input
 - [ ] Pruned sessions logged in run summary
-- [ ] Freed storage space reported in metrics
 
 ---
 
@@ -576,9 +535,377 @@ Detect obvious corruption in restored storage.
 
 ---
 
-## Category D: Security & Access Control
+## Category D: Setup Action & Environment Bootstrap
 
-### F25: auth.json Exclusion
+### F25: Setup Action Entrypoint
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F1
+
+**Description:**
+Provide a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment.
+
+**Acceptance Criteria:**
+- [ ] `uses: fro-bot/agent/setup` available as separate action
+- [ ] Outputs: `opencode-path`, `opencode-version`, `gh-authenticated`, `setup-duration`, `cache-status`
+
+---
+
+### F26: OpenCode CLI Installation
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F25
+
+**Description:**
+Install OpenCode binary via `@actions/tool-cache` for cross-run caching.
+
+**Acceptance Criteria:**
+- [ ] Installs OpenCode CLI via `@actions/tool-cache` with cross-run caching
+- [ ] Supports `opencode-version` input (default: `latest`)
+- [ ] Add OpenCode to PATH for subsequent steps
+
+---
+
+### F27: oMo Plugin Installation
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F26
+
+**Description:**
+Automatically install Bun runtime and oMo plugins.
+
+**Acceptance Criteria:**
+- [ ] Automatically installs Bun runtime via `@actions/tool-cache`
+- [ ] Installs oMo plugin via `bunx oh-my-opencode install`
+- [ ] Users do NOT need `oven-sh/setup-bun`
+- [ ] Graceful degradation: warn on failure, do not fail the run
+
+---
+
+### F28: GitHub CLI Authentication
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F25
+
+**Description:**
+Configure `gh` CLI with appropriate credentials.
+
+**Acceptance Criteria:**
+- [ ] Configures `gh` CLI with `GH_TOKEN` environment variable
+- [ ] Supports GitHub App token generation from `app-id` + `private-key` inputs
+- [ ] Falls back to `GITHUB_TOKEN` when App credentials not provided
+- [ ] `GH_TOKEN` takes priority over `GITHUB_TOKEN` for `gh` CLI operations
+
+---
+
+### F29: Git Identity Configuration
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F25
+
+**Description:**
+Configure git identity for commits.
+
+**Acceptance Criteria:**
+- [ ] Set `user.name` and `user.email` for commits
+- [ ] Use GitHub App bot identity format: `<app-slug>[bot]`
+- [ ] Email format: `<user-id>+<app-slug>[bot]@users.noreply.github.com`
+
+---
+
+### F30: auth.json Population
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F25
+
+**Description:**
+Write LLM provider credentials securely.
+
+**Acceptance Criteria:**
+- [ ] Populates `auth.json` from `auth-json` secret input
+- [ ] File written with mode `0600` (owner read/write only)
+- [ ] **NEVER cached** - populated fresh each run
+
+---
+
+### F31: Cache Restoration in Setup
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F25, F17
+
+**Description:**
+Restore OpenCode storage from cache during setup phase.
+
+**Acceptance Criteria:**
+- [ ] Restore OpenCode storage from GitHub Actions cache
+- [ ] Run early in setup phase for session continuity
+- [ ] Cache miss does not fail setup
+
+---
+
+## Category E: SDK Execution
+
+### F32: SDK-Based Agent Execution
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F26, F27
+
+**Description:**
+Use `@opencode-ai/sdk` for agent execution, replacing CLI model.
+
+**Acceptance Criteria:**
+- [ ] Use `createOpencode()` for automatic server lifecycle
+- [ ] Server started automatically, managed via AbortController
+- [ ] No manual port management required
+- [ ] Session created via `client.session.create({ body: { title } })`
+- [ ] Prompt sent via `client.session.promptAsync()` (non-blocking)
+- [ ] Track session ID throughout execution
+
+---
+
+### F33: Event Subscription and Processing
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F32
+
+**Description:**
+Subscribe to and process SDK events for progress tracking.
+
+**Acceptance Criteria:**
+- [ ] Subscribe via `client.event.subscribe()` returns async stream
+- [ ] Track state: `mainSessionIdle`, `mainSessionError`, `lastError`
+- [ ] Process tool calls, text updates, session events
+
+---
+
+### F34: Completion Detection
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F33
+
+**Description:**
+Detect when agent has completed work.
+
+**Acceptance Criteria:**
+- [ ] Poll every 500ms for idle state
+- [ ] Check completion conditions (todos complete, no pending work)
+- [ ] Handle session errors with proper exit codes
+
+---
+
+### F35: Timeout and Cancellation
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F32
+
+**Description:**
+Support configurable timeout and clean cancellation.
+
+**Acceptance Criteria:**
+- [ ] Configurable timeout via `timeout` input (0 = no timeout, default: 30 minutes)
+- [ ] AbortController for clean cancellation
+- [ ] SIGINT handling for graceful shutdown
+
+---
+
+### F36: SDK Cleanup
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F32
+
+**Description:**
+Clean shutdown of SDK server and resources.
+
+**Acceptance Criteria:**
+- [ ] `server.close()` on completion, error, or signal
+- [ ] Restore any modified git config
+- [ ] Proper exit codes (0=success, 1=error, 130=interrupted)
+
+---
+
+### F37: Model and Agent Configuration
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F32
+
+**Description:**
+Configure which model and agent to use via action inputs.
+
+**Acceptance Criteria:**
+- [ ] `model` input required (format: `provider/model`)
+- [ ] `agent` input optional, validated against available agents via `client.agent.list()`
+- [ ] Fall back to default agent with warning if validation fails
+- [ ] Model/agent included in run summary footer
+- [ ] Log model selection at start of execution
+
+---
+
+## Category F: Context & Prompt
+
+### F38: Mock Event Support
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F1
+
+**Description:**
+Support mock GitHub events for local development and testing.
+
+**Acceptance Criteria:**
+- [ ] `MOCK_EVENT` environment variable accepts JSON payload matching GitHub webhook schema
+- [ ] `MOCK_TOKEN` provides authentication token for local testing
+- [ ] Only enabled when `CI` env var is not `true` OR `allow-mock-event: true` input is set
+- [ ] Mock payload validated on parse; clear error messages for malformed input
+- [ ] Log warning when mock mode is active
+- [ ] Mock mode uses `https://dev.opencode.ai` for share links
+
+---
+
+### F39: File Attachment Detection
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F32
+
+**Description:**
+Parse GitHub user-attachment URLs from comment body.
+
+**Acceptance Criteria:**
+- [ ] Parse markdown images: `![alt](https://github.com/user-attachments/assets/...)`
+- [ ] Parse HTML images: `<img ... src="https://github.com/user-attachments/assets/..." />`
+- [ ] Parse file links: `[filename](https://github.com/user-attachments/files/...)`
+- [ ] Validate URLs are from `github.com/user-attachments/` only
+
+---
+
+### F40: File Attachment Download
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F39
+
+**Description:**
+Download and process file attachments.
+
+**Acceptance Criteria:**
+- [ ] Authenticate with GitHub token for private repo attachments
+- [ ] Download to temp storage
+- [ ] Determine MIME type from response headers
+- [ ] Max 5 attachments per comment
+- [ ] Max 5MB per attachment, 15MB total
+- [ ] Allowed types: `image/*`, `text/*`, `application/json`, `application/pdf`
+- [ ] Attachments NOT persisted to cache
+
+---
+
+### F41: File Attachment Prompt Injection
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F40, F32
+
+**Description:**
+Pass file attachments to SDK as typed parts.
+
+**Acceptance Criteria:**
+- [ ] Replace original markdown with `@filename` reference
+- [ ] Pass as `type: "file"` parts with base64 content
+- [ ] Log attachment metadata (filename, size, type) but not content
+
+---
+
+### F42: GraphQL Issue Context Hydration
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F1
+
+**Description:**
+Fetch full issue context via GraphQL.
+
+**Acceptance Criteria:**
+- [ ] Fetch: title, body, author, state, created date
+- [ ] Fetch: last 50 comments with author, timestamp, body
+- [ ] Fetch: labels and assignees
+- [ ] Truncate bodies > 10KB with note
+- [ ] Fall back to REST API on GraphQL failure
+
+---
+
+### F43: GraphQL PR Context Hydration
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F1
+
+**Description:**
+Fetch full PR context via GraphQL.
+
+**Acceptance Criteria:**
+- [ ] Fetch base data: title, body, author, state, baseRefName, headRefName, headRefOid
+- [ ] Fetch stats: additions, deletions, commits.totalCount
+- [ ] Fetch repository info: baseRepository.nameWithOwner, headRepository.nameWithOwner
+- [ ] Fetch commits: last 100 with oid, message, author
+- [ ] Fetch files: last 100 with path, additions, deletions, changeType
+- [ ] Fetch comments: last 100 with full metadata
+- [ ] Fetch reviews: last 100 with state, body, and inline comments (path, line)
+- [ ] Detect fork PRs by comparing headRepository vs baseRepository
+- [ ] Fall back to REST API on GraphQL failure
+
+---
+
+### F44: Context Budgeting
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F42, F43
+
+**Description:**
+Enforce limits on context size.
+
+**Acceptance Criteria:**
+- [ ] Max 50 comments per thread
+- [ ] Max 100 changed files
+- [ ] Truncate bodies > 10KB with note
+- [ ] Total context budget: ~100KB before prompt injection
+- [ ] Log warning when context is degraded
+
+---
+
+### F45: Agent Prompt Construction
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F42, F43, F44
+
+**Description:**
+Build structured agent prompt with all required sections.
+
+**Acceptance Criteria:**
+- [ ] Multi-section structure: mode-instructions, identity, context, user-request, mandatory-reading, issue/pr-data, action-instructions
+- [ ] Include mandatory reading instructions (gh issue view, gh pr view, etc.)
+- [ ] Include heredoc syntax guidance for GitHub comments
+- [ ] Include session tool instructions (session_search, session_read)
+- [ ] Include GitHub CLI examples for common operations
+
+---
+
+## Category G: Security & Access Control
+
+### F46: auth.json Exclusion
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -595,7 +922,7 @@ Never persist `auth.json`; rehydrate each run from secrets.
 
 ---
 
-### F26: Fork PR Permission Gating
+### F47: Fork PR Permission Gating
 
 **Priority:** Must Have (P0)
 **Complexity:** Medium
@@ -612,11 +939,11 @@ Only respond to comments from authorized users on fork PRs.
 
 **Technical Considerations:**
 - `github.event.comment.author_association` for association check
-- Matches oMo Sisyphus approach for secure fork handling
+- Matches oMo Sisyphus agent approach for secure fork handling
 
 ---
 
-### F27: Credential Strategy
+### F48: Credential Strategy
 
 **Priority:** Must Have (P0)
 **Complexity:** Medium
@@ -633,7 +960,7 @@ Flexible credential handling for elevated operations.
 
 ---
 
-### F28: Branch-Scoped Caching
+### F49: Branch-Scoped Caching
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -649,7 +976,7 @@ Prefer branch-scoped caches to reduce poisoning risk.
 
 ---
 
-### F29: Concurrency Handling
+### F50: Concurrency Handling
 
 **Priority:** Should Have (P1)
 **Complexity:** Medium
@@ -665,25 +992,45 @@ Handle simultaneous runs hitting same cache key.
 
 ---
 
-## Category E: Observability & Auditability
+## Category H: Observability & Auditability
 
-### F30: GitHub Actions Job Summary
+### F51: Run Summary in Comments
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F2, F3, F4
+
+**Description:**
+Every agent comment includes collapsed details block with run metadata.
+
+**Acceptance Criteria:**
+- [ ] Summary includes: event type, repo, ref/branch, run ID
+- [ ] Summary includes: cache status (hit/miss/corrupted)
+- [ ] Summary includes: session IDs used/created
+- [ ] Summary includes: links to PRs/commits created
+- [ ] Summary includes: duration and token usage (if available)
+- [ ] Summary includes: model/agent used
+- [ ] Summary formatted as collapsed `<details>` block
+
+---
+
+### F52: GitHub Actions Job Summary
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
-**Dependencies:** F20
+**Dependencies:** F51
 
 **Description:**
 Provide structured summary in GitHub Actions job output.
 
 **Acceptance Criteria:**
-- [ ] Job summary includes all metadata from F20
+- [ ] Job summary includes all metadata from F51
 - [ ] Job summary viewable in Actions UI
 - [ ] Session IDs and run IDs included for traceability
 
 ---
 
-### F31: Structured Logging
+### F53: Structured Logging
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -699,11 +1046,11 @@ Emit JSON-structured logs for machine parsing.
 
 ---
 
-### F32: Token Usage Reporting
+### F54: Token Usage Reporting
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
-**Dependencies:** F20
+**Dependencies:** F51
 
 **Description:**
 Report LLM token usage in run summary when available.
@@ -715,9 +1062,9 @@ Report LLM token usage in run summary when available.
 
 ---
 
-## Category F: Error Handling & Reliability
+## Category I: Error Handling & Reliability
 
-### F33: Error Message Format
+### F55: Error Message Format
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -734,7 +1081,7 @@ Standardized error message format in agent comments.
 
 ---
 
-### F34: GitHub API Rate Limit Handling
+### F56: GitHub API Rate Limit Handling
 
 **Priority:** Must Have (P0)
 **Complexity:** Medium
@@ -751,7 +1098,7 @@ Graceful degradation when GitHub API rate limited.
 
 ---
 
-### F35: LLM API Error Handling
+### F57: LLM API Error Handling
 
 **Priority:** Must Have (P0)
 **Complexity:** Medium
@@ -768,7 +1115,7 @@ Graceful handling of LLM API timeouts and errors.
 
 ---
 
-### F36: Discord API Error Handling
+### F58: Discord API Error Handling
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -784,9 +1131,9 @@ Discord bot handles API issues without crashing.
 
 ---
 
-## Category G: Configuration & Deployment
+## Category J: Configuration & Deployment
 
-### F37: Action Inputs Configuration
+### F59: Action Inputs Configuration
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -796,16 +1143,17 @@ Discord bot handles API issues without crashing.
 Configurable action inputs for customization.
 
 **Acceptance Criteria:**
-- [ ] OpenCode credentials (auth.json or JSON object) configurable
-- [ ] Custom prompt configurable
+- [ ] `model` input required (format: `provider/model`)
+- [ ] `agent` input optional
+- [ ] `timeout` input configurable (default: 30 minutes)
+- [ ] `auth-json` input for LLM credentials
 - [ ] Session retention policy configurable
 - [ ] S3 backup enable/disable configurable
-- [ ] Elevated credential source configurable
 - [ ] All inputs documented with defaults
 
 ---
 
-### F38: Secrets/Vars Documentation
+### F60: Secrets/Vars Documentation
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -822,7 +1170,7 @@ Clear documentation of required secrets and variables.
 
 ---
 
-### F39: Discord Deployment Guide
+### F61: Discord Deployment Guide
 
 **Priority:** Must Have (P0)
 **Complexity:** Low
@@ -839,7 +1187,7 @@ Documentation for deploying Discord daemon.
 
 ---
 
-### F40: Rollback Plan
+### F62: Rollback Plan
 
 **Priority:** Should Have (P1)
 **Complexity:** Low
@@ -856,29 +1204,160 @@ Documented procedure for handling breaking storage changes.
 
 ---
 
+## P1 Additional Features (Should Have)
+
+### F63: Pull Request Review Comment Support
+
+**Priority:** Should Have (P1)
+**Complexity:** Medium
+**Dependencies:** F5
+
+**Description:**
+Handle `pull_request_review_comment` event type for inline code review responses.
+
+**Acceptance Criteria:**
+- [ ] Handle `pull_request_review_comment` event type
+- [ ] Extract inline context: file path, line number, diff hunk, commit ID
+- [ ] Include in prompt as `<review_comment_context>` block
+- [ ] Agent can respond with targeted fixes to the specific code location
+
+---
+
+### F64: Session Sharing
+
+**Priority:** Should Have (P1)
+**Complexity:** Medium
+**Dependencies:** F32
+
+**Description:**
+Create public session share links for transparency.
+
+**Acceptance Criteria:**
+- [ ] Optional `share` input: `true`, `false`, or unset (auto)
+- [ ] Auto behavior: share for public repos, don't share for private
+- [ ] Call `client.session.share({ path: session })` to create public link
+- [ ] Include share link in comment footer with optional social card image
+- [ ] Output `share-url` from action
+
+---
+
+### F65: Automatic Branch Management
+
+**Priority:** Should Have (P1)
+**Complexity:** High
+**Dependencies:** F6, F7
+
+**Description:**
+Automate branch creation and management for different workflows.
+
+**Acceptance Criteria:**
+- [ ] **Issue workflow**: Create new branch → make changes → push → create PR
+- [ ] **Local PR workflow**: Checkout existing branch → make changes → push
+- [ ] **Fork PR workflow**: Add fork remote → checkout → push to fork
+- [ ] Branch naming: `opencode/{issue|pr}{number}-{timestamp}`
+- [ ] Commit format with co-author attribution
+- [ ] Dirty check: `git status --porcelain` before attempting push
+
+---
+
+### F66: Event Streaming and Progress Logging
+
+**Priority:** Should Have (P1)
+**Complexity:** Medium
+**Dependencies:** F33
+
+**Description:**
+Real-time logging of agent progress and tool calls.
+
+**Acceptance Criteria:**
+- [ ] Subscribe to SSE events from OpenCode server
+- [ ] Log tool calls with color-coded output (todo: yellow, bash: red, edit: green, etc.)
+- [ ] Log text completions when finished
+- [ ] Track session state updates in real-time
+
+---
+
+## P2 Features (Could Have)
+
+### F67: Cross-Runner Portability
+
+**Priority:** Could Have (P2)
+**Complexity:** High
+**Dependencies:** F20
+
+**Description:**
+Optional write-through S3 backup/restore for cross-runner scenarios.
+
+**Acceptance Criteria:**
+- [ ] S3 backup can restore to different runner types
+- [ ] Storage format compatible across runners
+
+---
+
+### F68: Org-Level Memory Partitioning
+
+**Priority:** Could Have (P2)
+**Complexity:** Medium
+**Dependencies:** F17
+
+**Description:**
+Support additional scoping (repo-only vs org-wide) as configurable.
+
+**Acceptance Criteria:**
+- [ ] Configurable memory scope: repo-only or org-wide
+- [ ] Cache keys and S3 prefixes adjusted accordingly
+- [ ] Cross-repo session discovery when org-wide enabled
+
+---
+
 ## Dependency Graph
 
 ```
 F1 (Triggers)
 ├── F2 (Issue Comments)
-├── F3 (Discussion Comments)
+├── F3 (Discussion Comments) ──── F42/F43 (GraphQL)
 ├── F4 (PR Comments)
 │   └── F5 (PR Review Comments)
 ├── F6 (Push Commits) ──────┐
 │   └── F7 (Open PRs)       │
 ├── F8 (Idempotency)        │
 ├── F9 (Anti-Loop)          │
-├── F43 (Reactions/Labels)  │
-├── F44 (Issue/PR Detection)│
-└── F11 (Session Search) ◄──┤
+├── F10 (Reactions/Labels)  │
+├── F11 (Issue/PR Detection)│
+└── F38 (Mock Events)       │
+                            │
+F25 (Setup Action) ─────────┤
+├── F26 (OpenCode Install)  │
+│   └── F27 (oMo Install)   │
+│       └── F32 (SDK Exec)  │
+│           ├── F33 (Events)│
+│           ├── F34 (Complete)
+│           ├── F35 (Timeout)│
+│           ├── F36 (Cleanup)│
+│           └── F37 (Model)  │
+├── F28 (gh Auth)           │
+├── F29 (Git Identity)      │
+├── F30 (auth.json)         │
+└── F31 (Cache Restore)     │
                             │
 F17 (Cache Restore) ◄───────┤
 ├── F18 (Cache Save)        │
-│   └── F19 (S3 Backup)     │
+│   └── F20 (S3 Backup)     │
+├── F19 (Session Search)    │
+├── F21 (Writeback)         │
 ├── F22 (Pruning)           │
 ├── F23 (Versioning)        │
 ├── F24 (Corruption)        │
-└── F28 (Branch Scope)      │
+└── F49 (Branch Scope)      │
+                            │
+F39 (Attach Detect) ────────┤
+├── F40 (Attach Download)   │
+│   └── F41 (Attach Inject) │
+                            │
+F42 (GraphQL Issue) ────────┤
+├── F43 (GraphQL PR)        │
+│   └── F44 (Budgeting)     │
+│       └── F45 (Prompt)    │
                             │
 F12 (Channel Mapping) ──────┤
 ├── F13 (Thread Mapping)    │
@@ -886,113 +1365,13 @@ F12 (Channel Mapping) ──────┤
 └── F16 (Permissions)
 F14 (Daemon) ───────────────┐
 ├── F15 (Shared Memory)     │
-└── F36 (Discord Errors)    │
+└── F58 (Discord Errors)    │
                             │
-F25 (auth.json) ◄───────────┘
-F26 (Fork PR Gating)
-F27 (Credential Strategy)
+F46 (auth.json) ◄───────────┘
+F47 (Fork PR Gating)
+F48 (Credential Strategy)
 ```
 
 ---
 
-## Next Steps
-
-After FEATURES.md creation:
-
-1. **Run `/prd/to-rules`** - Generate technical guidelines and coding standards
-2. **Run `/prd/to-rfcs`** - Break down features into implementation RFCs with detailed specs
-
----
-
-## Category H: Agent Prompt & Context
-
-### F41: Agent Prompt Context Injection
-
-**Priority:** Must Have (P0)
-**Complexity:** Medium
-**Dependencies:** F10, F11
-
-**Description:**
-The agent prompt must include sufficient context and instructions for GitHub operations, session management, and run summaries.
-
-**Acceptance Criteria:**
-- [ ] Prompt includes GitHub context: repo, branch/ref, event type, actor
-- [ ] Prompt includes issue/PR context: number, title, triggering comment body
-- [ ] Prompt instructs agent to use `session_search` before re-investigating
-- [ ] Prompt instructs agent to use `session_read` when prior work is found
-- [ ] Prompt instructs agent to leave searchable summary before completing
-- [ ] Prompt provides `gh` CLI examples for all GitHub operations
-- [ ] Prompt requires every comment include collapsed run summary
-
-**Technical Considerations:**
-- Prompt constructed in setup action or main action entry
-- Context extracted from GitHub Actions environment and event payload
-- Must be compatible with OpenCode/oMo prompt format
-
----
-
-### F42: gh CLI Operation Instructions
-
-**Priority:** Must Have (P0)
-**Complexity:** Low
-**Dependencies:** F10
-
-**Description:**
-Agent prompt must instruct use of pre-authenticated `gh` CLI for all GitHub operations.
-
-**Acceptance Criteria:**
-- [ ] Prompt includes examples for `gh issue comment`
-- [ ] Prompt includes examples for `gh pr comment`
-- [ ] Prompt includes examples for `gh pr create`
-- [ ] Prompt includes examples for `gh api` calls
-- [ ] Prompt includes git commit/push workflow
-- [ ] Agent understands `GH_TOKEN` is already configured
-
----
-
-### F43: Reactions & Labels Acknowledgment
-
-**Priority:** Must Have (P0)
-**Complexity:** Low
-**Dependencies:** F1, F10
-
-**Description:**
-Agent provides visual feedback via reactions and labels to acknowledge work status, matching oMo Sisyphus behavior.
-
-**Acceptance Criteria:**
-- [ ] Agent adds 👀 (eyes) reaction to triggering comment on receipt
-- [ ] Agent adds "agent: working" label to issue/PR when starting work
-- [ ] Agent replaces 👀 with success reaction on completion (🎉 hooray - GitHub API doesn't support peace sign)
-- [ ] Agent removes "agent: working" label on completion (success or failure)
-- [ ] "agent: working" label is created automatically if it doesn't exist
-- [ ] All reaction/label operations are non-fatal (warn on failure, don't fail run)
-
-**Technical Considerations:**
-- Reactions via `gh api` POST to `/repos/{repo}/issues/comments/{id}/reactions`
-- Labels via `gh label create --force` and `gh issue/pr edit --add-label/--remove-label`
-- Must detect bot's own reactions for cleanup (filter by bot login)
-
----
-
-### F44: Issue vs PR Context Detection
-
-**Priority:** Must Have (P0)
-**Complexity:** Low
-**Dependencies:** F1
-
-**Description:**
-Agent accurately detects whether it's operating on an issue or PR from `issue_comment` events.
-
-**Acceptance Criteria:**
-- [ ] Agent queries GitHub API to determine if issue has associated PR
-- [ ] Detection works for both standalone issues and PRs
-- [ ] Context type ("issue" or "pr") included in prompt and run summary
-- [ ] PR-specific operations (review comments) only attempted on PRs
-
-**Technical Considerations:**
-- Use `gh api /repos/{repo}/issues/{number}` and check `.pull_request` field
-- Cache result to avoid repeated API calls
-
----
-
-*This document is auto-generated from PRD.md and should be updated when the PRD changes.*
+*This document is auto-generated from PRD.md v1.1 and should be updated when the PRD changes.*
