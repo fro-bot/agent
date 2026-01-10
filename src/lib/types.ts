@@ -35,7 +35,13 @@ export interface PruningConfig {
   readonly maxAgeDays: number
 }
 
-// Action inputs (parsed and validated) - per RFC-001
+// Model configuration for SDK execution (RFC-013)
+export interface ModelConfig {
+  readonly providerID: string
+  readonly modelID: string
+}
+
+// Action inputs (parsed and validated) - per RFC-001, RFC-013
 export interface ActionInputs {
   readonly githubToken: string
   readonly authJson: string
@@ -44,6 +50,10 @@ export interface ActionInputs {
   readonly s3Backup: boolean
   readonly s3Bucket: string | null
   readonly awsRegion: string | null
+  // RFC-013: SDK execution configuration
+  readonly agent: string
+  readonly model: ModelConfig | null
+  readonly timeoutMs: number
 }
 
 // Action outputs

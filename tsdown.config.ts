@@ -97,6 +97,8 @@ export default defineConfig({
     if (id.startsWith('@actions/')) return true
     // Bundle @octokit/auth-app
     if (id.startsWith('@octokit/auth-app')) return true
+    // Bundle @opencode-ai/sdk (RFC-013)
+    if (id.startsWith('@opencode-ai/sdk')) return true
     return false
   },
 })

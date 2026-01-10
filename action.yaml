@@ -27,6 +27,17 @@ inputs:
   aws-region:
     description: AWS region for S3 bucket
     required: false
+  agent:
+    description: 'Agent to use (default: Sisyphus). Must be a primary agent, not subagent.'
+    required: false
+    default: Sisyphus
+  model:
+    description: "Model override (format: provider/model). If not set, uses agent's configured model."
+    required: false
+  timeout:
+    description: 'Execution timeout in milliseconds. 0 = no timeout. Default: 1800000 (30 minutes)'
+    required: false
+    default: '1800000'
 
 outputs:
   session-id:
