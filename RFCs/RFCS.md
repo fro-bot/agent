@@ -30,7 +30,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending    |
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed  |
 | RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Superseded |
-| RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Pending    |
+| RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
 
 ---
 

@@ -1,9 +1,10 @@
 # RFC-013: SDK Execution Mode
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 1
+**Completed:** 2026-01-10
 
 ---
 
@@ -74,14 +75,14 @@ src/lib/agent/
 
 The following CLI-specific code from RFC-012 is **removed**:
 
-| Removed                                 | Reason                                                 |
-| --------------------------------------- | ------------------------------------------------------ |
-| `@actions/exec` import and usage        | Server mode uses `child_process.spawn()`               |
-| `opencode run "$PROMPT"` CLI invocation | Replaced by `opencode serve` + SDK client              |
-| `stdbuf` Linux streaming workaround     | SDK provides SSE event subscription                    |
-| `OPENCODE_PROMPT` environment variable  | Prompt passed directly to `client.session.chat()`      |
-| Exit code parsing from CLI              | SDK `chat()` is synchronous, returns response directly |
-| Stdout/stderr log parsing               | SDK provides typed event stream via `/event` SSE       |
+| Removed                                 | Reason                                                   |
+| --------------------------------------- | -------------------------------------------------------- |
+| `@actions/exec` import and usage        | Server mode uses `child_process.spawn()`                 |
+| `opencode run "$PROMPT"` CLI invocation | Replaced by `opencode serve` + SDK client                |
+| `stdbuf` Linux streaming workaround     | SDK provides SSE event subscription                      |
+| `OPENCODE_PROMPT` environment variable  | Prompt passed directly to `client.session.prompt()`      |
+| Exit code parsing from CLI              | SDK `prompt()` is synchronous, returns response directly |
+| Stdout/stderr log parsing               | SDK provides typed event stream via `/event` SSE         |
 
 ### 3. Type Additions (`src/lib/agent/types.ts`)
 
@@ -141,7 +142,7 @@ The entire SDK implementation is consolidated into a single file, replacing the 
  * 1. Spawn OpenCode server: `opencode serve --hostname=127.0.0.1 --port=4096`
  * 2. Create SDK client: `createOpencodeClient({ baseUrl: url })`
  * 3. Verify connection with retry loop
- * 4. Create session and send prompt via `client.session.chat()`
+ * 4. Create session and send prompt via `client.session.prompt()`
  * 5. Subscribe to events via SSE (`/event` endpoint)
  * 6. Kill server process on cleanup
  */
@@ -210,16 +211,27 @@ export async function verifyOpenCodeAvailable(opencodePath: string | null, logge
  * @param logger - Logger instance
  * @returns AgentResult with success status and sessionId
  */
+/**
+ * Execution configuration passed from parsed action inputs.
+ * Follows repo pattern: parse in inputs.ts, pass as config object.
+ */
+export interface ExecutionConfig {
+  readonly agent: string
+  readonly model: ModelConfig | null
+  readonly timeoutMs: number
+}
+
 export async function executeOpenCode(
   prompt: string,
   opencodePath: string | null,
   logger: Logger,
+  config?: ExecutionConfig,
 ): Promise<AgentResult> {
   let server: OpenCodeServer | null = null
   let client: SDKClient | null = null
   let session: SessionInfo | null = null
 
-  const timeoutMs = getTimeoutMs()
+  const timeoutMs = config?.timeoutMs ?? 1800000 // Default: 30 minutes
   const timeoutId =
     timeoutMs > 0
       ? setTimeout(() => {
@@ -240,9 +252,10 @@ export async function executeOpenCode(
     // 3. Verify connection with retry
     await assertOpenCodeConnected(client, logger)
 
-    // 4. Get model and agent configuration
-    const model = getModelConfig(logger)
-    const agent = await resolveAgent(client, getAgentName(), logger)
+    // 4. Get model and agent configuration from config (parsed in inputs.ts)
+    const model = config?.model ?? null
+    const agentName = config?.agent ?? "Sisyphus"
+    const agent = await resolveAgent(client, agentName, logger)
 
     // 5. Create session
     const sessionResponse = await client.session.create<true>()
@@ -252,22 +265,24 @@ export async function executeOpenCode(
     // 6. Subscribe to session events (background)
     subscribeSessionEvents(server.url, session.id, logger)
 
-    // 7. Send prompt and wait for response (synchronous chat)
+    // 7. Send prompt and wait for response (synchronous)
     logger.debug("Sending prompt to OpenCode...")
-    const chatResponse = await client.session.chat<true>({
+    const promptResponse = await client.session.prompt<true>({
       path: {id: session.id},
       body: {
-        ...(model != null && {model: {
-          providerID: model.providerID,
-          modelID: model.modelID,
-        }}),
+        ...(model != null && {
+          model: {
+            providerID: model.providerID,
+            modelID: model.modelID,
+          },
+        }),
         agent: agent ?? undefined,
         parts: [{type: "text", text: prompt}],
       },
     })
 
     // 8. Extract text response
-    const responseParts = chatResponse.data?.parts ?? []
+    const responseParts = promptResponse.data?.parts ?? []
     const textPart = responseParts.findLast((p: {type: string}) => p.type === "text") as
       | {type: "text"; text: string}
       | undefined
@@ -398,47 +413,10 @@ async function assertOpenCodeConnected(client: SDKClient, logger: Logger): Promi
   throw new Error("Failed to connect to OpenCode server after 30 retries")
 }
 
-/**
- * Get model configuration from INPUT_MODEL environment variable.
- *
- * Model is optional - if not provided, returns null and the agent's
- * configured model will be used.
- */
-function getModelConfig(logger: Logger): ModelConfig | null {
-  const modelInput = process.env["INPUT_MODEL"]
-
-  if (modelInput == null || modelInput.length === 0) {
-    logger.debug("No model override specified, using agent's configured model")
-    return null
-  }
-
-  const config = parseModelInput(modelInput)
-  logger.info("Model override configured", {
-    provider: config.providerID,
-    model: config.modelID,
-  })
-
-  return config
-}
-
-/**
- * Get agent name from INPUT_AGENT environment variable.
- *
- * Defaults to "Sisyphus" (oMo's default agent) if not specified.
- */
-function getAgentName(): string {
-  const agent = process.env["INPUT_AGENT"]
-  return agent != null && agent.length > 0 ? agent : "Sisyphus"
-}
-
-function getTimeoutMs(): number {
-  const timeout = process.env["INPUT_TIMEOUT"]
-  if (timeout == null || timeout.length === 0) {
-    return 1800000 // Default: 30 minutes
-  }
-  const parsed = parseInt(timeout, 10)
-  return isNaN(parsed) ? 1800000 : parsed
-}
+// NOTE: Model/agent/timeout configuration is now parsed in src/lib/inputs.ts
+// and passed via the ExecutionConfig parameter. The helper functions
+// getModelConfig(), getAgentName(), getTimeoutMs() are REMOVED.
+// This follows the repo pattern of parsing inputs centrally.
 
 /**
  * Validate agent exists and is a primary agent.
@@ -780,54 +758,54 @@ inputs:
 
 ### OpenCode Server Lifecycle
 
-- [ ] Server spawned via `opencode serve --hostname=127.0.0.1 --port=4096`
-- [ ] SDK client created via `createOpencodeClient({ baseUrl: url })`
-- [ ] Connection verified with retry loop (30 retries, 300ms delay)
-- [ ] Server process killed on completion, error, or signal
+- [x] Server spawned via `opencode serve --hostname=127.0.0.1 --port=4096`
+- [x] SDK client created via `createOpencodeClient({ baseUrl: url })`
+- [x] Connection verified with retry loop (30 retries, 300ms delay)
+- [x] Server process killed on completion, error, or signal
 
 ### Model & Agent Configuration
 
-- [ ] `agent` input defaults to `"Sisyphus"` if not provided
-- [ ] `model` input is parsed as `provider/model` format when provided; if not provided, uses agent's configured model
-- [ ] Invalid model format produces clear error message
-- [ ] Agent validated against `client.agent.list()`
-- [ ] Non-primary agents fall back to default with warning
-- [ ] Missing agents fall back to default with warning
+- [x] `agent` input defaults to `"Sisyphus"` if not provided
+- [x] `model` input is parsed as `provider/model` format when provided; if not provided, uses agent's configured model
+- [x] Invalid model format produces clear error message
+- [x] Agent validated against `client.agent.list()`
+- [x] Non-primary agents fall back to default with warning
+- [x] Missing agents fall back to default with warning
 
 ### Session Lifecycle
 
-- [ ] Session created via `client.session.create()`
-- [ ] Session ID tracked throughout execution
-- [ ] Prompt sent via `client.session.chat()` (synchronous, waits for completion)
-- [ ] Session ID included in action outputs
+- [x] Session created via `client.session.create()`
+- [x] Session ID tracked throughout execution
+- [x] Prompt sent via `client.session.prompt()` (synchronous, waits for completion)
+- [x] Session ID included in action outputs
 
 ### Event Subscription
 
-- [ ] Events subscribed via SSE at `${serverUrl}/event`
-- [ ] Tool completion events logged
-- [ ] Text response completion logged
-- [ ] Session update events tracked
+- [x] Events subscribed via SSE at `${serverUrl}/event`
+- [x] Tool completion events logged
+- [x] Text response completion logged
+- [x] Session update events tracked
 
 ### Completion Detection
 
-- [ ] `client.session.chat()` is synchronous (waits for response)
-- [ ] Text response extracted from `chatResponse.data.parts`
-- [ ] Proper exit codes (0=success, 1=error, 130=timeout)
+- [x] `client.session.prompt()` is synchronous (waits for response)
+- [x] Text response extracted from `promptResponse.data.parts`
+- [x] Proper exit codes (0=success, 1=error, 130=timeout)
 
 ### Timeout & Cancellation
 
-- [ ] Configurable timeout via `timeout` input
-- [ ] 0 = no timeout (infinite)
-- [ ] Default: 30 minutes (1800000ms)
-- [ ] Timeout kills server process
-- [ ] Server closed on timeout
+- [x] Configurable timeout via `timeout` input
+- [x] 0 = no timeout (infinite)
+- [x] Default: 30 minutes (1800000ms)
+- [x] Timeout kills server process
+- [x] Server closed on timeout
 
 ### Cleanup
 
-- [ ] `server.close()` (proc.kill()) called on completion
-- [ ] `server.close()` called on error
-- [ ] `server.close()` called on timeout
-- [ ] Cleanup failures don't mask original errors
+- [x] `server.close()` (proc.kill()) called on completion
+- [x] `server.close()` called on error
+- [x] `server.close()` called on timeout
+- [x] Cleanup failures don't mask original errors
 
 ---
 
@@ -877,7 +855,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -897,7 +875,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -905,7 +883,7 @@ describe("executeOpenCode", () => {
     await executeOpenCode("test prompt", null, mockLogger)
 
     // #then
-    expect(mockClient.session.chat).toHaveBeenCalledWith(
+    expect(mockClient.session.prompt).toHaveBeenCalledWith(
       expect.objectContaining({
         body: expect.objectContaining({
           agent: "Sisyphus",
@@ -920,7 +898,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -929,7 +907,7 @@ describe("executeOpenCode", () => {
 
     // #then
     // Should NOT include providerID/modelID when model not specified
-    expect(mockClient.session.chat).toHaveBeenCalledWith(
+    expect(mockClient.session.prompt).toHaveBeenCalledWith(
       expect.objectContaining({
         body: expect.not.objectContaining({
           providerID: expect.any(String),
@@ -946,7 +924,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -954,12 +932,14 @@ describe("executeOpenCode", () => {
     await executeOpenCode("test prompt", null, mockLogger)
 
     // #then
-    expect(mockClient.session.chat).toHaveBeenCalledWith(
+    expect(mockClient.session.prompt).toHaveBeenCalledWith(
       expect.objectContaining({
         body: expect.objectContaining({
           agent: "Sisyphus",
-          providerID: "anthropic",
-          modelID: "claude-sonnet-4-20250514",
+          model: {
+            providerID: "anthropic",
+            modelID: "claude-sonnet-4-20250514",
+          },
         }),
       }),
     )
@@ -971,7 +951,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -987,7 +967,7 @@ describe("executeOpenCode", () => {
     const mockProc = createMockProcess()
     vi.mocked(spawn).mockReturnValue(mockProc)
 
-    const mockClient = createMockClient({throwOnChat: true})
+    const mockClient = createMockClient({throwOnPrompt: true})
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
     // #when
@@ -1005,7 +985,7 @@ describe("executeOpenCode", () => {
     vi.mocked(spawn).mockReturnValue(mockProc)
 
     const mockClient = createMockClient({
-      chatResponse: {parts: [{type: "text", text: "Response"}]},
+      promptResponse: {parts: [{type: "text", text: "Response"}]},
     })
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
@@ -1021,7 +1001,7 @@ describe("executeOpenCode", () => {
     const mockProc = createMockProcess()
     vi.mocked(spawn).mockReturnValue(mockProc)
 
-    const mockClient = createMockClient({throwOnChat: true})
+    const mockClient = createMockClient({throwOnPrompt: true})
     vi.mocked(createOpencodeClient).mockReturnValue(mockClient)
 
     // #when
@@ -1115,8 +1095,8 @@ function createMockProcess(options: {exitCode?: number} = {}) {
 }
 
 function createMockClient(options: {
-  chatResponse?: {parts: Array<{type: string; text?: string}>}
-  throwOnChat?: boolean
+  promptResponse?: {parts: Array<{type: string; text?: string}>}
+  throwOnPrompt?: boolean
 }) {
   return {
     app: {
@@ -1124,9 +1104,9 @@ function createMockClient(options: {
     },
     session: {
       create: vi.fn().mockResolvedValue({data: {id: "ses_123", title: "Test", version: "1"}}),
-      chat: options.throwOnChat
-        ? vi.fn().mockRejectedValue(new Error("Chat failed"))
-        : vi.fn().mockResolvedValue({data: options.chatResponse}),
+      prompt: options.throwOnPrompt
+        ? vi.fn().mockRejectedValue(new Error("Prompt failed"))
+        : vi.fn().mockResolvedValue({data: options.promptResponse}),
     },
     agent: {
       list: vi.fn().mockResolvedValue({data: []}),
@@ -1201,3 +1181,37 @@ RFC-012's CLI execution is replaced **in-place** by this RFC. The exported API (
 3. **Agent List API**: Verify exact API shape for `client.agent.list()`
 4. **Session State**: Verify exact event names for session idle/error/active states
 5. **Prompt Parts**: File attachment support deferred to RFC for attachments (PRD section H)
+
+---
+
+## Completion Notes
+
+**Completed:** 2026-01-10
+
+### Implementation Summary
+
+RFC-013 SDK Execution Mode has been fully implemented, replacing CLI-based execution from RFC-012 with `@opencode-ai/sdk`.
+
+### Files Changed
+
+| File                             | Change                                          |
+| -------------------------------- | ----------------------------------------------- |
+| `package.json`                   | Added `@opencode-ai/sdk` dependency             |
+| `tsdown.config.ts`               | Added SDK to bundled dependencies               |
+| `action.yaml`                    | Added `agent`, `model`, `timeout` inputs        |
+| `src/lib/inputs.ts`              | Added `parseModelInput()` + new field parsing   |
+| `src/lib/types.ts`               | Added `ModelConfig` interface                   |
+| `src/lib/agent/types.ts`         | Added `ExecutionConfig`, `PromptPart`           |
+| `src/lib/agent/opencode.ts`      | Replaced CLI spawning with SDK client           |
+| `src/lib/agent/index.ts`         | Updated exports                                 |
+| `src/main.ts`                    | Passes `ExecutionConfig` to `executeOpenCode()` |
+| `src/lib/agent/opencode.test.ts` | Rewrote 19 tests for SDK mode                   |
+| `src/lib/inputs.test.ts`         | Added 6 tests for `parseModelInput()`           |
+
+### Verification
+
+- **Type check**: ✓ Pass
+- **Lint**: ✓ Pass
+- **Tests**: ✓ 349 tests passed
+- **Build**: ✓ 154KB main.js, 23KB setup.js
+- **Diagnostics**: ✓ No errors

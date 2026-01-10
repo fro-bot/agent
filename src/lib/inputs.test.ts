@@ -1,7 +1,7 @@
 import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {parseActionInputs} from './inputs.js'
+import {parseActionInputs, parseModelInput} from './inputs.js'
 
 // Mock @actions/core
 vi.mock('@actions/core', () => ({
@@ -210,5 +210,201 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(true)
       expect(result.success && result.data.s3Backup).toBe(true)
     })
+  })
+
+  describe('RFC-013 SDK execution inputs', () => {
+    it('parses agent input with default value', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.agent).toBe('Sisyphus')
+    })
+
+    it('parses custom agent input', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          agent: 'CustomAgent',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.agent).toBe('CustomAgent')
+    })
+
+    it('parses model input correctly', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          model: 'anthropic/claude-sonnet-4-20250514',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.model).toEqual({
+        providerID: 'anthropic',
+        modelID: 'claude-sonnet-4-20250514',
+      })
+    })
+
+    it('returns null model when not specified', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.model).toBeNull()
+    })
+
+    it('parses timeout input with default value', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.timeoutMs).toBe(1800000)
+    })
+
+    it('parses custom timeout input', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          timeout: '300000',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.timeoutMs).toBe(300000)
+    })
+
+    it('accepts zero timeout for no limit', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          timeout: '0',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.timeoutMs).toBe(0)
+    })
+
+    it('returns error for invalid model format (no slash)', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          model: 'invalid-model',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('Invalid model format')
+    })
+  })
+})
+
+describe('parseModelInput', () => {
+  it('parses valid provider/model format', () => {
+    const result = parseModelInput('anthropic/claude-sonnet-4-20250514')
+
+    expect(result).toEqual({
+      providerID: 'anthropic',
+      modelID: 'claude-sonnet-4-20250514',
+    })
+  })
+
+  it('handles model IDs with multiple slashes', () => {
+    const result = parseModelInput('openai/gpt-4/turbo')
+
+    expect(result).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-4/turbo',
+    })
+  })
+
+  it('trims whitespace from input', () => {
+    const result = parseModelInput('  anthropic/claude-sonnet-4-20250514  ')
+
+    expect(result).toEqual({
+      providerID: 'anthropic',
+      modelID: 'claude-sonnet-4-20250514',
+    })
+  })
+
+  it('throws error for input without slash', () => {
+    expect(() => parseModelInput('no-slash')).toThrow('Invalid model format')
+    expect(() => parseModelInput('no-slash')).toThrow('provider/model')
+  })
+
+  it('throws error for empty provider', () => {
+    expect(() => parseModelInput('/claude-sonnet')).toThrow('Provider cannot be empty')
+  })
+
+  it('throws error for empty model ID', () => {
+    expect(() => parseModelInput('anthropic/')).toThrow('Model ID cannot be empty')
+  })
+
+  it('throws error for empty string', () => {
+    expect(() => parseModelInput('')).toThrow('Invalid model format')
+  })
+
+  it('throws error for whitespace-only string', () => {
+    expect(() => parseModelInput('   ')).toThrow('Invalid model format')
   })
 })
