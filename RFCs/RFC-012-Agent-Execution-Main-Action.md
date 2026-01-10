@@ -1,6 +1,8 @@
 # RFC-012: Agent Execution & Main Action Lifecycle
 
-**Status:** Completed
+> **⚠️ SUPERSEDED:** This RFC's CLI execution model has been superseded by PRD v1.1 (2026-01-10), which adopts SDK-based execution via `@opencode-ai/sdk`. A new RFC-013 (SDK Execution Mode) will replace the execution specification. The context collection, prompt construction, and reactions/labels specifications remain valid.
+
+**Status:** Superseded (Execution Layer)
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 1
