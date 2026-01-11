@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-06
-**Commit:** 5062257
+**Generated:** 2026-01-11
+**Commit:** 1116f9e
 **Branch:** main
 
 ## OVERVIEW
@@ -13,13 +13,14 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ```
 ./
 ├── src/                  # TypeScript source
-│   ├── main.ts           # Primary entry (9-step orchestration with top-level await)
+│   ├── main.ts           # Primary entry (11-step orchestration with top-level await)
 │   ├── setup.ts          # Secondary entry (environment bootstrap)
 │   ├── index.ts          # Public API re-exports
 │   ├── lib/              # Core libraries
 │   │   ├── agent/        # Agent execution (context, prompt, reactions, opencode)
 │   │   ├── github/       # Octokit client, context parsing
 │   │   ├── setup/        # Environment bootstrap (bun, omo, opencode, auth)
+│   │   ├── session/      # Session persistence (storage, search, prune, writeback)
 │   │   ├── cache.ts      # Cache restore/save with corruption detection
 │   │   ├── cache-key.ts  # Branch-scoped key generation
 │   │   ├── logger.ts     # JSON logging with auto-redaction
@@ -41,38 +42,45 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ## WHERE TO LOOK
 
-| Task             | Location                     | Notes                                              |
-| ---------------- | ---------------------------- | -------------------------------------------------- |
-| Add action logic | `src/main.ts`                | 9-step orchestration lifecycle                     |
-| Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation                      |
-| Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`, corruption checks |
-| GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`              |
-| Event parsing    | `src/lib/github/context.ts`  | `parseGitHubContext()`, `classifyEventType()`      |
-| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()`, `verifyOpenCodeAvailable()`   |
-| Prompt building  | `src/lib/agent/prompt.ts`    | `buildAgentPrompt()` with session instructions     |
-| GitHub reactions | `src/lib/agent/reactions.ts` | Eyes emoji, working label, success/failure         |
-| Input parsing    | `src/lib/inputs.ts`          | `parseActionInputs()` returns `Result<T, E>`       |
-| Output setting   | `src/lib/outputs.ts`         | `setActionOutputs()`                               |
-| Logging          | `src/lib/logger.ts`          | `createLogger()` with sensitive field redaction    |
-| Core types       | `src/lib/types.ts`           | `ActionInputs`, `CacheResult`, `RunContext`        |
-| Build config     | `tsdown.config.ts`           | ESM shim, bundled deps, license extraction         |
-| Action I/O       | `action.yaml`                | Inputs, outputs, node24 runtime                    |
-| CI pipeline      | `.github/workflows/ci.yaml`  | Path-filtered jobs, v-branch release               |
+| Task             | Location                     | Notes                                               |
+| ---------------- | ---------------------------- | --------------------------------------------------- |
+| Add action logic | `src/main.ts`                | 11-step orchestration lifecycle                     |
+| Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation                       |
+| Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`, corruption checks  |
+| GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`               |
+| Event parsing    | `src/lib/github/context.ts`  | `parseGitHubContext()`, `classifyEventType()`       |
+| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()`, `verifyOpenCodeAvailable()`    |
+| Prompt building  | `src/lib/agent/prompt.ts`    | `buildAgentPrompt()` with session instructions      |
+| GitHub reactions | `src/lib/agent/reactions.ts` | Eyes emoji, working label, success/failure          |
+| Session storage  | `src/lib/session/storage.ts` | `listProjects()`, `getSession()`, `deleteSession()` |
+| Session search   | `src/lib/session/search.ts`  | `listSessions()`, `searchSessions()`                |
+| Session pruning  | `src/lib/session/prune.ts`   | `pruneSessions()` with retention policy             |
+| Input parsing    | `src/lib/inputs.ts`          | `parseActionInputs()` returns `Result<T, E>`        |
+| Output setting   | `src/lib/outputs.ts`         | `setActionOutputs()`                                |
+| Logging          | `src/lib/logger.ts`          | `createLogger()` with sensitive field redaction     |
+| Core types       | `src/lib/types.ts`           | `ActionInputs`, `CacheResult`, `RunContext`         |
+| Build config     | `tsdown.config.ts`           | ESM shim, bundled deps, license extraction          |
+| Action I/O       | `action.yaml`                | Inputs, outputs, node24 runtime                     |
+| CI pipeline      | `.github/workflows/ci.yaml`  | Path-filtered jobs, v-branch release                |
 
 ## CODE MAP
 
-| Symbol              | Type      | Location                    | Role                             |
-| ------------------- | --------- | --------------------------- | -------------------------------- |
-| `run`               | Function  | `src/main.ts:49`            | Main entry, 9-step orchestration |
-| `runSetup`          | Function  | `src/lib/setup/setup.ts:64` | Setup orchestration              |
-| `restoreCache`      | Function  | `src/lib/cache.ts:50`       | Restore OpenCode state           |
-| `saveCache`         | Function  | `src/lib/cache.ts:136`      | Persist state to cache           |
-| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`      | Parse/validate inputs            |
-| `createLogger`      | Function  | `src/lib/logger.ts:108`     | Logger with redaction            |
-| `ActionInputs`      | Interface | `src/lib/types.ts:39`       | Input schema                     |
-| `CacheResult`       | Interface | `src/lib/types.ts:11`       | Cache restore result             |
+| Symbol              | Type      | Location                    | Role                              |
+| ------------------- | --------- | --------------------------- | --------------------------------- |
+| `run`               | Function  | `src/main.ts:60`            | Main entry, 11-step orchestration |
+| `runSetup`          | Function  | `src/lib/setup/setup.ts:64` | Setup orchestration               |
+| `restoreCache`      | Function  | `src/lib/cache.ts:50`       | Restore OpenCode state            |
+| `saveCache`         | Function  | `src/lib/cache.ts:136`      | Persist state to cache            |
+| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts` | SDK execution with event stream   |
+| `listSessions`      | Function  | `src/lib/session/search.ts` | Get recent sessions               |
+| `searchSessions`    | Function  | `src/lib/session/search.ts` | Search prior work context         |
+| `pruneSessions`     | Function  | `src/lib/session/prune.ts`  | Cleanup old sessions              |
+| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`      | Parse/validate inputs             |
+| `createLogger`      | Function  | `src/lib/logger.ts:108`     | Logger with redaction             |
+| `ActionInputs`      | Interface | `src/lib/types.ts:45`       | Input schema                      |
+| `CacheResult`       | Interface | `src/lib/types.ts:11`       | Cache restore result              |
 
-> See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`).
+> See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`, `src/lib/session/`).
 
 ## TDD (Test-Driven Development)
 
@@ -114,13 +122,13 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 - **tsdown**: esbuild wrapper bundling to `dist/main.js` + `dist/setup.js`
 - **ESM shim**: Banner injects `createRequire` for CJS compat
-- **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@bfra.me/es` (not external)
+- **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`, `@bfra.me/es` (not external)
 - **Licenses**: Auto-extracted to `dist/licenses.txt`
 - **dist/ committed**: MUST run `pnpm build` after src changes; CI fails if out of sync
 
 ### Testing
 
-- **Vitest**: `pnpm test` runs all `*.test.ts`
+- **Vitest**: `pnpm test` runs all `*.test.ts` (349 tests, 24 files)
 - **Colocated**: Tests live alongside source
 - **No mocking libs**: vi.mock for externals only, functional testing otherwise
 - **Anti-.only**: `eslint-plugin-no-only-tests` blocks committing `.only`
@@ -163,6 +171,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 - **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
 - **v-branch releases**: Main merges to `v0` for major version pinning
 - **Dual entry points**: Main action + setup action with separate bundled outputs
+- **Logger injection**: All functions take `logger: Logger` as parameter (37 files)
+- **Synthetic run summaries**: Session writeback creates fake "user" messages for discoverability
 
 ## COMMANDS
 
@@ -172,7 +182,7 @@ pnpm build            # Bundle to dist/ (REQUIRED before commit)
 pnpm check-types      # TypeScript validation
 pnpm lint             # ESLint
 pnpm fix              # ESLint --fix
-pnpm test             # Vitest (247 tests)
+pnpm test             # Vitest (349 tests)
 ```
 
 ## NOTES
@@ -181,13 +191,13 @@ pnpm test             # Vitest (247 tests)
 - **GitHub App releases**: CI uses app token to push to protected `v0` branch
 - **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review
 - **Pre-commit hook**: `simple-git-hooks` runs `lint-staged`
-- **12 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution
+- **14 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode
 
 ## EXTERNAL RESOURCES
 
 ### Dependencies
 
-@actions/core, @actions/cache, @actions/exec, @actions/github, @actions/tool-cache, @bfra.me/es, @octokit/auth-app, vitest, tsdown, typescript
+@actions/core, @actions/cache, @actions/exec, @actions/github, @actions/tool-cache, @bfra.me/es, @octokit/auth-app, @opencode-ai/sdk, vitest, tsdown, typescript
 
 ### Context7 IDs
 
@@ -205,6 +215,7 @@ pnpm test             # Vitest (247 tests)
 - vitest-dev/vitest - Test framework
 - rolldown/tsdown - Build bundler (esbuild wrapper)
 - octokit/auth-app.js - GitHub App authentication
+- opencode-ai/opencode - OpenCode SDK
 
 ### Documentation
 

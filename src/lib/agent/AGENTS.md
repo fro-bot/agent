@@ -1,16 +1,28 @@
 # AGENT MODULE
 
-**Overview**: OpenCode CLI execution harness with GitHub context injection and UX feedback loops.
+**Overview**: OpenCode SDK execution harness with GitHub context injection and UX feedback loops.
 
 ## WHERE TO LOOK
 
 | Component     | File           | Responsibility                                       |
 | ------------- | -------------- | ---------------------------------------------------- |
-| **Execution** | `opencode.ts`  | Runs `opencode` CLI (uses `stdbuf` on Linux)         |
+| **Execution** | `opencode.ts`  | SDK server spawn, connection, session events, exec   |
 | **Context**   | `context.ts`   | Gathers event data, defaults, and issue details      |
 | **UX**        | `reactions.ts` | Manages emojis (👀/🎉/😕) and 'agent: working' label |
-| **Prompting** | `prompt.ts`    | Builds final system prompt with session/cache state  |
-| **Types**     | `types.ts`     | `AgentContext`, `AgentResult`, `ReactionContext`     |
+| **Prompting** | `prompt.ts`    | Builds final prompt with session/cache context       |
+| **Types**     | `types.ts`     | `AgentContext`, `AgentResult`, `ExecutionConfig`     |
+
+## KEY EXPORTS
+
+```typescript
+executeOpenCode(prompt, config, logger) // Main SDK execution
+verifyOpenCodeAvailable(path, logger) // Binary validation
+collectAgentContext(client, context, logger) // GitHub event context
+buildAgentPrompt(options, logger) // Multi-section prompt
+acknowledgeReceipt(ctx, logger) // Eyes + working label
+markSuccess(ctx, logger) // Replace with 🎉
+markFailure(ctx, logger) // Replace with 😕
+```
 
 ## CONVENTIONS
 
@@ -26,14 +38,10 @@
   - Created lazily if missing
 
 - **Execution Safety**:
-  - **Linux**: Wraps with `stdbuf -oL -eL` for real-time log streaming
+  - **SDK Mode**: Spawn OpenCode server, connect via SDK client (RFC-013)
+  - **Event Streaming**: SSE subscription for real-time logging (fire-and-forget)
+  - **Connection Retry**: 30 attempts with 1s delay for server startup
   - **Timings**: `startTime` / `duration` tracked for all operations
-  - **Path**: Fallback to `opencode` in PATH if no binary provided
-
-- **Code Style**:
-  - **Parallelism**: `acknowledgeReceipt` runs reaction + label concurrently
-  - **Pure Functions**: Logic separated from side effects where possible
-  - **Result Types**: Returns `AgentResult` object, catches and wraps errors
 
 ## ANTI-PATTERNS
 
