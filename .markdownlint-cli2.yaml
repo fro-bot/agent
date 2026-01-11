@@ -9,7 +9,7 @@ globs:
   - '**/*.md'
   - '!node_modules'
   - '!.ai/**'
-  - '!AGENTS.md'
+  - '!**/AGENTS.md'
   - '!PRD*.md'
   - '!FEATURES.md'
   - '!RULES.md'
