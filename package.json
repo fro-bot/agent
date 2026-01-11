@@ -17,7 +17,7 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "bootstrap": "pnpm install --prefer-offline --loglevel warn",
+    "bootstrap": "pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
     "build": "pnpm check-types && tsdown",
     "check-types": "tsc --noEmit",
     "fix": "eslint --fix",
