@@ -1,64 +1,47 @@
-import type {ExecAdapter, ExecOptions, GhAuthResult, Logger} from './types.js'
+import type {Octokit} from '../github/types.js'
+import type {ExecAdapter, GhAuthResult, Logger} from './types.js'
 import process from 'node:process'
+import {getUserByUsername} from '../github/api.js'
+import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
 
-/**
- * Configure gh CLI with GitHub App token or fallback to GITHUB_TOKEN.
- *
- * Uses GH_TOKEN environment variable (preferred over GITHUB_TOKEN)
- * to avoid conflicts with the Actions-provided token.
- */
 export async function configureGhAuth(
+  client: Octokit | null,
   appToken: string | null,
   defaultToken: string,
   logger: Logger,
-  execAdapter: ExecAdapter,
 ): Promise<GhAuthResult> {
   const token = appToken ?? defaultToken
   const method: GhAuthResult['method'] =
     appToken == null ? (defaultToken.length > 0 ? 'github-token' : 'none') : 'app-token'
 
   if (token.length === 0) {
-    logger.warning('No GitHub token available for gh CLI')
+    logger.warning('No GitHub token available')
     return {authenticated: false, method: 'none', botLogin: null}
   }
 
-  // GH_TOKEN takes priority over GITHUB_TOKEN for gh CLI
   process.env.GH_TOKEN = token
 
-  logger.info('Configured gh CLI authentication', {method})
+  logger.info('Configured authentication', {method})
 
-  const botLogin = await getBotLogin(token, logger, execAdapter)
+  let botLogin: string | null = null
+  if (client != null) {
+    botLogin = await getAuthenticatedUser(client, logger)
+  }
 
   return {authenticated: true, method, botLogin}
 }
 
-/**
- * Get the authenticated user/bot login.
- */
-export async function getBotLogin(token: string, logger: Logger, execAdapter: ExecAdapter): Promise<string | null> {
+export async function getBotLogin(client: Octokit, logger: Logger): Promise<string | null> {
   try {
-    const {stdout} = await execAdapter.getExecOutput('gh', ['api', '/user', '--jq', '.login'], {
-      env: {...process.env, GH_TOKEN: token},
-      silent: true,
-    })
-
-    const login = stdout.trim()
-    if (login.length > 0) {
-      logger.info('Authenticated as', {login})
-      return login
-    }
-    return null
+    const {data: user} = await client.rest.users.getAuthenticated()
+    logger.debug('Authenticated as', {login: user.login})
+    return user.login
   } catch {
     logger.debug('Could not determine bot login')
     return null
   }
 }
 
-/**
- * Configure git identity for commits.
- *
- * Uses GitHub App bot identity format: <app-slug>[bot]
- */
 export async function configureGitIdentity(
   appSlug: string | null,
   botUserId: string | null,
@@ -75,29 +58,10 @@ export async function configureGitIdentity(
   logger.info('Configured git identity', {name, email})
 }
 
-/**
- * Get GitHub App bot user ID for commit attribution.
- */
-export async function getBotUserId(
-  appSlug: string,
-  token: string,
-  logger: Logger,
-  execAdapter: ExecAdapter,
-): Promise<string | null> {
-  try {
-    const options: ExecOptions = {
-      env: {...process.env, GH_TOKEN: token},
-      silent: true,
-    }
-    const {stdout} = await execAdapter.getExecOutput('gh', ['api', `/users/${appSlug}[bot]`, '--jq', '.id'], options)
-
-    const userId = stdout.trim()
-    if (userId.length > 0) {
-      return userId
-    }
-    return null
-  } catch {
-    logger.debug('Could not get bot user ID')
-    return null
+export async function getBotUserId(client: Octokit, appSlug: string, logger: Logger): Promise<string | null> {
+  const user = await getUserByUsername(client, `${appSlug}[bot]`, logger)
+  if (user != null) {
+    return String(user.id)
   }
+  return null
 }

@@ -1,152 +1,91 @@
-/**
- * Reactions and labels management for RFC-012.
- *
- * Handles acknowledgment of agent receipt (eyes reaction, working label)
- * and completion updates (success/failure reactions, label removal).
- */
-
+import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {ReactionContext} from './types.js'
-import * as exec from '@actions/exec'
+import {
+  addLabelsToIssue,
+  createCommentReaction,
+  deleteCommentReaction,
+  ensureLabelExists,
+  listCommentReactions,
+  removeLabelFromIssue,
+} from '../github/api.js'
 import {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from './types.js'
 
-/**
- * Add eyes reaction to acknowledge receipt of the triggering comment.
- */
-export async function addEyesReaction(ctx: ReactionContext, logger: Logger): Promise<boolean> {
+export async function addEyesReaction(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<boolean> {
   if (ctx.commentId == null) {
     logger.debug('No comment ID, skipping eyes reaction')
     return false
   }
 
-  try {
-    await exec.exec(
-      'gh',
-      [
-        'api',
-        '--method',
-        'POST',
-        `/repos/${ctx.repo}/issues/comments/${ctx.commentId}/reactions`,
-        '-f',
-        'content=eyes',
-      ],
-      {silent: true},
-    )
-
+  const result = await createCommentReaction(client, ctx.repo, ctx.commentId, 'eyes', logger)
+  if (result != null) {
     logger.info('Added eyes reaction', {commentId: ctx.commentId})
     return true
-  } catch (error) {
-    logger.warning('Failed to add eyes reaction (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return false
   }
+  return false
 }
 
-/**
- * Add "agent: working" label to the issue/PR.
- */
-export async function addWorkingLabel(ctx: ReactionContext, logger: Logger): Promise<boolean> {
+export async function addWorkingLabel(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<boolean> {
   if (ctx.issueNumber == null) {
     logger.debug('No issue number, skipping working label')
     return false
   }
 
-  try {
-    // Ensure label exists (--force updates if exists)
-    await exec.exec(
-      'gh',
-      [
-        'label',
-        'create',
-        WORKING_LABEL,
-        '--color',
-        WORKING_LABEL_COLOR,
-        '--description',
-        WORKING_LABEL_DESCRIPTION,
-        '--force',
-      ],
-      {silent: true},
-    )
+  const labelCreated = await ensureLabelExists(
+    client,
+    ctx.repo,
+    WORKING_LABEL,
+    WORKING_LABEL_COLOR,
+    WORKING_LABEL_DESCRIPTION,
+    logger,
+  )
 
-    // Add label to issue/PR
-    const cmd = ctx.issueType === 'pr' ? 'pr' : 'issue'
-    await exec.exec('gh', [cmd, 'edit', String(ctx.issueNumber), '--add-label', WORKING_LABEL], {silent: true})
-
-    logger.info('Added working label', {issueNumber: ctx.issueNumber})
-    return true
-  } catch (error) {
-    logger.warning('Failed to add working label (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
-    })
+  if (!labelCreated) {
     return false
   }
+
+  const labelAdded = await addLabelsToIssue(client, ctx.repo, ctx.issueNumber, [WORKING_LABEL], logger)
+  if (labelAdded) {
+    logger.info('Added working label', {issueNumber: ctx.issueNumber})
+    return true
+  }
+  return false
 }
 
-/**
- * Acknowledge receipt by adding eyes reaction and working label.
- */
-export async function acknowledgeReceipt(ctx: ReactionContext, logger: Logger): Promise<void> {
-  // Run both in parallel - neither is dependent on the other
-  await Promise.all([addEyesReaction(ctx, logger), addWorkingLabel(ctx, logger)])
+export async function acknowledgeReceipt(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
+  await Promise.all([addEyesReaction(client, ctx, logger), addWorkingLabel(client, ctx, logger)])
 }
 
-/**
- * Remove the bot's eyes reaction from a comment.
- */
-async function removeEyesReaction(ctx: ReactionContext): Promise<void> {
+async function removeEyesReaction(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
   if (ctx.commentId == null || ctx.botLogin == null) return
 
-  const {stdout} = await exec.getExecOutput(
-    'gh',
-    [
-      'api',
-      `/repos/${ctx.repo}/issues/comments/${ctx.commentId}/reactions`,
-      '--jq',
-      `.[] | select(.content=="eyes" and .user.login=="${ctx.botLogin}") | .id`,
-    ],
-    {silent: true},
-  )
+  const reactions = await listCommentReactions(client, ctx.repo, ctx.commentId, logger)
+  const eyesReaction = reactions.find(r => r.content === 'eyes' && r.userLogin === ctx.botLogin)
 
-  const reactionId = stdout.trim()
-  if (reactionId.length > 0) {
-    await exec.exec('gh', ['api', '--method', 'DELETE', `/repos/${ctx.repo}/reactions/${reactionId}`], {silent: true})
+  if (eyesReaction != null) {
+    await deleteCommentReaction(client, ctx.repo, ctx.commentId, eyesReaction.id, logger)
   }
 }
 
-/**
- * Add a reaction to the triggering comment.
- */
-async function addReaction(ctx: ReactionContext, content: string): Promise<void> {
+async function addReaction(
+  client: Octokit,
+  ctx: ReactionContext,
+  content: 'hooray' | 'confused',
+  logger: Logger,
+): Promise<void> {
   if (ctx.commentId == null) return
-
-  await exec.exec(
-    'gh',
-    [
-      'api',
-      '--method',
-      'POST',
-      `/repos/${ctx.repo}/issues/comments/${ctx.commentId}/reactions`,
-      '-f',
-      `content=${content}`,
-    ],
-    {silent: true},
-  )
+  await createCommentReaction(client, ctx.repo, ctx.commentId, content, logger)
 }
 
-/**
- * Update reaction from eyes to success indicator on successful completion.
- * Uses hooray (🎉) as GitHub API doesn't support peace sign reactions.
- */
-export async function updateReactionOnSuccess(ctx: ReactionContext, logger: Logger): Promise<void> {
+export async function updateReactionOnSuccess(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
   if (ctx.commentId == null || ctx.botLogin == null) {
     logger.debug('Missing comment ID or bot login, skipping reaction update')
     return
   }
 
   try {
-    await removeEyesReaction(ctx)
-    await addReaction(ctx, 'hooray')
+    await removeEyesReaction(client, ctx, logger)
+    await addReaction(client, ctx, 'hooray', logger)
     logger.info('Updated reaction to success indicator', {commentId: ctx.commentId, reaction: 'hooray'})
   } catch (error) {
     logger.warning('Failed to update reaction (non-fatal)', {
@@ -155,18 +94,15 @@ export async function updateReactionOnSuccess(ctx: ReactionContext, logger: Logg
   }
 }
 
-/**
- * Update reaction to confused (😕) on failure.
- */
-export async function updateReactionOnFailure(ctx: ReactionContext, logger: Logger): Promise<void> {
+export async function updateReactionOnFailure(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
   if (ctx.commentId == null || ctx.botLogin == null) {
     logger.debug('Missing comment ID or bot login, skipping reaction update')
     return
   }
 
   try {
-    await removeEyesReaction(ctx)
-    await addReaction(ctx, 'confused')
+    await removeEyesReaction(client, ctx, logger)
+    await addReaction(client, ctx, 'confused', logger)
     logger.info('Updated reaction to confused', {commentId: ctx.commentId})
   } catch (error) {
     logger.warning('Failed to update failure reaction (non-fatal)', {
@@ -175,38 +111,29 @@ export async function updateReactionOnFailure(ctx: ReactionContext, logger: Logg
   }
 }
 
-/**
- * Remove "agent: working" label on completion (success or failure).
- */
-export async function removeWorkingLabel(ctx: ReactionContext, logger: Logger): Promise<void> {
+export async function removeWorkingLabel(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<void> {
   if (ctx.issueNumber == null) {
     logger.debug('No issue number, skipping label removal')
     return
   }
 
-  try {
-    const cmd = ctx.issueType === 'pr' ? 'pr' : 'issue'
-    await exec.exec('gh', [cmd, 'edit', String(ctx.issueNumber), '--remove-label', WORKING_LABEL], {silent: true})
-
+  const removed = await removeLabelFromIssue(client, ctx.repo, ctx.issueNumber, WORKING_LABEL, logger)
+  if (removed) {
     logger.info('Removed working label', {issueNumber: ctx.issueNumber})
-  } catch (error) {
-    logger.warning('Failed to remove working label (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
-    })
   }
 }
 
-/**
- * Complete acknowledgment cycle based on success/failure.
- */
-export async function completeAcknowledgment(ctx: ReactionContext, success: boolean, logger: Logger): Promise<void> {
-  // Update reaction based on outcome
+export async function completeAcknowledgment(
+  client: Octokit,
+  ctx: ReactionContext,
+  success: boolean,
+  logger: Logger,
+): Promise<void> {
   if (success) {
-    await updateReactionOnSuccess(ctx, logger)
+    await updateReactionOnSuccess(client, ctx, logger)
   } else {
-    await updateReactionOnFailure(ctx, logger)
+    await updateReactionOnFailure(client, ctx, logger)
   }
 
-  // Always remove working label
-  await removeWorkingLabel(ctx, logger)
+  await removeWorkingLabel(client, ctx, logger)
 }

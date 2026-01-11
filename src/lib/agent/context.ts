@@ -8,7 +8,6 @@
 import type {IssueCommentPayload} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {AgentContext} from './types.js'
-import * as exec from '@actions/exec'
 import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
 
 /**
@@ -63,23 +62,5 @@ export function collectAgentContext(logger: Logger): AgentContext {
     commentAuthor,
     commentId,
     defaultBranch: 'main', // Will be fetched via gh CLI if needed
-  }
-}
-
-/**
- * Fetch repository default branch via gh CLI.
- * Called separately to avoid blocking context collection.
- */
-export async function fetchDefaultBranch(repo: string, logger: Logger): Promise<string> {
-  try {
-    const {stdout} = await exec.getExecOutput('gh', ['api', `/repos/${repo}`, '--jq', '.default_branch'], {
-      silent: true,
-    })
-    return stdout.trim() || 'main'
-  } catch (error) {
-    logger.warning('Failed to fetch default branch', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return 'main'
   }
 }

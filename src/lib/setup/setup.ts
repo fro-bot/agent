@@ -4,6 +4,7 @@ import process from 'node:process'
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
+import {getOctokit} from '@actions/github'
 
 import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'
@@ -124,7 +125,8 @@ export async function runSetup(): Promise<SetupResult | null> {
     }
 
     // Configure gh CLI authentication
-    const ghResult = await configureGhAuth(null, githubToken, logger, execAdapter)
+    const octokit = getOctokit(githubToken)
+    const ghResult = await configureGhAuth(octokit, null, githubToken, logger)
     core.exportVariable('GH_TOKEN', githubToken)
     logger.info('GitHub CLI configured')
 
