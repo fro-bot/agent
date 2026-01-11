@@ -1,8 +1,8 @@
+import type {Octokit} from '../github/types.js'
 import type {ExecAdapter, Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
 
-// Mock logger
 function createMockLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -12,13 +12,24 @@ function createMockLogger(): Logger {
   }
 }
 
-// Mock exec adapter
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
   return {
     exec: vi.fn().mockResolvedValue(0),
     getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''}),
     ...overrides,
   }
+}
+
+function createMockOctokit(overrides: Record<string, unknown> = {}): Octokit {
+  return {
+    rest: {
+      users: {
+        getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
+        getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
+      },
+      ...overrides,
+    },
+  } as unknown as Octokit
 }
 
 describe('gh-auth', () => {
@@ -38,16 +49,10 @@ describe('gh-auth', () => {
   describe('configureGhAuth', () => {
     it('prefers app token over default token', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: 'fro-bot[bot]\n',
-          stderr: '',
-        }),
-      })
+      const mockOctokit = createMockOctokit()
 
       // #when
-      const result = await configureGhAuth('app-token-123', 'default-token', mockLogger, mockExec)
+      const result = await configureGhAuth(mockOctokit, 'app-token-123', 'default-token', mockLogger)
 
       // #then
       expect(result.method).toBe('app-token')
@@ -57,16 +62,10 @@ describe('gh-auth', () => {
 
     it('falls back to github token when app token is null', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: 'user123\n',
-          stderr: '',
-        }),
-      })
+      const mockOctokit = createMockOctokit()
 
       // #when
-      const result = await configureGhAuth(null, 'github-token-456', mockLogger, mockExec)
+      const result = await configureGhAuth(mockOctokit, null, 'github-token-456', mockLogger)
 
       // #then
       expect(result.method).toBe('github-token')
@@ -75,11 +74,10 @@ describe('gh-auth', () => {
     })
 
     it('returns not authenticated when both tokens are empty', async () => {
-      // #given
-      const mockExec = createMockExecAdapter()
+      // #given - no client needed when no tokens
 
       // #when
-      const result = await configureGhAuth(null, '', mockLogger, mockExec)
+      const result = await configureGhAuth(null, null, '', mockLogger)
 
       // #then
       expect(result.method).toBe('none')
@@ -87,81 +85,56 @@ describe('gh-auth', () => {
       expect(result.botLogin).toBe(null)
     })
 
-    it('returns botLogin from gh api response', async () => {
+    it('returns botLogin from Octokit API response', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: 'my-app[bot]\n',
-          stderr: '',
-        }),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getAuthenticated).mockResolvedValue({
+        data: {login: 'my-app[bot]', type: 'Bot'},
+      } as never)
 
       // #when
-      const result = await configureGhAuth('app-token', 'default', mockLogger, mockExec)
+      const result = await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger)
 
       // #then
       expect(result.botLogin).toBe('my-app[bot]')
     })
 
-    it('handles gh api failure gracefully', async () => {
+    it('handles API failure gracefully', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockRejectedValue(new Error('gh api failed')),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getAuthenticated).mockRejectedValue(new Error('API failed'))
 
       // #when
-      const result = await configureGhAuth('app-token', 'default', mockLogger, mockExec)
+      const result = await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger)
 
       // #then
       expect(result.authenticated).toBe(true)
-      expect(result.botLogin).toBe(null)
+      expect(result.botLogin).toBe('fro-bot[bot]')
     })
   })
 
   describe('getBotLogin', () => {
-    it('extracts login from gh api response', async () => {
+    it('extracts login from Octokit API response', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: 'fro-bot[bot]\n',
-          stderr: '',
-        }),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getAuthenticated).mockResolvedValue({
+        data: {login: 'fro-bot[bot]', type: 'Bot'},
+      } as never)
 
       // #when
-      const login = await getBotLogin('token', mockLogger, mockExec)
+      const login = await getBotLogin(mockOctokit, mockLogger)
 
       // #then
       expect(login).toBe('fro-bot[bot]')
     })
 
-    it('returns null on empty response', async () => {
-      // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: '',
-          stderr: '',
-        }),
-      })
-
-      // #when
-      const login = await getBotLogin('token', mockLogger, mockExec)
-
-      // #then
-      expect(login).toBe(null)
-    })
-
     it('returns null on error', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockRejectedValue(new Error('Network error')),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getAuthenticated).mockRejectedValue(new Error('Network error'))
 
       // #when
-      const login = await getBotLogin('token', mockLogger, mockExec)
+      const login = await getBotLogin(mockOctokit, mockLogger)
 
       // #then
       expect(login).toBe(null)
@@ -214,75 +187,41 @@ describe('gh-auth', () => {
   })
 
   describe('getBotUserId', () => {
-    it('extracts user ID from gh api response', async () => {
+    it('extracts user ID from Octokit API response', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: '123456789\n',
-          stderr: '',
-        }),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getByUsername).mockResolvedValue({
+        data: {id: 123456789, login: 'fro-bot[bot]'},
+      } as never)
 
       // #when
-      const userId = await getBotUserId('fro-bot', 'token', mockLogger, mockExec)
+      const userId = await getBotUserId(mockOctokit, 'fro-bot', mockLogger)
 
       // #then
       expect(userId).toBe('123456789')
     })
 
-    it('returns null on empty response', async () => {
-      // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: '',
-          stderr: '',
-        }),
-      })
-
-      // #when
-      const userId = await getBotUserId('fro-bot', 'token', mockLogger, mockExec)
-
-      // #then
-      expect(userId).toBe(null)
-    })
-
     it('returns null on error', async () => {
       // #given
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockRejectedValue(new Error('User not found')),
-      })
+      const mockOctokit = createMockOctokit()
+      vi.mocked(mockOctokit.rest.users.getByUsername).mockRejectedValue(new Error('User not found'))
 
       // #when
-      const userId = await getBotUserId('fro-bot', 'token', mockLogger, mockExec)
+      const userId = await getBotUserId(mockOctokit, 'fro-bot', mockLogger)
 
       // #then
       expect(userId).toBe(null)
     })
 
-    it('calls correct gh api endpoint', async () => {
+    it('calls correct Octokit API endpoint', async () => {
       // #given
-      const mockGetExecOutput = vi.fn().mockResolvedValue({
-        exitCode: 0,
-        stdout: '12345\n',
-        stderr: '',
-      })
-      const mockExec = createMockExecAdapter({
-        getExecOutput: mockGetExecOutput,
-      })
+      const mockOctokit = createMockOctokit()
 
       // #when
-      await getBotUserId('my-app', 'token123', mockLogger, mockExec)
+      await getBotUserId(mockOctokit, 'my-app', mockLogger)
 
       // #then
-      expect(mockGetExecOutput).toHaveBeenCalledWith(
-        'gh',
-        ['api', '/users/my-app[bot]', '--jq', '.id'],
-        expect.objectContaining({
-          env: expect.objectContaining({GH_TOKEN: 'token123'}) as Record<string, string>,
-        }),
-      )
+      expect(mockOctokit.rest.users.getByUsername).toHaveBeenCalledWith({username: 'my-app[bot]'})
     })
   })
 })

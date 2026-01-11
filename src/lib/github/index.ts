@@ -1,3 +1,15 @@
+export {
+  addLabelsToIssue,
+  createCommentReaction,
+  deleteCommentReaction,
+  ensureLabelExists,
+  getDefaultBranch,
+  getUserByUsername,
+  listCommentReactions,
+  parseRepoString,
+  removeLabelFromIssue,
+} from './api.js'
+export type {RepoIdentifier} from './api.js'
 export {createAppClient, createClient, getBotLogin} from './client.js'
 export type {AppClientOptions, ClientOptions} from './client.js'
 export {
