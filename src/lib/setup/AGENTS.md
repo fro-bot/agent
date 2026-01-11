@@ -14,6 +14,17 @@
 | **Credentials**   | `auth-json.ts` | Populate `auth.json` for OpenCode           |
 | **Types**         | `types.ts`     | `SetupResult`, `BunInstallResult`, adapters |
 
+## KEY EXPORTS
+
+```typescript
+runSetup(options) // Main orchestration
+installOpenCode(options) // CLI installation with version resolution
+installBun(options) // Bun runtime setup
+installOmo(options) // oMo plugin (graceful failure)
+configureGhAuth(token) // gh CLI authentication
+populateAuthJson(config) // Write credentials with 0o600 permissions
+```
+
 ## PATTERNS
 
 - **Tool Cache**: Download → validate → extract → `@actions/tool-cache` for reuse
@@ -37,14 +48,3 @@
 | Hardcoded versions                    | Use `getLatestVersion()` with fallback           |
 | Blocking on oMo                       | It's optional; failures shouldn't stop execution |
 | Direct `fetch` without error handling | Always check `response.ok`                       |
-
-## KEY EXPORTS
-
-```typescript
-runSetup(options) // Main orchestration
-installOpenCode(options) // CLI installation
-installBun(options) // Bun runtime
-installOmo(options) // oMo plugin (graceful)
-configureGhAuth(token) // gh CLI auth
-populateAuthJson(config) // Write credentials
-```

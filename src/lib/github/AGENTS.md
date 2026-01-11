@@ -1,10 +1,6 @@
-# GITHUB MODULE KNOWLEDGE BASE
+# GITHUB MODULE
 
-**Generated:** 2026-01-06
-
-## OVERVIEW
-
-Provides authenticated Octokit clients (Token/App) and strictly typed event context parsing for Actions.
+**Overview**: Authenticated Octokit clients (Token/App) and strictly typed event context parsing.
 
 ## WHERE TO LOOK
 
@@ -15,26 +11,30 @@ Provides authenticated Octokit clients (Token/App) and strictly typed event cont
 | Context   | `context.ts` | Event parsing, target extraction, PR detection            |
 | Exports   | `index.ts`   | Public API surface                                        |
 
-## KEY FUNCTIONS
+## KEY EXPORTS
 
-- **`createClient(options)`**: Standard token-based Octokit. Wraps logger.
-- **`createAppClient(options)`**: Elevated permissions via `@octokit/auth-app`. Dynamic import.
-- **`getBotLogin(client)`**: Auto-detects identity. Returns `login` or `fro-bot[bot]` on failure.
-- **`parseGitHubContext(logger)`**: Converts global `github.context` to typed `GitHubContext`.
-- **`classifyEventType(name)`**: Normalizes events to `issue_comment`, `discussion`, etc.
-- **`getCommentTarget(ctx)`**: Extracts `{type, number, owner, repo}` from payload.
-- **`isPullRequest(payload)`**: Distinguishes PR comments from Issue comments (shared event).
+```typescript
+createClient(options) // Standard token-based Octokit
+createAppClient(options) // Elevated permissions via @octokit/auth-app
+getBotLogin(client) // Auto-detect identity (returns login or fallback)
+parseGitHubContext(logger) // Convert global context to typed GitHubContext
+classifyEventType(name) // Normalize to issue_comment, discussion, etc.
+getCommentTarget(ctx) // Extract {type, number, owner, repo}
+isPullRequest(payload) // Distinguish PR comments from Issue comments
+```
 
 ## PATTERNS
 
-- **Dual Auth**: Use `createClient` for read/reaction, `createAppClient` for high-privilege writes.
-- **Logger Wrapping**: `createOctokitLogger` adapts project `Logger` to Octokit's interface.
-- **Dynamic Imports**: `@octokit/auth-app` is imported only when needed to save bundle size.
-- **Payload Typing**: We define specific payload interfaces (`IssueCommentPayload`) vs generic `any`.
+- **Dual Auth**: Use `createClient` for read/reaction, `createAppClient` for high-privilege writes
+- **Logger Wrapping**: `createOctokitLogger` adapts project `Logger` to Octokit's interface
+- **Dynamic Imports**: `@octokit/auth-app` imported only when needed to save bundle size
+- **Payload Typing**: Specific interfaces (`IssueCommentPayload`) vs generic `any`
 
 ## ANTI-PATTERNS
 
-- **Global Context**: Don't use `github.context` directly in logic; pass parsed `GitHubContext`.
-- **Implicit Types**: Don't cast payloads to `any`; use `types.ts` definitions.
-- **Hardcoded Bots**: Always use `getBotLogin()` instead of assuming bot name.
-- **Raw Events**: Don't check `ctx.eventName` strings; use `classifyEventType()` enum.
+| Pattern            | Why                                                   |
+| ------------------ | ----------------------------------------------------- |
+| **Global Context** | Don't use `github.context` directly; pass parsed type |
+| **Implicit Types** | Don't cast payloads to `any`; use `types.ts`          |
+| **Hardcoded Bots** | Always use `getBotLogin()` instead of assuming name   |
+| **Raw Events**     | Don't check `ctx.eventName` strings; use classifier   |
