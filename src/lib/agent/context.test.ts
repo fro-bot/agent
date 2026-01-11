@@ -1,13 +1,10 @@
 import type {IssueCommentPayload} from '../github/types.js'
 import type {Logger} from '../logger.js'
-import * as exec from '@actions/exec'
 
-// Import after mocks are set up
 import * as github from '@actions/github'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {collectAgentContext, fetchDefaultBranch} from './context.js'
+import {collectAgentContext} from './context.js'
 
-// Mock @actions/github before importing the module under test
 vi.mock('@actions/github', () => ({
   context: {
     eventName: 'issue_comment',
@@ -18,11 +15,6 @@ vi.mock('@actions/github', () => ({
     actor: 'test-actor',
     payload: {},
   },
-}))
-
-// Mock @actions/exec for fetchDefaultBranch
-vi.mock('@actions/exec', () => ({
-  getExecOutput: vi.fn(),
 }))
 
 function createMockLogger(): Logger {
@@ -141,7 +133,6 @@ describe('collectAgentContext', () => {
   it('detects PR type when pull_request field is present', () => {
     // #given
     const payload = createIssueCommentPayload()
-    // Add pull_request field to indicate this is a PR
     ;(payload.issue as Record<string, unknown>).pull_request = {url: 'https://api.github.com/...'}
     vi.mocked(github.context).eventName = 'issue_comment'
     vi.mocked(github.context).payload = payload as unknown as typeof github.context.payload
@@ -200,66 +191,5 @@ describe('collectAgentContext', () => {
 
     // #then
     expect(ctx.defaultBranch).toBe('main')
-  })
-})
-
-describe('fetchDefaultBranch', () => {
-  let mockLogger: Logger
-
-  beforeEach(() => {
-    mockLogger = createMockLogger()
-    vi.clearAllMocks()
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('fetches default branch via gh CLI', async () => {
-    // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({
-      stdout: 'develop\n',
-      stderr: '',
-      exitCode: 0,
-    })
-
-    // #when
-    const branch = await fetchDefaultBranch('owner/repo', mockLogger)
-
-    // #then
-    expect(branch).toBe('develop')
-    expect(exec.getExecOutput).toHaveBeenCalledWith('gh', ['api', '/repos/owner/repo', '--jq', '.default_branch'], {
-      silent: true,
-    })
-  })
-
-  it('returns "main" on API failure', async () => {
-    // #given
-    vi.mocked(exec.getExecOutput).mockRejectedValue(new Error('API error'))
-
-    // #when
-    const branch = await fetchDefaultBranch('owner/repo', mockLogger)
-
-    // #then
-    expect(branch).toBe('main')
-    expect(mockLogger.warning).toHaveBeenCalledWith(
-      'Failed to fetch default branch',
-      expect.objectContaining({error: 'API error'}),
-    )
-  })
-
-  it('returns "main" when stdout is empty', async () => {
-    // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({
-      stdout: '',
-      stderr: '',
-      exitCode: 0,
-    })
-
-    // #when
-    const branch = await fetchDefaultBranch('owner/repo', mockLogger)
-
-    // #then
-    expect(branch).toBe('main')
   })
 })

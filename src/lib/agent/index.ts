@@ -9,7 +9,7 @@
  */
 
 // Context collection
-export {collectAgentContext, fetchDefaultBranch} from './context.js'
+export {collectAgentContext} from './context.js'
 
 // OpenCode execution (RFC-013: SDK mode)
 export {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'

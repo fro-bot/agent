@@ -20,6 +20,7 @@
 
 import type {ExecutionConfig, ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
+import type {Octokit} from './lib/github/types.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
@@ -29,10 +30,10 @@ import {
   collectAgentContext,
   completeAcknowledgment,
   executeOpenCode,
-  fetchDefaultBranch,
   verifyOpenCodeAvailable,
 } from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
+import {createClient, getDefaultBranch} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {setActionOutputs} from './lib/outputs.js'
@@ -64,6 +65,7 @@ async function run(): Promise<void> {
   // Track agent state for cleanup
   let reactionCtx: ReactionContext | null = null
   let agentSuccess = false
+  let githubClient: Octokit | null = null
 
   try {
     bootstrapLogger.info('Starting Fro Bot Agent')
@@ -105,7 +107,8 @@ async function run(): Promise<void> {
     const agentContext = collectAgentContext(contextLogger)
 
     // Fetch default branch asynchronously (non-blocking enhancement)
-    const defaultBranch = await fetchDefaultBranch(agentContext.repo, contextLogger)
+    githubClient = createClient({token: inputs.githubToken, logger: contextLogger})
+    const defaultBranch = await getDefaultBranch(githubClient, agentContext.repo, contextLogger)
     const contextWithBranch = {...agentContext, defaultBranch}
 
     // 4. Build reaction context for acknowledgment
@@ -120,7 +123,7 @@ async function run(): Promise<void> {
 
     // 5. Acknowledge receipt immediately (eyes reaction + working label)
     const ackLogger = createLogger({phase: 'acknowledgment'})
-    await acknowledgeReceipt(reactionCtx, ackLogger)
+    await acknowledgeReceipt(githubClient, reactionCtx, ackLogger)
 
     // 6. Build cache key components and restore cache
     const cacheComponents: CacheKeyComponents = {
@@ -263,9 +266,9 @@ async function run(): Promise<void> {
     // Always cleanup: update reactions, prune sessions, and save cache
     try {
       // Complete acknowledgment (update reaction, remove label)
-      if (reactionCtx != null) {
+      if (reactionCtx != null && githubClient != null) {
         const cleanupLogger = createLogger({phase: 'cleanup'})
-        await completeAcknowledgment(reactionCtx, agentSuccess, cleanupLogger)
+        await completeAcknowledgment(githubClient, reactionCtx, agentSuccess, cleanupLogger)
       }
 
       // Prune old sessions (RFC-004) before cache save

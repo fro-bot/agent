@@ -1,6 +1,6 @@
+import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {ReactionContext} from './types.js'
-import * as exec from '@actions/exec'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {
@@ -13,12 +13,6 @@ import {
   updateReactionOnSuccess,
 } from './reactions.js'
 
-// Mock @actions/exec
-vi.mock('@actions/exec', () => ({
-  exec: vi.fn(),
-  getExecOutput: vi.fn(),
-}))
-
 function createMockLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -26,6 +20,23 @@ function createMockLogger(): Logger {
     warning: vi.fn(),
     error: vi.fn(),
   }
+}
+
+function createMockOctokit(): Octokit {
+  return {
+    rest: {
+      reactions: {
+        createForIssueComment: vi.fn().mockResolvedValue({data: {id: 123}}),
+        listForIssueComment: vi.fn().mockResolvedValue({data: []}),
+        deleteForIssueComment: vi.fn().mockResolvedValue({}),
+      },
+      issues: {
+        createLabel: vi.fn().mockResolvedValue({data: {}}),
+        addLabels: vi.fn().mockResolvedValue({data: {}}),
+        removeLabel: vi.fn().mockResolvedValue({data: {}}),
+      },
+    },
+  } as unknown as Octokit
 }
 
 function createMockReactionContext(overrides: Partial<ReactionContext> = {}): ReactionContext {
@@ -41,9 +52,11 @@ function createMockReactionContext(overrides: Partial<ReactionContext> = {}): Re
 
 describe('addEyesReaction', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
@@ -51,21 +64,21 @@ describe('addEyesReaction', () => {
     vi.restoreAllMocks()
   })
 
-  it('adds eyes reaction to comment via gh API', async () => {
+  it('adds eyes reaction to comment via Octokit API', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
     const ctx = createMockReactionContext({commentId: 99999})
 
     // #when
-    const result = await addEyesReaction(ctx, mockLogger)
+    const result = await addEyesReaction(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(true)
-    expect(exec.exec).toHaveBeenCalledWith(
-      'gh',
-      ['api', '--method', 'POST', '/repos/owner/repo/issues/comments/99999/reactions', '-f', 'content=eyes'],
-      {silent: true},
-    )
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      comment_id: 99999,
+      content: 'eyes',
+    })
   })
 
   it('returns false when commentId is null', async () => {
@@ -73,36 +86,34 @@ describe('addEyesReaction', () => {
     const ctx = createMockReactionContext({commentId: null})
 
     // #when
-    const result = await addEyesReaction(ctx, mockLogger)
+    const result = await addEyesReaction(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(false)
-    expect(exec.exec).not.toHaveBeenCalled()
+    expect(mockOctokit.rest.reactions.createForIssueComment).not.toHaveBeenCalled()
     expect(mockLogger.debug).toHaveBeenCalledWith('No comment ID, skipping eyes reaction')
   })
 
-  it('returns false and logs warning on API failure', async () => {
+  it('returns false on API failure', async () => {
     // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('API error'))
+    vi.mocked(mockOctokit.rest.reactions.createForIssueComment).mockRejectedValue(new Error('API error'))
     const ctx = createMockReactionContext()
 
     // #when
-    const result = await addEyesReaction(ctx, mockLogger)
+    const result = await addEyesReaction(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(false)
-    expect(mockLogger.warning).toHaveBeenCalledWith(
-      'Failed to add eyes reaction (non-fatal)',
-      expect.objectContaining({error: 'API error'}),
-    )
   })
 })
 
 describe('addWorkingLabel', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
@@ -112,45 +123,26 @@ describe('addWorkingLabel', () => {
 
   it('creates label and adds it to issue', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
     const ctx = createMockReactionContext({issueNumber: 123, issueType: 'issue'})
 
     // #when
-    const result = await addWorkingLabel(ctx, mockLogger)
+    const result = await addWorkingLabel(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(true)
-    // First call creates/updates the label
-    expect(exec.exec).toHaveBeenCalledWith(
-      'gh',
-      [
-        'label',
-        'create',
-        'agent: working',
-        '--color',
-        'fcf2e1',
-        '--description',
-        'Agent is currently working on this',
-        '--force',
-      ],
-      {silent: true},
-    )
-    // Second call adds label to issue
-    expect(exec.exec).toHaveBeenCalledWith('gh', ['issue', 'edit', '123', '--add-label', 'agent: working'], {
-      silent: true,
+    expect(mockOctokit.rest.issues.createLabel).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      name: 'agent: working',
+      color: 'fcf2e1',
+      description: 'Agent is currently working on this',
     })
-  })
-
-  it('uses pr command for PR type', async () => {
-    // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
-    const ctx = createMockReactionContext({issueNumber: 456, issueType: 'pr'})
-
-    // #when
-    await addWorkingLabel(ctx, mockLogger)
-
-    // #then
-    expect(exec.exec).toHaveBeenCalledWith('gh', ['pr', 'edit', '456', '--add-label', 'agent: working'], {silent: true})
+    expect(mockOctokit.rest.issues.addLabels).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      issue_number: 123,
+      labels: ['agent: working'],
+    })
   })
 
   it('returns false when issueNumber is null', async () => {
@@ -158,85 +150,73 @@ describe('addWorkingLabel', () => {
     const ctx = createMockReactionContext({issueNumber: null})
 
     // #when
-    const result = await addWorkingLabel(ctx, mockLogger)
+    const result = await addWorkingLabel(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(false)
-    expect(exec.exec).not.toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.createLabel).not.toHaveBeenCalled()
   })
 
-  it('returns false and logs warning on failure', async () => {
+  it('returns false on failure', async () => {
     // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('Permission denied'))
+    vi.mocked(mockOctokit.rest.issues.createLabel).mockRejectedValue(new Error('Permission denied'))
     const ctx = createMockReactionContext()
 
     // #when
-    const result = await addWorkingLabel(ctx, mockLogger)
+    const result = await addWorkingLabel(mockOctokit, ctx, mockLogger)
 
     // #then
     expect(result).toBe(false)
-    expect(mockLogger.warning).toHaveBeenCalledWith(
-      'Failed to add working label (non-fatal)',
-      expect.objectContaining({error: 'Permission denied'}),
-    )
   })
 })
 
 describe('acknowledgeReceipt', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
   it('runs both reaction and label operations in parallel', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
     const ctx = createMockReactionContext()
 
     // #when
-    await acknowledgeReceipt(ctx, mockLogger)
+    await acknowledgeReceipt(mockOctokit, ctx, mockLogger)
 
     // #then
-    // Should have made calls for both eyes reaction and working label
-    expect(exec.exec).toHaveBeenCalledTimes(3) // label create + label add + reaction
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.createLabel).toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.addLabels).toHaveBeenCalled()
   })
 })
 
 describe('removeWorkingLabel', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
   it('removes working label from issue', async () => {
     // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
     const ctx = createMockReactionContext({issueNumber: 42, issueType: 'issue'})
 
     // #when
-    await removeWorkingLabel(ctx, mockLogger)
+    await removeWorkingLabel(mockOctokit, ctx, mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalledWith('gh', ['issue', 'edit', '42', '--remove-label', 'agent: working'], {
-      silent: true,
-    })
-  })
-
-  it('uses pr command for PR type', async () => {
-    // #given
-    vi.mocked(exec.exec).mockResolvedValue(0)
-    const ctx = createMockReactionContext({issueNumber: 99, issueType: 'pr'})
-
-    // #when
-    await removeWorkingLabel(ctx, mockLogger)
-
-    // #then
-    expect(exec.exec).toHaveBeenCalledWith('gh', ['pr', 'edit', '99', '--remove-label', 'agent: working'], {
-      silent: true,
+    expect(mockOctokit.rest.issues.removeLabel).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      issue_number: 42,
+      name: 'agent: working',
     })
   })
 
@@ -245,48 +225,48 @@ describe('removeWorkingLabel', () => {
     const ctx = createMockReactionContext({issueNumber: null})
 
     // #when
-    await removeWorkingLabel(ctx, mockLogger)
+    await removeWorkingLabel(mockOctokit, ctx, mockLogger)
 
     // #then
-    expect(exec.exec).not.toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.removeLabel).not.toHaveBeenCalled()
     expect(mockLogger.debug).toHaveBeenCalledWith('No issue number, skipping label removal')
   })
 })
 
 describe('updateReactionOnSuccess', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
   it('removes eyes reaction and adds hooray reaction', async () => {
     // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({
-      stdout: '777\n',
-      stderr: '',
-      exitCode: 0,
-    })
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({
+      data: [{id: 777, content: 'eyes', user: {login: 'fro-bot[bot]'}}],
+    } as never)
     const ctx = createMockReactionContext({commentId: 123, botLogin: 'fro-bot[bot]'})
 
     // #when
-    await updateReactionOnSuccess(ctx, mockLogger)
+    await updateReactionOnSuccess(mockOctokit, ctx, mockLogger)
 
     // #then
-    // Should query for eyes reaction
-    expect(exec.getExecOutput).toHaveBeenCalledWith(
-      'gh',
-      expect.arrayContaining(['api', '/repos/owner/repo/issues/comments/123/reactions']),
-      {silent: true},
-    )
-    // Should delete the eyes reaction
-    expect(exec.exec).toHaveBeenCalledWith('gh', ['api', '--method', 'DELETE', '/repos/owner/repo/reactions/777'], {
-      silent: true,
+    expect(mockOctokit.rest.reactions.listForIssueComment).toHaveBeenCalled()
+    expect(mockOctokit.rest.reactions.deleteForIssueComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      comment_id: 123,
+      reaction_id: 777,
     })
-    // Should add hooray reaction
-    expect(exec.exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['content=hooray']), {silent: true})
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      comment_id: 123,
+      content: 'hooray',
+    })
   })
 
   it('skips when commentId or botLogin is null', async () => {
@@ -294,73 +274,77 @@ describe('updateReactionOnSuccess', () => {
     const ctx = createMockReactionContext({commentId: null, botLogin: 'bot'})
 
     // #when
-    await updateReactionOnSuccess(ctx, mockLogger)
+    await updateReactionOnSuccess(mockOctokit, ctx, mockLogger)
 
     // #then
-    expect(exec.getExecOutput).not.toHaveBeenCalled()
+    expect(mockOctokit.rest.reactions.listForIssueComment).not.toHaveBeenCalled()
     expect(mockLogger.debug).toHaveBeenCalled()
   })
 })
 
 describe('updateReactionOnFailure', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
   it('removes eyes reaction and adds confused reaction', async () => {
     // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({
-      stdout: '888\n',
-      stderr: '',
-      exitCode: 0,
-    })
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({
+      data: [{id: 888, content: 'eyes', user: {login: 'fro-bot[bot]'}}],
+    } as never)
     const ctx = createMockReactionContext({commentId: 456, botLogin: 'fro-bot[bot]'})
 
     // #when
-    await updateReactionOnFailure(ctx, mockLogger)
+    await updateReactionOnFailure(mockOctokit, ctx, mockLogger)
 
     // #then
-    // Should add confused reaction
-    expect(exec.exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['content=confused']), {silent: true})
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      comment_id: 456,
+      content: 'confused',
+    })
   })
 })
 
 describe('completeAcknowledgment', () => {
   let mockLogger: Logger
+  let mockOctokit: Octokit
 
   beforeEach(() => {
     mockLogger = createMockLogger()
+    mockOctokit = createMockOctokit()
     vi.clearAllMocks()
   })
 
   it('updates reaction to success and removes label on success', async () => {
     // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({stdout: '123', stderr: '', exitCode: 0})
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({data: []} as never)
     const ctx = createMockReactionContext()
 
     // #when
-    await completeAcknowledgment(ctx, true, mockLogger)
+    await completeAcknowledgment(mockOctokit, ctx, true, mockLogger)
 
     // #then
-    // Should have called for success reaction update and label removal
-    expect(exec.exec).toHaveBeenCalled()
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.removeLabel).toHaveBeenCalled()
   })
 
   it('updates reaction to failure and removes label on failure', async () => {
     // #given
-    vi.mocked(exec.getExecOutput).mockResolvedValue({stdout: '123', stderr: '', exitCode: 0})
-    vi.mocked(exec.exec).mockResolvedValue(0)
+    vi.mocked(mockOctokit.rest.reactions.listForIssueComment).mockResolvedValue({data: []} as never)
     const ctx = createMockReactionContext()
 
     // #when
-    await completeAcknowledgment(ctx, false, mockLogger)
+    await completeAcknowledgment(mockOctokit, ctx, false, mockLogger)
 
     // #then
-    expect(exec.exec).toHaveBeenCalled()
+    expect(mockOctokit.rest.reactions.createForIssueComment).toHaveBeenCalled()
+    expect(mockOctokit.rest.issues.removeLabel).toHaveBeenCalled()
   })
 })
