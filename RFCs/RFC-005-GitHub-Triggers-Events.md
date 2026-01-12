@@ -489,11 +489,218 @@ describe("extractCommand", () => {
 })
 ```
 
+## Mock Event Support (Local Development)
+
+### Overview
+
+Enable local development and testing by supporting mock GitHub event payloads via environment variables.
+
+### Environment Variables
+
+```typescript
+/**
+ * Mock event environment variables.
+ *
+ * MOCK_EVENT: JSON payload matching GitHub webhook schema
+ * MOCK_TOKEN: Authentication token for local testing
+ */
+interface MockEventConfig {
+  readonly eventName: string
+  readonly payload: Record<string, unknown>
+  readonly repo: {owner: string; repo: string}
+  readonly actor: string
+}
+```
+
+### Implementation (`src/lib/triggers/mock.ts`)
+
+```typescript
+import type {GitHubContext} from "../github/types.js"
+import type {Logger} from "../types.js"
+
+/**
+ * Check if mock event mode is enabled.
+ *
+ * Mock mode is only enabled when:
+ * - MOCK_EVENT env var is set, AND
+ * - CI env var is NOT 'true', OR allow-mock-event input is true
+ */
+export function isMockEventEnabled(allowMockEvent: boolean): boolean {
+  const mockEvent = process.env["MOCK_EVENT"]
+  const isCI = process.env["CI"] === "true"
+
+  if (mockEvent == null || mockEvent.length === 0) {
+    return false
+  }
+
+  // In CI, only allow if explicitly enabled
+  if (isCI && !allowMockEvent) {
+    return false
+  }
+
+  return true
+}
+
+/**
+ * Parse mock event from environment.
+ *
+ * @throws Error if MOCK_EVENT is malformed
+ */
+export function parseMockEvent(logger: Logger): GitHubContext | null {
+  const mockEventJson = process.env["MOCK_EVENT"]
+
+  if (mockEventJson == null || mockEventJson.length === 0) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(mockEventJson) as {
+      eventName?: string
+      payload?: Record<string, unknown>
+      repo?: {owner?: string; repo?: string}
+      actor?: string
+    }
+
+    // Validate required fields
+    if (parsed.eventName == null || parsed.eventName.length === 0) {
+      throw new Error("MOCK_EVENT missing required field: eventName")
+    }
+
+    if (parsed.payload == null || typeof parsed.payload !== "object") {
+      throw new Error("MOCK_EVENT missing required field: payload")
+    }
+
+    if (parsed.repo?.owner == null || parsed.repo?.repo == null) {
+      throw new Error("MOCK_EVENT missing required field: repo.owner or repo.repo")
+    }
+
+    if (parsed.actor == null || parsed.actor.length === 0) {
+      throw new Error("MOCK_EVENT missing required field: actor")
+    }
+
+    logger.warning("Mock event mode active - DO NOT USE IN PRODUCTION", {
+      eventName: parsed.eventName,
+      actor: parsed.actor,
+    })
+
+    return {
+      eventName: parsed.eventName,
+      payload: parsed.payload,
+      repo: {
+        owner: parsed.repo.owner,
+        repo: parsed.repo.repo,
+      },
+      actor: parsed.actor,
+      ref: (parsed.payload["ref"] as string | undefined) ?? "refs/heads/main",
+      sha: (parsed.payload["sha"] as string | undefined) ?? "mock-sha",
+      workflow: "mock-workflow",
+      runId: 0,
+      runNumber: 0,
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error(`MOCK_EVENT is not valid JSON: ${error.message}`)
+    }
+    throw error
+  }
+}
+
+/**
+ * Get mock token from environment.
+ */
+export function getMockToken(): string | null {
+  return process.env["MOCK_TOKEN"] ?? null
+}
+
+/**
+ * Get share URL base based on mock mode.
+ */
+export function getShareUrlBase(isMockMode: boolean): string {
+  return isMockMode ? "https://dev.opencode.ai" : "https://opencode.ai"
+}
+```
+
+### Security Constraints
+
+| Constraint                | Implementation                                       |
+| ------------------------- | ---------------------------------------------------- |
+| Disabled in CI by default | Check `CI !== 'true'` OR `allow-mock-event: true`    |
+| Explicit opt-in required  | `allow-mock-event` input must be `true` in workflows |
+| Warning logged            | Always log warning when mock mode is active          |
+| Production guard          | Document as development-only feature                 |
+
+### Action Input
+
+```yaml
+inputs:
+  allow-mock-event:
+    description: "Allow MOCK_EVENT env var for local testing (default: false)"
+    required: false
+    default: "false"
+```
+
+### Test Cases
+
+```typescript
+describe("isMockEventEnabled", () => {
+  it("returns false when MOCK_EVENT not set", () => {
+    delete process.env["MOCK_EVENT"]
+    expect(isMockEventEnabled(false)).toBe(false)
+  })
+
+  it("returns true when MOCK_EVENT set and not in CI", () => {
+    process.env["MOCK_EVENT"] = '{"eventName":"issue_comment"}'
+    delete process.env["CI"]
+    expect(isMockEventEnabled(false)).toBe(true)
+  })
+
+  it("returns false in CI without explicit allow", () => {
+    process.env["MOCK_EVENT"] = '{"eventName":"issue_comment"}'
+    process.env["CI"] = "true"
+    expect(isMockEventEnabled(false)).toBe(false)
+  })
+
+  it("returns true in CI with explicit allow", () => {
+    process.env["MOCK_EVENT"] = '{"eventName":"issue_comment"}'
+    process.env["CI"] = "true"
+    expect(isMockEventEnabled(true)).toBe(true)
+  })
+})
+
+describe("parseMockEvent", () => {
+  it("parses valid mock event", () => {
+    process.env["MOCK_EVENT"] = JSON.stringify({
+      eventName: "issue_comment",
+      payload: {action: "created"},
+      repo: {owner: "test", repo: "repo"},
+      actor: "user",
+    })
+    const result = parseMockEvent(mockLogger)
+    expect(result?.eventName).toBe("issue_comment")
+  })
+
+  it("throws on invalid JSON", () => {
+    process.env["MOCK_EVENT"] = "not-json"
+    expect(() => parseMockEvent(mockLogger)).toThrow(/not valid JSON/)
+  })
+
+  it("throws on missing required fields", () => {
+    process.env["MOCK_EVENT"] = JSON.stringify({eventName: "test"})
+    expect(() => parseMockEvent(mockLogger)).toThrow(/missing required field/)
+  })
+})
+```
+
+---
+
 ## Implementation Notes
 
 1. **Event payload typing**: GitHub payloads are complex; types cover common fields
 2. **Mention patterns**: Support both `@bot` and `@bot[bot]` for GitHub Apps
 3. **Extensibility**: Router pattern allows easy addition of new triggers
+4. **Mock event security**: Disabled in CI by default, requires explicit opt-in
+
+---
 
 ## Estimated Effort
 

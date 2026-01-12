@@ -1144,7 +1144,14 @@ async function run(): Promise<void> {
 }
 ```
 
-## Session Tools: Action vs Agent
+## Session Tools: Action vs Agent (Two-Layer Architecture)
+
+**Important**: Two distinct layers of session management exist, operating on the same OpenCode storage:
+
+| Layer | Tools/Functions | Used By | When | Language |
+| --- | --- | --- | --- | --- |
+| **Action-side** | `listSessions()`, `searchSessions()`, `pruneSessions()`, `writeSessionSummary()` | GitHub Action harness | Before/after agent execution | TypeScript |
+| **Agent-side** | `session_list`, `session_read`, `session_search`, `session_info` | AI agent via LLM | During agent execution | Natural language |
 
 ### Action-Side Utilities (This RFC)
 
@@ -1156,6 +1163,35 @@ The utilities defined in this RFC are used by the **GitHub Action harness** for:
 4. **Cache management**: Understand what sessions exist in restored cache
 
 These utilities run **before** and **after** the AI agent executes.
+
+#### Action-Side Usage Example
+
+```typescript
+// In main.ts - BEFORE agent execution
+import {listSessions, searchSessions} from "./lib/session/index.js"
+
+const workingDirectory = process.env["GITHUB_WORKSPACE"] ?? process.cwd()
+
+// List recent sessions for context injection
+const recentSessions = await listSessions(workingDirectory, {limit: 10}, logger)
+
+// Search for sessions related to current issue title
+if (agentContext.issueTitle != null) {
+  const priorWork = await searchSessions(agentContext.issueTitle, workingDirectory, {limit: 5}, logger)
+  // Include in agent prompt as context hints
+}
+
+// In main.ts - AFTER agent execution
+import {writeSessionSummary, pruneSessions} from "./lib/session/index.js"
+
+// Write searchable run summary
+if (result.sessionId != null) {
+  await writeSessionSummary(result.sessionId, runSummary, logger)
+}
+
+// Prune old sessions before cache save
+await pruneSessions(workingDirectory, {maxSessions: 50, maxAgeDays: 30}, logger)
+```
 
 ### Agent-Side Tools (oMo Plugin)
 
@@ -1170,21 +1206,81 @@ The `session_*` tools provided by Oh My OpenCode are available to the **AI agent
 
 **Key Difference**: The agent uses these tools through natural language via the LLM tool-calling interface. The action uses the RFC-004 utilities directly in TypeScript.
 
-### Ensuring Agent Uses Session Tools
+#### Agent-Side Usage Example (Prompt Instructions)
 
-The agent prompt (defined in RFC-011) must instruct the agent to use session tools:
+Include in agent prompt to ensure session tool usage:
 
 ```markdown
 ## Session Management (REQUIRED)
 
 Before investigating any issue, you MUST use the session management tools to check for prior work:
 
-1. Use `session_search` to find sessions related to the current issue/PR
-2. Use `session_read` to review relevant prior conversations
-3. Only after checking for prior work should you begin new investigation
+1. Use `session_search` to find sessions related to the current issue/PR:
+```
+
+session_search(query="authentication bug login flow", limit=5)
+
+```
+
+2. Use `session_read` to review relevant prior conversations:
+```
+
+session_read(session_id="ses_abc123", include_todos=true)
+
+```
+
+3. Only after checking for prior work should you begin new investigation.
 
 At the end of your work, leave a searchable summary that future sessions can find.
 ```
+
+### Integration Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      main.ts Lifecycle                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ ACTION-SIDE (TypeScript, before agent)                   │   │
+│  │                                                          │   │
+│  │  1. restoreCache()                                       │   │
+│  │  2. listSessions()      ← RFC-004 utility                │   │
+│  │  3. searchSessions()    ← RFC-004 utility                │   │
+│  │  4. buildAgentPrompt()  ← Include session hints          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ AGENT-SIDE (LLM tool calls, during execution)            │   │
+│  │                                                          │   │
+│  │  • session_search()     ← oMo tool (agent decides)       │   │
+│  │  • session_read()       ← oMo tool (agent decides)       │   │
+│  │  • session_list()       ← oMo tool (agent decides)       │   │
+│  │  • session_info()       ← oMo tool (agent decides)       │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ ACTION-SIDE (TypeScript, after agent)                    │   │
+│  │                                                          │   │
+│  │  1. writeSessionSummary() ← RFC-004 utility              │   │
+│  │  2. pruneSessions()       ← RFC-004 utility              │   │
+│  │  3. saveCache()                                          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why Two Layers?
+
+| Concern         | Action-Side                       | Agent-Side                   |
+| --------------- | --------------------------------- | ---------------------------- |
+| **Control**     | Deterministic, always runs        | Agent decides if/when to use |
+| **Timing**      | Before/after execution            | During execution             |
+| **Interface**   | TypeScript API                    | LLM tool calling             |
+| **Purpose**     | Infrastructure (prune, writeback) | Discovery (search, read)     |
+| **Reliability** | Guaranteed execution              | Best-effort via prompt       |
 
 ## Future Enhancement: Custom OpenCode Tools
 

@@ -1180,7 +1180,203 @@ RFC-012's CLI execution is replaced **in-place** by this RFC. The exported API (
 2. **Event Types**: Event type names may vary from SDK version; verify against actual SDK
 3. **Agent List API**: Verify exact API shape for `client.agent.list()`
 4. **Session State**: Verify exact event names for session idle/error/active states
-5. **Prompt Parts**: File attachment support deferred to RFC for attachments (PRD section H)
+5. **Prompt Parts**: File attachment support deferred to RFC-014 (PRD section H)
+
+---
+
+## Enhanced Prompt Construction (PRD §K)
+
+### Prompt Structure
+
+The agent prompt must follow this multi-section structure:
+
+```
+[mode-instructions]     # analyze-mode, ultrawork-mode (from config)
+
+[identity]              # Bot username, mentioned by whom, in which repo
+
+[context]               # Type, number, title, repo, default branch
+
+[user-request]          # The triggering comment body
+
+[mandatory-reading]     # Instructions to read full conversation first
+
+[issue/pr-data]         # GraphQL-hydrated context (from RFC-015)
+
+[action-instructions]   # Create todos, investigate, report results
+```
+
+### Mandatory Context Reading Instructions
+
+For issues, instruct the agent:
+
+```bash
+gh issue view NUMBER --comments
+```
+
+For PRs, THREE commands are required:
+
+```bash
+gh pr view NUMBER --comments
+gh api repos/OWNER/REPO/pulls/NUMBER/comments
+gh api repos/OWNER/REPO/pulls/NUMBER/reviews
+```
+
+Extract from these: original description, previous attempts, decisions, feedback, linked references.
+
+### GitHub Comment Formatting Guidance
+
+**CRITICAL**: ALWAYS use heredoc syntax for comments with backticks:
+
+````bash
+gh issue comment NUMBER --body "$(cat <<'EOF'
+Content with `code` and ```blocks``` preserved
+EOF
+)"
+````
+
+Rules:
+
+- Code blocks MUST have exactly 3 backticks + language identifier
+- Every opening triple-backtick must have a closing triple-backtick on its own line
+- Use single-quoted heredoc (`'EOF'`) to prevent variable expansion
+
+### Prompt Builder Implementation
+
+Update `src/lib/agent/prompt.ts`:
+
+```typescript
+export interface PromptOptions {
+  readonly context: AgentContext
+  readonly customPrompt?: string
+  readonly cacheStatus: "hit" | "miss" | "corrupted"
+  readonly modeInstructions?: string // NEW: mode config
+  readonly hydratedContext?: HydratedContext // NEW: from RFC-015
+  readonly sessionHints?: SessionHints // NEW: from RFC-004
+}
+
+interface SessionHints {
+  readonly recentSessions: readonly SessionSummary[]
+  readonly priorWorkMatches: readonly SessionSearchResult[]
+}
+
+/**
+ * Build multi-section agent prompt per PRD §K.
+ */
+export function buildAgentPrompt(options: PromptOptions, logger: Logger): string {
+  const {context, customPrompt, cacheStatus, modeInstructions, hydratedContext, sessionHints} = options
+
+  const sections: string[] = []
+
+  // 1. Mode instructions (if provided)
+  if (modeInstructions != null && modeInstructions.length > 0) {
+    sections.push(modeInstructions)
+  }
+
+  // 2. Identity section
+  sections.push(`## Identity
+
+You are @${context.botLogin ?? "fro-bot"}, mentioned by @${context.actor} in ${context.repo.owner}/${context.repo.repo}.
+Cache status: ${cacheStatus}`)
+
+  // 3. Context section
+  sections.push(`## Context
+
+**Type:** ${context.issueType}
+**Number:** #${context.issueNumber}
+**Title:** ${context.issueTitle ?? "N/A"}
+**Repository:** ${context.repo.owner}/${context.repo.repo}
+**Default Branch:** ${context.defaultBranch ?? "main"}`)
+
+  // 4. User request
+  sections.push(`## User Request
+
+${customPrompt ?? context.commentBody ?? "No specific request provided."}`)
+
+  // 5. Mandatory reading instructions
+  const readingInstructions =
+    context.issueType === "pr"
+      ? `## Mandatory Reading (BEFORE investigating)
+
+You MUST read the full conversation context using these commands:
+
+\`\`\`bash
+gh pr view ${context.issueNumber} --comments
+gh api repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issueNumber}/comments
+gh api repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issueNumber}/reviews
+\`\`\`
+
+Extract: original description, previous attempts, decisions made, feedback received, linked references.`
+      : `## Mandatory Reading (BEFORE investigating)
+
+You MUST read the full conversation context:
+
+\`\`\`bash
+gh issue view ${context.issueNumber} --comments
+\`\`\`
+
+Extract: original description, previous attempts, decisions made, feedback received, linked references.`
+
+  sections.push(readingInstructions)
+
+  // 6. Hydrated context (from RFC-015, if available)
+  if (hydratedContext != null) {
+    const formatted = formatContextForPrompt(hydratedContext)
+    sections.push(`## ${hydratedContext.type === "issue" ? "Issue" : "Pull Request"} Data
+
+${formatted}`)
+  }
+
+  // 7. Session hints (from RFC-004, if available)
+  if (sessionHints != null && sessionHints.priorWorkMatches.length > 0) {
+    sections.push(`## Prior Work Found
+
+The following sessions may contain relevant prior work:
+
+${sessionHints.priorWorkMatches.map(m => `- Session \`${m.sessionId}\`: ${m.matches.length} matches`).join("\n")}
+
+Use \`session_read\` to review these before re-investigating.`)
+  }
+
+  // 8. Action instructions
+  sections.push(`## Action Instructions
+
+1. Create a todo list for your investigation
+2. Check for prior work using \`session_search\` before re-investigating
+3. Investigate the issue/request thoroughly
+4. Report your findings and proposed solution
+5. Leave a searchable summary for future sessions
+
+### GitHub Comment Formatting
+
+When posting comments, ALWAYS use heredoc syntax:
+
+\`\`\`bash
+gh issue comment ${context.issueNumber} --body "$(cat <<'EOF'
+Your comment with \`code\` preserved
+EOF
+)"
+\`\`\``)
+
+  return sections.join("\n\n---\n\n")
+}
+```
+
+### Session Tool Instructions
+
+Include in every prompt:
+
+```markdown
+## Session Management (REQUIRED)
+
+Before investigating any issue, you MUST use the session management tools to check for prior work:
+
+1. Use `session_search` to find sessions related to the current issue/PR
+2. Use `session_read` to review relevant prior conversations
+3. Only after checking for prior work should you begin new investigation
+
+At the end of your work, leave a searchable summary that future sessions can find.
+```
 
 ---
 
