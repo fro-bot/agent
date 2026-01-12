@@ -154,16 +154,21 @@ export async function executeOpenCode(prompt: string, logger: Logger, config?: E
     const events = await client.event.subscribe()
     const sessionRef: {current: SessionInfo | null} = {current: null}
 
+    let eventStreamEnded = false
     const eventProcessingPromise = processEventStream(
       events.stream as AsyncIterable<OpenCodeEvent>,
       sessionId,
       sessionRef,
       logger,
-    ).catch(error => {
-      if (error instanceof Error && error.name !== 'AbortError') {
-        logger.debug('Event stream error', {error: error.message})
-      }
-    })
+    )
+      .catch(error => {
+        if (error instanceof Error && error.name !== 'AbortError') {
+          logger.debug('Event stream error', {error: error.message})
+        }
+      })
+      .finally(() => {
+        eventStreamEnded = true
+      })
 
     logger.debug('Sending prompt to OpenCode...')
     const promptBody: {
@@ -187,7 +192,12 @@ export async function executeOpenCode(prompt: string, logger: Logger, config?: E
       body: promptBody,
     })
 
-    await eventProcessingPromise
+    // Give event stream a short grace period to flush remaining events, then abort
+    // Don't wait indefinitely - the prompt response indicates completion
+    if (!eventStreamEnded) {
+      const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 1000))
+      await Promise.race([eventProcessingPromise, gracePeriod])
+    }
 
     if (timedOut) {
       return {
