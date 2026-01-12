@@ -161,6 +161,25 @@ jobs:
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
           opencode-version: latest
 
+      - if: always()
+        name: Introspect setup action installation
+        run: |
+          echo "Installed versions:"
+          which bun && bun --version || true
+          which opencode && opencode --version || true
+          bunx oh-my-opencode get-local-version || true
+
+          echo "OpenCode config files:"
+          find ~/.config/opencode -type f | sort
+          [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
+          [ -f ~/.config/opencode/oh-my-opencode.json ] && cat ~/.config/opencode/oh-my-opencode.json || true
+
+          echo "OpenCode shared files:"
+          ls -lA ~/.local/share/opencode || true
+
+          echo "Check oh-my-opencode installation:"
+          bunx oh-my-opencode doctor || true
+
       - name: Test main action
         uses: ./
         env:
@@ -168,6 +187,18 @@ jobs:
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
+
+      - if: always()
+        name: Introspect main action execution
+        run: |
+          echo "OpenCode storage folder:"
+          ls -lA ~/.local/share/opencode/storage || true
+
+          echo "OpenCode cache files:"
+          ls -lA ~/.cache/opencode || true
+
+          echo "OpenCode state files:"
+          ls -lA ~/.local/state/opencode || true
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
