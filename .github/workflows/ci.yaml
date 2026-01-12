@@ -169,8 +169,10 @@ jobs:
           which opencode && opencode --version || true
           bunx oh-my-opencode get-local-version || true
 
-          echo "Installed files:"
+          echo "OpenCode config files:"
           find ~/.config/opencode -type f | sort
+          [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
+          [ -f ~/.config/opencode/oh-my-opencode.json ] && cat ~/.config/opencode/oh-my-opencode.json || true
 
           echo "OpenCode shared files:"
           ls -lA ~/.local/share/opencode || true
