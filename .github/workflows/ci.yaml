@@ -194,6 +194,10 @@ jobs:
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true
 
+          # Output the contents of each project json file
+          echo "OpenCode projects:"
+          find ~/.local/share/opencode/storage/project -name '*.json' -exec echo "Project file: {}" \; -exec cat {} \; || true
+
           echo "OpenCode cache files:"
           ls -lA ~/.cache/opencode || true
 
