@@ -196,7 +196,7 @@ async function run(): Promise<void> {
         timeoutMs: inputs.timeoutMs,
       }
 
-      const execResult = await executeOpenCode(prompt, opencodePath, execLogger, executionConfig)
+      const execResult = await executeOpenCode(prompt, execLogger, executionConfig)
 
       // SDK mode returns sessionId directly (RFC-013)
       // Fall back to session discovery for backward compatibility

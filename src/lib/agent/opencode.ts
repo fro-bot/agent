@@ -5,269 +5,122 @@
  * Replaces CLI-based execution from RFC-012 with SDK-based execution.
  */
 
-import type {Buffer} from 'node:buffer'
-import type {ChildProcess} from 'node:child_process'
 import type {Logger} from '../logger.js'
 import type {AgentResult, ExecutionConfig} from './types.js'
-import {spawn} from 'node:child_process'
 import process from 'node:process'
 import * as exec from '@actions/exec'
-import {createOpencodeClient} from '@opencode-ai/sdk'
+import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
 
-/** Default port for OpenCode server */
-const SERVER_PORT = 4096
+/** ANSI color codes for tool output formatting */
+const TOOL_COLORS: Record<string, [string, string]> = {
+  todowrite: ['Todo', '\u001B[33m\u001B[1m'],
+  todoread: ['Todo', '\u001B[33m\u001B[1m'],
+  bash: ['Bash', '\u001B[31m\u001B[1m'],
+  edit: ['Edit', '\u001B[32m\u001B[1m'],
+  glob: ['Glob', '\u001B[34m\u001B[1m'],
+  grep: ['Grep', '\u001B[34m\u001B[1m'],
+  list: ['List', '\u001B[34m\u001B[1m'],
+  read: ['Read', '\u001B[35m\u001B[1m'],
+  write: ['Write', '\u001B[32m\u001B[1m'],
+  websearch: ['Search', '\u001B[2m\u001B[1m'],
+} as const
+const ANSI_RESET = '\u001B[0m'
+const ANSI_DIM = '\u001B[0m\u001B[2m'
 
-/** Default hostname for OpenCode server */
-const SERVER_HOSTNAME = '127.0.0.1'
-
-/** Maximum retries for connection verification */
-const MAX_CONNECTION_RETRIES = 30
-
-/** Delay between connection retries in milliseconds */
-const CONNECTION_RETRY_DELAY_MS = 300
-
-/**
- * OpenCode server instance with cleanup function.
- */
-interface OpenCodeServer {
-  readonly url: string
-  readonly process: ChildProcess
-  close: () => void
+function outputToolExecution(toolName: string, title: string): void {
+  const [displayName, color] = TOOL_COLORS[toolName.toLowerCase()] ?? [toolName, '\u001B[36m\u001B[1m']
+  const paddedName = displayName.padEnd(7, ' ')
+  process.stdout.write(`\n${color}|${ANSI_RESET}${ANSI_DIM} ${paddedName} ${ANSI_RESET}${title}\n`)
 }
 
-/**
- * Create and start the OpenCode server process.
- *
- * Spawns `opencode serve` with hostname and port configuration.
- * Waits for the server to indicate it's ready via stdout.
- *
- * @param opencodePath - Path to OpenCode binary (null uses 'opencode' from PATH)
- * @param logger - Logger instance
- * @returns Promise resolving to server instance
- */
-async function createOpenCodeServer(opencodePath: string | null, logger: Logger): Promise<OpenCodeServer> {
-  return new Promise((resolve, reject) => {
-    const opencodeCmd = opencodePath ?? 'opencode'
-    const args = ['serve', `--hostname=${SERVER_HOSTNAME}`, `--port=${SERVER_PORT}`]
-
-    logger.debug('Starting OpenCode server', {command: opencodeCmd, args})
-
-    const proc = spawn(opencodeCmd, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    })
-
-    let serverStarted = false
-    let stderrBuffer = ''
-
-    const cleanup = () => {
-      if (!proc.killed) {
-        proc.kill('SIGTERM')
-      }
-    }
-
-    proc.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString()
-      logger.debug('OpenCode server stdout', {output: output.trim()})
-
-      // Look for server ready message
-      if (!serverStarted && output.includes('listening')) {
-        serverStarted = true
-        const url = `http://${SERVER_HOSTNAME}:${SERVER_PORT}`
-        logger.info('OpenCode server started', {url})
-        resolve({
-          url,
-          process: proc,
-          close: cleanup,
-        })
-      }
-    })
-
-    proc.stderr?.on('data', (data: Buffer) => {
-      stderrBuffer += data.toString()
-      logger.debug('OpenCode server stderr', {output: data.toString().trim()})
-    })
-
-    proc.on('error', error => {
-      logger.error('OpenCode server failed to start', {error: error.message})
-      reject(new Error(`Failed to start OpenCode server: ${error.message}`))
-    })
-
-    proc.on('exit', (code, signal) => {
-      if (!serverStarted) {
-        const exitInfo = code == null ? `signal ${signal}` : `code ${code}`
-        logger.error('OpenCode server exited before ready', {exitInfo, stderr: stderrBuffer})
-        reject(new Error(`OpenCode server exited (${exitInfo}) before becoming ready`))
-      }
-    })
-
-    // Timeout for server startup
-    setTimeout(() => {
-      if (!serverStarted) {
-        cleanup()
-        reject(new Error('OpenCode server startup timeout (10s)'))
-      }
-    }, 10000)
-  })
+function outputTextContent(text: string): void {
+  process.stdout.write(`\n${text}\n`)
 }
 
-/**
- * Verify connection to OpenCode server with retry loop.
- *
- * Uses client.app.log() as a lightweight health check.
- *
- * @param client - OpenCode SDK client
- * @param logger - Logger instance
- */
-async function assertOpenCodeConnected(client: ReturnType<typeof createOpencodeClient>, logger: Logger): Promise<void> {
-  for (let attempt = 1; attempt <= MAX_CONNECTION_RETRIES; attempt++) {
-    try {
-      await client.app.log()
-      logger.debug('OpenCode connection verified', {attempt})
-      return
-    } catch (error) {
-      if (attempt === MAX_CONNECTION_RETRIES) {
-        throw new Error(
-          `Failed to connect to OpenCode after ${MAX_CONNECTION_RETRIES} attempts: ${error instanceof Error ? error.message : String(error)}`,
-        )
+interface EventProperties {
+  part?: {
+    sessionID?: string
+    type?: string
+    text?: string
+    tool?: string
+    time?: {end?: number}
+    state?: {status?: string; title?: string; input?: Record<string, unknown>}
+  }
+  info?: {id?: string; title?: string; version?: string}
+  sessionID?: string
+  error?: unknown
+}
+
+interface OpenCodeEvent {
+  type: string
+  properties: EventProperties
+}
+
+interface SessionInfo {
+  id: string
+  title: string
+  version: string
+}
+
+async function processEventStream(
+  stream: AsyncIterable<OpenCodeEvent>,
+  sessionId: string,
+  sessionRef: {current: SessionInfo | null},
+  logger: Logger,
+): Promise<void> {
+  let lastText = ''
+
+  for await (const event of stream) {
+    const props = event.properties
+
+    if (event.type === 'message.part.updated') {
+      const part = props.part
+      if (part?.sessionID !== sessionId) continue
+
+      if (part.type === 'text' && part.text != null) {
+        const newText = part.text.slice(lastText.length)
+        if (newText.length > 0) {
+          process.stdout.write(newText)
+        }
+        lastText = part.text
+
+        if (part.time?.end != null) {
+          outputTextContent('')
+          lastText = ''
+        }
+      } else if (part.type === 'tool' && part.state?.status === 'completed') {
+        const toolName = part.tool ?? 'unknown'
+        const title = part.state.title ?? (part.state.input == null ? '' : JSON.stringify(part.state.input))
+        outputToolExecution(toolName, title)
       }
-      logger.debug('Connection attempt failed, retrying', {attempt, maxRetries: MAX_CONNECTION_RETRIES})
-      await new Promise(resolve => setTimeout(resolve, CONNECTION_RETRY_DELAY_MS))
+    } else if (event.type === 'session.updated') {
+      const info = props.info
+      if (info?.id === sessionId && info.title != null && info.version != null) {
+        sessionRef.current = {id: info.id, title: info.title, version: info.version}
+        logger.debug('Session updated', {sessionId: info.id, title: info.title})
+      }
+    } else if (event.type === 'session.error' && props.sessionID === sessionId) {
+      logger.error('Session error', {error: props.error})
     }
   }
 }
 
-/**
- * Resolve agent name.
- *
- * Note: The SDK doesn't expose an agent listing API, so we accept the
- * configured agent name and pass it through. The server will validate.
- *
- * @param agentName - Requested agent name
- * @param logger - Logger instance
- * @returns Agent name to use
- */
-function resolveAgent(agentName: string, logger: Logger): string {
-  logger.debug('Using agent', {agent: agentName})
-  return agentName
-}
-
-/**
- * Subscribe to session events for logging (fire-and-forget).
- *
- * Opens SSE connection to /event endpoint and logs tool completions.
- * Non-blocking - errors are logged but don't fail execution.
- *
- * @param serverUrl - OpenCode server URL
- * @param sessionId - Session ID to filter events
- * @param logger - Logger instance
- * @returns AbortController to cancel subscription
- */
-function subscribeSessionEvents(serverUrl: string, sessionId: string, logger: Logger): AbortController {
-  const controller = new AbortController()
-
-  // Fire and forget - explicitly ignore promise using catch
-  ;(async () => {
-    try {
-      const response = await fetch(`${serverUrl}/event`, {
-        signal: controller.signal,
-        headers: {Accept: 'text/event-stream'},
-      })
-
-      if (!response.ok || response.body == null) {
-        logger.debug('Event subscription failed', {status: response.status})
-        return
-      }
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      let readResult: {done: boolean; value?: Uint8Array} = await reader.read()
-      while (!readResult.done) {
-        const chunk = readResult.value == null ? '' : decoder.decode(readResult.value, {stream: true})
-        buffer += chunk
-
-        const lines = buffer.split('\n')
-        // Keep the last incomplete line in the buffer
-        buffer = lines.pop() ?? ''
-
-        for (const line of lines) {
-          if (line.trim().length === 0) continue
-
-          if (line.startsWith('data:')) {
-            try {
-              const event = JSON.parse(line.slice(5)) as {
-                type?: string
-                properties?: {
-                  part?: {sessionID?: string; type?: string}
-                  tool?: {name?: string}
-                }
-              }
-              if (event.properties?.part?.sessionID === sessionId && event.properties?.tool?.name != null) {
-                logger.debug('Tool execution', {tool: event.properties.tool.name})
-              }
-            } catch {
-              // Ignore parse errors
-            }
-          }
-        }
-        readResult = await reader.read()
-      }
-    } catch (error) {
-      if (error instanceof Error && error.name !== 'AbortError') {
-        logger.debug('Event subscription error', {error: error.message})
-      }
-    }
-  })().catch(() => {
-    // Silently ignore - fire and forget pattern
-  })
-
-  return controller
-}
-
-/**
- * Execute OpenCode with SDK mode.
- *
- * Lifecycle:
- * 1. Spawn OpenCode server
- * 2. Create SDK client and verify connection
- * 3. Resolve agent configuration
- * 4. Create session
- * 5. Subscribe to events (background)
- * 6. Send prompt via client.session.prompt()
- * 7. Wait for response
- * 8. Return result with sessionId
- * 9. Cleanup server in finally block
- *
- * @param prompt - The complete agent prompt
- * @param opencodePath - Path to OpenCode binary (from setup action)
- * @param logger - Logger instance
- * @param config - Optional execution configuration (agent, model, timeout)
- * @returns Agent result with exit code and session ID
- */
-export async function executeOpenCode(
-  prompt: string,
-  opencodePath: string | null,
-  logger: Logger,
-  config?: ExecutionConfig,
-): Promise<AgentResult> {
+export async function executeOpenCode(prompt: string, logger: Logger, config?: ExecutionConfig): Promise<AgentResult> {
   const startTime = Date.now()
-  let server: OpenCodeServer | null = null
-  let eventController: AbortController | null = null
+  const abortController = new AbortController()
 
-  // Setup timeout if configured
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
   let timeoutId: ReturnType<typeof setTimeout> | null = null
   let timedOut = false
+
+  let server: Awaited<ReturnType<typeof createOpencode>>['server'] | null = null
 
   if (timeoutMs > 0) {
     timeoutId = setTimeout(() => {
       timedOut = true
       logger.warning('Execution timeout reached', {timeoutMs})
-      eventController?.abort()
-      server?.close()
+      abortController.abort()
     }, timeoutMs)
   }
 
@@ -279,14 +132,13 @@ export async function executeOpenCode(
   })
 
   try {
-    server = await createOpenCodeServer(opencodePath, logger)
+    const opencode = await createOpencode({
+      signal: abortController.signal,
+    })
+    const {client} = opencode
+    server = opencode.server
 
-    const client = createOpencodeClient({baseUrl: server.url})
-
-    await assertOpenCodeConnected(client, logger)
-
-    const agentName = config?.agent ?? 'Sisyphus'
-    const agent = resolveAgent(agentName, logger)
+    logger.debug('OpenCode server started', {url: server.url})
 
     const sessionResponse = await client.session.create()
     if (sessionResponse.data == null || sessionResponse.error != null) {
@@ -296,7 +148,22 @@ export async function executeOpenCode(
     const sessionId = sessionResponse.data.id
     logger.debug('Session created', {sessionId})
 
-    eventController = subscribeSessionEvents(server.url, sessionId, logger)
+    const agentName = config?.agent ?? 'Sisyphus'
+    logger.debug('Using agent', {agent: agentName})
+
+    const events = await client.event.subscribe()
+    const sessionRef: {current: SessionInfo | null} = {current: null}
+
+    const eventProcessingPromise = processEventStream(
+      events.stream as AsyncIterable<OpenCodeEvent>,
+      sessionId,
+      sessionRef,
+      logger,
+    ).catch(error => {
+      if (error instanceof Error && error.name !== 'AbortError') {
+        logger.debug('Event stream error', {error: error.message})
+      }
+    })
 
     logger.debug('Sending prompt to OpenCode...')
     const promptBody: {
@@ -304,7 +171,7 @@ export async function executeOpenCode(
       model?: {modelID: string; providerID: string}
       parts: {text: string; type: 'text'}[]
     } = {
-      agent,
+      agent: agentName,
       parts: [{type: 'text', text: prompt}],
     }
 
@@ -319,6 +186,8 @@ export async function executeOpenCode(
       path: {id: sessionId},
       body: promptBody,
     })
+
+    await eventProcessingPromise
 
     if (timedOut) {
       return {
@@ -371,11 +240,10 @@ export async function executeOpenCode(
       error: errorMessage,
     }
   } finally {
-    // Cleanup
     if (timeoutId != null) {
       clearTimeout(timeoutId)
     }
-    eventController?.abort()
+    abortController.abort()
     server?.close()
   }
 }
@@ -395,7 +263,7 @@ export async function verifyOpenCodeAvailable(
     let version = ''
     await exec.exec(opencodeCmd, ['--version'], {
       listeners: {
-        stdout: (data: Buffer) => {
+        stdout: (data: Uint8Array) => {
           version += data.toString()
         },
       },
