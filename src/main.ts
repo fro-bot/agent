@@ -58,13 +58,14 @@ import {
  * Main action entry point.
  * Orchestrates: acknowledge → collect context → execute agent → complete acknowledgment
  */
-async function run(): Promise<void> {
+async function run(): Promise<number> {
   const startTime = Date.now()
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
 
   // Track agent state for cleanup
   let reactionCtx: ReactionContext | null = null
   let agentSuccess = false
+  let exitCode = 0
   let githubClient: Octokit | null = null
 
   try {
@@ -75,7 +76,7 @@ async function run(): Promise<void> {
 
     if (!inputsResult.success) {
       core.setFailed(`Invalid inputs: ${inputsResult.error.message}`)
-      return
+      return 1
     }
 
     const inputs = inputsResult.data
@@ -97,7 +98,7 @@ async function run(): Promise<void> {
 
     if (!opencodeCheck.available) {
       core.setFailed('OpenCode is not available. Did you run the setup action first?')
-      return
+      return 1
     }
 
     logger.info('OpenCode verified', {version: opencodeCheck.version})
@@ -196,7 +197,7 @@ async function run(): Promise<void> {
         timeoutMs: inputs.timeoutMs,
       }
 
-      const execResult = await executeOpenCode(prompt, opencodePath, execLogger, executionConfig)
+      const execResult = await executeOpenCode(prompt, execLogger, executionConfig)
 
       // SDK mode returns sessionId directly (RFC-013)
       // Fall back to session discovery for backward compatibility
@@ -244,9 +245,11 @@ async function run(): Promise<void> {
     if (result.success) {
       logger.info('Agent run completed successfully', {durationMs: duration})
     } else {
+      exitCode = result.exitCode
       core.setFailed(`Agent execution failed with exit code ${result.exitCode}`)
     }
   } catch (error) {
+    exitCode = 1
     const duration = Date.now() - startTime
 
     setActionOutputs({
@@ -304,6 +307,10 @@ async function run(): Promise<void> {
       })
     }
   }
+
+  return exitCode
 }
 
-await run()
+await run().then(exitCode => {
+  process.exit(exitCode)
+})
