@@ -78,20 +78,18 @@ async function processEventStream(
       const part = props.part
       if (part?.sessionID !== sessionId) continue
 
-      if (part.type === 'text' && part.text != null) {
-        const newText = part.text.slice(lastText.length)
-        if (newText.length > 0) {
-          process.stdout.write(newText)
-        }
+      if (part.type === 'text' && typeof part.text === 'string') {
         lastText = part.text
+        const endTime = part.time?.end
 
-        if (part.time?.end != null) {
-          outputTextContent('')
+        if (endTime != null && Number.isFinite(endTime)) {
+          outputTextContent(lastText)
           lastText = ''
         }
       } else if (part.type === 'tool' && part.state?.status === 'completed') {
         const toolName = part.tool ?? 'unknown'
-        const title = part.state.title ?? (part.state.input == null ? '' : JSON.stringify(part.state.input))
+        const toolInput = part.state.input ?? {}
+        const title = part.state.title ?? (Object.keys(toolInput).length > 0 ? JSON.stringify(toolInput) : 'Unknown')
         outputToolExecution(toolName, title)
       }
     } else if (event.type === 'session.updated') {
