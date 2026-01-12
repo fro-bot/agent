@@ -131,7 +131,7 @@ Every comment you post MUST include a collapsed details block at the end:
 | Repository | ${context.repo} |
 | Run ID | ${context.runId} |
 | Cache | ${cacheStatus} |
-| Session | <your_session_id> |
+| Session | ${options.sessionId ?? '<your_session_id>'} |
 
 </details>
 \`\`\`
