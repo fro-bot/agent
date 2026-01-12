@@ -1,5 +1,5 @@
 import type {Logger} from '../logger.js'
-import type {ExecutionConfig} from './types.js'
+import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as exec from '@actions/exec'
 
@@ -18,12 +18,39 @@ vi.mock('@opencode-ai/sdk', () => ({
   createOpencode: vi.fn(),
 }))
 
+// Mock buildAgentPrompt
+vi.mock('./prompt.js', () => ({
+  buildAgentPrompt: vi.fn().mockReturnValue('Built prompt with sessionId'),
+}))
+
 function createMockLogger(): Logger {
   return {
     debug: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
     error: vi.fn(),
+  }
+}
+
+function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): PromptOptions {
+  return {
+    context: {
+      eventName: 'issue_comment',
+      repo: 'owner/repo',
+      ref: 'refs/heads/main',
+      actor: 'test-user',
+      runId: '12345',
+      issueNumber: 42,
+      issueTitle: 'Test Issue',
+      issueType: 'issue',
+      commentBody: 'Test comment',
+      commentAuthor: 'commenter',
+      commentId: 999,
+      defaultBranch: 'main',
+    },
+    customPrompt: null,
+    cacheStatus: 'hit',
+    ...overrides,
   }
 }
 
@@ -109,7 +136,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(createOpencode).toHaveBeenCalledWith(
@@ -129,7 +156,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(mockClient.session.create).toHaveBeenCalled()
@@ -139,7 +166,7 @@ describe('executeOpenCode', () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         body: expect.objectContaining({
           agent: 'Sisyphus',
-          parts: [{type: 'text', text: 'Test prompt'}],
+          parts: [{type: 'text', text: 'Built prompt with sessionId'}],
         }),
       }),
     )
@@ -161,7 +188,7 @@ describe('executeOpenCode', () => {
     }
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger, config)
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
     expect(mockClient.session.prompt).toHaveBeenCalledWith(
@@ -192,7 +219,7 @@ describe('executeOpenCode', () => {
     }
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger, config)
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
     const promptCalls = vi.mocked(mockClient.session.prompt).mock.calls
@@ -216,7 +243,7 @@ describe('executeOpenCode', () => {
     }
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger, config)
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
     const callArgs = vi.mocked(mockClient.session.prompt).mock.calls[0]?.[0] as {
@@ -234,7 +261,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(result.success).toBe(true)
@@ -250,7 +277,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(result.success).toBe(false)
@@ -265,7 +292,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(result.success).toBe(false)
@@ -283,7 +310,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger)
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(mockServer.close).toHaveBeenCalled()
@@ -297,7 +324,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger)
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(mockServer.close).toHaveBeenCalled()
@@ -312,13 +339,12 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger)
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(mockLogger.info).toHaveBeenCalledWith(
       'Executing OpenCode agent (SDK mode)',
       expect.objectContaining({
-        promptLength: 11,
         agent: 'Sisyphus',
       }),
     )
@@ -329,7 +355,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockRejectedValue(new Error('Server startup failed'))
 
     // #when
-    const result = await executeOpenCode('Test prompt', mockLogger)
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(result.success).toBe(false)
@@ -345,7 +371,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    await executeOpenCode('Test prompt', mockLogger)
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
 
     // #then
     expect(mockClient.event.subscribe).toHaveBeenCalled()
