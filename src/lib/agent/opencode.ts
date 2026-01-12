@@ -6,11 +6,12 @@
  */
 
 import type {Logger} from '../logger.js'
-import type {AgentResult, ExecutionConfig} from './types.js'
+import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import process from 'node:process'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {buildAgentPrompt} from './prompt.js'
 
 /** ANSI color codes for tool output formatting */
 const TOOL_COLORS: Record<string, [string, string]> = {
@@ -104,7 +105,11 @@ async function processEventStream(
   }
 }
 
-export async function executeOpenCode(prompt: string, logger: Logger, config?: ExecutionConfig): Promise<AgentResult> {
+export async function executeOpenCode(
+  promptOptions: PromptOptions,
+  logger: Logger,
+  config?: ExecutionConfig,
+): Promise<AgentResult> {
   const startTime = Date.now()
   const abortController = new AbortController()
 
@@ -123,7 +128,6 @@ export async function executeOpenCode(prompt: string, logger: Logger, config?: E
   }
 
   logger.info('Executing OpenCode agent (SDK mode)', {
-    promptLength: prompt.length,
     agent: config?.agent ?? 'Sisyphus',
     hasModelOverride: config?.model != null,
     timeoutMs,
@@ -145,6 +149,8 @@ export async function executeOpenCode(prompt: string, logger: Logger, config?: E
     }
     const sessionId = sessionResponse.data.id
     logger.debug('Session created', {sessionId})
+
+    const prompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
 
     const agentName = config?.agent ?? 'Sisyphus'
     logger.debug('Using agent', {agent: agentName})

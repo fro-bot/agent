@@ -18,7 +18,7 @@
  * 11. Save cache (always, in finally block)
  */
 
-import type {ExecutionConfig, ReactionContext} from './lib/agent/types.js'
+import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {Octokit} from './lib/github/types.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
@@ -26,7 +26,6 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import {
   acknowledgeReceipt,
-  buildAgentPrompt,
   collectAgentContext,
   completeAcknowledgment,
   executeOpenCode,
@@ -164,20 +163,16 @@ async function run(): Promise<number> {
       resultCount: priorWorkContext.length,
     })
 
-    // 7. Build agent prompt
-    const promptLogger = createLogger({phase: 'prompt'})
-    const prompt = buildAgentPrompt(
-      {
-        context: contextWithBranch,
-        customPrompt: inputs.prompt,
-        cacheStatus,
-        sessionContext: {
-          recentSessions,
-          priorWorkContext,
-        },
+    // 7. Build prompt options (prompt built inside executeOpenCode with sessionId)
+    const promptOptions: PromptOptions = {
+      context: contextWithBranch,
+      customPrompt: inputs.prompt,
+      cacheStatus,
+      sessionContext: {
+        recentSessions,
+        priorWorkContext,
       },
-      promptLogger,
-    )
+    }
 
     // 8. Execute OpenCode agent (skip in test mode)
     const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'
@@ -197,7 +192,7 @@ async function run(): Promise<number> {
         timeoutMs: inputs.timeoutMs,
       }
 
-      const execResult = await executeOpenCode(prompt, execLogger, executionConfig)
+      const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig)
 
       // SDK mode returns sessionId directly (RFC-013)
       // Fall back to session discovery for backward compatibility

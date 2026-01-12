@@ -66,6 +66,7 @@ export interface PromptOptions {
   readonly customPrompt: string | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly sessionContext?: SessionContext
+  readonly sessionId?: string
 }
 
 /**

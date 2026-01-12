@@ -209,6 +209,42 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('| Cache | corrupted |')
   })
 
+  it('includes actual sessionId in run summary when provided', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'issue_comment',
+        repo: 'owner/repo',
+        runId: '99999',
+      }),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      sessionId: 'ses_abc123xyz',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('| Session | ses_abc123xyz |')
+    expect(prompt).not.toContain('<your_session_id>')
+  })
+
+  it('uses placeholder when sessionId not provided', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('| Session | <your_session_id> |')
+  })
+
   it('includes custom prompt when provided', () => {
     // #given
     const options: PromptOptions = {

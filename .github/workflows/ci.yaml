@@ -183,7 +183,7 @@ jobs:
       - name: Test main action
         uses: ./
         env:
-          SKIP_AGENT_EXECUTION: 'true'
+          SKIP_AGENT_EXECUTION: 'false'
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: '{"test":{"type":"api","key":"test-key"}}'
