@@ -11,7 +11,14 @@
       semanticCommitType: 'build',
     },
     {
-      matchPackageNames: ['conventional-changelog-conventionalcommits', 'semantic-release', 'tsup', 'typescript'],
+      matchPackageNames: [
+        '@bfra.me/tsconfig',
+        '@semantic-release/git',
+        'conventional-changelog-conventionalcommits',
+        'semantic-release',
+        'tsdown',
+        'typescript',
+      ],
       semanticCommitType: 'build',
     },
     {
@@ -23,12 +30,6 @@
       matchUpdateTypes: ['major'],
       groupName: 'semantic-release and conventionalcommits',
       semanticCommitType: 'feat',
-    },
-    {
-      description: 'Keep the bfra-me/renovate-config preset pinned.',
-      matchPackageNames: ['bfra-me/renovate-config'],
-      rangeStrategy: 'pin',
-      updatePinnedDependencies: false,
     },
   ],
   postUpgradeTasks: {
