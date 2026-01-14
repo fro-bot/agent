@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-11
-**Commit:** 1116f9e
+**Generated:** 2026-01-14
+**Commit:** d8de37e
 **Branch:** main
 
 ## OVERVIEW
@@ -21,6 +21,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   ├── github/       # Octokit client, context parsing
 │   │   ├── setup/        # Environment bootstrap (bun, omo, opencode, auth)
 │   │   ├── session/      # Session persistence (storage, search, prune, writeback)
+│   │   ├── triggers/     # Event routing, skip conditions, mock events (RFC-005)
 │   │   ├── cache.ts      # Cache restore/save with corruption detection
 │   │   ├── cache-key.ts  # Branch-scoped key generation
 │   │   ├── logger.ts     # JSON logging with auto-redaction
@@ -34,7 +35,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
 ├── setup/                # Setup action definition
 │   └── action.yaml       # Secondary action (../dist/setup.js)
-├── RFCs/                 # 14 RFC documents (architecture specs)
+├── RFCs/                 # 17 RFC documents (architecture specs)
 ├── .github/              # CI workflows, Renovate, settings
 ├── action.yaml           # Primary GitHub Action definition (node24)
 └── tsdown.config.ts      # esbuild bundler config (dual entry points)
@@ -80,7 +81,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | `ActionInputs`      | Interface | `src/lib/types.ts:45`       | Input schema                      |
 | `CacheResult`       | Interface | `src/lib/types.ts:11`       | Cache restore result              |
 
-> See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`, `src/lib/session/`).
+> See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`, `src/lib/session/`, `src/lib/triggers/`).
 
 ## TDD (Test-Driven Development)
 
@@ -191,13 +192,13 @@ pnpm test             # Vitest (349 tests)
 - **GitHub App releases**: CI uses app token to push to protected `v0` branch
 - **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review
 - **Pre-commit hook**: `simple-git-hooks` runs `lint-staged`
-- **14 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode
+- **17 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context
 
 ## EXTERNAL RESOURCES
 
-### Dependencies
+### Dependencies (from package.json)
 
-@actions/core, @actions/cache, @actions/exec, @actions/github, @actions/tool-cache, @bfra.me/es, @octokit/auth-app, @opencode-ai/sdk, vitest, tsdown, typescript
+@actions/cache, @actions/core, @actions/exec, @actions/github, @actions/tool-cache, @bfra.me/es, @octokit/auth-app, @opencode-ai/sdk, vitest, tsdown, typescript
 
 ### Context7 IDs
 
@@ -208,14 +209,20 @@ pnpm test             # Vitest (349 tests)
 | GitHub Actions Docs    | /websites/github_en_actions | 6032     | 72.7  |
 | Vitest                 | /vitest-dev/vitest          | 2776     | 90.4  |
 | Vitest Docs            | /websites/main_vitest_dev   | 1295     | 94.0  |
+| tsdown                 | /rolldown/tsdown            | 279      | 85.3  |
+| tsdown Docs            | /websites/tsdown_dev        | 389      | 82.1  |
+| OpenCode SDK           | /sst/opencode-sdk-js        | 96       | 83.4  |
+| OpenCode               | /anomalyco/opencode         | 1231     | 73.4  |
 
 ### GitHub Repos
 
 - actions/toolkit - GitHub Actions SDK (@actions/core, @actions/cache, @actions/github)
+- actions/cache - Cache action for workflows
 - vitest-dev/vitest - Test framework
-- rolldown/tsdown - Build bundler (esbuild wrapper)
+- rolldown/tsdown - Build bundler (Rolldown-powered)
 - octokit/auth-app.js - GitHub App authentication
-- opencode-ai/opencode - OpenCode SDK
+- anomalyco/opencode-sdk-js - OpenCode SDK for TypeScript
+- anomalyco/opencode - OpenCode AI agent
 
 ### Documentation
 
@@ -224,3 +231,5 @@ pnpm test             # Vitest (349 tests)
 - https://github.com/actions/toolkit/tree/main/packages/github - @actions/github (Octokit)
 - https://vitest.dev - Vitest testing framework
 - https://docs.github.com/en/actions - GitHub Actions official docs
+- https://tsdown.dev - tsdown bundler documentation
+- https://opencode.ai - OpenCode AI coding agent
