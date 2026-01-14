@@ -1,8 +1,6 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-12
-**Total RFCs:** 15
-**Implementation Strategy:** Sequential (RFC-001 → RFC-013)
+**Generated:** 2026-01-12 **Total RFCs:** 15 **Implementation Strategy:** Sequential (RFC-001 → RFC-013)
 
 ---
 
@@ -22,7 +20,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-002 | Cache Infrastructure                 | MUST     | High       | 1     | Completed  |
 | RFC-003 | GitHub API Client Layer              | MUST     | Medium     | 1     | Completed  |
 | RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed  |
-| RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Pending    |
+| RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Completed  |
 | RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Pending    |
 | RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending    |
 | RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending    |
@@ -176,7 +174,7 @@ RFC-001 (Foundation)
 
 | Feature                                | RFC              | Status    |
 | -------------------------------------- | ---------------- | --------- |
-| F1: GitHub Action Triggers             | RFC-005          | Pending   |
+| F1: GitHub Action Triggers             | RFC-005          | Completed |
 | F2: Issue Comment Interaction          | RFC-008          | Pending   |
 | F3: Discussion Comment Interaction     | RFC-008          | Pending   |
 | F4: PR Conversation Comments           | RFC-008          | Pending   |
@@ -184,7 +182,7 @@ RFC-001 (Foundation)
 | F6: Delegated Work - Push Commits      | RFC-010          | Pending   |
 | F7: Delegated Work - Open PRs          | RFC-010          | Pending   |
 | F8: Comment Idempotency                | RFC-008          | Pending   |
-| F9: Anti-Loop Protection               | RFC-005          | Pending   |
+| F9: Anti-Loop Protection               | RFC-005          | Completed |
 | F10: Reactions & Labels Acknowledgment | RFC-013          | Completed |
 | F11: Issue vs PR Context Detection     | RFC-013          | Completed |
 | F17: OpenCode Storage Cache Restore    | RFC-002          | Pending   |
@@ -205,7 +203,7 @@ RFC-001 (Foundation)
 | F35: Timeout and Cancellation          | RFC-013          | Completed |
 | F36: SDK Cleanup                       | RFC-013          | Completed |
 | F37: Model and Agent Configuration     | RFC-013          | Completed |
-| F38: Mock Event Support                | RFC-005          | Pending   |
+| F38: Mock Event Support                | RFC-005          | Completed |
 | F39: File Attachment Detection         | RFC-014          | Pending   |
 | F40: File Attachment Download          | RFC-014          | Pending   |
 | F41: File Attachment Prompt Injection  | RFC-014          | Pending   |
