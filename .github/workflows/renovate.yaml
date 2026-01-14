@@ -6,7 +6,7 @@ on:
   issues:
     types: [edited]
   pull_request:
-    types: [edited, synchronize]
+    types: [edited]
   push:
     branches-ignore: [main, v*]
   workflow_dispatch:
