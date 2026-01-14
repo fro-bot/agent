@@ -4,18 +4,19 @@
  * GitHub Action harness for OpenCode + oMo agents with persistent session state.
  * This is the entry point that orchestrates the agent workflow.
  *
- * Lifecycle (RFC-012 + RFC-004 + RFC-013 integration):
+ * Lifecycle (RFC-012 + RFC-004 + RFC-005 + RFC-013 integration):
  * 1. Parse inputs, verify OpenCode available
  * 2. Collect GitHub context
- * 3. Acknowledge receipt (eyes reaction + working label)
- * 4. Restore cache
- * 5. Session introspection (list recent, search prior work)
- * 6. Build agent prompt (with session context)
- * 7. Execute OpenCode agent (SDK mode - RFC-013)
- * 8. Write session summary (if sessionId available)
- * 9. Complete acknowledgment (update reaction, remove label)
- * 10. Prune old sessions (before cache save)
- * 11. Save cache (always, in finally block)
+ * 3. Route event and check skip conditions (RFC-005)
+ * 4. Acknowledge receipt (eyes reaction + working label) - ONLY if processing
+ * 5. Restore cache
+ * 6. Session introspection (list recent, search prior work)
+ * 7. Build agent prompt (with session context)
+ * 8. Execute OpenCode agent (SDK mode - RFC-013)
+ * 9. Write session summary (if sessionId available)
+ * 10. Complete acknowledgment (update reaction, remove label)
+ * 11. Prune old sessions (before cache save)
+ * 12. Save cache (always, in finally block)
  */
 
 import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
@@ -32,7 +33,7 @@ import {
   verifyOpenCodeAvailable,
 } from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
-import {createClient, getDefaultBranch} from './lib/github/index.js'
+import {createClient, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {setActionOutputs} from './lib/outputs.js'
@@ -44,6 +45,7 @@ import {
   searchSessions,
   writeSessionSummary,
 } from './lib/session/index.js'
+import {routeEvent} from './lib/triggers/index.js'
 import {
   getGitHubRefName,
   getGitHubRepository,
@@ -111,8 +113,35 @@ async function run(): Promise<number> {
     const defaultBranch = await getDefaultBranch(githubClient, agentContext.repo, contextLogger)
     const contextWithBranch = {...agentContext, defaultBranch}
 
-    // 4. Build reaction context for acknowledgment
+    // 3b. Route event and check skip conditions (RFC-005) - BEFORE acknowledgment
     const botLogin = process.env.BOT_LOGIN ?? null
+    const triggerLogger = createLogger({phase: 'trigger'})
+    const githubContext = parseGitHubContext(triggerLogger)
+    const triggerResult = routeEvent(githubContext, triggerLogger, {
+      botLogin,
+      requireMention: true,
+    })
+
+    if (!triggerResult.shouldProcess) {
+      triggerLogger.info('Skipping event', {
+        reason: triggerResult.skipReason,
+        message: triggerResult.skipMessage,
+      })
+      setActionOutputs({
+        sessionId: null,
+        cacheStatus: 'miss',
+        duration: Date.now() - startTime,
+      })
+      return 0
+    }
+
+    triggerLogger.info('Event routed for processing', {
+      triggerType: triggerResult.context.triggerType,
+      hasMention: triggerResult.context.hasMention,
+      command: triggerResult.context.command?.action ?? null,
+    })
+
+    // 4. Build reaction context for acknowledgment
     reactionCtx = {
       repo: agentContext.repo,
       commentId: agentContext.commentId,
@@ -121,7 +150,7 @@ async function run(): Promise<number> {
       botLogin,
     }
 
-    // 5. Acknowledge receipt immediately (eyes reaction + working label)
+    // 5. Acknowledge receipt immediately (eyes reaction + working label) - ONLY if processing
     const ackLogger = createLogger({phase: 'acknowledgment'})
     await acknowledgeReceipt(githubClient, reactionCtx, ackLogger)
 
