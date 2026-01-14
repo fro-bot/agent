@@ -63,7 +63,7 @@
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.2",
     "simple-git-hooks": "2.13.1",
-    "tsdown": "0.18.4",
+    "tsdown": "0.19.0",
     "typescript": "5.9.3",
     "vitest": "4.0.16"
   },
