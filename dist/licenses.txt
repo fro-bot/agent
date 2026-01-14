@@ -1,4 +1,4 @@
-@actions/cache@5.0.1
+@actions/cache@5.0.2
 MIT
 The MIT License (MIT)
 
