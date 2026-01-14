@@ -36,13 +36,13 @@
   "prettier": "@bfra.me/prettier-config/120-proof",
   "dependencies": {
     "@actions/cache": "^5.0.2",
-    "@actions/core": "2.0.1",
+    "@actions/core": "2.0.2",
     "@actions/exec": "^2.0.0",
     "@actions/github": "^7.0.0",
     "@actions/tool-cache": "^3.0.0",
     "@bfra.me/es": "0.1.0",
     "@octokit/auth-app": "8.1.2",
-    "@opencode-ai/sdk": "1.1.11"
+    "@opencode-ai/sdk": "1.1.13"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.47.7",
@@ -50,7 +50,7 @@
     "@bfra.me/tsconfig": "0.12.1",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.10.4",
-    "@vitest/eslint-plugin": "1.6.4",
+    "@vitest/eslint-plugin": "1.6.6",
     "conventional-changelog-conventionalcommits": "9.1.0",
     "eslint": "9.39.2",
     "eslint-config-prettier": "10.1.8",
