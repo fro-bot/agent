@@ -114,7 +114,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 - **ESM-only**: `"type": "module"`, use `.js` extensions in imports
 - **Function-based**: No ES6 classes, pure functions only
-- **Strict booleans**: Use `!= null` or `Boolean()`, never implicit falsy (`if (!value)`)
+- **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types (never for generic falsy checks).
 - **Const assertions**: Use `as const` for fixed values
 - **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors

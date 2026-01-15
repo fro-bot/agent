@@ -5,7 +5,7 @@ import * as exec from '@actions/exec'
 
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+import {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -451,5 +451,64 @@ describe('verifyOpenCodeAvailable', () => {
     // #then
     expect(result.available).toBe(true)
     expect(result.version).toBeNull()
+  })
+})
+
+describe('ensureOpenCodeAvailable', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+    delete process.env.OPENCODE_PATH
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env.OPENCODE_PATH
+  })
+
+  it('returns existing OpenCode when already available', async () => {
+    // #given
+    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
+      if (options?.listeners?.stdout != null) {
+        options.listeners.stdout(Buffer.from('opencode version 1.2.3\n'))
+      }
+      return 0
+    })
+    process.env.OPENCODE_PATH = '/existing/path'
+
+    // #when
+    const result = await ensureOpenCodeAvailable({
+      logger: mockLogger,
+      opencodeVersion: 'latest',
+    })
+
+    // #then
+    expect(result.didSetup).toBe(false)
+    expect(result.version).toBe('1.2.3')
+    expect(result.path).toBe('/existing/path')
+    expect(mockLogger.info).toHaveBeenCalledWith('OpenCode already available', expect.any(Object))
+  })
+
+  it('logs message when OpenCode not available and setup needed', async () => {
+    // #given
+    vi.mocked(exec.exec).mockRejectedValue(new Error('Command not found'))
+
+    // #when
+    try {
+      await ensureOpenCodeAvailable({
+        logger: mockLogger,
+        opencodeVersion: 'latest',
+      })
+    } catch {
+      // Expected to fail since runSetup will fail in test environment
+    }
+
+    // #then
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'OpenCode not found, running auto-setup',
+      expect.objectContaining({requestedVersion: 'latest'}),
+    )
   })
 })

@@ -54,6 +54,9 @@ export interface ActionInputs {
   readonly agent: string
   readonly model: ModelConfig | null
   readonly timeoutMs: number
+  // Setup consolidation: auto-setup inputs
+  readonly opencodeVersion: string
+  readonly skipCache: boolean
 }
 
 // Action outputs
