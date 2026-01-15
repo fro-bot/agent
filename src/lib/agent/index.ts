@@ -15,7 +15,9 @@ export {collectAgentContext} from './context.js'
 export {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
 
 // Prompt construction
-export {buildAgentPrompt} from './prompt.js'
+export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
+
+export type {TriggerDirective} from './prompt.js'
 
 // Reactions & labels
 export {

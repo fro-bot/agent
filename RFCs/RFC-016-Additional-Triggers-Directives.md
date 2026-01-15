@@ -1,9 +1,32 @@
 # RFC-016: Additional Triggers & Directives
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** Medium
 **Phase:** 2
+**Completed:** 2026-01-14
+
+---
+
+## Completion Notes
+
+**Implementation Date:** 2026-01-14
+
+**Summary:** Extended GitHub event handling to support additional triggers (`issues`, `pull_request`, `pull_request_review_comment`, `schedule`) and implemented trigger-specific prompt directives via `getTriggerDirective()`.
+
+**Files Modified:**
+
+- `src/lib/triggers/types.ts` - Extended trigger types, skip reasons, TriggerTarget, TriggerConfig
+- `src/lib/triggers/router.ts` - Added context builders and skip checkers for all new triggers
+- `src/lib/triggers/router.test.ts` - Added 24 new tests for all new trigger types
+- `src/lib/agent/prompt.ts` - Added `getTriggerDirective()`, `buildTaskSection()`, `TriggerDirective` interface
+- `src/lib/agent/prompt.test.ts` - Added 16 new tests for directive and task section logic
+- `src/lib/agent/types.ts` - Extended `PromptOptions` with `triggerContext`
+- `src/lib/agent/index.ts` - Exported new functions and types
+
+**Test Coverage:** 443 tests pass (27 test files)
+
+**Deviations from RFC:** None - implemented as specified.
 
 ---
 
