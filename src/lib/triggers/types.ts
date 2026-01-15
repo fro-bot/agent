@@ -16,7 +16,16 @@ import type {GitHubContext} from '../github/types.js'
  * - 'workflow_dispatch': Manual workflow trigger
  * - 'unsupported': Event type not handled by this action
  */
-export const TRIGGER_TYPES = ['issue_comment', 'discussion_comment', 'workflow_dispatch', 'unsupported'] as const
+export const TRIGGER_TYPES = [
+  'discussion_comment',
+  'issue_comment',
+  'issues',
+  'pull_request',
+  'pull_request_review_comment',
+  'schedule',
+  'unsupported',
+  'workflow_dispatch',
+] as const
 
 export type TriggerType = (typeof TRIGGER_TYPES)[number]
 
@@ -46,6 +55,16 @@ export interface TriggerTarget {
   readonly body: string | null
   /** Whether the target is locked */
   readonly locked: boolean
+  /** Whether the PR is a draft (pull_request only) */
+  readonly isDraft?: boolean
+  /** File path for review comments (pull_request_review_comment only) */
+  readonly path?: string
+  /** Line number for review comments (pull_request_review_comment only) */
+  readonly line?: number
+  /** Diff hunk for review comments (pull_request_review_comment only) */
+  readonly diffHunk?: string
+  /** Commit ID for review comments (pull_request_review_comment only) */
+  readonly commitId?: string
 }
 
 /**
@@ -100,8 +119,11 @@ export interface TriggerContext {
  */
 export const SKIP_REASONS = [
   'action_not_created',
+  'action_not_supported',
+  'draft_pr',
   'issue_locked',
   'no_mention',
+  'prompt_required',
   'self_comment',
   'unauthorized_author',
   'unsupported_event',
@@ -144,6 +166,10 @@ export interface TriggerConfig {
   readonly requireMention: boolean
   /** Allowed author associations for processing */
   readonly allowedAssociations: readonly string[]
+  /** Whether to skip draft PRs (default: true) */
+  readonly skipDraftPRs: boolean
+  /** Prompt input for schedule/workflow_dispatch triggers */
+  readonly promptInput: string | null
 }
 
 /**
@@ -159,4 +185,6 @@ export const DEFAULT_TRIGGER_CONFIG: TriggerConfig = {
   botLogin: null,
   requireMention: true,
   allowedAssociations: ALLOWED_ASSOCIATIONS,
+  skipDraftPRs: true,
+  promptInput: null,
 } as const

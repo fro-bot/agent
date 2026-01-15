@@ -1,8 +1,9 @@
 import type {Logger} from '../logger.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, PromptOptions, SessionContext} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {buildAgentPrompt} from './prompt.js'
+import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 
 function createMockLogger(): Logger {
   return {
@@ -625,5 +626,240 @@ describe('buildAgentPrompt', () => {
         }),
       )
     })
+  })
+})
+
+function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
+  return {
+    triggerType: 'issue_comment',
+    eventName: 'issue_comment',
+    repo: {owner: 'owner', repo: 'repo'},
+    ref: 'refs/heads/main',
+    sha: 'abc123',
+    runId: 12345,
+    actor: 'test-user',
+    author: {
+      login: 'commenter',
+      association: 'MEMBER',
+      isBot: false,
+    },
+    target: {
+      kind: 'issue',
+      number: 42,
+      title: 'Test Issue',
+      body: 'Issue description',
+      locked: false,
+    },
+    commentBody: '@fro-bot help',
+    commentId: 999,
+    hasMention: true,
+    command: null,
+    raw: {payload: {action: 'created'}} as unknown as TriggerContext['raw'],
+    ...overrides,
+  }
+}
+
+describe('getTriggerDirective', () => {
+  it('returns respond directive for issue_comment', () => {
+    // #given
+    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toBe('Respond to the comment above.')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns respond directive for discussion_comment', () => {
+    // #given
+    const context = createMockTriggerContext({triggerType: 'discussion_comment'})
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toBe('Respond to the discussion comment above.')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns triage directive for issues.opened', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'issues',
+      raw: {payload: {action: 'opened'}} as unknown as TriggerContext['raw'],
+    })
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toBe('Triage this issue: summarize, reproduce if possible, propose next steps.')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns mention directive for issues.edited', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'issues',
+      raw: {payload: {action: 'edited'}} as unknown as TriggerContext['raw'],
+    })
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toBe('Respond to the mention in this issue.')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns review directive for pull_request', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'pull_request',
+      target: {
+        kind: 'pr',
+        number: 99,
+        title: 'feat: add feature',
+        body: 'Description',
+        locked: false,
+        isDraft: false,
+      },
+    })
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toBe('Review this pull request for code quality, potential bugs, and improvements.')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns file context directive for pull_request_review_comment', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'pull_request_review_comment',
+      target: {
+        kind: 'pr',
+        number: 99,
+        title: 'feat: add feature',
+        body: null,
+        locked: false,
+        path: 'src/lib/feature.ts',
+        line: 42,
+        diffHunk: '@@ -10,6 +10,8 @@\n+  const newCode = true',
+        commitId: 'abc123',
+      },
+    })
+
+    // #when
+    const directive = getTriggerDirective(context, null)
+
+    // #then
+    expect(directive.directive).toContain('Respond to the review comment.')
+    expect(directive.directive).toContain('**File:** `src/lib/feature.ts`')
+    expect(directive.directive).toContain('**Line:** 42')
+    expect(directive.appendMode).toBe(true)
+  })
+
+  it('returns prompt input for schedule with replace mode', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'schedule',
+      commentBody: 'Run daily maintenance tasks',
+    })
+    const promptInput = 'Run daily maintenance tasks'
+
+    // #when
+    const directive = getTriggerDirective(context, promptInput)
+
+    // #then
+    expect(directive.directive).toBe('Run daily maintenance tasks')
+    expect(directive.appendMode).toBe(false)
+  })
+
+  it('returns prompt input for workflow_dispatch with replace mode', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'workflow_dispatch',
+      commentBody: 'Deploy to production',
+    })
+    const promptInput = 'Deploy to production'
+
+    // #when
+    const directive = getTriggerDirective(context, promptInput)
+
+    // #then
+    expect(directive.directive).toBe('Deploy to production')
+    expect(directive.appendMode).toBe(false)
+  })
+})
+
+describe('buildTaskSection', () => {
+  it('builds task section with directive only when no custom prompt', () => {
+    // #given
+    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+
+    // #when
+    const section = buildTaskSection(context, null)
+
+    // #then
+    expect(section).toContain('## Task')
+    expect(section).toContain('Respond to the comment above.')
+    expect(section).not.toContain('Custom Instructions')
+  })
+
+  it('appends custom prompt in append mode', () => {
+    // #given
+    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+    const customPrompt = 'Focus on security issues'
+
+    // #when
+    const section = buildTaskSection(context, customPrompt)
+
+    // #then
+    expect(section).toContain('## Task')
+    expect(section).toContain('Respond to the comment above.')
+    expect(section).toContain('Focus on security issues')
+  })
+
+  it('replaces directive with custom prompt in replace mode (schedule)', () => {
+    // #given
+    const context = createMockTriggerContext({triggerType: 'schedule'})
+    const customPrompt = 'Run maintenance tasks'
+
+    // #when
+    const section = buildTaskSection(context, customPrompt)
+
+    // #then
+    expect(section).toContain('## Task')
+    expect(section).toContain('Run maintenance tasks')
+  })
+
+  it('includes review comment context in task section', () => {
+    // #given
+    const context = createMockTriggerContext({
+      triggerType: 'pull_request_review_comment',
+      target: {
+        kind: 'pr',
+        number: 99,
+        title: 'feat: add feature',
+        body: null,
+        locked: false,
+        path: 'src/api/handler.ts',
+        line: 100,
+        diffHunk: '@@ changes @@',
+        commitId: 'def456',
+      },
+    })
+
+    // #when
+    const section = buildTaskSection(context, null)
+
+    // #then
+    expect(section).toContain('**File:** `src/api/handler.ts`')
+    expect(section).toContain('**Line:** 100')
+    expect(section).toContain('**Commit:** `def456`')
   })
 })

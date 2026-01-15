@@ -6,6 +6,7 @@
  */
 
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {ModelConfig} from '../types.js'
 
 /**
@@ -67,6 +68,7 @@ export interface PromptOptions {
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly sessionContext?: SessionContext
   readonly sessionId?: string
+  readonly triggerContext?: TriggerContext
 }
 
 /**
