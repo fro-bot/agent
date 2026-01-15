@@ -6,11 +6,13 @@
  */
 
 import type {Logger} from '../logger.js'
-import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
+import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
 import process from 'node:process'
+import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {runSetup} from '../setup/setup.js'
 import {buildAgentPrompt} from './prompt.js'
 
 /** ANSI color codes for tool output formatting */
@@ -58,16 +60,9 @@ interface OpenCodeEvent {
   properties: EventProperties
 }
 
-interface SessionInfo {
-  id: string
-  title: string
-  version: string
-}
-
 async function processEventStream(
   stream: AsyncIterable<OpenCodeEvent>,
   sessionId: string,
-  sessionRef: {current: SessionInfo | null},
   logger: Logger,
 ): Promise<void> {
   let lastText = ''
@@ -92,12 +87,6 @@ async function processEventStream(
         const toolInput = part.state.input ?? {}
         const title = part.state.title ?? (Object.keys(toolInput).length > 0 ? JSON.stringify(toolInput) : 'Unknown')
         outputToolExecution(toolName, title)
-      }
-    } else if (event.type === 'session.updated') {
-      const info = props.info
-      if (info?.id === sessionId && info.title != null && info.version != null) {
-        sessionRef.current = {id: info.id, title: info.title, version: info.version}
-        logger.debug('Session updated', {sessionId: info.id, title: info.title})
       }
     } else if (event.type === 'session.error' && props.sessionID === sessionId) {
       logger.error('Session error', {error: props.error})
@@ -156,15 +145,9 @@ export async function executeOpenCode(
     logger.debug('Using agent', {agent: agentName})
 
     const events = await client.event.subscribe()
-    const sessionRef: {current: SessionInfo | null} = {current: null}
 
     let eventStreamEnded = false
-    const eventProcessingPromise = processEventStream(
-      events.stream as AsyncIterable<OpenCodeEvent>,
-      sessionId,
-      sessionRef,
-      logger,
-    )
+    const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
       .catch(error => {
         if (error instanceof Error && error.name !== 'AbortError') {
           logger.debug('Event stream error', {error: error.message})
@@ -174,7 +157,6 @@ export async function executeOpenCode(
         eventStreamEnded = true
       })
 
-    logger.debug('Sending prompt to OpenCode...')
     const promptBody: {
       agent?: string
       model?: {modelID: string; providerID: string}
@@ -191,6 +173,7 @@ export async function executeOpenCode(
       }
     }
 
+    logger.debug('Sending prompt to OpenCode', {sessionId, body: promptBody})
     const promptResponse = await client.session.prompt({
       path: {id: sessionId},
       body: promptBody,
@@ -292,5 +275,48 @@ export async function verifyOpenCodeAvailable(
   } catch {
     logger.warning('OpenCode not available')
     return {available: false, version: null}
+  }
+}
+
+export interface EnsureOpenCodeOptions {
+  logger: Logger
+  opencodeVersion: string
+}
+
+export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): Promise<EnsureOpenCodeResult> {
+  const {logger, opencodeVersion} = options
+
+  const existingPath = process.env.OPENCODE_PATH ?? null
+  const check = await verifyOpenCodeAvailable(existingPath, logger)
+
+  if (check.available && check.version != null) {
+    logger.info('OpenCode already available', {version: check.version})
+    return {
+      path: existingPath ?? 'opencode',
+      version: check.version,
+      didSetup: false,
+    }
+  }
+
+  logger.info('OpenCode not found, running auto-setup', {requestedVersion: opencodeVersion})
+
+  const setupResult = await runSetup()
+
+  if (setupResult == null) {
+    throw new Error('Auto-setup failed: runSetup returned null')
+  }
+
+  core.addPath(setupResult.opencodePath)
+  process.env.OPENCODE_PATH = setupResult.opencodePath
+
+  logger.info('Auto-setup completed', {
+    version: setupResult.opencodeVersion,
+    path: setupResult.opencodePath,
+  })
+
+  return {
+    path: setupResult.opencodePath,
+    version: setupResult.opencodeVersion,
+    didSetup: true,
   }
 }

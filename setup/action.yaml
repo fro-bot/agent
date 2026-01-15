@@ -1,6 +1,11 @@
+# DEPRECATED: Use fro-bot/agent@v0 directly. The main action now auto-installs
+# dependencies when needed. This action is maintained for backward compatibility.
 name: Setup Fro Bot Agent
 description: Bootstrap environment for OpenCode agent execution
 author: fro-bot
+branding:
+  icon: cpu
+  color: purple
 
 inputs:
   auth-json:

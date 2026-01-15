@@ -29,8 +29,8 @@ import {
   acknowledgeReceipt,
   collectAgentContext,
   completeAcknowledgment,
+  ensureOpenCodeAvailable,
   executeOpenCode,
-  verifyOpenCodeAvailable,
 } from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
 import {createClient, getBotLogin, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
@@ -45,6 +45,7 @@ import {
   searchSessions,
   writeSessionSummary,
 } from './lib/session/index.js'
+import {STATE_KEYS} from './lib/state-keys.js'
 import {routeEvent} from './lib/triggers/index.js'
 import {
   getGitHubRefName,
@@ -68,6 +69,9 @@ async function run(): Promise<number> {
   let agentSuccess = false
   let exitCode = 0
   let githubClient: Octokit | null = null
+
+  core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+  core.saveState(STATE_KEYS.CACHE_SAVED, 'false')
 
   try {
     bootstrapLogger.info('Starting Fro Bot Agent')
@@ -93,16 +97,17 @@ async function run(): Promise<number> {
       timeoutMs: inputs.timeoutMs,
     })
 
-    // 2. Verify OpenCode is available (from setup action)
-    const opencodePath = process.env.OPENCODE_PATH ?? null
-    const opencodeCheck = await verifyOpenCodeAvailable(opencodePath, logger)
+    // 2. Ensure OpenCode is available (auto-setup if needed)
+    const opencodeResult = await ensureOpenCodeAvailable({
+      logger,
+      opencodeVersion: inputs.opencodeVersion,
+    })
 
-    if (!opencodeCheck.available) {
-      core.setFailed('OpenCode is not available. Did you run the setup action first?')
-      return 1
+    if (opencodeResult.didSetup) {
+      logger.info('OpenCode auto-setup completed', {version: opencodeResult.version})
+    } else {
+      logger.info('OpenCode already available', {version: opencodeResult.version})
     }
-
-    logger.info('OpenCode verified', {version: opencodeCheck.version})
 
     // 3. Collect GitHub context
     const contextLogger = createLogger({phase: 'context'})
@@ -139,6 +144,8 @@ async function run(): Promise<number> {
       hasMention: triggerResult.context.hasMention,
       command: triggerResult.context.command?.action ?? null,
     })
+
+    core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
     // 4. Get bot login for reaction context and build reaction context for acknowledgment
     const botLogin = await getBotLogin(githubClient, contextLogger)
@@ -237,6 +244,10 @@ async function run(): Promise<number> {
       result = {...execResult, sessionId}
     }
 
+    if (result.sessionId != null) {
+      core.saveState(STATE_KEYS.SESSION_ID, result.sessionId)
+    }
+
     agentSuccess = result.success
 
     // 8b. Write session summary (RFC-004) if we have a sessionId
@@ -318,13 +329,17 @@ async function run(): Promise<number> {
       }
 
       const cacheLogger = createLogger({phase: 'cache-save'})
-      await saveCache({
+      const cacheSaved = await saveCache({
         components: cacheComponents,
         runId: getGitHubRunId(),
         logger: cacheLogger,
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
       })
+
+      if (cacheSaved) {
+        core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
+      }
     } catch (cleanupError) {
       bootstrapLogger.warning('Cleanup failed (non-fatal)', {
         error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),

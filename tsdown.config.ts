@@ -86,7 +86,7 @@ function licenseCollectorPlugin(): Plugin {
 }
 
 export default defineConfig({
-  entry: ['src/main.ts', 'src/setup.ts'],
+  entry: ['src/main.ts', 'src/setup.ts', 'src/post.ts'],
   fixedExtension: false,
   minify: true,
   plugins: [licenseCollectorPlugin()],
