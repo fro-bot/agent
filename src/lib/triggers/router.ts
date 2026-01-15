@@ -77,17 +77,6 @@ export function extractCommand(text: string, botLogin: string): ParsedCommand | 
   return {raw, action, args}
 }
 
-function isSelfComment(authorLogin: string, botLogin: string | null): boolean {
-  if (botLogin == null || botLogin.length === 0) {
-    return false
-  }
-
-  const normalizedAuthor = authorLogin.toLowerCase()
-  const normalizedBot = botLogin.toLowerCase()
-
-  return normalizedAuthor === normalizedBot || normalizedAuthor === `${normalizedBot}[bot]`
-}
-
 function isAuthorizedAssociation(association: string, allowed: readonly string[]): boolean {
   return allowed.includes(association)
 }
@@ -635,12 +624,12 @@ function checkCommentSkipConditions(
     }
   }
 
-  if (context.author != null && isSelfComment(context.author.login, config.botLogin)) {
-    logger.debug('Skipping self-comment (anti-loop)')
+  if (context.author != null && context.author.isBot) {
+    logger.debug('Skipping bot actor', {bot: context.author.login})
     return {
       shouldSkip: true,
       reason: 'self_comment',
-      message: 'Comment is from the bot itself',
+      message: `Comments from bots (${context.author.login}) are not processed`,
     }
   }
 
@@ -867,7 +856,7 @@ export function routeEvent(
   const fullConfig: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, ...config}
 
   const triggerType = classifyTrigger(githubContext.eventName)
-  const context = buildTriggerContext(githubContext, triggerType, fullConfig.botLogin, fullConfig.promptInput)
+  const context = buildTriggerContext(githubContext, triggerType, fullConfig.login, fullConfig.promptInput)
 
   logger.debug('Routing event', {
     eventName: githubContext.eventName,

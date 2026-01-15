@@ -160,8 +160,8 @@ export interface TriggerResultSkip extends TriggerResultBase {
  * Configuration for trigger routing.
  */
 export interface TriggerConfig {
-  /** Bot login name (without [bot] suffix) */
-  readonly botLogin: string | null
+  /** Actor login from the event (used for mention detection and bot filtering) */
+  readonly login: string | null
   /** Whether to require bot mention for issue_comment events */
   readonly requireMention: boolean
   /** Allowed author associations for processing */
@@ -182,7 +182,7 @@ export const ALLOWED_ASSOCIATIONS = ['COLLABORATOR', 'MEMBER', 'OWNER'] as const
  * Default trigger configuration.
  */
 export const DEFAULT_TRIGGER_CONFIG: TriggerConfig = {
-  botLogin: null,
+  login: null,
   requireMention: true,
   allowedAssociations: ALLOWED_ASSOCIATIONS,
   skipDraftPRs: true,
