@@ -53,7 +53,7 @@ extractCommand(text, botLogin) // Parse command after mention
 
 | Pattern                    | Why                                               |
 | -------------------------- | ------------------------------------------------- |
-| Hardcoding bot name        | Use `config.botLogin` from setup action           |
+| Hardcoding bot name        | Use `config.login` (actor from event context)     |
 | Checking `payload.action`  | Use `checkSkipConditions()` for consistent gating |
 | Ignoring `TriggerResult`   | Always check `shouldProcess` before proceeding    |
 | Direct association compare | Use `ALLOWED_ASSOCIATIONS` constant               |

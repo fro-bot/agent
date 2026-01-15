@@ -33,7 +33,7 @@ import {
   verifyOpenCodeAvailable,
 } from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
-import {createClient, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
+import {createClient, getBotLogin, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {setActionOutputs} from './lib/outputs.js'
@@ -114,11 +114,10 @@ async function run(): Promise<number> {
     const contextWithBranch = {...agentContext, defaultBranch}
 
     // 3b. Route event and check skip conditions (RFC-005) - BEFORE acknowledgment
-    const botLogin = process.env.BOT_LOGIN ?? null
     const triggerLogger = createLogger({phase: 'trigger'})
     const githubContext = parseGitHubContext(triggerLogger)
     const triggerResult = routeEvent(githubContext, triggerLogger, {
-      botLogin,
+      login: githubContext.actor,
       requireMention: true,
     })
 
@@ -141,7 +140,8 @@ async function run(): Promise<number> {
       command: triggerResult.context.command?.action ?? null,
     })
 
-    // 4. Build reaction context for acknowledgment
+    // 4. Get bot login for reaction context and build reaction context for acknowledgment
+    const botLogin = await getBotLogin(githubClient, contextLogger)
     reactionCtx = {
       repo: agentContext.repo,
       commentId: agentContext.commentId,
