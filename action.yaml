@@ -38,6 +38,14 @@ inputs:
     description: 'Execution timeout in milliseconds. 0 = no timeout. Default: 1800000 (30 minutes)'
     required: false
     default: '1800000'
+  opencode-version:
+    description: 'OpenCode CLI version to install if auto-setup is needed (default: latest)'
+    required: false
+    default: latest
+  skip-cache:
+    description: Skip session cache restore (default false)
+    required: false
+    default: 'false'
 
 outputs:
   session-id:
@@ -50,3 +58,4 @@ outputs:
 runs:
   using: node24
   main: dist/main.js
+  post: dist/post.js

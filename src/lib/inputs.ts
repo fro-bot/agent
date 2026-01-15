@@ -2,7 +2,7 @@ import type {Result} from '@bfra.me/es/result'
 import type {ActionInputs, ModelConfig} from './types.js'
 import * as core from '@actions/core'
 import {validateJsonString, validatePositiveInteger} from '../utils/validation.js'
-import {DEFAULT_AGENT, DEFAULT_SESSION_RETENTION, DEFAULT_TIMEOUT_MS} from './constants.js'
+import {DEFAULT_AGENT, DEFAULT_OPENCODE_VERSION, DEFAULT_SESSION_RETENTION, DEFAULT_TIMEOUT_MS} from './constants.js'
 import {err, ok} from './types.js'
 
 /**
@@ -101,6 +101,13 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const timeoutRaw = core.getInput('timeout').trim()
     const timeoutMs = timeoutRaw.length > 0 ? parseTimeoutMs(timeoutRaw) : DEFAULT_TIMEOUT_MS
 
+    // Setup consolidation inputs
+    const opencodeVersionRaw = core.getInput('opencode-version').trim()
+    const opencodeVersion = opencodeVersionRaw.length > 0 ? opencodeVersionRaw : DEFAULT_OPENCODE_VERSION
+
+    const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
+    const skipCache = skipCacheRaw === 'true'
+
     return ok({
       githubToken,
       authJson,
@@ -112,6 +119,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       agent,
       model,
       timeoutMs,
+      opencodeVersion,
+      skipCache,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))

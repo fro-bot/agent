@@ -103,3 +103,9 @@ export interface PromptPart {
   readonly filename?: string
   readonly mimeType?: string
 }
+
+export interface EnsureOpenCodeResult {
+  readonly path: string
+  readonly version: string
+  readonly didSetup: boolean
+}

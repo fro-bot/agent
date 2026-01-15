@@ -12,7 +12,7 @@
 export {collectAgentContext} from './context.js'
 
 // OpenCode execution (RFC-013: SDK mode)
-export {executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+export {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
 
 // Prompt construction
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
@@ -35,6 +35,7 @@ export type {
   AcknowledgmentState,
   AgentContext,
   AgentResult,
+  EnsureOpenCodeResult,
   ExecutionConfig,
   PromptOptions,
   PromptPart,

@@ -154,15 +154,16 @@ jobs:
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
           owner: ${{ github.repository_owner}}
 
-      - name: Test setup action
-        uses: ./setup/
+      - name: Test main action
+        uses: ./
+        env:
+          SKIP_AGENT_EXECUTION: 'false'
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: ${{ secrets.AUTH_JSON }}
-          opencode-version: latest
 
       - if: always()
-        name: Introspect setup action installation
+        name: Introspect main action execution
         run: |
           echo "Installed versions:"
           which bun && bun --version || true
@@ -180,17 +181,6 @@ jobs:
           echo "Check oh-my-opencode installation:"
           bunx oh-my-opencode doctor || true
 
-      - name: Test main action
-        uses: ./
-        env:
-          SKIP_AGENT_EXECUTION: 'false'
-        with:
-          github-token: ${{ steps.get-app-token.outputs.token }}
-          auth-json: ${{ secrets.AUTH_JSON }}
-
-      - if: always()
-        name: Introspect main action execution
-        run: |
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true
 
