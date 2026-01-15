@@ -1,7 +1,7 @@
 # Development Rules: Fro Bot Agent
 
-**Version:** 1.1
-**Last Updated:** 2026-01-10
+**Version:** 1.2
+**Last Updated:** 2026-01-14
 **Applies to:** All contributors and AI assistants
 
 ---
@@ -605,6 +605,7 @@ lint-staged        # Runs on staged files
 
 - **Bundle**: `dist/main.js` (ESM, minified)
 - **Bundle (setup)**: `dist/setup.js` (ESM, minified)
+- **Bundle (post)**: `dist/post.js` (ESM, minified) - post-action cache hook
 - **Licenses**: `dist/licenses.txt` (auto-extracted)
 - **Source maps**: Not included in production
 
@@ -671,7 +672,81 @@ outputs:
 runs:
   using: "node24"
   main: "dist/main.js"
+  post: "dist/post.js"
 ```
+
+### Trigger Router Patterns
+
+The action supports multiple GitHub event triggers with specific handling:
+
+| Event | Supported Actions | Prompt Requirement | Default Behavior |
+| --- | --- | --- | --- |
+| `issue_comment` | `created` | Optional (uses comment body) | Respond to comment |
+| `discussion_comment` | `created` | Optional (uses comment body) | Respond to discussion |
+| `workflow_dispatch` | - | **Required** | Uses prompt input directly |
+| `schedule` | - | **Required** | Uses prompt input directly |
+| `issues` | `opened`, `edited` (with @mention) | Optional | Triage (opened) or respond to mention |
+| `pull_request` | `opened`, `synchronize`, `reopened` | Optional | Code review |
+| `pull_request_review_comment` | `created` | Optional (uses comment body) | Respond with file context |
+
+**Skip Conditions:**
+
+- `issues.edited`: Skip unless body contains `@fro-bot` mention
+- `pull_request`: Skip draft PRs by default (configurable)
+- `schedule`/`workflow_dispatch`: Hard fail if `inputs.prompt` is empty
+
+### Trigger-Specific Directives
+
+Each trigger injects a default task directive via `getTriggerDirective()`:
+
+```typescript
+// src/lib/agent/prompt.ts
+function getTriggerDirective(context: TriggerContext, inputs: ActionInputs): string {
+  switch (context.eventName) {
+    case "issue_comment":
+      return "Respond to the comment above"
+    case "issues":
+      return context.action === "opened"
+        ? "Triage this issue: summarize, reproduce if possible, propose next steps"
+        : "Respond to the mention in this issue"
+    case "pull_request":
+      return "Review this pull request for code quality, potential bugs, and improvements"
+    case "pull_request_review_comment":
+      return "Respond to the review comment with file and code context"
+    case "schedule":
+    case "workflow_dispatch":
+      // No default - prompt input required
+      return inputs.prompt
+  }
+}
+```
+
+**Prompt Override Behavior:**
+
+- Comment-based triggers: Custom `prompt` **appends** to directive
+- `schedule`/`workflow_dispatch`: Custom `prompt` **replaces** directive (required)
+
+### Post-Action Cache Hook
+
+The `post:` hook provides reliable cache persistence independent of main action lifecycle:
+
+```typescript
+// src/post.ts - Runs even on timeout/cancellation/SIGKILL
+async function post(): Promise<void> {
+  // 1. Save cache (idempotent, best-effort)
+  await saveCache(inputs) // Never throws
+
+  // 2. Session pruning (optional, non-fatal)
+  await pruneSessions(inputs) // Never throws
+}
+```
+
+**Key Properties:**
+
+- Runs in separate process via GitHub Actions `post:` field
+- Survives main action timeout, cancellation, or crash
+- **MUST NOT** fail the job if cache save fails
+- Complements (not replaces) `finally` block cleanup
 
 ### Cache Key Pattern
 
@@ -794,6 +869,24 @@ export async function executeOpenCode(
 4. Multi-section prompt construction
 5. Context budgeting (50 comments, 100 files)
 
+**Additional Triggers (v1.2)**
+
+1. `issues` event with `opened` action (auto-triage)
+2. `issues.edited` only when `@fro-bot` mentioned
+3. `pull_request` event with `opened`, `synchronize`, `reopened`
+4. `pull_request_review_comment` with `created` action
+5. `schedule` event with required `prompt` input
+6. `workflow_dispatch` hard fails if `prompt` empty
+7. Draft PR skip by default (configurable)
+8. Trigger-specific directives via `getTriggerDirective()`
+
+**Post-Action Hook (v1.2)**
+
+1. `src/post.ts` entry point bundled to `dist/post.js`
+2. `action.yaml` includes `runs.post: dist/post.js`
+3. Post-hook saves cache idempotently (never fails job)
+4. Post-hook runs even on main action failure/timeout
+
 **Core Functionality**
 
 1. Cache restore/save for OpenCode storage
@@ -811,10 +904,10 @@ export async function executeOpenCode(
 2. Corruption detection
 3. Concurrency handling (last-write-wins)
 4. Storage versioning
-5. Pull request review comment support
-6. Session sharing
-7. Automatic branch management
-8. Event streaming and progress logging
+5. Session sharing
+6. Automatic branch management
+7. Event streaming and progress logging
+8. Setup action consolidation
 
 ### P2 (Nice to Have)
 

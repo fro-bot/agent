@@ -1,8 +1,8 @@
 # Features: Fro Bot Agent
 
 **Extracted from:** PRD.md
-**Date:** 2026-01-10
-**Version:** v1.1 MVP
+**Date:** 2026-01-14
+**Version:** v1.2 MVP
 
 ---
 
@@ -20,6 +20,7 @@
 - [Category H: Observability & Auditability](#category-h-observability--auditability)
 - [Category I: Error Handling & Reliability](#category-i-error-handling--reliability)
 - [Category J: Configuration & Deployment](#category-j-configuration--deployment)
+- [Category K: Additional Triggers & Directives](#category-k-additional-triggers--directives)
 - [Dependency Graph](#dependency-graph)
 
 ---
@@ -29,6 +30,8 @@
 Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
 
 **Core Differentiator:** Durable memory across runs - OpenCode session/application state is restored at start and saved at end, enabling the agent to pick up work without repeating expensive investigation.
+
+**v1.2 Changes:** Additional GitHub triggers (`issues`, `pull_request`, `pull_request_review_comment`, `schedule`), trigger-specific prompt directives, post-action cache hook for reliable state persistence, prompt input required for scheduled/manual triggers.
 
 **v1.1 Changes:** SDK-based execution replaces CLI, GraphQL context hydration, file attachment support, explicit model/agent configuration, mock event support for local testing.
 
@@ -44,22 +47,23 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 
 | Priority             | Count | Categories                                     |
 | -------------------- | ----- | ---------------------------------------------- |
-| **Must Have (P0)**   | 44    | Core functionality for MVP                     |
+| **Must Have (P0)**   | 52    | Core functionality for MVP                     |
 | **Should Have (P1)** | 12    | Important but not critical for initial release |
 | **Could Have (P2)**  | 2     | Desirable, can be deferred                     |
 
-| Category                     | Feature Count |
-| ---------------------------- | ------------- |
-| GitHub Agent Interactions    | 11            |
-| Discord Agent                | 5             |
-| Shared Memory & Persistence  | 8             |
-| Setup Action & Bootstrap     | 7             |
-| SDK Execution (NEW)          | 6             |
-| Context & Prompt (NEW)       | 8             |
-| Security & Access Control    | 5             |
-| Observability & Auditability | 4             |
-| Error Handling & Reliability | 4             |
-| Configuration & Deployment   | 4             |
+| Category                         | Feature Count |
+| -------------------------------- | ------------- |
+| GitHub Agent Interactions        | 11            |
+| Discord Agent                    | 5             |
+| Shared Memory & Persistence      | 8             |
+| Setup Action & Bootstrap         | 7             |
+| SDK Execution                    | 6             |
+| Context & Prompt                 | 8             |
+| Security & Access Control        | 5             |
+| Observability & Auditability     | 4             |
+| Error Handling & Reliability     | 4             |
+| Configuration & Deployment       | 4             |
+| Additional Triggers & Directives | 8             |
 
 ---
 
@@ -72,11 +76,29 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 **Dependencies:** None
 
 **Description:**
-The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting oMo/Sisyphus-style triggers.
+The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting oMo/Sisyphus-style triggers with expanded event support.
+
+**Core Triggers:**
+| Event                         | Supported Actions                   | Prompt Requirement            | Scope      |
+| ----------------------------- | ----------------------------------- | ----------------------------- | ---------- |
+| `issue_comment`               | `created`                           | Optional (uses comment body)  | Issue/PR   |
+| `discussion_comment`          | `created`                           | Optional (uses comment body)  | Discussion |
+| `workflow_dispatch`           | -                                   | **Required**                  | Repo       |
+| `schedule`                    | -                                   | **Required**                  | Repo       |
+| `issues`                      | `opened`, `edited` (with @mention)  | Optional (defaults to triage) | Issue      |
+| `pull_request`                | `opened`, `synchronize`, `reopened` | Optional (defaults to review) | PR         |
+| `pull_request_review_comment` | `created`                           | Optional (uses comment body)  | PR Review  |
 
 **Acceptance Criteria:**
 - [ ] Supports `workflow_dispatch` for manual invocation
 - [ ] Supports `issue_comment` `created` as primary trigger for Issues and PRs
+- [ ] Supports `schedule` event with required `prompt` input
+- [ ] Supports `issues` event with `opened` action (auto-triage)
+- [ ] Supports `issues.edited` only when `@fro-bot` mentioned in body
+- [ ] Supports `pull_request` event with `opened`, `synchronize`, `reopened` actions
+- [ ] Supports `pull_request_review_comment` with `created` action
+- [ ] Skips draft PRs by default (configurable)
+- [ ] Hard fails if `prompt` is empty for `schedule`/`workflow_dispatch`
 - [ ] Runtime detection distinguishes Issue vs PR context
 - [ ] Supports `discussion` with `types: [created]` (document gaps as known limitations)
 - [ ] Action invocable via `uses: fro-bot/agent@v0`
@@ -84,6 +106,7 @@ The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting 
 **Technical Considerations:**
 - Must detect fork PRs at runtime to apply security gates
 - Event context parsing from `github.event.*` payloads
+- Trigger-specific prompt directives (see F69)
 
 ---
 
@@ -1206,20 +1229,16 @@ Documented procedure for handling breaking storage changes.
 
 ## P1 Additional Features (Should Have)
 
-### F63: Pull Request Review Comment Support
+### F63: Pull Request Review Comment Support (SUPERSEDED - See F73)
 
-**Priority:** Should Have (P1)
+**Priority:** ~~Should Have (P1)~~ → **Elevated to P0 as F73 in v1.2**
 **Complexity:** Medium
 **Dependencies:** F5
 
 **Description:**
 Handle `pull_request_review_comment` event type for inline code review responses.
 
-**Acceptance Criteria:**
-- [ ] Handle `pull_request_review_comment` event type
-- [ ] Extract inline context: file path, line number, diff hunk, commit ID
-- [ ] Include in prompt as `<review_comment_context>` block
-- [ ] Agent can respond with targeted fixes to the specific code location
+> **Note:** This feature has been elevated to P0 and is now tracked as **F73** in Category K.
 
 ---
 
@@ -1310,68 +1329,273 @@ Support additional scoping (repo-only vs org-wide) as configurable.
 
 ---
 
+## Category K: Additional Triggers & Directives
+
+### F69: Trigger-Specific Prompt Directives
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F1, F45
+
+**Description:**
+Each trigger type injects a default task directive into the agent prompt via `getTriggerDirective()` function.
+
+**Directive by Trigger Type:**
+| Trigger | Default Directive | Notes |
+| --- | --- | --- |
+| `issue_comment` | "Respond to the comment above" | Uses comment body as instruction |
+| `discussion_comment` | "Respond to the discussion comment above" | Similar to issue_comment |
+| `pull_request_review_comment` | "Respond to the review comment with file and code context" | Includes file path, line number, diff hunk |
+| `issues` (opened) | "Triage this issue: summarize, reproduce if possible, propose next steps" | Automated triage behavior |
+| `issues` (edited with @mention) | "Respond to the mention in this issue" | Only when @fro-bot mentioned |
+| `pull_request` (opened/synchronize) | "Review this pull request for code quality, potential bugs, and improvements" | Default review behavior |
+| `schedule` | (uses `prompt` input directly) | No default - prompt required |
+| `workflow_dispatch` | (uses `prompt` input directly) | No default - prompt required |
+
+**Acceptance Criteria:**
+- [ ] `getTriggerDirective(triggerContext, inputs)` function in `src/lib/agent/prompt.ts`
+- [ ] Returns 5-20 lines of task-specific instructions
+- [ ] Custom `prompt` input **appends** to directive for comment-based triggers
+- [ ] Custom `prompt` input **replaces** directive for `schedule`/`workflow_dispatch`
+
+---
+
+### F70: Issues Event Trigger
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F1, F69
+
+**Description:**
+Support `issues` event for automated triage when issues are opened or edited.
+
+**Acceptance Criteria:**
+- [ ] Handle `issues` event with `opened` action
+- [ ] Handle `issues.edited` only when `@fro-bot` mentioned in body
+- [ ] Skip `issues.edited` without @mention (no response, log only)
+- [ ] Default directive: triage behavior (summarize, reproduce, propose)
+- [ ] Inject full issue body and recent comments as context
+
+---
+
+### F71: Pull Request Event Trigger
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F1, F69
+
+**Description:**
+Support `pull_request` event for automated code review.
+
+**Acceptance Criteria:**
+- [ ] Handle `pull_request` event with `opened`, `synchronize`, `reopened` actions
+- [ ] Skip draft PRs by default (configurable via input)
+- [ ] Default directive: review behavior (code quality, bugs, improvements)
+- [ ] Inject commit summary, changed files list, existing review comments
+- [ ] Context includes PR diff and file changes
+
+---
+
+### F72: Schedule Event Trigger
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F1, F69
+
+**Description:**
+Support `schedule` event for cron-based agent invocation.
+
+**Acceptance Criteria:**
+- [ ] Handle `schedule` event
+- [ ] **Hard fail** if `inputs.prompt` is empty
+- [ ] Uses `prompt` input directly (no default directive)
+- [ ] Log scheduled task execution in run summary
+
+---
+
+### F73: Pull Request Review Comment Trigger (Elevated from P1)
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F5, F69
+
+**Description:**
+Handle `pull_request_review_comment` event type for inline code review responses. Elevated from P1 (F63) to P0 in v1.2.
+
+**Acceptance Criteria:**
+- [ ] Handle `pull_request_review_comment` event with `created` action
+- [ ] Extract inline context: file path (`path`), line number (`line`, `original_line`)
+- [ ] Extract diff hunk (`diff_hunk`) and commit ID (`commit_id`)
+- [ ] Include in prompt as `<review_comment_context>` block
+- [ ] Agent can respond with targeted fixes to the specific code location
+- [ ] Default directive: "Respond to the review comment with file and code context"
+
+---
+
+### F74: Post-Action Cache Hook
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F18
+
+**Description:**
+Reliable cache saving via GitHub Actions `post:` field, independent of main action lifecycle.
+
+**Acceptance Criteria:**
+- [ ] Add `src/post.ts` entry point
+- [ ] Update `action.yaml` with `runs.post: dist/post.js`
+- [ ] Post-hook saves cache idempotently (best-effort)
+- [ ] Post-hook runs session pruning (optional, non-fatal)
+- [ ] **MUST NOT** fail the job if cache save fails
+- [ ] Post-hook runs even on main action failure/timeout/cancellation
+
+**Technical Considerations:**
+- GitHub Actions `post:` runs in separate process, providing durability
+- Current `finally` block cleanup can miss on hard kills (SIGKILL)
+- Update `tsdown.config.ts` to bundle `post.ts` as third entry point
+- Produces `dist/main.js`, `dist/setup.js`, `dist/post.js`
+
+---
+
+### F75: Prompt Input Required Validation
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F1, F69
+
+**Description:**
+Validate that `prompt` input is provided for triggers that require it.
+
+**Acceptance Criteria:**
+- [ ] `schedule` event: hard fail if `inputs.prompt` is empty
+- [ ] `workflow_dispatch` event: hard fail if `inputs.prompt` is empty
+- [ ] Error message clearly states that prompt is required
+- [ ] Validation runs before agent execution begins
+
+---
+
+### F76: Draft PR Skip
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F71
+
+**Description:**
+Skip processing of draft PRs by default.
+
+**Acceptance Criteria:**
+- [ ] Detect draft PR status from `pull_request.draft` field
+- [ ] Skip processing if PR is draft (default behavior)
+- [ ] Configurable via action input to allow draft PR processing
+- [ ] Log skip reason when draft PR is skipped
+
+---
+
 ## Dependency Graph
 
 ```
-F1 (Triggers)
-├── F2 (Issue Comments)
-├── F3 (Discussion Comments) ──── F42/F43 (GraphQL)
-├── F4 (PR Comments)
-│   └── F5 (PR Review Comments)
-├── F6 (Push Commits) ──────┐
-│   └── F7 (Open PRs)       │
-├── F8 (Idempotency)        │
-├── F9 (Anti-Loop)          │
-├── F10 (Reactions/Labels)  │
-├── F11 (Issue/PR Detection)│
-└── F38 (Mock Events)       │
-                            │
-F25 (Setup Action) ─────────┤
-├── F26 (OpenCode Install)  │
-│   └── F27 (oMo Install)   │
-│       └── F32 (SDK Exec)  │
-│           ├── F33 (Events)│
-│           ├── F34 (Complete)
-│           ├── F35 (Timeout)│
-│           ├── F36 (Cleanup)│
-│           └── F37 (Model)  │
-├── F28 (gh Auth)           │
-├── F29 (Git Identity)      │
-├── F30 (auth.json)         │
-└── F31 (Cache Restore)     │
-                            │
-F17 (Cache Restore) ◄───────┤
-├── F18 (Cache Save)        │
-│   └── F20 (S3 Backup)     │
-├── F19 (Session Search)    │
-├── F21 (Writeback)         │
-├── F22 (Pruning)           │
-├── F23 (Versioning)        │
-├── F24 (Corruption)        │
-└── F49 (Branch Scope)      │
-                            │
-F39 (Attach Detect) ────────┤
-├── F40 (Attach Download)   │
-│   └── F41 (Attach Inject) │
-                            │
-F42 (GraphQL Issue) ────────┤
-├── F43 (GraphQL PR)        │
-│   └── F44 (Budgeting)     │
-│       └── F45 (Prompt)    │
-                            │
-F12 (Channel Mapping) ──────┤
-├── F13 (Thread Mapping)    │
-├── F15 (Shared Memory) ◄───┘
-└── F16 (Permissions)
-F14 (Daemon) ───────────────┐
-├── F15 (Shared Memory)     │
-└── F58 (Discord Errors)    │
-                            │
-F46 (auth.json) ◄───────────┘
-F47 (Fork PR Gating)
-F48 (Credential Strategy)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           GITHUB ACTION LAYER                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  F1 (Triggers) ─────────────────────────────────────────────────────────┐   │
+│  ├── F2 (Issue Comments)                                                │   │
+│  ├── F3 (Discussion Comments)                                           │   │
+│  ├── F4 (PR Comments)                                                   │   │
+│  │   └── F5 (PR Review Comments)                                        │   │
+│  ├── F6 (Push Commits)                                                  │   │
+│  │   └── F7 (Open PRs)                                                  │   │
+│  ├── F8 (Idempotency)                                                   │   │
+│  ├── F9 (Anti-Loop)                                                     │   │
+│  ├── F10 (Reactions/Labels)                                             │   │
+│  ├── F11 (Issue/PR Detection)                                           │   │
+│  ├── F38 (Mock Events)                                                  │   │
+│  │                                                                      │   │
+│  └── F69 (Trigger Directives) ◄─────────────────────────────────────┐   │   │
+│      ├── F70 (Issues Event)                                         │   │   │
+│      │   └── responds to: opened, edited (with @mention)            │   │   │
+│      ├── F71 (PR Event)                                             │   │   │
+│      │   └── F76 (Draft PR Skip)                                    │   │   │
+│      ├── F72 (Schedule Event)                                       │   │   │
+│      │   └── F75 (Prompt Required Validation)                       │   │   │
+│      └── F73 (PR Review Comment)                                    │   │   │
+│                                                                     │   │   │
+├─────────────────────────────────────────────────────────────────────┼───┼───┤
+│                           SETUP & EXECUTION                         │   │   │
+├─────────────────────────────────────────────────────────────────────┼───┼───┤
+│                                                                     │   │   │
+│  F25 (Setup Action) ────────────────────────────────────────────────┤   │   │
+│  ├── F26 (OpenCode Install)                                         │   │   │
+│  │   └── F27 (oMo Install)                                          │   │   │
+│  │       └── F32 (SDK Exec) ────────────────────────────────────┐   │   │   │
+│  │           ├── F33 (Event Subscription)                       │   │   │   │
+│  │           ├── F34 (Completion Detection)                     │   │   │   │
+│  │           ├── F35 (Timeout/Cancellation)                     │   │   │   │
+│  │           ├── F36 (SDK Cleanup)                              │   │   │   │
+│  │           └── F37 (Model/Agent Config)                       │   │   │   │
+│  ├── F28 (gh CLI Auth)                                          │   │   │   │
+│  ├── F29 (Git Identity)                                         │   │   │   │
+│  ├── F30 (auth.json Population)                                 │   │   │   │
+│  └── F31 (Cache Restore in Setup)                               │   │   │   │
+│                                                                 │   │   │   │
+├─────────────────────────────────────────────────────────────────┼───┼───┼───┤
+│                           PERSISTENCE LAYER                     │   │   │   │
+├─────────────────────────────────────────────────────────────────┼───┼───┼───┤
+│                                                                 │   │   │   │
+│  F17 (Cache Restore) ◄──────────────────────────────────────────┘   │   │   │
+│  ├── F18 (Cache Save) ──────────────────────────────────────────────┤   │   │
+│  │   ├── F20 (S3 Write-Through Backup)                              │   │   │
+│  │   └── F74 (Post-Action Hook) ◄───────────────────────────────────┘   │   │
+│  │       └── reliable save via runs.post, survives timeout/kill        │   │
+│  ├── F19 (Session Search on Startup)                                    │   │
+│  ├── F21 (Close-the-Loop Writeback)                                     │   │
+│  ├── F22 (Session Pruning)                                              │   │
+│  ├── F23 (Storage Versioning)                                           │   │
+│  ├── F24 (Corruption Detection)                                         │   │
+│  └── F49 (Branch-Scoped Caching)                                        │   │
+│                                                                         │   │
+├─────────────────────────────────────────────────────────────────────────┼───┤
+│                           CONTEXT HYDRATION                             │   │
+├─────────────────────────────────────────────────────────────────────────┼───┤
+│                                                                         │   │
+│  F39 (Attachment Detection) ────────────────────────────────────────────┤   │
+│  ├── F40 (Attachment Download)                                          │   │
+│  │   └── F41 (Attachment Prompt Injection)                              │   │
+│                                                                         │   │
+│  F42 (GraphQL Issue Context) ───────────────────────────────────────────┤   │
+│  ├── F43 (GraphQL PR Context)                                           │   │
+│  │   └── F44 (Context Budgeting)                                        │   │
+│  │       └── F45 (Agent Prompt Construction) ◄──────────────────────────┘   │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                           SECURITY & ACCESS                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  F46 (auth.json Exclusion from Cache)                                       │
+│  F47 (Fork PR Permission Gating)                                            │
+│  F48 (Credential Strategy: App Token / PAT / GITHUB_TOKEN)                  │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                           DISCORD LAYER (Future)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  F12 (Channel-Repo Mapping) ────────────────────────────────────────────┐   │
+│  ├── F13 (Thread-Session Mapping)                                       │   │
+│  ├── F15 (Shared Memory with GitHub) ◄──────────────────────────────────┘   │
+│  └── F16 (Discord Permissions)                                              │
+│                                                                             │
+│  F14 (Discord Daemon) ──────────────────────────────────────────────────┐   │
+│  ├── F15 (Shared Memory)                                                │   │
+│  └── F58 (Discord API Error Handling)                                   │   │
+│                                                                         │   │
+└─────────────────────────────────────────────────────────────────────────┴───┘
+
+Legend:
+  ├──            = depends on / child of
+  └──            = last child
+  ◄──────────────= dependency arrow
 ```
 
 ---
 
-*This document is auto-generated from PRD.md v1.1 and should be updated when the PRD changes.*
+*This document is auto-generated from PRD.md v1.2 and should be updated when the PRD changes.*

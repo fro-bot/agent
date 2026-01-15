@@ -1,6 +1,8 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-12 **Total RFCs:** 15 **Implementation Strategy:** Sequential (RFC-001 → RFC-013)
+**Generated:** 2026-01-14
+**Total RFCs:** 17
+**Implementation Strategy:** Sequential (RFC-001 → RFC-017)
 
 ---
 
@@ -31,6 +33,8 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
 | RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Pending    |
 | RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Pending    |
+| RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Pending    |
+| RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Pending    |
 
 ---
 
@@ -51,11 +55,15 @@ RFC-001 (Foundation)
     │
     ├── RFC-002 (Cache) ──────────────┐ │
     │       │                         │ │
-    │       └── RFC-004 (Sessions) ───┼─┼── RFC-007 (Observability)
+    │       ├── RFC-004 (Sessions) ───┼─┼── RFC-007 (Observability)
+    │       │                         │ │
+    │       └── RFC-017 (Post-Action Cache Hook) ─── [Reliable cache save]
     │                                 │ │
     ├── RFC-003 (GitHub Client) ──────┤ │
     │       │                         │ │
     │       ├── RFC-005 (Triggers) ───┤ │
+    │       │       │                 │ │
+    │       │       ├── RFC-016 (Additional Triggers) ─── [issues, PR, schedule]
     │       │       │                 │ │
     │       │       └── RFC-006 (Security)
     │       │               │
@@ -113,8 +121,10 @@ RFC-001 (Foundation)
 | RFC-007 | Run summary, job summary, metrics                  | 6-9 hours        |
 | RFC-014 | File attachment processing                         | 9-12 hours       |
 | RFC-015 | GraphQL context hydration                          | 14-20 hours      |
+| RFC-016 | Additional triggers, directives                    | 12-18 hours      |
+| RFC-017 | Post-action cache hook                             | 6-9 hours        |
 
-**Phase 2 Total:** ~52-73 hours
+**Phase 2 Total:** ~70-100 hours
 
 **Milestone:** Agent can detect events, check permissions, search prior sessions, report summaries, process file attachments, and hydrate full issue/PR context via GraphQL.
 
@@ -141,9 +151,9 @@ RFC-001 (Foundation)
 | Phase     | Effort Range      |
 | --------- | ----------------- |
 | Phase 1   | 69-92 hours       |
-| Phase 2   | 52-73 hours       |
+| Phase 2   | 70-100 hours      |
 | Phase 3   | 33-42 hours       |
-| **Total** | **154-207 hours** |
+| **Total** | **172-234 hours** |
 
 ---
 
@@ -172,70 +182,78 @@ RFC-001 (Foundation)
 
 ### P0 Features (Must-Have)
 
-| Feature                                | RFC              | Status    |
-| -------------------------------------- | ---------------- | --------- |
-| F1: GitHub Action Triggers             | RFC-005          | Completed |
-| F2: Issue Comment Interaction          | RFC-008          | Pending   |
-| F3: Discussion Comment Interaction     | RFC-008          | Pending   |
-| F4: PR Conversation Comments           | RFC-008          | Pending   |
-| F5: PR Review Comments                 | RFC-009          | Pending   |
-| F6: Delegated Work - Push Commits      | RFC-010          | Pending   |
-| F7: Delegated Work - Open PRs          | RFC-010          | Pending   |
-| F8: Comment Idempotency                | RFC-008          | Pending   |
-| F9: Anti-Loop Protection               | RFC-005          | Completed |
-| F10: Reactions & Labels Acknowledgment | RFC-013          | Completed |
-| F11: Issue vs PR Context Detection     | RFC-013          | Completed |
-| F17: OpenCode Storage Cache Restore    | RFC-002          | Pending   |
-| F18: OpenCode Storage Cache Save       | RFC-002          | Pending   |
-| F19: Session Search on Startup         | RFC-004          | Pending   |
-| F21: Close-the-Loop Session Writeback  | RFC-004          | Pending   |
-| F22: Session Pruning                   | RFC-004          | Pending   |
-| F25: Setup Action Entrypoint           | RFC-011          | Pending   |
-| F26: OpenCode CLI Installation         | RFC-011          | Pending   |
-| F27: oMo Plugin Installation           | RFC-011          | Pending   |
-| F28: GitHub CLI Authentication         | RFC-011          | Pending   |
-| F29: Git Identity Configuration        | RFC-011          | Pending   |
-| F30: auth.json Population              | RFC-011          | Pending   |
-| F31: Cache Restoration in Setup        | RFC-011          | Pending   |
-| F32: SDK-Based Agent Execution         | RFC-013          | Completed |
-| F33: Event Subscription and Processing | RFC-013          | Completed |
-| F34: Completion Detection              | RFC-013          | Completed |
-| F35: Timeout and Cancellation          | RFC-013          | Completed |
-| F36: SDK Cleanup                       | RFC-013          | Completed |
-| F37: Model and Agent Configuration     | RFC-013          | Completed |
-| F38: Mock Event Support                | RFC-005          | Completed |
-| F39: File Attachment Detection         | RFC-014          | Pending   |
-| F40: File Attachment Download          | RFC-014          | Pending   |
-| F41: File Attachment Prompt Injection  | RFC-014          | Pending   |
-| F42: GraphQL Issue Context Hydration   | RFC-015          | Pending   |
-| F43: GraphQL PR Context Hydration      | RFC-015          | Pending   |
-| F44: Context Budgeting                 | RFC-015          | Pending   |
-| F45: Agent Prompt Construction         | RFC-013          | Completed |
-| F46: auth.json Exclusion               | RFC-002, RFC-006 | Pending   |
-| F47: Fork PR Permission Gating         | RFC-006          | Pending   |
-| F48: Credential Strategy               | RFC-003, RFC-006 | Pending   |
-| F49: Branch-Scoped Caching             | RFC-002          | Pending   |
-| F51: Run Summary in Comments           | RFC-007          | Pending   |
-| F52: GitHub Actions Job Summary        | RFC-007          | Pending   |
-| F53: Structured Logging                | RFC-001, RFC-007 | Pending   |
-| F54: Token Usage Reporting             | RFC-007          | Pending   |
-| F55: Error Message Format              | RFC-008          | Pending   |
-| F56: GitHub API Rate Limit Handling    | RFC-007          | Pending   |
-| F57: LLM API Error Handling            | RFC-007          | Pending   |
-| F59: Action Inputs Configuration       | RFC-001, RFC-011 | Pending   |
+| Feature                                 | RFC              | Status    |
+| --------------------------------------- | ---------------- | --------- |
+| F1: GitHub Action Triggers              | RFC-005, RFC-016 | Completed |
+| F2: Issue Comment Interaction           | RFC-008          | Pending   |
+| F3: Discussion Comment Interaction      | RFC-008          | Pending   |
+| F4: PR Conversation Comments            | RFC-008          | Pending   |
+| F5: PR Review Comments                  | RFC-009          | Pending   |
+| F6: Delegated Work - Push Commits       | RFC-010          | Pending   |
+| F7: Delegated Work - Open PRs           | RFC-010          | Pending   |
+| F8: Comment Idempotency                 | RFC-008          | Pending   |
+| F9: Anti-Loop Protection                | RFC-005          | Completed |
+| F10: Reactions & Labels Acknowledgment  | RFC-013          | Completed |
+| F11: Issue vs PR Context Detection      | RFC-013          | Completed |
+| F17: OpenCode Storage Cache Restore     | RFC-002          | Pending   |
+| F18: OpenCode Storage Cache Save        | RFC-002          | Pending   |
+| F19: Session Search on Startup          | RFC-004          | Pending   |
+| F21: Close-the-Loop Session Writeback   | RFC-004          | Pending   |
+| F22: Session Pruning                    | RFC-004          | Pending   |
+| F25: Setup Action Entrypoint            | RFC-011          | Pending   |
+| F26: OpenCode CLI Installation          | RFC-011          | Pending   |
+| F27: oMo Plugin Installation            | RFC-011          | Pending   |
+| F28: GitHub CLI Authentication          | RFC-011          | Pending   |
+| F29: Git Identity Configuration         | RFC-011          | Pending   |
+| F30: auth.json Population               | RFC-011          | Pending   |
+| F31: Cache Restoration in Setup         | RFC-011          | Pending   |
+| F32: SDK-Based Agent Execution          | RFC-013          | Completed |
+| F33: Event Subscription and Processing  | RFC-013          | Completed |
+| F34: Completion Detection               | RFC-013          | Completed |
+| F35: Timeout and Cancellation           | RFC-013          | Completed |
+| F36: SDK Cleanup                        | RFC-013          | Completed |
+| F37: Model and Agent Configuration      | RFC-013          | Completed |
+| F38: Mock Event Support                 | RFC-005          | Completed |
+| F39: File Attachment Detection          | RFC-014          | Pending   |
+| F40: File Attachment Download           | RFC-014          | Pending   |
+| F41: File Attachment Prompt Injection   | RFC-014          | Pending   |
+| F42: GraphQL Issue Context Hydration    | RFC-015          | Pending   |
+| F43: GraphQL PR Context Hydration       | RFC-015          | Pending   |
+| F44: Context Budgeting                  | RFC-015          | Pending   |
+| F45: Agent Prompt Construction          | RFC-013          | Completed |
+| F46: auth.json Exclusion                | RFC-002, RFC-006 | Pending   |
+| F47: Fork PR Permission Gating          | RFC-006          | Pending   |
+| F48: Credential Strategy                | RFC-003, RFC-006 | Pending   |
+| F49: Branch-Scoped Caching              | RFC-002          | Pending   |
+| F51: Run Summary in Comments            | RFC-007          | Pending   |
+| F52: GitHub Actions Job Summary         | RFC-007          | Pending   |
+| F53: Structured Logging                 | RFC-001, RFC-007 | Pending   |
+| F54: Token Usage Reporting              | RFC-007          | Pending   |
+| F55: Error Message Format               | RFC-008          | Pending   |
+| F56: GitHub API Rate Limit Handling     | RFC-007          | Pending   |
+| F57: LLM API Error Handling             | RFC-007          | Pending   |
+| F59: Action Inputs Configuration        | RFC-001, RFC-011 | Pending   |
+| F69: Trigger-Specific Prompt Directives | RFC-016          | Pending   |
+| F70: Issues Event Trigger               | RFC-016          | Pending   |
+| F71: Pull Request Event Trigger         | RFC-016          | Pending   |
+| F72: Schedule Event Trigger             | RFC-016          | Pending   |
+| F73: Pull Request Review Comment        | RFC-016          | Pending   |
+| F74: Post-Action Cache Hook             | RFC-017          | Pending   |
+| F75: Prompt Input Required Validation   | RFC-016          | Pending   |
+| F76: Draft PR Skip                      | RFC-016          | Pending   |
 
 ### P1 Features (Should-Have) - Future RFCs
 
-| Feature                                | Description                        | Notes                |
-| -------------------------------------- | ---------------------------------- | -------------------- |
-| F20: S3 Write-Through Backup           | Cross-runner persistence           | Partially in RFC-002 |
-| F23: Storage Versioning                | Version marker in storage          | Partially in RFC-002 |
-| F24: Corruption Detection              | Detect & handle corruption         | Partially in RFC-002 |
-| F50: Concurrency Handling              | Last-write-wins + warning          | Future RFC           |
-| F63: Pull Request Review Comment       | Handle inline review comment event | Future RFC           |
-| F64: Session Sharing                   | Public session share links         | Future RFC           |
-| F65: Automatic Branch Management       | Branch creation workflows          | Future RFC           |
-| F66: Event Streaming and Progress Logs | Real-time agent progress logging   | Future RFC           |
+| Feature                                | Description                      | Notes                            |
+| -------------------------------------- | -------------------------------- | -------------------------------- |
+| F20: S3 Write-Through Backup           | Cross-runner persistence         | Partially in RFC-002             |
+| F23: Storage Versioning                | Version marker in storage        | Partially in RFC-002             |
+| F24: Corruption Detection              | Detect & handle corruption       | Partially in RFC-002             |
+| F50: Concurrency Handling              | Last-write-wins + warning        | Future RFC                       |
+| ~~F63: Pull Request Review Comment~~   | ~~Handle inline review comment~~ | **ELEVATED to P0 as F73 (v1.2)** |
+| F64: Session Sharing                   | Public session share links       | Future RFC                       |
+| F65: Automatic Branch Management       | Branch creation workflows        | Future RFC                       |
+| F66: Event Streaming and Progress Logs | Real-time agent progress logging | Future RFC                       |
 
 ### P2 Features (Nice-to-Have) - Future RFCs
 
