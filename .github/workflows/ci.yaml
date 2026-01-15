@@ -158,7 +158,7 @@ jobs:
         uses: ./setup/
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
-          auth-json: '{"test":{"type":"api","key":"test-key"}}'
+          auth-json: ${{ secrets.AUTH_JSON }}
           opencode-version: latest
 
       - if: always()
@@ -186,7 +186,7 @@ jobs:
           SKIP_AGENT_EXECUTION: 'false'
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
-          auth-json: '{"test":{"type":"api","key":"test-key"}}'
+          auth-json: ${{ secrets.AUTH_JSON }}
 
       - if: always()
         name: Introspect main action execution
