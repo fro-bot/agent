@@ -1,12 +1,13 @@
 # Product Requirements Document (PRD): Fro Bot Agent Harness
 
-**Version:** 1.1
-**Last Updated:** 2026-01-10
+**Version:** 1.2
+**Last Updated:** 2026-01-14
 
 ### Version History
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.2 | 2026-01-14 | Additional GitHub triggers (`issues`, `pull_request`, `pull_request_review_comment`, `schedule`), trigger-specific prompt directives, post-action cache hook, prompt input required for scheduled/manual triggers |
 | 1.1 | 2026-01-10 | SDK execution model (replaces CLI), GraphQL context hydration, file attachments, model/agent config, mock event support, enhanced prompt construction |
 | 1.0 | 2026-01-02 | Initial PRD |
 
@@ -151,9 +152,25 @@ Fro Bot addresses this by:
 
 1. **Triggers / entrypoints**
    - The product ships as a **TypeScript GitHub Action** (Node.js 24 runtime) with one or more entrypoints (e.g. `uses: fro-bot/agent`, `uses: fro-bot/agent/setup`), not as a reusable workflow.
-   - v1 must support the oMo/Sisyphus-style **mention-driven** and **manual** flows:
-     - `workflow_dispatch` for manual invocation.
-     - `issue_comment` `created` as the primary trigger surface for Issues and PRs (including fork PRs), with runtime detection of Issue vs PR.
+   - **Core triggers (v1):**
+
+     | Event | Supported Actions | Prompt Requirement | Scope |
+     | --- | --- | --- | --- |
+     | `issue_comment` | `created` | Optional (uses comment body) | Issue/PR |
+     | `discussion_comment` | `created` | Optional (uses comment body) | Discussion |
+     | `workflow_dispatch` | - | **Required** | Repo |
+     | `schedule` | - | **Required** | Repo |
+     | `issues` | `opened`, `edited` (with @mention) | Optional (defaults to triage) | Issue |
+     | `pull_request` | `opened`, `synchronize`, `reopened` | Optional (defaults to review) | PR |
+     | `pull_request_review_comment` | `created` | Optional (uses comment body) | PR Review |
+
+   - **Skip conditions:**
+     - `issues.edited`: Skip unless comment body contains `@fro-bot` mention.
+     - `pull_request`: Skip draft PRs by default (configurable).
+     - `schedule`/`workflow_dispatch`: Hard fail if `inputs.prompt` is empty.
+   - **Trigger-specific prompt directives:**
+     - Each trigger type injects a default task directive (e.g., "review this PR", "triage this issue").
+     - Custom `prompt` input overrides the default directive.
    - v1 should also support Discussions where feasible (e.g., `discussion` with `types: [created]` on comments), but any gap must be documented as a known limitation until implemented.
 
 2. **Supported surfaces**
@@ -520,6 +537,60 @@ The agent prompt must include sufficient context and instructions for GitHub ope
    - Use `session_read` when prior work found.
    - Leave searchable summary before completing.
 
+#### L. Trigger-Specific Prompt Directives (P0)
+
+Each trigger type injects a default task directive into the agent prompt. The `getTriggerDirective()` function returns trigger-appropriate instructions that can be overridden by custom `prompt` input.
+
+1. **Directive by trigger type**
+
+   | Trigger | Default Directive | Notes |
+   | --- | --- | --- |
+   | `issue_comment` | "Respond to the comment above" | Uses comment body as instruction |
+   | `discussion_comment` | "Respond to the discussion comment above" | Similar to issue_comment |
+   | `pull_request_review_comment` | "Respond to the review comment with file and code context" | Includes file path, line number, diff hunk |
+   | `issues` (opened) | "Triage this issue: summarize, reproduce if possible, propose next steps" | Automated triage behavior |
+   | `issues` (edited with @mention) | "Respond to the mention in this issue" | Only when @fro-bot mentioned |
+   | `pull_request` (opened/synchronize) | "Review this pull request for code quality, potential bugs, and improvements" | Default review behavior |
+   | `schedule` | (uses `prompt` input directly) | No default - prompt required |
+   | `workflow_dispatch` | (uses `prompt` input directly) | No default - prompt required |
+
+2. **Context injection per trigger**
+   - `pull_request_review_comment`: Inject `<review_comment_context>` block with:
+     - File path (`path`)
+     - Line number (`line`, `original_line`)
+     - Diff hunk (`diff_hunk`)
+     - Commit ID (`commit_id`)
+   - `pull_request`: Inject commit summary, changed files list, existing review comments.
+   - `issues`: Inject full issue body and recent comments.
+
+3. **Prompt override behavior**
+   - Custom `prompt` input **appends** to trigger directive for comment-based triggers.
+   - Custom `prompt` input **replaces** directive for `schedule`/`workflow_dispatch`.
+
+4. **Implementation**
+   - Add `getTriggerDirective(triggerContext, inputs)` function in `src/lib/agent/prompt.ts`.
+   - Thin layer - returns 5-20 lines of task text, not a separate prompt builder.
+
+#### M. Post-Action Cache Hook (P0)
+
+Reliable cache saving via GitHub Actions `post:` field, independent of main action lifecycle.
+
+1. **Rationale**
+   - Current `finally` block cleanup can miss on hard kills (timeout, cancellation, SIGKILL).
+   - GitHub Actions `post:` runs in a separate process, providing durability.
+
+2. **Implementation**
+   - Add `src/post.ts` entry point.
+   - Update `action.yaml` with `runs.post: dist/post.js`.
+   - Post-hook responsibilities:
+     - Save cache (idempotent, best-effort).
+     - Session pruning (optional, non-fatal).
+   - **MUST NOT** fail the job if cache save fails.
+
+3. **Build impact**
+   - Update `tsdown.config.ts` to bundle `post.ts` as third entry point.
+   - Produces `dist/main.js`, `dist/setup.js`, `dist/post.js`.
+
 ### P1 (should-have)
 
 1. **Setup action refinements**
@@ -539,20 +610,14 @@ The agent prompt must include sufficient context and instructions for GitHub ope
    - Include a version marker in the storage directory.
    - On version mismatch: warn and proceed with clean state (do not fail).
 
-5. **Pull request review comment support**
-   - Handle `pull_request_review_comment` event type.
-   - Extract inline context: file path, line number, diff hunk, commit ID.
-   - Include in prompt as `<review_comment_context>` block.
-   - Agent can respond with targeted fixes to the specific code location.
-
-6. **Session sharing** (SDK mode)
+5. **Session sharing** (SDK mode)
    - Optional `share` input: `true`, `false`, or unset (auto).
    - Auto behavior: share for public repos, don't share for private.
    - Call `client.session.share({ path: session })` to create public link.
    - Include share link in comment footer with optional social card image.
    - Output `share-url` from action.
 
-7. **Automatic branch management**
+6. **Automatic branch management**
    - **Issue workflow**: Create new branch → make changes → push → create PR.
    - **Local PR workflow**: Checkout existing branch → make changes → push.
    - **Fork PR workflow**: Add fork remote → checkout → push to fork.
@@ -560,11 +625,16 @@ The agent prompt must include sufficient context and instructions for GitHub ope
    - Commit format with co-author attribution.
    - Dirty check: `git status --porcelain` before attempting push.
 
-8. **Event streaming and progress logging**
+7. **Event streaming and progress logging**
    - Subscribe to SSE events from OpenCode server.
    - Log tool calls with color-coded output (todo: yellow, bash: red, edit: green, etc.).
    - Log text completions when finished.
    - Track session state updates in real-time.
+
+8. **Setup action consolidation** (deferred from v1.2)
+   - Consolidate setup functionality into main action for simplified UX.
+   - Requires separate RFC with migration plan.
+   - Keep setup action for backwards compatibility.
 
 ### P2 (nice-to-have)
 
@@ -769,6 +839,25 @@ The agent prompt must include sufficient context and instructions for GitHub ope
 
 The MVP is considered complete when:
 
+**Additional Triggers (L)**
+
+- [ ] `issues` event supported with `opened` action (triage behavior).
+- [ ] `issues.edited` triggers only when `@fro-bot` mentioned in body.
+- [ ] `pull_request` event supported with `opened`, `synchronize`, `reopened` actions.
+- [ ] `pull_request` skips draft PRs by default.
+- [ ] `pull_request_review_comment` event supported with `created` action.
+- [ ] `schedule` event supported with required `prompt` input (hard fail if empty).
+- [ ] `workflow_dispatch` hard fails if `prompt` input is empty.
+- [ ] Each trigger type injects appropriate default directive via `getTriggerDirective()`.
+- [ ] Custom `prompt` input appends to (comment-based) or replaces (scheduled/manual) directive.
+
+**Post-Action Cache Hook (M)**
+
+- [ ] `src/post.ts` entry point exists and bundles to `dist/post.js`.
+- [ ] `action.yaml` includes `runs.post: dist/post.js`.
+- [ ] Post-hook saves cache idempotently (best-effort, never fails job).
+- [ ] Post-hook runs even on main action failure/timeout.
+
 **SDK Execution (F)**
 
 - [ ] Agent execution uses `@opencode-ai/sdk` with `createOpencode()` for server lifecycle.
@@ -858,27 +947,42 @@ The MVP is considered complete when:
      - Implement session pruning (default: 50 sessions or 30 days) in v1.
      - Emit storage size in run summary; warn when exceeding a configurable threshold.
 
-3. **@opencode-ai/sdk stability** (NEW)
+3. **@opencode-ai/sdk stability**
    - Risk: External SDK dependency with unknown API stability.
    - Mitigation:
      - Pin SDK version in package.json.
      - Comprehensive integration tests for SDK interactions.
      - Monitor SDK releases for breaking changes.
 
-4. **GraphQL rate limits** (NEW)
+4. **GraphQL rate limits**
    - Risk: Large PRs with many comments/files could hit rate limits.
    - Mitigation:
      - Implement pagination with limits (50 comments, 100 files).
      - Cache GraphQL responses within a run.
      - Fall back to REST API on GraphQL failure.
 
-5. **File attachment security** (NEW)
+5. **File attachment security**
    - Risk: Malicious attachments (malware, oversized files, unexpected MIME types).
    - Mitigation:
      - Strict URL allowlist (`github.com/user-attachments/` only).
      - Size limits (5MB per file, 15MB total).
      - MIME type validation.
      - Attachments never persisted to cache.
+
+6. **Noisy automated triggers** (NEW - v1.2)
+   - Risk: `issues` and `pull_request` events could trigger expensive/noisy runs on every edit.
+   - Mitigation:
+     - Constrain supported actions per trigger (see section A.1).
+     - Require @mention for `issues.edited`.
+     - Skip draft PRs by default.
+     - Clear documentation on which events/actions are handled.
+
+7. **Post-action hook reliability** (NEW - v1.2)
+   - Risk: Post-hook may still miss in extreme edge cases (runner crash).
+   - Mitigation:
+     - Post-hook is best-effort addition, not replacement for `finally` cleanup.
+     - S3 write-through provides additional durability layer.
+     - Monitor cache hit rates to detect issues.
 
 ---
 
