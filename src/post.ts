@@ -10,10 +10,9 @@
  * - Skip if main already saved cache (cacheSaved=true)
  * - NEVER call core.setFailed() - best-effort only
  */
-import type {CacheAdapter} from './lib/cache.js'
 import type {Logger} from './lib/logger.js'
 import * as core from '@actions/core'
-import {defaultCacheAdapter, saveCache} from './lib/cache.js'
+import {saveCache} from './lib/cache.js'
 import {createLogger} from './lib/logger.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {
@@ -27,12 +26,10 @@ import {
 
 export interface PostOptions {
   logger?: Logger
-  cacheAdapter?: CacheAdapter
 }
 
 export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
-  const cacheAdapter = options.cacheAdapter ?? defaultCacheAdapter
 
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
   const cacheSaved = core.getState(STATE_KEYS.CACHE_SAVED)
@@ -64,7 +61,6 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       logger,
       storagePath: getOpenCodeStoragePath(),
       authPath: getOpenCodeAuthPath(),
-      cacheAdapter,
     })
 
     if (saved) {

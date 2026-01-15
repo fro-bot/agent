@@ -1,4 +1,3 @@
-import type {CacheAdapter} from './lib/cache.js'
 import type {Logger} from './lib/logger.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -9,22 +8,20 @@ vi.mock('@actions/core', () => ({
   debug: vi.fn(),
 }))
 
+vi.mock('./lib/cache.js', async importOriginal => {
+  const original = await importOriginal<typeof import('./lib/cache.js')>()
+  return {
+    ...original,
+    saveCache: vi.fn(),
+  }
+})
+
 function createMockLogger(): Logger {
   return {
     info: vi.fn(),
     warning: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
-  }
-}
-
-function createMockCacheAdapter(options: {saveFails?: boolean} = {}): CacheAdapter {
-  return {
-    restoreCache: vi.fn().mockResolvedValue(undefined),
-    saveCache:
-      options.saveFails === true
-        ? vi.fn().mockRejectedValue(new Error('Cache save failed'))
-        : vi.fn().mockResolvedValue(1234),
   }
 }
 
@@ -56,11 +53,11 @@ describe('post action', () => {
 
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
-      const cacheAdapter = createMockCacheAdapter()
 
-      await runPost({logger, cacheAdapter})
+      await runPost({logger})
 
-      expect(cacheAdapter.saveCache).not.toHaveBeenCalled()
+      const {saveCache} = await import('./lib/cache.js')
+      expect(saveCache).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith('Skipping post-action: event was not processed', expect.any(Object))
     })
 
@@ -74,11 +71,11 @@ describe('post action', () => {
 
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
-      const cacheAdapter = createMockCacheAdapter()
 
-      await runPost({logger, cacheAdapter})
+      await runPost({logger})
 
-      expect(cacheAdapter.saveCache).not.toHaveBeenCalled()
+      const {saveCache} = await import('./lib/cache.js')
+      expect(saveCache).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith(
         'Skipping post-action: cache already saved by main action',
         expect.any(Object),
@@ -94,17 +91,43 @@ describe('post action', () => {
         return ''
       })
 
+      const {saveCache} = await import('./lib/cache.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
-      const cacheAdapter = createMockCacheAdapter()
 
-      await runPost({logger, cacheAdapter})
+      await runPost({logger})
 
-      expect(cacheAdapter.saveCache).toHaveBeenCalled()
+      expect(saveCache).toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
     })
 
-    it('should not fail job when cache save fails', async () => {
+    it('should log no content message when saveCache returns false', async () => {
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'false'
+        if (key === 'sessionId') return 'ses_123'
+        return ''
+      })
+
+      const {saveCache} = await import('./lib/cache.js')
+      vi.mocked(saveCache).mockResolvedValue(false)
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      await runPost({logger})
+
+      expect(saveCache).toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith(
+        'Post-action: no cache content to save',
+        expect.objectContaining({sessionId: 'ses_123'}),
+      )
+    })
+
+    it('should not fail job when cache save throws', async () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
         if (key === 'shouldSaveCache') return 'true'
@@ -112,15 +135,17 @@ describe('post action', () => {
         return ''
       })
 
+      const {saveCache} = await import('./lib/cache.js')
+      vi.mocked(saveCache).mockRejectedValue(new Error('Cache save failed'))
+
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
-      const cacheAdapter = createMockCacheAdapter({saveFails: true})
 
-      await expect(runPost({logger, cacheAdapter})).resolves.not.toThrow()
+      await expect(runPost({logger})).resolves.not.toThrow()
 
       expect(logger.warning).toHaveBeenCalledWith(
-        'Cache save failed',
-        expect.objectContaining({error: expect.any(String) as unknown}),
+        'Post-action cache save failed (non-fatal)',
+        expect.objectContaining({error: 'Cache save failed'}),
       )
     })
 
@@ -133,11 +158,13 @@ describe('post action', () => {
         return ''
       })
 
+      const {saveCache} = await import('./lib/cache.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
-      const cacheAdapter = createMockCacheAdapter()
 
-      await runPost({logger, cacheAdapter})
+      await runPost({logger})
 
       expect(logger.info).toHaveBeenCalledWith(
         'Post-action cache saved',
