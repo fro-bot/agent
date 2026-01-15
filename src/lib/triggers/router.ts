@@ -22,6 +22,14 @@ export function classifyTrigger(eventName: string): TriggerType {
       return 'discussion_comment'
     case 'workflow_dispatch':
       return 'workflow_dispatch'
+    case 'issues':
+      return 'issues'
+    case 'pull_request':
+      return 'pull_request'
+    case 'pull_request_review_comment':
+      return 'pull_request_review_comment'
+    case 'schedule':
+      return 'schedule'
     default:
       return 'unsupported'
   }
@@ -256,6 +264,350 @@ interface CommentSkipCheckOptions {
   actionLabel: string
 }
 
+interface IssuesPayload {
+  action: string
+  issue: {
+    number: number
+    title: string
+    body: string | null
+    state: string
+    user: {login: string}
+    locked: boolean
+    author_association?: string
+  }
+  repository: {
+    owner: {login: string}
+    name: string
+  }
+  sender: {login: string}
+}
+
+interface IssuesContextData {
+  author: AuthorInfo
+  target: TriggerTarget
+  commentBody: string | null
+  commentId: null
+  hasMention: boolean
+  command: ParsedCommand | null
+}
+
+function buildIssuesContextData(payload: IssuesPayload, botLogin: string | null): IssuesContextData {
+  const issue = payload.issue
+  const issueBody = issue.body ?? ''
+
+  const author: AuthorInfo = {
+    login: payload.sender.login,
+    association: issue.author_association ?? 'NONE',
+    isBot: payload.sender.login.endsWith('[bot]'),
+  }
+
+  const target: TriggerTarget = {
+    kind: 'issue',
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    locked: issue.locked,
+  }
+
+  const {hasMention, command} = parseBotMentionAndCommand(issueBody, botLogin)
+
+  return {
+    author,
+    target,
+    commentBody: issue.body,
+    commentId: null,
+    hasMention,
+    command,
+  }
+}
+
+const ISSUES_SUPPORTED_ACTIONS = ['opened', 'edited'] as const
+
+function isIssuesSupportedAction(action: string): action is (typeof ISSUES_SUPPORTED_ACTIONS)[number] {
+  return (ISSUES_SUPPORTED_ACTIONS as readonly string[]).includes(action)
+}
+
+function checkIssuesSkipConditions(context: TriggerContext, _config: TriggerConfig, logger: Logger): SkipCheckResult {
+  const payload = context.raw.payload as IssuesPayload
+  const action = payload.action
+
+  if (!isIssuesSupportedAction(action)) {
+    logger.debug('Skipping unsupported issues action', {action})
+    return {
+      shouldSkip: true,
+      reason: 'action_not_supported',
+      message: `Issues action '${action}' is not supported (only 'opened' and 'edited')`,
+    }
+  }
+
+  if (action === 'edited' && !context.hasMention) {
+    logger.debug('Skipping issues.edited without bot mention')
+    return {
+      shouldSkip: true,
+      reason: 'no_mention',
+      message: 'Issue edit does not mention the bot',
+    }
+  }
+
+  if (context.target?.locked === true) {
+    logger.debug('Skipping locked issue')
+    return {
+      shouldSkip: true,
+      reason: 'issue_locked',
+      message: 'Issue is locked',
+    }
+  }
+
+  return {shouldSkip: false}
+}
+
+interface PullRequestPayload {
+  action: string
+  pull_request: {
+    number: number
+    title: string
+    body: string | null
+    state: string
+    user: {login: string}
+    draft: boolean
+    locked: boolean
+    author_association?: string
+  }
+  repository: {
+    owner: {login: string}
+    name: string
+  }
+  sender: {login: string}
+}
+
+interface PullRequestContextData {
+  author: AuthorInfo
+  target: TriggerTarget
+  commentBody: string | null
+  commentId: null
+  hasMention: boolean
+  command: ParsedCommand | null
+}
+
+function buildPullRequestContextData(payload: PullRequestPayload, botLogin: string | null): PullRequestContextData {
+  const pr = payload.pull_request
+  const prBody = pr.body ?? ''
+
+  const author: AuthorInfo = {
+    login: payload.sender.login,
+    association: pr.author_association ?? 'NONE',
+    isBot: payload.sender.login.endsWith('[bot]'),
+  }
+
+  const target: TriggerTarget = {
+    kind: 'pr',
+    number: pr.number,
+    title: pr.title,
+    body: pr.body,
+    locked: pr.locked,
+    isDraft: pr.draft,
+  }
+
+  const {hasMention, command} = parseBotMentionAndCommand(prBody, botLogin)
+
+  return {
+    author,
+    target,
+    commentBody: pr.body,
+    commentId: null,
+    hasMention,
+    command,
+  }
+}
+
+const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened'] as const
+
+function isPRSupportedAction(action: string): action is (typeof PR_SUPPORTED_ACTIONS)[number] {
+  return (PR_SUPPORTED_ACTIONS as readonly string[]).includes(action)
+}
+
+function checkPullRequestSkipConditions(
+  context: TriggerContext,
+  config: TriggerConfig,
+  logger: Logger,
+): SkipCheckResult {
+  const payload = context.raw.payload as PullRequestPayload
+  const action = payload.action
+
+  if (!isPRSupportedAction(action)) {
+    logger.debug('Skipping unsupported pull_request action', {action})
+    return {
+      shouldSkip: true,
+      reason: 'action_not_supported',
+      message: `Pull request action '${action}' is not supported`,
+    }
+  }
+
+  if (config.skipDraftPRs && context.target?.isDraft === true) {
+    logger.debug('Skipping draft PR')
+    return {
+      shouldSkip: true,
+      reason: 'draft_pr',
+      message: 'Pull request is a draft',
+    }
+  }
+
+  if (context.target?.locked === true) {
+    logger.debug('Skipping locked pull request')
+    return {
+      shouldSkip: true,
+      reason: 'issue_locked',
+      message: 'Pull request is locked',
+    }
+  }
+
+  return {shouldSkip: false}
+}
+
+interface PRReviewCommentPayload {
+  action: string
+  pull_request: {
+    number: number
+    title: string
+    locked: boolean
+  }
+  comment: {
+    id: number
+    body: string
+    user: {login: string}
+    author_association: string
+    path: string
+    line: number | null
+    diff_hunk: string
+    commit_id: string
+  }
+  repository: {
+    owner: {login: string}
+    name: string
+  }
+  sender: {login: string}
+}
+
+interface PRReviewCommentContextData {
+  author: AuthorInfo
+  target: TriggerTarget
+  commentBody: string
+  commentId: number
+  hasMention: boolean
+  command: ParsedCommand | null
+}
+
+function buildPRReviewCommentContextData(
+  payload: PRReviewCommentPayload,
+  botLogin: string | null,
+): PRReviewCommentContextData {
+  const pr = payload.pull_request
+  const comment = payload.comment
+
+  const author: AuthorInfo = {
+    login: comment.user.login,
+    association: comment.author_association,
+    isBot: comment.user.login.endsWith('[bot]'),
+  }
+
+  const target: TriggerTarget = {
+    kind: 'pr',
+    number: pr.number,
+    title: pr.title,
+    body: comment.body,
+    locked: pr.locked,
+    path: comment.path,
+    line: comment.line ?? undefined,
+    diffHunk: comment.diff_hunk,
+    commitId: comment.commit_id,
+  }
+
+  const {hasMention, command} = parseBotMentionAndCommand(comment.body, botLogin)
+
+  return {
+    author,
+    target,
+    commentBody: comment.body,
+    commentId: comment.id,
+    hasMention,
+    command,
+  }
+}
+
+interface SchedulePayload {
+  schedule?: string
+}
+
+interface ScheduleContextData {
+  author: AuthorInfo
+  target: TriggerTarget
+  commentBody: string | null
+  commentId: null
+  hasMention: false
+  command: null
+}
+
+function buildScheduleContextData(
+  _payload: SchedulePayload,
+  actor: string,
+  promptInput: string | null,
+): ScheduleContextData {
+  const effectivePrompt = promptInput?.trim() ?? ''
+
+  const target: TriggerTarget = {
+    kind: 'manual',
+    number: 0,
+    title: 'Scheduled workflow',
+    body: effectivePrompt.length > 0 ? effectivePrompt : null,
+    locked: false,
+  }
+
+  const author: AuthorInfo = {
+    login: actor,
+    association: 'OWNER',
+    isBot: false,
+  }
+
+  return {
+    author,
+    target,
+    commentBody: effectivePrompt.length > 0 ? effectivePrompt : null,
+    commentId: null,
+    hasMention: false,
+    command: null,
+  }
+}
+
+function checkScheduleSkipConditions(config: TriggerConfig, logger: Logger): SkipCheckResult {
+  const promptInput = config.promptInput?.trim() ?? ''
+
+  if (promptInput.length === 0) {
+    logger.debug('Skipping schedule event without prompt input')
+    return {
+      shouldSkip: true,
+      reason: 'prompt_required',
+      message: 'Schedule trigger requires prompt input',
+    }
+  }
+
+  return {shouldSkip: false}
+}
+
+function checkWorkflowDispatchSkipConditions(context: TriggerContext, logger: Logger): SkipCheckResult {
+  const promptInput = context.commentBody?.trim() ?? ''
+
+  if (promptInput.length === 0) {
+    logger.debug('Skipping workflow_dispatch event without prompt input')
+    return {
+      shouldSkip: true,
+      reason: 'prompt_required',
+      message: 'Workflow dispatch requires prompt input',
+    }
+  }
+
+  return {shouldSkip: false}
+}
+
 function checkCommentSkipConditions(
   context: TriggerContext,
   config: TriggerConfig,
@@ -355,7 +707,24 @@ export function checkSkipConditions(context: TriggerContext, config: TriggerConf
     case 'discussion_comment':
       return checkDiscussionCommentSkipConditions(context, config, logger)
 
+    case 'issues':
+      return checkIssuesSkipConditions(context, config, logger)
+
+    case 'pull_request':
+      return checkPullRequestSkipConditions(context, config, logger)
+
+    case 'pull_request_review_comment':
+      return checkCommentSkipConditions(context, config, logger, {
+        targetLabel: 'Pull request',
+        actionLabel: 'Review comment',
+      })
+
+    case 'schedule':
+      return checkScheduleSkipConditions(config, logger)
+
     case 'workflow_dispatch':
+      return checkWorkflowDispatchSkipConditions(context, logger)
+
     default:
       return {shouldSkip: false}
   }
@@ -365,6 +734,7 @@ function buildTriggerContext(
   githubContext: GitHubContext,
   triggerType: TriggerType,
   botLogin: string | null,
+  promptInput: string | null,
 ): TriggerContext {
   const baseContext = {
     triggerType,
@@ -420,6 +790,62 @@ function buildTriggerContext(
       }
     }
 
+    case 'issues': {
+      const payload = githubContext.payload as IssuesPayload
+      const data = buildIssuesContextData(payload, botLogin)
+      return {
+        ...baseContext,
+        author: data.author,
+        target: data.target,
+        commentBody: data.commentBody,
+        commentId: data.commentId,
+        hasMention: data.hasMention,
+        command: data.command,
+      }
+    }
+
+    case 'pull_request': {
+      const payload = githubContext.payload as PullRequestPayload
+      const data = buildPullRequestContextData(payload, botLogin)
+      return {
+        ...baseContext,
+        author: data.author,
+        target: data.target,
+        commentBody: data.commentBody,
+        commentId: data.commentId,
+        hasMention: data.hasMention,
+        command: data.command,
+      }
+    }
+
+    case 'pull_request_review_comment': {
+      const payload = githubContext.payload as PRReviewCommentPayload
+      const data = buildPRReviewCommentContextData(payload, botLogin)
+      return {
+        ...baseContext,
+        author: data.author,
+        target: data.target,
+        commentBody: data.commentBody,
+        commentId: data.commentId,
+        hasMention: data.hasMention,
+        command: data.command,
+      }
+    }
+
+    case 'schedule': {
+      const payload = githubContext.payload as SchedulePayload
+      const data = buildScheduleContextData(payload, githubContext.actor, promptInput)
+      return {
+        ...baseContext,
+        author: data.author,
+        target: data.target,
+        commentBody: data.commentBody,
+        commentId: data.commentId,
+        hasMention: data.hasMention,
+        command: data.command,
+      }
+    }
+
     case 'unsupported':
       return {
         ...baseContext,
@@ -441,7 +867,7 @@ export function routeEvent(
   const fullConfig: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, ...config}
 
   const triggerType = classifyTrigger(githubContext.eventName)
-  const context = buildTriggerContext(githubContext, triggerType, fullConfig.botLogin)
+  const context = buildTriggerContext(githubContext, triggerType, fullConfig.botLogin, fullConfig.promptInput)
 
   logger.debug('Routing event', {
     eventName: githubContext.eventName,

@@ -6,7 +6,93 @@
  */
 
 import type {Logger} from '../logger.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {PromptOptions, SessionContext} from './types.js'
+
+export interface TriggerDirective {
+  readonly directive: string
+  readonly appendMode: boolean
+}
+
+function getPayloadAction(payload: unknown): string {
+  if (typeof payload === 'object' && payload !== null && 'action' in payload) {
+    const action = (payload as Record<string, unknown>).action
+    return typeof action === 'string' ? action : ''
+  }
+  return ''
+}
+
+export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
+  const action = getPayloadAction(context.raw.payload)
+
+  switch (context.triggerType) {
+    case 'issue_comment':
+      return {directive: 'Respond to the comment above.', appendMode: true}
+
+    case 'discussion_comment':
+      return {directive: 'Respond to the discussion comment above.', appendMode: true}
+
+    case 'issues':
+      if (action === 'opened') {
+        return {directive: 'Triage this issue: summarize, reproduce if possible, propose next steps.', appendMode: true}
+      }
+      return {directive: 'Respond to the mention in this issue.', appendMode: true}
+
+    case 'pull_request':
+      return {
+        directive: 'Review this pull request for code quality, potential bugs, and improvements.',
+        appendMode: true,
+      }
+
+    case 'pull_request_review_comment':
+      return {directive: buildReviewCommentDirective(context), appendMode: true}
+
+    case 'schedule':
+    case 'workflow_dispatch':
+      return {directive: promptInput ?? '', appendMode: false}
+
+    case 'unsupported':
+    default:
+      return {directive: 'Execute the requested operation.', appendMode: true}
+  }
+}
+
+function buildReviewCommentDirective(context: TriggerContext): string {
+  const target = context.target
+  const lines: string[] = ['Respond to the review comment.', '']
+
+  if (target?.path != null) {
+    lines.push(`**File:** \`${target.path}\``)
+  }
+  if (target?.line != null) {
+    lines.push(`**Line:** ${target.line}`)
+  }
+  if (target?.commitId != null) {
+    lines.push(`**Commit:** \`${target.commitId}\``)
+  }
+  if (target?.diffHunk != null && target.diffHunk.length > 0) {
+    lines.push('', '**Diff Context:**', '```diff', target.diffHunk, '```')
+  }
+
+  return lines.join('\n')
+}
+
+export function buildTaskSection(context: TriggerContext, promptInput: string | null): string {
+  const {directive, appendMode} = getTriggerDirective(context, promptInput)
+  const lines: string[] = ['## Task', '']
+
+  if (appendMode) {
+    lines.push(directive)
+    if (promptInput != null && promptInput.trim().length > 0) {
+      lines.push('', '**Additional Instructions:**', promptInput.trim())
+    }
+  } else {
+    lines.push(directive)
+  }
+
+  lines.push('')
+  return lines.join('\n')
+}
 
 /**
  * Build the complete agent prompt with GitHub context and instructions.
@@ -137,16 +223,16 @@ Every comment you post MUST include a collapsed details block at the end:
 \`\`\`
 `)
 
-  // Custom prompt if provided
-  if (customPrompt != null && customPrompt.trim().length > 0) {
+  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
     parts.push(`## Custom Instructions
 
 ${customPrompt.trim()}
 `)
   }
 
-  // Task directive
-  if (context.commentBody == null) {
+  if (options.triggerContext != null) {
+    parts.push(buildTaskSection(options.triggerContext, customPrompt))
+  } else if (context.commentBody == null) {
     parts.push(`## Task
 
 Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.

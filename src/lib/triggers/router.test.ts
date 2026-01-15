@@ -109,13 +109,40 @@ describe('classifyTrigger', () => {
     expect(result).toBe('unsupported')
   })
 
-  it('classifies pull_request as unsupported', () => {
-    // #given a pull_request event (not issue_comment on PR)
+  it('classifies pull_request as pull_request', () => {
+    // #given a pull_request event
     // #when classifying the trigger
     const result = classifyTrigger('pull_request')
 
-    // #then it should return unsupported
-    expect(result).toBe('unsupported')
+    // #then it should return pull_request
+    expect(result).toBe('pull_request')
+  })
+
+  it('classifies issues as issues', () => {
+    // #given an issues event
+    // #when classifying the trigger
+    const result = classifyTrigger('issues')
+
+    // #then it should return issues
+    expect(result).toBe('issues')
+  })
+
+  it('classifies pull_request_review_comment as pull_request_review_comment', () => {
+    // #given a pull_request_review_comment event
+    // #when classifying the trigger
+    const result = classifyTrigger('pull_request_review_comment')
+
+    // #then it should return pull_request_review_comment
+    expect(result).toBe('pull_request_review_comment')
+  })
+
+  it('classifies schedule as schedule', () => {
+    // #given a schedule event
+    // #when classifying the trigger
+    const result = classifyTrigger('schedule')
+
+    // #then it should return schedule
+    expect(result).toBe('schedule')
   })
 })
 
@@ -289,6 +316,8 @@ describe('checkSkipConditions', () => {
       botLogin: 'fro-bot',
       requireMention: true,
       allowedAssociations: ALLOWED_ASSOCIATIONS,
+      skipDraftPRs: true,
+      promptInput: null,
     }
   })
 
@@ -703,6 +732,38 @@ describe('routeEvent', () => {
     expect(result.context.commentBody).toBe('Please review the codebase')
   })
 
+  it('skips workflow_dispatch event without prompt input', () => {
+    // #given a workflow_dispatch event without prompt
+    const payload = {
+      inputs: {},
+    }
+    const ghContext = createMockGitHubContext('workflow_dispatch', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger)
+
+    // #then it should skip with prompt_required reason
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('prompt_required')
+  })
+
+  it('skips workflow_dispatch event with empty prompt input', () => {
+    // #given a workflow_dispatch event with empty prompt
+    const payload = {
+      inputs: {
+        prompt: '   ',
+      },
+    }
+    const ghContext = createMockGitHubContext('workflow_dispatch', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger)
+
+    // #then it should skip with prompt_required reason
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('prompt_required')
+  })
+
   it('skips discussion_comment from bot itself', () => {
     // #given a discussion comment from the bot
     const payload = {
@@ -747,5 +808,475 @@ describe('routeEvent', () => {
     // #then it should skip with issue_locked reason
     expect(result.shouldProcess).toBe(false)
     expect(result.shouldProcess === false && result.skipReason).toBe('issue_locked')
+  })
+
+  describe('issues event', () => {
+    it('routes issues.opened event', () => {
+      // #given an issues.opened event
+      const payload = {
+        action: 'opened',
+        issue: {
+          number: 42,
+          title: 'Bug: Something is broken',
+          body: 'Description of the bug',
+          state: 'open',
+          user: {login: 'reporter'},
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reporter'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process with correct context
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('issues')
+      expect(result.context.target?.kind).toBe('issue')
+      expect(result.context.target?.number).toBe(42)
+      expect(result.context.target?.title).toBe('Bug: Something is broken')
+    })
+
+    it('routes issues.edited event with bot mention', () => {
+      // #given an issues.edited event with @fro-bot mention
+      const payload = {
+        action: 'edited',
+        issue: {
+          number: 42,
+          title: 'Bug: Something is broken',
+          body: '@fro-bot please help with this',
+          state: 'open',
+          user: {login: 'reporter'},
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reporter'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process and detect the mention
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('issues')
+      expect(result.context.hasMention).toBe(true)
+    })
+
+    it('skips issues.edited event without bot mention', () => {
+      // #given an issues.edited event without mention
+      const payload = {
+        action: 'edited',
+        issue: {
+          number: 42,
+          title: 'Bug: Something is broken',
+          body: 'Updated description without mention',
+          state: 'open',
+          user: {login: 'reporter'},
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reporter'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with no_mention reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('no_mention')
+    })
+
+    it('skips issues.closed event (unsupported action)', () => {
+      // #given an issues.closed event
+      const payload = {
+        action: 'closed',
+        issue: {
+          number: 42,
+          title: 'Bug: Something is broken',
+          body: 'Description',
+          state: 'closed',
+          user: {login: 'reporter'},
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reporter'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with action_not_supported reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('action_not_supported')
+    })
+  })
+
+  describe('pull_request event', () => {
+    it('routes pull_request.opened event', () => {
+      // #given a pull_request.opened event
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description of the feature',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process with correct context
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('pull_request')
+      expect(result.context.target?.kind).toBe('pr')
+      expect(result.context.target?.number).toBe(99)
+      expect(result.context.target?.isDraft).toBe(false)
+    })
+
+    it('routes pull_request.synchronize event', () => {
+      // #given a pull_request.synchronize event
+      const payload = {
+        action: 'synchronize',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('pull_request')
+    })
+
+    it('routes pull_request.reopened event', () => {
+      // #given a pull_request.reopened event
+      const payload = {
+        action: 'reopened',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('pull_request')
+    })
+
+    it('skips draft PRs when skipDraftPRs is true', () => {
+      // #given a draft pull_request.opened event
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'feat: WIP feature',
+          body: 'Description',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: true,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot', skipDraftPRs: true}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with draft_pr reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('draft_pr')
+    })
+
+    it('processes draft PRs when skipDraftPRs is false', () => {
+      // #given a draft pull_request.opened event with skipDraftPRs false
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'feat: WIP feature',
+          body: 'Description',
+          state: 'open',
+          user: {login: 'contributor'},
+          draft: true,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot', skipDraftPRs: false}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.target?.isDraft).toBe(true)
+    })
+
+    it('skips pull_request.closed event (unsupported action)', () => {
+      // #given a pull_request.closed event
+      const payload = {
+        action: 'closed',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description',
+          state: 'closed',
+          user: {login: 'contributor'},
+          draft: false,
+          locked: false,
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'contributor'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with action_not_supported reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('action_not_supported')
+    })
+  })
+
+  describe('pull_request_review_comment event', () => {
+    it('routes pull_request_review_comment.created event', () => {
+      // #given a pull_request_review_comment.created event
+      const payload = {
+        action: 'created',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          locked: false,
+        },
+        comment: {
+          id: 123,
+          body: '@fro-bot please explain this code',
+          user: {login: 'reviewer'},
+          author_association: 'MEMBER',
+          path: 'src/lib/feature.ts',
+          line: 42,
+          diff_hunk: '@@ -10,6 +10,8 @@ function example() {\n+  const newCode = true\n }',
+          commit_id: 'abc123',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reviewer'},
+      }
+      const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process with correct context
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('pull_request_review_comment')
+      expect(result.context.target?.kind).toBe('pr')
+      expect(result.context.target?.path).toBe('src/lib/feature.ts')
+      expect(result.context.target?.line).toBe(42)
+      expect(result.context.target?.diffHunk).toContain('const newCode')
+      expect(result.context.target?.commitId).toBe('abc123')
+      expect(result.context.hasMention).toBe(true)
+    })
+
+    it('skips pull_request_review_comment.edited event', () => {
+      // #given a pull_request_review_comment.edited event
+      const payload = {
+        action: 'edited',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          locked: false,
+        },
+        comment: {
+          id: 123,
+          body: '@fro-bot please explain this code',
+          user: {login: 'reviewer'},
+          author_association: 'MEMBER',
+          path: 'src/lib/feature.ts',
+          line: 42,
+          diff_hunk: '',
+          commit_id: 'abc123',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reviewer'},
+      }
+      const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with action_not_created reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('action_not_created')
+    })
+
+    it('handles pull_request_review_comment with null line number', () => {
+      // #given a review comment without a line number (file-level comment)
+      const payload = {
+        action: 'created',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          locked: false,
+        },
+        comment: {
+          id: 123,
+          body: '@fro-bot please review this file',
+          user: {login: 'reviewer'},
+          author_association: 'MEMBER',
+          path: 'src/lib/feature.ts',
+          line: null,
+          diff_hunk: '@@ -10,6 +10,8 @@ function example() {',
+          commit_id: 'abc123',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'reviewer'},
+      }
+      const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
+      const config = {botLogin: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process and line should be undefined
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.target?.line).toBeUndefined()
+      expect(result.context.target?.path).toBe('src/lib/feature.ts')
+    })
+  })
+
+  describe('schedule event', () => {
+    it('routes schedule event with prompt input', () => {
+      // #given a schedule event with promptInput configured
+      const payload = {schedule: '0 0 * * *'}
+      const ghContext = createMockGitHubContext('schedule', payload)
+      const config = {botLogin: 'fro-bot', promptInput: 'Run daily maintenance tasks'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should process
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.triggerType).toBe('schedule')
+      expect(result.context.target?.kind).toBe('manual')
+      expect(result.context.commentBody).toBe('Run daily maintenance tasks')
+    })
+
+    it('fails schedule event without prompt input', () => {
+      // #given a schedule event without promptInput
+      const payload = {schedule: '0 0 * * *'}
+      const ghContext = createMockGitHubContext('schedule', payload)
+      const config = {botLogin: 'fro-bot', promptInput: null}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with prompt_required reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('prompt_required')
+    })
+
+    it('fails schedule event with empty prompt input', () => {
+      // #given a schedule event with empty promptInput
+      const payload = {schedule: '0 0 * * *'}
+      const ghContext = createMockGitHubContext('schedule', payload)
+      const config = {botLogin: 'fro-bot', promptInput: '   '}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with prompt_required reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('prompt_required')
+    })
   })
 })

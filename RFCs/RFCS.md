@@ -33,7 +33,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
 | RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Pending    |
 | RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Pending    |
-| RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Pending    |
+| RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Completed  |
 | RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Pending    |
 
 ---
@@ -233,14 +233,14 @@ RFC-001 (Foundation)
 | F56: GitHub API Rate Limit Handling     | RFC-007          | Pending   |
 | F57: LLM API Error Handling             | RFC-007          | Pending   |
 | F59: Action Inputs Configuration        | RFC-001, RFC-011 | Pending   |
-| F69: Trigger-Specific Prompt Directives | RFC-016          | Pending   |
-| F70: Issues Event Trigger               | RFC-016          | Pending   |
-| F71: Pull Request Event Trigger         | RFC-016          | Pending   |
-| F72: Schedule Event Trigger             | RFC-016          | Pending   |
-| F73: Pull Request Review Comment        | RFC-016          | Pending   |
+| F69: Trigger-Specific Prompt Directives | RFC-016          | Completed |
+| F70: Issues Event Trigger               | RFC-016          | Completed |
+| F71: Pull Request Event Trigger         | RFC-016          | Completed |
+| F72: Schedule Event Trigger             | RFC-016          | Completed |
+| F73: Pull Request Review Comment        | RFC-016          | Completed |
 | F74: Post-Action Cache Hook             | RFC-017          | Pending   |
-| F75: Prompt Input Required Validation   | RFC-016          | Pending   |
-| F76: Draft PR Skip                      | RFC-016          | Pending   |
+| F75: Prompt Input Required Validation   | RFC-016          | Completed |
+| F76: Draft PR Skip                      | RFC-016          | Completed |
 
 ### P1 Features (Should-Have) - Future RFCs
 
