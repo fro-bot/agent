@@ -2,6 +2,50 @@
 
 All notable changes to the PRD and project requirements will be documented in this file.
 
+## [1.2] - 2026-01-14
+
+### Added
+
+#### P0 (must-have) - Additional Triggers & Directives
+
+- **L. Trigger-Specific Prompt Directives**: Context-aware default behaviors per trigger
+  - `issues` (opened): Automated triage - summarize, reproduce, propose next steps
+  - `issues` (edited with @mention): Respond to specific mention
+  - `pull_request` (opened/synchronize/reopened): Default review behavior
+  - `pull_request_review_comment` (created): Respond with file/line/diff context
+  - `schedule`: Requires `prompt` input (hard fail if empty)
+  - `workflow_dispatch`: Requires `prompt` input (hard fail if empty)
+  - `getTriggerDirective()` function for thin directive layer
+
+- **M. Post-Action Cache Hook**: Reliable cache saving via `runs.post`
+  - New `src/post.ts` entry point bundled to `dist/post.js`
+  - Runs even on main action timeout/cancellation
+  - Best-effort, never fails the job
+  - Independent of setup consolidation
+
+#### New Trigger Events
+
+- **`issues` event**: Support `opened` and `edited` (with @mention) actions
+- **`pull_request` event**: Support `opened`, `synchronize`, `reopened` actions
+- **`pull_request_review_comment` event**: Elevated from P1 to P0, support `created` action
+- **`schedule` event**: Cron-based triggers with required prompt input
+
+### Changed
+
+- **Trigger documentation**: Comprehensive table in section A.1 with actions, prompt requirements, and scope
+- **Skip conditions**: Added per-trigger guards (draft PR skip, mention requirement, prompt validation)
+- **P1 section**: Added "Setup action consolidation (deferred from v1.2)" as future work item
+
+### Deferred
+
+- **Setup action consolidation**: Architectural change requires separate RFC, user research, and migration plan
+- Documented in P1 for future consideration
+
+### Risks Added
+
+- Noisy automated triggers (mitigated by action constraints and @mention requirements)
+- Post-action hook reliability (mitigated by best-effort design and S3 backup)
+
 ## [1.1] - 2026-01-10
 
 ### Added
