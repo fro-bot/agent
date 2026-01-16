@@ -54,7 +54,11 @@ export interface DiscussionCommentPayload {
  * Maps from GitHub event names to processable event categories.
  *
  * - 'issue_comment': Comment on issue or PR (via issue_comment event)
- * - 'discussion_comment': Comment on discussion (via discussion_comment event)
+ * - 'discussion_comment': Comment on discussion (via discussion or discussion_comment event)
+ * - 'issues': Issue opened or edited
+ * - 'pull_request': PR opened, synchronized, or reopened
+ * - 'pull_request_review_comment': Review comment on PR
+ * - 'schedule': Cron-triggered workflow run
  * - 'workflow_dispatch': Manual workflow trigger
  * - 'unsupported': Event type not handled by this action
  */
