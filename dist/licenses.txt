@@ -460,7 +460,7 @@ SOFTWARE.
 MIT
 MIT
 
-@opencode-ai/sdk@1.1.15
+@opencode-ai/sdk@1.1.17
 MIT
 MIT
 
