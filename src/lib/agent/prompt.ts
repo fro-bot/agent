@@ -25,7 +25,7 @@ function getPayloadAction(payload: unknown): string {
 export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
   const action = getPayloadAction(context.raw.payload)
 
-  switch (context.triggerType) {
+  switch (context.eventType) {
     case 'issue_comment':
       return {directive: 'Respond to the comment above.', appendMode: true}
 

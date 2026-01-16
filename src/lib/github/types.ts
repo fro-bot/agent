@@ -49,7 +49,27 @@ export interface DiscussionCommentPayload {
 }
 
 // Context types
-export type EventType = 'discussion' | 'issue_comment' | 'unknown' | 'workflow_dispatch'
+/**
+ * Supported event types for agent activation.
+ * Maps from GitHub event names to processable event categories.
+ *
+ * - 'issue_comment': Comment on issue or PR (via issue_comment event)
+ * - 'discussion_comment': Comment on discussion (via discussion_comment event)
+ * - 'workflow_dispatch': Manual workflow trigger
+ * - 'unsupported': Event type not handled by this action
+ */
+export const EVENT_TYPES = [
+  'discussion_comment',
+  'issue_comment',
+  'issues',
+  'pull_request',
+  'pull_request_review_comment',
+  'schedule',
+  'unsupported',
+  'workflow_dispatch',
+] as const
+
+export type EventType = (typeof EVENT_TYPES)[number]
 
 export interface GitHubContext {
   readonly eventName: string

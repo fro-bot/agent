@@ -8,32 +8,9 @@ import type {
   TriggerContext,
   TriggerResult,
   TriggerTarget,
-  TriggerType,
 } from './types.js'
 import {getAuthorAssociation, getCommentAuthor, isIssueLocked, isPullRequest} from '../github/context.js'
 import {ALLOWED_ASSOCIATIONS, DEFAULT_TRIGGER_CONFIG} from './types.js'
-
-export function classifyTrigger(eventName: string): TriggerType {
-  switch (eventName) {
-    case 'issue_comment':
-      return 'issue_comment'
-    case 'discussion':
-    case 'discussion_comment':
-      return 'discussion_comment'
-    case 'workflow_dispatch':
-      return 'workflow_dispatch'
-    case 'issues':
-      return 'issues'
-    case 'pull_request':
-      return 'pull_request'
-    case 'pull_request_review_comment':
-      return 'pull_request_review_comment'
-    case 'schedule':
-      return 'schedule'
-    default:
-      return 'unsupported'
-  }
-}
 
 export function hasBotMention(text: string, botLogin: string): boolean {
   if (botLogin.length === 0) {
@@ -70,8 +47,8 @@ export function extractCommand(text: string, botLogin: string): ParsedCommand | 
   }
 
   const parts = raw.split(/\s+/)
-  const firstPart = parts[0]
-  const action = firstPart != null && firstPart.length > 0 ? firstPart : null
+  const firstPart = parts[0] ?? ''
+  const action = firstPart.length > 0 ? firstPart : null
   const args = parts.slice(1).join(' ')
 
   return {raw, action, args}
@@ -268,7 +245,7 @@ interface IssuesPayload {
     owner: {login: string}
     name: string
   }
-  sender: {login: string}
+  sender: {login: string; type?: 'Bot' | 'Organization' | 'User'}
 }
 
 interface IssuesContextData {
@@ -287,7 +264,7 @@ function buildIssuesContextData(payload: IssuesPayload, botLogin: string | null)
   const author: AuthorInfo = {
     login: payload.sender.login,
     association: issue.author_association ?? 'NONE',
-    isBot: payload.sender.login.endsWith('[bot]'),
+    isBot: payload.sender.type === 'Bot' || payload.sender.login.endsWith('[bot]'),
   }
 
   const target: TriggerTarget = {
@@ -316,7 +293,7 @@ function isIssuesSupportedAction(action: string): action is (typeof ISSUES_SUPPO
   return (ISSUES_SUPPORTED_ACTIONS as readonly string[]).includes(action)
 }
 
-function checkIssuesSkipConditions(context: TriggerContext, _config: TriggerConfig, logger: Logger): SkipCheckResult {
+function checkIssuesSkipConditions(context: TriggerContext, config: TriggerConfig, logger: Logger): SkipCheckResult {
   const payload = context.raw.payload as IssuesPayload
   const action = payload.action
 
@@ -326,6 +303,27 @@ function checkIssuesSkipConditions(context: TriggerContext, _config: TriggerConf
       shouldSkip: true,
       reason: 'action_not_supported',
       message: `Issues action '${action}' is not supported (only 'opened' and 'edited')`,
+    }
+  }
+
+  if (context.author != null && context.author.isBot) {
+    logger.debug('Skipping bot actor', {bot: context.author.login})
+    return {
+      shouldSkip: true,
+      reason: 'self_comment',
+      message: `Issues from bots (${context.author.login}) are not processed`,
+    }
+  }
+
+  if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {
+    logger.debug('Skipping unauthorized author', {
+      association: context.author.association,
+      allowed: config.allowedAssociations,
+    })
+    return {
+      shouldSkip: true,
+      reason: 'unauthorized_author',
+      message: `Author association '${context.author.association}' is not authorized`,
     }
   }
 
@@ -366,7 +364,7 @@ interface PullRequestPayload {
     owner: {login: string}
     name: string
   }
-  sender: {login: string}
+  sender: {login: string; type?: 'Bot' | 'Organization' | 'User'}
 }
 
 interface PullRequestContextData {
@@ -385,7 +383,7 @@ function buildPullRequestContextData(payload: PullRequestPayload, botLogin: stri
   const author: AuthorInfo = {
     login: payload.sender.login,
     association: pr.author_association ?? 'NONE',
-    isBot: payload.sender.login.endsWith('[bot]'),
+    isBot: payload.sender.type === 'Bot' || payload.sender.login.endsWith('[bot]'),
   }
 
   const target: TriggerTarget = {
@@ -429,6 +427,27 @@ function checkPullRequestSkipConditions(
       shouldSkip: true,
       reason: 'action_not_supported',
       message: `Pull request action '${action}' is not supported`,
+    }
+  }
+
+  if (context.author != null && context.author.isBot) {
+    logger.debug('Skipping bot actor', {bot: context.author.login})
+    return {
+      shouldSkip: true,
+      reason: 'self_comment',
+      message: `Pull requests from bots (${context.author.login}) are not processed`,
+    }
+  }
+
+  if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {
+    logger.debug('Skipping unauthorized author', {
+      association: context.author.association,
+      allowed: config.allowedAssociations,
+    })
+    return {
+      shouldSkip: true,
+      reason: 'unauthorized_author',
+      message: `Author association '${context.author.association}' is not authorized`,
     }
   }
 
@@ -680,7 +699,7 @@ function checkDiscussionCommentSkipConditions(
 }
 
 export function checkSkipConditions(context: TriggerContext, config: TriggerConfig, logger: Logger): SkipCheckResult {
-  if (context.triggerType === 'unsupported') {
+  if (context.eventType === 'unsupported') {
     logger.debug('Skipping unsupported event', {eventName: context.eventName})
     return {
       shouldSkip: true,
@@ -689,7 +708,7 @@ export function checkSkipConditions(context: TriggerContext, config: TriggerConf
     }
   }
 
-  switch (context.triggerType) {
+  switch (context.eventType) {
     case 'issue_comment':
       return checkIssueCommentSkipConditions(context, config, logger)
 
@@ -721,12 +740,11 @@ export function checkSkipConditions(context: TriggerContext, config: TriggerConf
 
 function buildTriggerContext(
   githubContext: GitHubContext,
-  triggerType: TriggerType,
   botLogin: string | null,
   promptInput: string | null,
 ): TriggerContext {
   const baseContext = {
-    triggerType,
+    eventType: githubContext.eventType,
     eventName: githubContext.eventName,
     repo: githubContext.repo,
     ref: githubContext.ref,
@@ -736,7 +754,7 @@ function buildTriggerContext(
     raw: githubContext,
   }
 
-  switch (triggerType) {
+  switch (githubContext.eventType) {
     case 'issue_comment': {
       const payload = githubContext.payload as IssueCommentPayload
       const data = buildIssueCommentContextData(payload, botLogin)
@@ -855,12 +873,11 @@ export function routeEvent(
 ): TriggerResult {
   const fullConfig: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, ...config}
 
-  const triggerType = classifyTrigger(githubContext.eventName)
-  const context = buildTriggerContext(githubContext, triggerType, fullConfig.login, fullConfig.promptInput)
+  const context = buildTriggerContext(githubContext, fullConfig.login, fullConfig.promptInput)
 
   logger.debug('Routing event', {
     eventName: githubContext.eventName,
-    triggerType,
+    eventType: githubContext.eventType,
     hasMention: context.hasMention,
   })
 

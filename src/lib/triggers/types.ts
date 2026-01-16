@@ -5,29 +5,7 @@
  * Works alongside github/context.ts utilities, not replacing them.
  */
 
-import type {GitHubContext} from '../github/types.js'
-
-/**
- * Supported trigger types for agent activation.
- * Maps from GitHub event names to processable trigger categories.
- *
- * - 'issue_comment': Comment on issue or PR (via issue_comment event)
- * - 'discussion_comment': Comment on discussion (via discussion_comment event)
- * - 'workflow_dispatch': Manual workflow trigger
- * - 'unsupported': Event type not handled by this action
- */
-export const TRIGGER_TYPES = [
-  'discussion_comment',
-  'issue_comment',
-  'issues',
-  'pull_request',
-  'pull_request_review_comment',
-  'schedule',
-  'unsupported',
-  'workflow_dispatch',
-] as const
-
-export type TriggerType = (typeof TRIGGER_TYPES)[number]
+import type {EventType, GitHubContext} from '../github/types.js'
 
 /**
  * Author information extracted from the triggering event.
@@ -84,8 +62,8 @@ export interface ParsedCommand {
  * Built by routeEvent() from GitHubContext.
  */
 export interface TriggerContext {
-  /** Classified trigger type */
-  readonly triggerType: TriggerType
+  /** Classified event type */
+  readonly eventType: EventType
   /** Original GitHub event name */
   readonly eventName: string
   /** Repository owner and name */

@@ -11,11 +11,19 @@ export function classifyEventType(eventName: string): EventType {
       return 'issue_comment'
     case 'discussion':
     case 'discussion_comment':
-      return 'discussion'
+      return 'discussion_comment'
     case 'workflow_dispatch':
       return 'workflow_dispatch'
+    case 'issues':
+      return 'issues'
+    case 'pull_request':
+      return 'pull_request'
+    case 'pull_request_review_comment':
+      return 'pull_request_review_comment'
+    case 'schedule':
+      return 'schedule'
     default:
-      return 'unknown'
+      return 'unsupported'
   }
 }
 
@@ -68,7 +76,7 @@ export function getCommentTarget(context: GitHubContext): CommentTarget | null {
     }
   }
 
-  if (eventType === 'discussion') {
+  if (eventType === 'discussion_comment') {
     // Discussion handling requires GraphQL - implemented in RFC-008
     return null
   }

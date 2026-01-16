@@ -1,7 +1,8 @@
 import type {GitHubContext, IssueCommentPayload} from '../github/types.js'
 import type {TriggerConfig} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {checkSkipConditions, classifyTrigger, extractCommand, hasBotMention, routeEvent} from './router.js'
+import {classifyEventType} from '../github/context.js'
+import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {ALLOWED_ASSOCIATIONS} from './types.js'
 
 function createMockLogger() {
@@ -53,7 +54,7 @@ function createMockIssueCommentPayload(
 function createMockGitHubContext(eventName: string, payload: unknown = {}): GitHubContext {
   return {
     eventName,
-    eventType: 'issue_comment',
+    eventType: classifyEventType(eventName),
     repo: {owner: 'owner', repo: 'repo'},
     ref: 'refs/heads/main',
     sha: 'abc123',
@@ -62,89 +63,6 @@ function createMockGitHubContext(eventName: string, payload: unknown = {}): GitH
     payload,
   }
 }
-
-describe('classifyTrigger', () => {
-  it('classifies issue_comment as issue_comment', () => {
-    // #given an issue_comment event
-    // #when classifying the trigger
-    const result = classifyTrigger('issue_comment')
-
-    // #then it should return issue_comment
-    expect(result).toBe('issue_comment')
-  })
-
-  it('classifies discussion as discussion_comment', () => {
-    // #given a discussion event
-    // #when classifying the trigger
-    const result = classifyTrigger('discussion')
-
-    // #then it should return discussion_comment
-    expect(result).toBe('discussion_comment')
-  })
-
-  it('classifies discussion_comment as discussion_comment', () => {
-    // #given a discussion_comment event
-    // #when classifying the trigger
-    const result = classifyTrigger('discussion_comment')
-
-    // #then it should return discussion_comment
-    expect(result).toBe('discussion_comment')
-  })
-
-  it('classifies workflow_dispatch as workflow_dispatch', () => {
-    // #given a workflow_dispatch event
-    // #when classifying the trigger
-    const result = classifyTrigger('workflow_dispatch')
-
-    // #then it should return workflow_dispatch
-    expect(result).toBe('workflow_dispatch')
-  })
-
-  it('classifies unknown events as unsupported', () => {
-    // #given an unknown event
-    // #when classifying the trigger
-    const result = classifyTrigger('push')
-
-    // #then it should return unsupported
-    expect(result).toBe('unsupported')
-  })
-
-  it('classifies pull_request as pull_request', () => {
-    // #given a pull_request event
-    // #when classifying the trigger
-    const result = classifyTrigger('pull_request')
-
-    // #then it should return pull_request
-    expect(result).toBe('pull_request')
-  })
-
-  it('classifies issues as issues', () => {
-    // #given an issues event
-    // #when classifying the trigger
-    const result = classifyTrigger('issues')
-
-    // #then it should return issues
-    expect(result).toBe('issues')
-  })
-
-  it('classifies pull_request_review_comment as pull_request_review_comment', () => {
-    // #given a pull_request_review_comment event
-    // #when classifying the trigger
-    const result = classifyTrigger('pull_request_review_comment')
-
-    // #then it should return pull_request_review_comment
-    expect(result).toBe('pull_request_review_comment')
-  })
-
-  it('classifies schedule as schedule', () => {
-    // #given a schedule event
-    // #when classifying the trigger
-    const result = classifyTrigger('schedule')
-
-    // #then it should return schedule
-    expect(result).toBe('schedule')
-  })
-})
 
 describe('hasBotMention', () => {
   it('detects @botname mention', () => {
@@ -326,7 +244,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload()
     const ghContext = createMockGitHubContext('push', payload)
     const context = {
-      triggerType: 'unsupported' as const,
+      eventType: 'unsupported' as const,
       eventName: 'push',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -355,7 +273,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({action: 'edited'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -384,7 +302,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({isLocked: true})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -413,7 +331,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({authorLogin: 'fro-bot'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -442,7 +360,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({authorLogin: 'fro-bot[bot]'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -471,7 +389,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({authorAssociation: 'NONE'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -500,7 +418,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({commentBody: 'Just a regular comment'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -530,7 +448,7 @@ describe('checkSkipConditions', () => {
     const payload = createMockIssueCommentPayload({commentBody: 'Just a regular comment'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -561,7 +479,7 @@ describe('checkSkipConditions', () => {
     })
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
-      triggerType: 'issue_comment' as const,
+      eventType: 'issue_comment' as const,
       eventName: 'issue_comment',
       repo: ghContext.repo,
       ref: ghContext.ref,
@@ -606,7 +524,7 @@ describe('routeEvent', () => {
 
     // #then it should process
     expect(result.shouldProcess).toBe(true)
-    expect(result.context.triggerType).toBe('issue_comment')
+    expect(result.context.eventType).toBe('issue_comment')
     expect(result.context.hasMention).toBe(true)
     expect(result.context.command?.action).toBe('review')
   })
@@ -621,7 +539,7 @@ describe('routeEvent', () => {
     // #then it should not process
     expect(result.shouldProcess).toBe(false)
     expect(result.shouldProcess === false && result.skipReason).toBe('unsupported_event')
-    expect(result.context.triggerType).toBe('unsupported')
+    expect(result.context.eventType).toBe('unsupported')
   })
 
   it('builds complete TriggerContext for issue_comment', () => {
@@ -639,7 +557,7 @@ describe('routeEvent', () => {
     const result = routeEvent(ghContext, logger, config)
 
     // #then context should be complete
-    expect(result.context.triggerType).toBe('issue_comment')
+    expect(result.context.eventType).toBe('issue_comment')
     expect(result.context.target?.kind).toBe('pr')
     expect(result.context.author?.login).toBe('contributor')
     expect(result.context.author?.association).toBe('COLLABORATOR')
@@ -703,7 +621,7 @@ describe('routeEvent', () => {
 
     // #then it should process with correct context
     expect(result.shouldProcess).toBe(true)
-    expect(result.context.triggerType).toBe('discussion_comment')
+    expect(result.context.eventType).toBe('discussion_comment')
     expect(result.context.target?.kind).toBe('discussion')
     expect(result.context.target?.number).toBe(42)
     expect(result.context.hasMention).toBe(true)
@@ -724,7 +642,7 @@ describe('routeEvent', () => {
 
     // #then it should process with correct context
     expect(result.shouldProcess).toBe(true)
-    expect(result.context.triggerType).toBe('workflow_dispatch')
+    expect(result.context.eventType).toBe('workflow_dispatch')
     expect(result.context.target?.kind).toBe('manual')
     expect(result.context.target?.body).toBe('Please review the codebase')
     expect(result.context.author?.login).toBe('actor')
@@ -822,6 +740,7 @@ describe('routeEvent', () => {
           state: 'open',
           user: {login: 'reporter'},
           locked: false,
+          author_association: 'MEMBER',
         },
         repository: {
           owner: {login: 'owner'},
@@ -837,7 +756,7 @@ describe('routeEvent', () => {
 
       // #then it should process with correct context
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('issues')
+      expect(result.context.eventType).toBe('issues')
       expect(result.context.target?.kind).toBe('issue')
       expect(result.context.target?.number).toBe(42)
       expect(result.context.target?.title).toBe('Bug: Something is broken')
@@ -854,6 +773,7 @@ describe('routeEvent', () => {
           state: 'open',
           user: {login: 'reporter'},
           locked: false,
+          author_association: 'MEMBER',
         },
         repository: {
           owner: {login: 'owner'},
@@ -869,7 +789,7 @@ describe('routeEvent', () => {
 
       // #then it should process and detect the mention
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('issues')
+      expect(result.context.eventType).toBe('issues')
       expect(result.context.hasMention).toBe(true)
     })
 
@@ -884,6 +804,7 @@ describe('routeEvent', () => {
           state: 'open',
           user: {login: 'reporter'},
           locked: false,
+          author_association: 'MEMBER',
         },
         repository: {
           owner: {login: 'owner'},
@@ -930,6 +851,96 @@ describe('routeEvent', () => {
       expect(result.shouldProcess).toBe(false)
       expect(result.shouldProcess === false && result.skipReason).toBe('action_not_supported')
     })
+
+    it('skips issues from bot sender (type: Bot)', () => {
+      // #given an issues.opened event from a bot
+      const payload = {
+        action: 'opened',
+        issue: {
+          number: 42,
+          title: 'Automated issue',
+          body: 'Created by automation',
+          state: 'open',
+          user: {login: 'automation-bot[bot]'},
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'automation-bot[bot]', type: 'Bot'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with self_comment reason (bot actors are rejected)
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
+    })
+
+    it('skips issues from bot sender (login ends with [bot])', () => {
+      // #given an issues.opened event from a bot identified by login suffix
+      const payload = {
+        action: 'opened',
+        issue: {
+          number: 42,
+          title: 'Automated issue',
+          body: 'Created by automation',
+          state: 'open',
+          user: {login: 'some-bot[bot]'},
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'some-bot[bot]'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with self_comment reason (bot actors are rejected)
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
+    })
+
+    it('skips issues from unauthorized author association', () => {
+      // #given an issues.opened event from an unauthorized user
+      const payload = {
+        action: 'opened',
+        issue: {
+          number: 42,
+          title: 'Feature request',
+          body: 'Please add this feature',
+          state: 'open',
+          user: {login: 'random-user'},
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'random-user'},
+      }
+      const ghContext = createMockGitHubContext('issues', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with unauthorized_author reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
+    })
   })
 
   describe('pull_request event', () => {
@@ -945,6 +956,7 @@ describe('routeEvent', () => {
           user: {login: 'contributor'},
           draft: false,
           locked: false,
+          author_association: 'COLLABORATOR',
         },
         repository: {
           owner: {login: 'owner'},
@@ -960,7 +972,7 @@ describe('routeEvent', () => {
 
       // #then it should process with correct context
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('pull_request')
+      expect(result.context.eventType).toBe('pull_request')
       expect(result.context.target?.kind).toBe('pr')
       expect(result.context.target?.number).toBe(99)
       expect(result.context.target?.isDraft).toBe(false)
@@ -978,6 +990,7 @@ describe('routeEvent', () => {
           user: {login: 'contributor'},
           draft: false,
           locked: false,
+          author_association: 'COLLABORATOR',
         },
         repository: {
           owner: {login: 'owner'},
@@ -993,7 +1006,7 @@ describe('routeEvent', () => {
 
       // #then it should process
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('pull_request')
+      expect(result.context.eventType).toBe('pull_request')
     })
 
     it('routes pull_request.reopened event', () => {
@@ -1008,6 +1021,7 @@ describe('routeEvent', () => {
           user: {login: 'contributor'},
           draft: false,
           locked: false,
+          author_association: 'COLLABORATOR',
         },
         repository: {
           owner: {login: 'owner'},
@@ -1023,7 +1037,7 @@ describe('routeEvent', () => {
 
       // #then it should process
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('pull_request')
+      expect(result.context.eventType).toBe('pull_request')
     })
 
     it('skips draft PRs when skipDraftPRs is true', () => {
@@ -1038,6 +1052,7 @@ describe('routeEvent', () => {
           user: {login: 'contributor'},
           draft: true,
           locked: false,
+          author_association: 'COLLABORATOR',
         },
         repository: {
           owner: {login: 'owner'},
@@ -1068,6 +1083,7 @@ describe('routeEvent', () => {
           user: {login: 'contributor'},
           draft: true,
           locked: false,
+          author_association: 'COLLABORATOR',
         },
         repository: {
           owner: {login: 'owner'},
@@ -1115,6 +1131,99 @@ describe('routeEvent', () => {
       expect(result.shouldProcess).toBe(false)
       expect(result.shouldProcess === false && result.skipReason).toBe('action_not_supported')
     })
+
+    it('skips pull_request from bot sender (type: Bot)', () => {
+      // #given a pull_request.opened event from a bot (e.g., Renovate)
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'chore(deps): update dependencies',
+          body: 'Automated dependency update',
+          state: 'open',
+          user: {login: 'renovate[bot]'},
+          draft: false,
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'renovate[bot]', type: 'Bot'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with self_comment reason (bot actors are rejected)
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
+    })
+
+    it('skips pull_request from bot sender (login ends with [bot])', () => {
+      // #given a pull_request.opened event from a bot identified by login suffix
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'chore(deps): update dependencies',
+          body: 'Automated dependency update',
+          state: 'open',
+          user: {login: 'dependabot[bot]'},
+          draft: false,
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'dependabot[bot]'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with self_comment reason (bot actors are rejected)
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
+    })
+
+    it('skips pull_request from unauthorized author association', () => {
+      // #given a pull_request.opened event from an unauthorized user
+      const payload = {
+        action: 'opened',
+        pull_request: {
+          number: 99,
+          title: 'feat: add new feature',
+          body: 'Description',
+          state: 'open',
+          user: {login: 'random-user'},
+          draft: false,
+          locked: false,
+          author_association: 'NONE',
+        },
+        repository: {
+          owner: {login: 'owner'},
+          name: 'repo',
+        },
+        sender: {login: 'random-user'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {login: 'fro-bot'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then it should skip with unauthorized_author reason
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
+    })
   })
 
   describe('pull_request_review_comment event', () => {
@@ -1151,7 +1260,7 @@ describe('routeEvent', () => {
 
       // #then it should process with correct context
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('pull_request_review_comment')
+      expect(result.context.eventType).toBe('pull_request_review_comment')
       expect(result.context.target?.kind).toBe('pr')
       expect(result.context.target?.path).toBe('src/lib/feature.ts')
       expect(result.context.target?.line).toBe(42)
@@ -1246,7 +1355,7 @@ describe('routeEvent', () => {
 
       // #then it should process
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.triggerType).toBe('schedule')
+      expect(result.context.eventType).toBe('schedule')
       expect(result.context.target?.kind).toBe('manual')
       expect(result.context.commentBody).toBe('Run daily maintenance tasks')
     })
