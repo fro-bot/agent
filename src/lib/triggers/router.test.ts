@@ -4,7 +4,7 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {classifyEventType} from '../github/context.js'
 import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
-import {ALLOWED_ASSOCIATIONS} from './types.js'
+import {ALL_AUTHOR_ASSOCIATIONS, ALLOWED_ASSOCIATIONS} from './types.js'
 
 function createMockLogger() {
   return {
@@ -1351,5 +1351,45 @@ describe('routeEvent', () => {
       expect(result.shouldProcess).toBe(false)
       expect(result.shouldProcess === false && result.skipReason).toBe('prompt_required')
     })
+  })
+})
+
+describe('ALL_AUTHOR_ASSOCIATIONS', () => {
+  it('contains all 8 GitHub author association values', () => {
+    expect(ALL_AUTHOR_ASSOCIATIONS).toHaveLength(8)
+  })
+
+  it('includes all allowed associations', () => {
+    for (const allowed of ALLOWED_ASSOCIATIONS) {
+      expect(ALL_AUTHOR_ASSOCIATIONS).toContain(allowed)
+    }
+  })
+
+  it('includes unauthorized associations for completeness', () => {
+    expect(ALL_AUTHOR_ASSOCIATIONS).toContain('CONTRIBUTOR')
+    expect(ALL_AUTHOR_ASSOCIATIONS).toContain('FIRST_TIME_CONTRIBUTOR')
+    expect(ALL_AUTHOR_ASSOCIATIONS).toContain('FIRST_TIMER')
+    expect(ALL_AUTHOR_ASSOCIATIONS).toContain('MANNEQUIN')
+    expect(ALL_AUTHOR_ASSOCIATIONS).toContain('NONE')
+  })
+
+  it('is sorted alphabetically', () => {
+    const sorted = [...ALL_AUTHOR_ASSOCIATIONS].sort()
+    expect(ALL_AUTHOR_ASSOCIATIONS).toEqual(sorted)
+  })
+})
+
+describe('ALLOWED_ASSOCIATIONS', () => {
+  it('contains exactly OWNER, MEMBER, COLLABORATOR', () => {
+    expect(ALLOWED_ASSOCIATIONS).toHaveLength(3)
+    expect(ALLOWED_ASSOCIATIONS).toContain('OWNER')
+    expect(ALLOWED_ASSOCIATIONS).toContain('MEMBER')
+    expect(ALLOWED_ASSOCIATIONS).toContain('COLLABORATOR')
+  })
+
+  it('does not include untrusted associations', () => {
+    expect(ALLOWED_ASSOCIATIONS).not.toContain('CONTRIBUTOR')
+    expect(ALLOWED_ASSOCIATIONS).not.toContain('NONE')
+    expect(ALLOWED_ASSOCIATIONS).not.toContain('FIRST_TIMER')
   })
 })

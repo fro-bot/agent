@@ -6,6 +6,35 @@
  */
 
 import type {EventType, GitHubContext} from '../github/types.js'
+import {ALLOWED_ASSOCIATIONS} from '../types.js'
+
+export {ALLOWED_ASSOCIATIONS}
+
+/**
+ * All possible GitHub author_association values (RFC-006).
+ *
+ * Per GitHub API docs (https://docs.github.com/en/graphql/reference/enums#commentauthorassociation):
+ * - COLLABORATOR: Author has been invited to collaborate on the repository
+ * - CONTRIBUTOR: Author has previously committed to the repository
+ * - FIRST_TIMER: Author has not previously committed to ANY repository on GitHub
+ * - FIRST_TIME_CONTRIBUTOR: Author has not previously committed to the repository
+ * - MANNEQUIN: Author is a placeholder for an unclaimed user
+ * - MEMBER: Author is a member of the organization that owns the repository
+ * - NONE: Author has no association with the repository
+ * - OWNER: Author is the owner of the repository
+ */
+export const ALL_AUTHOR_ASSOCIATIONS = [
+  'COLLABORATOR',
+  'CONTRIBUTOR',
+  'FIRST_TIMER',
+  'FIRST_TIME_CONTRIBUTOR',
+  'MANNEQUIN',
+  'MEMBER',
+  'NONE',
+  'OWNER',
+] as const
+
+export type AuthorAssociation = (typeof ALL_AUTHOR_ASSOCIATIONS)[number]
 
 /**
  * Author information extracted from the triggering event.
@@ -149,12 +178,6 @@ export interface TriggerConfig {
   /** Prompt input for schedule/workflow_dispatch triggers */
   readonly promptInput: string | null
 }
-
-/**
- * Default allowed author associations.
- * Only repo owners, members, and collaborators can trigger the agent.
- */
-export const ALLOWED_ASSOCIATIONS = ['COLLABORATOR', 'MEMBER', 'OWNER'] as const
 
 /**
  * Default trigger configuration.

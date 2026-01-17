@@ -53,3 +53,18 @@ export async function populateAuthJson(authConfig: AuthConfig, opencodeDir: stri
 
   return authPath
 }
+
+/**
+ * Verify auth.json exists and is readable.
+ * Called before agent execution to ensure credentials are available.
+ */
+export async function verifyAuthJson(authPath: string, logger: Logger): Promise<boolean> {
+  try {
+    await fs.access(authPath, fs.constants.R_OK)
+    logger.debug('auth.json verified', {path: authPath})
+    return true
+  } catch {
+    logger.error('auth.json not found or not readable', {path: authPath})
+    return false
+  }
+}

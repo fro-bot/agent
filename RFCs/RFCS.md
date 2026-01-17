@@ -23,7 +23,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-003 | GitHub API Client Layer              | MUST     | Medium     | 1     | Completed  |
 | RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed  |
 | RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Completed  |
-| RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Pending    |
+| RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Completed  |
 | RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending    |
 | RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending    |
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending    |
@@ -34,7 +34,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Pending    |
 | RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Pending    |
 | RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Completed  |
-| RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Pending    |
+| RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Completed  |
 
 ---
 
@@ -238,7 +238,7 @@ RFC-001 (Foundation)
 | F71: Pull Request Event Trigger         | RFC-016          | Completed |
 | F72: Schedule Event Trigger             | RFC-016          | Completed |
 | F73: Pull Request Review Comment        | RFC-016          | Completed |
-| F74: Post-Action Cache Hook             | RFC-017          | Pending   |
+| F74: Post-Action Cache Hook             | RFC-017          | Completed |
 | F75: Prompt Input Required Validation   | RFC-016          | Completed |
 | F76: Draft PR Skip                      | RFC-016          | Completed |
 

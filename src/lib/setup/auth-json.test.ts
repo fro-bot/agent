@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
-import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
+import {parseAuthJsonInput, populateAuthJson, verifyAuthJson} from './auth-json.js'
 
 function createMockLogger(): Logger {
   return {
@@ -186,5 +186,70 @@ describe('populateAuthJson', () => {
     const parsed = JSON.parse(content) as Record<string, unknown>
     expect('anthropic' in parsed).toBe(true)
     expect('old' in parsed).toBe(false)
+  })
+})
+
+describe('verifyAuthJson', () => {
+  let tempDir: string
+  let logger: Logger
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'verify-auth-test-'))
+    logger = createMockLogger()
+  })
+
+  afterEach(async () => {
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  it('returns true when auth.json exists and is readable', async () => {
+    // #given auth.json file exists
+    const authPath = path.join(tempDir, 'auth.json')
+    await fs.writeFile(authPath, '{"anthropic": {"type": "api", "key": "test"}}')
+
+    // #when verifying
+    const result = await verifyAuthJson(authPath, logger)
+
+    // #then returns true
+    expect(result).toBe(true)
+  })
+
+  it('returns false when auth.json does not exist', async () => {
+    // #given non-existent path
+    const authPath = path.join(tempDir, 'nonexistent', 'auth.json')
+
+    // #when verifying
+    const result = await verifyAuthJson(authPath, logger)
+
+    // #then returns false
+    expect(result).toBe(false)
+  })
+
+  it('returns true for empty auth.json file', async () => {
+    // #given empty but existing file
+    const authPath = path.join(tempDir, 'auth.json')
+    await fs.writeFile(authPath, '{}')
+
+    // #when verifying
+    const result = await verifyAuthJson(authPath, logger)
+
+    // #then returns true (file exists and is readable)
+    expect(result).toBe(true)
+  })
+
+  it.skipIf(process.platform === 'win32')('returns false when auth.json is not readable', async () => {
+    // #given file with no read permissions
+    const authPath = path.join(tempDir, 'auth.json')
+    await fs.writeFile(authPath, '{"test": "data"}')
+    await fs.chmod(authPath, 0o000)
+
+    // #when verifying
+    const result = await verifyAuthJson(authPath, logger)
+
+    // #then returns false
+    expect(result).toBe(false)
+
+    // cleanup: restore permissions for deletion
+    await fs.chmod(authPath, 0o600)
   })
 })
