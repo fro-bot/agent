@@ -558,20 +558,22 @@ Detect obvious corruption in restored storage.
 
 ---
 
-## Category D: Setup Action & Environment Bootstrap
+## Category D: Auto-Setup & Environment Bootstrap
 
-### F25: Setup Action Entrypoint
+### F25: Auto-Setup Integration (DEPRECATED as separate action)
 
 **Priority:** Must Have (P0)
 **Complexity:** High
 **Dependencies:** F1
+**Status:** COMPLETED (integrated into main action)
 
 **Description:**
-Provide a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment.
+Environment setup is integrated into the main action via auto-setup. The separate `uses: fro-bot/agent/setup@v0` action has been deprecated and removed.
 
 **Acceptance Criteria:**
-- [ ] `uses: fro-bot/agent/setup` available as separate action
-- [ ] Outputs: `opencode-path`, `opencode-version`, `gh-authenticated`, `setup-duration`, `cache-status`
+- [x] Auto-setup integrated into main action (`fro-bot/agent@v0`)
+- [x] OpenCode and oMo installed automatically on first run
+- [x] Outputs: `session-id`, `cache-status`, `duration`
 
 ---
 

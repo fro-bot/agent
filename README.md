@@ -30,7 +30,7 @@ Most CI agents run statelessly—they boot, do a task, and lose everything learn
 
 - **GitHub Integration** — Respond to issues, PRs, and discussions via comment triggers
 - **Persistent Memory** — Session state cached and restored across workflow runs
-- **Dual Entry Points** — Separate setup and agent actions for flexible workflows
+- **Auto-Setup** — OpenCode and oMo automatically installed on first run
 - **Acknowledgment UX** — Eyes reaction and working label provide visual feedback
 - **S3 Backup** — Optional write-through backup for cache eviction protection
 - **Session Management** — Search and reuse prior work via oMo session tools
@@ -56,10 +56,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: fro-bot/agent/setup@v0
-        with:
-          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-
       - uses: fro-bot/agent@v0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -68,14 +64,15 @@ jobs:
 
 ## Usage
 
-### Two-Action Architecture
+### Single Action Architecture
 
-Fro Bot provides two separate actions for maximum flexibility:
+Fro Bot provides a single action that handles both environment setup and agent execution:
 
-| Action                   | Purpose                                                      |
-| ------------------------ | ------------------------------------------------------------ |
-| `fro-bot/agent/setup@v0` | Bootstrap environment (install OpenCode, oMo, restore cache) |
-| `fro-bot/agent@v0`       | Execute the AI agent with the configured prompt              |
+| Action             | Purpose                                        |
+| ------------------ | ---------------------------------------------- |
+| `fro-bot/agent@v0` | Bootstrap environment and execute the AI agent |
+
+The action automatically installs OpenCode and oMo on first run, then executes the agent with the configured prompt.
 
 ### Supported Triggers
 
@@ -91,7 +88,7 @@ For security, the agent only responds to comments from users with `OWNER`, `MEMB
 
 ## Configuration
 
-### Main Action Inputs (`fro-bot/agent@v0`)
+### Action Inputs (`fro-bot/agent@v0`)
 
 | Input               | Required | Default    | Description                               |
 | ------------------- | -------- | ---------- | ----------------------------------------- |
@@ -101,23 +98,13 @@ For security, the agent only responds to comments from users with `OWNER`, `MEMB
 | `agent`             | No       | `Sisyphus` | Agent to use (must be primary agent)      |
 | `model`             | No       | —          | Model override (`provider/model` format)  |
 | `timeout`           | No       | `1800000`  | Execution timeout in ms (0 = no timeout)  |
+| `opencode-version`  | No       | `latest`   | OpenCode CLI version to install           |
 | `session-retention` | No       | `50`       | Number of sessions to retain              |
 | `s3-backup`         | No       | `false`    | Enable S3 write-through backup            |
 | `s3-bucket`         | No       | —          | S3 bucket for backup                      |
 | `aws-region`        | No       | —          | AWS region for S3 bucket                  |
 
-### Setup Action Inputs (`fro-bot/agent/setup@v0`)
-
-| Input              | Required | Default               | Description                            |
-| ------------------ | -------- | --------------------- | -------------------------------------- |
-| `auth-json`        | Yes      | —                     | JSON object with OpenCode credentials  |
-| `github-token`     | No       | `${{ github.token }}` | GitHub token for API access            |
-| `app-id`           | No       | —                     | GitHub App ID for elevated permissions |
-| `private-key`      | No       | —                     | GitHub App private key (PEM format)    |
-| `opencode-version` | No       | `latest`              | OpenCode CLI version to install        |
-| `skip-cache`       | No       | `false`               | Skip session cache restore             |
-
-### Main Action Outputs
+### Action Outputs
 
 | Output         | Description                                       |
 | -------------- | ------------------------------------------------- |
@@ -126,14 +113,6 @@ For security, the agent only responds to comments from users with `OWNER`, `MEMB
 | `duration`     | Run duration in seconds                           |
 
 ### Setup Action Outputs
-
-| Output             | Description                                  |
-| ------------------ | -------------------------------------------- |
-| `opencode-path`    | Path to the installed OpenCode CLI binary    |
-| `opencode-version` | Installed OpenCode CLI version               |
-| `storage-path`     | Path to OpenCode storage directory           |
-| `cache-status`     | Cache restore status                         |
-| `bot-login`        | GitHub bot login name for commit attribution |
 
 ## Secrets Setup
 
@@ -161,16 +140,12 @@ Create these secrets in your repository settings:
 For elevated permissions (push commits, create PRs), use a GitHub App:
 
 ```yaml
-- uses: fro-bot/agent/setup@v0
+- uses: fro-bot/agent@v0
   with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
     auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
     app-id: ${{ secrets.APP_ID }}
     private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-- uses: fro-bot/agent@v0
-  with:
-    github-token: ${{ steps.setup.outputs.token }}
-    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
 ```
 
 ### With S3 Backup
@@ -207,9 +182,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: fro-bot/agent/setup@v0
-        with:
-          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
       - uses: fro-bot/agent@v0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -269,16 +241,13 @@ Branch-scoped caching reduces the risk of cache poisoning while allowing memory 
 ```txt
 ├── src/
 │   ├── main.ts          # Agent execution entry point
-│   ├── setup.ts         # Environment bootstrap entry point
 │   └── lib/
 │       ├── agent/       # Agent execution, prompts, reactions
 │       ├── github/      # Octokit client, context parsing
-│       ├── setup/       # Installation, auth configuration
+│       ├── setup/       # Installation, auth configuration (library)
 │       ├── cache.ts     # Cache restore/save
 │       └── logger.ts    # JSON logging with redaction
-├── setup/
-│   └── action.yaml      # Setup action definition
-├── action.yaml          # Main action definition
+├── action.yaml          # Action definition
 └── dist/                # Bundled output (committed)
 ```
 

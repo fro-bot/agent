@@ -1,15 +1,21 @@
 # RFC-011: Setup Action & Environment Bootstrap
 
-**Status:** Pending
+**Status:** DEPRECATED
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 1
 
 ---
 
+> **DEPRECATION NOTICE:** This RFC originally specified a separate `uses: fro-bot/agent/setup@v0` action. This has been deprecated in favor of **auto-setup** integrated directly into the main action. The setup functionality described below is now part of the main action's execution flow, triggered automatically when OpenCode is not available.
+
+---
+
 ## Summary
 
-Implement a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment: installs OpenCode CLI, installs Oh My OpenCode (oMo) plugin, configures `gh` CLI with GitHub App credentials, populates `auth.json`, and prepares the workspace for agent execution. This mirrors the functionality of the oMo Sisyphus reusable workflow but as a composable TypeScript GitHub Action.
+~~Implement a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment~~
+
+**Current Implementation:** The main action (`uses: fro-bot/agent@v0`) now automatically handles environment setup via the `ensureOpenCodeAvailable()` function in `src/lib/agent/opencode.ts`. This includes installing OpenCode CLI, Oh My OpenCode (oMo) plugin, and configuring the workspace for agent execution.
 
 ## Dependencies
 

@@ -151,7 +151,7 @@ Fro Bot addresses this by:
 #### A. GitHub agent interactions
 
 1. **Triggers / entrypoints**
-   - The product ships as a **TypeScript GitHub Action** (Node.js 24 runtime) with one or more entrypoints (e.g. `uses: fro-bot/agent`, `uses: fro-bot/agent/setup`), not as a reusable workflow.
+   - The product ships as a **TypeScript GitHub Action** (Node.js 24 runtime) with a single entrypoint (`uses: fro-bot/agent`), not as a reusable workflow. Setup functionality is integrated into the main action via auto-setup.
    - **Core triggers (v1):**
 
      | Event | Supported Actions | Prompt Requirement | Scope |
@@ -275,11 +275,11 @@ Both layers operate on the same OpenCode storage directory (`~/.local/share/open
    - Default: keep last 50 sessions per repo, or sessions from last 30 days (whichever is larger).
    - Configurable via action input.
 
-### P0-B: Setup Action & Environment Bootstrap
+### P0-B: Auto-Setup & Environment Bootstrap
 
-The agent requires a dedicated setup phase that mirrors the oMo Sisyphus workflow functionality.
+The agent automatically handles environment setup as part of the main action execution.
 
-#### D. Setup action (`uses: fro-bot/agent/setup@v0`)
+#### D. Auto-setup (integrated into `fro-bot/agent@v0`)
 
 1. **OpenCode CLI installation**
    - Install OpenCode binary via `@actions/tool-cache` for cross-run caching.
@@ -1015,12 +1015,9 @@ The project uses **Node.js 24** as the GitHub Actions runtime. This aligns with:
 
 **Note:** The oMo Sisyphus reference implementation uses **Bun** in its reusable workflow. This project targets Node.js for the action runtime but **automatically installs Bun** when needed for oMo plugin installation, providing seamless compatibility without requiring users to configure Bun separately.
 
-### Multiple Entrypoints
+### Single Entrypoint with Auto-Setup
 
-To support `uses: fro-bot/agent/setup`, the project will need:
-
-- A `setup/action.yaml` in the repo root, or
-- A composite action pattern with multiple `action.yaml` files.
+The main action (`uses: fro-bot/agent`) handles both environment setup and agent execution. There is no separate setup action.
 
 ### Storage Format Versioning
 
