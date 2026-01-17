@@ -631,7 +631,7 @@ describe('buildAgentPrompt', () => {
 
 function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
   return {
-    triggerType: 'issue_comment',
+    eventType: 'issue_comment',
     eventName: 'issue_comment',
     repo: {owner: 'owner', repo: 'repo'},
     ref: 'refs/heads/main',
@@ -662,7 +662,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
 describe('getTriggerDirective', () => {
   it('returns respond directive for issue_comment', () => {
     // #given
-    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+    const context = createMockTriggerContext({eventType: 'issue_comment'})
 
     // #when
     const directive = getTriggerDirective(context, null)
@@ -674,7 +674,7 @@ describe('getTriggerDirective', () => {
 
   it('returns respond directive for discussion_comment', () => {
     // #given
-    const context = createMockTriggerContext({triggerType: 'discussion_comment'})
+    const context = createMockTriggerContext({eventType: 'discussion_comment'})
 
     // #when
     const directive = getTriggerDirective(context, null)
@@ -687,7 +687,7 @@ describe('getTriggerDirective', () => {
   it('returns triage directive for issues.opened', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'issues',
+      eventType: 'issues',
       raw: {payload: {action: 'opened'}} as unknown as TriggerContext['raw'],
     })
 
@@ -702,7 +702,7 @@ describe('getTriggerDirective', () => {
   it('returns mention directive for issues.edited', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'issues',
+      eventType: 'issues',
       raw: {payload: {action: 'edited'}} as unknown as TriggerContext['raw'],
     })
 
@@ -717,7 +717,7 @@ describe('getTriggerDirective', () => {
   it('returns review directive for pull_request', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'pull_request',
+      eventType: 'pull_request',
       target: {
         kind: 'pr',
         number: 99,
@@ -739,7 +739,7 @@ describe('getTriggerDirective', () => {
   it('returns file context directive for pull_request_review_comment', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'pull_request_review_comment',
+      eventType: 'pull_request_review_comment',
       target: {
         kind: 'pr',
         number: 99,
@@ -766,7 +766,7 @@ describe('getTriggerDirective', () => {
   it('returns prompt input for schedule with replace mode', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'schedule',
+      eventType: 'schedule',
       commentBody: 'Run daily maintenance tasks',
     })
     const promptInput = 'Run daily maintenance tasks'
@@ -782,7 +782,7 @@ describe('getTriggerDirective', () => {
   it('returns prompt input for workflow_dispatch with replace mode', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'workflow_dispatch',
+      eventType: 'workflow_dispatch',
       commentBody: 'Deploy to production',
     })
     const promptInput = 'Deploy to production'
@@ -799,7 +799,7 @@ describe('getTriggerDirective', () => {
 describe('buildTaskSection', () => {
   it('builds task section with directive only when no custom prompt', () => {
     // #given
-    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+    const context = createMockTriggerContext({eventType: 'issue_comment'})
 
     // #when
     const section = buildTaskSection(context, null)
@@ -812,7 +812,7 @@ describe('buildTaskSection', () => {
 
   it('appends custom prompt in append mode', () => {
     // #given
-    const context = createMockTriggerContext({triggerType: 'issue_comment'})
+    const context = createMockTriggerContext({eventType: 'issue_comment'})
     const customPrompt = 'Focus on security issues'
 
     // #when
@@ -826,7 +826,7 @@ describe('buildTaskSection', () => {
 
   it('replaces directive with custom prompt in replace mode (schedule)', () => {
     // #given
-    const context = createMockTriggerContext({triggerType: 'schedule'})
+    const context = createMockTriggerContext({eventType: 'schedule'})
     const customPrompt = 'Run maintenance tasks'
 
     // #when
@@ -840,7 +840,7 @@ describe('buildTaskSection', () => {
   it('includes review comment context in task section', () => {
     // #given
     const context = createMockTriggerContext({
-      triggerType: 'pull_request_review_comment',
+      eventType: 'pull_request_review_comment',
       target: {
         kind: 'pr',
         number: 99,

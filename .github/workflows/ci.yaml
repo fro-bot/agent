@@ -171,7 +171,7 @@ jobs:
           bunx oh-my-opencode get-local-version || true
 
           echo "OpenCode config files:"
-          find ~/.config/opencode -type f | sort
+          find ~/.config/opencode -maxdepth 2 -type f | sort
           [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
           [ -f ~/.config/opencode/oh-my-opencode.json ] && cat ~/.config/opencode/oh-my-opencode.json || true
 

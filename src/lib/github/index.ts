@@ -21,13 +21,5 @@ export {
   isPullRequest,
   parseGitHubContext,
 } from './context.js'
-export type {
-  Comment,
-  CommentTarget,
-  DiscussionCommentPayload,
-  EventType,
-  GitHubContext,
-  IssueCommentPayload,
-  Octokit,
-} from './types.js'
+export type {Comment, CommentTarget, EventType, GitHubContext, Octokit} from './types.js'
 export {BOT_COMMENT_MARKER} from './types.js'

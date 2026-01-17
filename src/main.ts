@@ -140,7 +140,7 @@ async function run(): Promise<number> {
     }
 
     triggerLogger.info('Event routed for processing', {
-      triggerType: triggerResult.context.triggerType,
+      eventType: triggerResult.context.eventType,
       hasMention: triggerResult.context.hasMention,
       command: triggerResult.context.command?.action ?? null,
     })
@@ -186,14 +186,14 @@ async function run(): Promise<number> {
 
     // 6b. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
-    const storagePath = getOpenCodeStoragePath()
+    const projectPath = process.env.GITHUB_WORKSPACE ?? process.cwd()
 
-    const recentSessions = await listSessions(storagePath, {limit: 10}, sessionLogger)
+    const recentSessions = await listSessions(projectPath, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = contextWithBranch.issueTitle ?? contextWithBranch.repo
-    const priorWorkContext = await searchSessions(searchQuery, storagePath, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(searchQuery, projectPath, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -208,6 +208,7 @@ async function run(): Promise<number> {
         recentSessions,
         priorWorkContext,
       },
+      triggerContext: triggerResult.context,
     }
 
     // 8. Execute OpenCode agent (skip in test mode)
