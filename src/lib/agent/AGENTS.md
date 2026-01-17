@@ -16,31 +16,25 @@
 
 ```typescript
 executeOpenCode(prompt, config, logger) // Main SDK execution
-verifyOpenCodeAvailable(path, logger) // Binary validation
-collectAgentContext(client, context, logger) // GitHub event context
+ensureOpenCodeAvailable(options) // Auto-setup if missing
+collectAgentContext(logger) // GitHub event context
 buildAgentPrompt(options, logger) // Multi-section prompt
-acknowledgeReceipt(ctx, logger) // Eyes + working label
-markSuccess(ctx, logger) // Replace with 🎉
-markFailure(ctx, logger) // Replace with 😕
+acknowledgeReceipt(client, ctx, logger) // Eyes + working label
+completeAcknowledgment(client, ctx, success, logger) // Finalize UX
 ```
 
 ## CONVENTIONS
 
 - **Reaction-based UX**:
-  - **Start**: 👀 (Eyes) reaction on triggering comment
-  - **Success**: Replace 👀 with 🎉 (Hooray)
-  - **Failure**: Replace 👀 with 😕 (Confused)
-  - **Non-fatal**: Reaction failures are logged but never crash the agent
-
-- **Working Label**:
-  - `agent: working` (color: `fcf2e1`) added on start
-  - Always removed on completion (success or failure)
-  - Created lazily if missing
+  - **Start**: 👀 (Eyes) on trigger + `agent: working` label (`fcf2e1`)
+  - **Success**: Replace 👀 with 🎉 (Hooray) + remove label
+  - **Failure**: Replace 👀 with 😕 (Confused) + remove label
+  - **Non-fatal**: UX failures logged but never crash execution
 
 - **Execution Safety**:
   - **SDK Mode**: Spawn OpenCode server, connect via SDK client (RFC-013)
-  - **Event Streaming**: SSE subscription for real-time logging (fire-and-forget)
-  - **Connection Retry**: 30 attempts with 1s delay for server startup
+  - **Connection**: 30 retries (1s delay) for server startup
+  - **Event Streaming**: SSE subscription for real-time logging
   - **Timings**: `startTime` / `duration` tracked for all operations
 
 ## ANTI-PATTERNS

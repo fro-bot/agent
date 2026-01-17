@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-14
-**Commit:** d8de37e
+**Generated:** 2026-01-16
+**Commit:** 0940f4d
 **Branch:** main
 
 ## OVERVIEW
@@ -15,6 +15,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ├── src/                  # TypeScript source
 │   ├── main.ts           # Primary entry (11-step orchestration with top-level await)
 │   ├── setup.ts          # Secondary entry (environment bootstrap)
+│   ├── post.ts           # Post-action hook (durable cache save, RFC-017)
 │   ├── index.ts          # Public API re-exports
 │   ├── lib/              # Core libraries
 │   │   ├── agent/        # Agent execution (context, prompt, reactions, opencode)
@@ -38,7 +39,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ├── RFCs/                 # 17 RFC documents (architecture specs)
 ├── .github/              # CI workflows, Renovate, settings
 ├── action.yaml           # Primary GitHub Action definition (node24)
-└── tsdown.config.ts      # esbuild bundler config (dual entry points)
+└── tsdown.config.ts      # esbuild bundler config (triple entry points)
 ```
 
 ## WHERE TO LOOK
@@ -47,10 +48,11 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | ---------------- | ---------------------------- | --------------------------------------------------- |
 | Add action logic | `src/main.ts`                | 11-step orchestration lifecycle                     |
 | Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation                       |
+| Post-action hook | `src/post.ts`                | Durable cache save (RFC-017), runs even on timeout  |
 | Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`, corruption checks  |
 | GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`               |
 | Event parsing    | `src/lib/github/context.ts`  | `parseGitHubContext()`, `classifyEventType()`       |
-| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()`, `verifyOpenCodeAvailable()`    |
+| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()` via SDK, event streaming        |
 | Prompt building  | `src/lib/agent/prompt.ts`    | `buildAgentPrompt()` with session instructions      |
 | GitHub reactions | `src/lib/agent/reactions.ts` | Eyes emoji, working label, success/failure          |
 | Session storage  | `src/lib/session/storage.ts` | `listProjects()`, `getSession()`, `deleteSession()` |
@@ -66,20 +68,21 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ## CODE MAP
 
-| Symbol              | Type      | Location                    | Role                              |
-| ------------------- | --------- | --------------------------- | --------------------------------- |
-| `run`               | Function  | `src/main.ts:60`            | Main entry, 11-step orchestration |
-| `runSetup`          | Function  | `src/lib/setup/setup.ts:64` | Setup orchestration               |
-| `restoreCache`      | Function  | `src/lib/cache.ts:50`       | Restore OpenCode state            |
-| `saveCache`         | Function  | `src/lib/cache.ts:136`      | Persist state to cache            |
-| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts` | SDK execution with event stream   |
-| `listSessions`      | Function  | `src/lib/session/search.ts` | Get recent sessions               |
-| `searchSessions`    | Function  | `src/lib/session/search.ts` | Search prior work context         |
-| `pruneSessions`     | Function  | `src/lib/session/prune.ts`  | Cleanup old sessions              |
-| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`      | Parse/validate inputs             |
-| `createLogger`      | Function  | `src/lib/logger.ts:108`     | Logger with redaction             |
-| `ActionInputs`      | Interface | `src/lib/types.ts:45`       | Input schema                      |
-| `CacheResult`       | Interface | `src/lib/types.ts:11`       | Cache restore result              |
+| Symbol              | Type      | Location                     | Role                              |
+| ------------------- | --------- | ---------------------------- | --------------------------------- |
+| `run`               | Function  | `src/main.ts:63`             | Main entry, 11-step orchestration |
+| `runSetup`          | Function  | `src/lib/setup/setup.ts:64`  | Setup orchestration               |
+| `restoreCache`      | Function  | `src/lib/cache.ts:50`        | Restore OpenCode state            |
+| `saveCache`         | Function  | `src/lib/cache.ts:136`       | Persist state to cache            |
+| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`  | SDK execution with event stream   |
+| `listSessions`      | Function  | `src/lib/session/search.ts`  | Get recent sessions               |
+| `searchSessions`    | Function  | `src/lib/session/search.ts`  | Search prior work context         |
+| `pruneSessions`     | Function  | `src/lib/session/prune.ts`   | Cleanup old sessions              |
+| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`       | Parse/validate inputs             |
+| `createLogger`      | Function  | `src/lib/logger.ts:108`      | Logger with redaction             |
+| `routeEvent`        | Function  | `src/lib/triggers/router.ts` | Event routing and skip-gating     |
+| `ActionInputs`      | Interface | `src/lib/types.ts:45`        | Input schema                      |
+| `CacheResult`       | Interface | `src/lib/types.ts:11`        | Cache restore result              |
 
 > See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`, `src/lib/session/`, `src/lib/triggers/`).
 
@@ -114,14 +117,15 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 - **ESM-only**: `"type": "module"`, use `.js` extensions in imports
 - **Function-based**: No ES6 classes, pure functions only
-- **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types (never for generic falsy checks).
+- **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types (never for generic falsy checks)
 - **Const assertions**: Use `as const` for fixed values
 - **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
+- **Logger injection**: All functions take `logger: Logger` as parameter
 
 ### Build
 
-- **tsdown**: esbuild wrapper bundling to `dist/main.js` + `dist/setup.js`
+- **tsdown**: esbuild wrapper bundling to `dist/main.js` + `dist/setup.js` + `dist/post.js`
 - **ESM shim**: Banner injects `createRequire` for CJS compat
 - **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`, `@bfra.me/es` (not external)
 - **Licenses**: Auto-extracted to `dist/licenses.txt`
@@ -129,7 +133,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ### Testing
 
-- **Vitest**: `pnpm test` runs all `*.test.ts` (349 tests, 24 files)
+- **Vitest**: `pnpm test` runs all `*.test.ts` (350+ tests, 24 files)
 - **Colocated**: Tests live alongside source
 - **No mocking libs**: vi.mock for externals only, functional testing otherwise
 - **Anti-.only**: `eslint-plugin-no-only-tests` blocks committing `.only`
@@ -163,17 +167,19 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Empty catch blocks                         | Log or rethrow errors               |
 | Global mutable state                       | Use dependency injection            |
 | Deleting failing tests                     | Fix the code instead                |
+| Mocking internal modules                   | Use dependency injection instead    |
 
 ## UNIQUE STYLES
 
 - **@bfra.me ecosystem**: ESLint, Prettier, TSConfig from `@bfra.me/*`
-- **Top-level await**: `main.ts` and `setup.ts` execute at module scope
-- **RFC-driven development**: Major features documented in `RFCs/` first
+- **Top-level await**: `main.ts`, `setup.ts`, `post.ts` execute at module scope
+- **RFC-driven development**: Major features documented in `RFCs/` first (17 total)
 - **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
 - **v-branch releases**: Main merges to `v0` for major version pinning
-- **Dual entry points**: Main action + setup action with separate bundled outputs
-- **Logger injection**: All functions take `logger: Logger` as parameter (37 files)
+- **Triple entry points**: Main action + setup action + post-action hook
+- **Logger injection**: All functions take `logger: Logger` as parameter
 - **Synthetic run summaries**: Session writeback creates fake "user" messages for discoverability
+- **Post-action hook**: `post.ts` ensures cache save even on main action timeout/crash
 
 ## COMMANDS
 
@@ -183,7 +189,7 @@ pnpm build            # Bundle to dist/ (REQUIRED before commit)
 pnpm check-types      # TypeScript validation
 pnpm lint             # ESLint
 pnpm fix              # ESLint --fix
-pnpm test             # Vitest (349 tests)
+pnpm test             # Vitest (350+ tests)
 ```
 
 ## NOTES
@@ -192,7 +198,8 @@ pnpm test             # Vitest (349 tests)
 - **GitHub App releases**: CI uses app token to push to protected `v0` branch
 - **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review
 - **Pre-commit hook**: `simple-git-hooks` runs `lint-staged`
-- **17 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context
+- **17 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook
+- **Phase 2 complete**: Core infrastructure done; Phase 3 (PR review, delegated work) pending
 
 ## EXTERNAL RESOURCES
 
