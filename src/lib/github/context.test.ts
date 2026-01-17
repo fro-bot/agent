@@ -201,7 +201,7 @@ describe('getCommentTarget', () => {
     })
   })
 
-  it('returns null for discussion events (not yet implemented)', () => {
+  it('returns discussion target for discussion_comment events', () => {
     const context: GitHubContext = {
       eventName: 'discussion',
       eventType: 'discussion_comment',
@@ -210,12 +210,19 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {},
+      payload: {
+        discussion: {number: 99},
+      },
     }
 
     const target = getCommentTarget(context)
 
-    expect(target).toBeNull()
+    expect(target).toEqual({
+      type: 'discussion',
+      number: 99,
+      owner: 'test-owner',
+      repo: 'test-repo',
+    })
   })
 
   it('returns null for unknown events', () => {

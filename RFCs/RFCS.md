@@ -25,7 +25,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Completed  |
 | RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Completed  |
 | RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Completed  |
-| RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending    |
+| RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Completed  |
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending    |
 | RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending    |
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed  |
