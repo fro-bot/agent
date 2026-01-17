@@ -27,7 +27,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Completed  |
 | RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Completed  |
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Completed  |
-| RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending    |
+| RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Completed  |
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed  |
 | RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Superseded |
 | RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
@@ -189,8 +189,8 @@ RFC-001 (Foundation)
 | F3: Discussion Comment Interaction      | RFC-008          | Pending   |
 | F4: PR Conversation Comments            | RFC-008          | Pending   |
 | F5: PR Review Comments                  | RFC-009          | Completed |
-| F6: Delegated Work - Push Commits       | RFC-010          | Pending   |
-| F7: Delegated Work - Open PRs           | RFC-010          | Pending   |
+| F6: Delegated Work - Push Commits       | RFC-010          | Completed |
+| F7: Delegated Work - Open PRs           | RFC-010          | Completed |
 | F8: Comment Idempotency                 | RFC-008          | Pending   |
 | F9: Anti-Loop Protection                | RFC-005          | Completed |
 | F10: Reactions & Labels Acknowledgment  | RFC-013          | Completed |
