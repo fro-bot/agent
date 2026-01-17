@@ -46,7 +46,9 @@ export async function createBranch(
       created: true,
     }
   } catch (error) {
-    if (error instanceof Error && error.message.includes('Reference already exists')) {
+    // Extract message safely - handles non-Error throws (e.g., string literals)
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('Reference already exists')) {
       logger.info('Branch already exists', {branchName})
 
       const {data: existingRef} = await octokit.rest.git.getRef({

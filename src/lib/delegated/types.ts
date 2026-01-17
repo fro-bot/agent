@@ -122,8 +122,12 @@ export interface GeneratePRBodyOptions {
 export const FILE_VALIDATION = {
   /** Maximum file size in bytes (5MB) */
   MAX_FILE_SIZE_BYTES: 5 * 1024 * 1024,
-  /** Forbidden path patterns */
-  FORBIDDEN_PATTERNS: [/^\.\.\//, /^\.git\//, /\.\.\//, /\/\.git\//] as readonly RegExp[],
+  /** Forbidden path patterns (path traversal and .git directories) */
+  FORBIDDEN_PATTERNS: [
+    /\.\.\//, // Path traversal anywhere (covers ../foo and foo/../bar)
+    /^\.git\//, // .git directory at start (.git/config)
+    /\/\.git\//, // .git directory in path (foo/.git/config)
+  ] as readonly RegExp[],
   /** Forbidden file names (secrets) */
   FORBIDDEN_FILES: ['.env', '.env.local', '.env.production', 'credentials.json', 'auth.json'] as const,
   /** Forbidden extensions */
