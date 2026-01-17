@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-01-16
-**Commit:** 0940f4d
+**Commit:** 3d85a4d
 **Branch:** main
 
 ## OVERVIEW
@@ -13,103 +13,80 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ```
 ./
 ├── src/                  # TypeScript source
-│   ├── main.ts           # Primary entry (11-step orchestration with top-level await)
+│   ├── main.ts           # Primary entry (11-step orchestration)
 │   ├── setup.ts          # Secondary entry (environment bootstrap)
 │   ├── post.ts           # Post-action hook (durable cache save, RFC-017)
 │   ├── index.ts          # Public API re-exports
-│   ├── lib/              # Core libraries
-│   │   ├── agent/        # Agent execution (context, prompt, reactions, opencode)
+│   ├── lib/              # Core libraries (see subdir AGENTS.md)
+│   │   ├── agent/        # SDK execution, prompts, reactions
 │   │   ├── github/       # Octokit client, context parsing
-│   │   ├── setup/        # Environment bootstrap (bun, omo, opencode, auth)
-│   │   ├── session/      # Session persistence (storage, search, prune, writeback)
-│   │   ├── triggers/     # Event routing, skip conditions, mock events (RFC-005)
+│   │   ├── setup/        # Bun, oMo, OpenCode installation
+│   │   ├── session/      # Persistence layer (search, prune, writeback)
+│   │   ├── triggers/     # Event routing, skip conditions
 │   │   ├── cache.ts      # Cache restore/save with corruption detection
-│   │   ├── cache-key.ts  # Branch-scoped key generation
 │   │   ├── logger.ts     # JSON logging with auto-redaction
 │   │   ├── inputs.ts     # Action input parsing (Result type)
-│   │   ├── outputs.ts    # Action output setting
-│   │   ├── types.ts      # Core interfaces
-│   │   └── constants.ts  # Config values
-│   └── utils/            # Pure utility functions
-│       ├── env.ts        # Environment variable getters
-│       └── validation.ts # Input validators
+│   │   └── types.ts      # Core interfaces
+│   └── utils/            # Pure utility functions (env, validation)
 ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
 ├── setup/                # Setup action definition
-│   └── action.yaml       # Secondary action (../dist/setup.js)
 ├── RFCs/                 # 17 RFC documents (architecture specs)
-├── .github/              # CI workflows, Renovate, settings
 ├── action.yaml           # Primary GitHub Action definition (node24)
 └── tsdown.config.ts      # esbuild bundler config (triple entry points)
 ```
 
 ## WHERE TO LOOK
 
-| Task             | Location                     | Notes                                               |
-| ---------------- | ---------------------------- | --------------------------------------------------- |
-| Add action logic | `src/main.ts`                | 11-step orchestration lifecycle                     |
-| Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation                       |
-| Post-action hook | `src/post.ts`                | Durable cache save (RFC-017), runs even on timeout  |
-| Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`, corruption checks  |
-| GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`               |
-| Event parsing    | `src/lib/github/context.ts`  | `parseGitHubContext()`, `classifyEventType()`       |
-| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()` via SDK, event streaming        |
-| Prompt building  | `src/lib/agent/prompt.ts`    | `buildAgentPrompt()` with session instructions      |
-| GitHub reactions | `src/lib/agent/reactions.ts` | Eyes emoji, working label, success/failure          |
-| Session storage  | `src/lib/session/storage.ts` | `listProjects()`, `getSession()`, `deleteSession()` |
-| Session search   | `src/lib/session/search.ts`  | `listSessions()`, `searchSessions()`                |
-| Session pruning  | `src/lib/session/prune.ts`   | `pruneSessions()` with retention policy             |
-| Input parsing    | `src/lib/inputs.ts`          | `parseActionInputs()` returns `Result<T, E>`        |
-| Output setting   | `src/lib/outputs.ts`         | `setActionOutputs()`                                |
-| Logging          | `src/lib/logger.ts`          | `createLogger()` with sensitive field redaction     |
-| Core types       | `src/lib/types.ts`           | `ActionInputs`, `CacheResult`, `RunContext`         |
-| Build config     | `tsdown.config.ts`           | ESM shim, bundled deps, license extraction          |
-| Action I/O       | `action.yaml`                | Inputs, outputs, node24 runtime                     |
-| CI pipeline      | `.github/workflows/ci.yaml`  | Path-filtered jobs, v-branch release                |
+| Task             | Location                     | Notes                                       |
+| ---------------- | ---------------------------- | ------------------------------------------- |
+| Add action logic | `src/main.ts`                | 11-step orchestration lifecycle             |
+| Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation               |
+| Post-action hook | `src/post.ts`                | Durable cache save (RFC-017)                |
+| Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`             |
+| GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`       |
+| Event parsing    | `src/lib/github/context.ts`  | `parseGitHubContext()`                      |
+| Agent execution  | `src/lib/agent/opencode.ts`  | `executeOpenCode()` via SDK                 |
+| Prompt building  | `src/lib/agent/prompt.ts`    | `buildAgentPrompt()`                        |
+| Session storage  | `src/lib/session/storage.ts` | File I/O, project discovery                 |
+| Session search   | `src/lib/session/search.ts`  | `listSessions()`, `searchSessions()`        |
+| Event routing    | `src/lib/triggers/router.ts` | `routeEvent()`, skip conditions             |
+| Input parsing    | `src/lib/inputs.ts`          | `parseActionInputs()` returns Result        |
+| Logging          | `src/lib/logger.ts`          | `createLogger()` with redaction             |
+| Core types       | `src/lib/types.ts`           | `ActionInputs`, `CacheResult`, `RunContext` |
+| Build config     | `tsdown.config.ts`           | ESM shim, bundled deps, license extraction  |
 
 ## CODE MAP
 
 | Symbol              | Type      | Location                     | Role                              |
 | ------------------- | --------- | ---------------------------- | --------------------------------- |
 | `run`               | Function  | `src/main.ts:63`             | Main entry, 11-step orchestration |
-| `runSetup`          | Function  | `src/lib/setup/setup.ts:64`  | Setup orchestration               |
-| `restoreCache`      | Function  | `src/lib/cache.ts:50`        | Restore OpenCode state            |
-| `saveCache`         | Function  | `src/lib/cache.ts:136`       | Persist state to cache            |
-| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`  | SDK execution with event stream   |
-| `listSessions`      | Function  | `src/lib/session/search.ts`  | Get recent sessions               |
-| `searchSessions`    | Function  | `src/lib/session/search.ts`  | Search prior work context         |
-| `pruneSessions`     | Function  | `src/lib/session/prune.ts`   | Cleanup old sessions              |
-| `parseActionInputs` | Function  | `src/lib/inputs.ts:14`       | Parse/validate inputs             |
-| `createLogger`      | Function  | `src/lib/logger.ts:108`      | Logger with redaction             |
-| `routeEvent`        | Function  | `src/lib/triggers/router.ts` | Event routing and skip-gating     |
-| `ActionInputs`      | Interface | `src/lib/types.ts:45`        | Input schema                      |
-| `CacheResult`       | Interface | `src/lib/types.ts:11`        | Cache restore result              |
+| `runSetup`          | Function  | `src/lib/setup/setup.ts`     | Setup orchestration               |
+| `runPost`           | Function  | `src/post.ts:31`             | Post-action cache save            |
+| `restoreCache`      | Function  | `src/lib/cache.ts`           | Restore OpenCode state            |
+| `saveCache`         | Function  | `src/lib/cache.ts`           | Persist state to cache            |
+| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`  | SDK execution with events         |
+| `routeEvent`        | Function  | `src/lib/triggers/router.ts` | Event routing + skip-gating       |
+| `parseActionInputs` | Function  | `src/lib/inputs.ts`          | Parse/validate inputs             |
+| `createLogger`      | Function  | `src/lib/logger.ts`          | Logger with redaction             |
+| `ActionInputs`      | Interface | `src/lib/types.ts`           | Input schema                      |
+| `CacheResult`       | Interface | `src/lib/types.ts`           | Cache restore result              |
+| `TriggerResult`     | Interface | `src/lib/triggers/types.ts`  | Routing decision                  |
 
-> See subdirectory AGENTS.md files for module-specific symbols (`src/lib/agent/`, `src/lib/github/`, `src/lib/setup/`, `src/lib/session/`, `src/lib/triggers/`).
+## TDD (MANDATORY)
 
-## TDD (Test-Driven Development)
+**RED-GREEN-REFACTOR for all new features and bug fixes.**
 
-**MANDATORY for new features and bug fixes.** Follow RED-GREEN-REFACTOR:
-
-| Phase        | Action                     | Verification                  |
-| ------------ | -------------------------- | ----------------------------- |
-| **RED**      | Write failing test first   | `pnpm test` → FAIL (expected) |
-| **GREEN**    | Write MINIMAL code to pass | `pnpm test` → PASS            |
-| **REFACTOR** | Clean up, keep tests green | `pnpm test` → PASS            |
-
-**Rules:**
+| Phase        | Action                     | Verification       |
+| ------------ | -------------------------- | ------------------ |
+| **RED**      | Write failing test first   | `pnpm test` → FAIL |
+| **GREEN**    | Write MINIMAL code to pass | `pnpm test` → PASS |
+| **REFACTOR** | Clean up, keep tests green | `pnpm test` → PASS |
 
 - NEVER write implementation before test
 - NEVER delete failing tests - fix the code
 - Test naming: `*.test.ts` colocated with source
-- Use `// #given`, `// #when`, `// #then` comments
-
-**Test patterns:**
-
+- BDD comments: `// #given`, `// #when`, `// #then`
 - `vi.mock()` ONLY for external deps (`@actions/core`, `@actions/github`)
-- Create inline mock helpers for internal types (Logger, CacheAdapter)
-- `beforeEach`/`afterEach` for env cleanup with `vi.clearAllMocks()`/`vi.restoreAllMocks()`
-
-**Integration test:** `main.test.ts` spawns bundled `dist/main.js` as child process (black-box)
 
 ## CONVENTIONS
 
@@ -117,7 +94,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 - **ESM-only**: `"type": "module"`, use `.js` extensions in imports
 - **Function-based**: No ES6 classes, pure functions only
-- **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types (never for generic falsy checks)
+- **Strict booleans**: Use `!= null` or `Boolean()`, never implicit falsy (`!value`)
 - **Const assertions**: Use `as const` for fixed values
 - **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
@@ -125,25 +102,10 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ### Build
 
-- **tsdown**: esbuild wrapper bundling to `dist/main.js` + `dist/setup.js` + `dist/post.js`
+- **tsdown**: Bundles to `dist/main.js` + `dist/setup.js` + `dist/post.js`
 - **ESM shim**: Banner injects `createRequire` for CJS compat
-- **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`, `@bfra.me/es` (not external)
-- **Licenses**: Auto-extracted to `dist/licenses.txt`
-- **dist/ committed**: MUST run `pnpm build` after src changes; CI fails if out of sync
-
-### Testing
-
-- **Vitest**: `pnpm test` runs all `*.test.ts` (350+ tests, 24 files)
-- **Colocated**: Tests live alongside source
-- **No mocking libs**: vi.mock for externals only, functional testing otherwise
-- **Anti-.only**: `eslint-plugin-no-only-tests` blocks committing `.only`
-- **Lowercase titles**: `vitest/prefer-lowercase-title` (except `describe`)
-
-### Release
-
-- **v-branch strategy**: `main` merges to `v0` for stable refs (`@v0`, `@v0.3.2`)
-- **Semantic release**: Conventional commits drive versioning
-- **Patch triggers**: `build:` and `docs(readme):` commits
+- **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`
+- **dist/ committed**: MUST run `pnpm build` after src changes
 
 ### Security
 
@@ -152,34 +114,30 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 - **Log redaction**: Auto-redacts `token`, `password`, `secret`, `key`, `auth`
 - **Authorization gating**: Only `OWNER`, `MEMBER`, `COLLABORATOR`; bots blocked
 
-## ANTI-PATTERNS (THIS PROJECT)
+## ANTI-PATTERNS
 
-| Forbidden                                  | Reason                              |
-| ------------------------------------------ | ----------------------------------- |
-| ES6 classes                                | Use functions for composability     |
-| `if (!value)` (implicit falsy)             | Violates strict-boolean-expressions |
-| `as any`, `@ts-ignore`, `@ts-expect-error` | Maintain type safety                |
-| Manual dist edits                          | Rebuilt by CI; will be overwritten  |
-| Committing without `pnpm build`            | CI validates dist/ in sync          |
-| Mocking libraries (jest, sinon)            | Functional testing only             |
-| CommonJS `require()`                       | ESM-only project                    |
-| Caching secrets                            | Security risk                       |
-| Empty catch blocks                         | Log or rethrow errors               |
-| Global mutable state                       | Use dependency injection            |
-| Deleting failing tests                     | Fix the code instead                |
-| Mocking internal modules                   | Use dependency injection instead    |
+| Forbidden                       | Reason                              |
+| ------------------------------- | ----------------------------------- |
+| ES6 classes                     | Use functions for composability     |
+| `if (!value)` (implicit falsy)  | Violates strict-boolean-expressions |
+| `as any`, `@ts-ignore`          | Maintain type safety                |
+| Manual dist edits               | Rebuilt by CI; will be overwritten  |
+| Committing without `pnpm build` | CI validates dist/ in sync          |
+| CommonJS `require()`            | ESM-only project                    |
+| Caching secrets                 | Security risk                       |
+| Empty catch blocks              | Log or rethrow errors               |
+| Global mutable state            | Use dependency injection            |
+| Deleting failing tests          | Fix the code instead                |
 
 ## UNIQUE STYLES
 
-- **@bfra.me ecosystem**: ESLint, Prettier, TSConfig from `@bfra.me/*`
-- **Top-level await**: `main.ts`, `setup.ts`, `post.ts` execute at module scope
+- **Triple entry points**: Main action + setup action + post-action hook
 - **RFC-driven development**: Major features documented in `RFCs/` first (17 total)
 - **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
 - **v-branch releases**: Main merges to `v0` for major version pinning
-- **Triple entry points**: Main action + setup action + post-action hook
 - **Logger injection**: All functions take `logger: Logger` as parameter
-- **Synthetic run summaries**: Session writeback creates fake "user" messages for discoverability
-- **Post-action hook**: `post.ts` ensures cache save even on main action timeout/crash
+- **Synthetic run summaries**: Session writeback creates "user" messages for discoverability
+- **Post-action hook**: `post.ts` ensures cache save even on timeout/crash
 
 ## COMMANDS
 
@@ -195,48 +153,25 @@ pnpm test             # Vitest (350+ tests)
 ## NOTES
 
 - **dist/ committed**: CI fails if `git diff dist/` shows changes after build
-- **GitHub App releases**: CI uses app token to push to protected `v0` branch
-- **Security scanning**: CodeQL + OSSF Scorecard + Dependency Review
-- **Pre-commit hook**: `simple-git-hooks` runs `lint-staged`
+- **Node 24 required**: Matches `action.yaml` runtime
 - **17 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook
 - **Phase 2 complete**: Core infrastructure done; Phase 3 (PR review, delegated work) pending
 
 ## EXTERNAL RESOURCES
 
-### Dependencies (from package.json)
-
-@actions/cache, @actions/core, @actions/exec, @actions/github, @actions/tool-cache, @bfra.me/es, @octokit/auth-app, @opencode-ai/sdk, vitest, tsdown, typescript
-
 ### Context7 IDs
 
-| Library                | ID                          | Snippets | Score |
-| ---------------------- | --------------------------- | -------- | ----- |
-| GitHub Actions Toolkit | /actions/toolkit            | 332      | 87.4  |
-| GitHub Actions Cache   | /actions/cache              | 73       | 79.0  |
-| GitHub Actions Docs    | /websites/github_en_actions | 6032     | 72.7  |
-| Vitest                 | /vitest-dev/vitest          | 2776     | 90.4  |
-| Vitest Docs            | /websites/main_vitest_dev   | 1295     | 94.0  |
-| tsdown                 | /rolldown/tsdown            | 279      | 85.3  |
-| tsdown Docs            | /websites/tsdown_dev        | 389      | 82.1  |
-| OpenCode SDK           | /sst/opencode-sdk-js        | 96       | 83.4  |
-| OpenCode               | /anomalyco/opencode         | 1231     | 73.4  |
-
-### GitHub Repos
-
-- actions/toolkit - GitHub Actions SDK (@actions/core, @actions/cache, @actions/github)
-- actions/cache - Cache action for workflows
-- vitest-dev/vitest - Test framework
-- rolldown/tsdown - Build bundler (Rolldown-powered)
-- octokit/auth-app.js - GitHub App authentication
-- anomalyco/opencode-sdk-js - OpenCode SDK for TypeScript
-- anomalyco/opencode - OpenCode AI agent
+| Library                | ID                   | Snippets |
+| ---------------------- | -------------------- | -------- |
+| GitHub Actions Toolkit | /actions/toolkit     | 332      |
+| GitHub Actions Cache   | /actions/cache       | 73       |
+| Vitest                 | /vitest-dev/vitest   | 2776     |
+| tsdown                 | /rolldown/tsdown     | 279      |
+| OpenCode SDK           | /sst/opencode-sdk-js | 96       |
 
 ### Documentation
 
-- https://github.com/actions/toolkit/tree/main/packages/core - @actions/core API
-- https://github.com/actions/toolkit/tree/main/packages/cache - @actions/cache API
-- https://github.com/actions/toolkit/tree/main/packages/github - @actions/github (Octokit)
+- https://github.com/actions/toolkit - @actions/core, @actions/cache, @actions/github
 - https://vitest.dev - Vitest testing framework
-- https://docs.github.com/en/actions - GitHub Actions official docs
-- https://tsdown.dev - tsdown bundler documentation
+- https://tsdown.dev - tsdown bundler
 - https://opencode.ai - OpenCode AI coding agent
