@@ -260,7 +260,7 @@ describe('ensureProjectId', () => {
     await fs.mkdir(actualGitDir, {recursive: true})
     await fs.writeFile(path.join(workspacePath, '.git'), `gitdir: ${actualGitDir}`, 'utf8')
 
-    const rootCommitSha = 'worktree123'
+    const rootCommitSha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'
     const execAdapter = createMockExecAdapter({stdout: `${rootCommitSha}\n`})
 
     const options: ProjectIdOptions = {
@@ -275,6 +275,10 @@ describe('ensureProjectId', () => {
     // #then it handles the worktree and returns generated ID
     expect(result.projectId).toBe(rootCommitSha)
     expect(result.source).toBe('generated')
+
+    // #then it writes to actual git directory, not workspace
+    const cachedInActualDir = await fs.readFile(path.join(actualGitDir, 'opencode'), 'utf8')
+    expect(cachedInActualDir).toBe(rootCommitSha)
   })
 
   it('regenerates when cached ID has invalid SHA format', async () => {

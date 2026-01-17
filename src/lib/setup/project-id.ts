@@ -32,8 +32,8 @@ function createDefaultExecAdapter(): ExecAdapter {
  */
 export async function ensureProjectId(options: ProjectIdOptions): Promise<ProjectIdResult> {
   const {workspacePath, logger, execAdapter = createDefaultExecAdapter()} = options
-  const gitDir = path.join(workspacePath, '.git')
-  const projectIdFile = path.join(gitDir, 'opencode')
+  let gitDir = path.join(workspacePath, '.git')
+  let projectIdFile = path.join(gitDir, 'opencode')
 
   try {
     const cachedId = await fs.readFile(projectIdFile, 'utf8')
@@ -45,7 +45,11 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
       }
       logger.warning('Invalid cached project ID format, regenerating', {cachedId: trimmedId})
     }
-  } catch {}
+  } catch (error) {
+    logger.debug('No cached project ID found', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
 
   try {
     const stat = await fs.stat(gitDir)
@@ -55,6 +59,8 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
       if (gitdirMatch == null) {
         return {projectId: null, source: 'error', error: 'Invalid .git file format'}
       }
+      gitDir = path.resolve(workspacePath, gitdirMatch[1] as string)
+      projectIdFile = path.join(gitDir, 'opencode')
     }
   } catch {
     return {projectId: null, source: 'error', error: 'Not a git repository'}
