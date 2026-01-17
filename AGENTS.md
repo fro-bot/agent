@@ -57,20 +57,21 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ## CODE MAP
 
-| Symbol              | Type      | Location                     | Role                              |
-| ------------------- | --------- | ---------------------------- | --------------------------------- |
-| `run`               | Function  | `src/main.ts:63`             | Main entry, 11-step orchestration |
-| `runSetup`          | Function  | `src/lib/setup/setup.ts`     | Setup orchestration               |
-| `runPost`           | Function  | `src/post.ts:31`             | Post-action cache save            |
-| `restoreCache`      | Function  | `src/lib/cache.ts`           | Restore OpenCode state            |
-| `saveCache`         | Function  | `src/lib/cache.ts`           | Persist state to cache            |
-| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`  | SDK execution with events         |
-| `routeEvent`        | Function  | `src/lib/triggers/router.ts` | Event routing + skip-gating       |
-| `parseActionInputs` | Function  | `src/lib/inputs.ts`          | Parse/validate inputs             |
-| `createLogger`      | Function  | `src/lib/logger.ts`          | Logger with redaction             |
-| `ActionInputs`      | Interface | `src/lib/types.ts`           | Input schema                      |
-| `CacheResult`       | Interface | `src/lib/types.ts`           | Cache restore result              |
-| `TriggerResult`     | Interface | `src/lib/triggers/types.ts`  | Routing decision                  |
+| Symbol              | Type      | Location                      | Role                              |
+| ------------------- | --------- | ----------------------------- | --------------------------------- |
+| `run`               | Function  | `src/main.ts:63`              | Main entry, 11-step orchestration |
+| `runSetup`          | Function  | `src/lib/setup/setup.ts`      | Setup orchestration               |
+| `runPost`           | Function  | `src/post.ts:31`              | Post-action cache save            |
+| `restoreCache`      | Function  | `src/lib/cache.ts`            | Restore OpenCode state            |
+| `saveCache`         | Function  | `src/lib/cache.ts`            | Persist state to cache            |
+| `ensureProjectId`   | Function  | `src/lib/setup/project-id.ts` | Deterministic project ID creation |
+| `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`   | SDK execution with events         |
+| `routeEvent`        | Function  | `src/lib/triggers/router.ts`  | Event routing + skip-gating       |
+| `parseActionInputs` | Function  | `src/lib/inputs.ts`           | Parse/validate inputs             |
+| `createLogger`      | Function  | `src/lib/logger.ts`           | Logger with redaction             |
+| `ActionInputs`      | Interface | `src/lib/types.ts`            | Input schema                      |
+| `CacheResult`       | Interface | `src/lib/types.ts`            | Cache restore result              |
+| `TriggerResult`     | Interface | `src/lib/triggers/types.ts`   | Routing decision                  |
 
 ## TDD (MANDATORY)
 
@@ -94,7 +95,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 - **ESM-only**: `"type": "module"`, use `.js` extensions in imports
 - **Function-based**: No ES6 classes, pure functions only
-- **Strict booleans**: Use `!= null` or `Boolean()`, never implicit falsy (`!value`)
+- **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types (never for generic falsy checks)
 - **Const assertions**: Use `as const` for fixed values
 - **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors

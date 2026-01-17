@@ -29,6 +29,7 @@ export interface RestoreCacheOptions {
   readonly logger: Logger
   readonly storagePath: string
   readonly authPath: string
+  readonly projectIdPath?: string
   readonly cacheAdapter?: CacheAdapter
 }
 
@@ -38,6 +39,7 @@ export interface SaveCacheOptions {
   readonly logger: Logger
   readonly storagePath: string
   readonly authPath: string
+  readonly projectIdPath?: string
   readonly cacheAdapter?: CacheAdapter
 }
 
@@ -48,7 +50,7 @@ export interface SaveCacheOptions {
  * Corruption is detected and reported but does not throw.
  */
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
-  const {components, logger, storagePath, authPath, cacheAdapter = defaultCacheAdapter} = options
+  const {components, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache restore (SKIP_CACHE=true)')
@@ -63,11 +65,12 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
+  const cachePaths = projectIdPath == null ? [storagePath] : [storagePath, projectIdPath]
 
-  logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys]})
+  logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
   try {
-    const restoredKey = await cacheAdapter.restoreCache([storagePath], primaryKey, [...restoreKeys])
+    const restoredKey = await cacheAdapter.restoreCache(cachePaths, primaryKey, [...restoreKeys])
 
     if (restoredKey == null) {
       logger.info('Cache miss - starting with fresh state')
@@ -134,7 +137,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
  * Excludes auth.json from being saved.
  */
 export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
-  const {components, runId, logger, storagePath, authPath, cacheAdapter = defaultCacheAdapter} = options
+  const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache save (SKIP_CACHE=true)')
@@ -142,8 +145,9 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   }
 
   const saveKey = buildSaveCacheKey(components, runId)
+  const cachePaths = projectIdPath == null ? [storagePath] : [storagePath, projectIdPath]
 
-  logger.info('Saving cache', {saveKey})
+  logger.info('Saving cache', {saveKey, paths: cachePaths})
 
   try {
     await deleteAuthJson(authPath, storagePath, logger)
@@ -156,7 +160,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
 
     await writeStorageVersion(storagePath)
 
-    await cacheAdapter.saveCache([storagePath], saveKey)
+    await cacheAdapter.saveCache(cachePaths, saveKey)
     logger.info('Cache saved', {saveKey})
     return true
   } catch (error) {

@@ -23,6 +23,7 @@ import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {Octokit} from './lib/github/types.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {
@@ -45,12 +46,14 @@ import {
   searchSessions,
   writeSessionSummary,
 } from './lib/session/index.js'
+import {ensureProjectId} from './lib/setup/project-id.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {routeEvent} from './lib/triggers/index.js'
 import {
   getGitHubRefName,
   getGitHubRepository,
   getGitHubRunId,
+  getGitHubWorkspace,
   getOpenCodeAuthPath,
   getOpenCodeStoragePath,
   getRunnerOS,
@@ -170,11 +173,15 @@ async function run(): Promise<number> {
     }
 
     const cacheLogger = createLogger({phase: 'cache'})
+    const workspacePath = getGitHubWorkspace()
+    const projectIdPath = path.join(workspacePath, '.git', 'opencode')
+
     const cacheResult: CacheResult = await restoreCache({
       components: cacheComponents,
       logger: cacheLogger,
       storagePath: getOpenCodeStoragePath(),
       authPath: getOpenCodeAuthPath(),
+      projectIdPath,
     })
 
     const cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted
@@ -184,16 +191,23 @@ async function run(): Promise<number> {
         : 'miss'
     logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
 
-    // 6b. Session introspection (RFC-004) - gather prior session context
-    const sessionLogger = createLogger({phase: 'session'})
-    const projectPath = process.env.GITHUB_WORKSPACE ?? process.cwd()
+    // 6b. Ensure deterministic project ID (after cache restore, before session introspection)
+    const projectIdResult = await ensureProjectId({workspacePath, logger: cacheLogger})
+    if (projectIdResult.source === 'error') {
+      cacheLogger.warning('Failed to generate project ID (continuing)', {error: projectIdResult.error})
+    } else {
+      cacheLogger.debug('Project ID ready', {projectId: projectIdResult.projectId, source: projectIdResult.source})
+    }
 
-    const recentSessions = await listSessions(projectPath, {limit: 10}, sessionLogger)
+    // 6c. Session introspection (RFC-004) - gather prior session context
+    const sessionLogger = createLogger({phase: 'session'})
+
+    const recentSessions = await listSessions(workspacePath, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = contextWithBranch.issueTitle ?? contextWithBranch.repo
-    const priorWorkContext = await searchSessions(searchQuery, projectPath, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(searchQuery, workspacePath, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -330,12 +344,16 @@ async function run(): Promise<number> {
       }
 
       const cacheLogger = createLogger({phase: 'cache-save'})
+      const finalWorkspace = getGitHubWorkspace()
+      const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
+
       const cacheSaved = await saveCache({
         components: cacheComponents,
         runId: getGitHubRunId(),
         logger: cacheLogger,
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
+        projectIdPath: finalProjectIdPath,
       })
 
       if (cacheSaved) {
