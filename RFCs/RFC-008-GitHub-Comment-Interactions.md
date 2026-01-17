@@ -1,9 +1,38 @@
 # RFC-008: GitHub Comment Interactions
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** Medium
 **Phase:** 3
+**Completed:** 2026-01-17
+
+---
+
+## Completion Summary
+
+RFC-008 has been fully implemented with the following components:
+
+### Files Created
+
+- `src/lib/comments/types.ts` - ThreadComment, Thread, ErrorInfo, PostCommentResult types
+- `src/lib/comments/reader.ts` - `readThread()`, `findBotComment()`, pagination for Issues/PRs/Discussions
+- `src/lib/comments/writer.ts` - `postComment()`, `isBotComment()`, idempotent updates, GraphQL mutations
+- `src/lib/comments/error-format.ts` - `formatErrorComment()`, error creation helpers
+- `src/lib/comments/index.ts` - Public API exports
+- `src/lib/comments/AGENTS.md` - Module documentation
+- Test files: 37 tests total for the comments module
+
+### Integration Points
+
+- `src/lib/github/context.ts` - `getCommentTarget()` now handles `discussion_comment` events
+- `src/lib/triggers/issue-comment.ts` - `handleIssueComment()` implemented using comments module
+
+### Deviations from Spec
+
+1. **Reactions module not created** - `src/lib/comments/reactions.ts` was NOT implemented because `src/lib/agent/reactions.ts` already satisfies F43 (Reactions & Labels). No duplication needed.
+2. **Thread type simplified** - `Thread` interface uses `type: 'discussion' | 'issue' | 'pr'` instead of `target: CommentTarget` and omits `state`/`locked` fields (not needed for current use cases).
+3. **Error types adjusted** - Simplified to: `api_error`, `configuration`, `internal`, `llm_timeout`, `permission`, `rate_limit`, `validation`
+4. **Bot detection enhanced** - `findBotComment()` checks BOTH author AND marker (security against marker copying by users)
 
 ---
 
@@ -814,26 +843,31 @@ export type {ReactionType, ReactionResult, LabelResult} from "./reactions.js"
 
 ### Thread Reading & Writing
 
-- [ ] Issue threads are read with full comment history
-- [ ] PR threads are read with full comment history
-- [ ] Discussion threads are read via GraphQL
-- [ ] Pagination handles large comment threads (100+ comments)
-- [ ] New comments are created when no bot comment exists
-- [ ] Existing bot comments are updated when `updateExisting` is true
-- [ ] Bot comments are identified by marker
-- [ ] Error comments include type, message, and suggested action
-- [ ] Rate limit errors include reset time
-- [ ] Retryable errors are marked appropriately
+- [x] Issue threads are read with full comment history
+- [x] PR threads are read with full comment history
+- [x] Discussion threads are read via GraphQL
+- [x] Pagination handles large comment threads (100+ comments)
+- [x] New comments are created when no bot comment exists
+- [x] Existing bot comments are updated when `updateExisting` is true
+- [x] Bot comments are identified by marker AND author (security enhancement)
+- [x] Error comments include type, message, and suggested action
+- [x] Rate limit errors include reset time
+- [x] Retryable errors are marked appropriately
 
 ### Reactions & Labels (F43)
 
-- [ ] Agent adds 👀 (eyes) reaction to triggering comment on receipt
-- [ ] Agent adds "agent: working" label to issue/PR when starting work
-- [ ] "agent: working" label is created automatically if it doesn't exist
-- [ ] Agent removes 👀 reaction on completion
-- [ ] Agent removes "agent: working" label on completion (success or failure)
-- [ ] All reaction/label operations are non-fatal (warn on failure, don't fail run)
-- [ ] Bot can find and clean up its own reactions
+- [x] Agent adds 👀 (eyes) reaction to triggering comment on receipt _(implemented in src/lib/agent/reactions.ts)_
+- [x] Agent adds "agent: working" label to issue/PR when starting work _(implemented in src/lib/agent/reactions.ts)_
+- [x] "agent: working" label is created automatically if it doesn't exist _(implemented in src/lib/agent/reactions.ts)_
+- [x] Agent removes 👀 reaction on completion _(implemented in src/lib/agent/reactions.ts)_
+- [x] Agent removes "agent: working" label on completion (success or failure) _(implemented in src/lib/agent/reactions.ts)_
+- [x] All reaction/label operations are non-fatal (warn on failure, don't fail run)
+- [x] Bot can find and clean up its own reactions
+
+### Integration Points
+
+- [x] `getCommentTarget()` in `src/lib/github/context.ts` handles `discussion_comment` events
+- [x] `handleIssueComment()` in `src/lib/triggers/issue-comment.ts` uses comments module
 
 ## Test Cases
 
