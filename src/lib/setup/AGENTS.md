@@ -1,50 +1,53 @@
-# SETUP MODULE
+# SETUP MODULE KNOWLEDGE BASE
 
-**Overview**: Environment bootstrap for OpenCode + oMo execution (binaries, auth, cache).
+**Component:** Environment Bootstrap
+**Context:** Pre-agent execution
+
+## OVERVIEW
+
+Bootstraps runtime environment (Bun, OpenCode CLI, oMo plugin). Configures authentication (Git identity, gh CLI) and orchestrates installation via tool cache. Handles platform specifics and graceful degradation for optional components.
 
 ## WHERE TO LOOK
 
-| Component         | File           | Responsibility                              |
-| ----------------- | -------------- | ------------------------------------------- |
-| **Orchestration** | `setup.ts`     | `runSetup()` coordinates all setup phases   |
-| **OpenCode**      | `opencode.ts`  | Download, validate, cache CLI binary        |
-| **Bun**           | `bun.ts`       | Install Bun runtime (required for oMo)      |
-| **oMo**           | `omo.ts`       | Install oMo plugin via `bunx`               |
-| **GitHub Auth**   | `gh-auth.ts`   | `gh auth`, git identity configuration       |
-| **Credentials**   | `auth-json.ts` | Populate `auth.json` for OpenCode           |
-| **Types**         | `types.ts`     | `SetupResult`, `BunInstallResult`, adapters |
+| Component   | File           | Responsibility                         |
+| :---------- | :------------- | :------------------------------------- |
+| **Main**    | `setup.ts`     | Orchestration entry point (`runSetup`) |
+| **CLI**     | `opencode.ts`  | OpenCode CLI resolution & installation |
+| **Runtime** | `bun.ts`       | Bun runtime setup (required for oMo)   |
+| **Plugin**  | `omo.ts`       | oh-my-opencode install (graceful fail) |
+| **Auth**    | `gh-auth.ts`   | `gh` CLI auth & Git user identity      |
+| **Creds**   | `auth-json.ts` | Temporary `auth.json` generation       |
+| **API**     | `index.ts`     | Public exports & type definitions      |
 
 ## KEY EXPORTS
 
 ```typescript
 runSetup(options) // Main orchestration
-installOpenCode(options) // CLI installation with version resolution
-installBun(options) // Bun runtime setup
-installOmo(options) // oMo plugin (graceful failure)
-configureGhAuth(token) // gh CLI authentication
-populateAuthJson(config) // Write credentials with 0o600 permissions
+installOpenCode(version) // CLI install + cache
+installBun(version) // Runtime setup
+installOmo() // Plugin setup
+configureGhAuth(token) // CLI authentication
+populateAuthJson(conf) // Secure creds write
 ```
 
 ## PATTERNS
 
-- **Tool Cache**: Download → validate → extract → `@actions/tool-cache` for reuse
-- **Platform Detection**: `getBunPlatformInfo()` / `getPlatformInfo()` map OS/arch to download URLs
-- **Graceful Failure**: oMo install failures are logged but don't fail the action
-- **Version Resolution**: `getLatestVersion()` fetches from GitHub releases API
-- **Validation**: Downloaded binaries verified with `--version` before caching
+- **Tool Cache**: `tc.downloadTool` → `tc.extract` → `tc.cacheDir`
+- **Platform Map**: `getPlatformInfo()` maps OS/Arch to release assets
+- **Graceful Fail**: Optional components (oMo) warn on error, don't crash
+- **Dynamic Version**: Resolves `latest` via GitHub Releases API
+- **Verification**: Validates binaries (`--version`) before caching
 
 ## SECURITY
 
-- `auth.json` written with `mode: 0o600` (owner read/write only)
-- **NEVER** cache `auth.json` - populated fresh each run from secrets
-- Credentials deleted via `deleteAuthJson()` before cache save
+- **Permissions**: `auth.json` written with `0o600` (owner-only)
+- **Ephemeral**: Credentials never cached; fresh from secrets
+- **Identity**: Git user forced to `${bot}[bot]` for audit trails
+- **Isolation**: Binaries cached by version/arch to prevent pollution
 
 ## ANTI-PATTERNS
 
-| Pattern                               | Why                                              |
-| ------------------------------------- | ------------------------------------------------ |
-| Caching auth.json                     | Exposes credentials to fork PRs                  |
-| Skipping validation                   | Corrupted downloads cause cryptic failures       |
-| Hardcoded versions                    | Use `getLatestVersion()` with fallback           |
-| Blocking on oMo                       | It's optional; failures shouldn't stop execution |
-| Direct `fetch` without error handling | Always check `response.ok`                       |
+- **Hardcoded Versions**: Always use input or dynamic resolution
+- **Fatal Optionality**: Crashing on non-critical install failures
+- **Global Install**: Polluting system paths (use tool cache)
+- **Log Leaks**: Printing `auth.json` content or tokens

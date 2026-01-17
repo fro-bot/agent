@@ -1,69 +1,58 @@
-# TRIGGERS MODULE
+# TRIGGER ROUTING KNOWLEDGE BASE
 
-**Overview**: Event routing and skip-condition gating for GitHub triggers (RFC-005).
+**Generated:** 2026-01-16
+**Scope:** `src/lib/triggers/`
+
+## OVERVIEW
+
+Centralized event routing and skip-logic gating (RFC-005). Determines IF an action should run based on payload, config, and permissions. Pure logic; no side effects.
 
 ## WHERE TO LOOK
 
-| Component   | File               | Responsibility                                       |
-| ----------- | ------------------ | ---------------------------------------------------- |
-| **Router**  | `router.ts`        | `routeEvent()`, `checkSkipConditions()`, skip checks |
-| **Types**   | `types.ts`         | `TriggerContext`, `TriggerResult`, `SkipReason`      |
-| **Issue**   | `issue-comment.ts` | Issue/PR comment handling                            |
-| **Mock**    | `mock.ts`          | Local testing with synthetic events                  |
-| **Exports** | `index.ts`         | Public API surface                                   |
+- `router.ts`: Core logic (`routeEvent`, `checkSkipConditions`). Complexity hotspot (882 lines).
+- `types.ts`: `TriggerResult`, `TriggerConfig`, `SkipReason` definitions.
+- `mock.ts`: Synthetic event generation for local testing (`createMockEvent`).
+- `__fixtures__/payloads.ts`: Test payload factories (660 lines) for robust coverage.
 
 ## KEY EXPORTS
 
-```typescript
-routeEvent(githubContext, logger, config) // Main entry: route event + skip-check
-checkSkipConditions(context, config, logger) // Evaluate all skip rules
-hasBotMention(text, botLogin) // Detect @mention in comment
-extractCommand(text, botLogin) // Parse command after mention
-```
-
-> **Note**: Event type classification (`classifyEventType`) is now in `github/context.ts`.
+- `routeEvent(context, inputs, config?)`: Main entry. Returns `TriggerResult`.
+- `TriggerResult`: Discriminated union (`shouldProcess: boolean`).
+- `SkipReason`: Enum of rejection codes.
+- `DEFAULT_TRIGGER_CONFIG`: Base configuration.
 
 ## EVENT TYPES
 
-Uses `EventType` from `github/types.ts`:
-
-| Type                          | GitHub Event                 | Notes                        |
-| ----------------------------- | ---------------------------- | ---------------------------- |
-| `issue_comment`               | `issue_comment`              | Issues and PRs               |
-| `discussion_comment`          | `discussion`, `discussion_comment` | GitHub Discussions     |
-| `issues`                      | `issues`                     | Issue opened/edited          |
-| `pull_request`                | `pull_request`               | PR opened/sync/reopen        |
-| `pull_request_review_comment` | `pull_request_review_comment`| Review comments on PRs       |
-| `schedule`                    | `schedule`                   | Cron-triggered runs          |
-| `workflow_dispatch`           | `workflow_dispatch`          | Manual trigger               |
-| `unsupported`                 | Everything else              | Skipped immediately          |
+| Event                         | Supported Actions                   | Constraints                  |
+| :---------------------------- | :---------------------------------- | :--------------------------- |
+| `issue_comment`               | `created`                           | Optional prompt.             |
+| `discussion_comment`          | `created`                           | Optional prompt.             |
+| `pull_request`                | `opened`, `reopened`, `synchronize` | Skips drafts (configurable). |
+| `issues`                      | `opened`, `edited`                  | `edited` requires mention.   |
+| `schedule`                    | N/A                                 | **Requires** prompt input.   |
+| `workflow_dispatch`           | N/A                                 | **Requires** prompt input.   |
+| `pull_request_review_comment` | `created`                           | -                            |
 
 ## SKIP REASONS
 
-| Reason                | Condition                                       |
-| --------------------- | ----------------------------------------------- |
-| `action_not_created`  | Comment edited/deleted, not created             |
-| `action_not_supported`| Issues/PR action not in supported list          |
-| `draft_pr`            | PR is a draft (when `skipDraftPRs=true`)        |
-| `issue_locked`        | Target issue/PR/discussion is locked            |
-| `no_mention`          | Bot not @mentioned (when `requireMention=true`) |
-| `prompt_required`     | Schedule/dispatch missing prompt input          |
-| `self_comment`        | Comment from bot itself (anti-loop)             |
-| `unauthorized_author` | Author not in `ALLOWED_ASSOCIATIONS`            |
-| `unsupported_event`   | Event type not handled                          |
+| Reason                | Description                                 |
+| :-------------------- | :------------------------------------------ |
+| `action_not_created`  | Trigger action != `created` (comments).     |
+| `draft_pr`            | PR is in draft mode (default behavior).     |
+| `no_mention`          | Missing `@fro-bot` in `issues.edited`.      |
+| `prompt_required`     | `schedule`/`dispatch` missing input.        |
+| `self_comment`        | Bot responding to itself (loop protection). |
+| `unauthorized_author` | Author not OWNER/MEMBER/COLLABORATOR.       |
 
 ## PATTERNS
 
-- **Discriminated Union**: `TriggerResult` is `{shouldProcess: true}` or `{shouldProcess: false, skipReason, skipMessage}`
-- **Config Merging**: `routeEvent()` merges partial config with `DEFAULT_TRIGGER_CONFIG`
-- **Regex Escaping**: `hasBotMention()` escapes special chars in bot login
-- **Word Boundary**: Mention pattern uses `(?:$|[^\w])` to avoid partial matches
+- **Discriminated Union**: Check `shouldProcess` before accessing `skipReason`.
+- **Config Merging**: `routeEvent` applies defaults to partial configs.
+- **Regex Safety**: `hasBotMention` escapes input, uses `\b` boundaries.
+- **External Classification**: Event classification logic resides in `github/context.ts` (`classifyEventType`), not here.
 
 ## ANTI-PATTERNS
 
-| Pattern                    | Why                                               |
-| -------------------------- | ------------------------------------------------- |
-| Hardcoding bot name        | Use `config.login` (actor from event context)     |
-| Checking `payload.action`  | Use `checkSkipConditions()` for consistent gating |
-| Ignoring `TriggerResult`   | Always check `shouldProcess` before proceeding    |
-| Direct association compare | Use `ALLOWED_ASSOCIATIONS` constant               |
+- **Side Effects**: Router must NOT call APIs or log triggers (pure decisioning only).
+- **Hardcoded Config**: Always use `TriggerConfig` injection.
+- **Implicit Defaults**: Rely on `DEFAULT_TRIGGER_CONFIG`, don't reinvent defaults in functions.
