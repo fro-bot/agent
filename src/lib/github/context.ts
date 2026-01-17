@@ -1,4 +1,4 @@
-import type {IssueCommentEvent} from '@octokit/webhooks-types'
+import type {DiscussionCommentEvent, IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
 import type {CommentTarget, EventType, GitHubContext} from './types.js'
 import * as github from '@actions/github'
@@ -78,8 +78,13 @@ export function getCommentTarget(context: GitHubContext): CommentTarget | null {
   }
 
   if (eventType === 'discussion_comment') {
-    // Discussion handling requires GraphQL - implemented in RFC-008
-    return null
+    const p = payload as DiscussionCommentEvent
+    return {
+      type: 'discussion',
+      number: p.discussion.number,
+      owner: repo.owner,
+      repo: repo.repo,
+    }
   }
 
   return null
