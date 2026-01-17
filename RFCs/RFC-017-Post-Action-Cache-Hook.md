@@ -250,7 +250,7 @@ runs:
 
 ```typescript
 export default defineConfig({
-  entry: ["src/main.ts", "src/setup.ts", "src/post.ts"],
+  entry: ["src/main.ts", "src/post.ts"],
   fixedExtension: false,
   minify: true,
   plugins: [licenseCollectorPlugin()],

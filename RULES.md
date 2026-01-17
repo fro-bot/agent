@@ -983,7 +983,6 @@ pnpm test         # Run tests
 | File                        | Purpose                  |
 | --------------------------- | ------------------------ |
 | `src/main.ts`               | Action entry point       |
-| `src/setup.ts`              | Setup action entry point |
 | `src/lib/agent/opencode.ts` | SDK executor             |
 | `action.yaml`               | GitHub Action definition |
 | `tsdown.config.ts`          | Build configuration      |
@@ -1053,19 +1052,14 @@ git config --global user.name "fro-bot[bot]"
 git config --global user.email "<user-id>+fro-bot[bot]@users.noreply.github.com"
 ```
 
-### Setup Action Usage
+### Usage Example
 
 ```yaml
-- name: Setup Fro Bot Agent
-  uses: fro-bot/agent/setup@v0
-  with:
-    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-    opencode-version: "latest" # optional
-
 - name: Run Fro Bot Agent
   uses: fro-bot/agent@v0
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
     agent: "Sisyphus" # Optional, defaults to Sisyphus
     # model: "anthropic/claude-sonnet-4-20250514" # Optional, overrides agent's configured model
     prompt: "Respond to the issue comment"
