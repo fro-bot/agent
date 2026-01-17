@@ -1,3 +1,4 @@
+import type {Dirent} from 'node:fs'
 import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildBunDownloadUrl, DEFAULT_BUN_VERSION, getBunPlatformInfo, installBun, isBunAvailable} from './bun.js'
@@ -11,11 +12,7 @@ vi.mock('node:fs/promises', () => ({
   },
 }))
 
-/**
- * Create a mock fs.Dirent entry for testing extractBun directory traversal.
- * extractBun recursively searches directories for the bun executable.
- */
-function createMockDirent(name: string, isDirectory: boolean): unknown {
+function createMockDirent(name: string, isDirectory: boolean): Partial<Dirent> {
   return {
     name,
     isFile: () => !isDirectory,
@@ -198,19 +195,14 @@ describe('bun', () => {
       Object.defineProperty(process, 'platform', {value: 'linux'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
-      // Mock fs.readdir for extractBun - two-stage traversal simulation
-      // Stage 1: /tmp/extracted contains bun-linux-x64 subdirectory
-      // Stage 2: /tmp/extracted/bun-linux-x64 contains bun executable
-      // This prevents infinite recursion in extractBun's recursive directory search
       const fs = await import('node:fs/promises')
-      /* eslint-disable @typescript-eslint/no-unsafe-return */
-      vi.mocked(fs.default.readdir).mockImplementation(async (dir: any) => {
-        if (dir === '/tmp/extracted') {
-          return [createMockDirent('bun-linux-x64', true)] as any
+      vi.mocked(fs.default.readdir).mockImplementation((async dir => {
+        const dirPath = String(dir)
+        if (dirPath === '/tmp/extracted') {
+          return [createMockDirent('bun-linux-x64', true)]
         }
-        return [createMockDirent('bun', false)] as any
-      })
-      /* eslint-enable @typescript-eslint/no-unsafe-return */
+        return [createMockDirent('bun', false)]
+      }) as typeof fs.default.readdir)
 
       const mockToolCache = createMockToolCache({
         find: vi.fn().mockReturnValue(''),
@@ -298,16 +290,14 @@ describe('bun', () => {
       Object.defineProperty(process, 'platform', {value: 'win32'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
-      // Mock fs.readdir for extractBun - Windows variant with .exe extension
       const fs = await import('node:fs/promises')
-      /* eslint-disable @typescript-eslint/no-unsafe-return */
-      vi.mocked(fs.default.readdir).mockImplementation(async (dir: any) => {
-        if (dir === '/tmp/extracted') {
-          return [createMockDirent('bun-windows-x64', true)] as any
+      vi.mocked(fs.default.readdir).mockImplementation((async dir => {
+        const dirPath = String(dir)
+        if (dirPath === '/tmp/extracted') {
+          return [createMockDirent('bun-windows-x64', true)]
         }
-        return [createMockDirent('bun.exe', false)] as any
-      })
-      /* eslint-enable @typescript-eslint/no-unsafe-return */
+        return [createMockDirent('bun.exe', false)]
+      }) as typeof fs.default.readdir)
 
       const mockToolCache = createMockToolCache({
         find: vi.fn().mockReturnValue(''),
