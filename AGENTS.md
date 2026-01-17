@@ -14,13 +14,12 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ./
 ├── src/                  # TypeScript source
 │   ├── main.ts           # Primary entry (11-step orchestration)
-│   ├── setup.ts          # Secondary entry (environment bootstrap)
 │   ├── post.ts           # Post-action hook (durable cache save, RFC-017)
 │   ├── index.ts          # Public API re-exports
 │   ├── lib/              # Core libraries (see subdir AGENTS.md)
 │   │   ├── agent/        # SDK execution, prompts, reactions
 │   │   ├── github/       # Octokit client, context parsing
-│   │   ├── setup/        # Bun, oMo, OpenCode installation
+│   │   ├── setup/        # Bun, oMo, OpenCode installation (library, used by main action)
 │   │   ├── session/      # Persistence layer (search, prune, writeback)
 │   │   ├── triggers/     # Event routing, skip conditions
 │   │   ├── cache.ts      # Cache restore/save with corruption detection
@@ -29,10 +28,9 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   └── types.ts      # Core interfaces
 │   └── utils/            # Pure utility functions (env, validation)
 ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
-├── setup/                # Setup action definition
 ├── RFCs/                 # 17 RFC documents (architecture specs)
 ├── action.yaml           # Primary GitHub Action definition (node24)
-└── tsdown.config.ts      # esbuild bundler config (triple entry points)
+└── tsdown.config.ts      # esbuild bundler config (dual entry points)
 ```
 
 ## WHERE TO LOOK
@@ -40,7 +38,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Task             | Location                     | Notes                                       |
 | ---------------- | ---------------------------- | ------------------------------------------- |
 | Add action logic | `src/main.ts`                | 11-step orchestration lifecycle             |
-| Setup bootstrap  | `src/setup.ts`               | Bun/oMo/OpenCode installation               |
+| Setup library    | `src/lib/setup/`             | Bun/oMo/OpenCode installation (auto-setup)  |
 | Post-action hook | `src/post.ts`                | Durable cache save (RFC-017)                |
 | Cache operations | `src/lib/cache.ts`           | `restoreCache()`, `saveCache()`             |
 | GitHub API       | `src/lib/github/client.ts`   | `createClient()`, `createAppClient()`       |
@@ -103,7 +101,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ### Build
 
-- **tsdown**: Bundles to `dist/main.js` + `dist/setup.js` + `dist/post.js`
+- **tsdown**: Bundles to `dist/main.js` + `dist/post.js`
 - **ESM shim**: Banner injects `createRequire` for CJS compat
 - **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`
 - **dist/ committed**: MUST run `pnpm build` after src changes
@@ -132,7 +130,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ## UNIQUE STYLES
 
-- **Triple entry points**: Main action + setup action + post-action hook
+- **Dual entry points**: Main action + post-action hook (setup integrated into main action)
 - **RFC-driven development**: Major features documented in `RFCs/` first (17 total)
 - **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
 - **v-branch releases**: Main merges to `v0` for major version pinning
