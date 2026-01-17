@@ -7,7 +7,8 @@
 
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {PromptOptions, SessionContext} from './types.js'
+import type {DiffContext, PromptOptions, SessionContext} from './types.js'
+import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 
 export interface TriggerDirective {
   readonly directive: string
@@ -149,6 +150,11 @@ ${context.commentBody}
   // Prior session context (RFC-004 integration)
   if (sessionContext != null) {
     parts.push(buildSessionContextSection(sessionContext))
+  }
+
+  // PR diff context (RFC-009 integration)
+  if (context.diffContext != null) {
+    parts.push(buildDiffContextSection(context.diffContext))
   }
 
   // Session management instructions (REQUIRED)
@@ -295,6 +301,36 @@ function buildSessionContextSection(sessionContext: SessionContext): string {
     }
 
     lines.push('Use `session_read` to review full context before starting new investigation.')
+  }
+
+  lines.push('')
+  return lines.join('\n')
+}
+
+function buildDiffContextSection(diffContext: DiffContext): string {
+  const lines: string[] = ['## Pull Request Diff Summary']
+  lines.push('')
+  lines.push(`- **Changed Files:** ${diffContext.changedFiles}`)
+  lines.push(`- **Additions:** +${diffContext.additions}`)
+  lines.push(`- **Deletions:** -${diffContext.deletions}`)
+
+  if (diffContext.truncated) {
+    lines.push('- **Note:** Diff was truncated due to size limits')
+  }
+
+  if (diffContext.files.length > 0) {
+    lines.push('')
+    lines.push('### Changed Files')
+    lines.push('| File | Status | +/- |')
+    lines.push('|------|--------|-----|')
+
+    for (const file of diffContext.files.slice(0, MAX_FILES_IN_PROMPT)) {
+      lines.push(`| \`${file.filename}\` | ${file.status} | +${file.additions}/-${file.deletions} |`)
+    }
+
+    if (diffContext.files.length > MAX_FILES_IN_PROMPT) {
+      lines.push(`| ... | | +${diffContext.files.length - MAX_FILES_IN_PROMPT} more files |`)
+    }
   }
 
   lines.push('')

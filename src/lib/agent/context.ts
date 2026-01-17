@@ -6,9 +6,19 @@
  */
 
 import type {IssueCommentEvent} from '@octokit/webhooks-types'
+import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext} from './types.js'
+import {getDefaultBranch} from '../github/api.js'
 import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
+import {collectDiffContext} from './diff-context.js'
+
+export interface CollectAgentContextOptions {
+  readonly logger: Logger
+  readonly octokit: Octokit
+  readonly triggerContext: TriggerContext
+}
 
 /**
  * Collect GitHub context from @actions/github event payload.
@@ -17,17 +27,14 @@ import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/
  * event payload. No workflow-level environment variables needed for
  * comment/issue data.
  */
-export function collectAgentContext(logger: Logger): AgentContext {
+export async function collectAgentContext(options: CollectAgentContextOptions): Promise<AgentContext> {
+  const {logger, octokit, triggerContext} = options
   const ghContext = parseGitHubContext(logger)
   const repo = `${ghContext.repo.owner}/${ghContext.repo.repo}`
 
-  // Extract comment target (issue/PR number and type)
   const target = getCommentTarget(ghContext)
-
-  // Map target type to issue/pr (discussions are handled separately)
   const issueType: 'issue' | 'pr' | null = target?.type === 'issue' || target?.type === 'pr' ? target.type : null
 
-  // Extract comment details from payload (for issue_comment events)
   let commentBody: string | null = null
   let commentAuthor: string | null = null
   let commentId: number | null = null
@@ -41,12 +48,15 @@ export function collectAgentContext(logger: Logger): AgentContext {
     issueTitle = payload.issue.title
   }
 
+  const diffContext = await collectDiffContext(triggerContext, octokit, repo, logger)
+
   logger.info('Collected agent context', {
     eventName: ghContext.eventName,
     repo,
     issueNumber: target?.number ?? null,
     issueType,
     hasComment: commentBody != null,
+    hasDiffContext: diffContext != null,
   })
 
   return {
@@ -61,6 +71,7 @@ export function collectAgentContext(logger: Logger): AgentContext {
     commentBody,
     commentAuthor,
     commentId,
-    defaultBranch: 'main', // Will be fetched via gh CLI if needed
+    defaultBranch: await getDefaultBranch(octokit, repo, logger),
+    diffContext,
   }
 }
