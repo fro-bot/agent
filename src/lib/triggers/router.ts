@@ -18,7 +18,7 @@ import type {
   TriggerTarget,
 } from './types.js'
 import {getAuthorAssociation, getCommentAuthor, isIssueLocked, isPullRequest} from '../github/context.js'
-import {ALLOWED_ASSOCIATIONS, DEFAULT_TRIGGER_CONFIG} from './types.js'
+import {DEFAULT_TRIGGER_CONFIG} from './types.js'
 
 export function hasBotMention(text: string, botLogin: string): boolean {
   if (botLogin.length === 0) {
@@ -878,5 +878,3 @@ export function routeEvent(
     context,
   }
 }
-
-export {ALLOWED_ASSOCIATIONS}

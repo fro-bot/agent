@@ -180,7 +180,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
  * Check if a file path is inside a directory.
  * Prevents accidental deletion of files outside the cache scope.
  */
-function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
+export function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
   const resolvedFile = path.resolve(filePath)
   const resolvedDir = path.resolve(directoryPath)
   return resolvedFile.startsWith(resolvedDir + path.sep)
@@ -274,4 +274,18 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * Ensure auth.json is not in a path that would be cached.
+ *
+ * This is a safety check to prevent accidental credential caching.
+ * auth.json should be in the parent opencode directory, not inside storage/.
+ *
+ * @param authPath - Path to auth.json file
+ * @param storagePath - Path to OpenCode storage directory (cached)
+ * @returns true if auth.json is safely outside the storage path
+ */
+export function isAuthPathSafe(authPath: string, storagePath: string): boolean {
+  return !isPathInsideDirectory(authPath, storagePath)
 }

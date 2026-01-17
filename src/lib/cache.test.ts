@@ -4,7 +4,15 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
-import {restoreCache, saveCache, type CacheAdapter, type RestoreCacheOptions, type SaveCacheOptions} from './cache.js'
+import {
+  isAuthPathSafe,
+  isPathInsideDirectory,
+  restoreCache,
+  saveCache,
+  type CacheAdapter,
+  type RestoreCacheOptions,
+  type SaveCacheOptions,
+} from './cache.js'
 
 // Test fixtures
 const testComponents: CacheKeyComponents = {
@@ -468,5 +476,117 @@ describe('saveCache', () => {
     // #then .version file exists with correct content
     const versionContent = await fs.readFile(path.join(storagePath, '.version'), 'utf8')
     expect(versionContent).toBe('1')
+  })
+})
+
+describe('isPathInsideDirectory', () => {
+  it('returns true when file is inside directory', () => {
+    // #given a file path inside a directory
+    const filePath = '/home/user/storage/auth.json'
+    const dirPath = '/home/user/storage'
+
+    // #when checking containment
+    const result = isPathInsideDirectory(filePath, dirPath)
+
+    // #then returns true
+    expect(result).toBe(true)
+  })
+
+  it('returns true for nested paths', () => {
+    // #given a deeply nested file path
+    const filePath = '/home/user/storage/deep/nested/file.txt'
+    const dirPath = '/home/user/storage'
+
+    // #when checking containment
+    const result = isPathInsideDirectory(filePath, dirPath)
+
+    // #then returns true
+    expect(result).toBe(true)
+  })
+
+  it('returns false when file is outside directory', () => {
+    // #given a file path outside the directory
+    const filePath = '/home/user/config/auth.json'
+    const dirPath = '/home/user/storage'
+
+    // #when checking containment
+    const result = isPathInsideDirectory(filePath, dirPath)
+
+    // #then returns false
+    expect(result).toBe(false)
+  })
+
+  it('returns false when file is sibling directory', () => {
+    // #given a file in a sibling directory with similar prefix
+    const filePath = '/home/user/storage-backup/auth.json'
+    const dirPath = '/home/user/storage'
+
+    // #when checking containment
+    const result = isPathInsideDirectory(filePath, dirPath)
+
+    // #then returns false (not fooled by prefix matching)
+    expect(result).toBe(false)
+  })
+
+  it('returns false when paths are equal', () => {
+    // #given equal paths
+    const filePath = '/home/user/storage'
+    const dirPath = '/home/user/storage'
+
+    // #when checking containment
+    const result = isPathInsideDirectory(filePath, dirPath)
+
+    // #then returns false (file is not INSIDE, it IS the directory)
+    expect(result).toBe(false)
+  })
+})
+
+describe('isAuthPathSafe', () => {
+  it('returns true when auth.json is outside storage', () => {
+    // #given auth.json in parent directory, storage in sibling
+    const authPath = '/home/user/.local/share/opencode/auth.json'
+    const storagePath = '/home/user/.local/share/opencode/storage'
+
+    // #when checking safety
+    const result = isAuthPathSafe(authPath, storagePath)
+
+    // #then returns true (safe - won't be cached)
+    expect(result).toBe(true)
+  })
+
+  it('returns false when auth.json is inside storage', () => {
+    // #given auth.json accidentally inside storage
+    const authPath = '/home/user/storage/auth.json'
+    const storagePath = '/home/user/storage'
+
+    // #when checking safety
+    const result = isAuthPathSafe(authPath, storagePath)
+
+    // #then returns false (unsafe - would be cached!)
+    expect(result).toBe(false)
+  })
+
+  it('returns false when auth.json is nested inside storage', () => {
+    // #given auth.json in subdirectory of storage
+    const authPath = '/home/user/storage/config/auth.json'
+    const storagePath = '/home/user/storage'
+
+    // #when checking safety
+    const result = isAuthPathSafe(authPath, storagePath)
+
+    // #then returns false (unsafe)
+    expect(result).toBe(false)
+  })
+
+  it('returns true for typical XDG layout', () => {
+    // #given standard XDG paths (auth.json and storage are siblings)
+    const authPath = '/home/runner/.local/share/opencode/auth.json'
+    const storagePath = '/home/runner/.local/share/opencode/storage'
+
+    // #when checking safety
+    const result = isAuthPathSafe(authPath, storagePath)
+
+    // #then returns true
+    expect(result).toBe(true)
   })
 })
