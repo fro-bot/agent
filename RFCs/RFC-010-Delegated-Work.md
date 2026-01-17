@@ -1,9 +1,6 @@
 # RFC-010: Delegated Work - Push Commits & Open PRs
 
-**Status:** Pending
-**Priority:** MUST
-**Complexity:** High
-**Phase:** 3
+**Status:** Completed **Priority:** MUST **Complexity:** High **Phase:** 3
 
 ---
 
@@ -771,3 +768,57 @@ describe("generatePRBody", () => {
 - **Development**: 8-10 hours
 - **Testing**: 4-5 hours
 - **Total**: 12-15 hours
+
+---
+
+## Completion Notes
+
+**Completed:** 2026-01-17
+
+### Implementation Summary
+
+RFC-010 was implemented as a **library-only** solution. The delegated work functions are fully implemented and tested but are not yet exposed to the agent as invokable tools.
+
+### Files Created
+
+| File                                | Purpose                                                 | Tests |
+| ----------------------------------- | ------------------------------------------------------- | ----- |
+| `src/lib/delegated/types.ts`        | Type definitions, security constants                    | -     |
+| `src/lib/delegated/branch.ts`       | Branch operations (create, exists, delete, generate)    | 10    |
+| `src/lib/delegated/commit.ts`       | Git Data API atomic commits with security validation    | 17    |
+| `src/lib/delegated/pull-request.ts` | PR operations (create, find, update, labels, reviewers) | 14    |
+| `src/lib/delegated/index.ts`        | Public exports                                          | -     |
+| `src/lib/delegated/AGENTS.md`       | Module documentation                                    | -     |
+
+**Total: 41 new tests** (all passing)
+
+### Key Implementation Decisions
+
+1. **Git Data API over CLI**: Uses GitHub's REST Git Data API (createBlob → createTree → createCommit → updateRef) for atomic multi-file commits instead of shelling out to `git` CLI.
+
+2. **Security-first design**:
+   - Path validation rejects traversal (`../`), `.git/` directories, and secret files (`.env`, `*.key`, `*.pem`, etc.)
+   - 5MB per-file size limit
+   - `updateRef` always uses `force: false` (never force push)
+
+3. **Idempotent operations**: Branch creation returns existing ref if already exists (no error).
+
+4. **Function-based architecture**: Per RULES.md - no classes, pure exported functions with dependency injection.
+
+### Deferred Work
+
+Agent integration is **out of scope** for this RFC. A future RFC should:
+
+1. Register delegated work functions as MCP tools the agent can invoke
+2. Inject authenticated Octokit client and repo context into tools
+3. Inherit existing authorization gating (OWNER/MEMBER/COLLABORATOR only)
+4. Surface meaningful errors to the agent for retry/escalation
+
+### Verification Results
+
+| Check      | Status                 |
+| ---------- | ---------------------- |
+| TypeScript | ✅ Passed              |
+| Build      | ✅ 3 files, 1479.55 kB |
+| Tests      | ✅ 679 passed (41 new) |
+| Lint       | ✅ 0 errors            |
