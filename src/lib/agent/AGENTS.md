@@ -1,16 +1,16 @@
 # AGENT MODULE
 
-**Overview**: OpenCode SDK execution harness with GitHub context injection and UX feedback loops.
+**Scope:** OpenCode SDK execution harness with GitHub context injection and UX feedback loops.
 
 ## WHERE TO LOOK
 
-| Component     | File           | Responsibility                                       |
-| ------------- | -------------- | ---------------------------------------------------- |
-| **Execution** | `opencode.ts`  | SDK server spawn, connection, session events, exec   |
-| **Context**   | `context.ts`   | Gathers event data, defaults, and issue details      |
-| **UX**        | `reactions.ts` | Manages emojis (👀/🎉/😕) and 'agent: working' label |
-| **Prompting** | `prompt.ts`    | Builds final prompt with session/cache context       |
-| **Types**     | `types.ts`     | `AgentContext`, `AgentResult`, `ExecutionConfig`     |
+| Component     | File           | Responsibility                                   |
+| ------------- | -------------- | ------------------------------------------------ |
+| **Execution** | `opencode.ts`  | SDK server spawn, session events, prompt sending |
+| **Context**   | `context.ts`   | Gathers event data, defaults, issue details      |
+| **UX**        | `reactions.ts` | Emojis (👀/🎉/😕), `agent: working` label        |
+| **Prompting** | `prompt.ts`    | Builds final prompt with session/cache context   |
+| **Types**     | `types.ts`     | `AgentContext`, `AgentResult`, `ExecutionConfig` |
 
 ## KEY EXPORTS
 
@@ -23,25 +23,22 @@ acknowledgeReceipt(client, ctx, logger) // Eyes + working label
 completeAcknowledgment(client, ctx, success, logger) // Finalize UX
 ```
 
-## CONVENTIONS
+## PATTERNS
 
+- **SDK Lifecycle (RFC-013)**: Spawn server → connect client → create session → send prompt → stream events → close
+- **Connection Retry**: 30 retries (1s delay) for server startup
+- **Event Streaming**: SSE subscription for real-time logging
 - **Reaction-based UX**:
-  - **Start**: 👀 (Eyes) on trigger + `agent: working` label (`fcf2e1`)
-  - **Success**: Replace 👀 with 🎉 (Hooray) + remove label
-  - **Failure**: Replace 👀 with 😕 (Confused) + remove label
-  - **Non-fatal**: UX failures logged but never crash execution
-
-- **Execution Safety**:
-  - **SDK Mode**: Spawn OpenCode server, connect via SDK client (RFC-013)
-  - **Connection**: 30 retries (1s delay) for server startup
-  - **Event Streaming**: SSE subscription for real-time logging
-  - **Timings**: `startTime` / `duration` tracked for all operations
+  - Start: 👀 (Eyes) + `agent: working` label (`fcf2e1`)
+  - Success: Replace 👀 with 🎉 (Hooray) + remove label
+  - Failure: Replace 👀 with 😕 (Confused) + remove label
+  - Non-fatal: UX failures logged but never crash execution
 
 ## ANTI-PATTERNS
 
-| Pattern              | Why to Avoid                                                        |
-| -------------------- | ------------------------------------------------------------------- |
-| **Blocking on UX**   | Reactions are "nice to have"; API failures shouldn't stop the agent |
-| **Buffered Output**  | Running without `stdbuf` on Linux hides logs until process exit     |
-| **Implicit Context** | Relying on `process.env` directly; use `AgentContext` passed down   |
-| **Silent Failures**  | Always return `success: false` + `error` string in Result objects   |
+| Forbidden        | Reason                                                          |
+| ---------------- | --------------------------------------------------------------- |
+| Blocking on UX   | Reactions are "nice to have"; API failures shouldn't stop agent |
+| Buffered output  | Running without `stdbuf` on Linux hides logs until exit         |
+| Implicit context | Don't use `process.env` directly; use `AgentContext`            |
+| Silent failures  | Always return `success: false` + `error` string in Result       |
