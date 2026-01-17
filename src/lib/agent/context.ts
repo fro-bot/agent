@@ -5,7 +5,7 @@
  * to extract all context from the GitHub Actions event payload.
  */
 
-import type {IssueCommentPayload} from '../github/types.js'
+import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
 import type {AgentContext} from './types.js'
 import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
@@ -34,7 +34,7 @@ export function collectAgentContext(logger: Logger): AgentContext {
   let issueTitle: string | null = null
 
   if (ghContext.eventType === 'issue_comment') {
-    const payload = ghContext.payload as IssueCommentPayload
+    const payload = ghContext.payload as IssueCommentEvent
     commentBody = payload.comment.body
     commentAuthor = getCommentAuthor(payload)
     commentId = payload.comment.id

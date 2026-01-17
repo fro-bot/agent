@@ -1,5 +1,6 @@
+import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
-import type {GitHubContext, IssueCommentPayload} from './types.js'
+import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
 import {
   classifyEventType,
@@ -145,7 +146,7 @@ describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
     const payload = {
       issue: {pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/1'}},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(isPullRequest(payload)).toBe(true)
   })
@@ -153,7 +154,7 @@ describe('isPullRequest', () => {
   it('returns false for regular issues', () => {
     const payload = {
       issue: {number: 1, title: 'Test issue'},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(isPullRequest(payload)).toBe(false)
   })
@@ -250,7 +251,7 @@ describe('getAuthorAssociation', () => {
   it('extracts author association from payload', () => {
     const payload = {
       comment: {author_association: 'MEMBER'},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(getAuthorAssociation(payload)).toBe('MEMBER')
   })
@@ -260,7 +261,7 @@ describe('getCommentAuthor', () => {
   it('extracts comment author login from payload', () => {
     const payload = {
       comment: {user: {login: 'test-user'}},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(getCommentAuthor(payload)).toBe('test-user')
   })
@@ -270,7 +271,7 @@ describe('isIssueLocked', () => {
   it('returns true when issue is locked', () => {
     const payload = {
       issue: {locked: true},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(isIssueLocked(payload)).toBe(true)
   })
@@ -278,7 +279,7 @@ describe('isIssueLocked', () => {
   it('returns false when issue is not locked', () => {
     const payload = {
       issue: {locked: false},
-    } as unknown as IssueCommentPayload
+    } as unknown as IssueCommentEvent
 
     expect(isIssueLocked(payload)).toBe(false)
   })

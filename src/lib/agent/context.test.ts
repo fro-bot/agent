@@ -1,4 +1,4 @@
-import type {IssueCommentPayload} from '../github/types.js'
+import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
 
 import * as github from '@actions/github'
@@ -26,7 +26,7 @@ function createMockLogger(): Logger {
   }
 }
 
-function createIssueCommentPayload(overrides: Partial<IssueCommentPayload> = {}): IssueCommentPayload {
+function createIssueCommentEvent(overrides: Record<string, unknown> = {}) {
   return {
     action: 'created',
     issue: {
@@ -36,24 +36,24 @@ function createIssueCommentPayload(overrides: Partial<IssueCommentPayload> = {})
       state: 'open',
       user: {login: 'issue-author'},
       locked: false,
-      ...overrides.issue,
+      ...(overrides.issue as Record<string, unknown> | undefined),
     },
     comment: {
       id: 123456,
       body: 'Hello agent, please help!',
       user: {login: 'commenter'},
       author_association: 'MEMBER',
-      ...overrides.comment,
+      ...(overrides.comment as Record<string, unknown> | undefined),
     },
     repository: {
       owner: {login: 'test-owner'},
       name: 'test-repo',
       full_name: 'test-owner/test-repo',
-      ...overrides.repository,
+      ...(overrides.repository as Record<string, unknown> | undefined),
     },
     sender: {login: 'commenter'},
     ...overrides,
-  } as IssueCommentPayload
+  } as unknown as IssueCommentEvent
 }
 
 describe('collectAgentContext', () => {
@@ -70,7 +70,7 @@ describe('collectAgentContext', () => {
 
   it('extracts basic context from GitHub Actions environment', () => {
     // #given
-    const payload = createIssueCommentPayload()
+    const payload = createIssueCommentEvent()
     vi.mocked(github.context).eventName = 'issue_comment'
     vi.mocked(github.context).payload = payload as unknown as typeof github.context.payload
 
@@ -86,7 +86,7 @@ describe('collectAgentContext', () => {
 
   it('extracts comment details from issue_comment payload', () => {
     // #given
-    const payload = createIssueCommentPayload({
+    const payload = createIssueCommentEvent({
       comment: {
         id: 999,
         body: 'Please fix the bug',
@@ -108,7 +108,7 @@ describe('collectAgentContext', () => {
 
   it('extracts issue number and title from payload', () => {
     // #given
-    const payload = createIssueCommentPayload({
+    const payload = createIssueCommentEvent({
       issue: {
         number: 123,
         title: 'Bug: Something is broken',
@@ -132,8 +132,8 @@ describe('collectAgentContext', () => {
 
   it('detects PR type when pull_request field is present', () => {
     // #given
-    const payload = createIssueCommentPayload()
-    ;(payload.issue as Record<string, unknown>).pull_request = {url: 'https://api.github.com/...'}
+    const payload = createIssueCommentEvent()
+    ;(payload.issue as unknown as Record<string, unknown>).pull_request = {url: 'https://api.github.com/...'}
     vi.mocked(github.context).eventName = 'issue_comment'
     vi.mocked(github.context).payload = payload as unknown as typeof github.context.payload
 
@@ -162,7 +162,7 @@ describe('collectAgentContext', () => {
 
   it('logs collected context info', () => {
     // #given
-    const payload = createIssueCommentPayload()
+    const payload = createIssueCommentEvent()
     vi.mocked(github.context).eventName = 'issue_comment'
     vi.mocked(github.context).payload = payload as unknown as typeof github.context.payload
 
@@ -182,7 +182,7 @@ describe('collectAgentContext', () => {
 
   it('defaults to "main" for defaultBranch', () => {
     // #given
-    const payload = createIssueCommentPayload()
+    const payload = createIssueCommentEvent()
     vi.mocked(github.context).eventName = 'issue_comment'
     vi.mocked(github.context).payload = payload as unknown as typeof github.context.payload
 

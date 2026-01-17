@@ -2,52 +2,6 @@ import type {GitHub} from '@actions/github/lib/utils'
 
 export type Octokit = InstanceType<typeof GitHub>
 
-// Event payloads
-export interface IssueCommentPayload {
-  readonly action: string
-  readonly issue: {
-    readonly number: number
-    readonly title: string
-    readonly body: string | null
-    readonly state: string
-    readonly user: {readonly login: string}
-    readonly pull_request?: {readonly url: string}
-    readonly locked: boolean
-  }
-  readonly comment: {
-    readonly id: number
-    readonly body: string
-    readonly user: {readonly login: string}
-    readonly author_association: string
-  }
-  readonly repository: {
-    readonly owner: {readonly login: string}
-    readonly name: string
-    readonly full_name: string
-  }
-  readonly sender: {readonly login: string}
-}
-
-export interface DiscussionCommentPayload {
-  readonly action: string
-  readonly discussion: {
-    readonly number: number
-    readonly title: string
-    readonly body: string
-    readonly category: {readonly name: string}
-  }
-  readonly comment?: {
-    readonly id: number
-    readonly body: string
-    readonly user: {readonly login: string}
-    readonly author_association: string
-  }
-  readonly repository: {
-    readonly owner: {readonly login: string}
-    readonly name: string
-  }
-}
-
 // Context types
 /**
  * Supported event types for agent activation.
