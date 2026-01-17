@@ -30,7 +30,7 @@ function createMockRunSummary(overrides: Partial<RunSummary> = {}): RunSummary {
     createdPRs: [],
     createdCommits: [],
     duration: 45,
-    tokenUsage: {input: 1000, output: 500},
+    tokenUsage: {input: 1000, output: 500, reasoning: 0, cache: {read: 0, write: 0}},
     ...overrides,
   }
 }
@@ -124,7 +124,7 @@ describe('writeSessionSummary', () => {
   it('includes token usage in summary text', async () => {
     // #given
     const summary = createMockRunSummary({
-      tokenUsage: {input: 2000, output: 1500},
+      tokenUsage: {input: 2000, output: 1500, reasoning: 0, cache: {read: 0, write: 0}},
     })
     let writtenPart: unknown = null
 

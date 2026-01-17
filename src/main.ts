@@ -22,6 +22,7 @@
 import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {Octokit} from './lib/github/types.js'
+import type {CommentSummaryOptions} from './lib/observability/types.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -37,6 +38,7 @@ import {restoreCache, saveCache} from './lib/cache.js'
 import {createClient, getBotLogin, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
+import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
 import {
   DEFAULT_PRUNING_CONFIG,
@@ -72,6 +74,10 @@ async function run(): Promise<number> {
   let agentSuccess = false
   let exitCode = 0
   let githubClient: Octokit | null = null
+
+  // Create metrics collector for observability (RFC-007)
+  const metrics = createMetricsCollector()
+  metrics.start()
 
   core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
   core.saveState(STATE_KEYS.CACHE_SAVED, 'false')
@@ -189,6 +195,7 @@ async function run(): Promise<number> {
       : cacheResult.hit
         ? 'hit'
         : 'miss'
+    metrics.setCacheStatus(cacheStatus)
     logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
 
     // 6b. Ensure deterministic project ID (after cache restore, before session introspection)
@@ -213,6 +220,11 @@ async function run(): Promise<number> {
       resultCount: priorWorkContext.length,
     })
 
+    // Track prior sessions used for metrics
+    for (const session of priorWorkContext) {
+      metrics.addSessionUsed(session.sessionId)
+    }
+
     // 7. Build prompt options (prompt built inside executeOpenCode with sessionId)
     const promptOptions: PromptOptions = {
       context: contextWithBranch,
@@ -227,12 +239,34 @@ async function run(): Promise<number> {
 
     // 8. Execute OpenCode agent (skip in test mode)
     const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'
-    let result: {success: boolean; exitCode: number; sessionId: string | null; error: string | null}
+    let result: {
+      success: boolean
+      exitCode: number
+      sessionId: string | null
+      error: string | null
+      tokenUsage: import('./lib/types.js').TokenUsage | null
+      model: string | null
+      cost: number | null
+      prsCreated: readonly string[]
+      commitsCreated: readonly string[]
+      commentsPosted: number
+    }
     const executionStartTime = Date.now()
 
     if (skipExecution) {
       logger.info('Skipping agent execution (SKIP_AGENT_EXECUTION=true)')
-      result = {success: true, exitCode: 0, sessionId: null, error: null}
+      result = {
+        success: true,
+        exitCode: 0,
+        sessionId: null,
+        error: null,
+        tokenUsage: null,
+        model: null,
+        cost: null,
+        prsCreated: [],
+        commitsCreated: [],
+        commentsPosted: 0,
+      }
     } else {
       const execLogger = createLogger({phase: 'execution'})
 
@@ -265,6 +299,22 @@ async function run(): Promise<number> {
 
     agentSuccess = result.success
 
+    if (result.sessionId != null) {
+      metrics.addSessionCreated(result.sessionId)
+    }
+    if (result.tokenUsage != null) {
+      metrics.setTokenUsage(result.tokenUsage, result.model, result.cost)
+    }
+    for (const pr of result.prsCreated) {
+      metrics.addPRCreated(pr)
+    }
+    for (const commit of result.commitsCreated) {
+      metrics.addCommitCreated(commit)
+    }
+    for (let i = 0; i < result.commentsPosted; i++) {
+      metrics.incrementComments()
+    }
+
     // 8b. Write session summary (RFC-004) if we have a sessionId
     if (result.sessionId != null) {
       const runSummary: RunSummary = {
@@ -274,14 +324,16 @@ async function run(): Promise<number> {
         runId: Number(contextWithBranch.runId),
         cacheStatus,
         sessionIds: [result.sessionId],
-        createdPRs: [],
-        createdCommits: [],
+        createdPRs: [...result.prsCreated],
+        createdCommits: [...result.commitsCreated],
         duration: Math.round((Date.now() - startTime) / 1000),
-        tokenUsage: null,
+        tokenUsage: result.tokenUsage,
       }
       await writeSessionSummary(result.sessionId, runSummary, sessionLogger)
       sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
     }
+
+    metrics.end()
 
     // 9. Calculate duration and set outputs
     const duration = Date.now() - startTime
@@ -291,6 +343,17 @@ async function run(): Promise<number> {
       cacheStatus,
       duration,
     })
+
+    const summaryOptions: CommentSummaryOptions = {
+      eventType: contextWithBranch.eventName,
+      repo: contextWithBranch.repo,
+      ref: contextWithBranch.ref,
+      runId: Number(contextWithBranch.runId),
+      runUrl: `https://github.com/${contextWithBranch.repo}/actions/runs/${contextWithBranch.runId}`,
+      metrics: metrics.getMetrics(),
+      agent: inputs.agent,
+    }
+    await writeJobSummary(summaryOptions, logger)
 
     if (result.success) {
       logger.info('Agent run completed successfully', {durationMs: duration})

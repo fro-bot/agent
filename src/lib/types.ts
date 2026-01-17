@@ -66,13 +66,18 @@ export interface ActionOutputs {
   readonly duration: number
 }
 
-// Token usage tracking
+// Token usage tracking (matches OpenCode SDK structure)
 export interface TokenUsage {
   readonly input: number
   readonly output: number
+  readonly reasoning: number
+  readonly cache: {
+    readonly read: number
+    readonly write: number
+  }
 }
 
-// Run summary data
+// Run summary for session writeback (RFC-004)
 export interface RunSummary {
   readonly eventType: string
   readonly repo: string

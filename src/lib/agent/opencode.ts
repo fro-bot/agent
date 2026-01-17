@@ -6,6 +6,7 @@
  */
 
 import type {Logger} from '../logger.js'
+import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
@@ -48,7 +49,19 @@ interface EventProperties {
     text?: string
     tool?: string
     time?: {end?: number}
-    state?: {status?: string; title?: string; input?: Record<string, unknown>}
+    state?: {status?: string; title?: string; input?: Record<string, unknown>; output?: string}
+  }
+  message?: {
+    sessionID?: string
+    role?: string
+    modelID?: string
+    cost?: number
+    tokens?: {
+      input?: number
+      output?: number
+      reasoning?: number
+      cache?: {read?: number; write?: number}
+    }
   }
   info?: {id?: string; title?: string; version?: string}
   sessionID?: string
@@ -60,12 +73,63 @@ interface OpenCodeEvent {
   properties: EventProperties
 }
 
+interface EventStreamResult {
+  tokens: TokenUsage | null
+  model: string | null
+  cost: number | null
+  prsCreated: string[]
+  commitsCreated: string[]
+  commentsPosted: number
+}
+
+function detectArtifacts(
+  command: string,
+  output: string,
+  prsCreated: string[],
+  commitsCreated: string[],
+  onCommentPosted: () => void,
+): void {
+  if (command.includes('gh pr create')) {
+    const prUrlMatch = /https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.exec(output)
+    if (prUrlMatch != null) {
+      const prUrl = prUrlMatch[0]
+      if (!prsCreated.includes(prUrl)) {
+        prsCreated.push(prUrl)
+      }
+    }
+  }
+
+  if (command.includes('git commit')) {
+    const commitMatch = /\[[\w-]+\s+([a-f0-9]{7,40})\]/.exec(output)
+    if (commitMatch?.[1] != null) {
+      const sha = commitMatch[1]
+      if (!commitsCreated.includes(sha)) {
+        commitsCreated.push(sha)
+      }
+    }
+  }
+
+  if (
+    (command.includes('gh issue comment') || command.includes('gh pr comment')) &&
+    output.includes('github.com') &&
+    output.includes('#issuecomment')
+  ) {
+    onCommentPosted()
+  }
+}
+
 async function processEventStream(
   stream: AsyncIterable<OpenCodeEvent>,
   sessionId: string,
   logger: Logger,
-): Promise<void> {
+): Promise<EventStreamResult> {
   let lastText = ''
+  let tokens: TokenUsage | null = null
+  let model: string | null = null
+  let cost: number | null = null
+  const prsCreated: string[] = []
+  const commitsCreated: string[] = []
+  let commentsPosted = 0
 
   for await (const event of stream) {
     const props = event.properties
@@ -87,11 +151,37 @@ async function processEventStream(
         const toolInput = part.state.input ?? {}
         const title = part.state.title ?? (Object.keys(toolInput).length > 0 ? JSON.stringify(toolInput) : 'Unknown')
         outputToolExecution(toolName, title)
+
+        if (toolName.toLowerCase() === 'bash') {
+          const command = String(toolInput.command ?? toolInput.cmd ?? '')
+          const output = String(part.state.output ?? '')
+          detectArtifacts(command, output, prsCreated, commitsCreated, () => {
+            commentsPosted++
+          })
+        }
+      }
+    } else if (event.type === 'message.updated') {
+      const msg = props.message
+      if (msg?.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+        tokens = {
+          input: msg.tokens.input ?? 0,
+          output: msg.tokens.output ?? 0,
+          reasoning: msg.tokens.reasoning ?? 0,
+          cache: {
+            read: msg.tokens.cache?.read ?? 0,
+            write: msg.tokens.cache?.write ?? 0,
+          },
+        }
+        model = msg.modelID ?? null
+        cost = msg.cost ?? null
+        logger.debug('Token usage received', {tokens, model, cost})
       }
     } else if (event.type === 'session.error' && props.sessionID === sessionId) {
       logger.error('Session error', {error: props.error})
     }
   }
+
+  return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted}
 }
 
 export async function executeOpenCode(
@@ -147,7 +237,19 @@ export async function executeOpenCode(
     const events = await client.event.subscribe()
 
     let eventStreamEnded = false
+    let eventStreamResult: EventStreamResult = {
+      tokens: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+    }
+
     const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
+      .then(result => {
+        eventStreamResult = result
+      })
       .catch(error => {
         if (error instanceof Error && error.name !== 'AbortError') {
           logger.debug('Event stream error', {error: error.message})
@@ -193,6 +295,12 @@ export async function executeOpenCode(
         duration: Date.now() - startTime,
         sessionId,
         error: `Execution timed out after ${timeoutMs}ms`,
+        tokenUsage: eventStreamResult.tokens,
+        model: eventStreamResult.model,
+        cost: eventStreamResult.cost,
+        prsCreated: eventStreamResult.prsCreated,
+        commitsCreated: eventStreamResult.commitsCreated,
+        commentsPosted: eventStreamResult.commentsPosted,
       }
     }
 
@@ -204,6 +312,12 @@ export async function executeOpenCode(
         duration: Date.now() - startTime,
         sessionId,
         error: String(promptResponse.error),
+        tokenUsage: eventStreamResult.tokens,
+        model: eventStreamResult.model,
+        cost: eventStreamResult.cost,
+        prsCreated: eventStreamResult.prsCreated,
+        commitsCreated: eventStreamResult.commitsCreated,
+        commentsPosted: eventStreamResult.commentsPosted,
       }
     }
 
@@ -219,6 +333,12 @@ export async function executeOpenCode(
       duration,
       sessionId,
       error: null,
+      tokenUsage: eventStreamResult.tokens,
+      model: eventStreamResult.model,
+      cost: eventStreamResult.cost,
+      prsCreated: eventStreamResult.prsCreated,
+      commitsCreated: eventStreamResult.commitsCreated,
+      commentsPosted: eventStreamResult.commentsPosted,
     }
   } catch (error) {
     const duration = Date.now() - startTime
@@ -235,6 +355,12 @@ export async function executeOpenCode(
       duration,
       sessionId: null,
       error: errorMessage,
+      tokenUsage: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
     }
   } finally {
     if (timeoutId != null) {
