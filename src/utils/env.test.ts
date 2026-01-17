@@ -4,6 +4,7 @@ import {
   getGitHubRefName,
   getGitHubRepository,
   getGitHubRunId,
+  getGitHubWorkspace,
   getOpenCodeAuthPath,
   getOpenCodeStoragePath,
   getRunnerOS,
@@ -203,5 +204,54 @@ describe('getGitHubRunId', () => {
   it('returns 0 when GITHUB_RUN_ID is empty', () => {
     process.env.GITHUB_RUN_ID = ''
     expect(getGitHubRunId()).toBe(0)
+  })
+})
+
+describe('getGitHubWorkspace', () => {
+  const originalEnv = process.env
+  const originalCwd = process.cwd()
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_WORKSPACE when set', () => {
+    // #given GITHUB_WORKSPACE is set
+    process.env.GITHUB_WORKSPACE = '/home/runner/work/repo/repo'
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns the workspace path
+    expect(result).toBe('/home/runner/work/repo/repo')
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE not set', () => {
+    // #given GITHUB_WORKSPACE is not set
+    delete process.env.GITHUB_WORKSPACE
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE is empty', () => {
+    // #given GITHUB_WORKSPACE is empty string
+    process.env.GITHUB_WORKSPACE = ''
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE is whitespace only', () => {
+    // #given GITHUB_WORKSPACE is whitespace only
+    process.env.GITHUB_WORKSPACE = '   '
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
   })
 })
