@@ -23,6 +23,7 @@ import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {Octokit} from './lib/github/types.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {
@@ -173,7 +174,7 @@ async function run(): Promise<number> {
 
     const cacheLogger = createLogger({phase: 'cache'})
     const workspacePath = getGitHubWorkspace()
-    const projectIdPath = `${workspacePath}/.git/opencode`
+    const projectIdPath = path.join(workspacePath, '.git', 'opencode')
 
     const cacheResult: CacheResult = await restoreCache({
       components: cacheComponents,
@@ -200,14 +201,13 @@ async function run(): Promise<number> {
 
     // 6c. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
-    const projectPath = process.env.GITHUB_WORKSPACE ?? process.cwd()
 
-    const recentSessions = await listSessions(projectPath, {limit: 10}, sessionLogger)
+    const recentSessions = await listSessions(workspacePath, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = contextWithBranch.issueTitle ?? contextWithBranch.repo
-    const priorWorkContext = await searchSessions(searchQuery, projectPath, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(searchQuery, workspacePath, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -345,7 +345,7 @@ async function run(): Promise<number> {
 
       const cacheLogger = createLogger({phase: 'cache-save'})
       const finalWorkspace = getGitHubWorkspace()
-      const finalProjectIdPath = `${finalWorkspace}/.git/opencode`
+      const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
 
       const cacheSaved = await saveCache({
         components: cacheComponents,

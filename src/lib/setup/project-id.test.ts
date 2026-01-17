@@ -49,7 +49,7 @@ describe('ensureProjectId', () => {
 
   it('returns cached ID when .git/opencode exists', async () => {
     // #given workspace with .git/opencode containing cached ID
-    const cachedId = 'abc123def456'
+    const cachedId = 'abc123def456abc123def456abc123def456abc1'
     await fs.mkdir(gitDir, {recursive: true})
     await fs.writeFile(projectIdFile, cachedId, 'utf8')
 
@@ -275,5 +275,46 @@ describe('ensureProjectId', () => {
     // #then it handles the worktree and returns generated ID
     expect(result.projectId).toBe(rootCommitSha)
     expect(result.source).toBe('generated')
+  })
+
+  it('regenerates when cached ID has invalid SHA format', async () => {
+    // #given workspace with .git/opencode containing invalid SHA
+    await fs.mkdir(gitDir, {recursive: true})
+    await fs.writeFile(projectIdFile, 'not-a-valid-sha', 'utf8')
+
+    const validSha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'
+    const execAdapter = createMockExecAdapter({stdout: `${validSha}\n`})
+
+    const options: ProjectIdOptions = {
+      workspacePath,
+      logger: createTestLogger(),
+      execAdapter,
+    }
+
+    // #when ensureProjectId is called
+    const result = await ensureProjectId(options)
+
+    // #then it regenerates with valid SHA
+    expect(result.projectId).toBe(validSha)
+    expect(result.source).toBe('generated')
+  })
+
+  it('accepts valid SHA-1 format from cache', async () => {
+    // #given workspace with .git/opencode containing valid SHA
+    const validSha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'
+    await fs.mkdir(gitDir, {recursive: true})
+    await fs.writeFile(projectIdFile, validSha, 'utf8')
+
+    const options: ProjectIdOptions = {
+      workspacePath,
+      logger: createTestLogger(),
+    }
+
+    // #when ensureProjectId is called
+    const result = await ensureProjectId(options)
+
+    // #then it returns the cached valid SHA
+    expect(result.projectId).toBe(validSha)
+    expect(result.source).toBe('cached')
   })
 })

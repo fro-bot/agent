@@ -17,6 +17,8 @@ export interface ProjectIdOptions {
   readonly execAdapter?: ExecAdapter
 }
 
+const SHA1_PATTERN = /^[0-9a-f]{40}$/i
+
 function createDefaultExecAdapter(): ExecAdapter {
   return {
     exec: exec.exec,
@@ -37,8 +39,11 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
     const cachedId = await fs.readFile(projectIdFile, 'utf8')
     const trimmedId = cachedId.trim()
     if (trimmedId.length > 0) {
-      logger.debug('Project ID loaded from cache', {projectId: trimmedId})
-      return {projectId: trimmedId, source: 'cached'}
+      if (SHA1_PATTERN.test(trimmedId)) {
+        logger.debug('Project ID loaded from cache', {projectId: trimmedId})
+        return {projectId: trimmedId, source: 'cached'}
+      }
+      logger.warning('Invalid cached project ID format, regenerating', {cachedId: trimmedId})
     }
   } catch {}
 
@@ -76,10 +81,7 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
       return {projectId: null, source: 'error', error: 'No root commits found'}
     }
 
-    const firstRootCommit = rootCommits[0]
-    if (firstRootCommit == null) {
-      return {projectId: null, source: 'error', error: 'No root commits found'}
-    }
+    const firstRootCommit = rootCommits[0] as string
 
     try {
       await fs.writeFile(projectIdFile, firstRootCommit, 'utf8')
