@@ -1,8 +1,8 @@
-import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {GitHubContext} from '../github/types.js'
 import type {TriggerConfig} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {classifyEventType} from '../github/context.js'
+import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {ALLOWED_ASSOCIATIONS} from './types.js'
 
@@ -13,43 +13,6 @@ function createMockLogger() {
     warning: vi.fn(),
     error: vi.fn(),
   }
-}
-
-function createMockIssueCommentEvent(
-  overrides: Partial<{
-    action: string
-    commentBody: string
-    authorLogin: string
-    authorAssociation: string
-    issueNumber: number
-    isLocked: boolean
-    isPR: boolean
-  }> = {},
-) {
-  return {
-    action: overrides.action ?? 'created',
-    issue: {
-      number: overrides.issueNumber ?? 123,
-      title: 'Test Issue',
-      body: 'Issue body',
-      state: 'open',
-      user: {login: 'issue-author'},
-      locked: overrides.isLocked ?? false,
-      ...(overrides.isPR === true ? {pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/123'}} : {}),
-    },
-    comment: {
-      id: 456,
-      body: overrides.commentBody ?? 'Test comment',
-      user: {login: overrides.authorLogin ?? 'commenter'},
-      author_association: overrides.authorAssociation ?? 'MEMBER',
-    },
-    repository: {
-      owner: {login: 'owner'},
-      name: 'repo',
-      full_name: 'owner/repo',
-    },
-    sender: {login: overrides.authorLogin ?? 'commenter'},
-  } as unknown as IssueCommentEvent
 }
 
 function createMockGitHubContext(eventName: string, payload: unknown = {}): GitHubContext {
@@ -242,7 +205,7 @@ describe('checkSkipConditions', () => {
 
   it('skips unsupported events', () => {
     // #given an unsupported event context
-    const payload = createMockIssueCommentEvent()
+    const payload = createIssueCommentCreatedEvent()
     const ghContext = createMockGitHubContext('push', payload)
     const context = {
       eventType: 'unsupported' as const,
@@ -271,7 +234,7 @@ describe('checkSkipConditions', () => {
 
   it('skips non-created comment actions', () => {
     // #given an edited comment
-    const payload = createMockIssueCommentEvent({action: 'edited'})
+    const payload = createIssueCommentCreatedEvent({action: 'edited'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -300,7 +263,7 @@ describe('checkSkipConditions', () => {
 
   it('skips locked issues', () => {
     // #given a locked issue
-    const payload = createMockIssueCommentEvent({isLocked: true})
+    const payload = createIssueCommentCreatedEvent({issueLocked: true})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -329,7 +292,7 @@ describe('checkSkipConditions', () => {
 
   it('skips self-comments (anti-loop)', () => {
     // #given a comment from the bot itself
-    const payload = createMockIssueCommentEvent({authorLogin: 'fro-bot'})
+    const payload = createIssueCommentCreatedEvent({authorLogin: 'fro-bot'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -358,7 +321,7 @@ describe('checkSkipConditions', () => {
 
   it('skips self-comments with [bot] suffix', () => {
     // #given a comment from the bot with [bot] suffix
-    const payload = createMockIssueCommentEvent({authorLogin: 'fro-bot[bot]'})
+    const payload = createIssueCommentCreatedEvent({authorLogin: 'fro-bot[bot]'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -387,7 +350,7 @@ describe('checkSkipConditions', () => {
 
   it('skips unauthorized author associations', () => {
     // #given a comment from an unauthorized user
-    const payload = createMockIssueCommentEvent({authorAssociation: 'NONE'})
+    const payload = createIssueCommentCreatedEvent({authorAssociation: 'NONE'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -416,7 +379,7 @@ describe('checkSkipConditions', () => {
 
   it('skips comments without mention when requireMention is true', () => {
     // #given a comment without mention
-    const payload = createMockIssueCommentEvent({commentBody: 'Just a regular comment'})
+    const payload = createIssueCommentCreatedEvent({commentBody: 'Just a regular comment'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -446,7 +409,7 @@ describe('checkSkipConditions', () => {
   it('allows comments without mention when requireMention is false', () => {
     // #given requireMention is false
     const configNoMention = {...config, requireMention: false}
-    const payload = createMockIssueCommentEvent({commentBody: 'Just a regular comment'})
+    const payload = createIssueCommentCreatedEvent({commentBody: 'Just a regular comment'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const context = {
       eventType: 'issue_comment' as const,
@@ -474,7 +437,7 @@ describe('checkSkipConditions', () => {
 
   it('allows valid comments', () => {
     // #given a valid comment with mention from authorized user
-    const payload = createMockIssueCommentEvent({
+    const payload = createIssueCommentCreatedEvent({
       commentBody: '@fro-bot help',
       authorAssociation: 'OWNER',
     })
@@ -513,7 +476,7 @@ describe('routeEvent', () => {
 
   it('routes valid issue_comment event', () => {
     // #given a valid issue_comment event
-    const payload = createMockIssueCommentEvent({
+    const payload = createIssueCommentCreatedEvent({
       commentBody: '@fro-bot review',
       authorAssociation: 'MEMBER',
     })
@@ -545,8 +508,8 @@ describe('routeEvent', () => {
 
   it('builds complete TriggerContext for issue_comment', () => {
     // #given an issue_comment on a PR
-    const payload = createMockIssueCommentEvent({
-      isPR: true,
+    const payload = createIssueCommentCreatedEvent({
+      isPullRequest: true,
       commentBody: '@fro-bot help me please',
       authorLogin: 'contributor',
       authorAssociation: 'COLLABORATOR',
@@ -570,7 +533,7 @@ describe('routeEvent', () => {
 
   it('applies default config when none provided', () => {
     // #given an event with no config
-    const payload = createMockIssueCommentEvent({
+    const payload = createIssueCommentCreatedEvent({
       commentBody: 'No mention here',
       authorAssociation: 'MEMBER',
     })
@@ -586,7 +549,7 @@ describe('routeEvent', () => {
 
   it('merges partial config with defaults', () => {
     // #given partial config
-    const payload = createMockIssueCommentEvent({commentBody: 'No mention'})
+    const payload = createIssueCommentCreatedEvent({commentBody: 'No mention'})
     const ghContext = createMockGitHubContext('issue_comment', payload)
     const config = {requireMention: false}
 

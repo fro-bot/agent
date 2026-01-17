@@ -1,7 +1,7 @@
-import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
 import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
 import {
   classifyEventType,
   getAuthorAssociation,
@@ -144,24 +144,19 @@ describe('parseGitHubContext', () => {
 
 describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
-    const payload = {
-      issue: {pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/1'}},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({isPullRequest: true})
     expect(isPullRequest(payload)).toBe(true)
   })
 
   it('returns false for regular issues', () => {
-    const payload = {
-      issue: {number: 1, title: 'Test issue'},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({isPullRequest: false})
     expect(isPullRequest(payload)).toBe(false)
   })
 })
 
 describe('getCommentTarget', () => {
   it('returns issue target for issue_comment on issue', () => {
+    const payload = createIssueCommentCreatedEvent({issueNumber: 42})
     const context: GitHubContext = {
       eventName: 'issue_comment',
       eventType: 'issue_comment',
@@ -170,9 +165,7 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {
-        issue: {number: 42},
-      },
+      payload,
     }
 
     const target = getCommentTarget(context)
@@ -186,6 +179,7 @@ describe('getCommentTarget', () => {
   })
 
   it('returns pr target for issue_comment on PR', () => {
+    const payload = createIssueCommentCreatedEvent({issueNumber: 42, isPullRequest: true})
     const context: GitHubContext = {
       eventName: 'issue_comment',
       eventType: 'issue_comment',
@@ -194,12 +188,7 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {
-        issue: {
-          number: 42,
-          pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/42'},
-        },
-      },
+      payload,
     }
 
     const target = getCommentTarget(context)
@@ -249,38 +238,34 @@ describe('getCommentTarget', () => {
 
 describe('getAuthorAssociation', () => {
   it('extracts author association from payload', () => {
-    const payload = {
-      comment: {author_association: 'MEMBER'},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({authorAssociation: 'MEMBER'})
     expect(getAuthorAssociation(payload)).toBe('MEMBER')
+  })
+
+  it('handles different association values', () => {
+    const associations = ['OWNER', 'COLLABORATOR', 'CONTRIBUTOR', 'NONE'] as const
+    for (const assoc of associations) {
+      const payload = createIssueCommentCreatedEvent({authorAssociation: assoc})
+      expect(getAuthorAssociation(payload)).toBe(assoc)
+    }
   })
 })
 
 describe('getCommentAuthor', () => {
   it('extracts comment author login from payload', () => {
-    const payload = {
-      comment: {user: {login: 'test-user'}},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({authorLogin: 'test-user'})
     expect(getCommentAuthor(payload)).toBe('test-user')
   })
 })
 
 describe('isIssueLocked', () => {
   it('returns true when issue is locked', () => {
-    const payload = {
-      issue: {locked: true},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({issueLocked: true})
     expect(isIssueLocked(payload)).toBe(true)
   })
 
   it('returns false when issue is not locked', () => {
-    const payload = {
-      issue: {locked: false},
-    } as unknown as IssueCommentEvent
-
+    const payload = createIssueCommentCreatedEvent({issueLocked: false})
     expect(isIssueLocked(payload)).toBe(false)
   })
 })
