@@ -1,4 +1,4 @@
-export {getFileContent, getPRDiff, parseHunks} from './diff.js'
+export {getFileContent, getPRDiff} from './diff.js'
 export {
   getReviewComments,
   postReviewComment,
@@ -11,7 +11,6 @@ export type {
   DiffFile,
   DiffHunk,
   ExistingReviewComment,
-  GitHubReviewComment,
   PRDiff,
   PreparedReviewComments,
   ReviewComment,

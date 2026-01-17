@@ -8,6 +8,7 @@
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {DiffContext, PromptOptions, SessionContext} from './types.js'
+import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 
 export interface TriggerDirective {
   readonly directive: string
@@ -323,12 +324,12 @@ function buildDiffContextSection(diffContext: DiffContext): string {
     lines.push('| File | Status | +/- |')
     lines.push('|------|--------|-----|')
 
-    for (const file of diffContext.files.slice(0, 20)) {
+    for (const file of diffContext.files.slice(0, MAX_FILES_IN_PROMPT)) {
       lines.push(`| \`${file.filename}\` | ${file.status} | +${file.additions}/-${file.deletions} |`)
     }
 
-    if (diffContext.files.length > 20) {
-      lines.push(`| ... | | +${diffContext.files.length - 20} more files |`)
+    if (diffContext.files.length > MAX_FILES_IN_PROMPT) {
+      lines.push(`| ... | | +${diffContext.files.length - MAX_FILES_IN_PROMPT} more files |`)
     }
   }
 

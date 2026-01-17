@@ -705,11 +705,14 @@ The reviews module integrates into the main action through a clean abstraction l
    - Transforms result to `DiffContext` (limited to 50 files via `MAX_FILES_IN_CONTEXT`)
    - Returns `null` gracefully on errors (non-fatal)
 
-2. **`src/main.ts` (Step 6d)**: Single function call:
+2. **`src/main.ts` (Step 3c)**: Diff context collected during agent context creation:
 
    ```typescript
-   const diffContext =
-     (await collectDiffContext(triggerResult.context, githubClient, contextWithBranch.repo, reviewLogger)) ?? undefined
+   const agentContext = await collectAgentContext({
+     logger: contextLogger,
+     octokit: githubClient,
+     triggerContext: triggerResult.context,
+   })
    ```
 
 3. **`src/lib/agent/prompt.ts`**: Includes `buildDiffContextSection()` that adds a "Pull Request Diff Summary" section to the agent prompt with:

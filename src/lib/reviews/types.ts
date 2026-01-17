@@ -106,7 +106,7 @@ export interface ReviewResult {
 /**
  * Reasons why a review comment was skipped.
  */
-export const SKIP_REASONS = ['file_not_in_diff', 'patch_missing', 'line_not_in_hunks'] as const
+export const SKIP_REASONS = ['file_not_in_diff', 'patch_missing'] as const
 export type SkipReason = (typeof SKIP_REASONS)[number]
 
 /**

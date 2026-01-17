@@ -16,7 +16,6 @@
 ```typescript
 // Diff operations
 getPRDiff(octokit, owner, repo, prNumber, logger)
-parseHunks(patch)
 getFileContent(octokit, owner, repo, path, ref, logger)
 
 // Review operations
@@ -43,11 +42,10 @@ prepareReviewComments(comments, diff, logger)
 
 ## SKIP REASONS
 
-| Reason              | Description                          |
-| ------------------- | ------------------------------------ |
-| `file_not_in_diff`  | File path not found in PR diff       |
-| `patch_missing`     | File has no patch (binary/too large) |
-| `line_not_in_hunks` | Line not within parsed hunk ranges   |
+| Reason             | Description                          |
+| ------------------ | ------------------------------------ |
+| `file_not_in_diff` | File path not found in PR diff       |
+| `patch_missing`    | File has no patch (binary/too large) |
 
 ## ANTI-PATTERNS
 
