@@ -1,9 +1,10 @@
 # RFC-017: Post-Action Cache Hook
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** Medium
 **Phase:** 2
+**Completed:** 2026-01-17
 
 ---
 
@@ -295,32 +296,32 @@ export type StateKey = keyof typeof STATE_KEYS
 
 ### Post-Action Hook
 
-- [ ] `src/post.ts` entry point exists and bundles to `dist/post.js`
-- [ ] `action.yaml` includes `runs.post: dist/post.js`
-- [ ] Post-hook saves cache idempotently (best-effort, never fails job)
-- [ ] Post-hook runs even on main action failure/timeout
-- [ ] Post-hook skips cache save if main action already saved
-- [ ] Post-hook skips cache save if main action determined event should be skipped
+- [x] `src/post.ts` entry point exists and bundles to `dist/post.js`
+- [x] `action.yaml` includes `runs.post: dist/post.js`
+- [x] Post-hook saves cache idempotently (best-effort, never fails job)
+- [x] Post-hook runs even on main action failure/timeout
+- [x] Post-hook skips cache save if main action already saved
+- [x] Post-hook skips cache save if main action determined event should be skipped
 
 ### State Handoff
 
-- [ ] Main action sets `shouldSaveCache` state before processing
-- [ ] Main action sets `sessionId` state after session creation
-- [ ] Main action sets `cacheSaved` state after successful cache save
-- [ ] Post action reads state with `core.getState()`
+- [x] Main action sets `shouldSaveCache` state before processing
+- [x] Main action sets `sessionId` state after session creation
+- [x] Main action sets `cacheSaved` state after successful cache save
+- [x] Post action reads state with `core.getState()`
 
 ### Build Configuration
 
-- [ ] `tsdown.config.ts` includes `src/post.ts` in entry array
-- [ ] Build produces `dist/main.js`, `dist/setup.js`, `dist/post.js`
-- [ ] All three bundles pass type checking
+- [x] `tsdown.config.ts` includes `src/post.ts` in entry array
+- [x] Build produces `dist/main.js`, `dist/post.js` (setup consolidated into main)
+- [x] All bundles pass type checking
 
 ### Error Handling
 
-- [ ] Post-hook logs but does not throw on cache save failure
-- [ ] Post-hook logs but does not throw on session pruning failure
-- [ ] Post-hook catches all exceptions at top level
-- [ ] Job status is not affected by post-hook errors
+- [x] Post-hook logs but does not throw on cache save failure
+- [x] Post-hook logs but does not throw on session pruning failure (pruning in main action)
+- [x] Post-hook catches all exceptions at top level
+- [x] Job status is not affected by post-hook errors
 
 ## Test Cases
 
