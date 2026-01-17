@@ -1,5 +1,6 @@
+import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {Logger} from '../logger.js'
-import type {CommentTarget, EventType, GitHubContext, IssueCommentPayload} from './types.js'
+import type {CommentTarget, EventType, GitHubContext} from './types.js'
 import * as github from '@actions/github'
 
 /**
@@ -11,11 +12,19 @@ export function classifyEventType(eventName: string): EventType {
       return 'issue_comment'
     case 'discussion':
     case 'discussion_comment':
-      return 'discussion'
+      return 'discussion_comment'
     case 'workflow_dispatch':
       return 'workflow_dispatch'
+    case 'issues':
+      return 'issues'
+    case 'pull_request':
+      return 'pull_request'
+    case 'pull_request_review_comment':
+      return 'pull_request_review_comment'
+    case 'schedule':
+      return 'schedule'
     default:
-      return 'unknown'
+      return 'unsupported'
   }
 }
 
@@ -48,7 +57,7 @@ export function parseGitHubContext(logger: Logger): GitHubContext {
 /**
  * Determine if the issue_comment is on a PR or issue.
  */
-export function isPullRequest(payload: IssueCommentPayload): boolean {
+export function isPullRequest(payload: IssueCommentEvent): boolean {
   return payload.issue.pull_request != null
 }
 
@@ -59,7 +68,7 @@ export function getCommentTarget(context: GitHubContext): CommentTarget | null {
   const {eventType, payload, repo} = context
 
   if (eventType === 'issue_comment') {
-    const p = payload as IssueCommentPayload
+    const p = payload as IssueCommentEvent
     return {
       type: isPullRequest(p) ? 'pr' : 'issue',
       number: p.issue.number,
@@ -68,7 +77,7 @@ export function getCommentTarget(context: GitHubContext): CommentTarget | null {
     }
   }
 
-  if (eventType === 'discussion') {
+  if (eventType === 'discussion_comment') {
     // Discussion handling requires GraphQL - implemented in RFC-008
     return null
   }
@@ -79,20 +88,20 @@ export function getCommentTarget(context: GitHubContext): CommentTarget | null {
 /**
  * Get author association from comment payload.
  */
-export function getAuthorAssociation(payload: IssueCommentPayload): string {
+export function getAuthorAssociation(payload: IssueCommentEvent): string {
   return payload.comment.author_association
 }
 
 /**
  * Get comment author login.
  */
-export function getCommentAuthor(payload: IssueCommentPayload): string {
+export function getCommentAuthor(payload: IssueCommentEvent): string {
   return payload.comment.user.login
 }
 
 /**
  * Check if issue/PR is locked.
  */
-export function isIssueLocked(payload: IssueCommentPayload): boolean {
+export function isIssueLocked(payload: IssueCommentEvent): boolean {
   return payload.issue.locked
 }

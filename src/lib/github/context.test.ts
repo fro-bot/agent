@@ -1,6 +1,7 @@
 import type {Logger} from '../logger.js'
-import type {GitHubContext, IssueCommentPayload} from './types.js'
+import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
 import {
   classifyEventType,
   getAuthorAssociation,
@@ -33,26 +34,85 @@ function createMockLogger(): Logger {
 }
 
 describe('classifyEventType', () => {
-  it('classifies issue_comment event correctly', () => {
-    expect(classifyEventType('issue_comment')).toBe('issue_comment')
+  it('classifies issue_comment as issue_comment', () => {
+    // #given an issue_comment event
+    // #when classifying the event type
+    const result = classifyEventType('issue_comment')
+
+    // #then it should return issue_comment
+    expect(result).toBe('issue_comment')
   })
 
-  it('classifies discussion event correctly', () => {
-    expect(classifyEventType('discussion')).toBe('discussion')
+  it('classifies discussion as discussion_comment', () => {
+    // #given a discussion event
+    // #when classifying the event type
+    const result = classifyEventType('discussion')
+
+    // #then it should return discussion_comment
+    expect(result).toBe('discussion_comment')
   })
 
-  it('classifies discussion_comment event as discussion', () => {
-    expect(classifyEventType('discussion_comment')).toBe('discussion')
+  it('classifies discussion_comment as discussion_comment', () => {
+    // #given a discussion_comment event
+    // #when classifying the event type
+    const result = classifyEventType('discussion_comment')
+
+    // #then it should return discussion_comment
+    expect(result).toBe('discussion_comment')
   })
 
-  it('classifies workflow_dispatch event correctly', () => {
-    expect(classifyEventType('workflow_dispatch')).toBe('workflow_dispatch')
+  it('classifies workflow_dispatch as workflow_dispatch', () => {
+    // #given a workflow_dispatch event
+    // #when classifying the event type
+    const result = classifyEventType('workflow_dispatch')
+
+    // #then it should return workflow_dispatch
+    expect(result).toBe('workflow_dispatch')
   })
 
-  it('classifies unknown events as unknown', () => {
-    expect(classifyEventType('push')).toBe('unknown')
-    expect(classifyEventType('pull_request')).toBe('unknown')
-    expect(classifyEventType('random_event')).toBe('unknown')
+  it('classifies unknown events as unsupported', () => {
+    // #given an unknown event
+    // #when classifying the event type
+    const result = classifyEventType('push')
+
+    // #then it should return unsupported
+    expect(result).toBe('unsupported')
+  })
+
+  it('classifies pull_request as pull_request', () => {
+    // #given a pull_request event
+    // #when classifying the event type
+    const result = classifyEventType('pull_request')
+
+    // #then it should return pull_request
+    expect(result).toBe('pull_request')
+  })
+
+  it('classifies issues as issues', () => {
+    // #given an issues event
+    // #when classifying the event type
+    const result = classifyEventType('issues')
+
+    // #then it should return issues
+    expect(result).toBe('issues')
+  })
+
+  it('classifies pull_request_review_comment as pull_request_review_comment', () => {
+    // #given a pull_request_review_comment event
+    // #when classifying the event type
+    const result = classifyEventType('pull_request_review_comment')
+
+    // #then it should return pull_request_review_comment
+    expect(result).toBe('pull_request_review_comment')
+  })
+
+  it('classifies schedule as schedule', () => {
+    // #given a schedule event
+    // #when classifying the trigger
+    const result = classifyEventType('schedule')
+
+    // #then it should return schedule
+    expect(result).toBe('schedule')
   })
 })
 
@@ -84,24 +144,19 @@ describe('parseGitHubContext', () => {
 
 describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
-    const payload = {
-      issue: {pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/1'}},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({isPullRequest: true})
     expect(isPullRequest(payload)).toBe(true)
   })
 
   it('returns false for regular issues', () => {
-    const payload = {
-      issue: {number: 1, title: 'Test issue'},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({isPullRequest: false})
     expect(isPullRequest(payload)).toBe(false)
   })
 })
 
 describe('getCommentTarget', () => {
   it('returns issue target for issue_comment on issue', () => {
+    const payload = createIssueCommentCreatedEvent({issueNumber: 42})
     const context: GitHubContext = {
       eventName: 'issue_comment',
       eventType: 'issue_comment',
@@ -110,9 +165,7 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {
-        issue: {number: 42},
-      },
+      payload,
     }
 
     const target = getCommentTarget(context)
@@ -126,6 +179,7 @@ describe('getCommentTarget', () => {
   })
 
   it('returns pr target for issue_comment on PR', () => {
+    const payload = createIssueCommentCreatedEvent({issueNumber: 42, isPullRequest: true})
     const context: GitHubContext = {
       eventName: 'issue_comment',
       eventType: 'issue_comment',
@@ -134,12 +188,7 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {
-        issue: {
-          number: 42,
-          pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/42'},
-        },
-      },
+      payload,
     }
 
     const target = getCommentTarget(context)
@@ -155,7 +204,7 @@ describe('getCommentTarget', () => {
   it('returns null for discussion events (not yet implemented)', () => {
     const context: GitHubContext = {
       eventName: 'discussion',
-      eventType: 'discussion',
+      eventType: 'discussion_comment',
       repo: {owner: 'test-owner', repo: 'test-repo'},
       ref: 'refs/heads/main',
       sha: 'abc123',
@@ -172,7 +221,7 @@ describe('getCommentTarget', () => {
   it('returns null for unknown events', () => {
     const context: GitHubContext = {
       eventName: 'push',
-      eventType: 'unknown',
+      eventType: 'unsupported',
       repo: {owner: 'test-owner', repo: 'test-repo'},
       ref: 'refs/heads/main',
       sha: 'abc123',
@@ -189,38 +238,34 @@ describe('getCommentTarget', () => {
 
 describe('getAuthorAssociation', () => {
   it('extracts author association from payload', () => {
-    const payload = {
-      comment: {author_association: 'MEMBER'},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({authorAssociation: 'MEMBER'})
     expect(getAuthorAssociation(payload)).toBe('MEMBER')
+  })
+
+  it('handles different association values', () => {
+    const associations = ['OWNER', 'COLLABORATOR', 'CONTRIBUTOR', 'NONE'] as const
+    for (const assoc of associations) {
+      const payload = createIssueCommentCreatedEvent({authorAssociation: assoc})
+      expect(getAuthorAssociation(payload)).toBe(assoc)
+    }
   })
 })
 
 describe('getCommentAuthor', () => {
   it('extracts comment author login from payload', () => {
-    const payload = {
-      comment: {user: {login: 'test-user'}},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({authorLogin: 'test-user'})
     expect(getCommentAuthor(payload)).toBe('test-user')
   })
 })
 
 describe('isIssueLocked', () => {
   it('returns true when issue is locked', () => {
-    const payload = {
-      issue: {locked: true},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({issueLocked: true})
     expect(isIssueLocked(payload)).toBe(true)
   })
 
   it('returns false when issue is not locked', () => {
-    const payload = {
-      issue: {locked: false},
-    } as unknown as IssueCommentPayload
-
+    const payload = createIssueCommentCreatedEvent({issueLocked: false})
     expect(isIssueLocked(payload)).toBe(false)
   })
 })

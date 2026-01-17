@@ -10,7 +10,7 @@ export interface MockEventConfig {
 
 export function isMockEventEnabled(): boolean {
   const mockEvent = process.env.MOCK_EVENT
-  return mockEvent != null && mockEvent.length > 0
+  return mockEvent != null && mockEvent !== ''
 }
 
 export function isInCI(): boolean {
