@@ -1,0 +1,98 @@
+import type {ExecAdapter, Logger} from './types.js'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as exec from '@actions/exec'
+
+export type ProjectIdSource = 'cached' | 'generated' | 'error'
+
+export interface ProjectIdResult {
+  readonly projectId: string | null
+  readonly source: ProjectIdSource
+  readonly error?: string
+}
+
+export interface ProjectIdOptions {
+  readonly workspacePath: string
+  readonly logger: Logger
+  readonly execAdapter?: ExecAdapter
+}
+
+function createDefaultExecAdapter(): ExecAdapter {
+  return {
+    exec: exec.exec,
+    getExecOutput: exec.getExecOutput,
+  }
+}
+
+/**
+ * Pre-create `.git/opencode` matching OpenCode's algorithm: first root commit SHA (sorted).
+ * This ensures deterministic project ID in CI where `.git/opencode` isn't persisted.
+ */
+export async function ensureProjectId(options: ProjectIdOptions): Promise<ProjectIdResult> {
+  const {workspacePath, logger, execAdapter = createDefaultExecAdapter()} = options
+  const gitDir = path.join(workspacePath, '.git')
+  const projectIdFile = path.join(gitDir, 'opencode')
+
+  try {
+    const cachedId = await fs.readFile(projectIdFile, 'utf8')
+    const trimmedId = cachedId.trim()
+    if (trimmedId.length > 0) {
+      logger.debug('Project ID loaded from cache', {projectId: trimmedId})
+      return {projectId: trimmedId, source: 'cached'}
+    }
+  } catch {}
+
+  try {
+    const stat = await fs.stat(gitDir)
+    if (stat.isDirectory() === false) {
+      const gitFileContent = await fs.readFile(gitDir, 'utf8')
+      const gitdirMatch = /^gitdir: (.+)$/m.exec(gitFileContent)
+      if (gitdirMatch == null) {
+        return {projectId: null, source: 'error', error: 'Invalid .git file format'}
+      }
+    }
+  } catch {
+    return {projectId: null, source: 'error', error: 'Not a git repository'}
+  }
+
+  try {
+    const {stdout, exitCode} = await execAdapter.getExecOutput('git', ['rev-list', '--max-parents=0', '--all'], {
+      cwd: workspacePath,
+      silent: true,
+    })
+
+    if (exitCode !== 0 || stdout.trim().length === 0) {
+      return {projectId: null, source: 'error', error: 'No commits found in repository'}
+    }
+
+    const rootCommits = stdout
+      .trim()
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .sort()
+
+    if (rootCommits.length === 0) {
+      return {projectId: null, source: 'error', error: 'No root commits found'}
+    }
+
+    const firstRootCommit = rootCommits[0]
+    if (firstRootCommit == null) {
+      return {projectId: null, source: 'error', error: 'No root commits found'}
+    }
+
+    try {
+      await fs.writeFile(projectIdFile, firstRootCommit, 'utf8')
+      logger.info('Project ID generated and cached', {projectId: firstRootCommit, source: 'generated'})
+    } catch (writeError) {
+      logger.warning('Failed to cache project ID (continuing)', {
+        error: writeError instanceof Error ? writeError.message : String(writeError),
+      })
+    }
+
+    return {projectId: firstRootCommit, source: 'generated'}
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    return {projectId: null, source: 'error', error: errorMessage}
+  }
+}

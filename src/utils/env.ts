@@ -66,3 +66,11 @@ export function getGitHubRunId(): number {
   }
   return 0
 }
+
+export function getGitHubWorkspace(): string {
+  const workspace = process.env.GITHUB_WORKSPACE
+  if (workspace != null && workspace.trim().length > 0) {
+    return workspace
+  }
+  return process.cwd()
+}
