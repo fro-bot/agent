@@ -66,12 +66,15 @@ function isAuthorizedAssociation(association: string, allowed: readonly string[]
   return allowed.includes(association)
 }
 
+function isBotUser(login: string): boolean {
+  return login.endsWith('[bot]')
+}
+
 function buildIssueCommentAuthorInfo(payload: IssueCommentEvent): AuthorInfo {
   const login = getCommentAuthor(payload)
   const association = getAuthorAssociation(payload)
-  const isBot = login.endsWith('[bot]') || payload.comment.user.login.includes('[bot]')
 
-  return {login, association, isBot}
+  return {login, association, isBot: isBotUser(login)}
 }
 
 function buildIssueCommentTarget(payload: IssueCommentEvent): TriggerTarget {
@@ -138,7 +141,7 @@ function buildDiscussionContextData(payload: DiscussionCommentEvent, botLogin: s
   const author: AuthorInfo = {
     login: comment.user.login,
     association: comment.author_association ?? 'NONE',
-    isBot: comment.user.login.endsWith('[bot]'),
+    isBot: isBotUser(comment.user.login),
   }
 
   const target: TriggerTarget = {
@@ -217,7 +220,7 @@ function buildIssuesContextData(payload: IssuesEvent, botLogin: string | null): 
   const author: AuthorInfo = {
     login: payload.sender.login,
     association: issue.author_association ?? 'NONE',
-    isBot: payload.sender.login.endsWith('[bot]'),
+    isBot: isBotUser(payload.sender.login),
   }
 
   const target: TriggerTarget = {
@@ -240,6 +243,14 @@ function buildIssuesContextData(payload: IssuesEvent, botLogin: string | null): 
   }
 }
 
+/**
+ * Supported issue actions. Only 'opened' and 'edited' are processed.
+ *
+ * Other actions ('reopened', 'closed', 'labeled', etc.) are intentionally skipped:
+ * - 'reopened': Reopened issues should be addressed via comments, not auto-triggered
+ * - 'closed'/'deleted': No agent action needed on closed/deleted issues
+ * - 'labeled'/'assigned'/etc.: Minor actions that would cause excessive noise
+ */
 const ISSUES_SUPPORTED_ACTIONS = ['opened', 'edited'] as const
 
 function isIssuesSupportedAction(action: string): action is (typeof ISSUES_SUPPORTED_ACTIONS)[number] {
@@ -317,7 +328,7 @@ function buildPullRequestContextData(payload: PullRequestEvent, botLogin: string
   const author: AuthorInfo = {
     login: payload.sender.login,
     association: pr.author_association ?? 'NONE',
-    isBot: payload.sender.login.endsWith('[bot]'),
+    isBot: isBotUser(payload.sender.login),
   }
 
   const target: TriggerTarget = {
@@ -425,7 +436,7 @@ function buildPRReviewCommentContextData(
   const author: AuthorInfo = {
     login: comment.user.login,
     association: comment.author_association,
-    isBot: comment.user.login.endsWith('[bot]'),
+    isBot: isBotUser(comment.user.login),
   }
 
   const target: TriggerTarget = {
@@ -608,6 +619,69 @@ function checkDiscussionCommentSkipConditions(
   })
 }
 
+const PR_REVIEW_COMMENT_SUPPORTED_ACTIONS = ['created'] as const
+
+function checkPRReviewCommentSkipConditions(
+  context: TriggerContext,
+  config: TriggerConfig,
+  logger: Logger,
+): SkipCheckResult {
+  const payload = context.raw.payload as {action?: string}
+  if (
+    !PR_REVIEW_COMMENT_SUPPORTED_ACTIONS.includes(
+      payload.action as (typeof PR_REVIEW_COMMENT_SUPPORTED_ACTIONS)[number],
+    )
+  ) {
+    logger.debug('Skipping non-created review comment action', {action: payload.action})
+    return {
+      shouldSkip: true,
+      reason: 'action_not_created',
+      message: `Review comment action '${payload.action}' is not supported (only 'created')`,
+    }
+  }
+
+  if (context.target?.locked === true) {
+    logger.debug('Skipping locked pull request')
+    return {
+      shouldSkip: true,
+      reason: 'issue_locked',
+      message: 'Pull request is locked',
+    }
+  }
+
+  if (context.author != null && context.author.isBot) {
+    logger.debug('Skipping bot actor', {bot: context.author.login})
+    return {
+      shouldSkip: true,
+      reason: 'self_comment',
+      message: `Review comments from bots (${context.author.login}) are not processed`,
+    }
+  }
+
+  if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {
+    logger.debug('Skipping unauthorized author', {
+      association: context.author.association,
+      allowed: config.allowedAssociations,
+    })
+    return {
+      shouldSkip: true,
+      reason: 'unauthorized_author',
+      message: `Author association '${context.author.association}' is not authorized`,
+    }
+  }
+
+  if (config.requireMention && !context.hasMention) {
+    logger.debug('Skipping review comment without bot mention')
+    return {
+      shouldSkip: true,
+      reason: 'no_mention',
+      message: 'Review comment does not mention the bot',
+    }
+  }
+
+  return {shouldSkip: false}
+}
+
 export function checkSkipConditions(context: TriggerContext, config: TriggerConfig, logger: Logger): SkipCheckResult {
   if (context.eventType === 'unsupported') {
     logger.debug('Skipping unsupported event', {eventName: context.eventName})
@@ -632,10 +706,7 @@ export function checkSkipConditions(context: TriggerContext, config: TriggerConf
       return checkPullRequestSkipConditions(context, config, logger)
 
     case 'pull_request_review_comment':
-      return checkCommentSkipConditions(context, config, logger, {
-        targetLabel: 'Pull request',
-        actionLabel: 'Review comment',
-      })
+      return checkPRReviewCommentSkipConditions(context, config, logger)
 
     case 'schedule':
       return checkScheduleSkipConditions(config, logger)
