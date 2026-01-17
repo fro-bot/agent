@@ -7,7 +7,7 @@
 
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {ModelConfig} from '../types.js'
+import type {ModelConfig, TokenUsage} from '../types.js'
 
 /**
  * Context collected from GitHub Actions for agent prompt construction.
@@ -37,6 +37,12 @@ export interface AgentResult {
   readonly duration: number
   readonly sessionId: string | null
   readonly error: string | null
+  readonly tokenUsage: TokenUsage | null
+  readonly model: string | null
+  readonly cost: number | null
+  readonly prsCreated: readonly string[]
+  readonly commitsCreated: readonly string[]
+  readonly commentsPosted: number
 }
 
 /**

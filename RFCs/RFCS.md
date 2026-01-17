@@ -24,7 +24,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-004 | Session Management Integration       | MUST     | Medium     | 2     | Completed  |
 | RFC-005 | GitHub Triggers & Event Handling     | MUST     | Medium     | 2     | Completed  |
 | RFC-006 | Security & Permission Gating         | MUST     | Medium     | 2     | Completed  |
-| RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Pending    |
+| RFC-007 | Observability & Run Summary          | MUST     | Medium     | 2     | Completed  |
 | RFC-008 | GitHub Comment Interactions          | MUST     | Medium     | 3     | Pending    |
 | RFC-009 | PR Review Features                   | MUST     | High       | 3     | Pending    |
 | RFC-010 | Delegated Work (Push/PR)             | MUST     | High       | 3     | Pending    |
@@ -225,10 +225,10 @@ RFC-001 (Foundation)
 | F47: Fork PR Permission Gating          | RFC-006          | Pending   |
 | F48: Credential Strategy                | RFC-003, RFC-006 | Pending   |
 | F49: Branch-Scoped Caching              | RFC-002          | Pending   |
-| F51: Run Summary in Comments            | RFC-007          | Pending   |
-| F52: GitHub Actions Job Summary         | RFC-007          | Pending   |
-| F53: Structured Logging                 | RFC-001, RFC-007 | Pending   |
-| F54: Token Usage Reporting              | RFC-007          | Pending   |
+| F51: Run Summary in Comments            | RFC-007          | Completed |
+| F52: GitHub Actions Job Summary         | RFC-007          | Completed |
+| F53: Structured Logging                 | RFC-001, RFC-007 | Completed |
+| F54: Token Usage Reporting              | RFC-007          | Completed |
 | F55: Error Message Format               | RFC-008          | Pending   |
 | F56: GitHub API Rate Limit Handling     | RFC-007          | Pending   |
 | F57: LLM API Error Handling             | RFC-007          | Pending   |
