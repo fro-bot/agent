@@ -365,6 +365,12 @@ async function run(): Promise<number> {
     exitCode = 1
     const duration = Date.now() - startTime
 
+    const errorName = error instanceof Error ? error.name : 'UnknownError'
+    const errorMessage = error instanceof Error ? error.message : String(error)
+
+    metrics.recordError(errorName, errorMessage, false)
+    metrics.end()
+
     setActionOutputs({
       sessionId: null,
       cacheStatus: 'miss',

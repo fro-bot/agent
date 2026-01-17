@@ -14,7 +14,10 @@ vi.mock('@actions/core', () => {
     addList: vi.fn().mockReturnThis(),
     write: vi.fn().mockResolvedValue(undefined),
   }
-  return {summary: mockSummary}
+  return {
+    summary: mockSummary,
+    warning: vi.fn(),
+  }
 })
 
 vi.mock('../logger.js', () => ({
@@ -202,5 +205,6 @@ describe('writeJobSummary', () => {
     // #when / #then
     await expect(writeJobSummary(options, logger)).resolves.not.toThrow()
     expect(logger.warning).toHaveBeenCalledWith('Failed to write job summary', {error: 'Write failed'})
+    expect(core.warning).toHaveBeenCalledWith('Failed to write job summary: Write failed')
   })
 })

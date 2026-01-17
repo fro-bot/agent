@@ -13,6 +13,7 @@ import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
 import {buildAgentPrompt} from './prompt.js'
 
@@ -82,39 +83,49 @@ interface EventStreamResult {
   commentsPosted: number
 }
 
-function detectArtifacts(
+/**
+ * Detect artifacts created by the agent during execution.
+ *
+ * Scans bash command output for GitHub URLs and git commit SHAs to track
+ * what the agent has accomplished.
+ */
+export function detectArtifacts(
   command: string,
   output: string,
   prsCreated: string[],
   commitsCreated: string[],
   onCommentPosted: () => void,
 ): void {
+  const urls = extractGithubUrls(output)
+
+  // 1. Detect PR creation (gh pr create)
   if (command.includes('gh pr create')) {
-    const prUrlMatch = /https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.exec(output)
-    if (prUrlMatch != null) {
-      const prUrl = prUrlMatch[0]
-      if (!prsCreated.includes(prUrl)) {
-        prsCreated.push(prUrl)
+    // PR creation typically outputs the PR URL (without fragments)
+    const prUrls = urls.filter(u => u.includes('/pull/') && !u.includes('#'))
+    for (const url of prUrls) {
+      if (!prsCreated.includes(url)) {
+        prsCreated.push(url)
       }
     }
   }
 
+  // 2. Detect Commits (git commit)
   if (command.includes('git commit')) {
-    const commitMatch = /\[[\w-]+\s+([a-f0-9]{7,40})\]/.exec(output)
-    if (commitMatch?.[1] != null) {
-      const sha = commitMatch[1]
+    const shas = extractCommitShas(output)
+    for (const sha of shas) {
       if (!commitsCreated.includes(sha)) {
         commitsCreated.push(sha)
       }
     }
   }
 
-  if (
-    (command.includes('gh issue comment') || command.includes('gh pr comment')) &&
-    output.includes('github.com') &&
-    output.includes('#issuecomment')
-  ) {
-    onCommentPosted()
+  // 3. Detect Comment posting (gh issue/pr comment)
+  if (command.includes('gh issue comment') || command.includes('gh pr comment')) {
+    // Commenting typically outputs the comment URL (with #issuecomment- suffix)
+    const hasComment = urls.some(url => url.includes('#issuecomment'))
+    if (hasComment) {
+      onCommentPosted()
+    }
   }
 }
 

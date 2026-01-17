@@ -91,8 +91,8 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
     await core.summary.write()
     logger.debug('Wrote job summary')
   } catch (error) {
-    logger.warning('Failed to write job summary', {
-      error: error instanceof Error ? error.message : String(error),
-    })
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    logger.warning('Failed to write job summary', {error: errorMsg})
+    core.warning(`Failed to write job summary: ${errorMsg}`)
   }
 }
