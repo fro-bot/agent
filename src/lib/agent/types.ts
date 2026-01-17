@@ -26,6 +26,7 @@ export interface AgentContext {
   readonly commentAuthor: string | null
   readonly commentId: number | null
   readonly defaultBranch: string
+  readonly diffContext: DiffContext | null
 }
 
 /**
@@ -75,6 +76,28 @@ export interface PromptOptions {
   readonly sessionContext?: SessionContext
   readonly sessionId?: string
   readonly triggerContext?: TriggerContext
+}
+
+/**
+ * PR diff context for review (RFC-009 integration).
+ * Provides summarized diff information for the agent prompt.
+ */
+export interface DiffContext {
+  readonly changedFiles: number
+  readonly additions: number
+  readonly deletions: number
+  readonly truncated: boolean
+  readonly files: readonly DiffFileSummary[]
+}
+
+/**
+ * Summary of a changed file for prompt context.
+ */
+export interface DiffFileSummary {
+  readonly filename: string
+  readonly status: string
+  readonly additions: number
+  readonly deletions: number
 }
 
 /**
