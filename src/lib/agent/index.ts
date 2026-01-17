@@ -10,6 +10,10 @@
 
 // Context collection
 export {collectAgentContext} from './context.js'
+export type {CollectAgentContextOptions} from './context.js'
+
+// Diff context collection (RFC-009) - used internally by collectAgentContext
+export {collectDiffContext} from './diff-context.js'
 
 // OpenCode execution (RFC-013: SDK mode)
 export {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'

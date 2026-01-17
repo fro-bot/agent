@@ -35,7 +35,7 @@ import {
   executeOpenCode,
 } from './lib/agent/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
-import {createClient, getBotLogin, getDefaultBranch, parseGitHubContext} from './lib/github/index.js'
+import {createClient, getBotLogin, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
 import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
@@ -118,18 +118,13 @@ async function run(): Promise<number> {
       logger.info('OpenCode already available', {version: opencodeResult.version})
     }
 
-    // 3. Collect GitHub context
+    // 3. Parse GitHub context and setup client early (needed for routing and cache)
     const contextLogger = createLogger({phase: 'context'})
-    const agentContext = collectAgentContext(contextLogger)
-
-    // Fetch default branch asynchronously (non-blocking enhancement)
+    const githubContext = parseGitHubContext(contextLogger)
     githubClient = createClient({token: inputs.githubToken, logger: contextLogger})
-    const defaultBranch = await getDefaultBranch(githubClient, agentContext.repo, contextLogger)
-    const contextWithBranch = {...agentContext, defaultBranch}
 
     // 3b. Route event and check skip conditions (RFC-005) - BEFORE acknowledgment
     const triggerLogger = createLogger({phase: 'trigger'})
-    const githubContext = parseGitHubContext(triggerLogger)
     const triggerResult = routeEvent(githubContext, triggerLogger, {
       login: githubContext.actor,
       requireMention: true,
@@ -155,6 +150,13 @@ async function run(): Promise<number> {
     })
 
     core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
+
+    // 3c. Collect full agent context including diff (RFC-009)
+    const agentContext = await collectAgentContext({
+      logger: contextLogger,
+      octokit: githubClient,
+      triggerContext: triggerResult.context,
+    })
 
     // 4. Get bot login for reaction context and build reaction context for acknowledgment
     const botLogin = await getBotLogin(githubClient, contextLogger)
@@ -213,7 +215,7 @@ async function run(): Promise<number> {
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
-    const searchQuery = contextWithBranch.issueTitle ?? contextWithBranch.repo
+    const searchQuery = agentContext.issueTitle ?? agentContext.repo
     const priorWorkContext = await searchSessions(searchQuery, workspacePath, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
@@ -227,7 +229,7 @@ async function run(): Promise<number> {
 
     // 7. Build prompt options (prompt built inside executeOpenCode with sessionId)
     const promptOptions: PromptOptions = {
-      context: contextWithBranch,
+      context: agentContext,
       customPrompt: inputs.prompt,
       cacheStatus,
       sessionContext: {
@@ -318,10 +320,10 @@ async function run(): Promise<number> {
     // 8b. Write session summary (RFC-004) if we have a sessionId
     if (result.sessionId != null) {
       const runSummary: RunSummary = {
-        eventType: contextWithBranch.eventName,
-        repo: contextWithBranch.repo,
-        ref: contextWithBranch.ref,
-        runId: Number(contextWithBranch.runId),
+        eventType: agentContext.eventName,
+        repo: agentContext.repo,
+        ref: agentContext.ref,
+        runId: Number(agentContext.runId),
         cacheStatus,
         sessionIds: [result.sessionId],
         createdPRs: [...result.prsCreated],
@@ -345,11 +347,11 @@ async function run(): Promise<number> {
     })
 
     const summaryOptions: CommentSummaryOptions = {
-      eventType: contextWithBranch.eventName,
-      repo: contextWithBranch.repo,
-      ref: contextWithBranch.ref,
-      runId: Number(contextWithBranch.runId),
-      runUrl: `https://github.com/${contextWithBranch.repo}/actions/runs/${contextWithBranch.runId}`,
+      eventType: agentContext.eventName,
+      repo: agentContext.repo,
+      ref: agentContext.ref,
+      runId: Number(agentContext.runId),
+      runUrl: `https://github.com/${agentContext.repo}/actions/runs/${agentContext.runId}`,
       metrics: metrics.getMetrics(),
       agent: inputs.agent,
     }

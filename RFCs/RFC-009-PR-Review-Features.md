@@ -1,6 +1,6 @@
 # RFC-009: PR Review Features
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 3
@@ -644,3 +644,82 @@ describe("submitReview", () => {
 - **Development**: 8-10 hours
 - **Testing**: 4-5 hours
 - **Total**: 12-15 hours
+
+---
+
+## Completion Note
+
+**Completed:** 2026-01-17
+
+### Implementation Summary
+
+RFC-009 was implemented with the following modifications based on Oracle architecture review:
+
+1. **Removed `calculateDiffPosition()`**: The modern GitHub API uses `line`/`side` parameters instead of the deprecated `position` parameter, making diff position calculation unnecessary.
+
+2. **Added Bounded Pagination**: `getPRDiff()` now fetches up to `MAX_PAGES` (50) pages of 100 files each, with a `truncated` flag when the limit is hit.
+
+3. **Structured Skip Results**: `prepareReviewComments()` returns `{ready, skipped}` with explicit skip reasons (`file_not_in_diff`, `patch_missing`, `line_not_in_hunks`) instead of just logging warnings.
+
+4. **Added `ExistingReviewComment` type**: Includes `inReplyToId` field for tracking reply threads.
+
+### Files Created
+
+| File | Purpose |
+| --- | --- |
+| `src/lib/reviews/types.ts` | Type definitions with pagination config and skip reasons |
+| `src/lib/reviews/diff.ts` | `getPRDiff()`, `parseHunks()`, `getFileContent()` |
+| `src/lib/reviews/reviewer.ts` | `submitReview()`, `postReviewComment()`, `getReviewComments()`, `replyToReviewComment()`, `prepareReviewComments()` |
+| `src/lib/reviews/index.ts` | Public API exports |
+| `src/lib/reviews/AGENTS.md` | Module documentation |
+| `src/lib/reviews/diff.test.ts` | 13 tests |
+| `src/lib/reviews/reviewer.test.ts` | 11 tests |
+
+### Acceptance Criteria
+
+- [x] PR diff is fetched with all changed files (with pagination)
+- [x] Diff patches are parsed into hunks correctly
+- [x] ~~Line positions are calculated for review comments~~ (removed - using `line`/`side` instead)
+- [x] Reviews can be submitted with APPROVE, REQUEST_CHANGES, or COMMENT
+- [x] Review comments are attached to correct lines
+- [x] Large PRs (100+ files) are handled with pagination
+- [x] File content can be retrieved for context
+- [x] Existing review comments can be read
+- [x] Replies to review comments work correctly
+
+### Deviations from RFC
+
+1. **No `calculateDiffPosition()`**: Removed per Oracle recommendation - modern API doesn't need it
+2. **Added `truncated` flag to `PRDiff`**: Indicates when pagination limit was hit
+3. **Added `PreparedReviewComments` type**: Returns both ready and skipped comments with reasons
+4. **Added `SkipReason` enum**: `file_not_in_diff`, `patch_missing`, `line_not_in_hunks`
+
+### Integration Points
+
+The reviews module integrates into the main action through a clean abstraction layer:
+
+1. **`src/lib/agent/diff-context.ts`**: Exports `collectDiffContext()` function that:
+   - Checks if event is `pull_request` type
+   - Validates PR number and repo format
+   - Calls `getPRDiff()` from reviews module
+   - Transforms result to `DiffContext` (limited to 50 files via `MAX_FILES_IN_CONTEXT`)
+   - Returns `null` gracefully on errors (non-fatal)
+
+2. **`src/main.ts` (Step 3c)**: Diff context collected during agent context creation:
+
+   ```typescript
+   const agentContext = await collectAgentContext({
+     logger: contextLogger,
+     octokit: githubClient,
+     triggerContext: triggerResult.context,
+   })
+   ```
+
+3. **`src/lib/agent/prompt.ts`**: Includes `buildDiffContextSection()` that adds a "Pull Request Diff Summary" section to the agent prompt with:
+   - Changed file count, additions, deletions
+   - Truncation warning if applicable
+   - Table of changed files (up to 20 shown)
+
+4. **`src/lib/agent/types.ts`**: Added `DiffContext` and `DiffFileSummary` types, extended `PromptOptions` with optional `diffContext` field
+
+This integration ensures the agent receives structured diff context when reviewing PRs, enabling informed code review feedback.
