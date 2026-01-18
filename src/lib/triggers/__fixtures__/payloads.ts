@@ -4,7 +4,6 @@ import type {
   IssuesEvent,
   PullRequestEvent,
   PullRequestReviewCommentEvent,
-  WorkflowDispatchEvent,
 } from '@octokit/webhooks-types'
 
 const BASE_USER = {
@@ -623,38 +622,6 @@ export function createDiscussionCommentCreatedEvent(
       node_id: 'MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uMQ==',
     },
   } as unknown as DiscussionCommentEvent
-}
-
-export function createWorkflowDispatchEvent(
-  overrides: {
-    promptInput?: string
-    ref?: string
-    actorLogin?: string
-  } = {},
-): WorkflowDispatchEvent {
-  const actor = createUser({login: overrides.actorLogin ?? 'workflow-runner'})
-
-  return {
-    inputs: overrides.promptInput == null ? null : {prompt: overrides.promptInput},
-    ref: overrides.ref ?? 'refs/heads/main',
-    repository: createRepository(),
-    sender: actor,
-    workflow: '.github/workflows/agent.yaml',
-  } as unknown as WorkflowDispatchEvent
-}
-
-export interface ScheduleEventPayload {
-  schedule: string
-}
-
-export function createScheduleEvent(
-  overrides: {
-    schedule?: string
-  } = {},
-): ScheduleEventPayload {
-  return {
-    schedule: overrides.schedule ?? '0 0 * * *',
-  }
 }
 
 export {BASE_REPOSITORY, BASE_USER, BOT_USER, createRepository, createUser}
