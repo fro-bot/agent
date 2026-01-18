@@ -1,8 +1,11 @@
 # Development Rules: Fro Bot Agent
 
-**Version:** 1.2
-**Last Updated:** 2026-01-14
+**Version:** 1.4
+**Last Updated:** 2026-01-17
 **Applies to:** All contributors and AI assistants
+
+**Source of Truth:**
+This document is fourth in the documentation hierarchy (PRD > RFCs > FEATURES.md > RULES.md). If conflicts arise, defer to higher-priority documents. See PRD "Source of Truth & Conflict Resolution" section.
 
 ---
 
@@ -38,6 +41,7 @@ Fro Bot Agent is a GitHub Action + Discord bot harness for OpenCode with persist
 - File attachment support
 - Explicit model/agent configuration
 - Mock event support for local testing
+- Delegated work tools via OpenCode plugin (`dist/plugin/`)
 
 ---
 
@@ -495,6 +499,13 @@ function isSelfComment(context: Context, botLogin: string): boolean {
 - **S3 prefix isolation** by agent identity + repo
 - **Never cache secrets** - explicit exclusion list
 
+**GitHub Actions Cache Constraints** (per RFC-002):
+
+- 10GB total cache storage per repository
+- 7-day eviction for unused cache keys
+- 512-character maximum key length
+- Branch-scoped keys with fallback restore keys
+
 ### File Attachment Security
 
 ```typescript
@@ -513,6 +524,120 @@ const ATTACHMENT_LIMITS = {
   allowedMimeTypes: ["image/*", "text/*", "application/json", "application/pdf"],
 } as const
 ```
+
+### Delegated Work Plugin Security
+
+The OpenCode plugin exposes GitHub operations as agent-invokable tools. Security is enforced at tool invocation time:
+
+```typescript
+// Environment variables REQUIRED - fail fast if missing
+const token = process.env.GITHUB_TOKEN
+const repo = process.env.GITHUB_REPOSITORY
+
+if (token == null || token.length === 0) {
+  throw new Error("GITHUB_TOKEN environment variable is required")
+}
+
+// Tool-level authorization re-validation (not just trigger gating)
+// Agent may call tools at any time during execution
+const ALLOWED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"] as const
+
+// Path validation for commit_files tool
+function validateFilePath(path: string): void {
+  if (path.startsWith("/") || path.includes("..") || path.startsWith(".git/")) {
+    throw new Error(`Invalid file path: ${path}`)
+  }
+}
+
+// NEVER log tokens or file contents
+// Log only: tool name, arguments (sanitized), result status
+```
+
+### Telemetry Policy
+
+Privacy-first telemetry is mandatory (per PRD v1.4):
+
+- **Opt-in only**: No external telemetry aggregation by default
+- **Local-first**: All metrics derived from run summaries and structured JSON logs
+- **No raw content**: Never log code, comments, or prompts to external systems
+- **Transparent**: User controls what data leaves the system
+- **Metrics storage**: Run artifacts and GitHub Actions logs only
+
+---
+
+## Delegated Work Plugin Patterns
+
+### Overview
+
+The delegated work plugin exposes RFC-010 library functions as OpenCode custom tools, enabling the agent to perform GitHub operations during execution.
+
+### Plugin Structure
+
+```
+src/plugin/
+└── fro-bot-agent.ts     # Plugin source (registers tools)
+
+dist/plugin/
+└── fro-bot-agent.js     # Bundled plugin (ESM, self-contained)
+```
+
+### Available Tools
+
+| Tool                  | Purpose                   | Key Arguments                   |
+| --------------------- | ------------------------- | ------------------------------- |
+| `create_branch`       | Create feature branches   | `branchName`, `baseBranch`      |
+| `commit_files`        | Atomic multi-file commits | `branch`, `message`, `files[]`  |
+| `create_pull_request` | Open pull requests        | `title`, `body`, `head`, `base` |
+| `update_pull_request` | Update PR metadata        | `prNumber`, `title?`, `body?`   |
+
+### Installation
+
+Plugin installed globally during setup phase:
+
+```typescript
+// Installation location (NEVER workspace)
+const PLUGIN_DIR = path.join(os.homedir(), ".config/opencode/plugin")
+
+// Copy bundled plugin to global config
+await fs.copyFile(path.join(__dirname, "plugin/fro-bot-agent.js"), path.join(PLUGIN_DIR, "fro-bot-agent.js"))
+```
+
+**CRITICAL:**
+
+- Install to `~/.config/opencode/plugin/` (global)
+- NEVER install to `.opencode/plugin/` (workspace pollution)
+- Overwrite existing file on each run (idempotent upgrade)
+
+### Context Injection
+
+Tools receive context via environment variables (already set by GitHub Actions):
+
+| Variable            | Purpose                    | Required |
+| ------------------- | -------------------------- | -------- |
+| `GITHUB_TOKEN`      | Octokit authentication     | Yes      |
+| `GITHUB_REPOSITORY` | `owner/repo` for API calls | Yes      |
+
+Missing required variables cause immediate failure with clear error message.
+
+### Plugin Bundling
+
+```typescript
+// tsdown.config.ts - add plugin entry
+export default defineConfig({
+  entry: {
+    main: "src/main.ts",
+    post: "src/post.ts",
+    "plugin/fro-bot-agent": "src/plugin/fro-bot-agent.ts",
+  },
+  // Plugin must be self-contained (bundle all dependencies)
+})
+```
+
+### Testing Requirements
+
+- **Unit tests**: Each tool function in `src/lib/delegated/`
+- **Integration test**: Verify bundled `dist/plugin/fro-bot-agent.js` loads correctly
+- **TDD workflow**: Write failing test first, then implement
 
 ---
 
@@ -606,6 +731,7 @@ lint-staged        # Runs on staged files
 - **Bundle**: `dist/main.js` (ESM, minified)
 - **Bundle (setup)**: `dist/setup.js` (ESM, minified)
 - **Bundle (post)**: `dist/post.js` (ESM, minified) - post-action cache hook
+- **Bundle (plugin)**: `dist/plugin/fro-bot-agent.js` (ESM, self-contained)
 - **Licenses**: `dist/licenses.txt` (auto-extracted)
 - **Source maps**: Not included in production
 
@@ -886,6 +1012,15 @@ export async function executeOpenCode(
 2. `action.yaml` includes `runs.post: dist/post.js`
 3. Post-hook saves cache idempotently (never fails job)
 4. Post-hook runs even on main action failure/timeout
+
+**Delegated Work Plugin (v1.3)**
+
+1. Plugin bundled to `dist/plugin/fro-bot-agent.js`
+2. Four delegated work tools: `create_branch`, `commit_files`, `create_pull_request`, `update_pull_request`
+3. Global installation to `~/.config/opencode/plugin/` during setup
+4. Context injection via env vars (`GITHUB_TOKEN`, `GITHUB_REPOSITORY`)
+5. Tool-level security gating (OWNER/MEMBER/COLLABORATOR validation)
+6. Self-contained bundle with no shared state with action process
 
 **Core Functionality**
 
