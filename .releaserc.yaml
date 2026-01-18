@@ -22,6 +22,9 @@ analyzeCommits:
     - type: docs
       release: patch
       scope: readme
+    - type: docs
+      release: patch
+      scope: rfcs
     - type: skip
       release: false
 

@@ -1,26 +1,55 @@
 # Product Requirements Document (PRD): Fro Bot Agent Harness
 
-**Version:** 1.2
-**Last Updated:** 2026-01-14
+**Version:** 1.4
+**Last Updated:** 2026-01-17
 
 ### Version History
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.4 | 2026-01-17 | Major restructure: single PRD with shared semantics, modality RFCs split, SDK API corrections, cache constraints, telemetry policy, source of truth hierarchy |
+| 1.3 | 2026-01-17 | Agent-invokable delegated work tools via OpenCode plugin distribution (RFC-018), exposes RFC-010 library functions as MCP tools |
 | 1.2 | 2026-01-14 | Additional GitHub triggers (`issues`, `pull_request`, `pull_request_review_comment`, `schedule`), trigger-specific prompt directives, post-action cache hook, prompt input required for scheduled/manual triggers |
 | 1.1 | 2026-01-10 | SDK execution model (replaces CLI), GraphQL context hydration, file attachments, model/agent config, mock event support, enhanced prompt construction |
 | 1.0 | 2026-01-02 | Initial PRD |
 
 ---
 
+## Source of Truth & Conflict Resolution
+
+**Documentation Hierarchy** (highest to lowest priority):
+
+1. **PRD** (this document) — Product goals, shared semantics, cross-modality requirements
+2. **RFCs** — Modality-specific implementation details and technical specifications
+3. **FEATURES.md** — Feature tracking and acceptance criteria
+4. **RULES.md** — Development conventions and code standards
+
+**Conflict Resolution:**
+
+- If PRD conflicts with downstream docs, PRD takes precedence.
+- To change PRD requirements, open an RFC change request with justification.
+- RFCs may add detail or constraints not specified in PRD but must not contradict PRD.
+- Implementation details belong in RFCs, not PRD.
+
+---
+
 ## Overview
 
-Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on:
+Fro Bot Agent is a **multi-modality agent harness** that runs OpenCode with Oh My OpenCode (oMo) capabilities to act as an autonomous collaborator across multiple platforms:
 
-- **GitHub**: Issues, Discussions, and Pull Requests (PRs) via GitHub Actions.
-- **Discord**: A long-running bot (Kimaki-like UX) connected to OpenCode through a reverse proxy / daemon model.
+- **GitHub Action** (MVP): Issues, Discussions, and Pull Requests via GitHub Actions triggers
+- **Discord Bot** (MVP): Long-running daemon with channel=repo, thread=session UX
+- **Future Modalities**: CLI, Slack, web interface, etc.
 
-The core differentiator is **durable memory across runs**: OpenCode session/application state is restored at the start of each run and saved at the end, so the agent can pick up work without repeating expensive investigation.
+The core differentiator is **durable memory across runs**: OpenCode session state persists between interactions, enabling the agent to recall prior investigations and avoid redundant work.
+
+### Modality Status
+
+| Modality          | Status                 | Deliverable | RFCs                                                     |
+| ----------------- | ---------------------- | ----------- | -------------------------------------------------------- |
+| GitHub Action     | **Active Development** | MVP (0.x)   | RFC-001 through RFC-018 (GitHub Action implementation)   |
+| Discord Bot       | **Planned**            | MVP (0.x)   | TBD (Discord-specific RFCs)                              |
+| Shared Storage/S3 | **Active Development** | MVP (0.x)   | RFC-002 (Cache), future storage RFC for S3 write-through |
 
 ---
 
@@ -41,64 +70,161 @@ This leads to:
 Fro Bot addresses this by:
 
 1. Persisting OpenCode's stateful storage directory between runs.
-2. **Action-side utilities (RFC-004)**: The GitHub Action harness uses TypeScript utilities (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`) to manage sessions at the infrastructure level.
-3. **Agent-side tools (oMo)**: The AI agent uses oMo session tools (`session_list`, `session_read`, `session_search`, `session_info`) during runtime to discover and reuse prior work.
-4. Producing auditable "run summaries" in GitHub comments and action logs.
+2. **Action-side utilities (RFC-004)**: Infrastructure-level session management (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`).
+3. **Agent-side tools (oMo)**: Runtime session discovery and reuse (`session_list`, `session_read`, `session_search`, `session_info`).
+4. Producing auditable "run summaries" in platform-native formats.
 
 ---
 
 ## Goals and Objectives
 
-### Product goals (v1)
+### Product Goals
 
-1. **GitHub-native agent**: Respond and act on Issues, Discussions, and PRs via GitHub Actions triggers.
-2. **Discord-native agent**: Provide Kimaki-like UX (channel = repo/project, thread = session) via long-running daemon.
-3. **Shared memory**: For a given project (GitHub repo), the GitHub and Discord entrypoints share the same durable OpenCode storage.
-4. **Operationally safe persistence**: Persist only OpenCode storage (`$XDG_DATA_HOME/opencode/storage/`) and never persist `auth.json`.
-5. **Close-the-loop behavior**: Each run leaves behind a durable, searchable record (session writeback + run summary).
+1. **Multi-modality agent platform**: Support multiple interaction surfaces (GitHub, Discord, future) with shared memory.
+2. **Durable memory**: For a given project, all modalities share the same OpenCode storage.
+3. **Operationally safe persistence**: Persist only OpenCode storage; never persist credentials.
+4. **Close-the-loop behavior**: Each run leaves behind a durable, searchable record.
+5. **Privacy-first telemetry**: Opt-in only; no external aggregation by default.
 
-### Measurable objectives
+### Measurable Objectives
 
-| Objective | Target | Measurement |
-| --- | --- | --- |
-| Memory reuse rate | ≥60% of runs reference prior sessions | Count runs with `session_search`/`session_read` calls |
-| Repeat work reduction | ≥40% fewer redundant investigations | Compare exploration tool calls on recurring issues |
-| Time to first actionable output | ≤90s median on cache-hit runs | Measure time from job start to first comment |
-| Safety | 0 credential leakage incidents | Audit logs/comments/caches quarterly |
+| Objective | Target | Measurement | Instrumentation |
+| --- | --- | --- | --- |
+| Memory reuse rate | ≥60% of runs reference prior sessions | Count runs with `session_search`/`session_read` tool calls | Derived from run summary logs |
+| Repeat work reduction | ≥40% fewer redundant investigations | Compare exploration tool calls on recurring issues | JSON logs with tool call counts |
+| Time to first actionable output | ≤90s median on cache-hit runs | Measure time from job start to first comment | Run summary duration field |
+| Safety | 0 credential leakage incidents | Audit logs/comments/caches quarterly | Manual review + automated scan |
+
+**Telemetry Policy:**
+
+- All metrics derived from run summaries and structured JSON logs.
+- No external telemetry aggregation unless user explicitly opts in.
+- No raw content (code, comments, prompts) logged to external systems.
+- Metrics stored locally in run artifacts and GitHub Actions logs.
 
 ---
 
 ## Scope
 
-### In scope for v1
+### Shared Capabilities (All Modalities)
 
-#### GitHub agent
+These requirements apply to **all modalities** (GitHub, Discord, future):
 
-- Support **all interaction models currently supported by oMo Sisyphus** (reference workflow):
-  - https://github.com/code-yeongyu/oh-my-opencode/blob/f61e1a5f2bf7971caa6b8658a7964d1dbd217407/.github/workflows/sisyphus-agent.yml
-- Behaviors:
-  - Comment on Issues and Discussions.
-  - Comment on PR conversation **and** provide PR review comments (where appropriate).
-  - Accept delegated work, including the ability to **push commits and open PRs** (subject to permissions and safety gates).
+#### Session Management
 
-#### Discord agent
+- Persist OpenCode storage (`$XDG_DATA_HOME/opencode/storage/`)
+- Restore at run start; save at run end
+- Session search before re-investigating
+- Session pruning (default: 50 sessions or 30 days)
+- Close-the-loop writeback with run metadata
 
-- Kimaki-like mapping:
-  - **One channel per project** (project == GitHub repo).
-  - **One thread per OpenCode session** (resume/fork supported as a concept).
-- Reverse proxy / daemon model enabling persistent connectivity.
+#### Security & Privacy
 
-#### Shared memory
+- Never persist `auth.json` (rehydrated each run from secrets)
+- Permission gating (OWNER/MEMBER/COLLABORATOR only for write operations)
+- Anti-loop protection (ignore bot's own messages)
+- Audit trails with session IDs and run IDs
+- Least-privilege credentials
 
-- Restore at run start; save at run end.
-- Explicit session revive + search before re-investigating.
+#### Prompt Semantics
 
-### Not in scope (v1 non-goals)
+- Multi-section prompt structure (mode, identity, context, request, instructions)
+- Session tool instructions (use `session_search`, `session_read`, leave summary)
+- Trigger-specific directives with override behavior:
+  - **Append**: Comment-based triggers (custom prompt appends to default directive)
+  - **Replace**: Scheduled/manual triggers (custom prompt replaces directive, required)
 
-- Training a custom model.
-- Guaranteeing perfect long-term memory without user curation (memory can drift; the system is expected to summarize and prune).
-- Persisting secrets (explicitly out of scope).
-- Multi-tenant Discord hosting across unrelated orgs without isolation controls.
+#### Agent & Model Configuration
+
+- Agent selection with server-side validation
+- Model override (optional; format: `provider/model`)
+- Default: use agent's configured model if no override
+- Auditability: include agent/model in run summaries
+
+#### Telemetry & Observability
+
+- Structured JSON logs for machine parsing
+- Run summaries with metadata (event type, cache status, session IDs, duration, token usage)
+- Opt-in external aggregation only
+- No raw content in telemetry
+
+### Modality-Specific Scope
+
+Detailed requirements for each modality are documented in dedicated RFCs.
+
+#### GitHub Action (MVP) — See RFCs 001-018
+
+**Core Features:**
+
+- Triggers: `issue_comment`, `discussion_comment`, `issues`, `pull_request`, `pull_request_review_comment`, `workflow_dispatch`, `schedule`
+- Surfaces: Issue comments, discussion comments, PR conversation comments, PR review comments
+- Delegated work: branch creation, commits, PR creation (via OpenCode plugin tools)
+- Cache: GitHub Actions cache with S3 write-through (optional for MVP)
+- Runtime: Node.js 24, TypeScript, ESM
+
+**Key RFCs:**
+
+- RFC-001 through RFC-003: Foundation, cache, GitHub client
+- RFC-004: Session management
+- RFC-005, RFC-016: Triggers and event handling
+- RFC-006: Security and permission gating
+- RFC-007: Observability and run summaries
+- RFC-008, RFC-009: Comments and PR reviews
+- RFC-010, RFC-018: Delegated work (library + agent-invokable tools)
+- RFC-011: Setup action and environment bootstrap
+- RFC-013: SDK execution mode
+- RFC-014, RFC-015: File attachments and GraphQL context
+- RFC-017: Post-action cache hook
+
+**GitHub Actions Cache Constraints** (documented in RFC-002):
+
+- 10GB total per repository
+- 7-day eviction for unused keys
+- 512-character key length limit
+- Branch-scoped keys with fallback restore keys
+
+#### Discord Bot (MVP) — TBD RFCs
+
+**Planned Features:**
+
+- Mapping: channel=repo, thread=session
+- Architecture: Long-running daemon with reverse proxy boundary
+- Deployment: Docker container or systemd service
+- Storage: S3 sync (required; no GitHub Actions cache available)
+- Permissions: Discord role-based channel→repo linking
+
+**Implementation:**
+
+- Dedicated Discord RFCs to be created
+- Reverse proxy handles message routing and authentication
+- OpenCode execution in isolated process/container
+
+#### Shared Storage (MVP) — RFC-002 + Future S3 RFC
+
+**Current (RFC-002):**
+
+- GitHub Actions cache infrastructure
+- Cache key strategy and restore keys
+- Corruption detection
+
+**Planned (Future RFC):**
+
+- S3 write-through backup/restore
+- Scope: per agent identity + repo
+- Versioning: `.version` file for migration detection
+- Retention policy enforcement
+
+**S3 Classification:**
+
+- **Optional** for GitHub Action (cache is primary, S3 is backup)
+- **Required** for Discord Bot (no GitHub Actions cache available)
+
+### Not in Scope (MVP Non-Goals)
+
+- Training custom models
+- Guaranteed perfect long-term memory without curation
+- Persisting secrets
+- Multi-tenant Discord without isolation controls
 
 ---
 
@@ -123,715 +249,407 @@ Fro Bot addresses this by:
 
 ## Key User Stories
 
-### GitHub
+### Cross-Modality
 
-1. **Issue triage**
+1. **Memory continuity**
+   - As a maintainer, when I interact with Fro Bot on GitHub and Discord, it recalls prior context from both surfaces.
+
+2. **Avoid repeated work**
+   - As a maintainer, Fro Bot should recall prior investigations and not repeat the same exploration every run, regardless of interaction surface.
+
+### GitHub-Specific
+
+3. **Issue triage**
    - As a maintainer, when an issue is opened, Fro Bot can summarize, reproduce (if possible), search prior sessions, and propose next steps.
 
-2. **PR review + fix delegation**
+4. **PR review + fix delegation**
    - As a maintainer, I can ask Fro Bot to review a PR, suggest changes, and optionally push a fix branch and open a PR.
 
-3. **Avoid repeated work**
-   - As a maintainer, Fro Bot should recall prior investigations and not repeat the same exploration every run.
+### Discord-Specific
 
-### Discord
-
-4. **Live collaboration**
+5. **Live collaboration**
    - As a moderator, I can chat with Fro Bot in a project channel, and it uses (and enriches) the same memory as GitHub.
 
-5. **Session continuity**
+6. **Session continuity**
    - As a user, I can resume a prior session thread and Fro Bot continues with context.
 
 ---
 
-## Functional Requirements
+## Shared Functional Requirements
 
-### P0 (must-have for v1)
+These requirements apply to **all modalities**.
 
-#### A. GitHub agent interactions
+### A. Session Management & Memory
 
-1. **Triggers / entrypoints**
-   - The product ships as a **TypeScript GitHub Action** (Node.js 24 runtime) with a single entrypoint (`uses: fro-bot/agent`), not as a reusable workflow. Setup functionality is integrated into the main action via auto-setup.
-   - **Core triggers (v1):**
-
-     | Event | Supported Actions | Prompt Requirement | Scope |
-     | --- | --- | --- | --- |
-     | `issue_comment` | `created` | Optional (uses comment body) | Issue/PR |
-     | `discussion_comment` | `created` | Optional (uses comment body) | Discussion |
-     | `workflow_dispatch` | - | **Required** | Repo |
-     | `schedule` | - | **Required** | Repo |
-     | `issues` | `opened`, `edited` (with @mention) | Optional (defaults to triage) | Issue |
-     | `pull_request` | `opened`, `synchronize`, `reopened` | Optional (defaults to review) | PR |
-     | `pull_request_review_comment` | `created` | Optional (uses comment body) | PR Review |
-
-   - **Skip conditions:**
-     - `issues.edited`: Skip unless comment body contains `@fro-bot` mention.
-     - `pull_request`: Skip draft PRs by default (configurable).
-     - `schedule`/`workflow_dispatch`: Hard fail if `inputs.prompt` is empty.
-   - **Trigger-specific prompt directives:**
-     - Each trigger type injects a default task directive (e.g., "review this PR", "triage this issue").
-     - Custom `prompt` input overrides the default directive.
-   - v1 should also support Discussions where feasible (e.g., `discussion` with `types: [created]` on comments), but any gap must be documented as a known limitation until implemented.
-
-2. **Supported surfaces**
-   - Issues: in-thread comments.
-   - Discussions: in-thread comments.
-   - PRs: PR conversation comments **and** review comments.
-
-3. **Idempotency**
-   - For each run, the agent should be able to:
-     - Create a new comment, or
-     - Update an existing "agent comment" (for idempotent reruns).
-   - The system should support a mode where "agent summary" is posted as a **separate comment** in some situations (e.g., end-of-run summary, large diffs, or when updating would lose history).
-
-4. **Safe handling of forks / untrusted code**
-   - Use `issue_comment` trigger (not `pull_request_review_comment`) to maintain secret access for fork PRs.
-   - Permission gating: only respond to comments from users with `OWNER`, `MEMBER`, or `COLLABORATOR` association.
-   - Anti-loop protection: ignore comments from the bot's own account.
-   - Note: This matches the oMo Sisyphus approach for secure fork PR handling.
-
-5. **Delegated work**
-   - When requested, the agent may:
-     - Push commits to branches.
-     - Open PRs.
-   - **Credential strategy (v1 decision):**
-     - Recommended default: **GitHub App token** for elevated operations (branch creation, push commits, open PRs) with least-privilege scopes.
-     - Supported fallback: **PAT** (e.g., `${{ secrets.GH_PAT }}`) for repos that do not want to provision/configure a GitHub App.
-     - The default `GITHUB_TOKEN` permissions should remain minimal; elevated credentials are used only when delegated work is requested.
-   - Must enforce permissions boundaries and avoid secret exposure.
-
-6. **Run summary in GitHub output**
-   - Every comment created/updated by the agent must include a **collapsed details block** containing:
-     - Run metadata (event type, repo, ref/branch, run id).
-     - Whether cache was restored (hit/miss/corrupted).
-     - Session IDs used/created.
-     - Links to any PRs/commits the agent created.
-     - Duration and token usage (if available).
-
-7. **Reactions and labels (acknowledgment UX)**
-   - On comment trigger, immediately add 👀 reaction to acknowledge receipt.
-   - Add `agent: working` label to the issue/PR.
-   - On completion, remove 👀 reaction and add ✌🏽 (random skin tone) or ☮️ reaction.
-   - Remove `agent: working` label.
-   - All reaction/label operations use `|| true` for graceful failure.
-
-8. **Context collection**
-   - Determine if the trigger is an Issue or PR (check for `.pull_request` field via API).
-   - Extract: type, number, title, comment body, comment author, comment ID.
-   - Pass all context to the agent prompt.
-
-9. **Error message format**
-   - When the agent encounters an error, the comment must include:
-     - A human-readable summary of what failed.
-     - The error type (e.g., rate limit, LLM timeout, cache corruption).
-     - Suggested next steps or retry guidance.
-
-#### B. Discord agent interactions
-
-1. **Mapping model**
-   - Channel = GitHub repo/project.
-   - Thread = OpenCode session.
-
-2. **Architecture**
-   - Discord bot runs as a long-lived process (daemon).
-   - **Reverse proxy boundary**: The Discord-facing component handles message routing and authentication; OpenCode execution happens in an isolated process/container.
-   - Recommended deployment: container (Docker) or systemd service on a VM.
-
-3. **Shared memory with GitHub**
-   - For the same project, Discord and GitHub share OpenCode storage (see Data/Storage Requirements).
-   - Sync mechanism: S3 write-through (required for Discord, since it runs outside GitHub Actions cache).
-
-4. **Permission model**
-   - **Discord ↔ GitHub project mapping (v1 decision):**
-     - Only users with a configured Discord role (e.g., **Maintainer**) may link a Discord channel to a GitHub repo.
-     - The mapping is stored by the Discord daemon (config/database) and treated as an audited administrative action.
-   - Bot respects GitHub permissions when performing delegated work.
-
-#### C. Shared memory & session tool usage
-
-**Important: Two layers of session management exist:**
+#### Two-Layer Session Architecture
 
 | Layer | Tools/Functions | Used By | When |
 | --- | --- | --- | --- |
-| **Action-side (RFC-004)** | `listSessions()`, `searchSessions()`, `pruneSessions()`, `writeSessionSummary()` | GitHub Action harness | Before/after agent execution |
+| **Action-side (RFC-004)** | `listSessions()`, `searchSessions()`, `pruneSessions()`, `writeSessionSummary()` | Platform harness (GitHub Action, Discord bot) | Before/after agent execution |
 | **Agent-side (oMo)** | `session_list`, `session_read`, `session_search`, `session_info` | AI agent via LLM tool calls | During agent execution |
 
-Both layers operate on the same OpenCode storage directory (`~/.local/share/opencode/storage/`).
+Both layers operate on the same OpenCode storage directory.
+
+#### Storage Persistence
 
 1. **What to persist**
-   - Persist the entire OpenCode storage subtree:
-     - `$XDG_DATA_HOME/opencode/storage/`
+   - Persist entire OpenCode storage subtree: `$XDG_DATA_HOME/opencode/storage/`
+   - Storage format versioning via `.version` file
 
-2. **Startup behavior: revive + search**
-   - **Action harness**: Calls RFC-004 `listSessions()` and optionally `searchSessions()` to gather context for the agent prompt.
-   - **Agent**: Must use oMo `session_search` before re-investigating likely repeats.
+2. **What to exclude**
+   - Never persist: `$XDG_DATA_HOME/opencode/auth.json`
+   - Credentials rehydrated each run from secrets
 
-3. **Close-the-loop writeback**
-   - **Action harness**: Calls RFC-004 `writeSessionSummary()` to append run metadata.
-   - **Agent**: Must produce a durable summary message (final message in session, GitHub comment).
+3. **Startup behavior**
+   - Platform harness: calls `listSessions()` and optionally `searchSessions()` to gather context
+   - Agent: uses `session_search` before re-investigating
 
-4. **Session pruning (required for MVP)**
-   - **Action harness only**: Calls RFC-004 `pruneSessions()` at end of each run.
-   - Default: keep last 50 sessions per repo, or sessions from last 30 days (whichever is larger).
-   - Configurable via action input.
+4. **Close-the-loop writeback**
+   - Platform harness: calls `writeSessionSummary()` to append run metadata
+   - Agent: produces durable summary message
 
-### P0-B: Auto-Setup & Environment Bootstrap
+5. **Session pruning**
+   - Platform harness only: calls `pruneSessions()` at end of each run
+   - Default: keep last 50 sessions per repo, or sessions from last 30 days (whichever is larger)
+   - Configurable via platform-specific inputs
 
-The agent automatically handles environment setup as part of the main action execution.
+### B. Security & Privacy
 
-#### D. Auto-setup (integrated into `fro-bot/agent@v0`)
+#### Permission Gating
 
-1. **OpenCode CLI installation**
-   - Install OpenCode binary via `@actions/tool-cache` for cross-run caching.
-   - Support version pinning (`opencode-version` input) with `latest` as default.
-   - Add OpenCode to PATH for subsequent steps.
+- Only users with OWNER, MEMBER, or COLLABORATOR association may trigger write operations
+- Bots (including self) are ignored to prevent loops
+- Fork PRs: use appropriate secure triggers (e.g., `issue_comment` for GitHub)
 
-2. **Oh My OpenCode (oMo) plugin installation**
-   - Automatically installs Bun runtime (required dependency) via `@actions/tool-cache`.
-   - Runs `bunx oh-my-opencode install` to add Sisyphus agent capabilities.
-   - Graceful degradation: warn on failure, do not fail the run.
-   - Users do NOT need to manually install Bun or use `oven-sh/setup-bun`.
+#### Credential Handling
 
-3. **GitHub CLI (`gh`) authentication**
-   - Configure `gh` with `GH_TOKEN` environment variable.
-   - **Credential priority:**
-     1. GitHub App installation token (generated from `app-id` + `private-key` inputs)
-     2. Fallback: `GITHUB_TOKEN` (default, limited permissions)
-   - `GH_TOKEN` takes priority over `GITHUB_TOKEN` for `gh` CLI operations.
+- Never persist credentials to cache or storage
+- Credentials from secrets/environment only
+- Log redaction for sensitive fields
 
-4. **Git identity configuration**
-   - Set `user.name` and `user.email` for commits.
-   - Use GitHub App bot identity format: `<app-slug>[bot]` and `<user-id>+<app-slug>[bot]@users.noreply.github.com`.
+#### Cache Security
 
-5. **auth.json population**
-   - Write LLM provider credentials from `auth-json` secret input.
-   - File written with mode `0600` (owner read/write only).
-   - **NEVER cached** - populated fresh each run.
+- Branch-scoped keys to reduce poisoning risk
+- S3 prefix isolation by agent identity + repo
+- Never cache secrets or attachments
 
-6. **Cache restoration**
-   - Restore OpenCode storage from GitHub Actions cache.
-   - Run early in setup phase for session continuity.
+### C. Agent & Model Configuration
 
-#### E. Agent prompt requirements
+#### Agent Selection
 
-The agent prompt must include sufficient context and instructions for GitHub operations:
+- Default agent: configurable per modality (e.g., "Sisyphus" for GitHub Action)
+- Agent validation: **server-side** (SDK validates; client passes agent name)
+- Fallback: if agent invalid or unavailable, use default with warning
 
-1. **GitHub context injection**
-   - Repository, branch/ref, event type, actor.
-   - Issue/PR number and title (if applicable).
-   - Triggering comment body (if applicable).
+#### Model Override
 
-2. **Session tool instructions (REQUIRED)**
-   - Instruct agent to use `session_search` before re-investigating.
-   - Instruct agent to use `session_read` when prior work is found.
-   - Instruct agent to leave a searchable summary before completing.
+- **Optional** model override input (format: `provider/model`)
+- If not provided: use agent's configured model
+- SDK execution: pass agent (always) and model (when override specified)
 
-3. **GitHub CLI (`gh`) instructions**
-   - All GitHub operations MUST use pre-authenticated `gh` CLI.
-   - Provide examples for common operations:
-     - `gh issue comment <number> --body "message"`
-     - `gh pr comment <number> --body "message"`
-     - `gh pr create --title "..." --body "..." --base main --head branch`
-     - `gh api repos/{owner}/{repo}/...`
-   - For commits: use `git add`, `git commit`, `git push origin HEAD`.
+Example SDK call:
 
-4. **Run summary requirement**
-   - Every comment MUST include collapsed `<details>` block with run metadata.
+```typescript
+{
+  agent: agentName,  // Always provided
+  ...(model != null && {
+    providerID: model.providerID,
+    modelID: model.modelID,
+  }),
+  parts: [...]
+}
+```
 
-#### F. OpenCode SDK Execution (P0 - PRIMARY)
+#### Auditability
 
-> **Note:** This replaces the previous CLI execution model (`opencode run "$PROMPT"`). RFC-012 is superseded by this specification. A new RFC-013 will detail the SDK implementation.
+- Include agent and model (if overridden) in run summaries
+- Log agent/model selection at start of execution
 
-1. **SDK-based execution** (replaces CLI as default)
-   - Use `@opencode-ai/sdk` with `createOpencode()` for automatic server lifecycle.
-   - Server started automatically, managed via AbortController.
-   - No manual port management required.
+### D. Prompt Construction & Semantics
+
+#### Prompt Structure
+
+All prompts follow this structure:
+
+```
+[mode-instructions]     # Platform-specific mode (e.g., analyze-mode, ultrawork-mode)
+[identity]              # Bot identity, invoked by whom, in which context
+[context]               # Type, number, title, repo/channel, metadata
+[user-request]          # The triggering message/comment body
+[mandatory-reading]     # Instructions to gather full context
+[hydrated-data]         # Platform-specific context (issues, PRs, messages)
+[action-instructions]   # Create todos, investigate, report results
+```
+
+#### Session Tool Instructions (Required)
+
+All prompts MUST include:
+
+- Use `session_search` before re-investigating
+- Use `session_read` when prior work is found
+- Leave searchable summary before completing
+
+#### Trigger-Specific Directives
+
+Each trigger type has a default directive:
+
+- Comment-based: "Respond to the comment above"
+- Triage: "Triage this issue: summarize, reproduce if possible, propose next steps"
+- Review: "Review this pull request for code quality, potential bugs, and improvements"
+- Scheduled/manual: No default (custom prompt required)
+
+**Prompt Override Behavior:**
+
+- **Append** for comment-based triggers (custom prompt appends to default)
+- **Replace** for scheduled/manual triggers (custom prompt replaces directive; required)
+
+### E. OpenCode SDK Execution
+
+All modalities use `@opencode-ai/sdk` for OpenCode interaction.
+
+#### SDK Lifecycle
+
+1. **Server creation**
+   - Use `createOpencode()` for automatic server + client creation
+   - Server managed via AbortController
+   - No manual port management
 
 2. **Session lifecycle**
    - Create session: `client.session.create({ body: { title } })`
-   - Send prompt: `client.session.promptAsync()` (non-blocking)
-   - Track session ID throughout execution.
+   - Send prompt: `client.session.prompt({ path: { id }, body: { agent, parts, ... } })`
+   - Track session ID throughout execution
 
-3. **Event subscription and processing**
-   - Subscribe: `client.event.subscribe()` returns async stream.
-   - Track state: `mainSessionIdle`, `mainSessionError`, `lastError`.
-   - Process tool calls, text updates, session events.
+3. **Event subscription**
+   - Subscribe: `client.event.subscribe()` returns async stream
+   - Track state: `mainSessionIdle`, `mainSessionError`
+   - Process tool calls, text updates, session events
 
 4. **Completion detection**
-   - Poll every 500ms for idle state.
-   - Check completion conditions (todos complete, no pending work).
-   - Handle session errors with proper exit codes.
+   - Poll for idle state
+   - Check completion conditions
+   - Handle session errors with proper exit codes
 
-5. **Timeout and cancellation**
-   - Configurable timeout via `timeout` input (0 = no timeout, default: 30 minutes).
-   - AbortController for clean cancellation.
-   - SIGINT handling for graceful shutdown.
+5. **Cleanup**
+   - `server.close()` on completion, error, or signal
+   - Proper exit codes (0=success, 1=error, 130=interrupted)
 
-6. **Cleanup**
-   - `server.close()` on completion, error, or signal.
-   - Restore any modified git config.
-   - Proper exit codes (0=success, 1=error, 130=interrupted).
+**Note:** SDK method is `client.session.prompt()`, not `promptAsync()` or `chat()`. See RFC-013 for implementation details.
 
-#### G. Local Development & Testing (P0)
+### F. Telemetry & Observability
 
-1. **Mock event support**
-   - `MOCK_EVENT` environment variable accepts JSON payload matching GitHub webhook schema.
-   - `MOCK_TOKEN` provides authentication token for local testing.
-   - Only enabled when `CI` env var is not `true` OR `allow-mock-event: true` input is set.
+#### Run Summaries
 
-2. **Mock payload schema**
-   - Must include: `eventName`, `payload`, `repo`, `actor`.
-   - Validated on parse; clear error messages for malformed input.
+Every interaction MUST produce a run summary containing:
 
-3. **Share URL behavior**
-   - Mock mode uses `https://dev.opencode.ai` for share links.
-   - Production uses `https://opencode.ai`.
+- Run metadata (trigger type, repo/channel, ref/branch, run ID)
+- Cache status (hit/miss/corrupted)
+- Session IDs used/created
+- Links to created artifacts (PRs, commits, threads)
+- Duration and token usage (when available from provider)
 
-4. **Security guard**
-   - Mock mode MUST be explicitly disabled in production workflows.
-   - Log warning when mock mode is active.
+Run summary format is platform-specific (see RFC-007).
 
-#### H. File Attachment Processing (P0)
+#### Structured Logging
 
-1. **Attachment detection**
-   - Parse comment body for GitHub user-attachment URLs:
-     - Markdown images: `![alt](https://github.com/user-attachments/assets/...)`
-     - HTML images: `<img ... src="https://github.com/user-attachments/assets/..." />`
-     - File links: `[filename](https://github.com/user-attachments/files/...)`
-   - Regex pattern: `/!?\[.*?\]\((https:\/\/github\.com\/user-attachments\/[^)]+)\)/gi`
+- Emit JSON logs for machine parsing
+- Include session IDs and run IDs for traceability
+- Log redaction for sensitive fields
 
-2. **Download and processing**
-   - Authenticate with GitHub token for private repo attachments.
-   - Download to temp storage.
-   - Determine MIME type from response headers.
+#### Telemetry Policy
 
-3. **Prompt injection** (SDK mode)
-   - Replace original markdown with `@filename` reference.
-   - Pass as `type: "file"` parts with base64 content.
+- **Opt-in only**: No external telemetry aggregation by default
+- **Local-first**: Metrics derived from run summaries and JSON logs
+- **No raw content**: Never log code, comments, or prompts to external systems
+- **Transparent**: User controls what data leaves the system
 
-4. **Limits and policy**
-   - Max 5 attachments per comment.
-   - Max 5MB per attachment, 15MB total.
-   - Allowed types: `image/*`, `text/*`, `application/json`, `application/pdf`.
+### G. Error Handling & Reliability
 
-5. **Security**
-   - Validate URLs are from `github.com/user-attachments/` only.
-   - Attachments NOT persisted to cache.
-   - Log attachment metadata (filename, size, type) but not content.
+#### Graceful Degradation
 
-#### I. Model and Agent Configuration (P0)
+Agent MUST degrade gracefully when external systems are unavailable:
 
-1. **Action inputs**
+- **GitHub/Discord API rate limit**: Exponential backoff (max 3 retries, 30s/60s/120s), then post partial results
+- **LLM API timeout/error**: Retry once after 10s, then post error message
+- **Cache miss/corruption**: Proceed with clean state, log warning
 
-   ```yaml
-   agent:
-     description: "Agent to use (default: Sisyphus). Must be primary agent, not subagent."
-     required: false
-     default: "Sisyphus"
-   model:
-     description: "Model override (format: provider/model). If not set, uses agent's configured model."
-     required: false
-   ```
+#### Non-Fatal Operations
 
-2. **Agent configuration**
-   - Default agent: `"Sisyphus"` (oMo's default agent).
-   - Agent validated against `client.agent.list()`.
-   - Non-primary agents (subagents) fall back to Sisyphus with warning.
-   - Missing agents fall back to Sisyphus with warning.
+Reaction/label/acknowledgment operations are **best-effort**:
 
-3. **Model parsing and validation** (when provided)
-   - Format: `{providerID}/{modelID}` (e.g., `anthropic/claude-sonnet-4-20250514`).
-   - Both segments must be non-empty.
-   - Error if format invalid.
+- Log failures but do not fail the run
+- Use try/catch with error logging (not shell-specific `|| true`)
 
-4. **Execution**
-   - Pass to `client.session.chat()` or `client.session.promptAsync()`:
-     ```typescript
-     // Agent is always provided (defaults to "Sisyphus")
-     // Model override is optional
-     {
-       agent: agentName,
-       ...(model != null && {
-         providerID: model.providerID,
-         modelID: model.modelID,
-       }),
-       parts: [...]
-     }
-     ```
+#### Error Message Format
 
-5. **Auditability**
-   - Include agent (and model if overridden) in run summary footer.
-   - Log agent/model selection at start of execution.
+When errors occur, messages MUST include:
 
-#### J. Enhanced GitHub Context Hydration (P0)
+- Human-readable summary of what failed
+- Error type (rate limit, timeout, corruption)
+- Suggested next steps or retry guidance
 
-1. **Issue context** (via GraphQL)
-   - Title, body, author, state, created date.
-   - Last 50 comments with author, timestamp, body.
-   - Labels and assignees.
+---
 
-2. **Pull request context** (via GraphQL)
-   - Base data: title, body, author, state, baseRefName, headRefName, headRefOid.
-   - Stats: additions, deletions, commits.totalCount.
-   - Repository info: baseRepository.nameWithOwner, headRepository.nameWithOwner.
-   - Commits: last 100 with oid, message, author.
-   - Files: last 100 with path, additions, deletions, changeType.
-   - Comments: last 100 with full metadata.
-   - Reviews: last 100 with state, body, and inline comments (path, line).
+## Modality-Specific Requirements
 
-3. **Context budgeting**
-   - Max 50 comments per thread.
-   - Max 100 changed files.
-   - Truncate bodies > 10KB with note.
-   - Total context budget: ~100KB before prompt injection.
+Detailed requirements for each modality are documented in dedicated RFCs. This PRD provides only high-level summaries.
 
-4. **Fork PR detection**
-   - Compare `headRepository.nameWithOwner` vs `baseRepository.nameWithOwner`.
-   - Different handling for local vs fork PRs (branch checkout strategy).
+### GitHub Action (MVP) — See RFCs 001-018
 
-5. **Fallback behavior**
-   - If GraphQL fails, fall back to REST API with reduced context.
-   - Log warning when context is degraded.
+**Implementation RFCs:**
 
-#### K. Agent Prompt Construction (P0)
+- **RFC-001**: Foundation & Core Types
+- **RFC-002**: Cache Infrastructure
+- **RFC-003**: GitHub API Client Layer
+- **RFC-004**: Session Management Integration
+- **RFC-005**: GitHub Triggers & Event Handling
+- **RFC-006**: Security & Permission Gating
+- **RFC-007**: Observability & Run Summary
+- **RFC-008**: GitHub Comment Interactions
+- **RFC-009**: PR Review Features
+- **RFC-010**: Delegated Work (Push/PR)
+- **RFC-011**: Setup Action & Environment Bootstrap
+- **RFC-012**: Agent Execution & Main Action (superseded by RFC-013)
+- **RFC-013**: SDK Execution Mode
+- **RFC-014**: File Attachment Processing
+- **RFC-015**: GraphQL Context Hydration
+- **RFC-016**: Additional Triggers & Directives
+- **RFC-017**: Post-Action Cache Hook
+- **RFC-018**: Agent-Invokable Delegated Work Tools
 
-1. **Prompt structure**
+**Runtime:**
 
-   ```
-   [mode-instructions]     # analyze-mode, ultrawork-mode (from config)
+- Node.js 24, TypeScript, ESM
+- Bundled output: `dist/main.js`, `dist/post.js`, `dist/plugin/fro-bot-agent.js`
 
-   [identity]              # Bot username, mentioned by whom, in which repo
+### Discord Bot (MVP) — TBD RFCs
 
-   [context]               # Type, number, title, repo, default branch
+**Planned Architecture:**
 
-   [user-request]          # The triggering comment body
+- Long-running daemon with reverse proxy boundary
+- Recommended deployment: Docker container or systemd service
+- S3 sync required (no GitHub Actions cache)
+- Discord role-based permissions
 
-   [mandatory-reading]     # Instructions to read full conversation first
+**Implementation:**
 
-   [issue/pr-data]         # GraphQL-hydrated context (from J above)
+- Dedicated Discord RFCs to be created for MVP
+- Will share core session management (RFC-004) and SDK execution (RFC-013)
 
-   [action-instructions]   # Create todos, investigate, report results
-   ```
+### Shared Storage (MVP) — RFC-002 + Future S3 RFC
 
-2. **Mandatory context reading instructions**
-   - For issues: `gh issue view NUMBER --comments`
-   - For PRs: THREE commands required:
-     - `gh pr view NUMBER --comments`
-     - `gh api repos/OWNER/REPO/pulls/NUMBER/comments`
-     - `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`
-   - Extract: original description, previous attempts, decisions, feedback, linked references.
+**Current Implementation (RFC-002):**
 
-3. **GitHub comment formatting guidance**
-   - ALWAYS use heredoc syntax for comments with backticks:
-     ```bash
-     gh issue comment NUMBER --body "$(cat <<'EOF'
-     Content with `code` preserved
-     EOF
-     )"
-     ```
-   - Code blocks MUST have exactly 3 backticks + language identifier.
-   - Every opening triple-backtick must have a closing triple-backtick on its own line.
+- GitHub Actions cache infrastructure
+- Branch-scoped keys with fallback restore keys
+- Corruption detection and recovery
 
-4. **Session tool instructions** (preserved from current PRD)
-   - Use `session_search` before re-investigating.
-   - Use `session_read` when prior work found.
-   - Leave searchable summary before completing.
+**Future S3 Implementation (TBD RFC):**
 
-#### L. Trigger-Specific Prompt Directives (P0)
-
-Each trigger type injects a default task directive into the agent prompt. The `getTriggerDirective()` function returns trigger-appropriate instructions that can be overridden by custom `prompt` input.
-
-1. **Directive by trigger type**
-
-   | Trigger | Default Directive | Notes |
-   | --- | --- | --- |
-   | `issue_comment` | "Respond to the comment above" | Uses comment body as instruction |
-   | `discussion_comment` | "Respond to the discussion comment above" | Similar to issue_comment |
-   | `pull_request_review_comment` | "Respond to the review comment with file and code context" | Includes file path, line number, diff hunk |
-   | `issues` (opened) | "Triage this issue: summarize, reproduce if possible, propose next steps" | Automated triage behavior |
-   | `issues` (edited with @mention) | "Respond to the mention in this issue" | Only when @fro-bot mentioned |
-   | `pull_request` (opened/synchronize) | "Review this pull request for code quality, potential bugs, and improvements" | Default review behavior |
-   | `schedule` | (uses `prompt` input directly) | No default - prompt required |
-   | `workflow_dispatch` | (uses `prompt` input directly) | No default - prompt required |
-
-2. **Context injection per trigger**
-   - `pull_request_review_comment`: Inject `<review_comment_context>` block with:
-     - File path (`path`)
-     - Line number (`line`, `original_line`)
-     - Diff hunk (`diff_hunk`)
-     - Commit ID (`commit_id`)
-   - `pull_request`: Inject commit summary, changed files list, existing review comments.
-   - `issues`: Inject full issue body and recent comments.
-
-3. **Prompt override behavior**
-   - Custom `prompt` input **appends** to trigger directive for comment-based triggers.
-   - Custom `prompt` input **replaces** directive for `schedule`/`workflow_dispatch`.
-
-4. **Implementation**
-   - Add `getTriggerDirective(triggerContext, inputs)` function in `src/lib/agent/prompt.ts`.
-   - Thin layer - returns 5-20 lines of task text, not a separate prompt builder.
-
-#### M. Post-Action Cache Hook (P0)
-
-Reliable cache saving via GitHub Actions `post:` field, independent of main action lifecycle.
-
-1. **Rationale**
-   - Current `finally` block cleanup can miss on hard kills (timeout, cancellation, SIGKILL).
-   - GitHub Actions `post:` runs in a separate process, providing durability.
-
-2. **Implementation**
-   - Add `src/post.ts` entry point.
-   - Update `action.yaml` with `runs.post: dist/post.js`.
-   - Post-hook responsibilities:
-     - Save cache (idempotent, best-effort).
-     - Session pruning (optional, non-fatal).
-   - **MUST NOT** fail the job if cache save fails.
-
-3. **Build impact**
-   - Update `tsdown.config.ts` to bundle `post.ts` as third entry point.
-   - Produces `dist/main.js`, `dist/setup.js`, `dist/post.js`.
-
-### P1 (should-have)
-
-1. **Setup action refinements**
-   - Custom `opencode.json` configuration injection.
-   - App token generation within the action (vs external action).
-
-2. **"Corruption detected" handling**
-   - Detect obvious corruption in restored storage (e.g., missing required directories, unreadable DB files).
-   - If corruption detected: warn in logs + run summary; proceed with clean state.
-
-3. **Concurrency handling**
-   - If two runs hit the same cache key simultaneously:
-     - Use **last-write-wins** semantics.
-     - Emit a warning in the run summary if a race is detected (best-effort).
-
-4. **Storage versioning**
-   - Include a version marker in the storage directory.
-   - On version mismatch: warn and proceed with clean state (do not fail).
-
-5. **Session sharing** (SDK mode)
-   - Optional `share` input: `true`, `false`, or unset (auto).
-   - Auto behavior: share for public repos, don't share for private.
-   - Call `client.session.share({ path: session })` to create public link.
-   - Include share link in comment footer with optional social card image.
-   - Output `share-url` from action.
-
-6. **Automatic branch management**
-   - **Issue workflow**: Create new branch → make changes → push → create PR.
-   - **Local PR workflow**: Checkout existing branch → make changes → push.
-   - **Fork PR workflow**: Add fork remote → checkout → push to fork.
-   - Branch naming: `opencode/{issue|pr}{number}-{timestamp}`.
-   - Commit format with co-author attribution.
-   - Dirty check: `git status --porcelain` before attempting push.
-
-7. **Event streaming and progress logging**
-   - Subscribe to SSE events from OpenCode server.
-   - Log tool calls with color-coded output (todo: yellow, bash: red, edit: green, etc.).
-   - Log text completions when finished.
-   - Track session state updates in real-time.
-
-8. **Setup action consolidation** (deferred from v1.2)
-   - Consolidate setup functionality into main action for simplified UX.
-   - Requires separate RFC with migration plan.
-   - Keep setup action for backwards compatibility.
-
-### P2 (nice-to-have)
-
-1. **Cross-runner portability**
-   - Optional write-through S3 backup/restore.
-
-2. **Org-level memory partitioning**
-   - Support additional scoping (repo-only vs org-wide) as configurable.
+- S3 write-through for durability
+- Required for Discord Bot
+- Optional for GitHub Action (backup layer)
+- Scope: per agent identity + repo
+- Storage versioning via `.version` file
 
 ---
 
 ## Non-Functional Requirements
 
-### Security & privacy
+### Security & Privacy
 
-- **Never persist `auth.json`**; it must be populated each run from GitHub Actions secrets (placeholders only in docs/examples).
-- Avoid printing credentials or including them in comments.
-- Cache threat model considerations:
-  - Caches can be accessible depending on repo settings and scoping.
-  - Prefer branch-scoped caches to reduce poisoning risk.
-- For PRs from forks: use `issue_comment` trigger with permission gating (OWNER/MEMBER/COLLABORATOR only).
+- Never persist `auth.json`; rehydrated each run from secrets
+- Avoid printing credentials or including in comments
+- Cache threat model: branch-scoped keys, S3 prefix isolation
+- Fork PRs: secure triggers with permission gating
+- Telemetry: opt-in only, no raw content
 
 ### Reliability
 
-- Cache missing must not fail the run.
-- Cache corruption should not fail the run; it should be detected and warned.
-- Agent should degrade gracefully when external systems are unavailable:
-  - **GitHub API rate limit**: Exponential backoff (max 3 retries, 30s/60s/120s), then post partial results.
-  - **LLM API timeout/error**: Retry once after 10s, then post error comment.
-  - **Discord API issues**: Log and continue; do not crash daemon.
+- Cache missing must not fail the run
+- Cache corruption: detect, warn, proceed with clean state
+- Graceful degradation for API rate limits and timeouts
+- Best-effort operations: log failures, do not fail run
 
 ### Performance
 
-- Restore cache early in job.
-- Minimize repeated exploration using session search.
-- Target: cache restore < 30s for typical storage sizes (< 500MB).
+- Restore cache early in execution
+- Minimize repeated exploration via session search
+- Target: cache restore < 30s for typical storage sizes (< 500MB)
 
-### Observability / auditability
+### Observability
 
-- Provide:
-  - GitHub comment summary (with collapsed details block).
-  - GitHub Actions job summary + logs.
-- Include session IDs and run IDs for traceability.
-- Emit structured logs (JSON) for machine parsing.
+- GitHub comment summaries with collapsed details blocks
+- Platform-native job summaries and logs
+- Session IDs and run IDs for traceability
+- Structured JSON logs for machine parsing
 
-### Cost controls
+### Cost Controls
 
-- Avoid unnecessary repeated LLM/tool calls by:
-  - session revive + search.
-  - posting stable summaries.
-- Emit token usage in run summary (when available from LLM provider).
+- Avoid unnecessary LLM/tool calls via session reuse
+- Emit token usage in run summaries (when available)
+- Session pruning to manage storage growth
 
 ---
 
 ## Data / Storage Requirements
 
-### Persisted data (required)
+### Persisted Data
 
-- Persist exactly:
-  - `$XDG_DATA_HOME/opencode/storage/` (typically `~/.local/share/opencode/storage/`)
+Persist exactly:
 
-### Sensitive / excluded data
+- `$XDG_DATA_HOME/opencode/storage/` (typically `~/.local/share/opencode/storage/`)
 
-- Do not persist:
-  - `$XDG_DATA_HOME/opencode/auth.json`
-- `auth.json` is rehydrated each run from GitHub Actions secrets.
+### Excluded Data
 
-### GitHub Actions cache mechanics
+Never persist:
 
-- Restore persisted storage at start of run.
-- Save updated storage at end of run.
+- `$XDG_DATA_HOME/opencode/auth.json`
+- Credentials, secrets, API keys
+- File attachments
 
-### Cache key strategy (v1 default)
+### Storage Mechanics
 
-- Default: **branch-scoped** with agent identity and repo.
-- Key pattern:
-  ```
-  opencode-storage-${agent_identity}-${repo}-${ref_name}-${runner_os}
-  ```
-- Restore-keys (fallback):
-  ```
-  opencode-storage-${agent_identity}-${repo}-${ref_name}-
-  opencode-storage-${agent_identity}-${repo}-
-  ```
-- `agent_identity`: `github` or `discord` (prevents cross-contamination).
+Platform-specific storage mechanisms documented in RFCs:
 
-### Retention / eviction
+- **GitHub Action**: GitHub Actions cache (RFC-002) + optional S3 write-through (future RFC)
+- **Discord Bot**: S3 sync (required, future RFC)
 
-- Treat cache eviction as expected; S3 write-through exists to reduce loss.
-- GitHub Actions cache: 7-day eviction for unused keys (GitHub default).
+### Cache Key Strategy (GitHub Action)
 
-### Optional: S3 write-through backup (MVP)
+Default: branch-scoped with agent identity and repo.
 
-- MVP includes S3 sync as an option.
-- Scope: **per agent identity + repo**.
-- Uses GitHub secrets/vars placeholders only, e.g. `${{ secrets.AWS_ACCESS_KEY_ID }}`.
-- **Required for Discord** (since Discord runs outside GitHub Actions).
+Key pattern:
 
----
+```
+opencode-storage-${agent_identity}-${repo}-${ref_name}-${runner_os}
+```
 
-## Deployment / Operations
+Restore-keys (fallback):
 
-### GitHub
+```
+opencode-storage-${agent_identity}-${repo}-${ref_name}-
+opencode-storage-${agent_identity}-${repo}-
+```
 
-- Runs as GitHub Action(s) written in TypeScript, targeting **Node.js 24** runtime.
-- Required permissions (principle of least privilege; exact list depends on enabled features):
-  - `contents: read` (for analysis).
-  - `issues: write`, `pull-requests: write` (for comments/reviews).
-  - `contents: write` (when delegated work enabled).
+`agent_identity`: `github` or `discord` (prevents cross-contamination)
 
-### Discord
+### Retention / Eviction
 
-- Long-running daemon/bot.
-- Recommended deployment: Docker container or systemd service.
-- Requires a mapping from Discord channel → GitHub repo (stored in bot’s config/database).
-- Reverse proxy boundary between Discord and OpenCode execution.
-
-### Required secrets/vars (examples only)
-
-- GitHub:
-  - `${{ secrets.GITHUB_TOKEN }}` (default) and additional tokens if needed for elevated operations.
-  - `${{ secrets.OPENCODE_AUTH_JSON }}` or equivalent (input).
-- Optional S3 backup:
-  - `${{ secrets.AWS_ACCESS_KEY_ID }}`
-  - `${{ secrets.AWS_SECRET_ACCESS_KEY }}`
-  - `${{ vars.S3_BUCKET }}`
-  - `${{ vars.AWS_REGION }}`
-
-### Failure modes & expected behavior
-
-| Failure                          | Behavior                                          |
-| -------------------------------- | ------------------------------------------------- |
-| Cache miss                       | Proceed normally, seed cache at end               |
-| Cache corruption detected        | Proceed with clean state, post warning in summary |
-| Fork PR                          | Run via `issue_comment` with permission gating    |
-| LLM rate limit                   | Retry with backoff (3x), then post partial/error  |
-| GitHub API rate limit            | Retry with backoff, then post partial/error       |
-| Concurrent runs (same cache key) | Last-write-wins; emit warning                     |
-
-### Rollback plan
-
-- If a release breaks storage compatibility:
-  1. Revert to previous action version.
-  2. Clear cache keys matching the broken version.
-  3. Document in release notes.
-
----
-
-## User Journeys
-
-### Journey 1: Issue triage with memory
-
-1. User opens issue.
-2. Job restores OpenCode storage cache.
-3. Agent runs: `session_search` for similar issues; reads prior session if relevant.
-4. Agent posts an issue comment with:
-   - proposed diagnosis/next steps
-   - collapsed run summary with session IDs and cache status.
-5. Job saves updated storage.
-
-### Journey 2: PR review + delegated fix
-
-1. Maintainer requests Fro Bot review and fix.
-2. Agent restores storage, searches prior context.
-3. Agent reviews diff and posts:
-   - review comments
-   - conversation summary comment
-4. If requested, agent pushes commits and opens a PR.
-5. Agent posts final summary with links + collapsed details.
-6. Storage saved.
-
-### Journey 3: Discord collaboration, same project memory
-
-1. User chats in a repo channel.
-2. Bot opens/resumes a session thread.
-3. Session uses the same persisted storage as GitHub runs (via S3 sync).
-4. User resumes later; agent continues with context.
-
-### Journey 4: Cache miss / first run
-
-1. Issue opened on a repo with no prior agent runs.
-2. Cache restore returns miss (no error).
-3. Agent proceeds with fresh session.
-4. Agent posts comment with run summary noting "cache: miss (first run)".
-5. Storage saved for future runs.
+- GitHub Actions cache: 7-day eviction for unused keys (GitHub default)
+- S3 write-through: provides durability layer beyond cache eviction
+- Session pruning: default 50 sessions or 30 days (configurable)
 
 ---
 
 ## Success Metrics
 
-| Metric                          | Target                        | How to Measure                                    |
-| ------------------------------- | ----------------------------- | ------------------------------------------------- |
-| Memory reuse rate               | ≥60%                          | % runs with `session_search`/`session_read` calls |
-| Repeat work reduction           | ≥40%                          | Compare exploration calls on recurring issues     |
-| Time to first actionable output | ≤90s (cache hit)              | Job start → first comment timestamp               |
-| User satisfaction               | Positive qualitative feedback | Maintainer surveys/interviews                     |
-| Safety                          | 0 incidents                   | Quarterly audit of logs/comments/caches           |
+| Metric | Target | How to Measure |
+| --- | --- | --- |
+| Memory reuse rate | ≥60% | % runs with `session_search`/`session_read` calls (from logs) |
+| Repeat work reduction | ≥40% | Compare exploration calls on recurring issues (from logs) |
+| Time to first actionable output | ≤90s (cache hit) | Job start → first comment timestamp (from run summary) |
+| User satisfaction | Positive qualitative feedback | Maintainer surveys/interviews |
+| Safety | 0 incidents | Quarterly audit of logs/comments/caches |
 
 ---
 
@@ -839,199 +657,181 @@ Reliable cache saving via GitHub Actions `post:` field, independent of main acti
 
 The MVP is considered complete when:
 
-**Additional Triggers (L)**
+### Shared Capabilities
 
-- [ ] `issues` event supported with `opened` action (triage behavior).
-- [ ] `issues.edited` triggers only when `@fro-bot` mentioned in body.
-- [ ] `pull_request` event supported with `opened`, `synchronize`, `reopened` actions.
-- [ ] `pull_request` skips draft PRs by default.
-- [ ] `pull_request_review_comment` event supported with `created` action.
-- [ ] `schedule` event supported with required `prompt` input (hard fail if empty).
-- [ ] `workflow_dispatch` hard fails if `prompt` input is empty.
-- [ ] Each trigger type injects appropriate default directive via `getTriggerDirective()`.
-- [ ] Custom `prompt` input appends to (comment-based) or replaces (scheduled/manual) directive.
+- [ ] Session management with two-layer architecture (action-side + agent-side)
+- [ ] OpenCode storage persistence and restoration
+- [ ] `auth.json` never persisted
+- [ ] Session search on startup (evidence in logs)
+- [ ] Session pruning at end of run
+- [ ] Close-the-loop writeback with run metadata
+- [ ] Permission gating (OWNER/MEMBER/COLLABORATOR)
+- [ ] Anti-loop protection (ignore bot's own messages)
+- [ ] SDK-based execution with `createOpencode()` + `client.session.prompt()`
+- [ ] Agent selection with server-side validation
+- [ ] Optional model override (format: `provider/model`)
+- [ ] Run summaries with metadata (cache status, session IDs, duration, token usage when available)
+- [ ] Structured JSON logs
+- [ ] Graceful degradation on API failures
+- [ ] Best-effort non-fatal operations (logged failures)
 
-**Post-Action Cache Hook (M)**
+### GitHub Action (MVP) — See RFCs 001-018 for Full Criteria
 
-- [ ] `src/post.ts` entry point exists and bundles to `dist/post.js`.
-- [ ] `action.yaml` includes `runs.post: dist/post.js`.
-- [ ] Post-hook saves cache idempotently (best-effort, never fails job).
-- [ ] Post-hook runs even on main action failure/timeout.
+- [ ] All triggers supported (`issue_comment`, `discussion_comment`, `issues`, `pull_request`, `pull_request_review_comment`, `workflow_dispatch`, `schedule`)
+- [ ] GraphQL context hydration
+- [ ] File attachment processing
+- [ ] Delegated work tools via OpenCode plugin
+- [ ] GitHub Actions cache + optional S3 write-through
+- [ ] Post-action cache hook
 
-**SDK Execution (F)**
+### Discord Bot (MVP) — See Future Discord RFCs for Full Criteria
 
-- [ ] Agent execution uses `@opencode-ai/sdk` with `createOpencode()` for server lifecycle.
-- [ ] Session created via `client.session.create()` and prompt sent via `client.session.promptAsync()`.
-- [ ] Event subscription via `client.event.subscribe()` for progress tracking.
-- [ ] Completion detection via polling for idle state.
-- [ ] Timeout configurable via `timeout` input (default: 30 minutes).
-- [ ] Clean shutdown on completion, error, or signal (SIGINT).
+- [ ] Channel=repo, thread=session mapping
+- [ ] Long-running daemon with reverse proxy
+- [ ] S3 sync (required)
+- [ ] Discord role-based permissions
 
-**Mock Event Support (G)**
+### Shared Storage (MVP) — See RFC-002 + Future S3 RFC for Full Criteria
 
-- [ ] `MOCK_EVENT` and `MOCK_TOKEN` env vars enable local testing.
-- [ ] Mock mode disabled in production unless `allow-mock-event: true`.
-
-**File Attachments (H)**
-
-- [ ] GitHub user-attachment URLs parsed from comment body.
-- [ ] Attachments downloaded and passed as `type: "file"` parts to SDK.
-- [ ] Limits enforced: 5 files max, 5MB each, 15MB total.
-
-**Model/Agent Config (I)**
-
-- [ ] `agent` input optional, defaults to `"Sisyphus"`.
-- [ ] `model` input optional; if not provided, uses agent's configured model.
-- [ ] Model format validated as `provider/model` when provided.
-- [ ] Agent validated against available agents.
-- [ ] Agent/model included in run summary.
-
-**GraphQL Context (J)**
-
-- [ ] Full issue context fetched via GraphQL (title, body, comments, labels).
-- [ ] Full PR context fetched via GraphQL (commits, files, reviews, inline comments).
-- [ ] Context budgeting enforced (50 comments, 100 files, 10KB body truncation).
-- [ ] Fallback to REST API on GraphQL failure.
-
-**Prompt Construction (K)**
-
-- [ ] Multi-section prompt structure with mode instructions, identity, context, user request.
-- [ ] Mandatory reading instructions for issues and PRs.
-- [ ] Heredoc guidance for GitHub comment formatting.
-- [ ] Session tool instructions included.
-
-**Core Functionality (existing)**
-
-- [ ] GitHub Action runs on issue/PR/discussion events per oMo Sisyphus parity.
-- [ ] Setup action installs OpenCode via `@actions/tool-cache` caching pattern.
-- [ ] Setup action installs oMo plugins via `bunx oh-my-opencode install`.
-- [ ] Setup action configures `gh` CLI with GitHub App token or GITHUB_TOKEN.
-- [ ] Agent adds 👀 reaction to triggering comment and "agent: working" label on start.
-- [ ] Agent replaces 👀 with success reaction and removes label on completion.
-- [ ] Cache restore/save works for `$XDG_DATA_HOME/opencode/storage/`.
-- [ ] `auth.json` is never persisted.
-- [ ] Agent uses `session_search` on startup (evidence in logs).
-- [ ] Every comment includes collapsed run summary.
-- [ ] Fork PRs handled securely via `issue_comment` with permission gating.
-- [ ] Session pruning runs at end of each run.
-- [ ] S3 write-through option is functional.
-- [ ] Discord bot connects and routes messages to OpenCode.
-- [ ] Discord and GitHub share storage via S3.
+- [ ] GitHub Actions cache functional
+- [ ] S3 write-through functional
+- [ ] Storage versioning with `.version` file
+- [ ] Corruption detection and recovery
 
 ---
 
-## Timeline (high-level)
+## Timeline (High-Level)
 
-| Phase                        | Deliverables                                                  | Estimated Duration |
-| ---------------------------- | ------------------------------------------------------------- | ------------------ |
-| 1. SDK Execution Foundation  | SDK integration, model/agent config, mock event support       | 2 weeks            |
-| 2. Enhanced Context          | GraphQL hydration, file attachments, prompt construction      | 2 weeks            |
-| 3. GitHub Interaction Parity | Issue/PR/Discussion triggers, review comments, delegated work | 3 weeks            |
-| 4. Discord Daemon MVP        | Channel=repo, thread=session, reverse proxy, S3 sync          | 3 weeks            |
-| 5. Hardening                 | Concurrency handling, pruning, error handling, docs           | 2 weeks            |
+| Phase                      | Deliverables                                        | Estimated Duration |
+| -------------------------- | --------------------------------------------------- | ------------------ |
+| 1. GitHub Action MVP       | Core triggers, SDK execution, cache, shared storage | 4 weeks            |
+| 2. GitHub Action Hardening | Delegated work, error handling, observability       | 3 weeks            |
+| 3. Discord Bot MVP         | Daemon, S3 sync, basic commands                     | 3 weeks            |
+| 4. Discord Bot Hardening   | Permissions, threading, stability                   | 2 weeks            |
+| 5. Integration Testing     | Cross-modality memory continuity, security audit    | 2 weeks            |
 
 ---
 
 ## Open Questions / Risks / Dependencies
 
 1. **Cache poisoning & trust boundaries**
-   - Risk: branch-scoped cache reduces poisoning risk, but write-through S3 introduces new risks and IAM complexity.
-   - Mitigation:
-     - Separate S3 prefixes by `agent_identity + repo`.
-     - Separate IAM roles/policies by environment; restrict to `GetObject/PutObject/List` for that prefix.
-     - Document threat model and recommend enabling S3 bucket versioning.
+   - Risk: S3 introduces IAM complexity and new attack vectors
+   - Mitigation: S3 prefix isolation, IAM least-privilege policies, bucket versioning (see future S3 RFC)
 
-2. **Session storage size growth**
-   - Risk: unbounded storage growth can cause cache thrash and slower restores.
-   - Mitigation:
-     - Implement session pruning (default: 50 sessions or 30 days) in v1.
-     - Emit storage size in run summary; warn when exceeding a configurable threshold.
+2. **Session storage growth**
+   - Risk: Unbounded growth causes cache eviction and restore latency
+   - Mitigation: Session pruning (50 sessions/30 days default), storage size warnings
 
 3. **@opencode-ai/sdk stability**
-   - Risk: External SDK dependency with unknown API stability.
-   - Mitigation:
-     - Pin SDK version in package.json.
-     - Comprehensive integration tests for SDK interactions.
-     - Monitor SDK releases for breaking changes.
+   - Risk: External dependency with unknown API stability
+   - Mitigation: Pin SDK version, integration tests, monitor releases
 
 4. **GraphQL rate limits**
-   - Risk: Large PRs with many comments/files could hit rate limits.
-   - Mitigation:
-     - Implement pagination with limits (50 comments, 100 files).
-     - Cache GraphQL responses within a run.
-     - Fall back to REST API on GraphQL failure.
+   - Risk: Large PRs could hit rate limits
+   - Mitigation: Pagination limits (50 comments, 100 files), REST API fallback (see RFC-015)
 
 5. **File attachment security**
-   - Risk: Malicious attachments (malware, oversized files, unexpected MIME types).
-   - Mitigation:
-     - Strict URL allowlist (`github.com/user-attachments/` only).
-     - Size limits (5MB per file, 15MB total).
-     - MIME type validation.
-     - Attachments never persisted to cache.
+   - Risk: Malicious attachments
+   - Mitigation: URL allowlist, size limits, MIME validation, no cache persistence (see RFC-014)
 
-6. **Noisy automated triggers** (NEW - v1.2)
-   - Risk: `issues` and `pull_request` events could trigger expensive/noisy runs on every edit.
-   - Mitigation:
-     - Constrain supported actions per trigger (see section A.1).
-     - Require @mention for `issues.edited`.
-     - Skip draft PRs by default.
-     - Clear documentation on which events/actions are handled.
+6. **Noisy automated triggers**
+   - Risk: `issues` and `pull_request` events could trigger expensive runs
+   - Mitigation: Constrained actions, @mention requirement, skip conditions (see RFC-016)
 
-7. **Post-action hook reliability** (NEW - v1.2)
-   - Risk: Post-hook may still miss in extreme edge cases (runner crash).
-   - Mitigation:
-     - Post-hook is best-effort addition, not replacement for `finally` cleanup.
-     - S3 write-through provides additional durability layer.
-     - Monitor cache hit rates to detect issues.
+7. **Post-action hook reliability**
+   - Risk: May still miss in extreme edge cases (runner crash)
+   - Mitigation: Best-effort addition to `finally` cleanup, S3 provides durability layer (see RFC-017)
+
+8. **Discord daemon uptime**
+   - Risk: Long-running process requires monitoring and restart policies
+   - Mitigation: Docker health checks, systemd restart policies, heartbeat monitoring (see future Discord RFCs)
 
 ---
 
 ## Appendix: Technical Notes
 
-### Execution Model Decision
+### SDK Execution Model
 
-**v1.1 Change:** The project uses **SDK-based execution** via `@opencode-ai/sdk` as the primary execution model. This replaces the previous CLI execution model (`opencode run "$PROMPT"`).
+The project uses **SDK-based execution** via `@opencode-ai/sdk` as the primary execution model (see RFC-013).
+
+**Key SDK Methods:**
+
+- `createOpencode()` — Automatic server + client creation
+- `client.session.create()` — Create session
+- `client.session.prompt()` — Send prompt (not `promptAsync` or `chat`)
+- `client.event.subscribe()` — Event stream subscription
+- `server.close()` — Cleanup
 
 **Rationale:**
 
-- Enables structured file attachments as typed parts
-- Provides session event streaming for real-time progress
-- Supports agent validation before execution
-- Aligns with OpenCode GitHub Action and oh-my-opencode patterns
+- Structured file attachments as typed parts
+- Session event streaming for real-time progress
+- Server-side agent validation
+- Aligns with OpenCode ecosystem patterns
 
-**RFC Impact:**
+### Runtime & Dependencies
 
-- RFC-012 (Agent Execution - Main Action) is superseded by this specification
-- RFC-013 (SDK Execution Mode) will detail the implementation
-- RFC-011 (Setup Action) decision table updated to reflect SDK choice
+**GitHub Action Runtime:**
 
-### Runtime Decision
+- Node.js 24 (matches `action.yaml`)
+- TypeScript, ESM-only
+- Bundled output via `tsdown`
 
-The project uses **Node.js 24** as the GitHub Actions runtime. This aligns with:
+**Discord Bot Runtime:**
 
-- Current `action.yaml` (`runs.using: node24`)
-- Existing `package.json` and `tsdown` bundler setup
-- Broader ecosystem compatibility
+- TBD in future Discord RFCs
 
-**Note:** The oMo Sisyphus reference implementation uses **Bun** in its reusable workflow. This project targets Node.js for the action runtime but **automatically installs Bun** when needed for oMo plugin installation, providing seamless compatibility without requiring users to configure Bun separately.
+**New Dependencies:**
 
-### Single Entrypoint with Auto-Setup
-
-The main action (`uses: fro-bot/agent`) handles both environment setup and agent execution. There is no separate setup action.
+- `@opencode-ai/sdk` — Pinned version
+- GraphQL via Octokit built-in
 
 ### Storage Format Versioning
 
-Include a `.version` file in `$XDG_DATA_HOME/opencode/storage/`:
+Include `.version` file in `$XDG_DATA_HOME/opencode/storage/`:
 
 ```txt
 1
 ```
 
-Increment on breaking changes. Agent checks on restore and warns if mismatch.
+Increment on breaking changes. Harness checks on restore and warns if mismatch.
 
-### New Dependencies (v1.1)
+---
 
-| Dependency         | Purpose                        | Version Strategy               |
-| ------------------ | ------------------------------ | ------------------------------ |
-| `@opencode-ai/sdk` | SDK client for OpenCode server | Pin to specific version        |
-| GraphQL client     | GitHub context hydration       | Use Octokit's built-in GraphQL |
+## RFC References
+
+Modality-specific implementation details are documented in dedicated RFCs:
+
+### GitHub Action (RFCs 001-018)
+
+- **RFC-001**: Foundation & Core Types
+- **RFC-002**: Cache Infrastructure
+- **RFC-003**: GitHub API Client Layer
+- **RFC-004**: Session Management Integration
+- **RFC-005**: GitHub Triggers & Event Handling
+- **RFC-006**: Security & Permission Gating
+- **RFC-007**: Observability & Run Summary
+- **RFC-008**: GitHub Comment Interactions
+- **RFC-009**: PR Review Features
+- **RFC-010**: Delegated Work (Push/PR)
+- **RFC-011**: Setup Action & Environment Bootstrap
+- **RFC-012**: Agent Execution & Main Action (superseded by RFC-013)
+- **RFC-013**: SDK Execution Mode
+- **RFC-014**: File Attachment Processing
+- **RFC-015**: GraphQL Context Hydration
+- **RFC-016**: Additional Triggers & Directives
+- **RFC-017**: Post-Action Cache Hook
+- **RFC-018**: Agent-Invokable Delegated Work Tools
+
+### Discord Bot (Future RFCs)
+
+- TBD: Discord daemon architecture, permissions, threading, S3 sync
+
+### Shared Storage (Current + Future)
+
+- **RFC-002**: GitHub Actions cache infrastructure
+- **Future RFC**: S3 write-through backup/restore
+
+---
+
+_This PRD defines product-wide goals and shared semantics. Modality-specific implementation details are in RFCs. For conflicts, see "Source of Truth & Conflict Resolution" section._

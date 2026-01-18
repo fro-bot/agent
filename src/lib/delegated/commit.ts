@@ -46,7 +46,7 @@ export function validateFileSize(
   content: string,
   encoding: 'utf-8' | 'base64' = 'utf-8',
 ): {valid: boolean; reason?: string} {
-  const sizeBytes = encoding === 'base64' ? Math.ceil(content.length * 0.75) : Buffer.byteLength(content, 'utf-8')
+  const sizeBytes = encoding === 'base64' ? Buffer.byteLength(content, 'base64') : Buffer.byteLength(content, 'utf-8')
 
   if (sizeBytes > FILE_VALIDATION.MAX_FILE_SIZE_BYTES) {
     return {valid: false, reason: `File exceeds maximum size of ${FILE_VALIDATION.MAX_FILE_SIZE_BYTES} bytes`}

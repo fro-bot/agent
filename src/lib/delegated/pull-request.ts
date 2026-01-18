@@ -84,12 +84,16 @@ export async function updatePullRequest(
 ): Promise<PRResult> {
   logger.info('Updating pull request', {prNumber})
 
+  if (options.title == null && options.body == null) {
+    throw new Error('At least one of title or body must be provided for PR update')
+  }
+
   const {data} = await octokit.rest.pulls.update({
     owner,
     repo,
     pull_number: prNumber,
-    title: options.title,
-    body: options.body,
+    ...(options.title != null && {title: options.title}),
+    ...(options.body != null && {body: options.body}),
   })
 
   return {

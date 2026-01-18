@@ -47,12 +47,13 @@ Implement comprehensive observability: structured run summaries in GitHub commen
 
 ## Features Addressed
 
-| Feature ID | Feature Name               | Priority |
-| ---------- | -------------------------- | -------- |
-| F20        | Run Summary in Comments    | P0       |
-| F30        | GitHub Actions Job Summary | P0       |
-| F31        | Structured Logging         | P0       |
-| F32        | Token Usage Reporting      | P0       |
+| Feature ID | Feature Name                 | Priority |
+| ---------- | ---------------------------- | -------- |
+| F20        | Run Summary in Comments      | P0       |
+| F30        | GitHub Actions Job Summary   | P0       |
+| F31        | Structured Logging           | P0       |
+| F32        | Token Usage Reporting        | P0       |
+| F83        | Telemetry Policy Enforcement | P0       |
 
 ## Technical Specification
 
@@ -1149,8 +1150,158 @@ describe("writeJobSummary", () => {
 7. **Closure-based collector**: No ES6 classes per project rules
 8. **Frozen snapshots**: `getMetrics()` returns immutable objects
 
+## Telemetry Policy Enforcement (F83)
+
+**Added:** 2026-01-17 (PRD v1.4 requirement)
+
+This section addresses F83: Telemetry Policy Enforcement, ensuring privacy-first telemetry across all modalities.
+
+### Policy Requirements
+
+Per PRD v1.4, the telemetry policy mandates:
+
+1. **Opt-in only**: No external telemetry aggregation by default
+2. **Local-first**: Metrics derived from run summaries and structured JSON logs only
+3. **No raw content**: Never log code, comments, or prompts to external systems
+4. **Transparent**: User controls what data leaves the system
+
+### Implementation
+
+#### 1. Telemetry Configuration (`src/lib/observability/types.ts`)
+
+```typescript
+export interface TelemetryConfig {
+  readonly enabled: boolean
+  readonly externalAggregation: boolean // Defaults to false
+  readonly contentLogging: "none" | "metadata-only" | "full" // Defaults to "none"
+}
+
+export const DEFAULT_TELEMETRY_CONFIG: TelemetryConfig = {
+  enabled: true,
+  externalAggregation: false,
+  contentLogging: "none",
+} as const
+```
+
+#### 2. Content Redaction
+
+The logger already implements redaction for sensitive fields. Extend to ensure no raw content is logged:
+
+```typescript
+// Fields that are NEVER logged externally
+const REDACTED_FIELDS = [
+  "token",
+  "password",
+  "secret",
+  "key",
+  "auth",
+  "prompt",
+  "body",
+  "content",
+  "code",
+  "comment",
+] as const
+
+// Content redaction in logger
+function redactForTelemetry(obj: unknown, config: TelemetryConfig): unknown {
+  if (config.contentLogging === "full") return obj
+  if (config.contentLogging === "metadata-only") {
+    return redactContentFields(obj)
+  }
+  return redactAllSensitive(obj)
+}
+```
+
+#### 3. External Aggregation Gate
+
+When `externalAggregation` is false (default), metrics are stored locally only:
+
+```typescript
+export async function emitMetrics(metrics: RunMetrics, config: TelemetryConfig, logger: Logger): Promise<void> {
+  // Always write to local job summary and logs
+  await writeJobSummary(metrics, logger)
+  logger.info("Run metrics", {
+    duration: metrics.duration,
+    cacheStatus: metrics.cacheStatus,
+    sessionCount: metrics.sessionsCreated.length,
+    // Never include raw content
+  })
+
+  // External aggregation only when explicitly enabled
+  if (config.externalAggregation) {
+    // Future: send to external metrics service
+    logger.debug("External aggregation enabled - would send to metrics service")
+  }
+}
+```
+
+#### 4. Action Input
+
+```yaml
+inputs:
+  telemetry:
+    description: "Telemetry level: 'off', 'local' (default), 'external'"
+    required: false
+    default: "local"
+```
+
+### Acceptance Criteria (F83)
+
+- [ ] Default telemetry config disables external aggregation
+- [ ] Raw content (code, comments, prompts) never logged to external systems
+- [ ] Metrics derived from run summaries and structured JSON logs only
+- [ ] User can opt-in to external aggregation via input
+- [ ] Telemetry level documented in README and action.yaml
+- [ ] Content redaction applied before any external emission
+
+### Test Cases
+
+```typescript
+describe("Telemetry Policy", () => {
+  it("defaults to local-only telemetry", () => {
+    // #given
+    const config = DEFAULT_TELEMETRY_CONFIG
+
+    // #then
+    expect(config.externalAggregation).toBe(false)
+    expect(config.contentLogging).toBe("none")
+  })
+
+  it("redacts content fields from telemetry output", () => {
+    // #given
+    const data = {
+      sessionId: "ses_123",
+      prompt: "sensitive user prompt",
+      body: "comment body content",
+      duration: 45,
+    }
+
+    // #when
+    const redacted = redactForTelemetry(data, DEFAULT_TELEMETRY_CONFIG)
+
+    // #then
+    expect(redacted.sessionId).toBe("ses_123")
+    expect(redacted.duration).toBe(45)
+    expect(redacted.prompt).toBeUndefined()
+    expect(redacted.body).toBeUndefined()
+  })
+
+  it("does not send to external service when disabled", async () => {
+    // #given
+    const config = {...DEFAULT_TELEMETRY_CONFIG, externalAggregation: false}
+    const sendSpy = vi.fn()
+
+    // #when
+    await emitMetrics(mockMetrics, config, logger)
+
+    // #then
+    expect(sendSpy).not.toHaveBeenCalled()
+  })
+})
+```
+
 ## Estimated Effort
 
-- **Development**: 8-10 hours
-- **Testing**: 2-3 hours
-- **Total**: 10-13 hours
+- **Development**: 8-10 hours (original) + 2-3 hours (F83)
+- **Testing**: 2-3 hours (original) + 1 hour (F83)
+- **Total**: 13-17 hours
