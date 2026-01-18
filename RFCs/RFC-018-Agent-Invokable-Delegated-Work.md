@@ -91,7 +91,7 @@ import {createClient} from "../lib/github/client.js"
 import {createLogger} from "../lib/logger.js"
 import {getGitHubRepository} from "../utils/env.js"
 import {createBranch} from "../lib/delegated/branch.js"
-import {createCommit, validateFileChange} from "../lib/delegated/commit.js"
+import {createCommit, validateFiles} from "../lib/delegated/commit.js"
 import {createPullRequest, updatePullRequest, findPRForBranch} from "../lib/delegated/pull-request.js"
 
 /**
@@ -240,11 +240,9 @@ export const FroBotAgentPlugin: Plugin = async ({project, directory}) => {
           }
 
           // Validate each file (security checks happen in library)
-          for (const file of args.files) {
-            const validation = validateFileChange(file)
-            if (!validation.valid) {
-              return {success: false, error: `File '${file.path}': ${validation.reason}`}
-            }
+          const validation = validateFiles(args.files)
+          if (!validation.valid) {
+            return {success: false, error: validation.errors.join('; ')}
           }
 
           try {
