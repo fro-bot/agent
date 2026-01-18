@@ -34,6 +34,14 @@ import {
   ensureOpenCodeAvailable,
   executeOpenCode,
 } from './lib/agent/index.js'
+import {
+  buildAttachmentResult,
+  cleanupTempFiles,
+  downloadAttachments,
+  parseAttachmentUrls,
+  validateAttachments,
+  type AttachmentResult,
+} from './lib/attachments/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
 import {createClient, getBotLogin, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
@@ -74,6 +82,7 @@ async function run(): Promise<number> {
   let agentSuccess = false
   let exitCode = 0
   let githubClient: Octokit | null = null
+  let attachmentResult: AttachmentResult | null = null
 
   // Create metrics collector for observability (RFC-007)
   const metrics = createMetricsCollector()
@@ -227,6 +236,26 @@ async function run(): Promise<number> {
       metrics.addSessionUsed(session.sessionId)
     }
 
+    // 6d. Process attachments from comment body (RFC-014)
+    const attachmentLogger = createLogger({phase: 'attachments'})
+
+    const commentBody = agentContext.commentBody ?? ''
+    const parsedUrls = parseAttachmentUrls(commentBody)
+
+    if (parsedUrls.length > 0) {
+      attachmentLogger.info('Processing attachments', {count: parsedUrls.length})
+      const downloaded = await downloadAttachments(parsedUrls, inputs.githubToken, undefined, attachmentLogger)
+      const {validated, skipped} = validateAttachments(downloaded, undefined, attachmentLogger)
+
+      if (validated.length > 0 || skipped.length > 0) {
+        attachmentResult = buildAttachmentResult(commentBody, parsedUrls, validated, skipped)
+        attachmentLogger.info('Attachments processed', {
+          processed: validated.length,
+          skipped: skipped.length,
+        })
+      }
+    }
+
     // 7. Build prompt options (prompt built inside executeOpenCode with sessionId)
     const promptOptions: PromptOptions = {
       context: agentContext,
@@ -237,6 +266,7 @@ async function run(): Promise<number> {
         priorWorkContext,
       },
       triggerContext: triggerResult.context,
+      fileParts: attachmentResult?.fileParts,
     }
 
     // 8. Execute OpenCode agent (skip in test mode)
@@ -389,6 +419,12 @@ async function run(): Promise<number> {
   } finally {
     // Always cleanup: update reactions, prune sessions, and save cache
     try {
+      // Cleanup temp files from attachment processing (RFC-014)
+      if (attachmentResult != null) {
+        const attachmentCleanupLogger = createLogger({phase: 'attachment-cleanup'})
+        await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
+      }
+
       // Complete acknowledgment (update reaction, remove label)
       if (reactionCtx != null && githubClient != null) {
         const cleanupLogger = createLogger({phase: 'cleanup'})

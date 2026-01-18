@@ -42,7 +42,6 @@ export type {
   EnsureOpenCodeResult,
   ExecutionConfig,
   PromptOptions,
-  PromptPart,
   ReactionContext,
 } from './types.js'
 

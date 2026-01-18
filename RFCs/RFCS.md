@@ -31,7 +31,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-011 | Setup Action & Environment Bootstrap | MUST     | High       | 1     | Completed  |
 | RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Superseded |
 | RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
-| RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Pending    |
+| RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Completed  |
 | RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Pending    |
 | RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Completed  |
 | RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Completed  |
@@ -220,9 +220,9 @@ RFC-001 (Foundation)
 | F36: SDK Cleanup                           | RFC-013          | Completed |
 | F37: Model and Agent Configuration         | RFC-013          | Completed |
 | F38: Mock Event Support                    | RFC-005          | Completed |
-| F39: File Attachment Detection             | RFC-014          | Pending   |
-| F40: File Attachment Download              | RFC-014          | Pending   |
-| F41: File Attachment Prompt Injection      | RFC-014          | Pending   |
+| F39: File Attachment Detection             | RFC-014          | Completed |
+| F40: File Attachment Download              | RFC-014          | Completed |
+| F41: File Attachment Prompt Injection      | RFC-014          | Completed |
 | F42: GraphQL Issue Context Hydration       | RFC-015          | Pending   |
 | F43: GraphQL PR Context Hydration          | RFC-015          | Pending   |
 | F44: Context Budgeting                     | RFC-015          | Pending   |

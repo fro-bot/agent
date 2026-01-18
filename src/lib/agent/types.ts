@@ -1,10 +1,11 @@
 /**
- * Agent-specific type definitions for RFC-012 and RFC-013.
+ * Agent-specific type definitions for RFC-012, RFC-013, and RFC-014.
  *
  * These types are used for agent context collection, prompt construction,
  * reactions/labels management, and OpenCode execution.
  */
 
+import type {FilePartInput} from '@opencode-ai/sdk'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {ModelConfig, TokenUsage} from '../types.js'
@@ -76,6 +77,7 @@ export interface PromptOptions {
   readonly sessionContext?: SessionContext
   readonly sessionId?: string
   readonly triggerContext?: TriggerContext
+  readonly fileParts?: readonly FilePartInput[]
 }
 
 /**
@@ -120,17 +122,6 @@ export interface ExecutionConfig {
   readonly agent: string
   readonly model: ModelConfig | null
   readonly timeoutMs: number
-}
-
-/**
- * Prompt part for SDK execution (RFC-013).
- * Supports text and file attachments.
- */
-export interface PromptPart {
-  readonly type: 'file' | 'text'
-  readonly content: string
-  readonly filename?: string
-  readonly mimeType?: string
 }
 
 export interface EnsureOpenCodeResult {
