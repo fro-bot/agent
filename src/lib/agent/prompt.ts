@@ -116,7 +116,32 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
   parts.push(`# Agent Context
 
 You are the Fro Bot Agent running in GitHub Actions.
+`)
 
+  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
+    parts.push(`
+${customPrompt.trim()}
+
+`)
+  }
+
+  // Task section
+  if (options.triggerContext != null) {
+    parts.push(buildTaskSection(options.triggerContext, customPrompt))
+  } else if (context.commentBody == null) {
+    parts.push(`## Task
+
+Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
+`)
+  } else {
+    parts.push(`## Task
+
+Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
+`)
+  }
+
+  // Environment context
+  parts.push(`
 ## Environment
 - **Repository:** ${context.repo}
 - **Branch/Ref:** ${context.ref}
@@ -229,27 +254,6 @@ Every comment you post MUST include a collapsed details block at the end:
 \`\`\`
 `)
 
-  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(`## Custom Instructions
-
-${customPrompt.trim()}
-`)
-  }
-
-  if (options.triggerContext != null) {
-    parts.push(buildTaskSection(options.triggerContext, customPrompt))
-  } else if (context.commentBody == null) {
-    parts.push(`## Task
-
-Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
-`)
-  } else {
-    parts.push(`## Task
-
-Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
-`)
-  }
-
   const prompt = parts.join('\n')
   logger.debug('Built agent prompt', {
     length: prompt.length,
@@ -294,9 +298,11 @@ function buildSessionContextSection(sessionContext: SessionContext): string {
 
     for (const result of sessionContext.priorWorkContext.slice(0, 3)) {
       lines.push(`**Session ${result.sessionId}:**`)
+      lines.push('```markdown')
       for (const match of result.matches.slice(0, 2)) {
         lines.push(`- ${match.excerpt}`)
       }
+      lines.push('```')
       lines.push('')
     }
 

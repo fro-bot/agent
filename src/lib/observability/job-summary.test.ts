@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/unbound-method */
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger} from '../logger.js'
 import {writeJobSummary} from './job-summary.js'
@@ -63,9 +63,17 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
 
 describe('writeJobSummary', () => {
   const logger = createLogger({phase: 'test'})
+  const originalStepSummary = process.env.GITHUB_STEP_SUMMARY
 
   beforeEach(() => {
     vi.clearAllMocks()
+    delete process.env.GITHUB_STEP_SUMMARY
+  })
+
+  afterAll(() => {
+    if (originalStepSummary != null) {
+      process.env.GITHUB_STEP_SUMMARY = originalStepSummary
+    }
   })
 
   it('writes summary with required fields', async () => {
