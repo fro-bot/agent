@@ -1,8 +1,8 @@
 # Features: Fro Bot Agent
 
 **Extracted from:** PRD.md
-**Date:** 2026-01-14
-**Version:** v1.2 MVP
+**Date:** 2026-01-17
+**Version:** v1.4 MVP
 
 ---
 
@@ -13,7 +13,7 @@
 - [Category A: GitHub Agent Interactions](#category-a-github-agent-interactions)
 - [Category B: Discord Agent](#category-b-discord-agent)
 - [Category C: Shared Memory & Persistence](#category-c-shared-memory--persistence)
-- [Category D: Setup Action & Environment Bootstrap](#category-d-setup-action--environment-bootstrap)
+- [Category D: Auto-Setup & Environment Bootstrap](#category-d-auto-setup--environment-bootstrap)
 - [Category E: SDK Execution](#category-e-sdk-execution)
 - [Category F: Context & Prompt](#category-f-context--prompt)
 - [Category G: Security & Access Control](#category-g-security--access-control)
@@ -21,6 +21,7 @@
 - [Category I: Error Handling & Reliability](#category-i-error-handling--reliability)
 - [Category J: Configuration & Deployment](#category-j-configuration--deployment)
 - [Category K: Additional Triggers & Directives](#category-k-additional-triggers--directives)
+- [Category L: Agent-Invokable Delegated Work Tools](#category-l-agent-invokable-delegated-work-tools)
 - [Dependency Graph](#dependency-graph)
 
 ---
@@ -30,6 +31,10 @@
 Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
 
 **Core Differentiator:** Durable memory across runs - OpenCode session/application state is restored at start and saved at end, enabling the agent to pick up work without repeating expensive investigation.
+
+**v1.4 Changes:** Major documentation restructure aligning with PRD v1.4. SDK method name corrections (`client.session.prompt()` not `promptAsync()`). Cache constraint documentation (10GB repo limit, 7-day eviction, 512-char key limit). Formalized telemetry policy (opt-in only, privacy-first). Source of truth hierarchy established (PRD > RFCs > FEATURES > RULES).
+
+**v1.3 Changes:** Agent-invokable delegated work tools via OpenCode plugin distribution (RFC-018). Exposes RFC-010 library functions (`create_branch`, `commit_files`, `create_pull_request`, `update_pull_request`) as MCP tools the agent can call during execution. Plugin bundled with action and installed to global OpenCode config.
 
 **v1.2 Changes:** Additional GitHub triggers (`issues`, `pull_request`, `pull_request_review_comment`, `schedule`), trigger-specific prompt directives, post-action cache hook for reliable state persistence, prompt input required for scheduled/manual triggers.
 
@@ -47,23 +52,24 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 
 | Priority             | Count | Categories                                     |
 | -------------------- | ----- | ---------------------------------------------- |
-| **Must Have (P0)**   | 52    | Core functionality for MVP                     |
+| **Must Have (P0)**   | 59    | Core functionality for MVP                     |
 | **Should Have (P1)** | 12    | Important but not critical for initial release |
 | **Could Have (P2)**  | 2     | Desirable, can be deferred                     |
 
-| Category                         | Feature Count |
-| -------------------------------- | ------------- |
-| GitHub Agent Interactions        | 11            |
-| Discord Agent                    | 5             |
-| Shared Memory & Persistence      | 8             |
-| Setup Action & Bootstrap         | 7             |
-| SDK Execution                    | 6             |
-| Context & Prompt                 | 8             |
-| Security & Access Control        | 5             |
-| Observability & Auditability     | 4             |
-| Error Handling & Reliability     | 4             |
-| Configuration & Deployment       | 4             |
-| Additional Triggers & Directives | 8             |
+| Category                             | Feature Count |
+| ------------------------------------ | ------------- |
+| GitHub Agent Interactions            | 11            |
+| Discord Agent                        | 5             |
+| Shared Memory & Persistence          | 8             |
+| Setup Action & Bootstrap             | 7             |
+| SDK Execution                        | 6             |
+| Context & Prompt                     | 8             |
+| Security & Access Control            | 5             |
+| Observability & Auditability         | 5             |
+| Error Handling & Reliability         | 4             |
+| Configuration & Deployment           | 4             |
+| Additional Triggers & Directives     | 8             |
+| Agent-Invokable Delegated Work Tools | 6             |
 
 ---
 
@@ -415,6 +421,12 @@ Restore OpenCode storage directory at start of GitHub Action run.
 - [ ] Restore completes in <30s for typical sizes (<500MB)
 - [ ] Cache key includes agent identity, repo, and branch
 
+**GitHub Actions Cache Constraints:**
+- 10GB total cache storage per repository
+- 7-day eviction for unused cache keys
+- 512-character maximum key length
+- Branch-scoped keys reduce poisoning risk
+
 **Cache Key Pattern:**
 ```
 opencode-storage-${agent_identity}-${repo}-${ref_name}-${runner_os}
@@ -691,7 +703,7 @@ Use `@opencode-ai/sdk` for agent execution, replacing CLI model.
 - [ ] Server started automatically, managed via AbortController
 - [ ] No manual port management required
 - [ ] Session created via `client.session.create({ body: { title } })`
-- [ ] Prompt sent via `client.session.promptAsync()` (non-blocking)
+- [ ] Prompt sent via `client.session.prompt()` (SDK method)
 - [ ] Track session ID throughout execution
 
 ---
@@ -1493,6 +1505,154 @@ Skip processing of draft PRs by default.
 
 ---
 
+## Category L: Agent-Invokable Delegated Work Tools
+
+### F77: Agent Tool: create_branch
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F6, F25
+
+**Description:**
+OpenCode custom tool that allows the agent to create feature branches via the GitHub API.
+
+**Acceptance Criteria:**
+- [ ] Tool registered via `@opencode-ai/plugin` in bundled plugin
+- [ ] Accepts `branchName` and `baseBranch` (default: main) arguments
+- [ ] Calls `createBranch()` from `src/lib/delegated/branch.ts`
+- [ ] Creates Octokit client from `GITHUB_TOKEN` environment variable
+- [ ] Gets owner/repo from `GITHUB_REPOSITORY` environment variable
+- [ ] Returns structured result with branch name, SHA, and created flag
+- [ ] Returns meaningful error if branch creation fails
+
+---
+
+### F78: Agent Tool: commit_files
+
+**Priority:** Must Have (P0)
+**Complexity:** High
+**Dependencies:** F77
+
+**Description:**
+OpenCode custom tool that allows the agent to create atomic multi-file commits via the GitHub Git Data API.
+
+**Acceptance Criteria:**
+- [ ] Tool registered via `@opencode-ai/plugin` in bundled plugin
+- [ ] Accepts `branch`, `message`, and `files` array arguments
+- [ ] Each file has `path` and `content` (optional `encoding`)
+- [ ] Calls `createCommit()` from `src/lib/delegated/commit.ts`
+- [ ] Inherits security validation from library (path traversal, .git/, secrets, 5MB limit)
+- [ ] Returns structured result with commit SHA, URL, and message
+- [ ] Returns meaningful error with validation failure details
+
+---
+
+### F79: Agent Tool: create_pull_request
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F77
+
+**Description:**
+OpenCode custom tool that allows the agent to open pull requests via the GitHub API.
+
+**Acceptance Criteria:**
+- [ ] Tool registered via `@opencode-ai/plugin` in bundled plugin
+- [ ] Accepts `title`, `body`, `head`, `base`, and optional `draft` arguments
+- [ ] Calls `createPullRequest()` from `src/lib/delegated/pull-request.ts`
+- [ ] Returns structured result with PR number, URL, title, and state
+- [ ] Returns meaningful error if PR creation fails (e.g., no commits, branch not found)
+
+---
+
+### F80: Agent Tool: update_pull_request
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F79
+
+**Description:**
+OpenCode custom tool that allows the agent to update existing pull request metadata.
+
+**Acceptance Criteria:**
+- [ ] Tool registered via `@opencode-ai/plugin` in bundled plugin
+- [ ] Accepts `prNumber` and optional `title`, `body` arguments
+- [ ] Calls `updatePullRequest()` from `src/lib/delegated/pull-request.ts`
+- [ ] Returns structured result with updated PR metadata
+- [ ] Returns meaningful error if PR not found or update fails
+
+---
+
+### F81: Delegated Work Plugin Distribution
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F25, F77-F80
+
+**Description:**
+Bundle delegated work tools as an OpenCode plugin and install to global config during setup.
+
+**Acceptance Criteria:**
+- [ ] Plugin source at `src/plugin/fro-bot-agent.ts`
+- [ ] Plugin bundled to `dist/plugin/fro-bot-agent.js` via tsdown
+- [ ] Plugin installed to `~/.config/opencode/plugin/` during setup phase
+- [ ] No workspace pollution (never install to `.opencode/plugin/`)
+- [ ] Plugin loads successfully at OpenCode startup
+- [ ] Plugin exports all four delegated work tools
+
+**Technical Considerations:**
+- Use `@opencode-ai/plugin` for type-safe tool definitions
+- Bundle delegated library functions into plugin (self-contained)
+- Plugin must work across process boundary (no shared state with action)
+
+---
+
+### F82: Delegated Work Tool Context Injection
+
+**Priority:** Must Have (P0)
+**Complexity:** Medium
+**Dependencies:** F81
+
+**Description:**
+Inject authentication and repository context into delegated work tools via environment variables.
+
+**Acceptance Criteria:**
+- [ ] Tools read `GITHUB_TOKEN` for Octokit authentication
+- [ ] Tools read `GITHUB_REPOSITORY` for owner/repo context
+- [ ] Tools validate owner/repo matches expected context (prevent repo spoofing)
+- [ ] Tools enforce authorization gating (OWNER/MEMBER/COLLABORATOR only)
+- [ ] Authorization context passed via environment variable or plugin context
+- [ ] Tools never expose tokens in responses or logs
+
+**Technical Considerations:**
+- Environment variables already set by GitHub Actions runtime
+- Plugin receives `{ project, directory, worktree }` context
+- Security validation must happen at tool invocation time, not just trigger gating
+
+---
+
+### F83: Telemetry Policy Enforcement
+
+**Priority:** Must Have (P0)
+**Complexity:** Low
+**Dependencies:** F53
+
+**Description:**
+Enforce privacy-first telemetry policy across all modalities.
+
+**Acceptance Criteria:**
+- [ ] All metrics derived from run summaries and structured JSON logs only
+- [ ] No external telemetry aggregation unless user explicitly opts in
+- [ ] No raw content (code, comments, prompts) logged to external systems
+- [ ] Metrics stored locally in run artifacts and GitHub Actions logs
+- [ ] User controls what data leaves the system (transparent)
+
+**Technical Considerations:**
+- Aligns with PRD v1.4 telemetry policy requirements
+- Must apply to both GitHub Action and Discord Bot modalities
+
+---
+
 ## Dependency Graph
 
 ```
@@ -1600,4 +1760,4 @@ Legend:
 
 ---
 
-*This document is auto-generated from PRD.md v1.2 and should be updated when the PRD changes.*
+_This document is auto-generated from PRD.md v1.4 and should be updated when the PRD changes._
