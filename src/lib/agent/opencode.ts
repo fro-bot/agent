@@ -1,10 +1,12 @@
 /**
- * OpenCode SDK execution for RFC-013.
+ * OpenCode SDK execution for RFC-013 and RFC-014.
  *
  * Handles launching OpenCode in server mode and communicating via SDK client.
  * Replaces CLI-based execution from RFC-012 with SDK-based execution.
+ * RFC-014 adds file attachment support via SDK file parts.
  */
 
+import type {FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
 import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
@@ -270,13 +272,21 @@ export async function executeOpenCode(
         eventStreamEnded = true
       })
 
+    const textPart: TextPartInput = {type: 'text', text: prompt}
+    const parts: (TextPartInput | FilePartInput)[] = [textPart]
+
+    if (promptOptions?.fileParts != null && promptOptions.fileParts.length > 0) {
+      parts.push(...promptOptions.fileParts)
+      logger.info('Including file attachments in prompt', {count: promptOptions.fileParts.length})
+    }
+
     const promptBody: {
       agent?: string
       model?: {modelID: string; providerID: string}
-      parts: {text: string; type: 'text'}[]
+      parts: (TextPartInput | FilePartInput)[]
     } = {
       agent: agentName,
-      parts: [{type: 'text', text: prompt}],
+      parts,
     }
 
     if (config?.model != null) {

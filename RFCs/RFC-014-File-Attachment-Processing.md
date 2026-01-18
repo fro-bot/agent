@@ -1,9 +1,31 @@
 # RFC-014: File Attachment Processing
 
-**Status:** Pending
+**Status:** Completed
 **Priority:** MUST
 **Complexity:** Medium
 **Phase:** 2
+
+## Completion Note (2026-01-18)
+
+Implementation completed with the following components:
+
+| Component            | File                                | Tests |
+| -------------------- | ----------------------------------- | ----- |
+| Types & limits       | `src/lib/attachments/types.ts`      | N/A   |
+| URL parsing          | `src/lib/attachments/parser.ts`     | 22    |
+| Secure download      | `src/lib/attachments/downloader.ts` | 7     |
+| MIME/size validation | `src/lib/attachments/validator.ts`  | 10    |
+| SDK file parts       | `src/lib/attachments/injector.ts`   | 5     |
+| Public API           | `src/lib/attachments/index.ts`      | N/A   |
+| Module docs          | `src/lib/attachments/AGENTS.md`     | N/A   |
+
+**Key implementation details:**
+
+- **Temp file approach**: Downloads to temp files, uses `file://` URLs for SDK (not base64)
+- **Security**: `redirect: "manual"` prevents token leakage; redirect targets validated
+- **Limits enforced**: 5MB/file, 15MB total, max 5 files, MIME allowlist
+- **Integration**: Step 6d in `main.ts`, cleanup in finally block
+- **44 tests passing** across all attachment modules
 
 ---
 
@@ -42,8 +64,17 @@ src/lib/
 
 ### 2. Attachment Types (`src/lib/attachments/types.ts`)
 
+> **SDK Schema Verification (2026-01-18):** Types aligned with `@opencode-ai/sdk` v1.1.x `FilePartInput` from SDK: `{ type: 'file', mime: string, url: string, filename?: string }` `TextPartInput` from SDK: `{ type: 'text', text: string }` The SDK expects `url` (file:// URL), NOT base64 `content`.
+>
+> **IMPORTANT:** DO NOT duplicate SDK types. Import from `@opencode-ai/sdk` directly.
+
 ```typescript
-import type {Logger} from "../types.js"
+import type {Logger} from "../logger.js"
+// Import SDK types directly - DO NOT duplicate
+import type {FilePartInput, TextPartInput} from "@opencode-ai/sdk"
+
+// Re-export SDK types for convenience
+export type {FilePartInput, TextPartInput}
 
 /**
  * Parsed attachment URL from comment body.
@@ -56,14 +87,14 @@ export interface AttachmentUrl {
 }
 
 /**
- * Downloaded attachment with metadata.
+ * Downloaded attachment with metadata and temp file path.
  */
 export interface DownloadedAttachment {
   readonly url: string
   readonly filename: string
-  readonly mimeType: string
+  readonly mime: string
   readonly sizeBytes: number
-  readonly content: Buffer
+  readonly tempPath: string // Local temp file path
 }
 
 /**
@@ -71,19 +102,9 @@ export interface DownloadedAttachment {
  */
 export interface ValidatedAttachment {
   readonly filename: string
-  readonly mimeType: string
+  readonly mime: string
   readonly sizeBytes: number
-  readonly base64Content: string
-}
-
-/**
- * SDK-compatible file part.
- */
-export interface FilePart {
-  readonly type: "file"
-  readonly filename: string
-  readonly mimeType: string
-  readonly content: string // base64
+  readonly tempPath: string // Local temp file path
 }
 
 /**
@@ -93,6 +114,8 @@ export interface AttachmentResult {
   readonly processed: readonly ValidatedAttachment[]
   readonly skipped: readonly SkippedAttachment[]
   readonly modifiedBody: string
+  readonly fileParts: readonly FilePartInput[] // Uses SDK type directly
+  readonly tempFiles: readonly string[] // Paths to clean up
 }
 
 export interface SkippedAttachment {
@@ -265,57 +288,131 @@ export function extractFilename(url: string, altText: string, index: number): st
 
 ### 4. Downloader (`src/lib/attachments/downloader.ts`)
 
+> **Security Note (2026-01-18):** Downloads use `redirect: "manual"` to prevent token leakage to non-GitHub hosts. Content-Length checked before buffering to prevent memory exhaustion.
+
 ```typescript
-import type {AttachmentUrl, DownloadedAttachment, Logger} from "./types.js"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
+import type {AttachmentUrl, DownloadedAttachment, AttachmentLimits} from "./types.js"
+import type {Logger} from "../logger.js"
 import {extractFilename} from "./parser.js"
+import {DEFAULT_ATTACHMENT_LIMITS} from "./types.js"
 
 /**
  * Download attachment with GitHub token authentication.
  *
- * Uses fetch with Authorization header for private repo attachments.
+ * Security measures:
+ * - Uses redirect: "manual" to prevent token leakage on redirects
+ * - Validates final URL is still github.com before following redirect
+ * - Checks Content-Length before buffering to prevent memory exhaustion
+ * - Saves to temp file for SDK file:// URL consumption
  */
 export async function downloadAttachment(
   attachment: AttachmentUrl,
   index: number,
   token: string,
+  limits: AttachmentLimits,
   logger: Logger,
 ): Promise<DownloadedAttachment | null> {
   logger.debug("Downloading attachment", {url: attachment.url})
 
   try {
+    // Initial request with redirect: manual for security
     const response = await fetch(attachment.url, {
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: "*/*",
         "User-Agent": "fro-bot-agent",
       },
-      redirect: "follow",
+      redirect: "manual",
     })
 
-    if (!response.ok) {
+    // Handle redirect manually - validate target is still github.com
+    let finalResponse = response
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location")
+      if (location == null) {
+        logger.warning("Redirect without location", {url: attachment.url})
+        return null
+      }
+
+      // Validate redirect target
+      const redirectUrl = new URL(location)
+      if (redirectUrl.hostname !== "github.com" && !redirectUrl.hostname.endsWith(".githubusercontent.com")) {
+        logger.warning("Redirect to non-GitHub host blocked", {
+          url: attachment.url,
+          redirectTo: redirectUrl.hostname,
+        })
+        return null
+      }
+
+      // Follow redirect WITHOUT auth header (token only for initial request)
+      finalResponse = await fetch(location, {
+        headers: {
+          Accept: "*/*",
+          "User-Agent": "fro-bot-agent",
+        },
+        redirect: "follow",
+      })
+    }
+
+    if (!finalResponse.ok) {
       logger.warning("Attachment download failed", {
         url: attachment.url,
-        status: response.status,
+        status: finalResponse.status,
       })
       return null
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer())
-    const contentType = response.headers.get("content-type") ?? "application/octet-stream"
+    // Check Content-Length before buffering
+    const contentLength = finalResponse.headers.get("content-length")
+    if (contentLength != null) {
+      const size = parseInt(contentLength, 10)
+      if (size > limits.maxFileSizeBytes) {
+        logger.warning("Attachment exceeds size limit (Content-Length)", {
+          url: attachment.url,
+          size,
+          limit: limits.maxFileSizeBytes,
+        })
+        return null
+      }
+    }
+
+    const buffer = Buffer.from(await finalResponse.arrayBuffer())
+
+    // Double-check size after download (Content-Length may be missing/wrong)
+    if (buffer.length > limits.maxFileSizeBytes) {
+      logger.warning("Attachment exceeds size limit", {
+        url: attachment.url,
+        size: buffer.length,
+        limit: limits.maxFileSizeBytes,
+      })
+      return null
+    }
+
+    const contentType = finalResponse.headers.get("content-type") ?? "application/octet-stream"
     const filename = extractFilename(attachment.url, attachment.altText, index)
+    const mime = contentType.split(";")[0].trim()
+
+    // Write to temp file for SDK consumption
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "fro-bot-attachments-"))
+    const tempPath = path.join(tempDir, filename)
+    await fs.writeFile(tempPath, buffer)
 
     logger.debug("Attachment downloaded", {
       filename,
-      mimeType: contentType,
+      mime,
       sizeBytes: buffer.length,
+      tempPath,
     })
 
     return {
       url: attachment.url,
       filename,
-      mimeType: contentType.split(";")[0].trim(),
+      mime,
       sizeBytes: buffer.length,
-      content: buffer,
+      tempPath,
     }
   } catch (error) {
     logger.warning("Attachment download error", {
@@ -332,16 +429,40 @@ export async function downloadAttachment(
 export async function downloadAttachments(
   attachments: readonly AttachmentUrl[],
   token: string,
+  limits: AttachmentLimits = DEFAULT_ATTACHMENT_LIMITS,
   logger: Logger,
 ): Promise<readonly (DownloadedAttachment | null)[]> {
-  return Promise.all(attachments.map((attachment, index) => downloadAttachment(attachment, index, token, logger)))
+  return Promise.all(
+    attachments.map((attachment, index) => downloadAttachment(attachment, index, token, limits, logger)),
+  )
+}
+
+/**
+ * Clean up temp files after processing.
+ * Call in finally block to ensure cleanup even on errors.
+ */
+export async function cleanupTempFiles(tempPaths: readonly string[], logger: Logger): Promise<void> {
+  for (const tempPath of tempPaths) {
+    try {
+      await fs.unlink(tempPath)
+      // Also try to remove the temp directory
+      const tempDir = path.dirname(tempPath)
+      await fs.rmdir(tempDir).catch(() => {}) // Ignore if not empty
+    } catch (error) {
+      logger.debug("Failed to cleanup temp file", {
+        path: tempPath,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
 }
 ```
 
 ### 5. Validator (`src/lib/attachments/validator.ts`)
 
 ```typescript
-import type {DownloadedAttachment, ValidatedAttachment, SkippedAttachment, AttachmentLimits, Logger} from "./types.js"
+import type {DownloadedAttachment, ValidatedAttachment, SkippedAttachment, AttachmentLimits} from "./types.js"
+import type {Logger} from "../logger.js"
 import {DEFAULT_ATTACHMENT_LIMITS} from "./types.js"
 
 interface ValidationResult {
@@ -377,7 +498,7 @@ export function validateAttachments(
       continue
     }
 
-    // Check individual file size
+    // Check individual file size (already checked in downloader, but double-check)
     if (attachment.sizeBytes > limits.maxFileSizeBytes) {
       skipped.push({
         url: attachment.url,
@@ -401,14 +522,14 @@ export function validateAttachments(
     }
 
     // Check MIME type
-    if (!isMimeTypeAllowed(attachment.mimeType, limits.allowedMimeTypes)) {
+    if (!isMimeTypeAllowed(attachment.mime, limits.allowedMimeTypes)) {
       skipped.push({
         url: attachment.url,
-        reason: `MIME type not allowed: ${attachment.mimeType}`,
+        reason: `MIME type not allowed: ${attachment.mime}`,
       })
       logger.debug("Attachment skipped: MIME type", {
         url: attachment.url,
-        mimeType: attachment.mimeType,
+        mime: attachment.mime,
       })
       continue
     }
@@ -417,14 +538,14 @@ export function validateAttachments(
     totalSize += attachment.sizeBytes
     validated.push({
       filename: attachment.filename,
-      mimeType: attachment.mimeType,
+      mime: attachment.mime,
       sizeBytes: attachment.sizeBytes,
-      base64Content: attachment.content.toString("base64"),
+      tempPath: attachment.tempPath,
     })
 
     logger.info("Attachment validated", {
       filename: attachment.filename,
-      mimeType: attachment.mimeType,
+      mime: attachment.mime,
       sizeBytes: attachment.sizeBytes,
     })
   }
@@ -437,11 +558,11 @@ export function validateAttachments(
  *
  * Supports wildcards (e.g., "image/*").
  */
-function isMimeTypeAllowed(mimeType: string, allowedTypes: readonly string[]): boolean {
-  const [category, subtype] = mimeType.split("/")
+function isMimeTypeAllowed(mime: string, allowedTypes: readonly string[]): boolean {
+  const [category] = mime.split("/")
 
   for (const allowed of allowedTypes) {
-    if (allowed === mimeType) {
+    if (allowed === mime) {
       return true
     }
 
@@ -469,25 +590,24 @@ function formatBytes(bytes: number): string {
 
 ### 6. Prompt Injector (`src/lib/attachments/injector.ts`)
 
+> **Note:** Uses `FilePartInput` from `@opencode-ai/sdk` - do NOT duplicate the type.
+
 ```typescript
-import type {
-  AttachmentUrl,
-  ValidatedAttachment,
-  FilePart,
-  AttachmentResult,
-  SkippedAttachment,
-  Logger,
-} from "./types.js"
+import {pathToFileURL} from "node:url"
+import type {FilePartInput} from "@opencode-ai/sdk"
+import type {AttachmentUrl, ValidatedAttachment, AttachmentResult, SkippedAttachment} from "./types.js"
 
 /**
  * Transform validated attachments to SDK file parts.
+ *
+ * Uses file:// URLs pointing to temp files as required by SDK.
  */
-export function toFileParts(attachments: readonly ValidatedAttachment[]): readonly FilePart[] {
+export function toFileParts(attachments: readonly ValidatedAttachment[]): readonly FilePartInput[] {
   return attachments.map(attachment => ({
     type: "file" as const,
+    mime: attachment.mime,
+    url: pathToFileURL(attachment.tempPath).toString(),
     filename: attachment.filename,
-    mimeType: attachment.mimeType,
-    content: attachment.base64Content,
   }))
 }
 
@@ -531,11 +651,15 @@ export function buildAttachmentResult(
   skipped: readonly SkippedAttachment[],
 ): AttachmentResult {
   const modifiedBody = modifyBodyForAttachments(originalBody, parsedUrls, validated)
+  const fileParts = toFileParts(validated)
+  const tempFiles = validated.map(v => v.tempPath)
 
   return {
     processed: validated,
     skipped,
     modifiedBody,
+    fileParts,
+    tempFiles,
   }
 }
 ```
@@ -544,18 +668,19 @@ export function buildAttachmentResult(
 
 ```typescript
 export {parseAttachmentUrls, isValidAttachmentUrl, extractFilename} from "./parser.js"
-export {downloadAttachment, downloadAttachments} from "./downloader.js"
+export {downloadAttachment, downloadAttachments, cleanupTempFiles} from "./downloader.js"
 export {validateAttachments} from "./validator.js"
 export {toFileParts, modifyBodyForAttachments, buildAttachmentResult} from "./injector.js"
 export type {
   AttachmentUrl,
   DownloadedAttachment,
   ValidatedAttachment,
-  FilePart,
   AttachmentResult,
   SkippedAttachment,
   AttachmentLimits,
 } from "./types.js"
+// Re-export SDK types for convenience
+export type {FilePartInput, TextPartInput} from "./types.js"
 export {DEFAULT_ATTACHMENT_LIMITS} from "./types.js"
 ```
 
@@ -564,12 +689,14 @@ export {DEFAULT_ATTACHMENT_LIMITS} from "./types.js"
 Add to `src/main.ts` after context collection:
 
 ```typescript
+import type {FilePartInput} from "@opencode-ai/sdk"
 import {
   parseAttachmentUrls,
   downloadAttachments,
   validateAttachments,
   buildAttachmentResult,
-  toFileParts,
+  cleanupTempFiles,
+  type AttachmentResult,
 } from "./lib/attachments/index.js"
 
 // ... in run() function, after collecting agent context ...
@@ -579,18 +706,15 @@ const attachmentLogger = createLogger({phase: "attachments"})
 const parsedUrls = parseAttachmentUrls(agentContext.commentBody ?? "")
 
 let attachmentResult: AttachmentResult | null = null
-let fileParts: FilePart[] = []
 
 if (parsedUrls.length > 0) {
   attachmentLogger.info("Processing attachments", {count: parsedUrls.length})
 
   const token = inputs.githubToken
-  const downloaded = await downloadAttachments(parsedUrls, token, attachmentLogger)
+  const downloaded = await downloadAttachments(parsedUrls, token, undefined, attachmentLogger)
   const {validated, skipped} = validateAttachments(downloaded, undefined, attachmentLogger)
 
   attachmentResult = buildAttachmentResult(agentContext.commentBody ?? "", parsedUrls, validated, skipped)
-
-  fileParts = toFileParts(validated)
 
   attachmentLogger.info("Attachments processed", {
     processed: validated.length,
@@ -598,31 +722,53 @@ if (parsedUrls.length > 0) {
   })
 }
 
-// Use attachmentResult.modifiedBody in prompt if attachments were processed
-const promptBody = attachmentResult?.modifiedBody ?? agentContext.commentBody ?? ""
+// Pass attachmentResult to executeOpenCode for SDK file parts
+// Cleanup temp files in finally block:
+try {
+  // ... execute agent ...
+} finally {
+  if (attachmentResult != null) {
+    await cleanupTempFiles(attachmentResult.tempFiles, attachmentLogger)
+  }
+}
 ```
 
 ### 9. SDK Prompt with File Parts
 
-Update `executeOpenCode()` to accept file parts:
+Update `executeOpenCode()` to accept file parts. Import SDK types directly:
 
 ```typescript
-// In opencode.ts, update prompt call to include file parts
-const promptResponse = await client.session.prompt<true>({
-  path: {id: session.id},
-  body: {
-    ...(model != null && {
-      model: {
-        providerID: model.providerID,
-        modelID: model.modelID,
-      },
-    }),
-    agent: agent ?? undefined,
-    parts: [
-      {type: "text", text: prompt},
-      ...fileParts, // File parts added here
-    ],
-  },
+import type {FilePartInput, TextPartInput} from "@opencode-ai/sdk"
+
+// In PromptOptions, add fileParts field:
+export interface PromptOptions {
+  // ... existing fields ...
+  readonly fileParts?: readonly FilePartInput[]
+}
+
+// In opencode.ts, update prompt call to include file parts:
+const textPart: TextPartInput = {type: "text", text: prompt}
+const parts: Array<TextPartInput | FilePartInput> = [textPart]
+
+// Add file parts if present
+if (promptOptions.fileParts != null && promptOptions.fileParts.length > 0) {
+  parts.push(...promptOptions.fileParts)
+}
+
+const promptBody = {
+  agent: agentName,
+  parts,
+  ...(config?.model != null && {
+    model: {
+      providerID: config.model.providerID,
+      modelID: config.model.modelID,
+    },
+  }),
+}
+
+await client.session.prompt({
+  path: {id: sessionId},
+  body: promptBody,
 })
 ```
 

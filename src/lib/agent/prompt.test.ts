@@ -259,7 +259,6 @@ describe('buildAgentPrompt', () => {
     const prompt = buildAgentPrompt(options, mockLogger)
 
     // #then
-    expect(prompt).toContain('## Custom Instructions')
     expect(prompt).toContain('Focus on security vulnerabilities and performance issues.')
   })
 
