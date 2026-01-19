@@ -1,9 +1,9 @@
-# Delegated Work Module
+# DELEGATED WORK MODULE
 
 **RFC:** RFC-010
-**Purpose:** Push commits and open PRs programmatically via GitHub API
+**Purpose:** Push commits and open PRs programmatically via GitHub API.
 
-## Files
+## WHERE TO LOOK
 
 | File              | Purpose                                       |
 | ----------------- | --------------------------------------------- |
@@ -11,89 +11,51 @@
 | `branch.ts`       | Branch creation, existence checks, deletion   |
 | `commit.ts`       | Atomic multi-file commits via Git Data API    |
 | `pull-request.ts` | PR creation, updates, labels, reviewers       |
-| `index.ts`        | Public exports                                |
 
-## Usage
+## KEY EXPORTS
 
 ```typescript
-import {createBranch, createCommit, createPullRequest} from "../delegated/index.js"
+// Branch operations
+createBranch(octokit, options, logger) // Create branch from base (idempotent)
+branchExists(octokit, options, logger) // Check if branch exists
+deleteBranch(octokit, options, logger) // Delete a branch
+generateBranchName(prefix, description) // Generate unique branch name
 
-// Create branch
-const branch = await createBranch(
-  octokit,
-  {
-    owner: "owner",
-    repo: "repo",
-    branchName: "feature/my-feature",
-    baseBranch: "main",
-  },
-  logger,
-)
+// Commit operations
+createCommit(octokit, options, logger) // Atomic multi-file commit via Git Data API
+getFileContent(octokit, options, logger) // Get file content at ref
+validateFilePath(path) // Security validation
+validateFiles(files) // Validate all files before commit
 
-// Create atomic commit
-const commit = await createCommit(
-  octokit,
-  {
-    owner: "owner",
-    repo: "repo",
-    branch: branch.name,
-    message: "feat: add new feature",
-    files: [{path: "src/feature.ts", content: "export const feature = 1"}],
-  },
-  logger,
-)
-
-// Create PR
-const pr = await createPullRequest(
-  octokit,
-  {
-    owner: "owner",
-    repo: "repo",
-    title: "feat: add new feature",
-    body: "Description of changes",
-    head: branch.name,
-    base: "main",
-  },
-  logger,
-)
+// PR operations
+createPullRequest(octokit, options, logger) // Create new PR
+findPRForBranch(octokit, options, logger) // Find existing open PR
+updatePullRequest(octokit, options, logger) // Update PR title/body
+addPRLabels(octokit, options, logger) // Add labels to PR
+requestReviewers(octokit, options, logger) // Request reviewers
 ```
 
-## Security
+## SECURITY
 
-- **Path validation**: Rejects `../`, `.git/`, and secret files (`.env`, `*.key`)
+- **Path validation**: Rejects `../`, `.git/`, and secret files (`.env`, `*.key`, `*.pem`)
 - **File size cap**: 5MB per file
 - **No force push**: `updateRef` always uses `force: false`
 - **Default author**: Uses `fro-bot[bot]` identity
+- **Forbidden files**: `.env`, `.env.*`, `credentials.json`, `auth.json`
+- **Forbidden extensions**: `.key`, `.pem`, `.p12`, `.pfx`
 
-## API Reference
+## PATTERNS
 
-### Branch Operations
+- **Atomic Commits**: Uses Git Data API (create blobs → create tree → create commit → update ref)
+- **Idempotent Branches**: `createBranch` handles "already exists" gracefully
+- **Conventional Commits**: `formatCommitMessage` generates `type(scope): description` format
+- **PR Body Generation**: `generatePRBody` includes context section and checklist
 
-| Function             | Purpose                              |
-| -------------------- | ------------------------------------ |
-| `createBranch`       | Create branch from base (idempotent) |
-| `branchExists`       | Check if branch exists               |
-| `deleteBranch`       | Delete a branch                      |
-| `generateBranchName` | Generate unique branch name          |
+## ANTI-PATTERNS
 
-### Commit Operations
-
-| Function              | Purpose                                   |
-| --------------------- | ----------------------------------------- |
-| `createCommit`        | Atomic multi-file commit via Git Data API |
-| `getFileContent`      | Get file content at ref                   |
-| `formatCommitMessage` | Format conventional commit message        |
-| `validateFilePath`    | Validate path for security                |
-| `validateFileSize`    | Validate content size                     |
-| `validateFiles`       | Validate all files before commit          |
-
-### PR Operations
-
-| Function            | Purpose                          |
-| ------------------- | -------------------------------- |
-| `createPullRequest` | Create new PR                    |
-| `findPRForBranch`   | Find existing open PR for branch |
-| `updatePullRequest` | Update PR title/body             |
-| `addPRLabels`       | Add labels to PR                 |
-| `requestReviewers`  | Request reviewers                |
-| `generatePRBody`    | Generate PR body with context    |
+| Forbidden           | Reason                                 |
+| ------------------- | -------------------------------------- |
+| Force push          | Always `force: false` on ref updates   |
+| Direct file writes  | Use Git Data API for atomic operations |
+| Skipping validation | Always validate paths before commit    |
+| Large commits       | Break into smaller, focused commits    |

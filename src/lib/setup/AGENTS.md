@@ -1,50 +1,60 @@
-# SETUP MODULE
+# SETUP KNOWLEDGE BASE
 
-**Scope:** Environment bootstrap — Bun, OpenCode CLI, oMo plugin installation. Authentication (Git identity, gh CLI) and tool cache management.
+**Generated:** 2026-01-18
+**Location:** `src/lib/setup/`
 
-## WHERE TO LOOK
+## OVERVIEW
 
-| Component   | File           | Responsibility                         |
-| ----------- | -------------- | -------------------------------------- |
-| **Main**    | `setup.ts`     | Orchestration entry point (`runSetup`) |
-| **CLI**     | `opencode.ts`  | OpenCode CLI resolution & installation |
-| **Runtime** | `bun.ts`       | Bun runtime setup (required for oMo)   |
-| **Plugin**  | `omo.ts`       | oh-my-opencode install (graceful fail) |
-| **Auth**    | `gh-auth.ts`   | `gh` CLI auth & Git user identity      |
-| **Creds**   | `auth-json.ts` | Temporary `auth.json` generation       |
-| **API**     | `index.ts`     | Public exports & type definitions      |
+Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installation. Manages authentication state (Git identity, gh CLI) and tool cache persistence.
 
-## KEY EXPORTS
+## STRUCTURE
 
-```typescript
-runSetup(options) // Main orchestration
-installOpenCode(version) // CLI install + cache
-installBun(version) // Runtime setup
-installOmo() // Plugin setup (graceful)
-configureGhAuth(token) // CLI authentication
-populateAuthJson(conf) // Secure creds write
 ```
+./
+├── setup.ts       # Orchestration entry point (runSetup)
+├── opencode.ts    # OpenCode CLI resolution & installation
+├── bun.ts         # Bun runtime setup (required for oMo)
+├── omo.ts         # oh-my-opencode install (graceful fail)
+├── gh-auth.ts     # gh CLI auth & Git user identity
+├── auth-json.ts   # Temporary auth.json generation
+└── index.ts       # Public exports & type definitions
+```
+
+## CODE MAP
+
+| Symbol             | Type     | Location          | Role                         |
+| ------------------ | -------- | ----------------- | ---------------------------- |
+| `runSetup`         | Function | `setup.ts:65`     | Main orchestration           |
+| `installOpenCode`  | Function | `opencode.ts:85`  | CLI install + cache          |
+| `installBun`       | Function | `bun.ts:75`       | Runtime setup                |
+| `installOmo`       | Function | `omo.ts:28`       | Plugin setup (graceful fail) |
+| `configureGhAuth`  | Function | `gh-auth.ts:7`    | CLI authentication           |
+| `populateAuthJson` | Function | `auth-json.ts:41` | Secure credentials write     |
 
 ## PATTERNS
 
-- **Tool Cache**: `tc.downloadTool` → `tc.extract` → `tc.cacheDir`
-- **Platform Map**: `getPlatformInfo()` maps OS/Arch to release assets
-- **Graceful Fail**: Optional components (oMo) warn on error, don't crash
-- **Dynamic Version**: Resolves `latest` via GitHub Releases API
-- **Verification**: Validates binaries (`--version`) before caching
+- **Tool Cache**: `tc.downloadTool` → `tc.extract` → `tc.cacheDir`.
+- **Platform Map**: `getPlatformInfo()` maps OS/Arch to release assets.
+- **Graceful Fail**: Optional components (oMo, Bun) warn on error, don't crash.
+- **Dynamic Version**: Resolves 'latest' via GitHub Releases API.
+- **Verification**: Validates binaries (`--version`) BEFORE caching.
 
 ## SECURITY
 
-- **Permissions**: `auth.json` written with `0o600` (owner-only)
-- **Ephemeral**: Credentials never cached; fresh from secrets each run
-- **Identity**: Git user forced to `${bot}[bot]` for audit trails
-- **Isolation**: Binaries cached by version/arch to prevent pollution
+- **Permissions**: `auth.json` written with `0o600` (owner-only).
+- **Ephemeral**: Credentials never cached; fresh from secrets each run.
+- **Identity**: Git user forced to `${bot}[bot]` for audit trails.
+- **Isolation**: Binaries cached by version/arch to prevent pollution.
 
 ## ANTI-PATTERNS
 
-| Forbidden          | Reason                                       |
-| ------------------ | -------------------------------------------- |
-| Hardcoded versions | Always use input or dynamic resolution       |
-| Fatal optionality  | Don't crash on non-critical install failures |
-| Global install     | Pollutes system paths; use tool cache        |
-| Log leaks          | Never print `auth.json` content or tokens    |
+- **Hardcoded versions**: Always use input or dynamic resolution.
+- **Fatal optionality**: Don't crash on non-critical failures.
+- **Global install**: Pollutes system paths; use tool-cache.
+- **Log leaks**: Never print `auth.json` or tokens.
+
+## COMMANDS
+
+```bash
+pnpm test src/lib/setup/   # Run setup-specific tests
+```

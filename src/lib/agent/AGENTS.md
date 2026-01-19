@@ -1,44 +1,40 @@
 # AGENT MODULE
 
-**Scope:** OpenCode SDK execution harness with GitHub context injection and UX feedback loops.
+OpenCode SDK execution with GitHub context injection and UX feedback loops.
 
 ## WHERE TO LOOK
 
-| Component     | File           | Responsibility                                   |
-| ------------- | -------------- | ------------------------------------------------ |
-| **Execution** | `opencode.ts`  | SDK server spawn, session events, prompt sending |
-| **Context**   | `context.ts`   | Gathers event data, defaults, issue details      |
-| **UX**        | `reactions.ts` | Emojis (👀/🎉/😕), `agent: working` label        |
-| **Prompting** | `prompt.ts`    | Builds final prompt with session/cache context   |
-| **Types**     | `types.ts`     | `AgentContext`, `AgentResult`, `ExecutionConfig` |
+| Component     | File              | Responsibility                                                      |
+| ------------- | ----------------- | ------------------------------------------------------------------- |
+| **Execution** | `opencode.ts`     | SDK server spawn, session events, prompt sending, streaming (469 L) |
+| **Context**   | `context.ts`      | Gathers event data, defaults, issue details                         |
+| **UX**        | `reactions.ts`    | Emojis (👀/🎉/😕), `agent: working` label state machine             |
+| **Prompting** | `prompt.ts`       | Builds multi-section prompt with session/cache context (344 L)      |
+| **Budgeting** | `diff-context.ts` | Context limits (50 files in context, 20 in prompt)                  |
+| **Types**     | `types.ts`        | `AgentContext`, `AgentResult`, `ExecutionConfig`                    |
 
 ## KEY EXPORTS
 
-```typescript
-executeOpenCode(prompt, config, logger) // Main SDK execution
-ensureOpenCodeAvailable(options) // Auto-setup if missing
-collectAgentContext(logger) // GitHub event context
-buildAgentPrompt(options, logger) // Multi-section prompt
-acknowledgeReceipt(client, ctx, logger) // Eyes + working label
-completeAcknowledgment(client, ctx, success, logger) // Finalize UX
-```
+- `executeOpenCode(prompt, config, logger)`: Main SDK execution entry point
+- `ensureOpenCodeAvailable(options)`: Automated binary installation if missing
+- `collectAgentContext(logger)`: Hydrates event metadata from GitHub environment
+- `buildAgentPrompt(options, logger)`: Compiles instruction sections and context
+- `acknowledgeReceipt(client, ctx, logger)`: Posts 👀 reaction and "working" label
+- `completeAcknowledgment(client, ctx, success, logger)`: Finalizes UX state on completion
 
 ## PATTERNS
 
 - **SDK Lifecycle (RFC-013)**: Spawn server → connect client → create session → send prompt → stream events → close
-- **Connection Retry**: 30 retries (1s delay) for server startup
-- **Event Streaming**: SSE subscription for real-time logging
-- **Reaction-based UX**:
-  - Start: 👀 (Eyes) + `agent: working` label (`fcf2e1`)
-  - Success: Replace 👀 with 🎉 (Hooray) + remove label
-  - Failure: Replace 👀 with 😕 (Confused) + remove label
-  - Non-fatal: UX failures logged but never crash execution
+- **Connection Retry**: 30 retries with 1s delay to account for async server startup
+- **Event Streaming**: SSE subscription provides real-time progress logging to CI console
+- **Reaction-based UX**: Non-fatal state machine (Eyes → Hooray/Confused); failures never crash execution
+- **Context Budgeting**: Two-tier enforcement (50 files fetched, 20 files injected into prompt)
 
 ## ANTI-PATTERNS
 
-| Forbidden        | Reason                                                          |
-| ---------------- | --------------------------------------------------------------- |
-| Blocking on UX   | Reactions are "nice to have"; API failures shouldn't stop agent |
-| Buffered output  | Running without `stdbuf` on Linux hides logs until exit         |
-| Implicit context | Don't use `process.env` directly; use `AgentContext`            |
-| Silent failures  | Always return `success: false` + `error` string in Result       |
+| Forbidden        | Reason                                                        |
+| ---------------- | ------------------------------------------------------------- |
+| Blocking on UX   | Reactions are secondary; API failures must not halt execution |
+| Buffered output  | Linux environments require `stdbuf` to avoid log delay        |
+| Implicit context | Always use `AgentContext` instead of direct `process.env`     |
+| Silent failures  | Never swallow errors; return `success: false` + error string  |

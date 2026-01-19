@@ -10,16 +10,15 @@
 | **Metrics**     | `metrics.ts`     | `createMetricsCollector()` factory                   |
 | **Run Summary** | `run-summary.ts` | Comment summary generation and manipulation          |
 | **Job Summary** | `job-summary.ts` | GitHub Actions UI job summary                        |
-| **Exports**     | `index.ts`       | Public API surface                                   |
 
 ## KEY EXPORTS
 
 ```typescript
 createMetricsCollector() // Factory for metrics collection
 generateCommentSummary(options) // Generate markdown summary
-appendSummaryToComment(body, options) // Append summary to comment
+appendSummaryToComment(body, opts) // Append summary to comment
 extractSummaryFromComment(body) // Extract existing summary
-replaceSummaryInComment(body, options) // Idempotent replacement
+replaceSummaryInComment(body, opts) // Idempotent replacement
 writeJobSummary(options, logger) // Write GitHub Actions job summary
 formatCacheStatus(status) // Format cache status with emoji
 formatDuration(ms) // Human-readable duration

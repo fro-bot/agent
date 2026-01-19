@@ -1,6 +1,6 @@
-# SESSION MODULE
+# SESSION PERSISTENCE
 
-**Scope:** OpenCode session persistence layer — storage, search, pruning, and run summary writeback.
+OpenCode session persistence layer — storage, search, pruning, and run summary writeback.
 
 ## WHERE TO LOOK
 
@@ -11,19 +11,16 @@
 | **Pruning**   | `prune.ts`     | Retention policy, cascade deletion                  |
 | **Writeback** | `writeback.ts` | Synthetic run summary messages                      |
 | **Types**     | `types.ts`     | SessionInfo, Message, Part, TodoItem                |
-| **Exports**   | `index.ts`     | Public API surface                                  |
 
 ## KEY EXPORTS
 
-```typescript
-listSessions(directory, options, logger) // Get recent sessions by updatedAt
-searchSessions(directory, query, options) // Full-text search with excerpts
-pruneSessions(directory, config, logger) // Retention policy enforcement
-writeSessionSummary(options, logger) // Create synthetic run summary
-getSession(sessionId, logger) // Single session metadata
-getSessionMessages(sessionId, logger) // Chronological message list
-deleteSession(sessionId, logger) // Cascade delete with size tracking
-```
+- `listSessions(directory, options, logger)` — Recent sessions by `updatedAt`, child sessions filtered.
+- `searchSessions(directory, query, options)` — Cross-session full-text search with context excerpts.
+- `pruneSessions(directory, config, logger)` — Dual-condition retention (Age OR Count) with child cascade.
+- `writeSessionSummary(options, logger)` — Synthetic `role: 'user'` message injection for agent discovery.
+- `getSession(sessionId, logger)` — Retrieve single session metadata.
+- `getSessionMessages(sessionId, logger)` — Chronological message list sorted by `time.created`.
+- `deleteSession(sessionId, logger)` — Cascade delete parts, messages, and todos; returns bytes freed.
 
 ## STORAGE STRUCTURE
 
@@ -32,33 +29,26 @@ $XDG_DATA_HOME/opencode/storage/
 ├── project/{projectID}.json           # Git worktree → project mapping
 ├── session/{projectID}/{sessionID}.json  # Session metadata (timestamps, title)
 ├── message/{sessionID}/{messageID}.json  # Message headers (role, agent, model)
-├── part/{messageID}/{partID}.json       # Content (text, tool, reasoning)
-└── todo/{sessionID}.json                # Session todo items
+├── part/{messageID}/{partID}.json       # Content (text, tool outputs, reasoning)
+└── todo/{sessionID}.json                # Session-level todo items
 ```
 
 ## PATTERNS
 
-- **XDG Storage**: `$XDG_DATA_HOME/opencode/storage/` (typically `~/.local/share`)
-- **Null-Safe I/O**: `readJson()` returns `null` on any error (files lazy-created)
-- **Chronological Sort**: Messages sorted by `time.created`
-- **Dual-Condition Pruning**: Keep if (created >= cutoffDate) OR (within maxSessions)
-- **Child Session Tracking**: Sessions with `parentID` filtered, cascade-deleted
-- **ID Format**: `{prefix}_{hex-timestamp}{base62-random}` (e.g., `ses_`, `msg_`, `prt_`)
-
-## WRITEBACK PATTERN
-
-Synthetic "run summary" messages enable agents to discover prior work:
-
-- Created as `role: 'user'` with `agent: 'fro-bot'`, `modelID: 'run-summary'`
-- Contains: repo, ref, runId, cacheStatus, PRs created, commits, duration
-- Stored in message history for `session_search` discoverability
+- **XDG Storage**: Primary path `~/.local/share/opencode/storage/` via `getOpenCodeStoragePath()`.
+- **Null-Safe I/O**: `readJson()` returns `null` on error; files lazy-created (absence is normal).
+- **Chronological Sort**: Messages sorted by `time.created` (unsorted on disk).
+- **Dual-Condition Pruning**: Keep if `(age < cutoff OR index < maxSessions)`; prevents cache bloat.
+- **Child Tracking**: Sessions with `parentID` represent branches; filtered from lists, cascade-deleted.
+- **Synthetic Discovery**: `writeback.ts` injects `agent: 'fro-bot'`, `modelID: 'run-summary'` metadata.
+- **ID Packing**: `hex-timestamp` + `base62-random` (e.g., `ses_`, `msg_`, `prt_`).
 
 ## ANTI-PATTERNS
 
-| Forbidden                     | Reason                                           |
-| ----------------------------- | ------------------------------------------------ |
-| Throwing on file-not-found    | OpenCode creates files lazily; absence is normal |
-| Hardcoding `~/.local/share`   | Use `getOpenCodeStoragePath()` for XDG support   |
-| Unsorted message access       | Messages unordered on disk; always sort by time  |
-| Ignoring child sessions       | Must cascade-delete when parent is pruned        |
-| Time-only OR count-only prune | Use dual-condition for balanced retention        |
+| Forbidden                     | Reason                                                 |
+| ----------------------------- | ------------------------------------------------------ |
+| Throwing on file-not-found    | OpenCode creates files lazily; absence is normal       |
+| Hardcoding `~/.local/share`   | Respect `XDG_DATA_HOME` via `getOpenCodeStoragePath()` |
+| Unsorted message access       | Messages unordered on disk; always sort by time        |
+| Ignoring child sessions       | Must cascade-delete when parent is pruned              |
+| Time-only OR count-only prune | Dual-condition needed for balanced retention           |
