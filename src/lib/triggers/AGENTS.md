@@ -1,59 +1,53 @@
-# TRIGGERS MODULE
+# TRIGGER ROUTING
 
-**Scope:** Centralized event routing and skip-logic gating (RFC-005). Determines IF an action should run based on payload, config, and permissions. Pure logic; no side effects.
+**Context**: Centralized event routing and skip-logic gating (RFC-005). Determines IF an action should run based on payload, config, and permissions. Pure logic; no side effects.
 
-## WHERE TO LOOK
+## FILES
 
-| Component    | File                       | Purpose                                                      |
-| ------------ | -------------------------- | ------------------------------------------------------------ |
-| **Router**   | `router.ts`                | Core logic (`routeEvent`, `checkSkipConditions`). 882 lines. |
-| **Types**    | `types.ts`                 | `TriggerResult`, `TriggerConfig`, `SkipReason`               |
-| **Mock**     | `mock.ts`                  | Synthetic event generation for local testing                 |
-| **Fixtures** | `__fixtures__/payloads.ts` | Test payload factories (660 lines)                           |
+- `router.ts`: Core logic (882 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders.
+- `types.ts`: `TriggerResult` (discriminated union), `TriggerConfig`, `SkipReason` enum.
+- `mock.ts`: Synthetic event generation for local testing and CI simulation.
+- `__fixtures__/payloads.ts`: Factory-style payload generation using `BASE_*` spread pattern (627 lines).
 
 ## KEY EXPORTS
 
-```typescript
-routeEvent(context, inputs, config?)  // Main entry. Returns TriggerResult.
-TriggerResult                         // Discriminated union (shouldProcess: boolean)
-SkipReason                            // Enum of rejection codes
-DEFAULT_TRIGGER_CONFIG                // Base configuration
-```
+- `routeEvent(context, inputs, config?)`: Main entry. Returns `TriggerResult`.
+- `TriggerResult`: Discriminated union. If `shouldProcess: false`, contains `skipReason`.
+- `SkipReason`: Enum of rejection codes (e.g., `unauthorized_author`, `draft_pr`).
+- `DEFAULT_TRIGGER_CONFIG`: Base configuration for routing logic.
 
-## EVENT TYPES
+## SUPPORTED EVENTS
 
-| Event                         | Supported Actions                   | Constraints                 |
-| ----------------------------- | ----------------------------------- | --------------------------- |
-| `issue_comment`               | `created`                           | Optional prompt             |
-| `discussion_comment`          | `created`                           | Optional prompt             |
-| `pull_request`                | `opened`, `reopened`, `synchronize` | Skips drafts (configurable) |
-| `issues`                      | `opened`, `edited`                  | `edited` requires mention   |
-| `schedule`                    | N/A                                 | **Requires** prompt input   |
-| `workflow_dispatch`           | N/A                                 | **Requires** prompt input   |
-| `pull_request_review_comment` | `created`                           | —                           |
+| Event                         | Supported Actions                   | Prompt Requirement                   |
+| :---------------------------- | :---------------------------------- | :----------------------------------- |
+| `issue_comment`               | `created`                           | Optional (uses comment body)         |
+| `discussion_comment`          | `created`                           | Optional (uses comment body)         |
+| `pull_request`                | `opened`, `reopened`, `synchronize` | Optional (reviews code)              |
+| `issues`                      | `opened`, `edited`                  | `edited` requires `@fro-bot` mention |
+| `schedule`                    | N/A                                 | **Required** (hard fail if empty)    |
+| `workflow_dispatch`           | N/A                                 | **Required** (hard fail if empty)    |
+| `pull_request_review_comment` | `created`                           | Optional (uses comment body)         |
 
 ## SKIP REASONS
 
-| Reason                | Description                                |
-| --------------------- | ------------------------------------------ |
-| `action_not_created`  | Trigger action != `created` (comments)     |
-| `draft_pr`            | PR is in draft mode (default behavior)     |
-| `no_mention`          | Missing `@fro-bot` in `issues.edited`      |
-| `prompt_required`     | `schedule`/`dispatch` missing input        |
-| `self_comment`        | Bot responding to itself (loop protection) |
-| `unauthorized_author` | Author not OWNER/MEMBER/COLLABORATOR       |
+- `action_not_created`: Trigger action != `created` (for comments).
+- `draft_pr`: PR is in draft mode (skipped by default).
+- `no_mention`: Missing `@fro-bot` mention in `issues.edited` events.
+- `prompt_required`: `schedule` or `dispatch` events missing prompt input.
+- `self_comment`: Bot responding to its own comment (loop protection).
+- `unauthorized_author`: Author not `OWNER`, `MEMBER`, or `COLLABORATOR`.
 
 ## PATTERNS
 
-- **Discriminated Union**: Check `shouldProcess` before accessing `skipReason`
-- **Config Merging**: `routeEvent` applies defaults to partial configs
-- **Regex Safety**: `hasBotMention` escapes input, uses `\b` boundaries
-- **External Classification**: Event classification logic in `github/context.ts` (`classifyEventType`)
+- **Pure Decisioning**: Router MUST NOT call APIs or log triggers. Pure input-to-decision.
+- **Discriminated Union**: Narrow `TriggerResult` by `shouldProcess` before accessing `skipReason`.
+- **Config Merging**: `routeEvent` applies defaults to partial configurations.
+- **Regex Safety**: `hasBotMention` escapes input and uses `\b` boundaries for accuracy.
+- **External Classification**: `classifyEventType` resides in `github/context.ts`.
+- **Factory Spreads**: `__fixtures__` uses `BASE_*` templates + property overrides.
 
 ## ANTI-PATTERNS
 
-| Forbidden         | Reason                                                       |
-| ----------------- | ------------------------------------------------------------ |
-| Side effects      | Router must NOT call APIs or log triggers (pure decisioning) |
-| Hardcoded config  | Always use `TriggerConfig` injection                         |
-| Implicit defaults | Rely on `DEFAULT_TRIGGER_CONFIG`, don't reinvent             |
+- **Side Effects**: Never trigger external actions (API calls, logs) inside router logic.
+- **Hardcoded Config**: Always use `TriggerConfig` injection or defaults.
+- **Implicit Defaults**: Make skip-logic thresholds and logic explicit.
