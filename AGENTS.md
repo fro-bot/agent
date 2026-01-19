@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-17
-**Commit:** b1f6aa7
+**Generated:** 2026-01-18
+**Commit:** a6815bb
 **Branch:** main
 
 ## OVERVIEW
@@ -13,7 +13,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ```
 ./
 ├── src/                  # TypeScript source
-│   ├── main.ts           # Primary entry (11-step orchestration)
+│   ├── main.ts           # Primary entry (12-step orchestration)
 │   ├── post.ts           # Post-action hook (durable cache save, RFC-017)
 │   ├── index.ts          # Public API re-exports
 │   ├── lib/              # Core libraries (see subdir AGENTS.md)
@@ -25,6 +25,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   ├── comments/     # GitHub comment read/write, error formatting
 │   │   ├── observability/# Metrics collection, run summaries
 │   │   ├── reviews/      # PR diff parsing, review comments
+│   │   ├── attachments/  # File attachment processing (RFC-014)
+│   │   ├── delegated/    # Branch/commit/PR operations (RFC-010)
 │   │   ├── cache.ts      # Cache restore/save with corruption detection
 │   │   ├── logger.ts     # JSON logging with auto-redaction
 │   │   ├── inputs.ts     # Action input parsing (Result type)
@@ -32,7 +34,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   └── constants.ts  # Shared configuration
 │   └── utils/            # Pure utility functions (env, validation)
 ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
-├── RFCs/                 # 17 RFC documents (architecture specs)
+├── RFCs/                 # 19 RFC documents (architecture specs)
 ├── action.yaml           # GitHub Action definition (node24)
 └── tsdown.config.ts      # esbuild bundler config (dual entry points)
 ```
@@ -41,7 +43,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 | Task             | Location                      | Notes                                       |
 | ---------------- | ----------------------------- | ------------------------------------------- |
-| Add action logic | `src/main.ts`                 | 11-step orchestration lifecycle             |
+| Add action logic | `src/main.ts`                 | 12-step orchestration lifecycle             |
 | Setup library    | `src/lib/setup/`              | Bun/oMo/OpenCode installation (auto-setup)  |
 | Post-action hook | `src/post.ts`                 | Durable cache save (RFC-017)                |
 | Cache operations | `src/lib/cache.ts`            | `restoreCache()`, `saveCache()`             |
@@ -51,7 +53,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Prompt building  | `src/lib/agent/prompt.ts`     | `buildAgentPrompt()`                        |
 | Session storage  | `src/lib/session/storage.ts`  | File I/O, project discovery                 |
 | Session search   | `src/lib/session/search.ts`   | `listSessions()`, `searchSessions()`        |
-| Event routing    | `src/lib/triggers/router.ts`  | `routeEvent()`, skip conditions (880 lines) |
+| Event routing    | `src/lib/triggers/router.ts`  | `routeEvent()`, skip conditions (882 lines) |
 | Comment posting  | `src/lib/comments/writer.ts`  | `postComment()`, GraphQL mutations          |
 | PR reviews       | `src/lib/reviews/reviewer.ts` | `submitReview()`, line comments             |
 | Input parsing    | `src/lib/inputs.ts`           | `parseActionInputs()` returns Result        |
@@ -63,7 +65,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 | Symbol              | Type      | Location                      | Role                              |
 | ------------------- | --------- | ----------------------------- | --------------------------------- |
-| `run`               | Function  | `src/main.ts:68`              | Main entry, 11-step orchestration |
+| `run`               | Function  | `src/main.ts:76`              | Main entry, 12-step orchestration |
 | `runPost`           | Function  | `src/post.ts:31`              | Post-action cache save            |
 | `runSetup`          | Function  | `src/lib/setup/setup.ts`      | Setup orchestration               |
 | `restoreCache`      | Function  | `src/lib/cache.ts`            | Restore OpenCode state            |
@@ -88,6 +90,7 @@ main.ts
   ├─→ parseGitHubContext() → typed event context
   ├─→ routeEvent() → skip-check gating
   ├─→ acknowledgeReceipt() → 👀 + working label
+  ├─→ processAttachments() → download/validate files
   ├─→ executeOpenCode() → SDK server → session → prompt
   ├─→ writeSessionSummary() → synthetic run summary
   ├─→ pruneSessions() → retention policy
@@ -118,11 +121,12 @@ post.ts (runs even on failure/timeout)
 - **ESM-only**: `"type": "module"`, use `.js` extensions in imports
 - **Function-based**: No ES6 classes, pure functions only
 - **Strict booleans**: Use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types
-- **Const assertions**: Use `as const` for fixed values
+- **Const assertions**: Use `as const` for fixed values, induce union types from arrays
 - **No suppressions**: Never `as any`, `@ts-ignore`, `@ts-expect-error`
 - **Result type**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
 - **Logger injection**: All functions take `logger: Logger` as parameter
-- **Discriminated unions**: Model state with `type` discriminator fields
+- **Discriminated unions**: Model state with `type` or `shouldProcess` discriminator fields
+- **Readonly everywhere**: All interface properties use `readonly`
 
 ### Build
 
@@ -155,25 +159,27 @@ post.ts (runs even on failure/timeout)
 | Global mutable state            | Use dependency injection             |
 | Deleting failing tests          | Fix the code instead                 |
 | `core.setFailed()` in post.ts   | Post-hook is best-effort, never fail |
+| Duplicating SDK types           | Import from `@opencode-ai/sdk`       |
 
 ## UNIQUE STYLES
 
 - **Dual entry points**: Main action + post-action hook (setup integrated)
-- **RFC-driven development**: Major features documented in `RFCs/` first (17 total)
+- **RFC-driven development**: Major features documented in `RFCs/` first (19 total)
 - **Black-box integration test**: `main.test.ts` spawns Node to test bundled artifact
 - **v-branch releases**: Main merges to `v0` for major version pinning
 - **Logger injection**: All functions take `logger: Logger` as parameter
 - **Synthetic run summaries**: Session writeback creates "user" messages for discoverability
 - **Adapter pattern**: `ExecAdapter`, `ToolCacheAdapter` for testable I/O
+- **Graceful optionality**: Optional components (oMo) warn on failure, don't crash
 
 ## COMPLEXITY HOTSPOTS
 
 | File                 | Lines | Reason                                            |
 | -------------------- | ----- | ------------------------------------------------- |
-| `triggers/router.ts` | 880   | Multi-event context mapping, skip-condition logic |
-| `agent/opencode.ts`  | 459   | SDK lifecycle orchestration, event streaming      |
-| `main.ts`            | 445   | 11-step orchestration, error handling             |
-| `agent/prompt.ts`    | 338   | Large prompt templates, trigger directives        |
+| `triggers/router.ts` | 882   | Multi-event context mapping, skip-condition logic |
+| `main.ts`            | 481   | 12-step orchestration, error handling             |
+| `agent/opencode.ts`  | 469   | SDK lifecycle orchestration, event streaming      |
+| `agent/prompt.ts`    | 344   | Large prompt templates, trigger directives        |
 
 ## COMMANDS
 
@@ -190,7 +196,7 @@ pnpm test             # Vitest (350+ tests)
 
 - **dist/ committed**: CI fails if `git diff dist/` shows changes after build
 - **Node 24 required**: Matches `action.yaml` runtime
-- **17 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook
+- **19 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook, plugin, S3 backend
 - **SDK-based execution**: Uses `@opencode-ai/sdk` for server lifecycle + event streaming
 - **Persistent memory**: Sessions survive across CI runs via GitHub Actions cache
 

@@ -4,13 +4,13 @@
 
 ## WHERE TO LOOK
 
-| Component        | File              | Purpose                                              |
-| ---------------- | ----------------- | ---------------------------------------------------- |
-| **Types**        | `types.ts`        | ThreadComment, Thread, ErrorInfo, PostCommentResult  |
-| **Reader**       | `reader.ts`       | `readThread()`, `findBotComment()`, pagination       |
-| **Writer**       | `writer.ts`       | `postComment()`, `isBotComment()`, GraphQL mutations |
-| **Error Format** | `error-format.ts` | `formatErrorComment()`, error creation helpers       |
-| **Exports**      | `index.ts`        | Public API surface                                   |
+| Component        | File              | Purpose                                               |
+| ---------------- | ----------------- | ----------------------------------------------------- |
+| **Types**        | `types.ts`        | ThreadComment, Thread, ErrorInfo, PostCommentResult   |
+| **Reader**       | `reader.ts`       | `readThread()`, `findBotComment()`, pagination (257L) |
+| **Writer**       | `writer.ts`       | `postComment()`, `isBotComment()`, GraphQL mutations  |
+| **Error Format** | `error-format.ts` | `formatErrorComment()`, error creation helpers        |
+| **Exports**      | `index.ts`        | Public API surface                                    |
 
 ## KEY EXPORTS
 
@@ -26,34 +26,30 @@ isBotComment(body) // Check if body has BOT_COMMENT_MARKER
 // Error formatting
 formatErrorComment(error) // Format error as markdown
 createErrorInfo(type, message, retryable, opts) // Create error info
-createRateLimitError(message, resetTime) // Rate limit error helper
-createLLMTimeoutError(message) // LLM timeout error helper
-
-// Re-exported from github/types.ts
-BOT_COMMENT_MARKER // HTML comment for bot identification
+BOT_COMMENT_MARKER // HTML comment for identification
 ```
 
 ## PATTERNS
 
-- **Dual ID types**: REST returns `number` IDs, GraphQL returns `string` Node IDs
-- **Bot detection**: Checks BOTH author AND marker (security against marker copying)
-- **Pagination safety**: Max 50 pages to prevent infinite loops
-- **Non-fatal operations**: All API calls catch errors and return null/false
-- **Logger injection**: All functions take `logger: Logger` as parameter
-- **Idempotent updates**: `postComment` with `updateExisting: true` updates latest bot comment
+- **Dual ID types**: REST (Issue/PR) uses `number`; GraphQL (Discussion) uses `string` Node ID.
+- **Bot detection**: Verify BOTH author (`botLogin` or `botLogin[bot]`) AND `BOT_COMMENT_MARKER`.
+- **Pagination safety**: Enforced `MAX_PAGES = 50` limit to prevent infinite loops.
+- **Non-fatal operations**: All API calls catch errors, log warnings, and return `null`.
+- **Idempotent updates**: `postComment` with `updateExisting` replaces latest bot comment.
+- **Visual Severity Mapping**: ErrorType maps to emojis (⚠️ `rate_limit`, ⏳ `llm_timeout`, ❌ others).
 
 ## DATA FLOW
 
 ```
 postComment(client, target, options, logger)
   │
-  ├─→ target.type === 'discussion'
+  ├─→ target.type === 'discussion' (GraphQL)
   │     ├─ readThread() → findBotComment() [if updateExisting]
-  │     └─ GraphQL mutation (add or update)
+  │     └─ mutation: addDiscussionComment | updateDiscussionComment
   │
-  └─→ target.type === 'issue' | 'pr'
+  └─→ target.type === 'issue' | 'pr' (REST)
         ├─ readThread() → findBotComment() [if updateExisting]
-        └─ REST API (create or update)
+        └─ rest.issues: createComment | updateComment
 ```
 
 ## ANTI-PATTERNS
@@ -68,6 +64,6 @@ postComment(client, target, options, logger)
 
 ## INTEGRATION NOTES
 
-- **Reactions**: Use `src/lib/agent/reactions.ts` for emoji/label operations (RFC-008 F43)
-- **Run Summary**: Use `src/lib/observability/run-summary.ts` for comment summaries
-- **Workflows need**: `discussions: write` permission for discussion comments
+- **Reactions**: Use `src/lib/agent/reactions.ts` for emoji/label operations.
+- **Run Summary**: Use `src/lib/observability/run-summary.ts` for comment summaries.
+- **Permissions**: Discussions require `discussions: write` in workflow.

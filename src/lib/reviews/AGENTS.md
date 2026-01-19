@@ -9,7 +9,6 @@
 | **Types**    | `types.ts`    | PRDiff, ReviewComment, SubmitReviewOptions   |
 | **Diff**     | `diff.ts`     | Fetch PR diff, parse hunks, get file content |
 | **Reviewer** | `reviewer.ts` | Submit reviews, post/get/reply to comments   |
-| **Exports**  | `index.ts`    | Public API surface                           |
 
 ## KEY EXPORTS
 

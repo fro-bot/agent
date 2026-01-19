@@ -1,13 +1,13 @@
-# Attachments Module
+# ATTACHMENTS MODULE
 
 **RFC:** RFC-014 File Attachment Processing
 **Status:** Completed
 
-## Overview
+## OVERVIEW
 
-Processes file attachments from GitHub issue/PR comments for multi-modal agent interactions. Downloads, validates, and injects attachments as SDK file parts.
+Processes file attachments from GitHub issue/PR comments for multi-modal agent interactions.
 
-## Architecture
+## ARCHITECTURE
 
 ```
 Comment body → parseAttachmentUrls() → downloadAttachments() → validateAttachments() → buildAttachmentResult()
@@ -17,7 +17,7 @@ Comment body → parseAttachmentUrls() → downloadAttachments() → validateAtt
                                      cleanupTempFiles() [in finally block]
 ```
 
-## Files
+## WHERE TO LOOK
 
 | File            | Purpose                                                |
 | --------------- | ------------------------------------------------------ |
@@ -26,42 +26,18 @@ Comment body → parseAttachmentUrls() → downloadAttachments() → validateAtt
 | `downloader.ts` | Secure download with redirect validation               |
 | `validator.ts`  | MIME type and size limit enforcement                   |
 | `injector.ts`   | Build SDK `FilePartInput[]` from validated attachments |
-| `index.ts`      | Public API exports                                     |
 
-## Public API
+## KEY EXPORTS
 
 ```typescript
-// Parse URLs from comment body
-parseAttachmentUrls(body: string): readonly AttachmentUrl[]
-
-// Download with authorization
-downloadAttachments(
-  urls: readonly AttachmentUrl[],
-  token: string,
-  limits?: AttachmentLimits,
-  logger?: Logger,
-): Promise<readonly DownloadedAttachment[]>
-
-// Validate MIME types and sizes
-validateAttachments(
-  attachments: readonly DownloadedAttachment[],
-  limits?: AttachmentLimits,
-  logger?: Logger,
-): { validated: ValidatedAttachment[], skipped: SkippedAttachment[] }
-
-// Build final result for SDK prompt
-buildAttachmentResult(
-  originalBody: string,
-  parsedUrls: readonly AttachmentUrl[],
-  validated: readonly ValidatedAttachment[],
-  skipped: readonly SkippedAttachment[],
-): AttachmentResult
-
-// Cleanup temp files (call in finally block)
-cleanupTempFiles(tempFiles: readonly string[], logger?: Logger): Promise<void>
+parseAttachmentUrls(body) // Extract URLs from comment
+downloadAttachments(urls, token, limits, logger) // Secure download
+validateAttachments(attachments, limits, logger) // MIME/size validation
+buildAttachmentResult(body, urls, validated, skipped) // Build SDK parts
+cleanupTempFiles(tempFiles, logger) // Cleanup in finally block
 ```
 
-## Security
+## SECURITY
 
 - **URL validation**: Only `github.com/user-attachments/` URLs accepted
 - **Redirect handling**: `redirect: "manual"` prevents token leakage
@@ -70,34 +46,7 @@ cleanupTempFiles(tempFiles: readonly string[], logger?: Logger): Promise<void>
 - **MIME validation**: Allowlist-based (images, text, JSON, PDF)
 - **Temp cleanup**: Always runs in finally block (survives errors/timeouts)
 
-## Usage in main.ts
-
-```typescript
-// Step 6d: Process attachments
-const attachmentLogger = createLogger({phase: 'attachments'})
-const parsedUrls = parseAttachmentUrls(commentBody)
-
-if (parsedUrls.length > 0) {
-  const downloaded = await downloadAttachments(parsedUrls, token, undefined, logger)
-  const {validated, skipped} = validateAttachments(downloaded, undefined, logger)
-  attachmentResult = buildAttachmentResult(commentBody, parsedUrls, validated, skipped)
-}
-
-// Pass to prompt options
-const promptOptions: PromptOptions = {
-  // ...
-  fileParts: attachmentResult?.fileParts,
-}
-
-// Cleanup in finally block
-finally {
-  if (attachmentResult != null) {
-    await cleanupTempFiles(attachmentResult.tempFiles, logger)
-  }
-}
-```
-
-## Limits
+## LIMITS
 
 | Limit | Value |
 | --- | --- |
@@ -106,9 +55,11 @@ finally {
 | Max total size | 15 MB |
 | Allowed MIME types | image/png, image/jpeg, image/gif, image/webp, image/svg+xml, text/plain, text/markdown, text/csv, application/json, application/pdf |
 
-## Tests
+## ANTI-PATTERNS
 
-- `parser.test.ts` - 22 tests (URL extraction, markdown/HTML patterns)
-- `downloader.test.ts` - 7 tests (download, redirect handling, cleanup)
-- `validator.test.ts` - 10 tests (MIME validation, size limits)
-- `injector.test.ts` - 5 tests (file part building, body modification)
+| Forbidden               | Reason                                      |
+| ----------------------- | ------------------------------------------- |
+| Skipping URL validation | Only trusted github.com URLs                |
+| Following redirects     | Use `redirect: "manual"` to prevent leakage |
+| Missing cleanup         | Always call `cleanupTempFiles` in finally   |
+| Trusting MIME headers   | Validate against allowlist                  |
