@@ -37,7 +37,7 @@ export interface ContextComment {
   readonly author: string | null
   readonly body: string
   readonly createdAt: string
-  readonly authorAssociation?: string
+  readonly authorAssociation: string
 }
 
 /**
@@ -157,16 +157,6 @@ export type HydratedContext = IssueContext | PullRequestContext
 export interface TruncateResult {
   readonly text: string
   readonly truncated: boolean
-}
-
-/**
- * Options for hydrating context.
- */
-export interface HydrateOptions {
-  readonly owner: string
-  readonly repo: string
-  readonly number: number
-  readonly budget?: ContextBudget
 }
 
 /**

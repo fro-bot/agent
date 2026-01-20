@@ -78,7 +78,9 @@ describe('estimateContextSize', () => {
       createdAt: '2024-01-01T00:00:00Z',
       labels: [{name: 'bug'}],
       assignees: [{login: 'dev1'}],
-      comments: [{author: 'user1', body: 'Comment text', createdAt: '2024-01-01T00:00:00Z'}],
+      comments: [
+        {author: 'user1', body: 'Comment text', createdAt: '2024-01-01T00:00:00Z', authorAssociation: 'MEMBER'},
+      ],
       commentsTruncated: false,
       totalComments: 1,
     }
@@ -198,7 +200,14 @@ describe('formatContextForPrompt', () => {
       createdAt: '2024-01-15T10:00:00Z',
       labels: [{name: 'bug'}, {name: 'priority-high'}],
       assignees: [{login: 'developer'}],
-      comments: [{author: 'helper', body: 'Have you tried restarting?', createdAt: '2024-01-15T11:00:00Z'}],
+      comments: [
+        {
+          author: 'helper',
+          body: 'Have you tried restarting?',
+          createdAt: '2024-01-15T11:00:00Z',
+          authorAssociation: 'CONTRIBUTOR',
+        },
+      ],
       commentsTruncated: false,
       totalComments: 1,
     }

@@ -18,7 +18,6 @@ export type {
   ContextReview,
   ContextReviewComment,
   HydratedContext,
-  HydrateOptions,
   IssueContext,
   IssueGraphQLResponse,
   PullRequestContext,
