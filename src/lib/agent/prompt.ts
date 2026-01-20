@@ -8,6 +8,7 @@
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {DiffContext, PromptOptions, SessionContext} from './types.js'
+import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 
 export interface TriggerDirective {
@@ -180,6 +181,11 @@ ${context.commentBody}
   // PR diff context (RFC-009 integration)
   if (context.diffContext != null) {
     parts.push(buildDiffContextSection(context.diffContext))
+  }
+
+  // Hydrated issue/PR context (RFC-015 integration)
+  if (context.hydratedContext != null) {
+    parts.push(formatContextForPrompt(context.hydratedContext))
   }
 
   // Session management instructions (REQUIRED)

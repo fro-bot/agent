@@ -29,6 +29,7 @@ function createMockContext(overrides: Partial<AgentContext> = {}): AgentContext 
     commentId: 999,
     defaultBranch: 'main',
     diffContext: null,
+    hydratedContext: null,
     ...overrides,
   }
 }
