@@ -68,6 +68,7 @@ export const ERROR_TYPES = [
   'api_error',
   'configuration',
   'internal',
+  'llm_fetch_error',
   'llm_timeout',
   'permission',
   'rate_limit',

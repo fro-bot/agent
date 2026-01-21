@@ -1,4 +1,11 @@
-export {createErrorInfo, createLLMTimeoutError, createRateLimitError, formatErrorComment} from './error-format.js'
+export {
+  createErrorInfo,
+  createLLMFetchError,
+  createLLMTimeoutError,
+  createRateLimitError,
+  formatErrorComment,
+  isLlmFetchError,
+} from './error-format.js'
 
 export {findBotComment, readThread} from './reader.js'
 
