@@ -4,6 +4,7 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   api_error: 'API Error',
   configuration: 'Configuration Error',
   internal: 'Internal Error',
+  llm_fetch_error: 'LLM Fetch Error',
   llm_timeout: 'LLM Timeout',
   permission: 'Permission Error',
   rate_limit: 'Rate Limit',
@@ -17,6 +18,7 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
 function getErrorIcon(error: ErrorInfo): string {
   if (error.type === 'rate_limit') return ':warning:'
   if (error.type === 'llm_timeout') return ':hourglass:'
+  if (error.type === 'llm_fetch_error') return ':warning:'
   if (error.retryable) return ':warning:'
   return ':x:'
 }
@@ -95,5 +97,48 @@ export function createRateLimitError(message: string, resetTime: Date): ErrorInf
 export function createLLMTimeoutError(message: string): ErrorInfo {
   return createErrorInfo('llm_timeout', message, true, {
     suggestedAction: 'Try again with a simpler prompt or increased timeout.',
+  })
+}
+
+const LLM_FETCH_ERROR_PATTERNS = [
+  /fetch failed/i,
+  /connect\s*timeout/i,
+  /connecttimeouterror/i,
+  /timed?\s*out/i,
+  /econnrefused/i,
+  /econnreset/i,
+  /etimedout/i,
+  /network error/i,
+] as const
+
+export function isLlmFetchError(error: unknown): boolean {
+  if (error == null) return false
+
+  let errorMessage = ''
+
+  if (typeof error === 'string') {
+    errorMessage = error
+  } else if (error instanceof Error) {
+    errorMessage = error.message
+    if ('cause' in error && typeof error.cause === 'string') {
+      errorMessage += ` ${error.cause}`
+    }
+  } else if (typeof error === 'object') {
+    const obj = error as Record<string, unknown>
+    if (typeof obj.message === 'string') {
+      errorMessage = obj.message
+    }
+    if (typeof obj.cause === 'string') {
+      errorMessage += ` ${obj.cause}`
+    }
+  }
+
+  return LLM_FETCH_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage))
+}
+
+export function createLLMFetchError(message: string, model?: string): ErrorInfo {
+  return createErrorInfo('llm_fetch_error', `LLM request failed: ${message}`, true, {
+    details: model == null ? undefined : `Model: ${model}`,
+    suggestedAction: 'This is a transient network error. The request may succeed on retry, or try a different model.',
   })
 }
