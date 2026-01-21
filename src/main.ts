@@ -403,15 +403,20 @@ async function run(): Promise<number> {
       })
 
       const [repoOwner, repoName] = agentContext.repo.split('/')
+      const targetKind = triggerResult.context.target?.kind
       const targetType =
         triggerResult.context.eventType === 'discussion_comment'
           ? 'discussion'
-          : agentContext.issueType === 'pr'
+          : targetKind === 'pr'
             ? 'pr'
-            : 'issue'
+            : targetKind === 'issue'
+              ? 'issue'
+              : agentContext.issueType === 'pr'
+                ? 'pr'
+                : 'issue'
       const commentTarget: CommentTarget = {
         type: targetType,
-        number: agentContext.issueNumber ?? 0,
+        number: triggerResult.context.target?.number ?? agentContext.issueNumber ?? 0,
         owner: repoOwner ?? '',
         repo: repoName ?? '',
       }

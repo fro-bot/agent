@@ -520,9 +520,11 @@ describe('LLM error detection', () => {
   beforeEach(() => {
     mockLogger = createMockLogger()
     vi.clearAllMocks()
+    vi.useFakeTimers()
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
@@ -531,7 +533,14 @@ describe('LLM error detection', () => {
     vi.mocked(createOpencode).mockRejectedValue(new Error('fetch failed'))
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
 
     // #then
     expect(result.success).toBe(false)
@@ -544,7 +553,14 @@ describe('LLM error detection', () => {
     vi.mocked(createOpencode).mockRejectedValue(new Error('ECONNREFUSED: connection refused'))
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
 
     // #then
     expect(result.success).toBe(false)
