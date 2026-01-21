@@ -6,6 +6,7 @@
  */
 
 import type {FilePartInput} from '@opencode-ai/sdk'
+import type {ErrorInfo} from '../comments/types.js'
 import type {HydratedContext} from '../context/types.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
@@ -47,6 +48,7 @@ export interface AgentResult {
   readonly prsCreated: readonly string[]
   readonly commitsCreated: readonly string[]
   readonly commentsPosted: number
+  readonly llmError: ErrorInfo | null
 }
 
 /**

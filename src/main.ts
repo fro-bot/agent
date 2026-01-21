@@ -43,6 +43,7 @@ import {
   type AttachmentResult,
 } from './lib/attachments/index.js'
 import {restoreCache, saveCache} from './lib/cache.js'
+import {formatErrorComment, postComment} from './lib/comments/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createLogger} from './lib/logger.js'
@@ -282,6 +283,7 @@ async function run(): Promise<number> {
       prsCreated: readonly string[]
       commitsCreated: readonly string[]
       commentsPosted: number
+      llmError: import('./lib/comments/types.js').ErrorInfo | null
     }
     const executionStartTime = Date.now()
 
@@ -298,6 +300,7 @@ async function run(): Promise<number> {
         prsCreated: [],
         commitsCreated: [],
         commentsPosted: 0,
+        llmError: null,
       }
     } else {
       const execLogger = createLogger({phase: 'execution'})
@@ -389,9 +392,51 @@ async function run(): Promise<number> {
 
     if (result.success) {
       logger.info('Agent run completed successfully', {durationMs: duration})
-    } else {
+    } else if (result.llmError == null) {
       exitCode = result.exitCode
       core.setFailed(`Agent execution failed with exit code ${result.exitCode}`)
+    } else {
+      // Recoverable LLM error: post error comment and exit gracefully (exit 0)
+      logger.warning('LLM fetch error after retries', {
+        error: result.error,
+        llmErrorType: result.llmError.type,
+      })
+
+      // Post error comment to the PR/issue
+      const targetNumber = triggerResult.context.target?.number ?? agentContext.issueNumber ?? 0
+      if (targetNumber > 0 && githubClient != null) {
+        const repoParts = agentContext.repo.split('/')
+        const owner = repoParts[0] ?? ''
+        const repo = repoParts[1] ?? ''
+        const errorCommentBody = formatErrorComment(result.llmError)
+
+        try {
+          await postComment(
+            githubClient,
+            {
+              owner,
+              repo,
+              number: targetNumber,
+              type: agentContext.issueType === 'pr' ? 'pr' : 'issue',
+            },
+            {body: errorCommentBody},
+            logger,
+          )
+          logger.info('Posted LLM error comment', {targetNumber})
+        } catch (commentError) {
+          logger.warning('Failed to post LLM error comment', {
+            error: commentError instanceof Error ? commentError.message : String(commentError),
+          })
+        }
+      } else {
+        logger.warning('Cannot post error comment: missing target context', {
+          targetNumber,
+          hasClient: githubClient != null,
+        })
+      }
+
+      // Exit 0 for recoverable LLM errors (don't fail CI)
+      exitCode = 0
     }
   } catch (error) {
     exitCode = 1
