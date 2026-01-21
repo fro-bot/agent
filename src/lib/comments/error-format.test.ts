@@ -1,5 +1,12 @@
 import {describe, expect, it} from 'vitest'
-import {createErrorInfo, createLLMTimeoutError, createRateLimitError, formatErrorComment} from './error-format.js'
+import {
+  createErrorInfo,
+  createLLMFetchError,
+  createLLMTimeoutError,
+  createRateLimitError,
+  formatErrorComment,
+  isLlmFetchError,
+} from './error-format.js'
 
 describe('comments/error-format', () => {
   describe('formatErrorComment', () => {
@@ -124,6 +131,116 @@ describe('comments/error-format', () => {
       expect(error.type).toBe('llm_timeout')
       expect(error.retryable).toBe(true)
       expect(error.suggestedAction).toBeDefined()
+    })
+  })
+
+  describe('createLLMFetchError', () => {
+    it('creates retryable LLM fetch error with model info', () => {
+      // #when creating an LLM fetch error
+      const error = createLLMFetchError('fetch failed', 'opencode/glm-4.7-free')
+
+      // #then it should be correctly structured
+      expect(error.type).toBe('llm_fetch_error')
+      expect(error.retryable).toBe(true)
+      expect(error.message).toContain('fetch failed')
+      expect(error.details).toContain('opencode/glm-4.7-free')
+      expect(error.suggestedAction).toBeDefined()
+    })
+
+    it('creates error without model when not provided', () => {
+      // #when creating an LLM fetch error without model
+      const error = createLLMFetchError('Connection refused')
+
+      // #then it should work without model details
+      expect(error.type).toBe('llm_fetch_error')
+      expect(error.message).toContain('Connection refused')
+      expect(error.details).toBeUndefined()
+    })
+  })
+
+  describe('isLlmFetchError', () => {
+    it('detects "fetch failed" error message', () => {
+      // #given various error messages
+      const errors = [
+        'fetch failed',
+        'FETCH FAILED',
+        'Request: fetch failed after 3 retries',
+        'Error: fetch failed due to network issue',
+      ]
+
+      // #then all should be detected as LLM fetch errors
+      for (const msg of errors) {
+        expect(isLlmFetchError(msg)).toBe(true)
+      }
+    })
+
+    it('detects connection timeout errors', () => {
+      // #given timeout-related error messages
+      const errors = ['ConnectTimeoutError', 'Connection timed out', 'connect timeout']
+
+      // #then all should be detected as LLM fetch errors
+      for (const msg of errors) {
+        expect(isLlmFetchError(msg)).toBe(true)
+      }
+    })
+
+    it('detects ECONNREFUSED and network errors', () => {
+      // #given network error messages
+      const errors = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'network error']
+
+      // #then all should be detected as LLM fetch errors
+      for (const msg of errors) {
+        expect(isLlmFetchError(msg)).toBe(true)
+      }
+    })
+
+    it('returns false for non-fetch errors', () => {
+      // #given non-network error messages
+      const errors = ['Invalid API key', 'Rate limit exceeded', 'Permission denied', 'Syntax error in prompt', '']
+
+      // #then none should be detected as LLM fetch errors
+      for (const msg of errors) {
+        expect(isLlmFetchError(msg)).toBe(false)
+      }
+    })
+
+    it('handles Error objects with message property', () => {
+      // #given an Error object
+      const error = new Error('fetch failed')
+
+      // #then it should detect the error
+      expect(isLlmFetchError(error)).toBe(true)
+    })
+
+    it('handles objects with cause property', () => {
+      // #given an error with cause
+      const error = {message: 'Request failed', cause: 'fetch failed'}
+
+      // #then it should detect via cause
+      expect(isLlmFetchError(error)).toBe(true)
+    })
+
+    it('handles null and undefined safely', () => {
+      // #then should return false without throwing
+      expect(isLlmFetchError(null)).toBe(false)
+      expect(isLlmFetchError(undefined)).toBe(false)
+    })
+  })
+
+  describe('formatErrorComment for LLM fetch error', () => {
+    it('formats LLM fetch error with warning icon', () => {
+      // #given an LLM fetch error
+      const error = createLLMFetchError('fetch failed', 'opencode/glm-4.7-free')
+
+      // #when formatting the error
+      const formatted = formatErrorComment(error)
+
+      // #then it should include warning icon (retryable)
+      expect(formatted).toContain(':warning:')
+      // #then it should include the error type label
+      expect(formatted).toContain('LLM Fetch Error')
+      // #then it should indicate it's retryable
+      expect(formatted).toContain('retryable')
     })
   })
 })

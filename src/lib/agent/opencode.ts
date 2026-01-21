@@ -7,6 +7,7 @@
  */
 
 import type {FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+import type {ErrorInfo} from '../comments/types.js'
 import type {Logger} from '../logger.js'
 import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
@@ -14,6 +15,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
+import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
@@ -83,6 +85,7 @@ interface EventStreamResult {
   prsCreated: string[]
   commitsCreated: string[]
   commentsPosted: number
+  llmError: ErrorInfo | null
 }
 
 /**
@@ -143,6 +146,7 @@ async function processEventStream(
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
   let commentsPosted = 0
+  let llmError: ErrorInfo | null = null
 
   for await (const event of stream) {
     const props = event.properties
@@ -190,11 +194,17 @@ async function processEventStream(
         logger.debug('Token usage received', {tokens, model, cost})
       }
     } else if (event.type === 'session.error' && props.sessionID === sessionId) {
-      logger.error('Session error', {error: props.error})
+      const errorString = props.error == null ? '' : String(props.error)
+      logger.error('Session error', {error: errorString})
+
+      if (isLlmFetchError(props.error)) {
+        llmError = createLLMFetchError(errorString, model ?? undefined)
+        logger.info('Detected LLM fetch error (retryable)', {model})
+      }
     }
   }
 
-  return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted}
+  return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
 }
 
 export async function executeOpenCode(
@@ -257,6 +267,7 @@ export async function executeOpenCode(
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
+      llmError: null,
     }
 
     const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
@@ -297,10 +308,45 @@ export async function executeOpenCode(
     }
 
     logger.debug('Sending prompt to OpenCode', {sessionId, body: promptBody})
-    const promptResponse = await client.session.prompt({
-      path: {id: sessionId},
-      body: promptBody,
-    })
+
+    const MAX_LLM_RETRIES = 3
+    const RETRY_DELAY_MS = 5000
+    let lastLlmError: ErrorInfo | null = null
+    let promptResponse: Awaited<ReturnType<typeof client.session.prompt>> | null = null
+
+    for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
+      if (attempt > 1) {
+        logger.info('Retrying prompt after LLM fetch error', {attempt, maxRetries: MAX_LLM_RETRIES})
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+      }
+
+      promptResponse = await client.session.prompt({
+        path: {id: sessionId},
+        body: promptBody,
+      })
+
+      const responseError = 'error' in promptResponse ? promptResponse.error : null
+      if (responseError != null) {
+        const errorString = String(responseError)
+
+        if (isLlmFetchError(errorString)) {
+          lastLlmError = createLLMFetchError(errorString, eventStreamResult.model ?? undefined)
+          logger.warning('LLM fetch error detected, will retry', {
+            attempt,
+            maxRetries: MAX_LLM_RETRIES,
+            error: errorString,
+          })
+          continue
+        }
+      }
+
+      lastLlmError = null
+      break
+    }
+
+    if (promptResponse == null) {
+      throw new Error('Prompt response is unexpectedly null')
+    }
 
     // Give event stream a short grace period to flush remaining events, then abort
     // Don't wait indefinitely - the prompt response indicates completion
@@ -322,23 +368,30 @@ export async function executeOpenCode(
         prsCreated: eventStreamResult.prsCreated,
         commitsCreated: eventStreamResult.commitsCreated,
         commentsPosted: eventStreamResult.commentsPosted,
+        llmError: eventStreamResult.llmError,
       }
     }
 
-    if (promptResponse.error != null) {
-      logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
+    const finalResponseError = 'error' in promptResponse ? promptResponse.error : null
+    if (finalResponseError != null) {
+      const errorString = String(finalResponseError)
+      logger.error('OpenCode prompt failed', {error: errorString})
+
+      const llmError = lastLlmError ?? eventStreamResult.llmError
+
       return {
         success: false,
         exitCode: 1,
         duration: Date.now() - startTime,
         sessionId,
-        error: String(promptResponse.error),
+        error: errorString,
         tokenUsage: eventStreamResult.tokens,
         model: eventStreamResult.model,
         cost: eventStreamResult.cost,
         prsCreated: eventStreamResult.prsCreated,
         commitsCreated: eventStreamResult.commitsCreated,
         commentsPosted: eventStreamResult.commentsPosted,
+        llmError,
       }
     }
 
@@ -360,6 +413,7 @@ export async function executeOpenCode(
       prsCreated: eventStreamResult.prsCreated,
       commitsCreated: eventStreamResult.commitsCreated,
       commentsPosted: eventStreamResult.commentsPosted,
+      llmError: null,
     }
   } catch (error) {
     const duration = Date.now() - startTime
@@ -369,6 +423,8 @@ export async function executeOpenCode(
       error: errorMessage,
       durationMs: duration,
     })
+
+    const llmError = isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null
 
     return {
       success: false,
@@ -382,6 +438,7 @@ export async function executeOpenCode(
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
+      llmError,
     }
   } finally {
     if (timeoutId != null) {

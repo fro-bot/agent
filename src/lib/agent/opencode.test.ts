@@ -513,3 +513,71 @@ describe('ensureOpenCodeAvailable', () => {
     )
   })
 })
+
+describe('LLM error detection', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('detects fetch failed in exception thrown from executeOpenCode', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('fetch failed'))
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('llm_fetch_error')
+  })
+
+  it('detects ECONNREFUSED in exception thrown from executeOpenCode', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('ECONNREFUSED: connection refused'))
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('llm_fetch_error')
+  })
+
+  it('returns null llmError for non-network errors in exception', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('Invalid API key'))
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).toBeNull()
+    expect(result.error).toContain('Invalid API key')
+  })
+
+  it('returns null llmError on successful execution', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Success'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.llmError).toBeNull()
+  })
+})
