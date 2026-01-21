@@ -290,7 +290,7 @@ async function sendPromptToSession(
 
   // Grace period for event stream to flush
   if (!eventStreamEnded) {
-    const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 1000))
+    const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 2000))
     await Promise.race([eventProcessingPromise, gracePeriod])
   }
 
@@ -368,13 +368,13 @@ export async function executeOpenCode(
     // Build initial prompt
     const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
 
-    // Track cumulative results across retries
-    let cumulativeTokens: TokenUsage | null = null
-    let cumulativeModel: string | null = null
-    let cumulativeCost: number | null = null
-    const cumulativePRs: string[] = []
-    const cumulativeCommits: string[] = []
-    let cumulativeComments = 0
+    // Track results - only from successful attempt (failed attempts waste tokens)
+    let finalTokens: TokenUsage | null = null
+    let finalModel: string | null = null
+    let finalCost: number | null = null
+    let finalPRs: string[] = []
+    let finalCommits: string[] = []
+    let finalComments = 0
     let lastError: string | null = null
     let lastLlmError: ErrorInfo | null = null
 
@@ -386,14 +386,26 @@ export async function executeOpenCode(
           duration: Date.now() - startTime,
           sessionId,
           error: `Execution timed out after ${timeoutMs}ms`,
-          tokenUsage: cumulativeTokens,
-          model: cumulativeModel,
-          cost: cumulativeCost,
-          prsCreated: cumulativePRs,
-          commitsCreated: cumulativeCommits,
-          commentsPosted: cumulativeComments,
+          tokenUsage: finalTokens,
+          model: finalModel,
+          cost: finalCost,
+          prsCreated: finalPRs,
+          commitsCreated: finalCommits,
+          commentsPosted: finalComments,
           llmError: lastLlmError,
         }
+      }
+
+      // Check remaining time before attempting (Issue #3)
+      const elapsedMs = Date.now() - startTime
+      const remainingMs = timeoutMs - elapsedMs
+      if (timeoutMs > 0 && remainingMs <= RETRY_DELAY_MS && attempt > 1) {
+        logger.warning('Insufficient time remaining for retry', {
+          remainingMs,
+          requiredMs: RETRY_DELAY_MS,
+          attempt,
+        })
+        break
       }
 
       // First attempt: send initial prompt. Retries: send continuation prompt
@@ -412,36 +424,16 @@ export async function executeOpenCode(
           logger,
         )
 
-        // Accumulate results from this attempt
-        const {eventStreamResult} = attemptResult
-        if (eventStreamResult.tokens != null) {
-          if (cumulativeTokens == null) {
-            cumulativeTokens = eventStreamResult.tokens
-          } else {
-            cumulativeTokens = {
-              input: cumulativeTokens.input + eventStreamResult.tokens.input,
-              output: cumulativeTokens.output + eventStreamResult.tokens.output,
-              reasoning: cumulativeTokens.reasoning + eventStreamResult.tokens.reasoning,
-              cache: {
-                read: cumulativeTokens.cache.read + eventStreamResult.tokens.cache.read,
-                write: cumulativeTokens.cache.write + eventStreamResult.tokens.cache.write,
-              },
-            }
-          }
-        }
-        cumulativeModel = eventStreamResult.model ?? cumulativeModel
-        if (eventStreamResult.cost != null) {
-          cumulativeCost = (cumulativeCost ?? 0) + eventStreamResult.cost
-        }
-        for (const pr of eventStreamResult.prsCreated) {
-          if (!cumulativePRs.includes(pr)) cumulativePRs.push(pr)
-        }
-        for (const commit of eventStreamResult.commitsCreated) {
-          if (!cumulativeCommits.includes(commit)) cumulativeCommits.push(commit)
-        }
-        cumulativeComments += eventStreamResult.commentsPosted
-
         if (attemptResult.success) {
+          // Only track results from successful attempt (Issue #1 & #2)
+          const {eventStreamResult} = attemptResult
+          finalTokens = eventStreamResult.tokens
+          finalModel = eventStreamResult.model
+          finalCost = eventStreamResult.cost
+          finalPRs = [...eventStreamResult.prsCreated]
+          finalCommits = [...eventStreamResult.commitsCreated]
+          finalComments = eventStreamResult.commentsPosted
+
           const duration = Date.now() - startTime
           logger.info('OpenCode execution completed', {sessionId, durationMs: duration, attempts: attempt})
 
@@ -451,12 +443,12 @@ export async function executeOpenCode(
             duration,
             sessionId,
             error: null,
-            tokenUsage: cumulativeTokens,
-            model: cumulativeModel,
-            cost: cumulativeCost,
-            prsCreated: cumulativePRs,
-            commitsCreated: cumulativeCommits,
-            commentsPosted: cumulativeComments,
+            tokenUsage: finalTokens,
+            model: finalModel,
+            cost: finalCost,
+            prsCreated: finalPRs,
+            commitsCreated: finalCommits,
+            commentsPosted: finalComments,
             llmError: null,
           }
         }
@@ -517,12 +509,12 @@ export async function executeOpenCode(
       duration: Date.now() - startTime,
       sessionId,
       error: lastError ?? 'Unknown error',
-      tokenUsage: cumulativeTokens,
-      model: cumulativeModel,
-      cost: cumulativeCost,
-      prsCreated: cumulativePRs,
-      commitsCreated: cumulativeCommits,
-      commentsPosted: cumulativeComments,
+      tokenUsage: finalTokens,
+      model: finalModel,
+      cost: finalCost,
+      prsCreated: finalPRs,
+      commitsCreated: finalCommits,
+      commentsPosted: finalComments,
       llmError: lastLlmError,
     }
   } catch (error) {
