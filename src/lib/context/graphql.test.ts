@@ -10,6 +10,8 @@ describe('ISSUE_QUERY', () => {
     expect(ISSUE_QUERY).toContain('repository')
     expect(ISSUE_QUERY).toContain('issue')
     expect(ISSUE_QUERY).toContain('comments')
+    expect(ISSUE_QUERY).toContain('id')
+    expect(ISSUE_QUERY).toContain('isMinimized')
     expect(ISSUE_QUERY).toContain('labels')
     expect(ISSUE_QUERY).toContain('assignees')
   })
@@ -24,6 +26,7 @@ describe('PULL_REQUEST_QUERY', () => {
     expect(PULL_REQUEST_QUERY).toContain('commits')
     expect(PULL_REQUEST_QUERY).toContain('files')
     expect(PULL_REQUEST_QUERY).toContain('reviews')
+    expect(PULL_REQUEST_QUERY).toContain('isMinimized')
     expect(PULL_REQUEST_QUERY).toContain('baseRepository')
     expect(PULL_REQUEST_QUERY).toContain('headRepository')
   })
@@ -53,10 +56,12 @@ describe('executeIssueQuery', () => {
             totalCount: 1,
             nodes: [
               {
+                id: 'comment-1',
                 body: 'Comment',
                 createdAt: '2024-01-01T01:00:00Z',
                 author: {login: 'commenter'},
                 authorAssociation: 'MEMBER',
+                isMinimized: false,
               },
             ],
           },

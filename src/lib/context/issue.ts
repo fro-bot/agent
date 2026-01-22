@@ -31,10 +31,12 @@ export async function hydrateIssueContext(
   const commentsTruncated = issue.comments.totalCount > limitedComments.length
 
   const comments = limitedComments.map(c => ({
+    id: c.id,
     author: c.author?.login ?? null,
     body: c.body,
     createdAt: c.createdAt,
     authorAssociation: c.authorAssociation,
+    isMinimized: c.isMinimized,
   }))
 
   const labels = issue.labels.nodes.map(l => ({

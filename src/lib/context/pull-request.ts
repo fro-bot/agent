@@ -45,10 +45,12 @@ export async function hydratePullRequestContext(
   const commentsTruncated = pr.comments.totalCount > limitedComments.length
 
   const comments = limitedComments.map(c => ({
+    id: c.id,
     author: c.author?.login ?? null,
     body: c.body,
     createdAt: c.createdAt,
     authorAssociation: c.authorAssociation,
+    isMinimized: c.isMinimized,
   }))
 
   const allCommits = pr.commits.nodes
@@ -81,6 +83,7 @@ export async function hydratePullRequestContext(
     body: r.body,
     createdAt: r.createdAt,
     comments: r.comments.nodes.map(c => ({
+      id: c.id,
       author: c.author?.login ?? null,
       body: c.body,
       path: c.path,

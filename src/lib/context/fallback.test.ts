@@ -32,6 +32,8 @@ describe('fallbackIssueContext', () => {
           listComments: vi.fn().mockResolvedValue({
             data: [
               {
+                id: 1001,
+                node_id: 'comment-1',
                 body: 'Comment 1',
                 created_at: '2024-01-01T01:00:00Z',
                 user: {login: 'user1'},

@@ -21,10 +21,12 @@ export const ISSUE_QUERY = `
         comments(first: $maxComments) {
           totalCount
           nodes {
+            id
             body
             createdAt
             author { login }
             authorAssociation
+            isMinimized
           }
         }
       }
@@ -63,10 +65,12 @@ export const PULL_REQUEST_QUERY = `
         comments(first: $maxComments) {
           totalCount
           nodes {
+            id
             body
             createdAt
             author { login }
             authorAssociation
+            isMinimized
           }
         }
         commits(first: $maxCommits) {
@@ -96,6 +100,7 @@ export const PULL_REQUEST_QUERY = `
             author { login }
             comments(first: 10) {
               nodes {
+                id
                 body
                 path
                 line

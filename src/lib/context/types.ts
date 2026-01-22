@@ -34,10 +34,12 @@ export const DEFAULT_CONTEXT_BUDGET: ContextBudget = {
  * Comment in an issue or PR thread.
  */
 export interface ContextComment {
+  readonly id: string
   readonly author: string | null
   readonly body: string
   readonly createdAt: string
   readonly authorAssociation: string
+  readonly isMinimized: boolean
 }
 
 /**
@@ -89,6 +91,7 @@ export interface ContextReview {
  * Inline review comment on a pull request.
  */
 export interface ContextReviewComment {
+  readonly id: string
   readonly author: string | null
   readonly body: string
   readonly path: string
@@ -180,10 +183,12 @@ export interface IssueGraphQLResponse {
       readonly comments: {
         readonly totalCount: number
         readonly nodes: readonly {
+          readonly id: string
           readonly body: string
           readonly createdAt: string
           readonly author: {readonly login: string} | null
           readonly authorAssociation: string
+          readonly isMinimized: boolean
         }[]
       }
     } | null
@@ -215,10 +220,12 @@ export interface PullRequestGraphQLResponse {
       readonly comments: {
         readonly totalCount: number
         readonly nodes: readonly {
+          readonly id: string
           readonly body: string
           readonly createdAt: string
           readonly author: {readonly login: string} | null
           readonly authorAssociation: string
+          readonly isMinimized: boolean
         }[]
       }
       readonly commits: {
@@ -248,6 +255,7 @@ export interface PullRequestGraphQLResponse {
           readonly author: {readonly login: string} | null
           readonly comments: {
             readonly nodes: readonly {
+              readonly id: string
               readonly body: string
               readonly path: string
               readonly line: number | null

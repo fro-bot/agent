@@ -33,10 +33,12 @@ describe('hydratePullRequestContext', () => {
             totalCount: 1,
             nodes: [
               {
+                id: 'comment-1',
                 body: 'Comment',
                 createdAt: '2024-01-01T01:00:00Z',
                 author: {login: 'user'},
                 authorAssociation: 'MEMBER',
+                isMinimized: false,
               },
             ],
           },
@@ -82,6 +84,9 @@ describe('hydratePullRequestContext', () => {
     expect(result?.baseBranch).toBe('main')
     expect(result?.headBranch).toBe('feature-branch')
     expect(result?.isFork).toBe(false)
+    expect(result?.comments).toHaveLength(1)
+    expect(result?.comments[0]?.id).toBe('comment-1')
+    expect(result?.comments[0]?.isMinimized).toBe(false)
     expect(result?.commits).toHaveLength(2)
     expect(result?.files).toHaveLength(2)
     expect(result?.reviews).toHaveLength(1)

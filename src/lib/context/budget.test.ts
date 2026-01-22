@@ -79,7 +79,14 @@ describe('estimateContextSize', () => {
       labels: [{name: 'bug'}],
       assignees: [{login: 'dev1'}],
       comments: [
-        {author: 'user1', body: 'Comment text', createdAt: '2024-01-01T00:00:00Z', authorAssociation: 'MEMBER'},
+        {
+          id: 'comment-1',
+          author: 'user1',
+          body: 'Comment text',
+          createdAt: '2024-01-01T00:00:00Z',
+          authorAssociation: 'MEMBER',
+          isMinimized: false,
+        },
       ],
       commentsTruncated: false,
       totalComments: 1,
@@ -202,10 +209,12 @@ describe('formatContextForPrompt', () => {
       assignees: [{login: 'developer'}],
       comments: [
         {
+          id: 'comment-2',
           author: 'helper',
           body: 'Have you tried restarting?',
           createdAt: '2024-01-15T11:00:00Z',
           authorAssociation: 'CONTRIBUTOR',
+          isMinimized: false,
         },
       ],
       commentsTruncated: false,

@@ -21,10 +21,12 @@ export async function fallbackIssueContext(
     const bodyResult = truncateBody(issue.body ?? '', budget.maxBodyBytes)
 
     const comments = commentsResponse.data.slice(0, budget.maxComments).map(c => ({
+      id: c.node_id ?? String(c.id),
       author: c.user?.login ?? null,
       body: c.body ?? '',
       createdAt: c.created_at,
       authorAssociation: c.author_association,
+      isMinimized: false,
     }))
 
     const labels = (issue.labels ?? [])
@@ -89,10 +91,12 @@ export async function fallbackPullRequestContext(
     const isFork = headOwner == null || baseOwner !== headOwner
 
     const comments = commentsResponse.data.slice(0, budget.maxComments).map(c => ({
+      id: c.node_id ?? String(c.id),
       author: c.user?.login ?? null,
       body: c.body ?? '',
       createdAt: c.created_at,
       authorAssociation: c.author_association,
+      isMinimized: false,
     }))
 
     const commits = commitsResponse.data.slice(0, budget.maxCommits).map(c => ({

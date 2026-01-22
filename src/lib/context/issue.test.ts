@@ -29,16 +29,20 @@ describe('hydrateIssueContext', () => {
             totalCount: 2,
             nodes: [
               {
+                id: 'comment-1',
                 body: 'First comment',
                 createdAt: '2024-01-01T01:00:00Z',
                 author: {login: 'commenter1'},
                 authorAssociation: 'MEMBER',
+                isMinimized: false,
               },
               {
+                id: 'comment-2',
                 body: 'Second comment',
                 createdAt: '2024-01-01T02:00:00Z',
                 author: {login: 'commenter2'},
                 authorAssociation: 'CONTRIBUTOR',
+                isMinimized: true,
               },
             ],
           },
@@ -61,6 +65,10 @@ describe('hydrateIssueContext', () => {
     expect(result?.labels?.[0]?.name).toBe('bug')
     expect(result?.assignees).toHaveLength(1)
     expect(result?.comments).toHaveLength(2)
+    expect(result?.comments[0]?.id).toBe('comment-1')
+    expect(result?.comments[0]?.isMinimized).toBe(false)
+    expect(result?.comments[1]?.id).toBe('comment-2')
+    expect(result?.comments[1]?.isMinimized).toBe(true)
     expect(result?.bodyTruncated).toBe(false)
     expect(result?.commentsTruncated).toBe(false)
   })
@@ -139,7 +147,16 @@ describe('hydrateIssueContext', () => {
           assignees: {nodes: []},
           comments: {
             totalCount: 1,
-            nodes: [{body: 'Comment', createdAt: '2024-01-01T01:00:00Z', author: null, authorAssociation: 'NONE'}],
+            nodes: [
+              {
+                id: 'comment-3',
+                body: 'Comment',
+                createdAt: '2024-01-01T01:00:00Z',
+                author: null,
+                authorAssociation: 'NONE',
+                isMinimized: false,
+              },
+            ],
           },
         },
       },
@@ -158,10 +175,12 @@ describe('hydrateIssueContext', () => {
   it('marks comments as truncated when exceeding maxComments', async () => {
     // #given
     const manyComments = Array.from({length: 100}, (_, i) => ({
+      id: `comment-${i}`,
       body: `Comment ${i}`,
       createdAt: '2024-01-01T00:00:00Z',
       author: {login: `user${i}`},
       authorAssociation: 'NONE',
+      isMinimized: false,
     }))
     const mockResponse = {
       repository: {
