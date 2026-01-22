@@ -48,6 +48,7 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
       commentId: 999,
       defaultBranch: 'main',
       diffContext: null,
+      hydratedContext: null,
     },
     customPrompt: null,
     cacheStatus: 'hit',
