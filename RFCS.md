@@ -1,6 +1,8 @@
 # Fro Bot Agent - RFC Index
 
-**Generated:** 2026-01-17 **Total RFCs:** 19 **Implementation Strategy:** Sequential (RFC-001 → RFC-019)
+**Generated:** 2026-01-17
+**Total RFCs:** 19
+**Implementation Strategy:** Sequential (RFC-001 → RFC-019)
 
 ---
 
@@ -30,7 +32,7 @@ The agent harness enables OpenCode with oMo Sisyphus agent workflow to act as an
 | RFC-012 | Agent Execution & Main Action        | MUST     | High       | 1     | Superseded |
 | RFC-013 | SDK Execution Mode                   | MUST     | High       | 1     | Completed  |
 | RFC-014 | File Attachment Processing           | MUST     | Medium     | 2     | Completed  |
-| RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Pending    |
+| RFC-015 | GraphQL Context Hydration            | MUST     | High       | 2     | Completed  |
 | RFC-016 | Additional Triggers & Directives     | MUST     | Medium     | 2     | Completed  |
 | RFC-017 | Post-Action Cache Hook               | MUST     | Medium     | 2     | Completed  |
 | RFC-018 | Agent-Invokable Delegated Work Tools | MUST     | Medium     | 3     | Pending    |

@@ -6,10 +6,18 @@
  */
 
 import type {IssueCommentEvent} from '@octokit/webhooks-types'
+import type {HydratedContext} from '../context/types.js'
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext} from './types.js'
+import {
+  DEFAULT_CONTEXT_BUDGET,
+  fallbackIssueContext,
+  fallbackPullRequestContext,
+  hydrateIssueContext,
+  hydratePullRequestContext,
+} from '../context/index.js'
 import {getDefaultBranch} from '../github/api.js'
 import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
 import {collectDiffContext} from './diff-context.js'
@@ -50,6 +58,15 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
 
   const diffContext = await collectDiffContext(triggerContext, octokit, repo, logger)
 
+  const hydratedContext = await hydrateContext(
+    octokit,
+    ghContext.repo.owner,
+    ghContext.repo.repo,
+    target?.number ?? null,
+    issueType,
+    logger,
+  )
+
   logger.info('Collected agent context', {
     eventName: ghContext.eventName,
     repo,
@@ -57,6 +74,7 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
     issueType,
     hasComment: commentBody != null,
     hasDiffContext: diffContext != null,
+    hasHydratedContext: hydratedContext != null,
   })
 
   return {
@@ -73,5 +91,35 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
     commentId,
     defaultBranch: await getDefaultBranch(octokit, repo, logger),
     diffContext,
+    hydratedContext,
   }
+}
+
+async function hydrateContext(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  number: number | null,
+  issueType: 'issue' | 'pr' | null,
+  logger: Logger,
+): Promise<HydratedContext | null> {
+  if (number == null || issueType == null) {
+    return null
+  }
+
+  const budget = DEFAULT_CONTEXT_BUDGET
+
+  if (issueType === 'issue') {
+    const context = await hydrateIssueContext(octokit, owner, repo, number, budget, logger)
+    if (context != null) {
+      return context
+    }
+    return fallbackIssueContext(octokit, owner, repo, number, budget, logger)
+  }
+
+  const context = await hydratePullRequestContext(octokit, owner, repo, number, budget, logger)
+  if (context != null) {
+    return context
+  }
+  return fallbackPullRequestContext(octokit, owner, repo, number, budget, logger)
 }
