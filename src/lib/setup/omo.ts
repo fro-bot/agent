@@ -64,7 +64,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
           output += data.toString()
         },
       },
-      silent: true,
+      silent: false,
     })
 
     if (exitCode !== 0) {
