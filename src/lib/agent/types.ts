@@ -7,6 +7,7 @@
 
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {ErrorInfo} from '../comments/types.js'
+import type {HydratedContext} from '../context/types.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {ModelConfig, TokenUsage} from '../types.js'
@@ -29,6 +30,7 @@ export interface AgentContext {
   readonly commentId: number | null
   readonly defaultBranch: string
   readonly diffContext: DiffContext | null
+  readonly hydratedContext: HydratedContext | null
 }
 
 /**
