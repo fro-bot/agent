@@ -194,12 +194,12 @@ async function processEventStream(
         logger.debug('Token usage received', {tokens, model, cost})
       }
     } else if (event.type === 'session.error' && props.sessionID === sessionId) {
-      const errorString = props.error == null ? '' : String(props.error)
-      logger.error('Session error', {error: errorString})
+      logger.error('Session error', {error: props.error})
 
+      // Check if this is a recoverable LLM fetch error
       if (isLlmFetchError(props.error)) {
-        llmError = createLLMFetchError(errorString, model ?? undefined)
-        logger.info('Detected LLM fetch error (retryable)', {model})
+        const errorMessage = typeof props.error === 'string' ? props.error : String(props.error)
+        llmError = createLLMFetchError(errorMessage, model ?? undefined)
       }
     }
   }
@@ -207,16 +207,148 @@ async function processEventStream(
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
 }
 
-async function attemptExecution(
+const MAX_LLM_RETRIES = 3
+const RETRY_DELAY_MS = 5000
+
+const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
+Please continue where you left off. If you were in the middle of a task, resume it.
+If you had completed the task, confirm the completion.`
+
+interface PromptAttemptResult {
+  success: boolean
+  error: string | null
+  llmError: ErrorInfo | null
+  shouldRetry: boolean
+  eventStreamResult: EventStreamResult
+}
+
+async function sendPromptToSession(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  promptText: string,
+  fileParts: readonly FilePartInput[] | undefined,
+  config: ExecutionConfig | undefined,
+  logger: Logger,
+): Promise<PromptAttemptResult> {
+  const agentName = config?.agent ?? 'Sisyphus'
+
+  const events = await client.event.subscribe()
+
+  let eventStreamEnded = false
+  let eventStreamResult: EventStreamResult = {
+    tokens: null,
+    model: null,
+    cost: null,
+    prsCreated: [],
+    commitsCreated: [],
+    commentsPosted: 0,
+    llmError: null,
+  }
+
+  const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
+    .then(result => {
+      eventStreamResult = result
+    })
+    .catch(error => {
+      if (error instanceof Error && error.name !== 'AbortError') {
+        logger.debug('Event stream error', {error: error.message})
+      }
+    })
+    .finally(() => {
+      eventStreamEnded = true
+    })
+
+  const textPart: TextPartInput = {type: 'text', text: promptText}
+  const parts: (TextPartInput | FilePartInput)[] = [textPart]
+
+  if (fileParts != null && fileParts.length > 0) {
+    parts.push(...fileParts)
+    logger.info('Including file attachments in prompt', {count: fileParts.length})
+  }
+
+  const promptBody: {
+    agent?: string
+    model?: {modelID: string; providerID: string}
+    parts: (TextPartInput | FilePartInput)[]
+  } = {
+    agent: agentName,
+    parts,
+  }
+
+  if (config?.model != null) {
+    promptBody.model = {
+      providerID: config.model.providerID,
+      modelID: config.model.modelID,
+    }
+  }
+
+  logger.debug('Sending prompt to OpenCode', {sessionId})
+  const promptResponse = await client.session.prompt({
+    path: {id: sessionId},
+    body: promptBody,
+  })
+
+  // Grace period for event stream to flush
+  if (!eventStreamEnded) {
+    const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 2000))
+    await Promise.race([eventProcessingPromise, gracePeriod])
+  }
+
+  if (promptResponse.error != null) {
+    logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
+
+    const promptErrorLlm = isLlmFetchError(promptResponse.error)
+      ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
+      : eventStreamResult.llmError
+
+    return {
+      success: false,
+      error: String(promptResponse.error),
+      llmError: promptErrorLlm,
+      shouldRetry: promptErrorLlm != null,
+      eventStreamResult,
+    }
+  }
+
+  return {
+    success: true,
+    error: null,
+    llmError: null,
+    shouldRetry: false,
+    eventStreamResult,
+  }
+}
+
+export async function executeOpenCode(
   promptOptions: PromptOptions,
   logger: Logger,
-  config: ExecutionConfig | undefined,
-  abortController: AbortController,
+  config?: ExecutionConfig,
 ): Promise<AgentResult> {
   const startTime = Date.now()
+  const abortController = new AbortController()
+
+  const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  let timedOut = false
+
   let server: Awaited<ReturnType<typeof createOpencode>>['server'] | null = null
 
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true
+      logger.warning('Execution timeout reached', {timeoutMs})
+      abortController.abort()
+    }, timeoutMs)
+  }
+
+  logger.info('Executing OpenCode agent (SDK mode)', {
+    agent: config?.agent ?? 'Sisyphus',
+    hasModelOverride: config?.model != null,
+    timeoutMs,
+  })
+
   try {
+    // Create server and session ONCE (outside retry loop)
     const opencode = await createOpencode({
       signal: abortController.signal,
     })
@@ -233,267 +365,189 @@ async function attemptExecution(
     const sessionId = sessionResponse.data.id
     logger.debug('Session created', {sessionId})
 
-    const prompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
+    // Build initial prompt
+    const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
 
-    const agentName = config?.agent ?? 'Sisyphus'
-    logger.debug('Using agent', {agent: agentName})
+    // Track results - only from successful attempt (failed attempts waste tokens)
+    let finalTokens: TokenUsage | null = null
+    let finalModel: string | null = null
+    let finalCost: number | null = null
+    let finalPRs: string[] = []
+    let finalCommits: string[] = []
+    let finalComments = 0
+    let lastError: string | null = null
+    let lastLlmError: ErrorInfo | null = null
 
-    const events = await client.event.subscribe()
+    for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
+      if (timedOut) {
+        return {
+          success: false,
+          exitCode: 130,
+          duration: Date.now() - startTime,
+          sessionId,
+          error: `Execution timed out after ${timeoutMs}ms`,
+          tokenUsage: finalTokens,
+          model: finalModel,
+          cost: finalCost,
+          prsCreated: finalPRs,
+          commitsCreated: finalCommits,
+          commentsPosted: finalComments,
+          llmError: lastLlmError,
+        }
+      }
 
-    let eventStreamEnded = false
-    let eventStreamResult: EventStreamResult = {
-      tokens: null,
+      // Check remaining time before attempting (Issue #3)
+      const elapsedMs = Date.now() - startTime
+      const remainingMs = timeoutMs - elapsedMs
+      if (timeoutMs > 0 && remainingMs <= RETRY_DELAY_MS && attempt > 1) {
+        logger.warning('Insufficient time remaining for retry', {
+          remainingMs,
+          requiredMs: RETRY_DELAY_MS,
+          attempt,
+        })
+        break
+      }
+
+      // First attempt: send initial prompt. Retries: send continuation prompt
+      const promptToSend = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
+      const filePartsToSend = attempt === 1 ? promptOptions.fileParts : undefined
+
+      logger.debug('Sending prompt', {attempt, isRetry: attempt > 1})
+
+      try {
+        const attemptResult = await sendPromptToSession(
+          client,
+          sessionId,
+          promptToSend,
+          filePartsToSend,
+          config,
+          logger,
+        )
+
+        if (attemptResult.success) {
+          // Only track results from successful attempt (Issue #1 & #2)
+          const {eventStreamResult} = attemptResult
+          finalTokens = eventStreamResult.tokens
+          finalModel = eventStreamResult.model
+          finalCost = eventStreamResult.cost
+          finalPRs = [...eventStreamResult.prsCreated]
+          finalCommits = [...eventStreamResult.commitsCreated]
+          finalComments = eventStreamResult.commentsPosted
+
+          const duration = Date.now() - startTime
+          logger.info('OpenCode execution completed', {sessionId, durationMs: duration, attempts: attempt})
+
+          return {
+            success: true,
+            exitCode: 0,
+            duration,
+            sessionId,
+            error: null,
+            tokenUsage: finalTokens,
+            model: finalModel,
+            cost: finalCost,
+            prsCreated: finalPRs,
+            commitsCreated: finalCommits,
+            commentsPosted: finalComments,
+            llmError: null,
+          }
+        }
+
+        lastError = attemptResult.error
+        lastLlmError = attemptResult.llmError
+
+        if (!attemptResult.shouldRetry || attempt >= MAX_LLM_RETRIES) {
+          if (attemptResult.shouldRetry && attempt >= MAX_LLM_RETRIES) {
+            logger.warning('LLM fetch error: max retries exhausted', {
+              attempts: attempt,
+              error: attemptResult.error,
+            })
+          }
+          break
+        }
+
+        logger.warning('LLM fetch error detected, retrying with continuation prompt', {
+          attempt,
+          maxAttempts: MAX_LLM_RETRIES,
+          error: attemptResult.error,
+          delayMs: RETRY_DELAY_MS,
+          sessionId,
+        })
+
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        logger.error('Prompt attempt failed with exception', {attempt, error: errorMessage})
+
+        lastError = errorMessage
+        const caughtLlmError = isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null
+        lastLlmError = caughtLlmError
+
+        if (caughtLlmError == null || attempt >= MAX_LLM_RETRIES) {
+          if (caughtLlmError != null && attempt >= MAX_LLM_RETRIES) {
+            logger.warning('LLM fetch error: max retries exhausted', {attempts: attempt, error: errorMessage})
+          }
+          break
+        }
+
+        logger.warning('LLM fetch error detected (exception), retrying with continuation prompt', {
+          attempt,
+          maxAttempts: MAX_LLM_RETRIES,
+          error: errorMessage,
+          delayMs: RETRY_DELAY_MS,
+          sessionId,
+        })
+
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+      }
+    }
+
+    // All retries exhausted or non-retryable error
+    return {
+      success: false,
+      exitCode: 1,
+      duration: Date.now() - startTime,
+      sessionId,
+      error: lastError ?? 'Unknown error',
+      tokenUsage: finalTokens,
+      model: finalModel,
+      cost: finalCost,
+      prsCreated: finalPRs,
+      commitsCreated: finalCommits,
+      commentsPosted: finalComments,
+      llmError: lastLlmError,
+    }
+  } catch (error) {
+    const duration = Date.now() - startTime
+    const errorMessage = error instanceof Error ? error.message : String(error)
+
+    logger.error('OpenCode execution failed', {
+      error: errorMessage,
+      durationMs: duration,
+    })
+
+    const caughtLlmError = isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null
+
+    return {
+      success: false,
+      exitCode: 1,
+      duration,
+      sessionId: null,
+      error: errorMessage,
+      tokenUsage: null,
       model: null,
       cost: null,
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
-      llmError: null,
+      llmError: caughtLlmError,
     }
-
-    const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
-      .then(result => {
-        eventStreamResult = result
-      })
-      .catch(error => {
-        if (error instanceof Error && error.name !== 'AbortError') {
-          logger.debug('Event stream error', {error: error.message})
-        }
-      })
-      .finally(() => {
-        eventStreamEnded = true
-      })
-
-    const textPart: TextPartInput = {type: 'text', text: prompt}
-    const parts: (TextPartInput | FilePartInput)[] = [textPart]
-
-    if (promptOptions?.fileParts != null && promptOptions.fileParts.length > 0) {
-      parts.push(...promptOptions.fileParts)
-      logger.info('Including file attachments in prompt', {count: promptOptions.fileParts.length})
-    }
-
-    const promptBody: {
-      agent?: string
-      model?: {modelID: string; providerID: string}
-      parts: (TextPartInput | FilePartInput)[]
-    } = {
-      agent: agentName,
-      parts,
-    }
-
-    if (config?.model != null) {
-      promptBody.model = {
-        providerID: config.model.providerID,
-        modelID: config.model.modelID,
-      }
-    }
-
-    logger.debug('Sending prompt to OpenCode', {sessionId, body: promptBody})
-
-    const promptResponse = await client.session.prompt({
-      path: {id: sessionId},
-      body: promptBody,
-    })
-
-    // Give event stream a short grace period to flush remaining events
-    if (!eventStreamEnded) {
-      const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 1000))
-      await Promise.race([eventProcessingPromise, gracePeriod])
-    }
-
-    const responseError = 'error' in promptResponse ? promptResponse.error : null
-    if (responseError != null) {
-      const errorString = String(responseError)
-      logger.error('OpenCode prompt failed', {error: errorString})
-
-      const llmError =
-        eventStreamResult.llmError ??
-        (isLlmFetchError(errorString) ? createLLMFetchError(errorString, eventStreamResult.model ?? undefined) : null)
-
-      return {
-        success: false,
-        exitCode: 1,
-        duration: Date.now() - startTime,
-        sessionId,
-        error: errorString,
-        tokenUsage: eventStreamResult.tokens,
-        model: eventStreamResult.model,
-        cost: eventStreamResult.cost,
-        prsCreated: eventStreamResult.prsCreated,
-        commitsCreated: eventStreamResult.commitsCreated,
-        commentsPosted: eventStreamResult.commentsPosted,
-        llmError,
-      }
-    }
-
-    const duration = Date.now() - startTime
-    logger.info('OpenCode execution completed', {
-      sessionId,
-      durationMs: duration,
-    })
-
-    return {
-      success: true,
-      exitCode: 0,
-      duration,
-      sessionId,
-      error: null,
-      tokenUsage: eventStreamResult.tokens,
-      model: eventStreamResult.model,
-      cost: eventStreamResult.cost,
-      prsCreated: eventStreamResult.prsCreated,
-      commitsCreated: eventStreamResult.commitsCreated,
-      commentsPosted: eventStreamResult.commentsPosted,
-      llmError: null,
-    }
-  } finally {
-    server?.close()
-  }
-}
-
-const MAX_LLM_RETRIES = 3
-const RETRY_DELAY_MS = 5000
-
-export async function executeOpenCode(
-  promptOptions: PromptOptions,
-  logger: Logger,
-  config?: ExecutionConfig,
-): Promise<AgentResult> {
-  const startTime = Date.now()
-  const abortController = new AbortController()
-
-  const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  let timeoutId: ReturnType<typeof setTimeout> | null = null
-  let timedOut = false
-
-  if (timeoutMs > 0) {
-    timeoutId = setTimeout(() => {
-      timedOut = true
-      logger.warning('Execution timeout reached', {timeoutMs})
-      abortController.abort()
-    }, timeoutMs)
-  }
-
-  logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? 'Sisyphus',
-    hasModelOverride: config?.model != null,
-    timeoutMs,
-  })
-
-  let lastResult: AgentResult | null = null
-
-  try {
-    for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
-      if (attempt > 1) {
-        logger.info('Retrying execution after LLM fetch error', {attempt, maxRetries: MAX_LLM_RETRIES})
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
-      }
-
-      try {
-        lastResult = await attemptExecution(promptOptions, logger, config, abortController)
-
-        // Check if this was an LLM fetch error that should be retried
-        if (lastResult.llmError != null && attempt < MAX_LLM_RETRIES) {
-          logger.warning('LLM fetch error detected, will retry', {
-            attempt,
-            maxRetries: MAX_LLM_RETRIES,
-            error: lastResult.error,
-          })
-          continue
-        }
-
-        // Success or non-retryable error
-        break
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error)
-
-        if (isLlmFetchError(error) && attempt < MAX_LLM_RETRIES) {
-          logger.warning('LLM fetch error detected (exception), will retry', {
-            attempt,
-            maxRetries: MAX_LLM_RETRIES,
-            error: errorMessage,
-          })
-          lastResult = {
-            success: false,
-            exitCode: 1,
-            duration: Date.now() - startTime,
-            sessionId: null,
-            error: errorMessage,
-            tokenUsage: null,
-            model: null,
-            cost: null,
-            prsCreated: [],
-            commitsCreated: [],
-            commentsPosted: 0,
-            llmError: createLLMFetchError(errorMessage),
-          }
-          continue
-        }
-
-        // Non-retryable exception
-        logger.error('OpenCode execution failed', {
-          error: errorMessage,
-          durationMs: Date.now() - startTime,
-        })
-
-        const llmError = isLlmFetchError(error) ? createLLMFetchError(errorMessage) : null
-
-        return {
-          success: false,
-          exitCode: 1,
-          duration: Date.now() - startTime,
-          sessionId: null,
-          error: errorMessage,
-          tokenUsage: null,
-          model: null,
-          cost: null,
-          prsCreated: [],
-          commitsCreated: [],
-          commentsPosted: 0,
-          llmError,
-        }
-      }
-    }
-
-    if (timedOut) {
-      return {
-        success: false,
-        exitCode: 130,
-        duration: Date.now() - startTime,
-        sessionId: lastResult?.sessionId ?? null,
-        error: `Execution timed out after ${timeoutMs}ms`,
-        tokenUsage: lastResult?.tokenUsage ?? null,
-        model: lastResult?.model ?? null,
-        cost: lastResult?.cost ?? null,
-        prsCreated: lastResult?.prsCreated ?? [],
-        commitsCreated: lastResult?.commitsCreated ?? [],
-        commentsPosted: lastResult?.commentsPosted ?? 0,
-        llmError: lastResult?.llmError ?? null,
-      }
-    }
-
-    // Return the last result (success or final failure after retries)
-    return (
-      lastResult ?? {
-        success: false,
-        exitCode: 1,
-        duration: Date.now() - startTime,
-        sessionId: null,
-        error: 'No execution result',
-        tokenUsage: null,
-        model: null,
-        cost: null,
-        prsCreated: [],
-        commitsCreated: [],
-        commentsPosted: 0,
-        llmError: null,
-      }
-    )
   } finally {
     if (timeoutId != null) {
       clearTimeout(timeoutId)
     }
     abortController.abort()
+    server?.close()
   }
 }
 
