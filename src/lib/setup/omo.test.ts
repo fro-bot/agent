@@ -183,8 +183,8 @@ describe('omo', () => {
       // #then
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--chatgpt=no', '--gemini=no'],
-        expect.objectContaining({silent: true}),
+        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--copilot=no', '--gemini=no', '--openai=no'],
+        expect.objectContaining({silent: false}),
       )
     })
 
@@ -196,13 +196,13 @@ describe('omo', () => {
       })
 
       // #when
-      await installOmo(mockDeps, {claude: 'yes', chatgpt: 'yes', gemini: 'yes'})
+      await installOmo(mockDeps, {claude: 'yes', copilot: 'yes', gemini: 'yes', openai: 'yes'})
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--chatgpt=yes', '--gemini=yes'],
-        expect.objectContaining({silent: true}),
+        ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--copilot=yes', '--gemini=yes', '--openai=yes'],
+        expect.objectContaining({silent: false}),
       )
     })
 
