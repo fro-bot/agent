@@ -833,6 +833,123 @@ describe('LLM error detection', () => {
   })
 })
 
+describe('executeOpenCode event streaming termination reproduction', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('captures events that arrive after prompt returns', async () => {
+    // #given
+    const mockServer = createMockServer()
+    const events: Event[] = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ses_123',
+            role: 'assistant',
+            tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
+            modelID: 'gpt-4',
+            cost: 0.001,
+          },
+        },
+      } as unknown as Event,
+    ]
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockResolvedValue({data: {}}),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue({
+          stream: (async function* () {
+            yield {type: 'server.connected', properties: {}} as unknown as Event
+            await new Promise(resolve => setTimeout(resolve, 3000))
+            for (const event of events) {
+              yield event
+            }
+          })(),
+        }),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(2000)
+    await vi.advanceTimersByTimeAsync(1500)
+
+    const result = await resultPromise
+
+    // #then
+    expect(result.tokenUsage).toEqual({
+      input: 100,
+      output: 50,
+      reasoning: 0,
+      cache: {read: 0, write: 0},
+    })
+  })
+
+  it('stops waiting when session.idle event is received', async () => {
+    // #given
+    const mockServer = createMockServer()
+    let streamEnded = false
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockResolvedValue({data: {}}),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue({
+          stream: (async function* () {
+            yield {type: 'server.connected', properties: {}} as unknown as Event
+            yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+
+            yield {
+              type: 'message.updated',
+              properties: {
+                info: {
+                  sessionID: 'ses_123',
+                  role: 'assistant',
+                  tokens: {input: 200, output: 100, reasoning: 0, cache: {read: 0, write: 0}},
+                },
+              },
+            } as unknown as Event
+            streamEnded = true
+          })(),
+        }),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.tokenUsage).toBeNull()
+    expect(streamEnded).toBe(false)
+  })
+})
+
 describe('logServerEvent', () => {
   let mockLogger: Logger
 

@@ -185,6 +185,9 @@ async function processEventStream(
           llmError = createLLMFetchError(errorMessage, model ?? undefined)
         }
       }
+    } else if (event.type === 'session.idle' && event.properties.sessionID === sessionId) {
+      logger.debug('Session idle received, ending event stream', {sessionId})
+      break
     }
   }
 
@@ -192,8 +195,10 @@ async function processEventStream(
 }
 
 const MAX_LLM_RETRIES = 3
+// 5-second delay balances network recovery time with timeout constraints
 const RETRY_DELAY_MS = 5000
 
+// Prompt for resuming after transient network failures
 const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
 Please continue where you left off. If you were in the middle of a task, resume it.
 If you had completed the task, confirm the completion.`
@@ -218,7 +223,6 @@ async function sendPromptToSession(
 
   const events = await client.event.subscribe()
 
-  let eventStreamEnded = false
   let eventStreamResult: EventStreamResult = {
     tokens: null,
     model: null,
@@ -237,9 +241,6 @@ async function sendPromptToSession(
       if (error instanceof Error && error.name !== 'AbortError') {
         logger.debug('Event stream error', {error: error.message})
       }
-    })
-    .finally(() => {
-      eventStreamEnded = true
     })
 
   const textPart: TextPartInput = {type: 'text', text: promptText}
@@ -272,11 +273,8 @@ async function sendPromptToSession(
     body: promptBody,
   })
 
-  // Grace period for event stream to flush
-  if (!eventStreamEnded) {
-    const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 2000))
-    await Promise.race([eventProcessingPromise, gracePeriod])
-  }
+  // Wait for event stream to complete (session.idle or stream close)
+  await eventProcessingPromise
 
   if (promptResponse.error != null) {
     logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
