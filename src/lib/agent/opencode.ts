@@ -6,7 +6,7 @@
  * RFC-014 adds file attachment support via SDK file parts.
  */
 
-import type {FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+import type {Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {ErrorInfo} from '../comments/types.js'
 import type {Logger} from '../logger.js'
 import type {TokenUsage} from '../types.js'
@@ -47,35 +47,12 @@ function outputTextContent(text: string): void {
   process.stdout.write(`\n${text}\n`)
 }
 
-interface EventProperties {
-  part?: {
-    sessionID?: string
-    type?: string
-    text?: string
-    tool?: string
-    time?: {end?: number}
-    state?: {status?: string; title?: string; input?: Record<string, unknown>; output?: string}
-  }
-  message?: {
-    sessionID?: string
-    role?: string
-    modelID?: string
-    cost?: number
-    tokens?: {
-      input?: number
-      output?: number
-      reasoning?: number
-      cache?: {read?: number; write?: number}
-    }
-  }
-  info?: {id?: string; title?: string; version?: string}
-  sessionID?: string
-  error?: unknown
-}
-
-interface OpenCodeEvent {
-  type: string
-  properties: EventProperties
+/** Log a server event at debug level for troubleshooting. */
+export function logServerEvent(event: Event, logger: Logger): void {
+  logger.debug('Server event', {
+    eventType: event.type,
+    properties: event.properties,
+  })
 }
 
 interface EventStreamResult {
@@ -135,7 +112,7 @@ export function detectArtifacts(
 }
 
 async function processEventStream(
-  stream: AsyncIterable<OpenCodeEvent>,
+  stream: AsyncIterable<Event>,
   sessionId: string,
   logger: Logger,
 ): Promise<EventStreamResult> {
@@ -149,37 +126,40 @@ async function processEventStream(
   let llmError: ErrorInfo | null = null
 
   for await (const event of stream) {
-    const props = event.properties
+    logServerEvent(event, logger)
 
     if (event.type === 'message.part.updated') {
-      const part = props.part
-      if (part?.sessionID !== sessionId) continue
+      const part = event.properties.part
+      if (part.sessionID !== sessionId) continue
 
-      if (part.type === 'text' && typeof part.text === 'string') {
+      if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
         lastText = part.text
-        const endTime = part.time?.end
+        const endTime = 'time' in part ? part.time?.end : undefined
 
         if (endTime != null && Number.isFinite(endTime)) {
           outputTextContent(lastText)
           lastText = ''
         }
-      } else if (part.type === 'tool' && part.state?.status === 'completed') {
-        const toolName = part.tool ?? 'unknown'
-        const toolInput = part.state.input ?? {}
-        const title = part.state.title ?? (Object.keys(toolInput).length > 0 ? JSON.stringify(toolInput) : 'Unknown')
-        outputToolExecution(toolName, title)
+      } else if (part.type === 'tool') {
+        const toolState = part.state
+        if (toolState.status === 'completed') {
+          const toolName = part.tool
+          const toolInput = toolState.input
+          const title = toolState.title
+          outputToolExecution(toolName, title)
 
-        if (toolName.toLowerCase() === 'bash') {
-          const command = String(toolInput.command ?? toolInput.cmd ?? '')
-          const output = String(part.state.output ?? '')
-          detectArtifacts(command, output, prsCreated, commitsCreated, () => {
-            commentsPosted++
-          })
+          if (toolName.toLowerCase() === 'bash') {
+            const command = String(toolInput.command ?? toolInput.cmd ?? '')
+            const output = String(toolState.output)
+            detectArtifacts(command, output, prsCreated, commitsCreated, () => {
+              commentsPosted++
+            })
+          }
         }
       }
     } else if (event.type === 'message.updated') {
-      const msg = props.message
-      if (msg?.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+      const msg = event.properties.info
+      if (msg.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
         tokens = {
           input: msg.tokens.input ?? 0,
           output: msg.tokens.output ?? 0,
@@ -193,13 +173,17 @@ async function processEventStream(
         cost = msg.cost ?? null
         logger.debug('Token usage received', {tokens, model, cost})
       }
-    } else if (event.type === 'session.error' && props.sessionID === sessionId) {
-      logger.error('Session error', {error: props.error})
+    } else if (event.type === 'session.error') {
+      const errorSessionID = event.properties.sessionID
+      if (errorSessionID === sessionId) {
+        const sessionError = event.properties.error
+        logger.error('Session error', {error: sessionError})
 
-      // Check if this is a recoverable LLM fetch error
-      if (isLlmFetchError(props.error)) {
-        const errorMessage = typeof props.error === 'string' ? props.error : String(props.error)
-        llmError = createLLMFetchError(errorMessage, model ?? undefined)
+        // Check if this is a recoverable LLM fetch error
+        if (isLlmFetchError(sessionError)) {
+          const errorMessage = typeof sessionError === 'string' ? sessionError : String(sessionError)
+          llmError = createLLMFetchError(errorMessage, model ?? undefined)
+        }
       }
     }
   }
@@ -210,8 +194,8 @@ async function processEventStream(
 const MAX_LLM_RETRIES = 3
 const RETRY_DELAY_MS = 5000
 
-const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed). 
-Please continue where you left off. If you were in the middle of a task, resume it. 
+const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
+Please continue where you left off. If you were in the middle of a task, resume it.
 If you had completed the task, confirm the completion.`
 
 interface PromptAttemptResult {
@@ -245,7 +229,7 @@ async function sendPromptToSession(
     llmError: null,
   }
 
-  const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<OpenCodeEvent>, sessionId, logger)
+  const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<Event>, sessionId, logger)
     .then(result => {
       eventStreamResult = result
     })
