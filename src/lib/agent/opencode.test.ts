@@ -1,5 +1,5 @@
+import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
-import type {OpenCodeEvent} from './opencode.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as exec from '@actions/exec'
@@ -57,8 +57,8 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
   }
 }
 
-function createMockEventStream(events: OpenCodeEvent[] = []): {
-  stream: AsyncIterable<OpenCodeEvent>
+function createMockEventStream(events: Event[] = []): {
+  stream: AsyncIterable<Event>
 } {
   return {
     stream: (async function* () {
@@ -74,7 +74,7 @@ function createMockClient(options: {
   throwOnPrompt?: boolean
   throwOnCreate?: boolean
   throwOnLog?: boolean
-  events?: OpenCodeEvent[]
+  events?: Event[]
 }) {
   return {
     app: {
@@ -597,22 +597,27 @@ describe('executeOpenCode retry behavior', () => {
       event: {
         subscribe: vi.fn().mockImplementation(async () => {
           subscribeCallCount++
-          const events: OpenCodeEvent[] =
+          const events: Event[] =
             subscribeCallCount === 1
               ? []
               : [
                   {
                     type: 'message.updated',
                     properties: {
-                      message: {
+                      info: {
+                        id: 'msg_123',
                         sessionID: 'ses_123',
+                        parentID: '',
                         role: 'assistant',
                         tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
                         modelID: 'claude-sonnet-4-20250514',
                         cost: 0.001,
+                        time: {created: 0},
+                        system: '',
+                        parts: [],
                       },
                     },
-                  },
+                  } as unknown as Event,
                 ]
           return Promise.resolve(createMockEventStream(events))
         }),
@@ -842,7 +847,7 @@ describe('logServerEvent', () => {
 
   it('logs event with type and properties in debug mode', () => {
     // #given
-    const event: OpenCodeEvent = {
+    const event: Event = {
       type: 'session.idle',
       properties: {sessionID: 'ses_123'},
     }
@@ -859,7 +864,7 @@ describe('logServerEvent', () => {
 
   it('logs message.part.updated events with part details', () => {
     // #given
-    const event: OpenCodeEvent = {
+    const event = {
       type: 'message.part.updated',
       properties: {
         part: {
@@ -869,7 +874,7 @@ describe('logServerEvent', () => {
           state: {status: 'completed', title: 'git status'},
         },
       },
-    }
+    } as unknown as Event
 
     // #when
     logServerEvent(event, mockLogger)
@@ -890,13 +895,13 @@ describe('logServerEvent', () => {
 
   it('logs session.error events with error details', () => {
     // #given
-    const event: OpenCodeEvent = {
+    const event = {
       type: 'session.error',
       properties: {
         sessionID: 'ses_123',
         error: 'Connection timeout',
       },
-    }
+    } as unknown as Event
 
     // #when
     logServerEvent(event, mockLogger)

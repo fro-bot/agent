@@ -8,6 +8,8 @@ export interface OmoInstallOptions {
   copilot?: 'no' | 'yes'
   gemini?: 'no' | 'yes'
   openai?: 'no' | 'yes'
+  opencodeZen?: 'no' | 'yes'
+  zaiCodingPlan?: 'no' | 'yes'
 }
 
 export interface OmoInstallDeps {
@@ -28,9 +30,16 @@ export interface OmoInstallDeps {
  */
 export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOptions = {}): Promise<OmoInstallResult> {
   const {logger, execAdapter, toolCache, addPath} = deps
-  const {claude = 'no', copilot = 'no', gemini = 'no', openai = 'no'} = options
+  const {
+    claude = 'no',
+    copilot = 'no',
+    gemini = 'no',
+    openai = 'no',
+    opencodeZen = 'no',
+    zaiCodingPlan = 'no',
+  } = options
 
-  logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai})
+  logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan})
 
   // Ensure Bun is available (install if needed)
   const bunAvailable = await isBunAvailable(execAdapter)
@@ -53,6 +62,8 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     `--copilot=${copilot}`,
     `--gemini=${gemini}`,
     `--openai=${openai}`,
+    `--opencode-zen=${opencodeZen}`,
+    `--zai-coding-plan=${zaiCodingPlan}`,
   ]
 
   try {

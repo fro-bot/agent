@@ -1,19 +1,77 @@
+import type {OmoInstallOptions} from './omo.js'
 import type {ExecAdapter, SetupInputs, SetupResult, ToolCacheAdapter} from './types.js'
 import {join} from 'node:path'
 import process from 'node:process'
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
-import {getOctokit} from '@actions/github'
 
+import {getOctokit} from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from '../cache-key.js'
+import {DEFAULT_OMO_PROVIDERS} from '../constants.js'
 import {createLogger} from '../logger.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
+
+const VALID_OMO_PROVIDERS = [
+  'claude',
+  'claude-max20',
+  'copilot',
+  'gemini',
+  'openai',
+  'opencode-zen',
+  'zai-coding-plan',
+] as const
+
+function parseOmoProviders(input: string): OmoInstallOptions {
+  const providers = input
+    .split(',')
+    .map(p => p.trim().toLowerCase())
+    .filter(p => p.length > 0)
+
+  let claude: 'no' | 'yes' | 'max20' = 'no'
+  let copilot: 'no' | 'yes' = 'no'
+  let gemini: 'no' | 'yes' = 'no'
+  let openai: 'no' | 'yes' = 'no'
+  let opencodeZen: 'no' | 'yes' = 'no'
+  let zaiCodingPlan: 'no' | 'yes' = 'no'
+
+  for (const provider of providers) {
+    if (!VALID_OMO_PROVIDERS.includes(provider as (typeof VALID_OMO_PROVIDERS)[number])) {
+      continue
+    }
+
+    switch (provider) {
+      case 'claude':
+        claude = 'yes'
+        break
+      case 'claude-max20':
+        claude = 'max20'
+        break
+      case 'copilot':
+        copilot = 'yes'
+        break
+      case 'gemini':
+        gemini = 'yes'
+        break
+      case 'openai':
+        openai = 'yes'
+        break
+      case 'opencode-zen':
+        opencodeZen = 'yes'
+        break
+      case 'zai-coding-plan':
+        zaiCodingPlan = 'yes'
+        break
+    }
+  }
+
+  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan}
+}
 
 /**
  * Create tool cache adapter from @actions/tool-cache
@@ -114,10 +172,9 @@ export async function runSetup(): Promise<SetupResult | null> {
     })
 
     // Install oMo (graceful failure)
-    const omoResult = await installOmo(
-      {logger, execAdapter, toolCache, addPath: core.addPath},
-      {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no'},
-    )
+    const omoProvidersRaw = core.getInput('omo-providers').trim()
+    const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+    const omoResult = await installOmo({logger, execAdapter, toolCache, addPath: core.addPath}, omoOptions)
     if (omoResult.installed) {
       logger.info('oMo installed', {version: omoResult.version})
     } else {

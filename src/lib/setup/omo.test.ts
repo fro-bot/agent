@@ -183,7 +183,17 @@ describe('omo', () => {
       // #then
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=no', '--copilot=no', '--gemini=no', '--openai=no'],
+        [
+          'oh-my-opencode',
+          'install',
+          '--no-tui',
+          '--claude=no',
+          '--copilot=no',
+          '--gemini=no',
+          '--openai=no',
+          '--opencode-zen=no',
+          '--zai-coding-plan=no',
+        ],
         expect.objectContaining({silent: true}),
       )
     })
@@ -196,12 +206,29 @@ describe('omo', () => {
       })
 
       // #when
-      await installOmo(mockDeps, {claude: 'yes', copilot: 'yes', gemini: 'yes', openai: 'yes'})
+      await installOmo(mockDeps, {
+        claude: 'yes',
+        copilot: 'yes',
+        gemini: 'yes',
+        openai: 'yes',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+      })
 
       // #then
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        ['oh-my-opencode', 'install', '--no-tui', '--claude=yes', '--copilot=yes', '--gemini=yes', '--openai=yes'],
+        [
+          'oh-my-opencode',
+          'install',
+          '--no-tui',
+          '--claude=yes',
+          '--copilot=yes',
+          '--gemini=yes',
+          '--openai=yes',
+          '--opencode-zen=no',
+          '--zai-coding-plan=no',
+        ],
         expect.objectContaining({silent: true}),
       )
     })

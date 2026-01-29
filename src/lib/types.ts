@@ -57,6 +57,18 @@ export interface ActionInputs {
   // Setup consolidation: auto-setup inputs
   readonly opencodeVersion: string
   readonly skipCache: boolean
+  // oMo provider configuration
+  readonly omoProviders: OmoProviders
+}
+
+// oMo provider configuration for installer
+export interface OmoProviders {
+  readonly claude: 'no' | 'yes' | 'max20'
+  readonly copilot: 'no' | 'yes'
+  readonly gemini: 'no' | 'yes'
+  readonly openai: 'no' | 'yes'
+  readonly opencodeZen: 'no' | 'yes'
+  readonly zaiCodingPlan: 'no' | 'yes'
 }
 
 // Action outputs
