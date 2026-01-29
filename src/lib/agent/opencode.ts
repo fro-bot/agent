@@ -11,10 +11,14 @@ import type {ErrorInfo} from '../comments/types.js'
 import type {Logger} from '../logger.js'
 import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
+import * as crypto from 'node:crypto'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
+import {getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
@@ -351,6 +355,24 @@ export async function executeOpenCode(
 
     // Build initial prompt
     const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
+
+    // Write prompt artifact if enabled (RFC-018)
+    if (isOpenCodePromptArtifactEnabled()) {
+      const logPath = getOpenCodeLogPath()
+      const hash = crypto.createHash('sha256').update(initialPrompt).digest('hex')
+      const artifactPath = path.join(logPath, `prompt-${sessionId}-${hash.slice(0, 8)}.txt`)
+
+      try {
+        await fs.mkdir(logPath, {recursive: true})
+        await fs.writeFile(artifactPath, initialPrompt, 'utf8')
+        logger.info('Prompt artifact written', {hash, path: artifactPath})
+      } catch (error) {
+        logger.warning('Failed to write prompt artifact', {
+          error: error instanceof Error ? error.message : String(error),
+          path: artifactPath,
+        })
+      }
+    }
 
     // Track results - only from successful attempt (failed attempts waste tokens)
     let finalTokens: TokenUsage | null = null
