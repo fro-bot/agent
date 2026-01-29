@@ -1,6 +1,7 @@
 import type {Logger} from '../logger.js'
 import type {Octokit} from './types.js'
 import * as github from '@actions/github'
+import {toErrorMessage} from '../../utils/errors.js'
 
 export interface ClientOptions {
   readonly token: string
@@ -86,7 +87,7 @@ export async function createAppClient(options: AppClientOptions): Promise<Octoki
     })
   } catch (error) {
     logger.error('Failed to create GitHub App client', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
