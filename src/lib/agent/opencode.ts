@@ -73,9 +73,17 @@ interface EventProperties {
   error?: unknown
 }
 
-interface OpenCodeEvent {
+export interface OpenCodeEvent {
   type: string
   properties: EventProperties
+}
+
+/** Log a server event at debug level for troubleshooting. */
+export function logServerEvent(event: OpenCodeEvent, logger: Logger): void {
+  logger.debug('Server event', {
+    eventType: event.type,
+    properties: event.properties,
+  })
 }
 
 interface EventStreamResult {
@@ -149,6 +157,7 @@ async function processEventStream(
   let llmError: ErrorInfo | null = null
 
   for await (const event of stream) {
+    logServerEvent(event, logger)
     const props = event.properties
 
     if (event.type === 'message.part.updated') {

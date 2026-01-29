@@ -1,11 +1,12 @@
 import type {Logger} from '../logger.js'
+import type {OpenCodeEvent} from './opencode.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as exec from '@actions/exec'
 
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -54,11 +55,6 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
     cacheStatus: 'hit',
     ...overrides,
   }
-}
-
-interface OpenCodeEvent {
-  type: string
-  properties: Record<string, unknown>
 }
 
 function createMockEventStream(events: OpenCodeEvent[] = []): {
@@ -829,5 +825,89 @@ describe('LLM error detection', () => {
     // #then
     expect(result.success).toBe(true)
     expect(result.llmError).toBeNull()
+  })
+})
+
+describe('logServerEvent', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('logs event with type and properties in debug mode', () => {
+    // #given
+    const event: OpenCodeEvent = {
+      type: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    }
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    })
+  })
+
+  it('logs message.part.updated events with part details', () => {
+    // #given
+    const event: OpenCodeEvent = {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    }
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    })
+  })
+
+  it('logs session.error events with error details', () => {
+    // #given
+    const event: OpenCodeEvent = {
+      type: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    }
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    })
   })
 })
