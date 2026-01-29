@@ -2,11 +2,27 @@ import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
-import * as exec from '@actions/exec'
+import * as fs from 'node:fs/promises'
 
+import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import * as envUtils from '../../utils/env.js'
 import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
+
+// Mock node:fs/promises
+vi.mock('node:fs/promises', () => ({
+  mkdir: vi.fn(),
+  writeFile: vi.fn(),
+}))
+
+// Mock node:crypto
+vi.mock('node:crypto', () => ({
+  createHash: vi.fn().mockReturnValue({
+    update: vi.fn().mockReturnThis(),
+    digest: vi.fn().mockReturnValue('mock-hash'),
+  }),
+}))
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -244,6 +260,7 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
+
     const callArgs = vi.mocked(mockClient.session.prompt).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
@@ -373,6 +390,53 @@ describe('executeOpenCode', () => {
 
     // #then
     expect(mockClient.event.subscribe).toHaveBeenCalled()
+  })
+
+  it('writes prompt artifact when OPENCODE_PROMPT_ARTIFACT is enabled', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    vi.spyOn(envUtils, 'isOpenCodePromptArtifactEnabled').mockReturnValue(true)
+    vi.spyOn(envUtils, 'getOpenCodeLogPath').mockReturnValue('/tmp/opencode/log')
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(fs.mkdir).toHaveBeenCalledWith('/tmp/opencode/log', {recursive: true})
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining('/tmp/opencode/log/prompt-ses_123-mock-has.txt'),
+      'Built prompt with sessionId',
+      'utf8',
+    )
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.stringContaining('Prompt artifact written'),
+      expect.objectContaining({
+        hash: 'mock-hash',
+        path: expect.stringContaining('/tmp/opencode/log/prompt-') as unknown as string,
+      }),
+    )
+  })
+
+  it('does not write prompt artifact when OPENCODE_PROMPT_ARTIFACT is disabled', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    vi.spyOn(envUtils, 'isOpenCodePromptArtifactEnabled').mockReturnValue(false)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(fs.writeFile).not.toHaveBeenCalled()
   })
 })
 
@@ -679,7 +743,9 @@ describe('executeOpenCode retry behavior', () => {
 
     // #then
     expect(promptBodies.length).toBe(2)
+
     const firstBody = promptBodies[0] as {parts: {type: string; text: string}[]}
+
     const secondBody = promptBodies[1] as {parts: {type: string; text: string}[]}
     const firstPart = firstBody.parts[0]
     const secondPart = secondBody.parts[0]
