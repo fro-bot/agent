@@ -1,26 +1,12 @@
-import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import {describe, expect, it, vi} from 'vitest'
 import {getPRDiff} from '../reviews/index.js'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {collectDiffContext, MAX_FILES_IN_CONTEXT} from './diff-context.js'
 
 vi.mock('../reviews/index.js', () => ({
   getPRDiff: vi.fn(),
 }))
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(): Octokit {
-  return {} as Octokit
-}
 
 function createTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
   return {

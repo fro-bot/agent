@@ -1,34 +1,7 @@
-import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {branchExists, createBranch, deleteBranch, generateBranchName} from './branch.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(
-  overrides: {
-    getRef?: ReturnType<typeof vi.fn>
-    createRef?: ReturnType<typeof vi.fn>
-    deleteRef?: ReturnType<typeof vi.fn>
-  } = {},
-): Octokit {
-  return {
-    rest: {
-      git: {
-        getRef: overrides.getRef ?? vi.fn(),
-        createRef: overrides.createRef ?? vi.fn(),
-        deleteRef: overrides.deleteRef ?? vi.fn(),
-      },
-    },
-  } as unknown as Octokit
-}
 
 describe('createBranch', () => {
   let logger: Logger

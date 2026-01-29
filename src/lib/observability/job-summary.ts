@@ -1,6 +1,7 @@
 import type {Logger} from '../logger.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
+import {toErrorMessage} from '../../utils/errors.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
 
 /**
@@ -91,7 +92,7 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
     await core.summary.write()
     logger.debug('Wrote job summary')
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error)
+    const errorMsg = toErrorMessage(error)
     logger.warning('Failed to write job summary', {error: errorMsg})
     core.warning(`Failed to write job summary: ${errorMsg}`)
   }

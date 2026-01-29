@@ -4,6 +4,7 @@ import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import {toErrorMessage} from '../../utils/errors.js'
 import {extractFilename} from './parser.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 
@@ -130,7 +131,7 @@ export async function downloadAttachment(
   } catch (error) {
     logger.warning('Attachment download error', {
       url: attachment.url,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -177,7 +178,7 @@ export async function cleanupTempFiles(tempPaths: readonly string[], logger: Log
     } catch (error) {
       logger.debug('Failed to cleanup temp file', {
         path: tempPath,
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       })
     }
   }

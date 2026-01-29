@@ -9,6 +9,7 @@ import * as exec from '@actions/exec'
 import {getOctokit} from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from '../cache-key.js'
 import {DEFAULT_OMO_PROVIDERS} from '../constants.js'
 import {createLogger} from '../logger.js'
@@ -137,7 +138,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     try {
       authConfig = parseAuthJsonInput(inputs.authJson)
     } catch (error) {
-      core.setFailed(`Invalid auth-json: ${error instanceof Error ? error.message : String(error)}`)
+      core.setFailed(`Invalid auth-json: ${toErrorMessage(error)}`)
       return null
     }
 
@@ -148,7 +149,7 @@ export async function runSetup(): Promise<SetupResult | null> {
         version = await getLatestVersion(logger)
       } catch (error) {
         logger.warning('Failed to get latest version, using fallback', {
-          error: error instanceof Error ? error.message : String(error),
+          error: toErrorMessage(error),
         })
         version = FALLBACK_VERSION
       }
@@ -159,7 +160,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     try {
       opencodeResult = await installOpenCode(version, logger, toolCache, execAdapter)
     } catch (error) {
-      core.setFailed(`Failed to install OpenCode: ${error instanceof Error ? error.message : String(error)}`)
+      core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
       return null
     }
 
@@ -218,7 +219,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     } catch (error) {
       cacheStatus = 'corrupted'
       logger.warning('Cache restore failed', {
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       })
     }
 
@@ -240,7 +241,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     logger.info('Setup complete', {duration})
     return result
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     logger.error('Setup failed', {error: message})
     core.setFailed(message)
     return null

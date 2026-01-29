@@ -6,6 +6,7 @@ import * as exec from '@actions/exec'
 
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
 
 // Mock @actions/exec
@@ -23,15 +24,6 @@ vi.mock('@opencode-ai/sdk', () => ({
 vi.mock('./prompt.js', () => ({
   buildAgentPrompt: vi.fn().mockReturnValue('Built prompt with sessionId'),
 }))
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): PromptOptions {
   return {

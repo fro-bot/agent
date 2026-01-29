@@ -3,8 +3,9 @@ import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-
 import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
+
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {collectAgentContext} from './context.js'
 
 vi.mock('../github/context.js', () => ({
@@ -20,19 +21,6 @@ vi.mock('../github/api.js', () => ({
 vi.mock('./diff-context.js', () => ({
   collectDiffContext: vi.fn().mockResolvedValue(null),
 }))
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(): Octokit {
-  return {} as Octokit
-}
 
 function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
   return {

@@ -1,5 +1,6 @@
 import type {Logger} from '../logger.js'
 import type {Octokit} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 
 type ReactionContent = '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket' | 'eyes'
 
@@ -43,7 +44,7 @@ export async function createCommentReaction(
     logger.warning('Failed to create comment reaction', {
       commentId,
       content,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -74,7 +75,7 @@ export async function listCommentReactions(
   } catch (error) {
     logger.warning('Failed to list comment reactions', {
       commentId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return []
   }
@@ -104,7 +105,7 @@ export async function deleteCommentReaction(
     logger.warning('Failed to delete comment reaction', {
       commentId,
       reactionId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
@@ -142,7 +143,7 @@ export async function ensureLabelExists(
     }
     logger.warning('Failed to create label', {
       name,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
@@ -173,7 +174,7 @@ export async function addLabelsToIssue(
     logger.warning('Failed to add labels to issue', {
       issueNumber,
       labels,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
@@ -209,7 +210,7 @@ export async function removeLabelFromIssue(
     logger.warning('Failed to remove label from issue', {
       issueNumber,
       label,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
@@ -226,7 +227,7 @@ export async function getDefaultBranch(client: Octokit, repoString: string, logg
   } catch (error) {
     logger.warning('Failed to get default branch', {
       repo: repoString,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return 'main'
   }
@@ -247,7 +248,7 @@ export async function getUserByUsername(
   } catch (error) {
     logger.debug('Failed to get user by username', {
       username,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }

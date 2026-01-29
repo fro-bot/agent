@@ -2,6 +2,8 @@ import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCache
 import os from 'node:os'
 import process from 'node:process'
 
+import {toErrorMessage} from '../../utils/errors.js'
+
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 
@@ -106,7 +108,7 @@ export async function installOpenCode(
     logger.warning('Primary version install failed, trying fallback', {
       requestedVersion: version,
       fallbackVersion,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 
@@ -117,9 +119,7 @@ export async function installOpenCode(
       logger.info('Installed fallback version', {version: fallbackVersion})
       return result
     } catch (error) {
-      throw new Error(
-        `Failed to install OpenCode (tried ${version} and ${fallbackVersion}): ${error instanceof Error ? error.message : String(error)}`,
-      )
+      throw new Error(`Failed to install OpenCode (tried ${version} and ${fallbackVersion}): ${toErrorMessage(error)}`)
     }
   }
 

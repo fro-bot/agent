@@ -23,6 +23,7 @@ import {
   getOpenCodeStoragePath,
   getRunnerOS,
 } from './utils/env.js'
+import {toErrorMessage} from './utils/errors.js'
 
 export interface PostOptions {
   logger?: Logger
@@ -70,7 +71,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
     }
   } catch (error) {
     logger.warning('Post-action cache save failed (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 }

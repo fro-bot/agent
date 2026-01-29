@@ -1,17 +1,8 @@
-import type {Logger} from '../logger.js'
 import type {AttachmentLimits, DownloadedAttachment} from './types.js'
 import {describe, expect, it} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 import {validateAttachments} from './validator.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: () => {},
-    info: () => {},
-    warning: () => {},
-    error: () => {},
-  }
-}
 
 function createMockDownload(overrides: Partial<DownloadedAttachment> = {}): DownloadedAttachment {
   return {

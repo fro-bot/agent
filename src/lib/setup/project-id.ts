@@ -3,6 +3,8 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as exec from '@actions/exec'
 
+import {toErrorMessage} from '../../utils/errors.js'
+
 export type ProjectIdSource = 'cached' | 'generated' | 'error'
 
 export interface ProjectIdResult {
@@ -47,7 +49,7 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
     }
   } catch (error) {
     logger.debug('No cached project ID found', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 
@@ -94,13 +96,13 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
       logger.info('Project ID generated and cached', {projectId: firstRootCommit, source: 'generated'})
     } catch (writeError) {
       logger.warning('Failed to cache project ID (continuing)', {
-        error: writeError instanceof Error ? writeError.message : String(writeError),
+        error: toErrorMessage(writeError),
       })
     }
 
     return {projectId: firstRootCommit, source: 'generated'}
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error)
+    const errorMessage = toErrorMessage(error)
     return {projectId: null, source: 'error', error: errorMessage}
   }
 }

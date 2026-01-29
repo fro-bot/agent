@@ -1,19 +1,10 @@
-import type {Logger} from '../logger.js'
 import type {AttachmentUrl} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {cleanupTempFiles, downloadAttachment} from './downloader.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 function createMockAttachmentUrl(overrides: Partial<AttachmentUrl> = {}): AttachmentUrl {
   return {

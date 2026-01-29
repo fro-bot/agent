@@ -1,19 +1,12 @@
 import type {GitHubContext} from '../github/types.js'
+import type {Logger} from '../logger.js'
 import type {TriggerConfig} from './types.js'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {beforeEach, describe, expect, it} from 'vitest'
 import {classifyEventType} from '../github/context.js'
+import {createMockLogger} from '../test-helpers.js'
 import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {ALL_AUTHOR_ASSOCIATIONS, ALLOWED_ASSOCIATIONS} from './types.js'
-
-function createMockLogger() {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 function createMockGitHubContext(eventName: string, payload: unknown = {}): GitHubContext {
   return {
@@ -189,7 +182,7 @@ describe('extractCommand', () => {
 })
 
 describe('checkSkipConditions', () => {
-  let logger: ReturnType<typeof createMockLogger>
+  let logger: Logger
   let config: TriggerConfig
 
   beforeEach(() => {
@@ -468,7 +461,7 @@ describe('checkSkipConditions', () => {
 })
 
 describe('routeEvent', () => {
-  let logger: ReturnType<typeof createMockLogger>
+  let logger: Logger
 
   beforeEach(() => {
     logger = createMockLogger()

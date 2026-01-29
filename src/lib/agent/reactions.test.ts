@@ -3,6 +3,7 @@ import type {Logger} from '../logger.js'
 import type {ReactionContext} from './types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {
   acknowledgeReceipt,
   addEyesReaction,
@@ -12,32 +13,6 @@ import {
   updateReactionOnFailure,
   updateReactionOnSuccess,
 } from './reactions.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(): Octokit {
-  return {
-    rest: {
-      reactions: {
-        createForIssueComment: vi.fn().mockResolvedValue({data: {id: 123}}),
-        listForIssueComment: vi.fn().mockResolvedValue({data: []}),
-        deleteForIssueComment: vi.fn().mockResolvedValue({}),
-      },
-      issues: {
-        createLabel: vi.fn().mockResolvedValue({data: {}}),
-        addLabels: vi.fn().mockResolvedValue({data: {}}),
-        removeLabel: vi.fn().mockResolvedValue({data: {}}),
-      },
-    },
-  } as unknown as Octokit
-}
 
 function createMockReactionContext(overrides: Partial<ReactionContext> = {}): ReactionContext {
   return {

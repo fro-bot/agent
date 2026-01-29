@@ -1,5 +1,6 @@
 import type {Logger, PruneResult, PruningConfig} from './types.js'
 
+import {toErrorMessage} from '../../utils/errors.js'
 import {deleteSession, findProjectByDirectory, listSessionsForProject} from './storage.js'
 
 /**
@@ -109,7 +110,7 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     } catch (error) {
       logger.warning('Failed to prune session', {
         sessionId,
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       })
     }
   }

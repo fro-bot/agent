@@ -1,6 +1,8 @@
 import type {Buffer} from 'node:buffer'
 
 import type {ExecAdapter, Logger, OmoInstallResult, ToolCacheAdapter} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
+
 import {installBun, isBunAvailable} from './bun.js'
 
 export interface OmoInstallOptions {
@@ -48,7 +50,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     try {
       await installBun(logger, toolCache, execAdapter, addPath)
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
+      const errorMsg = toErrorMessage(error)
       logger.error('Failed to install Bun runtime', {error: errorMsg})
       return {installed: false, version: null, error: `Bun installation failed: ${errorMsg}`}
     }
@@ -93,7 +95,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     logger.info('oMo plugin installed', {version})
     return {installed: true, version, error: null}
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error)
+    const errorMsg = toErrorMessage(error)
     logger.error('Failed to install oMo plugin', {error: errorMsg})
     return {installed: false, version: null, error: errorMsg}
   }

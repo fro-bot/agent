@@ -1,6 +1,6 @@
-import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {
   addPRLabels,
   createPullRequest,
@@ -9,39 +9,6 @@ import {
   requestReviewers,
   updatePullRequest,
 } from './pull-request.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(
-  overrides: {
-    create?: ReturnType<typeof vi.fn>
-    list?: ReturnType<typeof vi.fn>
-    update?: ReturnType<typeof vi.fn>
-    addLabels?: ReturnType<typeof vi.fn>
-    requestReviewers?: ReturnType<typeof vi.fn>
-  } = {},
-): Octokit {
-  return {
-    rest: {
-      pulls: {
-        create: overrides.create ?? vi.fn(),
-        list: overrides.list ?? vi.fn(),
-        update: overrides.update ?? vi.fn(),
-        requestReviewers: overrides.requestReviewers ?? vi.fn(),
-      },
-      issues: {
-        addLabels: overrides.addLabels ?? vi.fn(),
-      },
-    },
-  } as unknown as Octokit
-}
 
 describe('createPullRequest', () => {
   let logger: Logger

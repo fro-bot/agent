@@ -1,6 +1,7 @@
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {ContextBudget, IssueContext, PullRequestContext} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {truncateBody} from './budget.js'
 
 export async function fallbackIssueContext(
@@ -60,7 +61,7 @@ export async function fallbackIssueContext(
       owner,
       repo,
       number,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -161,7 +162,7 @@ export async function fallbackPullRequestContext(
       owner,
       repo,
       number,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }

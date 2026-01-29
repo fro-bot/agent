@@ -1,6 +1,7 @@
 import type {CommentTarget, Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {DiscussionQueryResponse, Thread, ThreadComment} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
 
 const MAX_PAGES = 50
@@ -57,7 +58,7 @@ async function fetchIssueOrPR(
   } catch (error) {
     logger.warning('Failed to fetch issue/PR', {
       target,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -107,7 +108,7 @@ async function fetchAllComments(
       logger.warning('Failed to fetch comments page', {
         target,
         page,
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       })
       break
     }
@@ -212,7 +213,7 @@ async function fetchDiscussionThread(
   } catch (error) {
     logger.warning('Failed to fetch discussion', {
       target,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }

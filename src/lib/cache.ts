@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as cache from '@actions/cache'
+import {toErrorMessage} from '../utils/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey, type CacheKeyComponents} from './cache-key.js'
 import {STORAGE_VERSION} from './constants.js'
 
@@ -119,7 +120,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     }
   } catch (error) {
     logger.warning('Cache restore failed', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return {
       hit: false,
@@ -170,7 +171,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
     }
 
     logger.warning('Cache save failed', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
@@ -205,7 +206,7 @@ async function deleteAuthJson(authPath: string, storagePath: string, logger: Log
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       logger.warning('Failed to delete auth.json', {
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       })
     }
   }

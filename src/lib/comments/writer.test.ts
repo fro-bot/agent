@@ -2,66 +2,8 @@ import type {CommentTarget, Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {isBotComment, postComment} from './writer.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-    group: vi.fn(),
-    groupEnd: vi.fn(),
-    child: vi.fn(() => createMockLogger()),
-  } as unknown as Logger
-}
-
-function createMockOctokit(
-  overrides: {
-    createComment?: {id: number; html_url: string}
-    updateComment?: {id: number; html_url: string}
-    listComments?: unknown[]
-    getIssue?: unknown
-    graphql?: unknown
-  } = {},
-): Octokit {
-  return {
-    rest: {
-      issues: {
-        createComment: vi.fn().mockResolvedValue({
-          data: overrides.createComment ?? {
-            id: 999,
-            html_url: 'https://github.com/owner/repo/issues/1#issuecomment-999',
-          },
-        }),
-        updateComment: vi.fn().mockResolvedValue({
-          data: overrides.updateComment ?? {
-            id: 123,
-            html_url: 'https://github.com/owner/repo/issues/1#issuecomment-123',
-          },
-        }),
-        listComments: vi.fn().mockResolvedValue({
-          data: overrides.listComments ?? [],
-        }),
-        get: vi.fn().mockResolvedValue({
-          data: overrides.getIssue ?? {
-            number: 123,
-            title: 'Test Issue',
-            body: 'Issue body',
-            user: {login: 'testuser'},
-          },
-        }),
-      },
-    },
-    graphql: vi.fn().mockResolvedValue(
-      overrides.graphql ?? {
-        addDiscussionComment: {
-          comment: {id: 'DC_new123', url: 'https://github.com/owner/repo/discussions/42#discussioncomment-new123'},
-        },
-      },
-    ),
-  } as unknown as Octokit
-}
 
 describe('comments/writer', () => {
   let logger: Logger

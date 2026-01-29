@@ -2,6 +2,7 @@ import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {DiffContext} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {getPRDiff} from '../reviews/index.js'
 
 const MAX_FILES_IN_CONTEXT = 50
@@ -65,7 +66,7 @@ export async function collectDiffContext(
     return diffContext
   } catch (error) {
     logger.warning('Failed to fetch PR diff', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }

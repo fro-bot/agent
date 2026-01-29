@@ -1,6 +1,6 @@
-import type {Logger} from '../logger.js'
 import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
 import {
   classifyEventType,
@@ -23,15 +23,6 @@ vi.mock('@actions/github', () => ({
     payload: {},
   },
 }))
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 describe('classifyEventType', () => {
   it('classifies issue_comment as issue_comment', () => {

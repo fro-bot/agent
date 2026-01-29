@@ -1,5 +1,5 @@
-import type {Logger} from './lib/logger.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from './lib/test-helpers.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
@@ -15,15 +15,6 @@ vi.mock('./lib/cache.js', async importOriginal => {
     saveCache: vi.fn(),
   }
 })
-
-function createMockLogger(): Logger {
-  return {
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }
-}
 
 describe('post action', () => {
   beforeEach(() => {

@@ -1,16 +1,7 @@
-import type {Logger} from '../logger.js'
 import type {Octokit} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {createAppClient, createClient, getBotLogin} from './client.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 describe('createClient', () => {
   it('creates Octokit instance with token', () => {
