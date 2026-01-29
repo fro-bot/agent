@@ -3,71 +3,8 @@ import type {Logger} from '../logger.js'
 import type {Thread} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {findBotComment, readThread} from './reader.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-    group: vi.fn(),
-    groupEnd: vi.fn(),
-    child: vi.fn(() => createMockLogger()),
-  } as unknown as Logger
-}
-
-function createMockOctokit(
-  overrides: {
-    listComments?: unknown[]
-    getIssue?: unknown
-    graphql?: unknown
-  } = {},
-): Octokit {
-  return {
-    rest: {
-      issues: {
-        listComments: vi.fn().mockResolvedValue({
-          data: overrides.listComments ?? [],
-        }),
-        get: vi.fn().mockResolvedValue({
-          data: overrides.getIssue ?? {
-            number: 123,
-            title: 'Test Issue',
-            body: 'Issue body',
-            user: {login: 'testuser'},
-          },
-        }),
-      },
-      pulls: {
-        get: vi.fn().mockResolvedValue({
-          data: {
-            number: 456,
-            title: 'Test PR',
-            body: 'PR body',
-            user: {login: 'prauthor'},
-          },
-        }),
-      },
-    },
-    graphql: vi.fn().mockResolvedValue(
-      overrides.graphql ?? {
-        repository: {
-          discussion: {
-            id: 'D_kwDO123',
-            title: 'Test Discussion',
-            body: 'Discussion body',
-            author: {login: 'discauthor'},
-            comments: {
-              nodes: [],
-              pageInfo: {hasNextPage: false, endCursor: null},
-            },
-          },
-        },
-      },
-    ),
-  } as unknown as Octokit
-}
 
 describe('comments/reader', () => {
   let logger: Logger

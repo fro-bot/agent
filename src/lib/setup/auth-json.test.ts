@@ -3,16 +3,8 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {parseAuthJsonInput, populateAuthJson, verifyAuthJson} from './auth-json.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: () => {},
-    info: () => {},
-    warning: () => {},
-    error: () => {},
-  }
-}
 
 describe('parseAuthJsonInput', () => {
   // #given valid JSON input

@@ -1,7 +1,8 @@
 import type {OmoInstallDeps} from './omo.js'
-import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
+import type {ExecAdapter, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {installBun, isBunAvailable} from './bun.js'
 import {installOmo, verifyOmoInstallation} from './omo.js'
 
@@ -10,19 +11,6 @@ vi.mock('./bun.js', () => ({
   isBunAvailable: vi.fn(),
   installBun: vi.fn(),
 }))
-
-/**
- * Create a mock Logger for testing.
- * All methods are vi.fn() mocks that can be verified with toHaveBeenCalled.
- */
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 // Mock exec adapter
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {

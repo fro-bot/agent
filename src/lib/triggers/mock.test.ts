@@ -1,14 +1,7 @@
+import type {Logger} from '../logger.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {getMockEventConfig, getMockToken, isInCI, isMockEventEnabled, parseMockEvent} from './mock.js'
-
-function createMockLogger() {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 describe('isMockEventEnabled', () => {
   beforeEach(() => {
@@ -107,7 +100,7 @@ describe('getMockToken', () => {
 })
 
 describe('parseMockEvent', () => {
-  let logger: ReturnType<typeof createMockLogger>
+  let logger: Logger
 
   beforeEach(() => {
     vi.unstubAllEnvs()
@@ -201,7 +194,7 @@ describe('parseMockEvent', () => {
 })
 
 describe('getMockEventConfig', () => {
-  let logger: ReturnType<typeof createMockLogger>
+  let logger: Logger
 
   beforeEach(() => {
     vi.unstubAllEnvs()
