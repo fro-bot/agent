@@ -46,6 +46,13 @@ inputs:
     description: Skip session cache restore (default false)
     required: false
     default: 'false'
+  omo-providers:
+    description: >-
+      Comma-separated list of oMo providers to enable. Values: claude, claude-max20,
+      copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: opencode-zen
+      (uses free OpenCode models).
+    required: false
+    default: opencode-zen
 
 outputs:
   session-id:

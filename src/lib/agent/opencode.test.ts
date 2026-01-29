@@ -1,3 +1,4 @@
+import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
@@ -5,7 +6,7 @@ import * as exec from '@actions/exec'
 
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -56,13 +57,8 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
   }
 }
 
-interface OpenCodeEvent {
-  type: string
-  properties: Record<string, unknown>
-}
-
-function createMockEventStream(events: OpenCodeEvent[] = []): {
-  stream: AsyncIterable<OpenCodeEvent>
+function createMockEventStream(events: Event[] = []): {
+  stream: AsyncIterable<Event>
 } {
   return {
     stream: (async function* () {
@@ -78,7 +74,7 @@ function createMockClient(options: {
   throwOnPrompt?: boolean
   throwOnCreate?: boolean
   throwOnLog?: boolean
-  events?: OpenCodeEvent[]
+  events?: Event[]
 }) {
   return {
     app: {
@@ -601,22 +597,27 @@ describe('executeOpenCode retry behavior', () => {
       event: {
         subscribe: vi.fn().mockImplementation(async () => {
           subscribeCallCount++
-          const events: OpenCodeEvent[] =
+          const events: Event[] =
             subscribeCallCount === 1
               ? []
               : [
                   {
                     type: 'message.updated',
                     properties: {
-                      message: {
+                      info: {
+                        id: 'msg_123',
                         sessionID: 'ses_123',
+                        parentID: '',
                         role: 'assistant',
                         tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
                         modelID: 'claude-sonnet-4-20250514',
                         cost: 0.001,
+                        time: {created: 0},
+                        system: '',
+                        parts: [],
                       },
                     },
-                  },
+                  } as unknown as Event,
                 ]
           return Promise.resolve(createMockEventStream(events))
         }),
@@ -745,5 +746,173 @@ describe('ensureOpenCodeAvailable', () => {
       'OpenCode not found, running auto-setup',
       expect.objectContaining({requestedVersion: 'latest'}),
     )
+  })
+})
+
+describe('LLM error detection', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('detects fetch failed in exception thrown from executeOpenCode', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('fetch failed'))
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('llm_fetch_error')
+  })
+
+  it('detects ECONNREFUSED in exception thrown from executeOpenCode', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('ECONNREFUSED: connection refused'))
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(result.llmError?.type).toBe('llm_fetch_error')
+  })
+
+  it('returns null llmError for non-network errors in exception', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('Invalid API key'))
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.llmError).toBeNull()
+    expect(result.error).toContain('Invalid API key')
+  })
+
+  it('returns null llmError on successful execution', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Success'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.llmError).toBeNull()
+  })
+})
+
+describe('logServerEvent', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('logs event with type and properties in debug mode', () => {
+    // #given
+    const event: Event = {
+      type: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    }
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    })
+  })
+
+  it('logs message.part.updated events with part details', () => {
+    // #given
+    const event = {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    } as unknown as Event
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    })
+  })
+
+  it('logs session.error events with error details', () => {
+    // #given
+    const event = {
+      type: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    } as unknown as Event
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    })
   })
 })

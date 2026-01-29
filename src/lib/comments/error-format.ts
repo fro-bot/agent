@@ -111,6 +111,10 @@ const LLM_FETCH_ERROR_PATTERNS = [
   /network error/i,
 ] as const
 
+/**
+ * Detect if an error is an LLM fetch/network error.
+ * Handles string messages, Error objects, and objects with cause property.
+ */
 export function isLlmFetchError(error: unknown): boolean {
   if (error == null) return false
 
@@ -136,6 +140,10 @@ export function isLlmFetchError(error: unknown): boolean {
   return LLM_FETCH_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage))
 }
 
+/**
+ * Create LLM fetch error for network/connection failures.
+ * These are retryable transient errors that may succeed on retry.
+ */
 export function createLLMFetchError(message: string, model?: string): ErrorInfo {
   return createErrorInfo('llm_fetch_error', `LLM request failed: ${message}`, true, {
     details: model == null ? undefined : `Model: ${model}`,

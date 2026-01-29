@@ -15,6 +15,7 @@ export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 
 // Setup consolidation defaults
 export const DEFAULT_OPENCODE_VERSION = 'latest'
+export const DEFAULT_OMO_PROVIDERS = 'opencode-zen'
 
 // Retry configuration
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const

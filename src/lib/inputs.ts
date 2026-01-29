@@ -1,8 +1,14 @@
 import type {Result} from '@bfra.me/es/result'
-import type {ActionInputs, ModelConfig} from './types.js'
+import type {ActionInputs, ModelConfig, OmoProviders} from './types.js'
 import * as core from '@actions/core'
 import {validateJsonString, validatePositiveInteger} from '../utils/validation.js'
-import {DEFAULT_AGENT, DEFAULT_OPENCODE_VERSION, DEFAULT_SESSION_RETENTION, DEFAULT_TIMEOUT_MS} from './constants.js'
+import {
+  DEFAULT_AGENT,
+  DEFAULT_OMO_PROVIDERS,
+  DEFAULT_OPENCODE_VERSION,
+  DEFAULT_SESSION_RETENTION,
+  DEFAULT_TIMEOUT_MS,
+} from './constants.js'
 import {err, ok} from './types.js'
 
 /**
@@ -48,6 +54,64 @@ function parseTimeoutMs(value: string): number {
   }
 
   return parsed
+}
+
+const VALID_OMO_PROVIDERS = [
+  'claude',
+  'claude-max20',
+  'copilot',
+  'gemini',
+  'openai',
+  'opencode-zen',
+  'zai-coding-plan',
+] as const
+
+type OmoProviderInput = (typeof VALID_OMO_PROVIDERS)[number]
+
+function parseOmoProviders(input: string): OmoProviders {
+  const providers = input
+    .split(',')
+    .map(p => p.trim().toLowerCase())
+    .filter(p => p.length > 0)
+
+  let claude: 'no' | 'yes' | 'max20' = 'no'
+  let copilot: 'no' | 'yes' = 'no'
+  let gemini: 'no' | 'yes' = 'no'
+  let openai: 'no' | 'yes' = 'no'
+  let opencodeZen: 'no' | 'yes' = 'no'
+  let zaiCodingPlan: 'no' | 'yes' = 'no'
+
+  for (const provider of providers) {
+    if (!VALID_OMO_PROVIDERS.includes(provider as OmoProviderInput)) {
+      throw new Error(`Invalid omo-providers value: "${provider}". Valid values: ${VALID_OMO_PROVIDERS.join(', ')}`)
+    }
+
+    switch (provider) {
+      case 'claude':
+        claude = 'yes'
+        break
+      case 'claude-max20':
+        claude = 'max20'
+        break
+      case 'copilot':
+        copilot = 'yes'
+        break
+      case 'gemini':
+        gemini = 'yes'
+        break
+      case 'openai':
+        openai = 'yes'
+        break
+      case 'opencode-zen':
+        opencodeZen = 'yes'
+        break
+      case 'zai-coding-plan':
+        zaiCodingPlan = 'yes'
+        break
+    }
+  }
+
+  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan}
 }
 
 /**
@@ -108,6 +172,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
     const skipCache = skipCacheRaw === 'true'
 
+    const omoProvidersRaw = core.getInput('omo-providers').trim()
+    const omoProviders = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+
     return ok({
       githubToken,
       authJson,
@@ -121,6 +188,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       timeoutMs,
       opencodeVersion,
       skipCache,
+      omoProviders,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
