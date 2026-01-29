@@ -1,12 +1,13 @@
+import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as exec from '@actions/exec'
-import {createOpencode} from '@opencode-ai/sdk'
 
+import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../test-helpers.js'
-import {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -48,13 +49,8 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
   }
 }
 
-interface OpenCodeEvent {
-  type: string
-  properties: Record<string, unknown>
-}
-
-function createMockEventStream(events: OpenCodeEvent[] = []): {
-  stream: AsyncIterable<OpenCodeEvent>
+function createMockEventStream(events: Event[] = []): {
+  stream: AsyncIterable<Event>
 } {
   return {
     stream: (async function* () {
@@ -70,7 +66,7 @@ function createMockClient(options: {
   throwOnPrompt?: boolean
   throwOnCreate?: boolean
   throwOnLog?: boolean
-  events?: OpenCodeEvent[]
+  events?: Event[]
 }) {
   return {
     app: {
@@ -448,6 +444,244 @@ describe('verifyOpenCodeAvailable', () => {
   })
 })
 
+describe('executeOpenCode retry behavior', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  it('retries on LLM fetch error and succeeds on second attempt', async () => {
+    // #given
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          if (promptCallCount === 1) {
+            return Promise.resolve({error: 'fetch failed: network error'})
+          }
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then
+    expect(promptCallCount).toBe(2)
+    expect(result.success).toBe(true)
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'LLM fetch error detected, retrying with continuation prompt',
+      expect.any(Object),
+    )
+  })
+
+  it('stops retrying after MAX_LLM_RETRIES attempts', async () => {
+    // #given
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({error: 'fetch failed: network error'})
+        }),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+      await vi.advanceTimersByTimeAsync(2000)
+    }
+    const result = await resultPromise
+
+    // #then
+    expect(promptCallCount).toBe(3)
+    expect(result.success).toBe(false)
+    expect(result.llmError).not.toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('LLM fetch error: max retries exhausted', expect.any(Object))
+  })
+
+  it('does not retry on non-LLM errors', async () => {
+    // #given
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          return Promise.resolve({error: 'Invalid API key'})
+        }),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(promptCallCount).toBe(1)
+    expect(result.success).toBe(false)
+    expect(result.llmError).toBeNull()
+  })
+
+  it('only tracks results from successful attempt', async () => {
+    // #given
+    const mockServer = createMockServer()
+    let promptCallCount = 0
+    let subscribeCallCount = 0
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockImplementation(async () => {
+          promptCallCount++
+          if (promptCallCount === 1) {
+            return Promise.resolve({error: 'fetch failed'})
+          }
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+      },
+      event: {
+        subscribe: vi.fn().mockImplementation(async () => {
+          subscribeCallCount++
+          const events: Event[] =
+            subscribeCallCount === 1
+              ? []
+              : [
+                  {
+                    type: 'message.updated',
+                    properties: {
+                      info: {
+                        id: 'msg_123',
+                        sessionID: 'ses_123',
+                        parentID: '',
+                        role: 'assistant',
+                        tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
+                        modelID: 'claude-sonnet-4-20250514',
+                        cost: 0.001,
+                        time: {created: 0},
+                        system: '',
+                        parts: [],
+                      },
+                    },
+                  } as unknown as Event,
+                ]
+          return Promise.resolve(createMockEventStream(events))
+        }),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.tokenUsage).toEqual({
+      input: 100,
+      output: 50,
+      reasoning: 0,
+      cache: {read: 0, write: 0},
+    })
+  })
+
+  it('sends continuation prompt on retry instead of initial prompt', async () => {
+    // #given
+    const mockServer = createMockServer()
+    const promptBodies: unknown[] = []
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        prompt: vi.fn().mockImplementation(async (args: {body: unknown}) => {
+          promptBodies.push(args.body)
+          if (promptBodies.length === 1) {
+            return Promise.resolve({error: 'fetch failed'})
+          }
+          return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+        }),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    await resultPromise
+
+    // #then
+    expect(promptBodies.length).toBe(2)
+    const firstBody = promptBodies[0] as {parts: {type: string; text: string}[]}
+    const secondBody = promptBodies[1] as {parts: {type: string; text: string}[]}
+    const firstPart = firstBody.parts[0]
+    const secondPart = secondBody.parts[0]
+    expect(firstPart).toBeDefined()
+    expect(secondPart).toBeDefined()
+    expect(firstPart?.text).toBe('Built prompt with sessionId')
+    expect(secondPart?.text).toContain('interrupted by a network error')
+  })
+})
+
 describe('ensureOpenCodeAvailable', () => {
   let mockLogger: Logger
 
@@ -513,9 +747,11 @@ describe('LLM error detection', () => {
   beforeEach(() => {
     mockLogger = createMockLogger()
     vi.clearAllMocks()
+    vi.useFakeTimers()
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
@@ -524,7 +760,14 @@ describe('LLM error detection', () => {
     vi.mocked(createOpencode).mockRejectedValue(new Error('fetch failed'))
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
 
     // #then
     expect(result.success).toBe(false)
@@ -537,7 +780,14 @@ describe('LLM error detection', () => {
     vi.mocked(createOpencode).mockRejectedValue(new Error('ECONNREFUSED: connection refused'))
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // Advance timers for all retry attempts (3 retries × 5000ms delay)
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+    }
+
+    const result = await resultPromise
 
     // #then
     expect(result.success).toBe(false)
@@ -572,5 +822,89 @@ describe('LLM error detection', () => {
     // #then
     expect(result.success).toBe(true)
     expect(result.llmError).toBeNull()
+  })
+})
+
+describe('logServerEvent', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('logs event with type and properties in debug mode', () => {
+    // #given
+    const event: Event = {
+      type: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    }
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.idle',
+      properties: {sessionID: 'ses_123'},
+    })
+  })
+
+  it('logs message.part.updated events with part details', () => {
+    // #given
+    const event = {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    } as unknown as Event
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'message.part.updated',
+      properties: {
+        part: {
+          sessionID: 'ses_123',
+          type: 'tool',
+          tool: 'bash',
+          state: {status: 'completed', title: 'git status'},
+        },
+      },
+    })
+  })
+
+  it('logs session.error events with error details', () => {
+    // #given
+    const event = {
+      type: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    } as unknown as Event
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then
+    expect(mockLogger.debug).toHaveBeenCalledWith('Server event', {
+      eventType: 'session.error',
+      properties: {
+        sessionID: 'ses_123',
+        error: 'Connection timeout',
+      },
+    })
   })
 })
