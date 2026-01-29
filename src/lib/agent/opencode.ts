@@ -20,7 +20,7 @@ import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
-import {DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -254,20 +254,19 @@ async function sendPromptToSession(
     logger.info('Including file attachments in prompt', {count: fileParts.length})
   }
 
+  const model =
+    config?.model == null
+      ? {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
+      : {providerID: config.model.providerID, modelID: config.model.modelID}
+
   const promptBody: {
     agent?: string
     model?: {modelID: string; providerID: string}
     parts: (TextPartInput | FilePartInput)[]
   } = {
     agent: agentName,
+    model,
     parts,
-  }
-
-  if (config?.model != null) {
-    promptBody.model = {
-      providerID: config.model.providerID,
-      modelID: config.model.modelID,
-    }
   }
 
   logger.debug('Sending prompt to OpenCode', {sessionId})

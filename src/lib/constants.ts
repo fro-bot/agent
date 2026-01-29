@@ -13,6 +13,12 @@ export const DEFAULT_MAX_AGE_DAYS = 30
 export const DEFAULT_AGENT = 'Sisyphus'
 export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 
+// Default model for OpenCode Zen - ensures inference starts
+export const DEFAULT_MODEL = {
+  providerID: 'opencode',
+  modelID: 'glm-4.7-free',
+} as const
+
 // Setup consolidation defaults
 export const DEFAULT_OPENCODE_VERSION = 'latest'
 export const DEFAULT_OMO_PROVIDERS = 'opencode-zen'

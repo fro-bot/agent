@@ -218,7 +218,7 @@ describe('executeOpenCode', () => {
     )
   })
 
-  it('does not include model when not configured', async () => {
+  it('uses default model when not configured', async () => {
     // #given
     const mockClient = createMockClient({
       promptResponse: {parts: [{type: 'text', text: 'Response'}]},
@@ -237,9 +237,12 @@ describe('executeOpenCode', () => {
 
     // #then
     const promptCalls = vi.mocked(mockClient.session.prompt).mock.calls
-    const firstCall = promptCalls[0] as [{body?: {model?: unknown}}] | undefined
+    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
     const promptCall = firstCall?.[0]
-    expect(promptCall?.body?.model).toBeUndefined()
+    expect(promptCall?.body?.model).toEqual({
+      providerID: 'opencode',
+      modelID: 'glm-4.7-free',
+    })
   })
 
   it('uses custom agent from config', async () => {
