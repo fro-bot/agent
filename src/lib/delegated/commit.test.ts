@@ -1,8 +1,8 @@
-import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 
 import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {
   createCommit,
   formatCommitMessage,
@@ -11,43 +11,6 @@ import {
   validateFiles,
   validateFileSize,
 } from './commit.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(
-  overrides: {
-    getRef?: ReturnType<typeof vi.fn>
-    getCommit?: ReturnType<typeof vi.fn>
-    createBlob?: ReturnType<typeof vi.fn>
-    createTree?: ReturnType<typeof vi.fn>
-    createCommit?: ReturnType<typeof vi.fn>
-    updateRef?: ReturnType<typeof vi.fn>
-    getContent?: ReturnType<typeof vi.fn>
-  } = {},
-): Octokit {
-  return {
-    rest: {
-      git: {
-        getRef: overrides.getRef ?? vi.fn(),
-        getCommit: overrides.getCommit ?? vi.fn(),
-        createBlob: overrides.createBlob ?? vi.fn(),
-        createTree: overrides.createTree ?? vi.fn(),
-        createCommit: overrides.createCommit ?? vi.fn(),
-        updateRef: overrides.updateRef ?? vi.fn(),
-      },
-      repos: {
-        getContent: overrides.getContent ?? vi.fn(),
-      },
-    },
-  } as unknown as Octokit
-}
 
 describe('validateFilePath', () => {
   it('accepts valid paths', () => {

@@ -1,7 +1,34 @@
 import type {Buffer} from 'node:buffer'
 
-import type {ExecAdapter, Logger, OmoInstallResult, ToolCacheAdapter} from './types.js'
-import {installBun, isBunAvailable} from './bun.js'
+import type {ExecAdapter, Logger, OmoInstallResult} from './types.js'
+
+import os from 'node:os'
+import {toErrorMessage} from '../../utils/errors.js'
+
+function getPlatformPackage(): string {
+  const platform = os.platform()
+  const arch = os.arch()
+
+  const platformMap: Record<string, string> = {
+    darwin: 'darwin',
+    linux: 'linux',
+    win32: 'windows',
+  }
+
+  const archMap: Record<string, string> = {
+    x64: 'x64',
+    arm64: 'arm64',
+  }
+
+  const mappedPlatform = platformMap[platform]
+  const mappedArch = archMap[arch]
+
+  if (mappedPlatform == null || mappedArch == null) {
+    return `oh-my-opencode-${platform}-${arch}`
+  }
+
+  return `oh-my-opencode-${mappedPlatform}-${mappedArch}`
+}
 
 export interface OmoInstallOptions {
   claude?: 'no' | 'yes' | 'max20'
@@ -15,21 +42,19 @@ export interface OmoInstallOptions {
 export interface OmoInstallDeps {
   logger: Logger
   execAdapter: ExecAdapter
-  toolCache: ToolCacheAdapter
-  addPath: (inputPath: string) => void
 }
 
 /**
  * Install Oh My OpenCode (oMo) plugin in headless mode.
  *
  * Adds Sisyphus agent capabilities to OpenCode with configurable model providers.
- * Automatically installs Bun runtime if not available, since oh-my-opencode
- * is built with `--target bun` and requires Bun runtime.
+ * Uses global npm install to ensure platform-specific binaries are properly
+ * installed via npm's optionalDependencies mechanism.
  *
  * See RFC-011-RESEARCH-SUMMARY.md for details.
  */
 export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOptions = {}): Promise<OmoInstallResult> {
-  const {logger, execAdapter, toolCache, addPath} = deps
+  const {logger, execAdapter} = deps
   const {
     claude = 'no',
     copilot = 'no',
@@ -41,21 +66,46 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
 
   logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan})
 
-  // Ensure Bun is available (install if needed)
-  const bunAvailable = await isBunAvailable(execAdapter)
-  if (!bunAvailable) {
-    logger.info('Bun not found, installing...')
-    try {
-      await installBun(logger, toolCache, execAdapter, addPath)
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      logger.error('Failed to install Bun runtime', {error: errorMsg})
-      return {installed: false, version: null, error: `Bun installation failed: ${errorMsg}`}
+  const platformPackage = getPlatformPackage()
+  logger.debug('Detected platform package', {platformPackage})
+
+  let output = ''
+
+  // Step 1: Install oh-my-opencode and platform binary globally
+  try {
+    const installExitCode = await execAdapter.exec(
+      'npm',
+      ['install', '-g', 'oh-my-opencode@latest', `${platformPackage}@latest`],
+      {
+        listeners: {
+          stdout: (data: Buffer) => {
+            output += data.toString()
+          },
+          stderr: (data: Buffer) => {
+            output += data.toString()
+          },
+        },
+        silent: true,
+        ignoreReturnCode: true,
+      },
+    )
+
+    if (installExitCode !== 0) {
+      const errorMsg = `npm install -g oh-my-opencode returned exit code ${installExitCode}`
+      logger.error(errorMsg, {output: output.slice(0, 1000)})
+      return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
+
+    logger.debug('oh-my-opencode package installed globally')
+  } catch (error) {
+    const errorMsg = toErrorMessage(error)
+    const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
+    logger.error('Failed to install oh-my-opencode package', {error: errorMsg, output: output.slice(0, 500)})
+    return {installed: false, version: null, error: `npm install -g failed: ${fullError}`}
   }
 
-  const args = [
-    'oh-my-opencode',
+  // Step 2: Run the oh-my-opencode installer
+  const installerArgs = [
     'install',
     '--no-tui',
     `--claude=${claude}`,
@@ -66,9 +116,9 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     `--zai-coding-plan=${zaiCodingPlan}`,
   ]
 
+  output = ''
   try {
-    let output = ''
-    const exitCode = await execAdapter.exec('bunx', args, {
+    const exitCode = await execAdapter.exec('oh-my-opencode', installerArgs, {
       listeners: {
         stdout: (data: Buffer) => {
           output += data.toString()
@@ -78,12 +128,13 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
         },
       },
       silent: true,
+      ignoreReturnCode: true,
     })
 
     if (exitCode !== 0) {
-      const errorMsg = `oMo installation returned exit code ${exitCode}`
-      logger.warning(errorMsg, {output: output.slice(0, 500)})
-      return {installed: false, version: null, error: errorMsg}
+      const errorMsg = `oh-my-opencode install returned exit code ${exitCode}`
+      logger.error(errorMsg, {output: output.slice(0, 1000)})
+      return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
 
     // Extract version from output if available
@@ -93,9 +144,10 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     logger.info('oMo plugin installed', {version})
     return {installed: true, version, error: null}
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error)
-    logger.error('Failed to install oMo plugin', {error: errorMsg})
-    return {installed: false, version: null, error: errorMsg}
+    const errorMsg = toErrorMessage(error)
+    const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
+    logger.error('Failed to run oMo installer', {error: errorMsg, output: output.slice(0, 500)})
+    return {installed: false, version: null, error: `oh-my-opencode install failed: ${fullError}`}
   }
 }
 

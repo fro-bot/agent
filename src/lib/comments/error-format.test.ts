@@ -1,10 +1,12 @@
 import {describe, expect, it} from 'vitest'
 import {
+  createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
   createRateLimitError,
   formatErrorComment,
+  isAgentNotFoundError,
   isLlmFetchError,
 } from './error-format.js'
 
@@ -241,6 +243,114 @@ describe('comments/error-format', () => {
       expect(formatted).toContain('LLM Fetch Error')
       // #then it should indicate it's retryable
       expect(formatted).toContain('retryable')
+    })
+  })
+
+  describe('isAgentNotFoundError', () => {
+    it('detects "agent not found" error messages', () => {
+      // #given various agent error messages
+      const errors = ['agent not found', 'Agent Not Found', 'Agent not found: sisyphus']
+
+      // #then all should be detected as agent errors
+      for (const msg of errors) {
+        expect(isAgentNotFoundError(msg)).toBe(true)
+      }
+    })
+
+    it('detects "unknown agent" error messages', () => {
+      // #given unknown agent messages
+      const errors = ['unknown agent: sisyphus', 'Unknown Agent']
+
+      // #then all should be detected as agent errors
+      for (const msg of errors) {
+        expect(isAgentNotFoundError(msg)).toBe(true)
+      }
+    })
+
+    it('detects "invalid agent" error messages', () => {
+      // #given invalid agent messages
+      const errors = ['invalid agent name', 'Invalid Agent']
+
+      // #then all should be detected as agent errors
+      for (const msg of errors) {
+        expect(isAgentNotFoundError(msg)).toBe(true)
+      }
+    })
+
+    it('detects "agent does not exist" patterns', () => {
+      // #given agent does not exist messages
+      const errors = ['agent sisyphus does not exist', 'Agent foo does not exist']
+
+      // #then all should be detected as agent errors
+      for (const msg of errors) {
+        expect(isAgentNotFoundError(msg)).toBe(true)
+      }
+    })
+
+    it('detects "no agent named" patterns', () => {
+      // #given no agent named messages
+      expect(isAgentNotFoundError('no agent named sisyphus')).toBe(true)
+    })
+
+    it('detects "agent is not available" patterns', () => {
+      // #given agent not available messages
+      expect(isAgentNotFoundError('agent sisyphus is not available')).toBe(true)
+    })
+
+    it('returns false for non-agent errors', () => {
+      // #given non-agent error messages
+      const errors = ['fetch failed', 'Rate limit exceeded', 'Permission denied', 'Invalid API key', '']
+
+      // #then none should be detected as agent errors
+      for (const msg of errors) {
+        expect(isAgentNotFoundError(msg)).toBe(false)
+      }
+    })
+
+    it('handles Error objects with message property', () => {
+      // #given an Error object
+      const error = new Error('agent not found')
+
+      // #then it should detect the error
+      expect(isAgentNotFoundError(error)).toBe(true)
+    })
+
+    it('handles objects with message property', () => {
+      // #given an object with message
+      const error = {message: 'unknown agent'}
+
+      // #then it should detect via message
+      expect(isAgentNotFoundError(error)).toBe(true)
+    })
+
+    it('handles null and undefined safely', () => {
+      // #then should return false without throwing
+      expect(isAgentNotFoundError(null)).toBe(false)
+      expect(isAgentNotFoundError(undefined)).toBe(false)
+    })
+  })
+
+  describe('createAgentError', () => {
+    it('creates non-retryable agent error', () => {
+      // #when creating an agent error
+      const error = createAgentError('agent not found', 'sisyphus')
+
+      // #then it should be correctly structured
+      expect(error.type).toBe('configuration')
+      expect(error.retryable).toBe(false)
+      expect(error.message).toContain('agent not found')
+      expect(error.details).toContain('sisyphus')
+      expect(error.suggestedAction).toBeDefined()
+    })
+
+    it('creates error without agent when not provided', () => {
+      // #when creating an agent error without agent name
+      const error = createAgentError('unknown agent error')
+
+      // #then it should work without agent details
+      expect(error.type).toBe('configuration')
+      expect(error.message).toContain('unknown agent error')
+      expect(error.details).toBeUndefined()
     })
   })
 })

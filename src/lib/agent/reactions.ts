@@ -1,6 +1,7 @@
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {ReactionContext} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {
   addLabelsToIssue,
   createCommentReaction,
@@ -89,7 +90,7 @@ export async function updateReactionOnSuccess(client: Octokit, ctx: ReactionCont
     logger.info('Updated reaction to success indicator', {commentId: ctx.commentId, reaction: 'hooray'})
   } catch (error) {
     logger.warning('Failed to update reaction (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 }
@@ -106,7 +107,7 @@ export async function updateReactionOnFailure(client: Octokit, ctx: ReactionCont
     logger.info('Updated reaction to confused', {commentId: ctx.commentId})
   } catch (error) {
     logger.warning('Failed to update failure reaction (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 }

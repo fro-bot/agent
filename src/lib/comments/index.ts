@@ -1,9 +1,11 @@
 export {
+  createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
   createRateLimitError,
   formatErrorComment,
+  isAgentNotFoundError,
   isLlmFetchError,
 } from './error-format.js'
 

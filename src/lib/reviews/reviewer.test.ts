@@ -1,6 +1,6 @@
-import type {Logger} from '../logger.js'
 import type {PRDiff, ReviewComment} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {
   getReviewComments,
   postReviewComment,
@@ -8,15 +8,6 @@ import {
   replyToReviewComment,
   submitReview,
 } from './reviewer.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 function createMockDiff(files: {filename: string; patch: string | null}[]): PRDiff {
   return {

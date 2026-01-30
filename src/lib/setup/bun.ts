@@ -4,6 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
+import {toErrorMessage} from '../../utils/errors.js'
+
 const TOOL_NAME = 'bun'
 const DOWNLOAD_BASE_URL = 'https://github.com/oven-sh/bun/releases/download'
 
@@ -119,7 +121,7 @@ export async function installBun(
     logger.info('Bun installed', {version, path: toolPath})
     return {path: toolPath, version, cached: false}
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error)
+    const errorMsg = toErrorMessage(error)
     throw new Error(`Failed to install Bun ${version}: ${errorMsg}`)
   }
 }
