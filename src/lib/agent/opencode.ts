@@ -11,15 +11,19 @@ import type {ErrorInfo} from '../comments/types.js'
 import type {Logger} from '../logger.js'
 import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
+import * as crypto from 'node:crypto'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {sleep} from '../../utils/async.js'
 import {outputTextContent, outputToolExecution} from '../../utils/console.js'
+import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
 import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
-import {DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -162,7 +166,20 @@ async function processEventStream(
           llmError = createLLMFetchError(errorMessage, model ?? undefined)
         }
       }
+    } else if (event.type === 'session.idle') {
+      const idleSessionID = event.properties.sessionID
+      if (idleSessionID === sessionId) {
+        if (lastText.length > 0) {
+          outputTextContent(lastText)
+          lastText = ''
+        }
+        break
+      }
     }
+  }
+
+  if (lastText.length > 0) {
+    outputTextContent(lastText)
   }
 
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
@@ -188,14 +205,16 @@ async function sendPromptToSession(
   sessionId: string,
   promptText: string,
   fileParts: readonly FilePartInput[] | undefined,
+  directory: string,
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
-  const agentName = config?.agent ?? 'Sisyphus'
+  const agentName = (config?.agent ?? 'Sisyphus').toLowerCase()
 
   const events = await client.event.subscribe()
+  const eventController =
+    'controller' in events ? ((events as {controller?: AbortController}).controller ?? null) : null
 
-  let eventStreamEnded = false
   let eventStreamResult: EventStreamResult = {
     tokens: null,
     model: null,
@@ -215,9 +234,6 @@ async function sendPromptToSession(
         logger.debug('Event stream error', {error: error.message})
       }
     })
-    .finally(() => {
-      eventStreamEnded = true
-    })
 
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart]
@@ -227,32 +243,36 @@ async function sendPromptToSession(
     logger.info('Including file attachments in prompt', {count: fileParts.length})
   }
 
+  const model =
+    config?.model == null
+      ? {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
+      : {providerID: config.model.providerID, modelID: config.model.modelID}
+
   const promptBody: {
     agent?: string
     model?: {modelID: string; providerID: string}
     parts: (TextPartInput | FilePartInput)[]
   } = {
     agent: agentName,
+    model,
     parts,
   }
 
-  if (config?.model != null) {
-    promptBody.model = {
-      providerID: config.model.providerID,
-      modelID: config.model.modelID,
-    }
-  }
-
   logger.debug('Sending prompt to OpenCode', {sessionId})
-  const promptResponse = await client.session.prompt({
+  const promptResponse = await client.session.promptAsync({
     path: {id: sessionId},
     body: promptBody,
+    query: {directory},
   })
 
-  // Grace period for event stream to flush
-  if (!eventStreamEnded) {
-    const gracePeriod = sleep(2000)
-    await Promise.race([eventProcessingPromise, gracePeriod])
+  if (promptResponse.error != null && eventController != null) {
+    eventController.abort()
+  }
+
+  await eventProcessingPromise
+
+  if (eventController != null) {
+    eventController.abort()
   }
 
   if (promptResponse.error != null) {
@@ -328,6 +348,25 @@ export async function executeOpenCode(
 
     // Build initial prompt
     const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
+    const directory = getGitHubWorkspace()
+
+    // Write prompt artifact if enabled (RFC-018)
+    if (isOpenCodePromptArtifactEnabled()) {
+      const logPath = getOpenCodeLogPath()
+      const hash = crypto.createHash('sha256').update(initialPrompt).digest('hex')
+      const artifactPath = path.join(logPath, `prompt-${sessionId}-${hash.slice(0, 8)}.txt`)
+
+      try {
+        await fs.mkdir(logPath, {recursive: true})
+        await fs.writeFile(artifactPath, initialPrompt, 'utf8')
+        logger.info('Prompt artifact written', {hash, path: artifactPath})
+      } catch (error) {
+        logger.warning('Failed to write prompt artifact', {
+          error: error instanceof Error ? error.message : String(error),
+          path: artifactPath,
+        })
+      }
+    }
 
     // Track results - only from successful attempt (failed attempts waste tokens)
     let finalTokens: TokenUsage | null = null
@@ -381,6 +420,7 @@ export async function executeOpenCode(
           sessionId,
           promptToSend,
           filePartsToSend,
+          directory,
           config,
           logger,
         )

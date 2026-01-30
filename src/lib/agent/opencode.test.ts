@@ -2,12 +2,29 @@ import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
-import * as exec from '@actions/exec'
+import * as fs from 'node:fs/promises'
+import process from 'node:process'
 
+import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import * as envUtils from '../../utils/env.js'
 import {createMockLogger} from '../test-helpers.js'
 import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
+
+// Mock node:fs/promises
+vi.mock('node:fs/promises', () => ({
+  mkdir: vi.fn(),
+  writeFile: vi.fn(),
+}))
+
+// Mock node:crypto
+vi.mock('node:crypto', () => ({
+  createHash: vi.fn().mockReturnValue({
+    update: vi.fn().mockReturnThis(),
+    digest: vi.fn().mockReturnValue('mock-hash'),
+  }),
+}))
 
 // Mock @actions/exec
 vi.mock('@actions/exec', () => ({
@@ -51,6 +68,7 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
 
 function createMockEventStream(events: Event[] = []): {
   stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
 } {
   return {
     stream: (async function* () {
@@ -58,6 +76,7 @@ function createMockEventStream(events: Event[] = []): {
         yield event
       }
     })(),
+    controller: {abort: vi.fn()},
   }
 }
 
@@ -78,7 +97,7 @@ function createMockClient(options: {
       create: options.throwOnCreate
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
-      prompt: options.throwOnPrompt
+      promptAsync: options.throwOnPrompt
         ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
         : vi.fn().mockResolvedValue({data: options.promptResponse}),
     },
@@ -150,16 +169,18 @@ describe('executeOpenCode', () => {
 
     // #then
     expect(mockClient.session.create).toHaveBeenCalled()
-    expect(mockClient.session.prompt).toHaveBeenCalledWith(
-      expect.objectContaining({
-        path: {id: 'ses_123'},
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        body: expect.objectContaining({
-          agent: 'Sisyphus',
-          parts: [{type: 'text', text: 'Built prompt with sessionId'}],
-        }),
-      }),
-    )
+    const promptCall = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as
+      | {
+          path?: {id?: string}
+          body?: {agent?: string; parts?: {type: string; text?: string}[]}
+          query?: {directory?: string}
+        }
+      | undefined
+
+    expect(promptCall?.path?.id).toBe('ses_123')
+    expect(promptCall?.body?.agent).toBe('sisyphus')
+    expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
+    expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
   })
 
@@ -172,7 +193,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'Sisyphus',
+      agent: 'sisyphus',
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
     }
@@ -181,7 +202,7 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.prompt).toHaveBeenCalledWith(
+    expect(mockClient.session.promptAsync).toHaveBeenCalledWith(
       expect.objectContaining({
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         body: expect.objectContaining({
@@ -194,7 +215,7 @@ describe('executeOpenCode', () => {
     )
   })
 
-  it('does not include model when not configured', async () => {
+  it('uses default model when not configured', async () => {
     // #given
     const mockClient = createMockClient({
       promptResponse: {parts: [{type: 'text', text: 'Response'}]},
@@ -203,7 +224,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'Sisyphus',
+      agent: 'sisyphus',
       model: null,
       timeoutMs: 1800000,
     }
@@ -212,10 +233,13 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    const promptCalls = vi.mocked(mockClient.session.prompt).mock.calls
-    const firstCall = promptCalls[0] as [{body?: {model?: unknown}}] | undefined
+    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
+    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
     const promptCall = firstCall?.[0]
-    expect(promptCall?.body?.model).toBeUndefined()
+    expect(promptCall?.body?.model).toEqual({
+      providerID: 'opencode',
+      modelID: 'glm-4.7-free',
+    })
   })
 
   it('uses custom agent from config', async () => {
@@ -236,10 +260,11 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    const callArgs = vi.mocked(mockClient.session.prompt).mock.calls[0]?.[0] as {
+
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
-    expect(callArgs?.body?.agent).toBe('CustomAgent')
+    expect(callArgs?.body?.agent).toBe('customagent')
   })
 
   it('returns success result on successful execution', async () => {
@@ -366,6 +391,82 @@ describe('executeOpenCode', () => {
     // #then
     expect(mockClient.event.subscribe).toHaveBeenCalled()
   })
+
+  it('flushes pending text on session.idle', async () => {
+    // #given
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+      events: [
+        {
+          type: 'message.part.updated',
+          properties: {
+            part: {sessionID: 'ses_123', type: 'text', text: 'Partial', time: {}},
+          },
+        } as unknown as Event,
+        {
+          type: 'session.idle',
+          properties: {sessionID: 'ses_123'},
+        } as unknown as Event,
+      ],
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(writeSpy).toHaveBeenCalledWith('\nPartial\n')
+    writeSpy.mockRestore()
+  })
+
+  it('writes prompt artifact when OPENCODE_PROMPT_ARTIFACT is enabled', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    vi.spyOn(envUtils, 'isOpenCodePromptArtifactEnabled').mockReturnValue(true)
+    vi.spyOn(envUtils, 'getOpenCodeLogPath').mockReturnValue('/tmp/opencode/log')
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(fs.mkdir).toHaveBeenCalledWith('/tmp/opencode/log', {recursive: true})
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining('/tmp/opencode/log/prompt-ses_123-mock-has.txt'),
+      'Built prompt with sessionId',
+      'utf8',
+    )
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.stringContaining('Prompt artifact written'),
+      expect.objectContaining({
+        hash: 'mock-hash',
+        path: expect.stringContaining('/tmp/opencode/log/prompt-') as unknown as string,
+      }),
+    )
+  })
+
+  it('does not write prompt artifact when OPENCODE_PROMPT_ARTIFACT is disabled', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    vi.spyOn(envUtils, 'isOpenCodePromptArtifactEnabled').mockReturnValue(false)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(fs.writeFile).not.toHaveBeenCalled()
+  })
 })
 
 describe('verifyOpenCodeAvailable', () => {
@@ -466,7 +567,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           if (promptCallCount === 1) {
             return Promise.resolve({error: 'fetch failed: network error'})
@@ -507,7 +608,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           return Promise.resolve({error: 'fetch failed: network error'})
         }),
@@ -545,7 +646,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           return Promise.resolve({error: 'Invalid API key'})
         }),
@@ -578,7 +679,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           if (promptCallCount === 1) {
             return Promise.resolve({error: 'fetch failed'})
@@ -645,7 +746,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async (args: {body: unknown}) => {
+        promptAsync: vi.fn().mockImplementation(async (args: {body: unknown}) => {
           promptBodies.push(args.body)
           if (promptBodies.length === 1) {
             return Promise.resolve({error: 'fetch failed'})
@@ -671,7 +772,9 @@ describe('executeOpenCode retry behavior', () => {
 
     // #then
     expect(promptBodies.length).toBe(2)
+
     const firstBody = promptBodies[0] as {parts: {type: string; text: string}[]}
+
     const secondBody = promptBodies[1] as {parts: {type: string; text: string}[]}
     const firstPart = firstBody.parts[0]
     const secondPart = secondBody.parts[0]
