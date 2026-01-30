@@ -1,11 +1,10 @@
 /**
  * GitHub context collection for agent prompt construction.
  *
- * Uses RFC-003 utilities (parseGitHubContext, getCommentTarget, etc.)
- * to extract all context from the GitHub Actions event payload.
+ * Uses TriggerContext (built by router.ts) which already has extracted
+ * comment data, author info, and target info. Avoids duplicating parsing.
  */
 
-import type {IssueCommentEvent} from '@octokit/webhooks-types'
 import type {HydratedContext} from '../context/types.js'
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
@@ -19,7 +18,6 @@ import {
   hydratePullRequestContext,
 } from '../context/index.js'
 import {getDefaultBranch} from '../github/api.js'
-import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
 import {collectDiffContext} from './diff-context.js'
 
 export interface CollectAgentContextOptions {
@@ -29,48 +27,34 @@ export interface CollectAgentContextOptions {
 }
 
 /**
- * Collect GitHub context from @actions/github event payload.
+ * Collect GitHub context from TriggerContext.
  *
- * Uses RFC-003 utilities to extract all context from the GitHub Actions
- * event payload. No workflow-level environment variables needed for
- * comment/issue data.
+ * TriggerContext is built by router.ts and contains all extracted data:
+ * - commentBody, commentId from payload
+ * - author.login for comment author
+ * - target.title for issue title
+ * - target.kind for issue type
+ *
+ * This function augments that with hydrated context and diff context.
  */
 export async function collectAgentContext(options: CollectAgentContextOptions): Promise<AgentContext> {
   const {logger, octokit, triggerContext} = options
-  const ghContext = parseGitHubContext(logger)
-  const repo = `${ghContext.repo.owner}/${ghContext.repo.repo}`
+  const {repo: repoInfo, ref, actor, runId, target, author, commentBody, commentId} = triggerContext
+  const repo = `${repoInfo.owner}/${repoInfo.repo}`
 
-  const target = getCommentTarget(ghContext)
-  const issueType: 'issue' | 'pr' | null = target?.type === 'issue' || target?.type === 'pr' ? target.type : null
-
-  let commentBody: string | null = null
-  let commentAuthor: string | null = null
-  let commentId: number | null = null
-  let issueTitle: string | null = null
-
-  if (ghContext.eventType === 'issue_comment') {
-    const payload = ghContext.payload as IssueCommentEvent
-    commentBody = payload.comment.body
-    commentAuthor = getCommentAuthor(payload)
-    commentId = payload.comment.id
-    issueTitle = payload.issue.title
-  }
+  const issueType = target?.kind === 'issue' || target?.kind === 'pr' ? target.kind : null
+  const issueNumber = target?.number ?? null
+  const issueTitle = target?.title ?? null
+  const commentAuthor = author?.login ?? null
 
   const diffContext = await collectDiffContext(triggerContext, octokit, repo, logger)
 
-  const hydratedContext = await hydrateContext(
-    octokit,
-    ghContext.repo.owner,
-    ghContext.repo.repo,
-    target?.number ?? null,
-    issueType,
-    logger,
-  )
+  const hydratedContext = await hydrateContext(octokit, repoInfo.owner, repoInfo.repo, issueNumber, issueType, logger)
 
   logger.info('Collected agent context', {
-    eventName: ghContext.eventName,
+    eventName: triggerContext.eventName,
     repo,
-    issueNumber: target?.number ?? null,
+    issueNumber,
     issueType,
     hasComment: commentBody != null,
     hasDiffContext: diffContext != null,
@@ -78,12 +62,12 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
   })
 
   return {
-    eventName: ghContext.eventName,
+    eventName: triggerContext.eventName,
     repo,
-    ref: ghContext.ref,
-    actor: ghContext.actor,
-    runId: String(ghContext.runId),
-    issueNumber: target?.number ?? null,
+    ref,
+    actor,
+    runId: String(runId),
+    issueNumber,
     issueTitle,
     issueType,
     commentBody,

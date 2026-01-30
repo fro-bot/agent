@@ -1,18 +1,11 @@
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
-import type {TriggerContext} from '../triggers/types.js'
+import type {TriggerContext, TriggerTarget} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {getCommentAuthor, getCommentTarget, parseGitHubContext} from '../github/context.js'
 
 import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {collectAgentContext} from './context.js'
-
-vi.mock('../github/context.js', () => ({
-  parseGitHubContext: vi.fn(),
-  getCommentTarget: vi.fn(),
-  getCommentAuthor: vi.fn(),
-}))
 
 vi.mock('../github/api.js', () => ({
   getDefaultBranch: vi.fn().mockResolvedValue('main'),
@@ -21,6 +14,17 @@ vi.mock('../github/api.js', () => ({
 vi.mock('./diff-context.js', () => ({
   collectDiffContext: vi.fn().mockResolvedValue(null),
 }))
+
+function createMockTarget(overrides: Partial<TriggerTarget> = {}): TriggerTarget {
+  return {
+    kind: 'issue',
+    number: 42,
+    title: 'Test Issue',
+    body: null,
+    locked: false,
+    ...overrides,
+  }
+}
 
 function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
   return {
@@ -42,57 +46,29 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
   }
 }
 
-function createMockGitHubContext(overrides: Record<string, unknown> = {}) {
-  const eventType = (overrides.eventType as string) ?? 'issue_comment'
-  const defaultPayload =
-    eventType === 'issue_comment'
-      ? {
-          comment: {id: 1, body: 'test comment', user: {login: 'test-user'}},
-          issue: {id: 1, title: 'Test Issue'},
-        }
-      : {}
-
-  return {
-    eventName: 'issue_comment',
-    eventType: 'issue_comment' as const,
-    repo: {owner: 'test-owner', repo: 'test-repo'},
-    ref: 'refs/heads/main',
-    sha: 'abc123',
-    runId: 12345,
-    actor: 'test-actor',
-    payload: defaultPayload,
-    ...overrides,
-  }
-}
-
 describe('collectAgentContext', () => {
   let mockLogger: Logger
   let mockOctokit: Octokit
-  let mockTriggerContext: TriggerContext
 
   beforeEach(() => {
     mockLogger = createMockLogger()
     mockOctokit = createMockOctokit()
-    mockTriggerContext = createMockTriggerContext()
     vi.clearAllMocks()
-
-    vi.mocked(parseGitHubContext).mockReturnValue(createMockGitHubContext())
-    vi.mocked(getCommentTarget).mockReturnValue(null)
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
   })
 
-  it('extracts basic context from GitHub Actions environment', async () => {
+  it('extracts basic context from TriggerContext', async () => {
     // #given
-    vi.mocked(parseGitHubContext).mockReturnValue(createMockGitHubContext())
+    const triggerContext = createMockTriggerContext()
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -102,26 +78,19 @@ describe('collectAgentContext', () => {
     expect(ctx.runId).toBe('12345')
   })
 
-  it('extracts comment details from issue_comment payload', async () => {
+  it('extracts comment details from TriggerContext', async () => {
     // #given
-    const mockPayload = {
-      comment: {
-        id: 999,
-        body: 'Please fix the bug',
-        user: {login: 'reporter'},
-      },
-      issue: {id: 1, title: 'Test Issue'},
-    }
-    vi.mocked(parseGitHubContext).mockReturnValue(
-      createMockGitHubContext({eventType: 'issue_comment', payload: mockPayload}),
-    )
-    vi.mocked(getCommentAuthor).mockReturnValue('reporter')
+    const triggerContext = createMockTriggerContext({
+      commentBody: 'Please fix the bug',
+      commentId: 999,
+      author: {login: 'reporter', association: 'MEMBER', isBot: false},
+    })
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -130,27 +99,21 @@ describe('collectAgentContext', () => {
     expect(ctx.commentId).toBe(999)
   })
 
-  it('extracts issue number and title from payload', async () => {
+  it('extracts issue number and title from target', async () => {
     // #given
-    const mockPayload = {
-      issue: {id: 123, title: 'Found a bug'},
-      comment: {id: 1, body: 'test', user: {login: 'user'}},
-    }
-    vi.mocked(parseGitHubContext).mockReturnValue(
-      createMockGitHubContext({eventType: 'issue_comment', payload: mockPayload}),
-    )
-    vi.mocked(getCommentTarget).mockReturnValue({
-      number: 123,
-      type: 'issue',
-      owner: 'test-owner',
-      repo: 'test-repo',
+    const triggerContext = createMockTriggerContext({
+      target: createMockTarget({
+        kind: 'issue',
+        number: 123,
+        title: 'Found a bug',
+      }),
     })
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -159,39 +122,39 @@ describe('collectAgentContext', () => {
     expect(ctx.issueType).toBe('issue')
   })
 
-  it('detects PR type when pull_request field is present', async () => {
+  it('detects PR type from target.kind', async () => {
     // #given
-    vi.mocked(parseGitHubContext).mockReturnValue(createMockGitHubContext())
-    vi.mocked(getCommentTarget).mockReturnValue({
-      number: 42,
-      type: 'pr',
-      owner: 'test-owner',
-      repo: 'test-repo',
+    const triggerContext = createMockTriggerContext({
+      target: createMockTarget({kind: 'pr', number: 42}),
     })
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
     expect(ctx.issueType).toBe('pr')
   })
 
-  it('returns null for comment fields on non-comment events', async () => {
+  it('returns null for comment fields when TriggerContext has nulls', async () => {
     // #given
-    vi.mocked(parseGitHubContext).mockReturnValue(
-      createMockGitHubContext({eventName: 'workflow_dispatch', eventType: 'workflow_dispatch'}),
-    )
-    vi.mocked(getCommentTarget).mockReturnValue(null)
+    const triggerContext = createMockTriggerContext({
+      eventName: 'workflow_dispatch',
+      eventType: 'workflow_dispatch',
+      commentBody: null,
+      commentId: null,
+      author: null,
+      target: null,
+    })
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -204,19 +167,16 @@ describe('collectAgentContext', () => {
 
   it('logs collected context info', async () => {
     // #given
-    const mockPayload = {
-      comment: {id: 1, body: 'test', user: {login: 'user'}},
-      issue: {id: 1, title: 'Test Issue'},
-    }
-    vi.mocked(parseGitHubContext).mockReturnValue(
-      createMockGitHubContext({eventType: 'issue_comment', payload: mockPayload}),
-    )
+    const triggerContext = createMockTriggerContext({
+      commentBody: 'test comment',
+      target: createMockTarget({kind: 'issue', number: 42}),
+    })
 
     // #when
     await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -226,19 +186,21 @@ describe('collectAgentContext', () => {
         eventName: 'issue_comment',
         repo: 'test-owner/test-repo',
         hasComment: true,
+        issueNumber: 42,
+        issueType: 'issue',
       }),
     )
   })
 
   it('defaults to "main" for defaultBranch', async () => {
     // #given
-    vi.mocked(parseGitHubContext).mockReturnValue(createMockGitHubContext())
+    const triggerContext = createMockTriggerContext()
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
@@ -247,13 +209,13 @@ describe('collectAgentContext', () => {
 
   it('returns null for diffContext when collectDiffContext returns null', async () => {
     // #given
-    vi.mocked(parseGitHubContext).mockReturnValue(createMockGitHubContext())
+    const triggerContext = createMockTriggerContext()
 
     // #when
     const ctx = await collectAgentContext({
       logger: mockLogger,
       octokit: mockOctokit,
-      triggerContext: mockTriggerContext,
+      triggerContext,
     })
 
     // #then
