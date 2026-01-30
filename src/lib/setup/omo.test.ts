@@ -141,7 +141,7 @@ describe('omo', () => {
 
       // #then
       expect(result.installed).toBe(false)
-      expect(result.error).toBe('Command not found')
+      expect(result.error).toContain('Command not found')
       expect(mockLogger.error).toHaveBeenCalled()
     })
 
@@ -252,9 +252,9 @@ describe('omo', () => {
 
       // #then
       expect(result.installed).toBe(false)
-      const warningCalls = (mockLogger.warning as ReturnType<typeof vi.fn>).mock.calls
-      expect(warningCalls.length).toBeGreaterThan(0)
-      const lastCall = warningCalls.at(-1)
+      const errorCalls = (mockLogger.error as ReturnType<typeof vi.fn>).mock.calls
+      expect(errorCalls.length).toBeGreaterThan(0)
+      const lastCall = errorCalls.at(-1)
       expect(lastCall?.[0]).toContain('exit code 1')
       expect(lastCall?.[1]).toBeDefined()
       expect(typeof lastCall?.[1]).toBe('object')

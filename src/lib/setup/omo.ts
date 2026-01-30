@@ -68,8 +68,8 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     `--zai-coding-plan=${zaiCodingPlan}`,
   ]
 
+  let output = ''
   try {
-    let output = ''
     const exitCode = await execAdapter.exec('bunx', args, {
       listeners: {
         stdout: (data: Buffer) => {
@@ -80,12 +80,13 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
         },
       },
       silent: true,
+      ignoreReturnCode: true,
     })
 
     if (exitCode !== 0) {
       const errorMsg = `oMo installation returned exit code ${exitCode}`
-      logger.warning(errorMsg, {output: output.slice(0, 500)})
-      return {installed: false, version: null, error: errorMsg}
+      logger.error(errorMsg, {output: output.slice(0, 1000)})
+      return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
 
     // Extract version from output if available
@@ -96,8 +97,9 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     return {installed: true, version, error: null}
   } catch (error) {
     const errorMsg = toErrorMessage(error)
-    logger.error('Failed to install oMo plugin', {error: errorMsg})
-    return {installed: false, version: null, error: errorMsg}
+    const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
+    logger.error('Failed to install oMo plugin', {error: errorMsg, output: output.slice(0, 500)})
+    return {installed: false, version: null, error: `bunx oh-my-opencode failed: ${fullError}`}
   }
 }
 
