@@ -7,6 +7,7 @@
 
 | File              | Purpose                                       |
 | ----------------- | --------------------------------------------- |
+| `index.ts`        | Public API entry point                        |
 | `types.ts`        | Type definitions for all delegated operations |
 | `branch.ts`       | Branch creation, existence checks, deletion   |
 | `commit.ts`       | Atomic multi-file commits via Git Data API    |
@@ -15,47 +16,41 @@
 ## KEY EXPORTS
 
 ```typescript
-// Branch operations
-createBranch(octokit, options, logger) // Create branch from base (idempotent)
-branchExists(octokit, options, logger) // Check if branch exists
-deleteBranch(octokit, options, logger) // Delete a branch
-generateBranchName(prefix, description) // Generate unique branch name
+// Branch (branch.ts)
+createBranch(octokit, options, logger)    // Idempotent branch creation
+branchExists(octokit, owner, repo, name) // Check if branch exists
+generateBranchName(prefix, suffix?)      // Unique branch name generation
 
-// Commit operations
-createCommit(octokit, options, logger) // Atomic multi-file commit via Git Data API
-getFileContent(octokit, options, logger) // Get file content at ref
-validateFilePath(path) // Security validation
-validateFiles(files) // Validate all files before commit
+// Commit (commit.ts)
+createCommit(octokit, options, logger)    // Atomic multi-file Git Data commit
+getFileContent(octokit, owner, repo, ...) // Read file content at specific ref
+validateFiles(files)                     // Security and size validation
+formatCommitMessage(type, scope, desc)   // Conventional commit formatting
 
-// PR operations
-createPullRequest(octokit, options, logger) // Create new PR
-findPRForBranch(octokit, options, logger) // Find existing open PR
-updatePullRequest(octokit, options, logger) // Update PR title/body
-addPRLabels(octokit, options, logger) // Add labels to PR
-requestReviewers(octokit, options, logger) // Request reviewers
+// Pull Request (pull-request.ts)
+createPullRequest(octokit, options, ...)  // Open new pull request
+findPRForBranch(octokit, owner, repo, ..) // Find open PR for head branch
+updatePullRequest(octokit, owner, repo,.) // Update PR title or body
+generatePRBody(options)                   // Markdown body with session info
 ```
 
 ## SECURITY
 
-- **Path validation**: Rejects `../`, `.git/`, and secret files (`.env`, `*.key`, `*.pem`)
-- **File size cap**: 5MB per file
+- **Path validation**: Rejects `../`, `.git/`, and secrets (`.env`, `auth.json`, etc.)
+- **File size cap**: 5MB per file (enforced in `validateFiles`)
 - **No force push**: `updateRef` always uses `force: false`
-- **Default author**: Uses `fro-bot[bot]` identity
-- **Forbidden files**: `.env`, `.env.*`, `credentials.json`, `auth.json`
-- **Forbidden extensions**: `.key`, `.pem`, `.p12`, `.pfx`
+- **Default author**: Uses `fro-bot[bot]@users.noreply.github.com`
 
 ## PATTERNS
 
-- **Atomic Commits**: Uses Git Data API (create blobs → create tree → create commit → update ref)
-- **Idempotent Branches**: `createBranch` handles "already exists" gracefully
-- **Conventional Commits**: `formatCommitMessage` generates `type(scope): description` format
-- **PR Body Generation**: `generatePRBody` includes context section and checklist
+- **Atomic Commits**: Uses Git Data API (blob → tree → commit → ref)
+- **Conventional Commits**: Enforces `type(scope): description` structure
+- **PR Attribution**: Bodies include session ID for auditability
 
 ## ANTI-PATTERNS
 
-| Forbidden           | Reason                                 |
-| ------------------- | -------------------------------------- |
-| Force push          | Always `force: false` on ref updates   |
-| Direct file writes  | Use Git Data API for atomic operations |
-| Skipping validation | Always validate paths before commit    |
-| Large commits       | Break into smaller, focused commits    |
+| Forbidden           | Reason                                    |
+| ------------------- | ----------------------------------------- |
+| Force push          | Always `force: false` to avoid data loss  |
+| Direct file writes  | Use Git Data API for atomic operations    |
+| Skipping validation | Always call `validateFiles` before commit |
