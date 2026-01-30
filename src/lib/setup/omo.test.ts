@@ -33,21 +33,19 @@ describe('omo', () => {
 
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
-      // #given
+      // #given - both npm install and oh-my-opencode install succeed
+      const execMock = vi
+        .fn()
+        .mockImplementation(
+          async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
+            if (options?.listeners?.stdout != null) {
+              options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
+            }
+            return 0
+          },
+        )
       const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({
-          exec: vi
-            .fn()
-            .mockImplementation(
-              async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
-                // Simulate successful output with version
-                if (options?.listeners?.stdout != null) {
-                  options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
-                }
-                return 0
-              },
-            ),
-        }),
+        execAdapter: createMockExecAdapter({exec: execMock}),
       })
 
       // #when
@@ -57,6 +55,14 @@ describe('omo', () => {
       expect(result.installed).toBe(true)
       expect(result.version).toBe('1.2.3')
       expect(result.error).toBeNull()
+      expect(execMock).toHaveBeenCalledTimes(2)
+      expect(execMock).toHaveBeenNthCalledWith(1, 'npm', ['install', '-g', 'oh-my-opencode@latest'], expect.any(Object))
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
+        expect.arrayContaining(['install']),
+        expect.any(Object),
+      )
     })
 
     it('returns success without version when version not in output', async () => {
@@ -85,12 +91,11 @@ describe('omo', () => {
       expect(result.error).toBeNull()
     })
 
-    it('returns failure on non-zero exit code', async () => {
-      // #given
+    it('returns failure when npm install -g fails', async () => {
+      // #given - first command (npm install -g) fails
+      const execMock = vi.fn().mockResolvedValue(1)
       const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({
-          exec: vi.fn().mockResolvedValue(1),
-        }),
+        execAdapter: createMockExecAdapter({exec: execMock}),
       })
 
       // #when
@@ -100,6 +105,23 @@ describe('omo', () => {
       expect(result.installed).toBe(false)
       expect(result.version).toBeNull()
       expect(result.error).toContain('exit code 1')
+      expect(execMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('returns failure when oh-my-opencode install fails', async () => {
+      // #given - npm install succeeds but oh-my-opencode install fails
+      const execMock = vi.fn().mockResolvedValueOnce(0).mockResolvedValueOnce(1)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      const result = await installOmo(mockDeps)
+
+      // #then
+      expect(result.installed).toBe(false)
+      expect(result.error).toContain('exit code 1')
+      expect(execMock).toHaveBeenCalledTimes(2)
     })
 
     it('returns failure on exception', async () => {
@@ -134,7 +156,7 @@ describe('omo', () => {
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('calls npx with headless options using defaults', async () => {
+    it('calls oh-my-opencode with headless options using defaults', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -144,11 +166,11 @@ describe('omo', () => {
       // #when
       await installOmo(mockDeps)
 
-      // #then
-      expect(execMock).toHaveBeenCalledWith(
-        'npx',
+      // #then - second call is oh-my-opencode install
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
         [
-          'oh-my-opencode@latest',
           'install',
           '--no-tui',
           '--claude=no',
@@ -162,7 +184,7 @@ describe('omo', () => {
       )
     })
 
-    it('calls npx with custom options when provided', async () => {
+    it('calls oh-my-opencode with custom options when provided', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -179,11 +201,11 @@ describe('omo', () => {
         zaiCodingPlan: 'no',
       })
 
-      // #then
-      expect(execMock).toHaveBeenCalledWith(
-        'npx',
+      // #then - second call is oh-my-opencode install with custom options
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
         [
-          'oh-my-opencode@latest',
           'install',
           '--no-tui',
           '--claude=yes',

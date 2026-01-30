@@ -21,7 +21,7 @@ export interface OmoInstallDeps {
  * Install Oh My OpenCode (oMo) plugin in headless mode.
  *
  * Adds Sisyphus agent capabilities to OpenCode with configurable model providers.
- * Uses npx for installation to ensure platform-specific binaries are properly
+ * Uses global npm install to ensure platform-specific binaries are properly
  * installed via npm's optionalDependencies mechanism.
  *
  * See RFC-011-RESEARCH-SUMMARY.md for details.
@@ -39,8 +39,39 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
 
   logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan})
 
-  const args = [
-    'oh-my-opencode@latest',
+  let output = ''
+
+  // Step 1: Install oh-my-opencode globally (ensures platform binary is installed)
+  try {
+    const installExitCode = await execAdapter.exec('npm', ['install', '-g', 'oh-my-opencode@latest'], {
+      listeners: {
+        stdout: (data: Buffer) => {
+          output += data.toString()
+        },
+        stderr: (data: Buffer) => {
+          output += data.toString()
+        },
+      },
+      silent: true,
+      ignoreReturnCode: true,
+    })
+
+    if (installExitCode !== 0) {
+      const errorMsg = `npm install -g oh-my-opencode returned exit code ${installExitCode}`
+      logger.error(errorMsg, {output: output.slice(0, 1000)})
+      return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
+    }
+
+    logger.debug('oh-my-opencode package installed globally')
+  } catch (error) {
+    const errorMsg = toErrorMessage(error)
+    const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
+    logger.error('Failed to install oh-my-opencode package', {error: errorMsg, output: output.slice(0, 500)})
+    return {installed: false, version: null, error: `npm install -g failed: ${fullError}`}
+  }
+
+  // Step 2: Run the oh-my-opencode installer
+  const installerArgs = [
     'install',
     '--no-tui',
     `--claude=${claude}`,
@@ -51,9 +82,9 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     `--zai-coding-plan=${zaiCodingPlan}`,
   ]
 
-  let output = ''
+  output = ''
   try {
-    const exitCode = await execAdapter.exec('npx', args, {
+    const exitCode = await execAdapter.exec('oh-my-opencode', installerArgs, {
       listeners: {
         stdout: (data: Buffer) => {
           output += data.toString()
@@ -67,7 +98,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     })
 
     if (exitCode !== 0) {
-      const errorMsg = `oMo installation returned exit code ${exitCode}`
+      const errorMsg = `oh-my-opencode install returned exit code ${exitCode}`
       logger.error(errorMsg, {output: output.slice(0, 1000)})
       return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
@@ -81,8 +112,8 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
   } catch (error) {
     const errorMsg = toErrorMessage(error)
     const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
-    logger.error('Failed to install oMo plugin', {error: errorMsg, output: output.slice(0, 500)})
-    return {installed: false, version: null, error: `npx oh-my-opencode failed: ${fullError}`}
+    logger.error('Failed to run oMo installer', {error: errorMsg, output: output.slice(0, 500)})
+    return {installed: false, version: null, error: `oh-my-opencode install failed: ${fullError}`}
   }
 }
 
