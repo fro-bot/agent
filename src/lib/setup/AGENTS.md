@@ -1,6 +1,6 @@
 # SETUP KNOWLEDGE BASE
 
-**Generated:** 2026-01-18
+**Generated:** 2026-01-29
 **Location:** `src/lib/setup/`
 
 ## OVERVIEW
@@ -17,19 +17,22 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 ├── omo.ts         # oh-my-opencode install (graceful fail)
 ├── gh-auth.ts     # gh CLI auth & Git user identity
 ├── auth-json.ts   # Temporary auth.json generation
-└── index.ts       # Public exports & type definitions
+├── project-id.ts  # Deterministic project ID generation
+├── types.ts       # Setup-specific types & interfaces
+└── index.ts       # Public exports
 ```
 
 ## CODE MAP
 
-| Symbol             | Type     | Location          | Role                         |
-| ------------------ | -------- | ----------------- | ---------------------------- |
-| `runSetup`         | Function | `setup.ts:65`     | Main orchestration           |
-| `installOpenCode`  | Function | `opencode.ts:85`  | CLI install + cache          |
-| `installBun`       | Function | `bun.ts:75`       | Runtime setup                |
-| `installOmo`       | Function | `omo.ts:28`       | Plugin setup (graceful fail) |
-| `configureGhAuth`  | Function | `gh-auth.ts:7`    | CLI authentication           |
-| `populateAuthJson` | Function | `auth-json.ts:41` | Secure credentials write     |
+| Symbol             | Type     | Location           | Role                          |
+| ------------------ | -------- | ------------------ | ----------------------------- |
+| `runSetup`         | Function | `setup.ts:124`     | Main orchestration            |
+| `installOpenCode`  | Function | `opencode.ts:87`   | CLI install + cache           |
+| `installBun`       | Function | `bun.ts:77`        | Runtime setup                 |
+| `installOmo`       | Function | `omo.ts:56`        | Plugin setup (graceful fail)  |
+| `configureGhAuth`  | Function | `gh-auth.ts:7`     | CLI authentication            |
+| `populateAuthJson` | Function | `auth-json.ts:41`  | Secure credentials write      |
+| `ensureProjectId`  | Function | `project-id.ts:35` | Deterministic ID for OpenCode |
 
 ## PATTERNS
 

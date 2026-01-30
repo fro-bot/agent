@@ -16,6 +16,7 @@
 // Diff operations
 getPRDiff(octokit, owner, repo, prNumber, logger)
 getFileContent(octokit, owner, repo, path, ref, logger)
+parseHunks(patch) // Parse diff chunks into startLine/lineCount
 
 // Review operations
 submitReview(octokit, options, logger)
@@ -24,20 +25,21 @@ getReviewComments(octokit, owner, repo, prNumber, logger)
 replyToReviewComment(octokit, owner, repo, prNumber, commentId, body, logger)
 prepareReviewComments(comments, diff, logger)
 
-// Types
+// Types & Constants
 ;(PRDiff, DiffFile, DiffHunk)
 ;(ReviewComment, ReviewEvent, ReviewResult)
 ;(SubmitReviewOptions, PreparedReviewComments)
 ;(ExistingReviewComment, SkippedReviewComment, SkipReason)
+;(PAGINATION_CONFIG, REVIEW_EVENTS, SKIP_REASONS)
 ```
 
 ## PATTERNS
 
-- **Bounded Pagination**: `getPRDiff` fetches up to MAX_PAGES (50) of 100 files each
-- **Modern API**: Uses `line`/`side` parameters (not deprecated `position`)
-- **Structured Skip Results**: `prepareReviewComments` returns `{ready, skipped}` with skip reasons
-- **Logger Injection**: All functions take `logger: Logger` as last parameter
-- **Null Patch Handling**: Binary files have `patch: null`; comments skipped with reason
+- **Bounded Pagination**: `getPRDiff` uses `PAGINATION_CONFIG` (max 50 pages of 100 files).
+- **Modern API**: Uses `line`/`side` (addition=RIGHT, deletion=LEFT) instead of `position`.
+- **Atomic Submission**: `submitReview` uses `createReview` to post all comments at once.
+- **Skip Transparency**: `prepareReviewComments` returns `{ready, skipped}` with reasons.
+- **Safe I/O**: `getFileContent` returns `null` on 404 instead of throwing.
 
 ## SKIP REASONS
 
@@ -53,4 +55,5 @@ prepareReviewComments(comments, diff, logger)
 | Using `position` parameter | Deprecated; use `line`/`side` instead       |
 | Ignoring `truncated` flag  | Large PRs may have incomplete diff data     |
 | Swallowing skip info       | Always return skipped comments with reasons |
-| Unbounded pagination       | Use PAGINATION_CONFIG limits                |
+| Manual patch parsing       | Use `parseHunks` for unified diff handling  |
+| Unbounded API calls        | Respect `PAGINATION_CONFIG` limits          |
