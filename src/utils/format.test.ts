@@ -78,4 +78,36 @@ describe('formatBytes', () => {
     // #then
     expect(result).toBe('15.0MB')
   })
+
+  it('throws for negative bytes', () => {
+    // #given
+    const bytes = -500
+
+    // #when + #then
+    expect(() => formatBytes(bytes)).toThrow('Invalid bytes value: -500')
+  })
+
+  it('throws for NaN', () => {
+    // #given
+    const bytes = Number.NaN
+
+    // #when + #then
+    expect(() => formatBytes(bytes)).toThrow('Invalid bytes value: NaN')
+  })
+
+  it('throws for Infinity', () => {
+    // #given
+    const bytes = Infinity
+
+    // #when + #then
+    expect(() => formatBytes(bytes)).toThrow('Invalid bytes value: Infinity')
+  })
+
+  it('throws for negative Infinity', () => {
+    // #given
+    const bytes = -Infinity
+
+    // #when + #then
+    expect(() => formatBytes(bytes)).toThrow('Invalid bytes value: -Infinity')
+  })
 })

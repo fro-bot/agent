@@ -1,5 +1,7 @@
 import type {Logger} from '../logger.js'
 import type {AttachmentLimits, DownloadedAttachment, SkippedAttachment, ValidatedAttachment} from './types.js'
+
+import {formatBytes} from '../../utils/format.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 
 interface ValidationResult {
@@ -109,10 +111,4 @@ function isMimeTypeAllowed(mime: string, allowedTypes: readonly string[]): boole
   }
 
   return false
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
 }

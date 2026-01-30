@@ -28,4 +28,36 @@ describe('sleep', () => {
     // #then
     expect(elapsed).toBeLessThan(20)
   })
+
+  it('throws for negative duration', async () => {
+    // #given
+    const delayMs = -100
+
+    // #when + #then
+    await expect(sleep(delayMs)).rejects.toThrow('Invalid sleep duration: -100')
+  })
+
+  it('throws for NaN duration', async () => {
+    // #given
+    const delayMs = Number.NaN
+
+    // #when + #then
+    await expect(sleep(delayMs)).rejects.toThrow('Invalid sleep duration: NaN')
+  })
+
+  it('throws for Infinity duration', async () => {
+    // #given
+    const delayMs = Infinity
+
+    // #when + #then
+    await expect(sleep(delayMs)).rejects.toThrow('Invalid sleep duration: Infinity')
+  })
+
+  it('throws for negative Infinity duration', async () => {
+    // #given
+    const delayMs = -Infinity
+
+    // #when + #then
+    await expect(sleep(delayMs)).rejects.toThrow('Invalid sleep duration: -Infinity')
+  })
 })

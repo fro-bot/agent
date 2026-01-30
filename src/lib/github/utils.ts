@@ -6,7 +6,7 @@ export function isNotFoundError(error: unknown): boolean {
   if (error == null || typeof error !== 'object') {
     return false
   }
-  return 'status' in error && (error as {status: number}).status === 404
+  return 'status' in error && (error as Record<string, unknown>).status === 404
 }
 
 /**

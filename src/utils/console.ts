@@ -14,12 +14,21 @@ const TOOL_COLORS: Record<string, [string, string]> = {
 } as const
 
 const ANSI_RESET = '\u001B[0m'
-const ANSI_DIM = '\u001B[0m\u001B[2m'
+const ANSI_DIM = '\u001B[2m'
+
+function useColor(): boolean {
+  return process.env.NO_COLOR == null
+}
 
 export function outputToolExecution(toolName: string, title: string): void {
-  const [displayName, color] = TOOL_COLORS[toolName.toLowerCase()] ?? [toolName, '\u001B[36m\u001B[1m']
-  const paddedName = displayName.padEnd(7, ' ')
-  process.stdout.write(`\n${color}|${ANSI_RESET}${ANSI_DIM} ${paddedName} ${ANSI_RESET}${title}\n`)
+  const [displayName, colorCode] = TOOL_COLORS[toolName.toLowerCase()] ?? [toolName, '\u001B[36m\u001B[1m']
+  const paddedName = displayName.padEnd(10, ' ')
+
+  if (useColor()) {
+    process.stdout.write(`\n${colorCode}|${ANSI_RESET}${ANSI_DIM} ${paddedName} ${ANSI_RESET}${title}\n`)
+  } else {
+    process.stdout.write(`\n| ${paddedName} ${title}\n`)
+  }
 }
 
 export function outputTextContent(text: string): void {
