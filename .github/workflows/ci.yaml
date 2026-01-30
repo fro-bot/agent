@@ -126,6 +126,7 @@ jobs:
         uses: ./
         env:
           SKIP_AGENT_EXECUTION: 'false'
+          OPENCODE_PROMPT_ARTIFACT: 'true'
         with:
           github-token: ${{ steps.get-app-token.outputs.token }}
           auth-json: ${{ secrets.AUTH_JSON }}
@@ -145,6 +146,7 @@ jobs:
 
           echo "OpenCode shared files:"
           ls -lA ~/.local/share/opencode || true
+          ls -lA ~/.local/share/opencode/log || true
 
           echo "Check oh-my-opencode installation:"
           bunx oh-my-opencode doctor || true
@@ -161,6 +163,13 @@ jobs:
 
           echo "OpenCode state files:"
           ls -lA ~/.local/state/opencode || true
+
+      - if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: opencode-logs
+          path: ~/.local/share/opencode/log
+          if-no-files-found: warn
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
