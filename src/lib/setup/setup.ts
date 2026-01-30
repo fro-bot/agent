@@ -175,7 +175,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     // Install oMo (required)
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-    const omoResult = await installOmo({logger, execAdapter, toolCache, addPath: core.addPath}, omoOptions)
+    const omoResult = await installOmo({logger, execAdapter}, omoOptions)
     if (omoResult.installed) {
       logger.info('oMo installed', {version: omoResult.version})
     } else {
