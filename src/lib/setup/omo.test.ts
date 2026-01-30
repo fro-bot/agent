@@ -1,46 +1,15 @@
 import type {OmoInstallDeps} from './omo.js'
-import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
+import type {ExecAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {installBun, isBunAvailable} from './bun.js'
+import {createMockLogger} from '../test-helpers.js'
 import {installOmo, verifyOmoInstallation} from './omo.js'
-
-// Mock the bun module
-vi.mock('./bun.js', () => ({
-  isBunAvailable: vi.fn(),
-  installBun: vi.fn(),
-}))
-
-/**
- * Create a mock Logger for testing.
- * All methods are vi.fn() mocks that can be verified with toHaveBeenCalled.
- */
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 // Mock exec adapter
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
   return {
     exec: vi.fn().mockResolvedValue(0),
     getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''}),
-    ...overrides,
-  }
-}
-
-// Mock tool cache adapter
-function createMockToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
-  return {
-    downloadTool: vi.fn().mockResolvedValue('/tmp/bun.zip'),
-    extractTar: vi.fn().mockResolvedValue('/tmp/bun-extracted'),
-    extractZip: vi.fn().mockResolvedValue('/tmp/bun-extracted'),
-    cacheDir: vi.fn().mockResolvedValue('/cached/bun'),
-    find: vi.fn().mockReturnValue(''),
     ...overrides,
   }
 }
@@ -53,8 +22,6 @@ function createMockDeps(overrides: Partial<OmoInstallDeps> = {}): OmoInstallDeps
   return {
     logger: createMockLogger(),
     execAdapter: createMockExecAdapter(),
-    toolCache: createMockToolCache(),
-    addPath: vi.fn(),
     ...overrides,
   }
 }
@@ -62,28 +29,23 @@ function createMockDeps(overrides: Partial<OmoInstallDeps> = {}): OmoInstallDeps
 describe('omo', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    // Default: Bun is available
-    vi.mocked(isBunAvailable).mockResolvedValue(true)
-    vi.mocked(installBun).mockResolvedValue({path: '/cached/bun', version: '1.2.5', cached: false})
   })
 
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
-      // #given
+      // #given - both npm install and oh-my-opencode install succeed
+      const execMock = vi
+        .fn()
+        .mockImplementation(
+          async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
+            if (options?.listeners?.stdout != null) {
+              options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
+            }
+            return 0
+          },
+        )
       const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({
-          exec: vi
-            .fn()
-            .mockImplementation(
-              async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
-                // Simulate successful output with version
-                if (options?.listeners?.stdout != null) {
-                  options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
-                }
-                return 0
-              },
-            ),
-        }),
+        execAdapter: createMockExecAdapter({exec: execMock}),
       })
 
       // #when
@@ -93,6 +55,19 @@ describe('omo', () => {
       expect(result.installed).toBe(true)
       expect(result.version).toBe('1.2.3')
       expect(result.error).toBeNull()
+      expect(execMock).toHaveBeenCalledTimes(2)
+      expect(execMock).toHaveBeenNthCalledWith(
+        1,
+        'npm',
+        expect.arrayContaining(['install', '-g', 'oh-my-opencode@latest']),
+        expect.any(Object),
+      )
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
+        expect.arrayContaining(['install']),
+        expect.any(Object),
+      )
     })
 
     it('returns success without version when version not in output', async () => {
@@ -121,12 +96,11 @@ describe('omo', () => {
       expect(result.error).toBeNull()
     })
 
-    it('returns failure on non-zero exit code', async () => {
-      // #given
+    it('returns failure when npm install -g fails', async () => {
+      // #given - first command (npm install -g) fails
+      const execMock = vi.fn().mockResolvedValue(1)
       const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({
-          exec: vi.fn().mockResolvedValue(1),
-        }),
+        execAdapter: createMockExecAdapter({exec: execMock}),
       })
 
       // #when
@@ -136,6 +110,23 @@ describe('omo', () => {
       expect(result.installed).toBe(false)
       expect(result.version).toBeNull()
       expect(result.error).toContain('exit code 1')
+      expect(execMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('returns failure when oh-my-opencode install fails', async () => {
+      // #given - npm install succeeds but oh-my-opencode install fails
+      const execMock = vi.fn().mockResolvedValueOnce(0).mockResolvedValueOnce(1)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      const result = await installOmo(mockDeps)
+
+      // #then
+      expect(result.installed).toBe(false)
+      expect(result.error).toContain('exit code 1')
+      expect(execMock).toHaveBeenCalledTimes(2)
     })
 
     it('returns failure on exception', async () => {
@@ -153,7 +144,7 @@ describe('omo', () => {
 
       // #then
       expect(result.installed).toBe(false)
-      expect(result.error).toBe('Command not found')
+      expect(result.error).toContain('Command not found')
       expect(mockLogger.error).toHaveBeenCalled()
     })
 
@@ -170,7 +161,7 @@ describe('omo', () => {
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('calls bunx with headless options using defaults', async () => {
+    it('calls oh-my-opencode with headless options using defaults', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -180,11 +171,11 @@ describe('omo', () => {
       // #when
       await installOmo(mockDeps)
 
-      // #then
-      expect(execMock).toHaveBeenCalledWith(
-        'bunx',
+      // #then - second call is oh-my-opencode install
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
         [
-          'oh-my-opencode',
           'install',
           '--no-tui',
           '--claude=no',
@@ -194,11 +185,11 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true}),
+        expect.objectContaining({silent: true, ignoreReturnCode: true}),
       )
     })
 
-    it('calls bunx with custom options when provided', async () => {
+    it('calls oh-my-opencode with custom options when provided', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -215,11 +206,11 @@ describe('omo', () => {
         zaiCodingPlan: 'no',
       })
 
-      // #then
-      expect(execMock).toHaveBeenCalledWith(
-        'bunx',
+      // #then - second call is oh-my-opencode install with custom options
+      expect(execMock).toHaveBeenNthCalledWith(
+        2,
+        'oh-my-opencode',
         [
-          'oh-my-opencode',
           'install',
           '--no-tui',
           '--claude=yes',
@@ -229,7 +220,7 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true}),
+        expect.objectContaining({silent: true, ignoreReturnCode: true}),
       )
     })
 
@@ -264,64 +255,13 @@ describe('omo', () => {
 
       // #then
       expect(result.installed).toBe(false)
-      const warningCalls = (mockLogger.warning as ReturnType<typeof vi.fn>).mock.calls
-      expect(warningCalls.length).toBeGreaterThan(0)
-      const lastCall = warningCalls.at(-1)
+      const errorCalls = (mockLogger.error as ReturnType<typeof vi.fn>).mock.calls
+      expect(errorCalls.length).toBeGreaterThan(0)
+      const lastCall = errorCalls.at(-1)
       expect(lastCall?.[0]).toContain('exit code 1')
       expect(lastCall?.[1]).toBeDefined()
       expect(typeof lastCall?.[1]).toBe('object')
       expect((lastCall?.[1] as {output?: string}).output).toContain('stdout output')
-    })
-
-    it('installs Bun when not available', async () => {
-      // #given
-      vi.mocked(isBunAvailable).mockResolvedValueOnce(false)
-      const mockLogger = createMockLogger()
-      const mockDeps = createMockDeps({logger: mockLogger})
-
-      // #when
-      await installOmo(mockDeps)
-
-      // #then
-      expect(isBunAvailable).toHaveBeenCalled()
-      expect(installBun).toHaveBeenCalledWith(
-        mockDeps.logger,
-        mockDeps.toolCache,
-        mockDeps.execAdapter,
-        mockDeps.addPath,
-      )
-      expect(mockLogger.info).toHaveBeenCalledWith('Bun not found, installing...')
-    })
-
-    it('skips Bun installation when already available', async () => {
-      // #given
-      vi.mocked(isBunAvailable).mockResolvedValueOnce(true)
-      const mockLogger = createMockLogger()
-      const mockDeps = createMockDeps({logger: mockLogger})
-
-      // #when
-      await installOmo(mockDeps)
-
-      // #then
-      expect(isBunAvailable).toHaveBeenCalled()
-      expect(installBun).not.toHaveBeenCalled()
-    })
-
-    it('returns failure when Bun installation fails', async () => {
-      // #given
-      vi.mocked(isBunAvailable).mockResolvedValueOnce(false)
-      vi.mocked(installBun).mockRejectedValueOnce(new Error('Download failed'))
-      const mockLogger = createMockLogger()
-      const mockDeps = createMockDeps({logger: mockLogger})
-
-      // #when
-      const result = await installOmo(mockDeps)
-
-      // #then
-      expect(result.installed).toBe(false)
-      expect(result.error).toContain('Bun installation failed')
-      expect(result.error).toContain('Download failed')
-      expect(mockLogger.error).toHaveBeenCalledWith('Failed to install Bun runtime', expect.any(Object))
     })
   })
 

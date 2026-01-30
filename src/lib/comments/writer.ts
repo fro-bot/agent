@@ -7,6 +7,7 @@ import type {
   PostCommentResult,
   UpdateDiscussionCommentResponse,
 } from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
 import {findBotComment, readThread} from './reader.js'
 
@@ -45,7 +46,7 @@ async function createIssueComment(
   } catch (error) {
     logger.warning('Failed to create issue comment', {
       target,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -80,7 +81,7 @@ async function updateIssueComment(
     logger.warning('Failed to update issue comment', {
       target,
       commentId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }
@@ -183,7 +184,7 @@ async function postDiscussionComment(
   } catch (error) {
     logger.warning('Failed to post discussion comment', {
       target,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return null
   }

@@ -1,16 +1,7 @@
-import type {Logger} from '../logger.js'
 import {Buffer} from 'node:buffer'
 import {describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {getFileContent, getPRDiff, parseHunks} from './diff.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 describe('parseHunks', () => {
   it('parses single hunk', () => {

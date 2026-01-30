@@ -4,6 +4,7 @@ import type {Logger} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 
+import {toErrorMessage} from '../../utils/errors.js'
 import {getOpenCodeStoragePath} from './storage.js'
 
 /**
@@ -119,7 +120,7 @@ export async function writeSessionSummary(sessionId: string, summary: RunSummary
   } catch (error) {
     logger.warning('Failed to write session summary', {
       sessionId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 }

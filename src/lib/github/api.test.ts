@@ -1,6 +1,7 @@
 import type {Logger} from '../logger.js'
 import type {Octokit} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {
   addLabelsToIssue,
   createCommentReaction,
@@ -12,39 +13,6 @@ import {
   parseRepoString,
   removeLabelFromIssue,
 } from './api.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-function createMockOctokit(overrides: Record<string, unknown> = {}): Octokit {
-  return {
-    rest: {
-      reactions: {
-        createForIssueComment: vi.fn().mockResolvedValue({data: {id: 123}}),
-        listForIssueComment: vi.fn().mockResolvedValue({data: []}),
-        deleteForIssueComment: vi.fn().mockResolvedValue({}),
-      },
-      issues: {
-        createLabel: vi.fn().mockResolvedValue({data: {}}),
-        addLabels: vi.fn().mockResolvedValue({data: {}}),
-        removeLabel: vi.fn().mockResolvedValue({data: {}}),
-      },
-      repos: {
-        get: vi.fn().mockResolvedValue({data: {default_branch: 'main'}}),
-      },
-      users: {
-        getByUsername: vi.fn().mockResolvedValue({data: {id: 456, login: 'test-user'}}),
-      },
-      ...overrides,
-    },
-  } as unknown as Octokit
-}
 
 describe('parseRepoString', () => {
   it('parses valid owner/repo string', () => {

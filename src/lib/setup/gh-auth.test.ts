@@ -1,16 +1,7 @@
-import type {Octokit} from '../github/types.js'
 import type {ExecAdapter, Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
-
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  }
-}
 
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
   return {
@@ -18,18 +9,6 @@ function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapte
     getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''}),
     ...overrides,
   }
-}
-
-function createMockOctokit(overrides: Record<string, unknown> = {}): Octokit {
-  return {
-    rest: {
-      users: {
-        getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
-        getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
-      },
-      ...overrides,
-    },
-  } as unknown as Octokit
 }
 
 describe('gh-auth', () => {

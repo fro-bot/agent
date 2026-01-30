@@ -1,6 +1,7 @@
 import type {GitHubContext} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import process from 'node:process'
+import {toErrorMessage} from '../../utils/errors.js'
 
 export interface MockEventConfig {
   readonly enabled: boolean
@@ -60,8 +61,7 @@ export function parseMockEvent(logger: Logger): GitHubContext | null {
       payload: ctx.payload ?? {},
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    logger.warning('Failed to parse MOCK_EVENT', {error: message})
+    logger.warning('Failed to parse MOCK_EVENT', {error: toErrorMessage(error)})
     return null
   }
 }

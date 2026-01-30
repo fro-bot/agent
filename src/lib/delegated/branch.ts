@@ -7,6 +7,7 @@
 import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {BranchResult, CreateBranchOptions} from './types.js'
+import {toErrorMessage} from '../../utils/errors.js'
 
 /**
  * Create a new branch from a base branch.
@@ -47,7 +48,7 @@ export async function createBranch(
     }
   } catch (error) {
     // Extract message safely - handles non-Error throws (e.g., string literals)
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     if (message.includes('Reference already exists')) {
       logger.info('Branch already exists', {branchName})
 

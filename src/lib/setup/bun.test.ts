@@ -1,6 +1,7 @@
 import type {Dirent} from 'node:fs'
 import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../test-helpers.js'
 import {buildBunDownloadUrl, DEFAULT_BUN_VERSION, getBunPlatformInfo, installBun, isBunAvailable} from './bun.js'
 
 // Mock fs/promises module
@@ -22,16 +23,6 @@ function createMockDirent(name: string, isDirectory: boolean): Partial<Dirent> {
     isSymbolicLink: () => false,
     isFIFO: () => false,
     isSocket: () => false,
-  }
-}
-
-// Mock logger
-function createMockLogger(): Logger {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
   }
 }
 
