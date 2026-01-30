@@ -18,7 +18,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
-import {getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
+import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
@@ -215,6 +215,7 @@ async function sendPromptToSession(
   sessionId: string,
   promptText: string,
   fileParts: readonly FilePartInput[] | undefined,
+  directory: string,
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
@@ -270,9 +271,10 @@ async function sendPromptToSession(
   }
 
   logger.debug('Sending prompt to OpenCode', {sessionId})
-  const promptResponse = await client.session.prompt({
+  const promptResponse = await client.session.promptAsync({
     path: {id: sessionId},
     body: promptBody,
+    query: {directory},
   })
 
   // Grace period for event stream to flush
@@ -354,6 +356,7 @@ export async function executeOpenCode(
 
     // Build initial prompt
     const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
+    const directory = getGitHubWorkspace()
 
     // Write prompt artifact if enabled (RFC-018)
     if (isOpenCodePromptArtifactEnabled()) {
@@ -425,6 +428,7 @@ export async function executeOpenCode(
           sessionId,
           promptToSend,
           filePartsToSend,
+          directory,
           config,
           logger,
         )

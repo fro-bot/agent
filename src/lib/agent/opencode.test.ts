@@ -102,7 +102,7 @@ function createMockClient(options: {
       create: options.throwOnCreate
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
-      prompt: options.throwOnPrompt
+      promptAsync: options.throwOnPrompt
         ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
         : vi.fn().mockResolvedValue({data: options.promptResponse}),
     },
@@ -174,16 +174,18 @@ describe('executeOpenCode', () => {
 
     // #then
     expect(mockClient.session.create).toHaveBeenCalled()
-    expect(mockClient.session.prompt).toHaveBeenCalledWith(
-      expect.objectContaining({
-        path: {id: 'ses_123'},
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        body: expect.objectContaining({
-          agent: 'Sisyphus',
-          parts: [{type: 'text', text: 'Built prompt with sessionId'}],
-        }),
-      }),
-    )
+    const promptCall = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as
+      | {
+          path?: {id?: string}
+          body?: {agent?: string; parts?: {type: string; text?: string}[]}
+          query?: {directory?: string}
+        }
+      | undefined
+
+    expect(promptCall?.path?.id).toBe('ses_123')
+    expect(promptCall?.body?.agent).toBe('Sisyphus')
+    expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
+    expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
   })
 
@@ -205,7 +207,7 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    expect(mockClient.session.prompt).toHaveBeenCalledWith(
+    expect(mockClient.session.promptAsync).toHaveBeenCalledWith(
       expect.objectContaining({
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         body: expect.objectContaining({
@@ -236,7 +238,7 @@ describe('executeOpenCode', () => {
     await executeOpenCode(createMockPromptOptions(), mockLogger, config)
 
     // #then
-    const promptCalls = vi.mocked(mockClient.session.prompt).mock.calls
+    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
     const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
     const promptCall = firstCall?.[0]
     expect(promptCall?.body?.model).toEqual({
@@ -264,7 +266,7 @@ describe('executeOpenCode', () => {
 
     // #then
 
-    const callArgs = vi.mocked(mockClient.session.prompt).mock.calls[0]?.[0] as {
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
     expect(callArgs?.body?.agent).toBe('CustomAgent')
@@ -541,7 +543,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           if (promptCallCount === 1) {
             return Promise.resolve({error: 'fetch failed: network error'})
@@ -582,7 +584,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           return Promise.resolve({error: 'fetch failed: network error'})
         }),
@@ -620,7 +622,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           return Promise.resolve({error: 'Invalid API key'})
         }),
@@ -653,7 +655,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async () => {
           promptCallCount++
           if (promptCallCount === 1) {
             return Promise.resolve({error: 'fetch failed'})
@@ -720,7 +722,7 @@ describe('executeOpenCode retry behavior', () => {
     const mockClient = {
       session: {
         create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
-        prompt: vi.fn().mockImplementation(async (args: {body: unknown}) => {
+        promptAsync: vi.fn().mockImplementation(async (args: {body: unknown}) => {
           promptBodies.push(args.body)
           if (promptBodies.length === 1) {
             return Promise.resolve({error: 'fetch failed'})
