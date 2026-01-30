@@ -189,7 +189,20 @@ async function processEventStream(
           llmError = createLLMFetchError(errorMessage, model ?? undefined)
         }
       }
+    } else if (event.type === 'session.idle') {
+      const idleSessionID = event.properties.sessionID
+      if (idleSessionID === sessionId) {
+        if (lastText.length > 0) {
+          outputTextContent(lastText)
+          lastText = ''
+        }
+        break
+      }
     }
+  }
+
+  if (lastText.length > 0) {
+    outputTextContent(lastText)
   }
 
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
@@ -222,8 +235,9 @@ async function sendPromptToSession(
   const agentName = config?.agent ?? 'Sisyphus'
 
   const events = await client.event.subscribe()
+  const eventController =
+    'controller' in events ? ((events as {controller?: AbortController}).controller ?? null) : null
 
-  let eventStreamEnded = false
   let eventStreamResult: EventStreamResult = {
     tokens: null,
     model: null,
@@ -242,9 +256,6 @@ async function sendPromptToSession(
       if (error instanceof Error && error.name !== 'AbortError') {
         logger.debug('Event stream error', {error: error.message})
       }
-    })
-    .finally(() => {
-      eventStreamEnded = true
     })
 
   const textPart: TextPartInput = {type: 'text', text: promptText}
@@ -277,10 +288,14 @@ async function sendPromptToSession(
     query: {directory},
   })
 
-  // Grace period for event stream to flush
-  if (!eventStreamEnded) {
-    const gracePeriod = new Promise<void>(resolve => setTimeout(resolve, 2000))
-    await Promise.race([eventProcessingPromise, gracePeriod])
+  if (promptResponse.error != null && eventController != null) {
+    eventController.abort()
+  }
+
+  await eventProcessingPromise
+
+  if (eventController != null) {
+    eventController.abort()
   }
 
   if (promptResponse.error != null) {

@@ -3,6 +3,7 @@ import type {Logger} from '../logger.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
+import process from 'node:process'
 
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
@@ -75,6 +76,7 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
 
 function createMockEventStream(events: Event[] = []): {
   stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
 } {
   return {
     stream: (async function* () {
@@ -82,6 +84,7 @@ function createMockEventStream(events: Event[] = []): {
         yield event
       }
     })(),
+    controller: {abort: vi.fn()},
   }
 }
 
@@ -395,6 +398,35 @@ describe('executeOpenCode', () => {
 
     // #then
     expect(mockClient.event.subscribe).toHaveBeenCalled()
+  })
+
+  it('flushes pending text on session.idle', async () => {
+    // #given
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+      events: [
+        {
+          type: 'message.part.updated',
+          properties: {
+            part: {sessionID: 'ses_123', type: 'text', text: 'Partial', time: {}},
+          },
+        } as unknown as Event,
+        {
+          type: 'session.idle',
+          properties: {sessionID: 'ses_123'},
+        } as unknown as Event,
+      ],
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(writeSpy).toHaveBeenCalledWith('\nPartial\n')
+    writeSpy.mockRestore()
   })
 
   it('writes prompt artifact when OPENCODE_PROMPT_ARTIFACT is enabled', async () => {
