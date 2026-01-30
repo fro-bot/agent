@@ -232,7 +232,7 @@ async function sendPromptToSession(
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
-  const agentName = config?.agent ?? 'Sisyphus'
+  const agentName = (config?.agent ?? 'Sisyphus').toLowerCase()
 
   const events = await client.event.subscribe()
   const eventController =

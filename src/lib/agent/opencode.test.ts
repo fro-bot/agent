@@ -186,7 +186,7 @@ describe('executeOpenCode', () => {
       | undefined
 
     expect(promptCall?.path?.id).toBe('ses_123')
-    expect(promptCall?.body?.agent).toBe('Sisyphus')
+    expect(promptCall?.body?.agent).toBe('sisyphus')
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
@@ -201,7 +201,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'Sisyphus',
+      agent: 'sisyphus',
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
     }
@@ -232,7 +232,7 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'Sisyphus',
+      agent: 'sisyphus',
       model: null,
       timeoutMs: 1800000,
     }
@@ -272,7 +272,7 @@ describe('executeOpenCode', () => {
     const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
-    expect(callArgs?.body?.agent).toBe('CustomAgent')
+    expect(callArgs?.body?.agent).toBe('customagent')
   })
 
   it('returns success result on successful execution', async () => {
