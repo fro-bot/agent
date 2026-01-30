@@ -1,7 +1,34 @@
 import type {Buffer} from 'node:buffer'
 
 import type {ExecAdapter, Logger, OmoInstallResult} from './types.js'
+
+import os from 'node:os'
 import {toErrorMessage} from '../../utils/errors.js'
+
+function getPlatformPackage(): string {
+  const platform = os.platform()
+  const arch = os.arch()
+
+  const platformMap: Record<string, string> = {
+    darwin: 'darwin',
+    linux: 'linux',
+    win32: 'windows',
+  }
+
+  const archMap: Record<string, string> = {
+    x64: 'x64',
+    arm64: 'arm64',
+  }
+
+  const mappedPlatform = platformMap[platform]
+  const mappedArch = archMap[arch]
+
+  if (mappedPlatform == null || mappedArch == null) {
+    return `oh-my-opencode-${platform}-${arch}`
+  }
+
+  return `oh-my-opencode-${mappedPlatform}-${mappedArch}`
+}
 
 export interface OmoInstallOptions {
   claude?: 'no' | 'yes' | 'max20'
@@ -39,22 +66,29 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
 
   logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan})
 
+  const platformPackage = getPlatformPackage()
+  logger.debug('Detected platform package', {platformPackage})
+
   let output = ''
 
-  // Step 1: Install oh-my-opencode globally (ensures platform binary is installed)
+  // Step 1: Install oh-my-opencode and platform binary globally
   try {
-    const installExitCode = await execAdapter.exec('npm', ['install', '-g', 'oh-my-opencode@latest'], {
-      listeners: {
-        stdout: (data: Buffer) => {
-          output += data.toString()
+    const installExitCode = await execAdapter.exec(
+      'npm',
+      ['install', '-g', 'oh-my-opencode@latest', `${platformPackage}@latest`],
+      {
+        listeners: {
+          stdout: (data: Buffer) => {
+            output += data.toString()
+          },
+          stderr: (data: Buffer) => {
+            output += data.toString()
+          },
         },
-        stderr: (data: Buffer) => {
-          output += data.toString()
-        },
+        silent: true,
+        ignoreReturnCode: true,
       },
-      silent: true,
-      ignoreReturnCode: true,
-    })
+    )
 
     if (installExitCode !== 0) {
       const errorMsg = `npm install -g oh-my-opencode returned exit code ${installExitCode}`

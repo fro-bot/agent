@@ -56,7 +56,12 @@ describe('omo', () => {
       expect(result.version).toBe('1.2.3')
       expect(result.error).toBeNull()
       expect(execMock).toHaveBeenCalledTimes(2)
-      expect(execMock).toHaveBeenNthCalledWith(1, 'npm', ['install', '-g', 'oh-my-opencode@latest'], expect.any(Object))
+      expect(execMock).toHaveBeenNthCalledWith(
+        1,
+        'npm',
+        expect.arrayContaining(['install', '-g', 'oh-my-opencode@latest']),
+        expect.any(Object),
+      )
       expect(execMock).toHaveBeenNthCalledWith(
         2,
         'oh-my-opencode',
