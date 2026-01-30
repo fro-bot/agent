@@ -172,14 +172,15 @@ export async function runSetup(): Promise<SetupResult | null> {
       cached: opencodeResult.cached,
     })
 
-    // Install oMo (graceful failure)
+    // Install oMo (required)
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
     const omoResult = await installOmo({logger, execAdapter, toolCache, addPath: core.addPath}, omoOptions)
     if (omoResult.installed) {
       logger.info('oMo installed', {version: omoResult.version})
     } else {
-      core.warning(`oMo installation failed (continuing without it): ${omoResult.error ?? 'unknown error'}`)
+      core.setFailed(`oMo installation failed: ${omoResult.error ?? 'unknown error'}`)
+      return null
     }
 
     // Configure gh CLI authentication

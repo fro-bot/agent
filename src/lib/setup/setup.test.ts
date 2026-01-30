@@ -140,6 +140,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -160,6 +161,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -179,6 +181,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -198,6 +201,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -210,7 +214,7 @@ describe('setup', () => {
       expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
     })
 
-    it('attempts oMo installation but continues on failure', async () => {
+    it('fails setup when oMo installation fails', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({
@@ -218,16 +222,17 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
-      vi.mocked(exec.exec).mockRejectedValue(new Error('npx failed'))
+      vi.mocked(exec.exec).mockRejectedValue(new Error('bunx failed'))
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      const result = await runSetup()
 
-      // #then - should complete without throwing
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('oMo'))
+      // #then - should fail the action
+      expect(result).toBeNull()
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('oMo'))
     })
 
     it('restores cache when available', async () => {
@@ -238,6 +243,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(cache.restoreCache).mockResolvedValue('cache-key-hit')
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
@@ -259,6 +265,7 @@ describe('setup', () => {
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
+      vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(cache.restoreCache).mockResolvedValue(undefined)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)

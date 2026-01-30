@@ -160,18 +160,16 @@ async function processEventStream(
         const sessionError = event.properties.error
         logger.error('Session error', {error: sessionError})
 
-        // Check if this is an agent-not-found or fatal configuration error
         const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
-        if (isAgentNotFoundError(errorStr)) {
-          llmError = createAgentError(errorStr)
-          break
-        }
 
-        // Check if this is a recoverable LLM fetch error
         if (isLlmFetchError(sessionError)) {
-          const errorMessage = typeof sessionError === 'string' ? sessionError : String(sessionError)
-          llmError = createLLMFetchError(errorMessage, model ?? undefined)
+          llmError = createLLMFetchError(errorStr, model ?? undefined)
+        } else if (isAgentNotFoundError(errorStr)) {
+          llmError = createAgentError(errorStr)
+        } else {
+          llmError = createAgentError(errorStr)
         }
+        break
       }
     } else if (event.type === 'session.idle') {
       const idleSessionID = event.properties.sessionID
