@@ -22,7 +22,7 @@ import {sleep} from '../../utils/async.js'
 import {outputTextContent, outputToolExecution} from '../../utils/console.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
-import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
+import {createAgentError, createLLMFetchError, isAgentNotFoundError, isLlmFetchError} from '../comments/error-format.js'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
@@ -159,6 +159,13 @@ async function processEventStream(
       if (errorSessionID === sessionId) {
         const sessionError = event.properties.error
         logger.error('Session error', {error: sessionError})
+
+        // Check if this is an agent-not-found or fatal configuration error
+        const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
+        if (isAgentNotFoundError(errorStr)) {
+          llmError = createAgentError(errorStr)
+          break
+        }
 
         // Check if this is a recoverable LLM fetch error
         if (isLlmFetchError(sessionError)) {

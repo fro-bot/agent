@@ -150,3 +150,38 @@ export function createLLMFetchError(message: string, model?: string): ErrorInfo 
     suggestedAction: 'This is a transient network error. The request may succeed on retry, or try a different model.',
   })
 }
+
+const AGENT_NOT_FOUND_PATTERNS = [
+  /agent\s+not\s+found/i,
+  /unknown\s+agent/i,
+  /invalid\s+agent/i,
+  /agent\s+\S+\s+does\s+not\s+exist/i,
+  /no\s+agent\s+named/i,
+  /agent\s+\S+\s+is\s+not\s+available/i,
+] as const
+
+export function isAgentNotFoundError(error: unknown): boolean {
+  if (error == null) return false
+
+  let errorMessage = ''
+
+  if (typeof error === 'string') {
+    errorMessage = error
+  } else if (error instanceof Error) {
+    errorMessage = error.message
+  } else if (typeof error === 'object') {
+    const obj = error as Record<string, unknown>
+    if (typeof obj.message === 'string') {
+      errorMessage = obj.message
+    }
+  }
+
+  return AGENT_NOT_FOUND_PATTERNS.some(pattern => pattern.test(errorMessage))
+}
+
+export function createAgentError(message: string, agent?: string): ErrorInfo {
+  return createErrorInfo('configuration', `Agent error: ${message}`, false, {
+    details: agent == null ? undefined : `Requested agent: ${agent}`,
+    suggestedAction: 'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+  })
+}
