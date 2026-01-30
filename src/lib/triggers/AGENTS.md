@@ -4,10 +4,10 @@
 
 ## FILES
 
-- `router.ts`: Core logic (882 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders.
+- `router.ts`: Core logic (880 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders.
 - `types.ts`: `TriggerResult` (discriminated union), `TriggerConfig`, `SkipReason` enum.
 - `mock.ts`: Synthetic event generation for local testing and CI simulation.
-- `__fixtures__/payloads.ts`: Factory-style payload generation using `BASE_*` spread pattern (627 lines).
+- `__fixtures__/payloads.ts`: Factory-style payload generation using `BASE_*` spread pattern (628 lines).
 
 ## KEY EXPORTS
 
@@ -31,8 +31,10 @@
 ## SKIP REASONS
 
 - `action_not_created`: Trigger action != `created` (for comments).
+- `action_not_supported`: Event action (e.g., `labeled`) is not in the allowlist.
 - `draft_pr`: PR is in draft mode (skipped by default).
-- `no_mention`: Missing `@fro-bot` mention in `issues.edited` events.
+- `issue_locked`: Target issue or pull request is locked.
+- `no_mention`: Missing `@fro-bot` mention in `issues.edited` or required comment events.
 - `prompt_required`: `schedule` or `dispatch` events missing prompt input.
 - `self_comment`: Bot responding to its own comment (loop protection).
 - `unauthorized_author`: Author not `OWNER`, `MEMBER`, or `COLLABORATOR`.

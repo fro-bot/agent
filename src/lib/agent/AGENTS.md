@@ -6,12 +6,12 @@ OpenCode SDK execution with GitHub context injection and UX feedback loops.
 
 | Component     | File              | Responsibility                                                      |
 | ------------- | ----------------- | ------------------------------------------------------------------- |
-| **Execution** | `opencode.ts`     | SDK server spawn, session events, prompt sending, streaming (469 L) |
-| **Context**   | `context.ts`      | Gathers event data, defaults, issue details                         |
-| **UX**        | `reactions.ts`    | Emojis (👀/🎉/😕), `agent: working` label state machine             |
-| **Prompting** | `prompt.ts`       | Builds multi-section prompt with session/cache context (344 L)      |
-| **Budgeting** | `diff-context.ts` | Context limits (50 files in context, 20 in prompt)                  |
-| **Types**     | `types.ts`        | `AgentContext`, `AgentResult`, `ExecutionConfig`                    |
+| **Execution** | `opencode.ts`     | SDK server spawn, session events, prompt sending, streaming (634 L) |
+| **Context**   | `context.ts`      | Gathers event data, defaults, issue details (125 L)                 |
+| **UX**        | `reactions.ts`    | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L)     |
+| **Prompting** | `prompt.ts`       | Builds multi-section prompt with session/cache context (350 L)      |
+| **Budgeting** | `diff-context.ts` | Context limits (50 files in context, 20 in prompt) (75 L)           |
+| **Types**     | `types.ts`        | `AgentContext`, `AgentResult`, `ExecutionConfig` (135 L)            |
 
 ## KEY EXPORTS
 

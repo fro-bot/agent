@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-01-18
-**Commit:** a6815bb
+**Generated:** 2026-01-29
+**Commit:** c1aa7d2
 **Branch:** main
 
 ## OVERVIEW
@@ -13,7 +13,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ```
 ./
 ├── src/                  # TypeScript source
-│   ├── main.ts           # Primary entry (12-step orchestration)
+│   ├── main.ts           # Primary entry (12-step orchestration, 521 L)
 │   ├── post.ts           # Post-action hook (durable cache save, RFC-017)
 │   ├── index.ts          # Public API re-exports
 │   ├── lib/              # Core libraries (see subdir AGENTS.md)
@@ -21,8 +21,9 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   ├── github/       # Octokit client, context parsing
 │   │   ├── setup/        # Bun, oMo, OpenCode installation
 │   │   ├── session/      # Persistence layer (search, prune, writeback)
-│   │   ├── triggers/     # Event routing, skip conditions
+│   │   ├── triggers/     # Event routing, skip conditions (880 L router)
 │   │   ├── comments/     # GitHub comment read/write, error formatting
+│   │   ├── context/      # GraphQL hydration for issues/PRs (RFC-015)
 │   │   ├── observability/# Metrics collection, run summaries
 │   │   ├── reviews/      # PR diff parsing, review comments
 │   │   ├── attachments/  # File attachment processing (RFC-014)
@@ -44,8 +45,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Task             | Location                      | Notes                                       |
 | ---------------- | ----------------------------- | ------------------------------------------- |
 | Add action logic | `src/main.ts`                 | 12-step orchestration lifecycle             |
-| Setup library    | `src/lib/setup/`              | Bun/oMo/OpenCode installation (auto-setup)  |
 | Post-action hook | `src/post.ts`                 | Durable cache save (RFC-017)                |
+| Setup library    | `src/lib/setup/`              | Bun/oMo/OpenCode installation (auto-setup)  |
 | Cache operations | `src/lib/cache.ts`            | `restoreCache()`, `saveCache()`             |
 | GitHub API       | `src/lib/github/client.ts`    | `createClient()`, `createAppClient()`       |
 | Event parsing    | `src/lib/github/context.ts`   | `parseGitHubContext()`                      |
@@ -53,7 +54,8 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Prompt building  | `src/lib/agent/prompt.ts`     | `buildAgentPrompt()`                        |
 | Session storage  | `src/lib/session/storage.ts`  | File I/O, project discovery                 |
 | Session search   | `src/lib/session/search.ts`   | `listSessions()`, `searchSessions()`        |
-| Event routing    | `src/lib/triggers/router.ts`  | `routeEvent()`, skip conditions (882 lines) |
+| Event routing    | `src/lib/triggers/router.ts`  | `routeEvent()`, skip conditions (880 lines) |
+| Context hydrate  | `src/lib/context/`            | GraphQL/REST issue/PR data (RFC-015)        |
 | Comment posting  | `src/lib/comments/writer.ts`  | `postComment()`, GraphQL mutations          |
 | PR reviews       | `src/lib/reviews/reviewer.ts` | `submitReview()`, line comments             |
 | Input parsing    | `src/lib/inputs.ts`           | `parseActionInputs()` returns Result        |
@@ -65,11 +67,11 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 | Symbol              | Type      | Location                      | Role                              |
 | ------------------- | --------- | ----------------------------- | --------------------------------- |
-| `run`               | Function  | `src/main.ts:76`              | Main entry, 12-step orchestration |
+| `run`               | Function  | `src/main.ts:77`              | Main entry, 12-step orchestration |
 | `runPost`           | Function  | `src/post.ts:31`              | Post-action cache save            |
 | `runSetup`          | Function  | `src/lib/setup/setup.ts`      | Setup orchestration               |
-| `restoreCache`      | Function  | `src/lib/cache.ts`            | Restore OpenCode state            |
-| `saveCache`         | Function  | `src/lib/cache.ts`            | Persist state to cache            |
+| `restoreCache`      | Function  | `src/lib/cache.ts:53`         | Restore OpenCode state            |
+| `saveCache`         | Function  | `src/lib/cache.ts:140`        | Persist state to cache            |
 | `executeOpenCode`   | Function  | `src/lib/agent/opencode.ts`   | SDK execution with events         |
 | `routeEvent`        | Function  | `src/lib/triggers/router.ts`  | Event routing + skip-gating       |
 | `postComment`       | Function  | `src/lib/comments/writer.ts`  | Create or update comment          |
@@ -135,6 +137,7 @@ post.ts (runs even on failure/timeout)
 - **Bundled deps**: `@actions/*`, `@octokit/auth-app`, `@opencode-ai/sdk`
 - **dist/ committed**: MUST run `pnpm build` after src changes; CI validates sync
 - **License extraction**: `dist/licenses.txt` auto-generated from bundled deps
+- **120-char lines**: Prettier uses `@bfra.me/prettier-config/120-proof`
 
 ### Security
 
@@ -160,6 +163,7 @@ post.ts (runs even on failure/timeout)
 | Deleting failing tests          | Fix the code instead                 |
 | `core.setFailed()` in post.ts   | Post-hook is best-effort, never fail |
 | Duplicating SDK types           | Import from `@opencode-ai/sdk`       |
+| Force push                      | Always `force: false` on ref updates |
 
 ## UNIQUE STYLES
 
@@ -169,17 +173,19 @@ post.ts (runs even on failure/timeout)
 - **v-branch releases**: Main merges to `v0` for major version pinning
 - **Logger injection**: All functions take `logger: Logger` as parameter
 - **Synthetic run summaries**: Session writeback creates "user" messages for discoverability
-- **Adapter pattern**: `ExecAdapter`, `ToolCacheAdapter` for testable I/O
+- **Adapter pattern**: `CacheAdapter`, `ExecAdapter`, `ToolCacheAdapter` for testable I/O
 - **Graceful optionality**: Optional components (oMo) warn on failure, don't crash
+- **BDD test comments**: `// #given`, `// #when`, `// #then` markers in tests
 
 ## COMPLEXITY HOTSPOTS
 
 | File                 | Lines | Reason                                            |
 | -------------------- | ----- | ------------------------------------------------- |
-| `triggers/router.ts` | 882   | Multi-event context mapping, skip-condition logic |
-| `main.ts`            | 481   | 12-step orchestration, error handling             |
-| `agent/opencode.ts`  | 469   | SDK lifecycle orchestration, event streaming      |
-| `agent/prompt.ts`    | 344   | Large prompt templates, trigger directives        |
+| `triggers/router.ts` | 880   | Multi-event context mapping, skip-condition logic |
+| `agent/opencode.ts`  | 634   | SDK lifecycle orchestration, event streaming      |
+| `main.ts`            | 521   | 12-step orchestration, error handling             |
+| `agent/prompt.ts`    | 350   | Large prompt templates, trigger directives        |
+| `cache.ts`           | 292   | Corruption detection, version checking            |
 
 ## COMMANDS
 
@@ -189,7 +195,7 @@ pnpm build            # Bundle to dist/ (REQUIRED before commit)
 pnpm check-types      # TypeScript validation
 pnpm lint             # ESLint
 pnpm fix              # ESLint --fix
-pnpm test             # Vitest (350+ tests)
+pnpm test             # Vitest (60 test files, 350+ tests)
 ```
 
 ## NOTES
