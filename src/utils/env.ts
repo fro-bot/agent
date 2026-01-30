@@ -18,6 +18,15 @@ export function getOpenCodeAuthPath(): string {
   return path.join(getXdgDataHome(), 'opencode', 'auth.json')
 }
 
+export function getOpenCodeLogPath(): string {
+  return path.join(getXdgDataHome(), 'opencode', 'log')
+}
+
+export function isOpenCodePromptArtifactEnabled(): boolean {
+  const enabled = process.env.OPENCODE_PROMPT_ARTIFACT
+  return enabled === 'true' || enabled === '1'
+}
+
 export function getRunnerOS(): string {
   const runnerOs = process.env.RUNNER_OS
   if (runnerOs != null && runnerOs.trim().length > 0) {
