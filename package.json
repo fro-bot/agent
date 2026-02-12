@@ -35,14 +35,14 @@
   },
   "prettier": "@bfra.me/prettier-config/120-proof",
   "dependencies": {
-    "@actions/cache": "^5.0.2",
-    "@actions/core": "2.0.2",
-    "@actions/exec": "^2.0.0",
-    "@actions/github": "^7.0.0",
-    "@actions/tool-cache": "^3.0.0",
+    "@actions/cache": "^6.0.0",
+    "@actions/core": "3.0.0",
+    "@actions/exec": "^3.0.0",
+    "@actions/github": "^9.0.0",
+    "@actions/tool-cache": "^4.0.0",
     "@bfra.me/es": "0.1.0",
-    "@octokit/auth-app": "8.1.2",
-    "@opencode-ai/sdk": "1.1.36"
+    "@octokit/auth-app": "8.2.0",
+    "@opencode-ai/sdk": "1.1.53"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.47.7",
@@ -50,7 +50,7 @@
     "@bfra.me/tsconfig": "0.12.1",
     "@octokit/webhooks-types": "7.6.1",
     "@semantic-release/git": "10.0.1",
-    "@types/node": "24.10.7",
+    "@types/node": "24.10.9",
     "@vitest/eslint-plugin": "1.6.6",
     "conventional-changelog-conventionalcommits": "9.1.0",
     "eslint": "9.39.2",
@@ -62,11 +62,11 @@
     "lint-staged": "16.2.7",
     "prettier": "3.8.1",
     "read-package-up": "12.0.0",
-    "semantic-release": "25.0.2",
+    "semantic-release": "25.0.3",
     "simple-git-hooks": "2.13.1",
-    "tsdown": "0.20.1",
+    "tsdown": "0.20.3",
     "typescript": "5.9.3",
     "vitest": "4.0.18"
   },
-  "packageManager": "pnpm@10.28.2"
+  "packageManager": "pnpm@10.29.2"
 }
