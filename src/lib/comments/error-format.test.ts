@@ -139,13 +139,13 @@ describe('comments/error-format', () => {
   describe('createLLMFetchError', () => {
     it('creates retryable LLM fetch error with model info', () => {
       // #when creating an LLM fetch error
-      const error = createLLMFetchError('fetch failed', 'opencode/glm-4.7-free')
+      const error = createLLMFetchError('fetch failed', 'opencode/big-pickle')
 
       // #then it should be correctly structured
       expect(error.type).toBe('llm_fetch_error')
       expect(error.retryable).toBe(true)
       expect(error.message).toContain('fetch failed')
-      expect(error.details).toContain('opencode/glm-4.7-free')
+      expect(error.details).toContain('opencode/big-pickle')
       expect(error.suggestedAction).toBeDefined()
     })
 
@@ -232,7 +232,7 @@ describe('comments/error-format', () => {
   describe('formatErrorComment for LLM fetch error', () => {
     it('formats LLM fetch error with warning icon', () => {
       // #given an LLM fetch error
-      const error = createLLMFetchError('fetch failed', 'opencode/glm-4.7-free')
+      const error = createLLMFetchError('fetch failed', 'opencode/big-pickle')
 
       // #when formatting the error
       const formatted = formatErrorComment(error)
