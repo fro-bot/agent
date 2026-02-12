@@ -1,8 +1,8 @@
 import type {Plugin} from 'rolldown'
+import {execFile} from 'node:child_process'
 import {writeFile} from 'node:fs/promises'
-import {join} from 'node:path'
+import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
-import {readPackageUp} from 'read-package-up'
 import {defineConfig} from 'tsdown'
 
 /**
@@ -31,20 +31,101 @@ function compareVersions(a: string, b: string): number {
   return 0
 }
 
-/**
- * Rolldown plugin that collects license information from bundled dependencies.
- *
- * Generates dist/licenses.txt with deduplicated highest version of each package,
- * including license type and full license text. Packages are resolved from
- * node_modules to extract license metadata from package.json.
- *
- * @returns Rolldown plugin with writeBundle hook
- */
+interface PnpmLicenseEntry {
+  readonly name: string
+  readonly versions?: readonly string[]
+  readonly version?: string
+  readonly license?: string | null
+}
+
+interface PnpmLicensesJson extends Record<string, readonly PnpmLicenseEntry[]> {}
+
+interface PnpmLicenseEntryCandidate {
+  readonly name?: unknown
+  readonly versions?: unknown
+  readonly version?: unknown
+  readonly license?: unknown
+}
+
+const execFileAsync = promisify(execFile)
+
+function isPnpmLicensesJson(value: unknown): value is PnpmLicensesJson {
+  if (value == null || typeof value !== 'object') {
+    return false
+  }
+
+  return Object.values(value).every(entries => {
+    if (!Array.isArray(entries)) {
+      return false
+    }
+
+    return entries.every(entry => {
+      if (entry == null || typeof entry !== 'object') {
+        return false
+      }
+
+      const candidate = entry as PnpmLicenseEntryCandidate
+      if (typeof candidate.name !== 'string') {
+        return false
+      }
+
+      if (candidate.versions != null && !Array.isArray(candidate.versions)) {
+        return false
+      }
+
+      if (candidate.version != null && typeof candidate.version !== 'string') {
+        return false
+      }
+
+      if (candidate.license != null && typeof candidate.license !== 'string') {
+        return false
+      }
+
+      return true
+    })
+  })
+}
+
+async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
+  const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
+    encoding: 'utf8',
+  })
+
+  const parsed: unknown = JSON.parse(stdout)
+  if (!isPnpmLicensesJson(parsed)) {
+    throw new Error('pnpm licenses list returned invalid JSON')
+  }
+
+  return parsed
+}
+
+function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
+  const map = new Map<string, string>()
+
+  for (const [licenseKey, items] of Object.entries(entries)) {
+    for (const item of items) {
+      let versions = item.versions
+      if (versions == null) {
+        const singleVersion = item.version
+        versions = singleVersion == null ? [] : [singleVersion]
+      }
+      const licenseType = item.license ?? licenseKey
+
+      for (const version of versions) {
+        map.set(`${item.name}@${version}`, licenseType)
+      }
+    }
+  }
+
+  return map
+}
+
 function licenseCollectorPlugin(): Plugin {
   return {
     name: 'license-collector',
     async writeBundle() {
       const highestVersions = new Map<string, {version: string; license: string; content: string}>()
+      const licenseTypeMap = buildLicenseTypeMap(await getPnpmLicensesJson())
 
       const licenses = await getProjectLicenses('./package.json')
 
@@ -56,15 +137,7 @@ function licenseCollectorPlugin(): Plugin {
           if (version != null) {
             const existing = highestVersions.get(pkgName)
             if (existing == null || compareVersions(existing.version, version) < 0) {
-              let licenseType = 'Unknown'
-              try {
-                const result = await readPackageUp({cwd: join('node_modules', pkgName)})
-                licenseType = result?.packageJson.license ?? 'Unknown'
-              } catch (error) {
-                console.error(
-                  `Failed to read package.json for ${pkgName}@${version}: ${error instanceof Error ? error.message : String(error)}`,
-                )
-              }
+              const licenseType = licenseTypeMap.get(`${pkgName}@${version}`) ?? 'Unknown'
               highestVersions.set(pkgName, {
                 version,
                 license: licenseType,
@@ -77,10 +150,11 @@ function licenseCollectorPlugin(): Plugin {
       }
 
       const output = Array.from(highestVersions.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
         .map(([name, {version, license, content}]) => `${name}@${version}\n${license}\n${content}`)
         .join('\n\n')
 
-      await writeFile('dist/licenses.txt', output)
+      await writeFile('dist/licenses.txt', output.replaceAll('\r\n', '\n'))
     },
   }
 }

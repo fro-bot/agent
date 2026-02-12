@@ -631,6 +631,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
     sha: 'abc123',
     runId: 12345,
     actor: 'test-user',
+    action: 'created',
     author: {
       login: 'commenter',
       association: 'MEMBER',
@@ -681,7 +682,7 @@ describe('getTriggerDirective', () => {
     // #given
     const context = createMockTriggerContext({
       eventType: 'issues',
-      raw: {payload: {action: 'opened'}} as unknown as TriggerContext['raw'],
+      action: 'opened',
     })
 
     // #when
@@ -696,7 +697,7 @@ describe('getTriggerDirective', () => {
     // #given
     const context = createMockTriggerContext({
       eventType: 'issues',
-      raw: {payload: {action: 'edited'}} as unknown as TriggerContext['raw'],
+      action: 'edited',
     })
 
     // #when

@@ -1,11 +1,3 @@
-import type {
-  DiscussionCommentEvent,
-  IssueCommentEvent,
-  IssuesEvent,
-  PullRequestEvent,
-  PullRequestReviewCommentEvent,
-  WorkflowDispatchEvent,
-} from '@octokit/webhooks-types'
 import type {GitHubContext} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {
@@ -17,7 +9,6 @@ import type {
   TriggerResult,
   TriggerTarget,
 } from './types.js'
-import {getAuthorAssociation, getCommentAuthor, isIssueLocked, isPullRequest} from '../github/context.js'
 import {DEFAULT_TRIGGER_CONFIG} from './types.js'
 
 export function hasBotMention(text: string, botLogin: string): boolean {
@@ -70,25 +61,6 @@ function isBotUser(login: string): boolean {
   return login.endsWith('[bot]')
 }
 
-function buildIssueCommentAuthorInfo(payload: IssueCommentEvent): AuthorInfo {
-  const login = getCommentAuthor(payload)
-  const association = getAuthorAssociation(payload)
-
-  return {login, association, isBot: isBotUser(login)}
-}
-
-function buildIssueCommentTarget(payload: IssueCommentEvent): TriggerTarget {
-  const kind = isPullRequest(payload) ? 'pr' : 'issue'
-
-  return {
-    kind,
-    number: payload.issue.number,
-    title: payload.issue.title,
-    body: payload.comment.body ?? null,
-    locked: isIssueLocked(payload),
-  }
-}
-
 interface IssueCommentContextData {
   author: AuthorInfo
   target: TriggerTarget
@@ -96,6 +68,7 @@ interface IssueCommentContextData {
   commentId: number
   hasMention: boolean
   command: ParsedCommand | null
+  action: string
 }
 
 interface MentionAndCommand {
@@ -114,15 +87,30 @@ function parseBotMentionAndCommand(commentBody: string | null, botLogin: string 
   return {hasMention, command}
 }
 
-function buildIssueCommentContextData(payload: IssueCommentEvent, botLogin: string | null): IssueCommentContextData {
-  const author = buildIssueCommentAuthorInfo(payload)
-  const target = buildIssueCommentTarget(payload)
-  const commentBody = payload.comment.body
-  const commentId = payload.comment.id
+function buildIssueCommentContextData(event: GitHubContext['event'], botLogin: string | null): IssueCommentContextData {
+  if (event.type !== 'issue_comment') {
+    throw new Error('Event type must be issue_comment')
+  }
 
+  const author: AuthorInfo = {
+    login: event.comment.author,
+    association: event.comment.authorAssociation,
+    isBot: isBotUser(event.comment.author),
+  }
+
+  const target: TriggerTarget = {
+    kind: event.issue.isPullRequest ? 'pr' : 'issue',
+    number: event.issue.number,
+    title: event.issue.title,
+    body: event.comment.body ?? null,
+    locked: event.issue.locked,
+  }
+
+  const commentBody = event.comment.body
+  const commentId = event.comment.id
   const {hasMention, command} = parseBotMentionAndCommand(commentBody, botLogin)
 
-  return {author, target, commentBody, commentId, hasMention, command}
+  return {author, target, commentBody, commentId, hasMention, command, action: event.action}
 }
 
 interface DiscussionContextData {
@@ -132,32 +120,33 @@ interface DiscussionContextData {
   commentId: number | null
   hasMention: boolean
   command: ParsedCommand | null
+  action: string
 }
 
-function buildDiscussionContextData(payload: DiscussionCommentEvent, botLogin: string | null): DiscussionContextData {
-  const discussion = payload.discussion
-  const comment = payload.comment
+function buildDiscussionContextData(event: GitHubContext['event'], botLogin: string | null): DiscussionContextData {
+  if (event.type !== 'discussion_comment') {
+    throw new Error('Event type must be discussion_comment')
+  }
 
   const author: AuthorInfo = {
-    login: comment.user.login,
-    association: comment.author_association ?? 'NONE',
-    isBot: isBotUser(comment.user.login),
+    login: event.comment.author,
+    association: event.comment.authorAssociation,
+    isBot: isBotUser(event.comment.author),
   }
 
   const target: TriggerTarget = {
     kind: 'discussion',
-    number: discussion.number,
-    title: discussion.title,
-    body: comment.body ?? discussion.body ?? null,
-    locked: discussion.locked ?? false,
+    number: event.discussion.number,
+    title: event.discussion.title,
+    body: event.comment.body ?? event.discussion.body ?? null,
+    locked: event.discussion.locked,
   }
 
-  const commentBody = comment.body ?? null
-  const commentId = comment.id
-
+  const commentBody = event.comment.body ?? null
+  const commentId = event.comment.id
   const {hasMention, command} = parseBotMentionAndCommand(commentBody, botLogin)
 
-  return {author, target, commentBody, commentId, hasMention, command}
+  return {author, target, commentBody, commentId, hasMention, command, action: event.action}
 }
 
 interface WorkflowDispatchContextData {
@@ -167,11 +156,15 @@ interface WorkflowDispatchContextData {
   commentId: null
   hasMention: false
   command: null
+  action: null
 }
 
-function buildWorkflowDispatchContextData(payload: WorkflowDispatchEvent, actor: string): WorkflowDispatchContextData {
-  const inputs = payload.inputs
-  const promptInput = (inputs?.prompt as string | undefined) ?? ''
+function buildWorkflowDispatchContextData(event: GitHubContext['event'], actor: string): WorkflowDispatchContextData {
+  if (event.type !== 'workflow_dispatch') {
+    throw new Error('Event type must be workflow_dispatch')
+  }
+
+  const promptInput = event.inputs.prompt ?? ''
 
   const target: TriggerTarget = {
     kind: 'manual',
@@ -194,6 +187,7 @@ function buildWorkflowDispatchContextData(payload: WorkflowDispatchEvent, actor:
     commentId: null,
     hasMention: false,
     command: null,
+    action: null,
   }
 }
 
@@ -211,35 +205,39 @@ interface IssuesContextData {
   commentId: null
   hasMention: boolean
   command: ParsedCommand | null
+  action: string
 }
 
-function buildIssuesContextData(payload: IssuesEvent, botLogin: string | null): IssuesContextData {
-  const issue = payload.issue
-  const issueBody = issue.body ?? ''
+function buildIssuesContextData(event: GitHubContext['event'], botLogin: string | null): IssuesContextData {
+  if (event.type !== 'issues') {
+    throw new Error('Event type must be issues')
+  }
 
   const author: AuthorInfo = {
-    login: payload.sender.login,
-    association: issue.author_association ?? 'NONE',
-    isBot: isBotUser(payload.sender.login),
+    login: event.sender.login,
+    association: event.issue.authorAssociation,
+    isBot: isBotUser(event.sender.login),
   }
 
   const target: TriggerTarget = {
     kind: 'issue',
-    number: issue.number,
-    title: issue.title,
-    body: issue.body ?? null,
-    locked: issue.locked ?? false,
+    number: event.issue.number,
+    title: event.issue.title,
+    body: event.issue.body,
+    locked: event.issue.locked,
   }
 
+  const issueBody = event.issue.body ?? ''
   const {hasMention, command} = parseBotMentionAndCommand(issueBody, botLogin)
 
   return {
     author,
     target,
-    commentBody: issue.body,
+    commentBody: event.issue.body,
     commentId: null,
     hasMention,
     command,
+    action: event.action,
   }
 }
 
@@ -258,10 +256,9 @@ function isIssuesSupportedAction(action: string): action is (typeof ISSUES_SUPPO
 }
 
 function checkIssuesSkipConditions(context: TriggerContext, config: TriggerConfig, logger: Logger): SkipCheckResult {
-  const payload = context.raw.payload as IssuesEvent
-  const action = payload.action
+  const action = context.action
 
-  if (!isIssuesSupportedAction(action)) {
+  if (action == null || !isIssuesSupportedAction(action)) {
     logger.debug('Skipping unsupported issues action', {action})
     return {
       shouldSkip: true,
@@ -319,36 +316,40 @@ interface PullRequestContextData {
   commentId: null
   hasMention: boolean
   command: ParsedCommand | null
+  action: string
 }
 
-function buildPullRequestContextData(payload: PullRequestEvent, botLogin: string | null): PullRequestContextData {
-  const pr = payload.pull_request
-  const prBody = pr.body ?? ''
+function buildPullRequestContextData(event: GitHubContext['event'], botLogin: string | null): PullRequestContextData {
+  if (event.type !== 'pull_request') {
+    throw new Error('Event type must be pull_request')
+  }
 
   const author: AuthorInfo = {
-    login: payload.sender.login,
-    association: pr.author_association ?? 'NONE',
-    isBot: isBotUser(payload.sender.login),
+    login: event.sender.login,
+    association: event.pullRequest.authorAssociation,
+    isBot: isBotUser(event.sender.login),
   }
 
   const target: TriggerTarget = {
     kind: 'pr',
-    number: pr.number,
-    title: pr.title,
-    body: pr.body ?? null,
-    locked: pr.locked ?? false,
-    isDraft: pr.draft ?? false,
+    number: event.pullRequest.number,
+    title: event.pullRequest.title,
+    body: event.pullRequest.body,
+    locked: event.pullRequest.locked,
+    isDraft: event.pullRequest.draft,
   }
 
+  const prBody = event.pullRequest.body ?? ''
   const {hasMention, command} = parseBotMentionAndCommand(prBody, botLogin)
 
   return {
     author,
     target,
-    commentBody: pr.body,
+    commentBody: event.pullRequest.body,
     commentId: null,
     hasMention,
     command,
+    action: event.action,
   }
 }
 
@@ -363,10 +364,9 @@ function checkPullRequestSkipConditions(
   config: TriggerConfig,
   logger: Logger,
 ): SkipCheckResult {
-  const payload = context.raw.payload as PullRequestEvent
-  const action = payload.action
+  const action = context.action
 
-  if (!isPRSupportedAction(action)) {
+  if (action == null || !isPRSupportedAction(action)) {
     logger.debug('Skipping unsupported pull_request action', {action})
     return {
       shouldSkip: true,
@@ -424,47 +424,46 @@ interface PRReviewCommentContextData {
   commentId: number
   hasMention: boolean
   command: ParsedCommand | null
+  action: string
 }
 
 function buildPRReviewCommentContextData(
-  payload: PullRequestReviewCommentEvent,
+  event: GitHubContext['event'],
   botLogin: string | null,
 ): PRReviewCommentContextData {
-  const pr = payload.pull_request
-  const comment = payload.comment
+  if (event.type !== 'pull_request_review_comment') {
+    throw new Error('Event type must be pull_request_review_comment')
+  }
 
   const author: AuthorInfo = {
-    login: comment.user.login,
-    association: comment.author_association,
-    isBot: isBotUser(comment.user.login),
+    login: event.comment.author,
+    association: event.comment.authorAssociation,
+    isBot: isBotUser(event.comment.author),
   }
 
   const target: TriggerTarget = {
     kind: 'pr',
-    number: pr.number,
-    title: pr.title,
-    body: comment.body,
-    locked: pr.locked ?? false,
-    path: comment.path,
-    line: comment.line ?? undefined,
-    diffHunk: comment.diff_hunk,
-    commitId: comment.commit_id,
+    number: event.pullRequest.number,
+    title: event.pullRequest.title,
+    body: event.comment.body,
+    locked: event.pullRequest.locked,
+    path: event.comment.path,
+    line: event.comment.line ?? undefined,
+    diffHunk: event.comment.diffHunk,
+    commitId: event.comment.commitId,
   }
 
-  const {hasMention, command} = parseBotMentionAndCommand(comment.body, botLogin)
+  const {hasMention, command} = parseBotMentionAndCommand(event.comment.body, botLogin)
 
   return {
     author,
     target,
-    commentBody: comment.body,
-    commentId: comment.id,
+    commentBody: event.comment.body,
+    commentId: event.comment.id,
     hasMention,
     command,
+    action: event.action,
   }
-}
-
-interface SchedulePayload {
-  schedule?: string
 }
 
 interface ScheduleContextData {
@@ -474,10 +473,11 @@ interface ScheduleContextData {
   commentId: null
   hasMention: false
   command: null
+  action: null
 }
 
 function buildScheduleContextData(
-  _payload: SchedulePayload,
+  _event: GitHubContext['event'],
   actor: string,
   promptInput: string | null,
 ): ScheduleContextData {
@@ -504,6 +504,7 @@ function buildScheduleContextData(
     commentId: null,
     hasMention: false,
     command: null,
+    action: null,
   }
 }
 
@@ -543,15 +544,14 @@ function checkCommentSkipConditions(
   logger: Logger,
   options: CommentSkipCheckOptions,
 ): SkipCheckResult {
-  const payload = context.raw.payload as {action?: string}
   const {targetLabel, actionLabel} = options
 
-  if (payload.action !== 'created') {
-    logger.debug(`Skipping non-created ${actionLabel} action`, {action: payload.action})
+  if (context.action !== 'created') {
+    logger.debug(`Skipping non-created ${actionLabel} action`, {action: context.action})
     return {
       shouldSkip: true,
       reason: 'action_not_created',
-      message: `${actionLabel} action is '${payload.action}', not 'created'`,
+      message: `${actionLabel} action is '${context.action}', not 'created'`,
     }
   }
 
@@ -619,24 +619,18 @@ function checkDiscussionCommentSkipConditions(
   })
 }
 
-const PR_REVIEW_COMMENT_SUPPORTED_ACTIONS = ['created'] as const
-
 function checkPRReviewCommentSkipConditions(
   context: TriggerContext,
   config: TriggerConfig,
   logger: Logger,
 ): SkipCheckResult {
-  const payload = context.raw.payload as {action?: string}
-  if (
-    !PR_REVIEW_COMMENT_SUPPORTED_ACTIONS.includes(
-      payload.action as (typeof PR_REVIEW_COMMENT_SUPPORTED_ACTIONS)[number],
-    )
-  ) {
-    logger.debug('Skipping non-created review comment action', {action: payload.action})
+  const action = context.action
+  if (action !== 'created') {
+    logger.debug('Skipping non-created review comment action', {action})
     return {
       shouldSkip: true,
       reason: 'action_not_created',
-      message: `Review comment action '${payload.action}' is not supported (only 'created')`,
+      message: `Review comment action '${action}' is not supported (only 'created')`,
     }
   }
 
@@ -737,10 +731,10 @@ function buildTriggerContext(
 
   switch (githubContext.eventType) {
     case 'issue_comment': {
-      const payload = githubContext.payload as IssueCommentEvent
-      const data = buildIssueCommentContextData(payload, botLogin)
+      const data = buildIssueCommentContextData(githubContext.event, botLogin)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -751,10 +745,10 @@ function buildTriggerContext(
     }
 
     case 'discussion_comment': {
-      const payload = githubContext.payload as DiscussionCommentEvent
-      const data = buildDiscussionContextData(payload, botLogin)
+      const data = buildDiscussionContextData(githubContext.event, botLogin)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -765,10 +759,10 @@ function buildTriggerContext(
     }
 
     case 'workflow_dispatch': {
-      const payload = githubContext.payload as WorkflowDispatchEvent
-      const data = buildWorkflowDispatchContextData(payload, githubContext.actor)
+      const data = buildWorkflowDispatchContextData(githubContext.event, githubContext.actor)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -779,10 +773,10 @@ function buildTriggerContext(
     }
 
     case 'issues': {
-      const payload = githubContext.payload as IssuesEvent
-      const data = buildIssuesContextData(payload, botLogin)
+      const data = buildIssuesContextData(githubContext.event, botLogin)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -793,10 +787,10 @@ function buildTriggerContext(
     }
 
     case 'pull_request': {
-      const payload = githubContext.payload as PullRequestEvent
-      const data = buildPullRequestContextData(payload, botLogin)
+      const data = buildPullRequestContextData(githubContext.event, botLogin)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -807,10 +801,10 @@ function buildTriggerContext(
     }
 
     case 'pull_request_review_comment': {
-      const payload = githubContext.payload as PullRequestReviewCommentEvent
-      const data = buildPRReviewCommentContextData(payload, botLogin)
+      const data = buildPRReviewCommentContextData(githubContext.event, botLogin)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -821,10 +815,10 @@ function buildTriggerContext(
     }
 
     case 'schedule': {
-      const payload = githubContext.payload as SchedulePayload
-      const data = buildScheduleContextData(payload, githubContext.actor, promptInput)
+      const data = buildScheduleContextData(githubContext.event, githubContext.actor, promptInput)
       return {
         ...baseContext,
+        action: data.action,
         author: data.author,
         target: data.target,
         commentBody: data.commentBody,
@@ -837,6 +831,7 @@ function buildTriggerContext(
     case 'unsupported':
       return {
         ...baseContext,
+        action: null,
         author: null,
         target: null,
         commentBody: null,
