@@ -29,6 +29,119 @@ export const EVENT_TYPES = [
 
 export type EventType = (typeof EVENT_TYPES)[number]
 
+// Normalized event data (discriminated union by eventType)
+export type NormalizedEvent =
+  | NormalizedIssueCommentEvent
+  | NormalizedDiscussionCommentEvent
+  | NormalizedIssuesEvent
+  | NormalizedPullRequestEvent
+  | NormalizedPullRequestReviewCommentEvent
+  | NormalizedWorkflowDispatchEvent
+  | NormalizedScheduleEvent
+  | NormalizedUnsupportedEvent
+
+export interface NormalizedIssueCommentEvent {
+  readonly type: 'issue_comment'
+  readonly action: string
+  readonly issue: {
+    readonly number: number
+    readonly title: string
+    readonly body: string | null
+    readonly locked: boolean
+    readonly isPullRequest: boolean
+  }
+  readonly comment: {
+    readonly id: number
+    readonly body: string
+    readonly author: string
+    readonly authorAssociation: string
+  }
+}
+
+export interface NormalizedDiscussionCommentEvent {
+  readonly type: 'discussion_comment'
+  readonly action: string
+  readonly discussion: {
+    readonly number: number
+    readonly title: string
+    readonly body: string | null
+    readonly locked: boolean
+  }
+  readonly comment: {
+    readonly id: number
+    readonly body: string | null
+    readonly author: string
+    readonly authorAssociation: string
+  }
+}
+
+export interface NormalizedIssuesEvent {
+  readonly type: 'issues'
+  readonly action: string
+  readonly issue: {
+    readonly number: number
+    readonly title: string
+    readonly body: string | null
+    readonly locked: boolean
+    readonly authorAssociation: string
+  }
+  readonly sender: {
+    readonly login: string
+  }
+}
+
+export interface NormalizedPullRequestEvent {
+  readonly type: 'pull_request'
+  readonly action: string
+  readonly pullRequest: {
+    readonly number: number
+    readonly title: string
+    readonly body: string | null
+    readonly locked: boolean
+    readonly draft: boolean
+    readonly authorAssociation: string
+  }
+  readonly sender: {
+    readonly login: string
+  }
+}
+
+export interface NormalizedPullRequestReviewCommentEvent {
+  readonly type: 'pull_request_review_comment'
+  readonly action: string
+  readonly pullRequest: {
+    readonly number: number
+    readonly title: string
+    readonly locked: boolean
+  }
+  readonly comment: {
+    readonly id: number
+    readonly body: string
+    readonly author: string
+    readonly authorAssociation: string
+    readonly path: string
+    readonly line: number | null
+    readonly diffHunk: string
+    readonly commitId: string
+  }
+}
+
+export interface NormalizedWorkflowDispatchEvent {
+  readonly type: 'workflow_dispatch'
+  readonly inputs: {
+    readonly prompt?: string
+  }
+}
+
+export interface NormalizedScheduleEvent {
+  readonly type: 'schedule'
+  readonly schedule?: string
+}
+
+export interface NormalizedUnsupportedEvent {
+  readonly type: 'unsupported'
+}
+
 export interface GitHubContext {
   readonly eventName: string
   readonly eventType: EventType
@@ -38,6 +151,7 @@ export interface GitHubContext {
   readonly runId: number
   readonly actor: string
   readonly payload: unknown
+  readonly event: NormalizedEvent
 }
 
 // Comment types

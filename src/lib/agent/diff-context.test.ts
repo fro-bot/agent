@@ -17,6 +17,7 @@ function createTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerC
     sha: 'abc123',
     runId: 12345,
     actor: 'testuser',
+    action: 'opened',
     author: {login: 'testuser', association: 'MEMBER', isBot: false},
     target: {kind: 'pr', number: 42, title: 'Test PR', body: null, locked: false},
     commentBody: null,

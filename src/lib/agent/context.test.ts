@@ -35,6 +35,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
     sha: 'abc123',
     runId: 12345,
     actor: 'test-actor',
+    action: 'created',
     author: {login: 'test-user', association: 'MEMBER', isBot: false},
     target: null,
     commentBody: null,

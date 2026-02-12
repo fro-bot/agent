@@ -2,6 +2,7 @@ import type {GitHubContext} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import process from 'node:process'
 import {toErrorMessage} from '../../utils/errors.js'
+import {classifyEventType, normalizeEvent} from '../github/context.js'
 
 export interface MockEventConfig {
   readonly enabled: boolean
@@ -47,9 +48,14 @@ export function parseMockEvent(logger: Logger): GitHubContext | null {
       return null
     }
 
+    const eventName = ctx.eventName
+    const eventType = classifyEventType(eventName)
+    const payload = ctx.payload ?? {}
+    const event = normalizeEvent(eventType, payload)
+
     return {
-      eventName: ctx.eventName,
-      eventType: 'issue_comment',
+      eventName,
+      eventType,
       repo: {
         owner: typeof ctx.owner === 'string' ? ctx.owner : 'mock-owner',
         repo: typeof ctx.repo === 'string' ? ctx.repo : 'mock-repo',
@@ -58,7 +64,8 @@ export function parseMockEvent(logger: Logger): GitHubContext | null {
       sha: typeof ctx.sha === 'string' ? ctx.sha : 'mock-sha',
       runId: typeof ctx.runId === 'number' ? ctx.runId : 0,
       actor: typeof ctx.actor === 'string' ? ctx.actor : 'mock-actor',
-      payload: ctx.payload ?? {},
+      payload,
+      event,
     }
   } catch (error) {
     logger.warning('Failed to parse MOCK_EVENT', {error: toErrorMessage(error)})

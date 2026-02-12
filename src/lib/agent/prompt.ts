@@ -16,17 +16,7 @@ export interface TriggerDirective {
   readonly appendMode: boolean
 }
 
-function getPayloadAction(payload: unknown): string {
-  if (typeof payload === 'object' && payload !== null && 'action' in payload) {
-    const action = (payload as Record<string, unknown>).action
-    return typeof action === 'string' ? action : ''
-  }
-  return ''
-}
-
 export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
-  const action = getPayloadAction(context.raw.payload)
-
   switch (context.eventType) {
     case 'issue_comment':
       return {directive: 'Respond to the comment above.', appendMode: true}
@@ -35,7 +25,7 @@ export function getTriggerDirective(context: TriggerContext, promptInput: string
       return {directive: 'Respond to the discussion comment above.', appendMode: true}
 
     case 'issues':
-      if (action === 'opened') {
+      if (context.action === 'opened') {
         return {directive: 'Triage this issue: summarize, reproduce if possible, propose next steps.', appendMode: true}
       }
       return {directive: 'Respond to the mention in this issue.', appendMode: true}

@@ -1,6 +1,8 @@
 import type {Logger} from '../logger.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {normalizeEvent} from '../github/context.js'
 import {createMockLogger} from '../test-helpers.js'
+import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {getMockEventConfig, getMockToken, isInCI, isMockEventEnabled, parseMockEvent} from './mock.js'
 
 describe('isMockEventEnabled', () => {
@@ -124,6 +126,7 @@ describe('parseMockEvent', () => {
 
   it('parses valid JSON with all fields', () => {
     // #given valid MOCK_EVENT JSON
+    const payload = createIssueCommentCreatedEvent({issueNumber: 42})
     vi.stubEnv(
       'MOCK_EVENT',
       JSON.stringify({
@@ -134,7 +137,7 @@ describe('parseMockEvent', () => {
         sha: 'abc123',
         runId: 12345,
         actor: 'test-actor',
-        payload: {action: 'created'},
+        payload,
       }),
     )
 
@@ -150,7 +153,8 @@ describe('parseMockEvent', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {action: 'created'},
+      payload,
+      event: normalizeEvent('issue_comment', payload),
     })
   })
 

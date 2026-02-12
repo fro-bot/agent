@@ -105,6 +105,8 @@ export interface TriggerContext {
   readonly runId: number
   /** Actor who triggered the event */
   readonly actor: string
+  /** Event action (e.g., 'created', 'opened', 'edited') */
+  readonly action: string | null
   /** Author of the comment (if applicable) */
   readonly author: AuthorInfo | null
   /** Target of the trigger */
