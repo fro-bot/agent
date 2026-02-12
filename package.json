@@ -37,7 +37,7 @@
   "dependencies": {
     "@actions/cache": "^6.0.0",
     "@actions/core": "3.0.0",
-    "@actions/exec": "^2.0.0",
+    "@actions/exec": "^3.0.0",
     "@actions/github": "^7.0.0",
     "@actions/tool-cache": "^3.0.0",
     "@bfra.me/es": "0.1.0",
