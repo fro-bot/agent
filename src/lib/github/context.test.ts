@@ -2,15 +2,7 @@ import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../test-helpers.js'
 import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
-import {
-  classifyEventType,
-  getAuthorAssociation,
-  getCommentAuthor,
-  getCommentTarget,
-  isIssueLocked,
-  isPullRequest,
-  parseGitHubContext,
-} from './context.js'
+import {classifyEventType, getCommentTarget, isPullRequest, normalizeEvent, parseGitHubContext} from './context.js'
 
 vi.mock('@actions/github', () => ({
   context: {
@@ -20,7 +12,23 @@ vi.mock('@actions/github', () => ({
     sha: 'abc123',
     runId: 12345,
     actor: 'test-actor',
-    payload: {},
+    payload: {
+      action: 'created',
+      issue: {
+        number: 1,
+        title: 'Test issue',
+        body: 'Test body',
+        locked: false,
+      },
+      comment: {
+        id: 1,
+        body: 'Test comment',
+        user: {login: 'test-user'},
+        author_association: 'MEMBER',
+      },
+      repository: {owner: {login: 'test-owner'}, name: 'test-repo'},
+      sender: {login: 'test-user'},
+    },
   },
 }))
 
@@ -119,6 +127,7 @@ describe('parseGitHubContext', () => {
     expect(ctx.sha).toBe('abc123')
     expect(ctx.runId).toBe(12345)
     expect(ctx.actor).toBe('test-actor')
+    expect(ctx.event.type).toBe('issue_comment')
   })
 
   it('logs debug message with context info', () => {
@@ -135,13 +144,45 @@ describe('parseGitHubContext', () => {
 
 describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
-    const payload = createIssueCommentCreatedEvent({isPullRequest: true})
-    expect(isPullRequest(payload)).toBe(true)
+    const event: GitHubContext['event'] = {
+      type: 'issue_comment',
+      action: 'created',
+      issue: {
+        number: 1,
+        title: 'Test',
+        body: null,
+        locked: false,
+        isPullRequest: true,
+      },
+      comment: {
+        id: 1,
+        body: 'test',
+        author: 'user',
+        authorAssociation: 'MEMBER',
+      },
+    }
+    expect(isPullRequest(event)).toBe(true)
   })
 
   it('returns false for regular issues', () => {
-    const payload = createIssueCommentCreatedEvent({isPullRequest: false})
-    expect(isPullRequest(payload)).toBe(false)
+    const event: GitHubContext['event'] = {
+      type: 'issue_comment',
+      action: 'created',
+      issue: {
+        number: 1,
+        title: 'Test',
+        body: null,
+        locked: false,
+        isPullRequest: false,
+      },
+      comment: {
+        id: 1,
+        body: 'test',
+        author: 'user',
+        authorAssociation: 'MEMBER',
+      },
+    }
+    expect(isPullRequest(event)).toBe(false)
   })
 })
 
@@ -157,6 +198,7 @@ describe('getCommentTarget', () => {
       runId: 12345,
       actor: 'test-actor',
       payload,
+      event: normalizeEvent('issue_comment', payload),
     }
 
     const target = getCommentTarget(context)
@@ -180,6 +222,7 @@ describe('getCommentTarget', () => {
       runId: 12345,
       actor: 'test-actor',
       payload,
+      event: normalizeEvent('issue_comment', payload),
     }
 
     const target = getCommentTarget(context)
@@ -193,6 +236,21 @@ describe('getCommentTarget', () => {
   })
 
   it('returns discussion target for discussion_comment events', () => {
+    const payload = {
+      action: 'created',
+      discussion: {
+        number: 99,
+        title: 'Test Discussion',
+        body: null,
+        locked: false,
+      },
+      comment: {
+        id: 1,
+        body: 'test',
+        user: {login: 'user'},
+        author_association: 'MEMBER',
+      },
+    }
     const context: GitHubContext = {
       eventName: 'discussion',
       eventType: 'discussion_comment',
@@ -201,9 +259,8 @@ describe('getCommentTarget', () => {
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: {
-        discussion: {number: 99},
-      },
+      payload,
+      event: normalizeEvent('discussion_comment', payload),
     }
 
     const target = getCommentTarget(context)
@@ -226,44 +283,11 @@ describe('getCommentTarget', () => {
       runId: 12345,
       actor: 'test-actor',
       payload: {},
+      event: normalizeEvent('unsupported', {}),
     }
 
     const target = getCommentTarget(context)
 
     expect(target).toBeNull()
-  })
-})
-
-describe('getAuthorAssociation', () => {
-  it('extracts author association from payload', () => {
-    const payload = createIssueCommentCreatedEvent({authorAssociation: 'MEMBER'})
-    expect(getAuthorAssociation(payload)).toBe('MEMBER')
-  })
-
-  it('handles different association values', () => {
-    const associations = ['OWNER', 'COLLABORATOR', 'CONTRIBUTOR', 'NONE'] as const
-    for (const assoc of associations) {
-      const payload = createIssueCommentCreatedEvent({authorAssociation: assoc})
-      expect(getAuthorAssociation(payload)).toBe(assoc)
-    }
-  })
-})
-
-describe('getCommentAuthor', () => {
-  it('extracts comment author login from payload', () => {
-    const payload = createIssueCommentCreatedEvent({authorLogin: 'test-user'})
-    expect(getCommentAuthor(payload)).toBe('test-user')
-  })
-})
-
-describe('isIssueLocked', () => {
-  it('returns true when issue is locked', () => {
-    const payload = createIssueCommentCreatedEvent({issueLocked: true})
-    expect(isIssueLocked(payload)).toBe(true)
-  })
-
-  it('returns false when issue is not locked', () => {
-    const payload = createIssueCommentCreatedEvent({issueLocked: false})
-    expect(isIssueLocked(payload)).toBe(false)
   })
 })

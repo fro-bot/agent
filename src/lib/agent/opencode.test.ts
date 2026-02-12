@@ -238,7 +238,7 @@ describe('executeOpenCode', () => {
     const promptCall = firstCall?.[0]
     expect(promptCall?.body?.model).toEqual({
       providerID: 'opencode',
-      modelID: 'glm-4.7-free',
+      modelID: 'big-pickle',
     })
   })
 

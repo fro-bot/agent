@@ -2,7 +2,9 @@ import type {Octokit} from '../github/types.js'
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {normalizeEvent} from '../github/context.js'
 import {createMockLogger, createMockOctokit} from '../test-helpers.js'
+import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {handleIssueComment} from './issue-comment.js'
 
 function createMockContext(
@@ -13,6 +15,8 @@ function createMockContext(
   } = {},
 ): TriggerContext {
   const issueNumber = options.issueNumber ?? 123
+  const fallbackPayload = createIssueCommentCreatedEvent({issueNumber})
+  const payload = options.payload ?? fallbackPayload
 
   return {
     eventType,
@@ -22,6 +26,7 @@ function createMockContext(
     sha: 'abc123',
     runId: 12345,
     actor: 'test-actor',
+    action: 'created',
     author: {login: 'commenter', association: 'MEMBER', isBot: false},
     target: {kind: 'issue', number: issueNumber, title: 'Test Issue', body: null, locked: false},
     commentBody: 'Test comment',
@@ -36,7 +41,8 @@ function createMockContext(
       sha: 'abc123',
       runId: 12345,
       actor: 'test-actor',
-      payload: options.payload ?? {issue: {number: issueNumber}},
+      payload,
+      event: normalizeEvent(eventType, payload),
     },
   } as TriggerContext
 }
@@ -110,6 +116,7 @@ describe('triggers/issue-comment', () => {
           runId: 12345,
           actor: 'test-actor',
           payload: {},
+          event: normalizeEvent('unsupported', {}),
         },
       } as TriggerContext
 
