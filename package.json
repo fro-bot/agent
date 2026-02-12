@@ -35,7 +35,7 @@
   },
   "prettier": "@bfra.me/prettier-config/120-proof",
   "dependencies": {
-    "@actions/cache": "^5.0.2",
+    "@actions/cache": "^6.0.0",
     "@actions/core": "3.0.0",
     "@actions/exec": "^2.0.0",
     "@actions/github": "^7.0.0",
