@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@actions/cache':
-        specifier: ^5.0.2
-        version: 5.0.5
+        specifier: ^6.0.0
+        version: 6.0.0
       '@actions/core':
         specifier: 3.0.0
         version: 3.0.0
@@ -102,8 +102,8 @@ importers:
 
 packages:
 
-  '@actions/cache@5.0.5':
-    resolution: {integrity: sha512-jiQSg0gfd+C2KPgcmdCOq7dCuCIQQWQ4b1YfGIRaaA9w7PJbRwTOcCz4LiFEUnqZGf0ha/8OKL3BeNwetHzYsQ==}
+  '@actions/cache@6.0.0':
+    resolution: {integrity: sha512-+tCs634SyGBQJ3KU1rtAVabmN/gYiT9WgzTSJzWwdPCLmM3zWrdbysaErKv8HyI6OozClrxNvDgPjJimbHZZvw==}
 
   '@actions/core@2.0.3':
     resolution: {integrity: sha512-Od9Thc3T1mQJYddvVPM4QGiLUewdh+3txmDYHHxoNdkqysR1MbCT+rFOtNUxYAz+7+6RIsqipVahY2GJqGPyxA==}
@@ -120,8 +120,8 @@ packages:
   '@actions/github@7.0.0':
     resolution: {integrity: sha512-PyGODO938aoBTZd/IfN/+e+Pd5hUcVpyf+thm4CPESLeqhdSkq5QwMTGX9v84XHE1ifmHWBQ60KB8kIgm96opw==}
 
-  '@actions/glob@0.5.1':
-    resolution: {integrity: sha512-+dv/t2aKQdKp9WWSp+1yIXVJzH5Q38M0Mta26pzIbeec14EcIleMB7UU6N7sNgbEuYfyuVGpE5pOKjl6j1WXkA==}
+  '@actions/glob@0.6.1':
+    resolution: {integrity: sha512-K4+2Ac5ILcf2ySdJCha+Pop9NcKjxqCL4xL4zI50dgB2PbXgC0+AcP011xfH4Of6b4QEJJg8dyZYv7zl4byTsw==}
 
   '@actions/http-client@3.0.2':
     resolution: {integrity: sha512-JP38FYYpyqvUsz+Igqlc/JG6YO9PaKuvqjM3iGvaLqFnJ7TFmcLyy2IDrY0bI0qCQug8E9K+elv5ZNfw62ZJzA==}
@@ -137,10 +137,6 @@ packages:
 
   '@actions/tool-cache@3.0.1':
     resolution: {integrity: sha512-euK7sID37jMg1yWGkdXkLPI5Te7x/+2QMUPeHXogcpzUZ81mqlDZ+CgYhQo3LtB8LpVnnQyjs+hTTU0Ir4Y0RQ==}
-
-  '@azure/abort-controller@1.1.0':
-    resolution: {integrity: sha512-TrRLIoSQVzfAJX9H1JeFjzAoDGcoK1IYX1UImfceTZpsyYfWr09Ss1aHW1y5TrrR3iq6RZLBwJ3E24uwPhwahw==}
-    engines: {node: '>=12.0.0'}
 
   '@azure/abort-controller@2.1.2':
     resolution: {integrity: sha512-nBrLsEWm4J2u5LpAPjxADTlq3trDgVZZXHNKabeXZtpq3d3AbN/KGO82R87rdDz5/lYB024rtEf10/q0urNgsA==}
@@ -4090,18 +4086,17 @@ packages:
 
 snapshots:
 
-  '@actions/cache@5.0.5':
+  '@actions/cache@6.0.0':
     dependencies:
-      '@actions/core': 2.0.3
-      '@actions/exec': 2.0.0
-      '@actions/glob': 0.5.1
-      '@actions/http-client': 3.0.2
-      '@actions/io': 2.0.0
-      '@azure/abort-controller': 1.1.0
+      '@actions/core': 3.0.0
+      '@actions/exec': 3.0.0
+      '@actions/glob': 0.6.1
+      '@actions/http-client': 4.0.0
+      '@actions/io': 3.0.2
       '@azure/core-rest-pipeline': 1.22.2
       '@azure/storage-blob': 12.30.0
       '@protobuf-ts/runtime-rpc': 2.11.1
-      semver: 6.3.1
+      semver: 7.7.3
     transitivePeerDependencies:
       - supports-color
 
@@ -4133,9 +4128,9 @@ snapshots:
       '@octokit/request-error': 5.1.1
       undici: 5.29.0
 
-  '@actions/glob@0.5.1':
+  '@actions/glob@0.6.1':
     dependencies:
-      '@actions/core': 2.0.3
+      '@actions/core': 3.0.0
       minimatch: 3.1.2
 
   '@actions/http-client@3.0.2':
@@ -4159,10 +4154,6 @@ snapshots:
       '@actions/http-client': 3.0.2
       '@actions/io': 2.0.0
       semver: 6.3.1
-
-  '@azure/abort-controller@1.1.0':
-    dependencies:
-      tslib: 2.8.1
 
   '@azure/abort-controller@2.1.2':
     dependencies:
