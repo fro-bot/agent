@@ -4,7 +4,6 @@ import {writeFile} from 'node:fs/promises'
 import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
 import {defineConfig} from 'tsdown'
-import {buildLicenseTypeMap, type PnpmLicensesJson} from './src/utils/license-collector.js'
 
 /**
  * Extracts package name from dependency string.
@@ -32,15 +31,15 @@ function compareVersions(a: string, b: string): number {
   return 0
 }
 
-/**
- * Rolldown plugin that collects license information from bundled dependencies.
- *
- * Generates dist/licenses.txt with deduplicated highest version of each package,
- * including license type and full license text. Packages are resolved from
- * node_modules to extract license metadata from package.json.
- *
- * @returns Rolldown plugin with writeBundle hook
- */
+interface PnpmLicenseEntry {
+  readonly name: string
+  readonly versions?: readonly string[]
+  readonly version?: string
+  readonly license?: string | null
+}
+
+interface PnpmLicensesJson extends Record<string, readonly PnpmLicenseEntry[]> {}
+
 interface PnpmLicenseEntryCandidate {
   readonly name?: unknown
   readonly versions?: unknown
@@ -49,18 +48,6 @@ interface PnpmLicenseEntryCandidate {
 }
 
 const execFileAsync = promisify(execFile)
-
-async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
-  const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
-    encoding: 'utf8',
-  })
-
-  const parsed: unknown = JSON.parse(stdout)
-  if (!isPnpmLicensesJson(parsed)) {
-    throw new Error('pnpm licenses list returned invalid JSON')
-  }
-  return parsed
-}
 
 function isPnpmLicensesJson(value: unknown): value is PnpmLicensesJson {
   if (value == null || typeof value !== 'object') {
@@ -99,6 +86,40 @@ function isPnpmLicensesJson(value: unknown): value is PnpmLicensesJson {
   })
 }
 
+async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
+  const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
+    encoding: 'utf8',
+  })
+
+  const parsed: unknown = JSON.parse(stdout)
+  if (!isPnpmLicensesJson(parsed)) {
+    throw new Error('pnpm licenses list returned invalid JSON')
+  }
+
+  return parsed
+}
+
+function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
+  const map = new Map<string, string>()
+
+  for (const [licenseKey, items] of Object.entries(entries)) {
+    for (const item of items) {
+      let versions = item.versions
+      if (versions == null) {
+        const singleVersion = item.version
+        versions = singleVersion == null ? [] : [singleVersion]
+      }
+      const licenseType = item.license ?? licenseKey
+
+      for (const version of versions) {
+        map.set(`${item.name}@${version}`, licenseType)
+      }
+    }
+  }
+
+  return map
+}
+
 function licenseCollectorPlugin(): Plugin {
   return {
     name: 'license-collector',
@@ -133,7 +154,7 @@ function licenseCollectorPlugin(): Plugin {
         .map(([name, {version, license, content}]) => `${name}@${version}\n${license}\n${content}`)
         .join('\n\n')
 
-      await writeFile('dist/licenses.txt', output)
+      await writeFile('dist/licenses.txt', output.replaceAll('\r\n', '\n'))
     },
   }
 }
