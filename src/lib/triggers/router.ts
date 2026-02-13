@@ -16,9 +16,15 @@ export function hasBotMention(text: string, botLogin: string): boolean {
     return false
   }
 
+  // Strip [bot] suffix so both 'fro-bot' and 'fro-bot[bot]' match @fro-bot
+  const normalizedLogin = botLogin.replace(/\[bot\]$/i, '')
+  if (normalizedLogin.length === 0) {
+    return false
+  }
+
   // Match @botLogin or @botLogin[bot] with word boundary
   // (?:$|[^\w]) ensures we don't match @fro-botty when looking for @fro-bot
-  const pattern = new RegExp(String.raw`@${escapeRegExp(botLogin)}(?:\[bot\])?(?:$|[^\w])`, 'i')
+  const pattern = new RegExp(String.raw`@${escapeRegExp(normalizedLogin)}(?:\[bot\])?(?:$|[^\w])`, 'i')
   return pattern.test(text)
 }
 
@@ -31,7 +37,13 @@ export function extractCommand(text: string, botLogin: string): ParsedCommand | 
     return null
   }
 
-  const pattern = new RegExp(String.raw`@${escapeRegExp(botLogin)}(?:\[bot\])?\s*(.*)`, 'is')
+  // Strip [bot] suffix to match both @fro-bot and @fro-bot[bot] mentions
+  const normalizedLogin = botLogin.replace(/\[bot\]$/i, '')
+  if (normalizedLogin.length === 0) {
+    return null
+  }
+
+  const pattern = new RegExp(String.raw`@${escapeRegExp(normalizedLogin)}(?:\[bot\])?\s*(.*)`, 'is')
   const match = pattern.exec(text)
 
   const captured = match?.[1]
@@ -849,7 +861,7 @@ export function routeEvent(
 ): TriggerResult {
   const fullConfig: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, ...config}
 
-  const context = buildTriggerContext(githubContext, fullConfig.login, fullConfig.promptInput)
+  const context = buildTriggerContext(githubContext, fullConfig.botLogin, fullConfig.promptInput)
 
   logger.debug('Routing event', {
     eventName: githubContext.eventName,
