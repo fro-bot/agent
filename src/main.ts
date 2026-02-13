@@ -133,10 +133,13 @@ async function run(): Promise<number> {
     const githubContext = parseGitHubContext(contextLogger)
     githubClient = createClient({token: inputs.githubToken, logger: contextLogger})
 
+    // 3a. Get bot login for mention detection (must happen before routing)
+    const botLogin = await getBotLogin(githubClient, contextLogger)
+
     // 3b. Route event and check skip conditions (RFC-005) - BEFORE acknowledgment
     const triggerLogger = createLogger({phase: 'trigger'})
     const triggerResult = routeEvent(githubContext, triggerLogger, {
-      login: githubContext.actor,
+      botLogin,
       requireMention: true,
     })
 
@@ -168,8 +171,7 @@ async function run(): Promise<number> {
       triggerContext: triggerResult.context,
     })
 
-    // 4. Get bot login for reaction context and build reaction context for acknowledgment
-    const botLogin = await getBotLogin(githubClient, contextLogger)
+    // 4. Build reaction context for acknowledgment
     reactionCtx = {
       repo: agentContext.repo,
       commentId: agentContext.commentId,
