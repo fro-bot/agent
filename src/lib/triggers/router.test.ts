@@ -100,6 +100,18 @@ describe('hasBotMention', () => {
     // #then it should detect the mention
     expect(result).toBe(true)
   })
+
+  it('normalizes [bot] suffix from botLogin before matching', () => {
+    // #given a comment mentioning @fro-bot and a botLogin with [bot] suffix
+    // (getBotLogin() returns 'fro-bot[bot]' from the GitHub API)
+    const text = 'Hey @fro-bot can you help?'
+
+    // #when checking for mention with the [bot]-suffixed login
+    const result = hasBotMention(text, 'fro-bot[bot]')
+
+    // #then it should detect the mention (stripping [bot] before matching)
+    expect(result).toBe(true)
+  })
 })
 
 describe('extractCommand', () => {
@@ -190,7 +202,7 @@ describe('checkSkipConditions', () => {
   beforeEach(() => {
     logger = createMockLogger()
     config = {
-      login: 'fro-bot',
+      botLogin: 'fro-bot',
       requireMention: true,
       allowedAssociations: ALLOWED_ASSOCIATIONS,
       skipDraftPRs: true,
@@ -485,7 +497,7 @@ describe('routeEvent', () => {
       authorAssociation: 'MEMBER',
     })
     const ghContext = createMockGitHubContext('issue_comment', payload)
-    const config = {login: 'fro-bot'}
+    const config = {botLogin: 'fro-bot'}
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, config)
@@ -495,6 +507,25 @@ describe('routeEvent', () => {
     expect(result.context.eventType).toBe('issue_comment')
     expect(result.context.hasMention).toBe(true)
     expect(result.context.command?.action).toBe('review')
+  })
+
+  it('detects @fro-bot mention when login has [bot] suffix', () => {
+    // #given a comment mentioning @fro-bot, with login from getBotLogin() API
+    const payload = createIssueCommentCreatedEvent({
+      commentBody: '@fro-bot help with this',
+      authorAssociation: 'OWNER',
+      authorLogin: 'marcusrbrown',
+    })
+    const ghContext = createMockGitHubContext('issue_comment', payload)
+    const config = {botLogin: 'fro-bot[bot]'}
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, config)
+
+    // #then it should process (not skip with no_mention)
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.hasMention).toBe(true)
+    expect(result.context.command?.action).toBe('help')
   })
 
   it('skips unsupported events', () => {
@@ -519,7 +550,7 @@ describe('routeEvent', () => {
       authorAssociation: 'COLLABORATOR',
     })
     const ghContext = createMockGitHubContext('issue_comment', payload)
-    const config = {login: 'fro-bot'}
+    const config = {botLogin: 'fro-bot'}
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, config)
@@ -582,7 +613,7 @@ describe('routeEvent', () => {
       },
     }
     const ghContext = createMockGitHubContext('discussion_comment', payload)
-    const config = {login: 'fro-bot'}
+    const config = {botLogin: 'fro-bot'}
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, config)
@@ -663,7 +694,7 @@ describe('routeEvent', () => {
       },
     }
     const ghContext = createMockGitHubContext('discussion_comment', payload)
-    const config = {login: 'some-user'}
+    const config = {botLogin: 'some-user'}
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, config)
@@ -686,7 +717,7 @@ describe('routeEvent', () => {
       },
     }
     const ghContext = createMockGitHubContext('discussion_comment', payload)
-    const config = {login: 'fro-bot'}
+    const config = {botLogin: 'fro-bot'}
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, config)
@@ -717,7 +748,7 @@ describe('routeEvent', () => {
         sender: {login: 'reporter'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -750,7 +781,7 @@ describe('routeEvent', () => {
         sender: {login: 'reporter'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -781,7 +812,7 @@ describe('routeEvent', () => {
         sender: {login: 'reporter'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -810,7 +841,7 @@ describe('routeEvent', () => {
         sender: {login: 'reporter'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -840,7 +871,7 @@ describe('routeEvent', () => {
         sender: {login: 'automation-bot[bot]', type: 'Bot'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -870,7 +901,7 @@ describe('routeEvent', () => {
         sender: {login: 'some-bot[bot]'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -900,7 +931,7 @@ describe('routeEvent', () => {
         sender: {login: 'random-user'},
       }
       const ghContext = createMockGitHubContext('issues', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -933,7 +964,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -967,7 +998,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -998,7 +1029,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1029,7 +1060,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot', skipDraftPRs: true}
+      const config = {botLogin: 'fro-bot', skipDraftPRs: true}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1060,7 +1091,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot', skipDraftPRs: false}
+      const config = {botLogin: 'fro-bot', skipDraftPRs: false}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1090,7 +1121,7 @@ describe('routeEvent', () => {
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1121,7 +1152,7 @@ describe('routeEvent', () => {
         sender: {login: 'renovate[bot]', type: 'Bot'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1152,7 +1183,7 @@ describe('routeEvent', () => {
         sender: {login: 'dependabot[bot]'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1183,7 +1214,7 @@ describe('routeEvent', () => {
         sender: {login: 'random-user'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1221,7 +1252,7 @@ describe('routeEvent', () => {
         sender: {login: 'reviewer'},
       }
       const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1263,7 +1294,7 @@ describe('routeEvent', () => {
         sender: {login: 'reviewer'},
       }
       const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1299,7 +1330,7 @@ describe('routeEvent', () => {
         sender: {login: 'reviewer'},
       }
       const ghContext = createMockGitHubContext('pull_request_review_comment', payload)
-      const config = {login: 'fro-bot'}
+      const config = {botLogin: 'fro-bot'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1316,7 +1347,7 @@ describe('routeEvent', () => {
       // #given a schedule event with promptInput configured
       const payload = {schedule: '0 0 * * *'}
       const ghContext = createMockGitHubContext('schedule', payload)
-      const config = {login: 'fro-bot', promptInput: 'Run daily maintenance tasks'}
+      const config = {botLogin: 'fro-bot', promptInput: 'Run daily maintenance tasks'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1332,7 +1363,7 @@ describe('routeEvent', () => {
       // #given a schedule event without promptInput
       const payload = {schedule: '0 0 * * *'}
       const ghContext = createMockGitHubContext('schedule', payload)
-      const config = {login: 'fro-bot', promptInput: null}
+      const config = {botLogin: 'fro-bot', promptInput: null}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
@@ -1346,7 +1377,7 @@ describe('routeEvent', () => {
       // #given a schedule event with empty promptInput
       const payload = {schedule: '0 0 * * *'}
       const ghContext = createMockGitHubContext('schedule', payload)
-      const config = {login: 'fro-bot', promptInput: '   '}
+      const config = {botLogin: 'fro-bot', promptInput: '   '}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
