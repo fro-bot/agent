@@ -1,0 +1,75 @@
+---
+name: Fro Bot
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Custom prompt for the Fro Bot agent
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fro-bot-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_PROMPT: |
+    You are Fro Bot, an AI assistant for managing GitHub repositories. Your tasks include:
+    - Reviewing new issues and pull requests
+    - Providing feedback and suggestions
+    - Triaging and labeling issues
+    - Assisting with code reviews
+    - Engaging with the community to keep the repository healthy and active
+    You have been triggered by a recent event. Please analyze the context and take appropriate actions to help maintain the repository.
+  SCHEDULE_PROMPT: |
+    Review the repository's open issues and pull requests. For each item, determine if it is:
+    - Stale and needs follow-up
+    - Ready for review
+    - Needs triage
+    Summarize your findings in a comment on the issue or PR, or create a new issue if necessary.
+
+jobs:
+  fro-bot:
+    if: >-
+      (
+        github.event.pull_request == null ||
+        !github.event.pull_request.head.repo.fork
+      ) &&
+      (
+        (github.event_name != 'issue_comment' && github.event_name != 'pull_request_review_comment') ||
+        (
+          contains(github.event.comment.body || '', '@fro-bot') &&
+          (github.event.comment.user.login || '') != 'fro-bot' &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+        )
+      )
+    name: Fro Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FRO_BOT_PAT }}
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - name: Run Fro Bot
+        uses: fro-bot/agent@9abf823ec5c0723219588188d792395237f5b90c # v0.23.27
+        env:
+          PROMPT: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.prompt || env.DEFAULT_PROMPT)) || (github.event_name == 'schedule' && env.SCHEDULE_PROMPT) || '' }}
+        with:
+          auth-json: ${{ secrets.AUTH_JSON }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
+          prompt: ${{ env.PROMPT }}
