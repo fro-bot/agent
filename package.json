@@ -42,7 +42,7 @@
     "@actions/tool-cache": "^4.0.0",
     "@bfra.me/es": "0.1.0",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.1.58"
+    "@opencode-ai/sdk": "1.1.59"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.47.7",
