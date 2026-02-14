@@ -4,6 +4,7 @@ name: CI
 on:
   merge_group:
   pull_request:
+    branches: [main]
     types: [opened, synchronize, ready_for_review, reopened]
   push:
     branches: [main]
@@ -109,18 +110,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.FRO_BOT_PAT }}
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
-
-      - id: get-app-token
-        name: Get GitHub App Installation Token
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
-        with:
-          app-id: ${{ secrets.APPLICATION_ID }}
-          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner}}
 
       - name: Test main action
         uses: ./
@@ -128,7 +124,7 @@ jobs:
           SKIP_AGENT_EXECUTION: 'false'
           OPENCODE_PROMPT_ARTIFACT: 'true'
         with:
-          github-token: ${{ steps.get-app-token.outputs.token }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
           auth-json: ${{ secrets.AUTH_JSON }}
 
       - if: always()
