@@ -121,7 +121,6 @@ jobs:
       - name: Test main action
         uses: ./
         env:
-          SKIP_AGENT_EXECUTION: 'false'
           OPENCODE_PROMPT_ARTIFACT: 'true'
         with:
           github-token: ${{ secrets.FRO_BOT_PAT }}
