@@ -11,7 +11,7 @@ import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from '../cache-key.js'
-import {DEFAULT_OMO_PROVIDERS} from '../constants.js'
+import {DEFAULT_OMO_PROVIDERS, DEFAULT_OMO_VERSION} from '../constants.js'
 import {createLogger} from '../logger.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
@@ -173,9 +173,11 @@ export async function runSetup(): Promise<SetupResult | null> {
     })
 
     // Install oMo (required)
+    const omoVersionRaw = core.getInput('omo-version').trim()
+    const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-    const omoResult = await installOmo({logger, execAdapter}, omoOptions)
+    const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
     if (omoResult.installed) {
       logger.info('oMo installed', {version: omoResult.version})
     } else {
