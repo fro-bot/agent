@@ -1,7 +1,6 @@
 # CONTEXT MODULE
 
-**RFC:** RFC-015 GraphQL Context Hydration
-**Status:** Completed
+**RFC:** RFC-015 GraphQL Context Hydration **Status:** Completed
 
 ## OVERVIEW
 
@@ -23,23 +22,23 @@ hydrateIssueContext() / hydratePullRequestContext()
 
 ## WHERE TO LOOK
 
-| File              | Purpose                                    |
-| ----------------- | ------------------------------------------ |
-| `types.ts`        | Type definitions, budget constraints       |
-| `graphql.ts`      | GraphQL queries and execution (batched)    |
-| `issue.ts`        | Issue context hydration logic              |
-| `pull-request.ts` | PR context hydration logic                 |
-| `fallback.ts`     | REST API fallback when GraphQL fails       |
-| `budget.ts`       | Truncation, size estimation, prompt format |
-| `index.ts`        | Public exports                             |
-| `test-helpers.ts` | Shared mock utilities for tests            |
+| File              | Purpose                                             |
+| ----------------- | --------------------------------------------------- |
+| `types.ts`        | Type definitions, budget constraints (279 L)        |
+| `graphql.ts`      | GraphQL queries and execution (batched)             |
+| `issue.ts`        | Issue context hydration logic                       |
+| `pull-request.ts` | PR context hydration (includes requested reviewers) |
+| `fallback.ts`     | REST API fallback (189 L, full PR context support)  |
+| `budget.ts`       | Truncation, size estimation, prompt format          |
+| `index.ts`        | Public exports                                      |
+| `test-helpers.ts` | Shared mock utilities for tests                     |
 
 ## KEY EXPORTS
 
 - `hydrateIssueContext(...)`: Primary entry for issues (GraphQL)
-- `hydratePullRequestContext(...)`: Primary entry for PRs (GraphQL)
+- `hydratePullRequestContext(...)`: Primary entry for PRs (GraphQL, includes requested reviewers)
 - `fallbackIssueContext(...)`: REST fallback for issues
-- `fallbackPullRequestContext(...)`: REST fallback for PRs
+- `fallbackPullRequestContext(...)`: REST fallback for PRs (full parity with GraphQL)
 - `formatContextForPrompt(context)`: Converts hydrated context to Markdown
 - `truncateBody(text, maxBytes)`: UTF-8 safe byte-level truncation
 - `DEFAULT_CONTEXT_BUDGET`: Budget limits per RFC-015
@@ -60,10 +59,15 @@ hydrateIssueContext() / hydratePullRequestContext()
 1. **Primary:** GraphQL API for efficient batched queries.
 2. **Fallback:** REST API (via Octokit) when GraphQL fails or is unavailable.
 3. **Null-Safe:** Returns `null` on terminal failures rather than throwing.
+4. **Partial Failure:** Requested reviewers fetch is isolated from main PR context (insufficient permissions degrade gracefully).
 
 ## FORK DETECTION
 
 PRs from forks are detected by comparing `baseRepository.owner` vs `headRepository.owner`. Fork PRs are flagged with `isFork: true` for security awareness in the prompt.
+
+## PR REVIEWER CONTEXT
+
+`PullRequestContext` includes `requestedReviewers` (user logins) and `requestedReviewerTeams` (team names). The agent uses `isRequestedReviewer` to determine whether it should approve/request-changes or comment-only.
 
 ## UTF-8 SAFETY
 
