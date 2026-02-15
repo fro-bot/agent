@@ -30,8 +30,8 @@ importers:
         specifier: 8.2.0
         version: 8.2.0
       '@opencode-ai/sdk':
-        specifier: 1.1.62
-        version: 1.1.62
+        specifier: 1.1.63
+        version: 1.1.63
     devDependencies:
       '@bfra.me/eslint-config':
         specifier: 0.47.7
@@ -707,8 +707,8 @@ packages:
   '@octokit/webhooks-types@7.6.1':
     resolution: {integrity: sha512-S8u2cJzklBC0FgTwWVLaM8tMrDuDMVE4xiTK4EYXM9GntyvrdbSoxqDQa+Fh57CCNApyIpyeqPhhFEmHPfrXgw==}
 
-  '@opencode-ai/sdk@1.1.62':
-    resolution: {integrity: sha512-RG7m1K7oBbbwuf0tFG/hYXn7h5gwZTzzHhTkD172uUho72IQqT4g9AkzFM9U3ZAbvG5lQpHZUxPoYkMh1J0R1w==}
+  '@opencode-ai/sdk@1.1.63':
+    resolution: {integrity: sha512-9452K0G04slXOsYoVVRVGl0qwXdKhQ1RdvutslaA+b+TtA8y0nbm2iDzDpU74uM1paLXXNPCVCTWWUpnLiAcCA==}
 
   '@oxc-project/types@0.112.0':
     resolution: {integrity: sha512-m6RebKHIRsax2iCwVpYW2ErQwa4ywHJrE4sCK3/8JK8ZZAWOKXaRJFl/uP51gaVyyXlaS4+chU1nSCdzYf6QqQ==}
@@ -4761,7 +4761,7 @@ snapshots:
 
   '@octokit/webhooks-types@7.6.1': {}
 
-  '@opencode-ai/sdk@1.1.62': {}
+  '@opencode-ai/sdk@1.1.63': {}
 
   '@oxc-project/types@0.112.0': {}
 
