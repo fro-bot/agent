@@ -1,18 +1,19 @@
 # TRIGGER ROUTING
 
-**Context**: Centralized event routing and skip-logic gating (RFC-005). Determines IF an action should run based on payload, config, and permissions. Pure logic; no side effects.
+**Context**: Centralized event routing and skip-logic gating (RFC-005). Consumes `NormalizedEvent` from `github/context.ts` to determine IF an action should run. Pure logic; no side effects.
 
 ## FILES
 
-- `router.ts`: Core logic (880 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders.
-- `types.ts`: `TriggerResult` (discriminated union), `TriggerConfig`, `SkipReason` enum.
+- `router.ts`: Core logic (887 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders. Operates on `NormalizedEvent` discriminated union.
+- `types.ts`: `TriggerResult` (discriminated union), `TriggerConfig`, `TriggerContext`, `SkipReason` enum.
 - `mock.ts`: Synthetic event generation for local testing and CI simulation.
-- `__fixtures__/payloads.ts`: Factory-style payload generation using `BASE_*` spread pattern (628 lines).
+- `__fixtures__/payloads.ts`: Factory-style payload generation using `BASE_*` spread pattern (627 lines).
 
 ## KEY EXPORTS
 
 - `routeEvent(context, inputs, config?)`: Main entry. Returns `TriggerResult`.
 - `TriggerResult`: Discriminated union. If `shouldProcess: false`, contains `skipReason`.
+- `TriggerContext`: Routing context for downstream consumers (prompt builder, agent).
 - `SkipReason`: Enum of rejection codes (e.g., `unauthorized_author`, `draft_pr`).
 - `DEFAULT_TRIGGER_CONFIG`: Base configuration for routing logic.
 
@@ -41,8 +42,10 @@
 
 ## PATTERNS
 
+- **NormalizedEvent Intake**: Router consumes `NormalizedEvent` from `GitHubContext.event`; never touches raw payloads.
 - **Pure Decisioning**: Router MUST NOT call APIs or log triggers. Pure input-to-decision.
 - **Discriminated Union**: Narrow `TriggerResult` by `shouldProcess` before accessing `skipReason`.
+- **TriggerContext Output**: On `shouldProcess: true`, builds `TriggerContext` consumed by prompt builder.
 - **Config Merging**: `routeEvent` applies defaults to partial configurations.
 - **Regex Safety**: `hasBotMention` escapes input and uses `\b` boundaries for accuracy.
 - **External Classification**: `classifyEventType` resides in `github/context.ts`.
