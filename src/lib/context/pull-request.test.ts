@@ -68,6 +68,14 @@ describe('hydratePullRequestContext', () => {
               },
             ],
           },
+          authorAssociation: 'MEMBER',
+          reviewRequests: {
+            nodes: [
+              {requestedReviewer: {login: 'reviewer1'}},
+              {requestedReviewer: {login: 'reviewer2'}},
+              {requestedReviewer: {name: 'team-a'}},
+            ],
+          },
         },
       },
     }
@@ -90,6 +98,9 @@ describe('hydratePullRequestContext', () => {
     expect(result?.commits).toHaveLength(2)
     expect(result?.files).toHaveLength(2)
     expect(result?.reviews).toHaveLength(1)
+    expect(result?.authorAssociation).toBe('MEMBER')
+    expect(result?.requestedReviewers).toEqual(['reviewer1', 'reviewer2'])
+    expect(result?.requestedReviewerTeams).toEqual(['team-a'])
   })
 
   it('detects fork PR correctly', async () => {
@@ -113,6 +124,8 @@ describe('hydratePullRequestContext', () => {
           commits: {totalCount: 0, nodes: []},
           files: {totalCount: 0, nodes: []},
           reviews: {totalCount: 0, nodes: []},
+          authorAssociation: 'NONE',
+          reviewRequests: {nodes: []},
         },
       },
     }
@@ -180,6 +193,8 @@ describe('hydratePullRequestContext', () => {
           commits: {totalCount: 0, nodes: []},
           files: {totalCount: 500, nodes: manyFiles},
           reviews: {totalCount: 0, nodes: []},
+          authorAssociation: 'CONTRIBUTOR',
+          reviewRequests: {nodes: []},
         },
       },
     }
@@ -217,6 +232,8 @@ describe('hydratePullRequestContext', () => {
           commits: {totalCount: 0, nodes: []},
           files: {totalCount: 0, nodes: []},
           reviews: {totalCount: 0, nodes: []},
+          authorAssociation: 'NONE',
+          reviewRequests: {nodes: []},
         },
       },
     }

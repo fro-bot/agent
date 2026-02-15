@@ -147,6 +147,9 @@ export interface PullRequestContext {
   readonly reviews: readonly ContextReview[]
   readonly reviewsTruncated: boolean
   readonly totalReviews: number
+  readonly authorAssociation: string
+  readonly requestedReviewers: readonly string[]
+  readonly requestedReviewerTeams: readonly string[]
 }
 
 /**
@@ -263,6 +266,12 @@ export interface PullRequestGraphQLResponse {
               readonly author: {readonly login: string} | null
             }[]
           }
+        }[]
+      }
+      readonly authorAssociation: string
+      readonly reviewRequests: {
+        readonly nodes: readonly {
+          readonly requestedReviewer: {readonly login: string} | {readonly name: string}
         }[]
       }
     } | null

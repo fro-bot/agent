@@ -128,6 +128,9 @@ describe('estimateContextSize', () => {
       reviews: [],
       reviewsTruncated: false,
       totalReviews: 0,
+      authorAssociation: 'MEMBER',
+      requestedReviewers: [],
+      requestedReviewerTeams: [],
     }
 
     // #when
@@ -270,6 +273,9 @@ describe('formatContextForPrompt', () => {
       ],
       reviewsTruncated: false,
       totalReviews: 1,
+      authorAssociation: 'MEMBER',
+      requestedReviewers: [],
+      requestedReviewerTeams: [],
     }
 
     // #when
@@ -338,6 +344,9 @@ describe('formatContextForPrompt', () => {
       reviews: [],
       reviewsTruncated: false,
       totalReviews: 0,
+      authorAssociation: 'NONE',
+      requestedReviewers: [],
+      requestedReviewerTeams: [],
     }
 
     // #when
