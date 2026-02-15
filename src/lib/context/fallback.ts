@@ -76,15 +76,26 @@ export async function fallbackPullRequestContext(
   logger: Logger,
 ): Promise<PullRequestContext | null> {
   try {
-    const [prResponse, commitsResponse, filesResponse, reviewsResponse, commentsResponse, reviewersResponse] =
-      await Promise.all([
-        client.rest.pulls.get({owner, repo, pull_number: number}),
-        client.rest.pulls.listCommits({owner, repo, pull_number: number, per_page: budget.maxCommits}),
-        client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
-        client.rest.pulls.listReviews({owner, repo, pull_number: number, per_page: budget.maxReviews}),
-        client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
-        client.rest.pulls.listRequestedReviewers({owner, repo, pull_number: number}),
-      ])
+    const [prResponse, commitsResponse, filesResponse, reviewsResponse, commentsResponse] = await Promise.all([
+      client.rest.pulls.get({owner, repo, pull_number: number}),
+      client.rest.pulls.listCommits({owner, repo, pull_number: number, per_page: budget.maxCommits}),
+      client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
+      client.rest.pulls.listReviews({owner, repo, pull_number: number, per_page: budget.maxReviews}),
+      client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
+    ])
+
+    // Isolated from Promise.all — insufficient permissions should not lose all PR context
+    const reviewersResponse = await client.rest.pulls
+      .listRequestedReviewers({owner, repo, pull_number: number})
+      .catch((error: unknown) => {
+        logger.warning('Failed to fetch requested reviewers, defaulting to empty', {
+          owner,
+          repo,
+          number,
+          error: toErrorMessage(error),
+        })
+        return {data: {users: [] as {login: string}[], teams: [] as {name: string}[]}}
+      })
 
     const pr = prResponse.data
     const bodyResult = truncateBody(pr.body ?? '', budget.maxBodyBytes)

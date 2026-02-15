@@ -225,14 +225,19 @@ Before completing:
 3. This summary will be searchable in future agent runs
 `)
 
-  parts.push(buildResponseProtocolSection(context, cacheStatus, options.sessionId))
+  if (context.issueNumber != null) {
+    parts.push(buildResponseProtocolSection(context, cacheStatus, options.sessionId))
+  }
 
   // GitHub CLI instructions
   const issueNum = context.issueNumber ?? '<number>'
+  const hasResponseProtocol = context.issueNumber != null
   parts.push(`## GitHub Operations (Use gh CLI)
 
 The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
-
+${
+  hasResponseProtocol
+    ? `
 ### Posting Your Response
 
 See **Response Protocol** above. Post exactly one comment or review per run.
@@ -246,7 +251,9 @@ gh pr review ${issueNum} --approve --body "Your review with Run Summary"
 
 # Post response as issue comment
 gh issue comment ${issueNum} --body "Your response with Run Summary"
-\`\`\`
+\`\`\``
+    : ''
+}
 
 ### Creating PRs
 \`\`\`bash

@@ -439,6 +439,38 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('# Agent Context') // Still has main sections
   })
 
+  it('omits Response Protocol when issueNumber is null (schedule/workflow_dispatch)', () => {
+    // #given — targetless trigger with no issue/PR to comment on
+    const context = createMockContext({
+      eventName: 'schedule',
+      issueNumber: null,
+      issueTitle: null,
+      issueType: null,
+      commentBody: null,
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'schedule',
+      target: undefined,
+      commentBody: null,
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: 'Run weekly maintenance',
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then — Response Protocol should NOT be included for targetless triggers
+    expect(prompt).not.toContain('## Response Protocol (REQUIRED)')
+    expect(prompt).not.toContain('exactly ONE comment or review')
+    expect(prompt).not.toContain('See **Response Protocol** above')
+    expect(prompt).toContain('## Session Management (REQUIRED)')
+    expect(prompt).toContain('## GitHub Operations (Use gh CLI)')
+  })
+
   describe('session context', () => {
     it('includes session context section when sessionContext is provided', () => {
       // #given
