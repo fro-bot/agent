@@ -3,7 +3,18 @@ import {defineConfig} from '@bfra.me/eslint-config'
 export default defineConfig(
   {
     name: '@bfra.me/github-action',
-    ignores: ['.ai/', '**/AGENTS.md', 'FEATURES.md', 'PRD.md', 'RFCs/', 'RFCS.md', 'RULES.md', 'dist/**'],
+    ignores: [
+      '.ai/',
+      '**/AGENTS.md',
+      'FEATURES.md',
+      'PRD.md',
+      'RFCs/',
+      'RFCS.md',
+      'RULES.md',
+      'dist/**',
+      'docs/plans/',
+      'docs/solutions/',
+    ],
     typescript: {
       tsconfigPath: './tsconfig.json',
     },
