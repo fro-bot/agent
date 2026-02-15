@@ -962,6 +962,42 @@ describe('output contract', () => {
     expect(prompt).toContain('Author association: CONTRIBUTOR')
   })
 
+  it('places output contract immediately after task section for PR events', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      commentBody: null,
+      isRequestedReviewer: true,
+      authorAssociation: 'MEMBER',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    const taskIndex = prompt.indexOf('## Task')
+    const contractIndex = prompt.indexOf('## Output Contract')
+    const environmentIndex = prompt.indexOf('## Environment')
+
+    expect(taskIndex).toBeGreaterThan(-1)
+    expect(contractIndex).toBeGreaterThan(-1)
+    expect(environmentIndex).toBeGreaterThan(-1)
+    expect(contractIndex).toBeGreaterThan(taskIndex)
+    expect(contractIndex).toBeLessThan(environmentIndex)
+  })
+
   it('does not include output contract for non-PR triggers', () => {
     // #given
     const context = createMockContext({eventName: 'issue_comment'})
