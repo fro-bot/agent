@@ -94,5 +94,13 @@ typings/
 .DS_Store
 Thumbs.db
 
+# Worktrees
+.worktrees/
+
+# Workflow docs
+docs/brainstorms/
+docs/plans/
+docs/solutions/
+
 # eslint-typegen (https://github.com/antfu/eslint-typegen)
 eslint-typegen.d.ts
