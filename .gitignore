@@ -104,3 +104,6 @@ docs/solutions/
 
 # eslint-typegen (https://github.com/antfu/eslint-typegen)
 eslint-typegen.d.ts
+
+# Oh My OpenCode
+.sisyphus/

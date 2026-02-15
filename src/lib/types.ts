@@ -57,6 +57,7 @@ export interface ActionInputs {
   // Setup consolidation: auto-setup inputs
   readonly opencodeVersion: string
   readonly skipCache: boolean
+  readonly omoVersion: string
   // oMo provider configuration
   readonly omoProviders: OmoProviders
 }

@@ -49,7 +49,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('1.2.3', mockDeps)
 
       // #then
       expect(result.installed).toBe(true)
@@ -59,7 +59,7 @@ describe('omo', () => {
       expect(execMock).toHaveBeenNthCalledWith(
         1,
         'npm',
-        expect.arrayContaining(['install', '-g', 'oh-my-opencode@latest']),
+        expect.arrayContaining(['install', '-g', 'oh-my-opencode@1.2.3']),
         expect.any(Object),
       )
       expect(execMock).toHaveBeenNthCalledWith(
@@ -88,7 +88,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(result.installed).toBe(true)
@@ -104,7 +104,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -121,7 +121,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -140,7 +140,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(result.installed).toBe(false)
@@ -154,11 +154,70 @@ describe('omo', () => {
       const mockDeps = createMockDeps({logger: mockLogger})
 
       // #when
-      await installOmo(mockDeps)
+      await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(mockLogger.info).toHaveBeenCalledWith('Installing Oh My OpenCode plugin', expect.any(Object))
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
+    })
+
+    it('uses pinned version in npm install', async () => {
+      // #given
+      const execMock = vi.fn().mockResolvedValue(0)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      await installOmo('3.5.5', mockDeps)
+
+      // #then - first call should use version parameter
+      expect(execMock).toHaveBeenNthCalledWith(
+        1,
+        'npm',
+        expect.arrayContaining(['install', '-g', 'oh-my-opencode@3.5.5']),
+        expect.any(Object),
+      )
+    })
+
+    it('uses version parameter for platform package', async () => {
+      // #given
+      const execMock = vi.fn().mockResolvedValue(0)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      await installOmo('3.5.5', mockDeps)
+
+      // #then - first call should include platform package with version
+      expect(execMock).toHaveBeenNthCalledWith(
+        1,
+        'npm',
+        expect.arrayContaining([
+          expect.stringMatching(
+            /^oh-my-opencode-.[^-\n\r\u2028\u2029]*-(?:[^\n\r@\u2028\u2029]*@[^-\n\r\u2028\u2029]*-)*(?:[\n\r\u2028\u2029][^@]*|[^\n\r@\u2028\u2029]+(?:[\n\r\u2028\u2029][^@]*)?)@3\.5\.5$/,
+          ),
+        ]),
+        expect.any(Object),
+      )
+    })
+
+    it('bypasses install when skipInstall is true', async () => {
+      // #given
+      const execMock = vi.fn().mockResolvedValue(0)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      const result = await installOmo('3.5.5', mockDeps, {skipInstall: true})
+
+      // #then
+      expect(result.installed).toBe(true)
+      expect(result.version).toBe('3.5.5')
+      expect(result.error).toBeNull()
+      expect(execMock).not.toHaveBeenCalled()
     })
 
     it('calls oh-my-opencode with headless options using defaults', async () => {
@@ -169,7 +228,7 @@ describe('omo', () => {
       })
 
       // #when
-      await installOmo(mockDeps)
+      await installOmo('3.5.5', mockDeps)
 
       // #then - second call is oh-my-opencode install
       expect(execMock).toHaveBeenNthCalledWith(
@@ -197,7 +256,7 @@ describe('omo', () => {
       })
 
       // #when
-      await installOmo(mockDeps, {
+      await installOmo('3.5.5', mockDeps, {
         claude: 'yes',
         copilot: 'yes',
         gemini: 'yes',
@@ -251,7 +310,7 @@ describe('omo', () => {
       })
 
       // #when
-      const result = await installOmo(mockDeps)
+      const result = await installOmo('3.5.5', mockDeps)
 
       // #then
       expect(result.installed).toBe(false)

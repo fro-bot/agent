@@ -5,6 +5,7 @@ import {validateJsonString, validatePositiveInteger} from '../utils/validation.j
 import {
   DEFAULT_AGENT,
   DEFAULT_OMO_PROVIDERS,
+  DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_TIMEOUT_MS,
@@ -172,6 +173,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
     const skipCache = skipCacheRaw === 'true'
 
+    const omoVersionRaw = core.getInput('omo-version').trim()
+    const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
+
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoProviders = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
 
@@ -188,6 +192,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       timeoutMs,
       opencodeVersion,
       skipCache,
+      omoVersion,
       omoProviders,
     })
   } catch (error) {
