@@ -111,6 +111,15 @@ export const PULL_REQUEST_QUERY = `
             }
           }
         }
+        authorAssociation
+        reviewRequests(first: 20) {
+          nodes {
+            requestedReviewer {
+              ... on User { login }
+              ... on Team { name }
+            }
+          }
+        }
       }
     }
   }

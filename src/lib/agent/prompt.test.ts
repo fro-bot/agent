@@ -22,6 +22,8 @@ function createMockContext(overrides: Partial<AgentContext> = {}): AgentContext 
     defaultBranch: 'main',
     diffContext: null,
     hydratedContext: null,
+    authorAssociation: null,
+    isRequestedReviewer: false,
     ...overrides,
   }
 }
@@ -78,6 +80,24 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Actor:** test-user')
     expect(prompt).toContain('**Run ID:** 12345')
     expect(prompt).toContain('**Cache Status:** hit')
+  })
+
+  it('includes CI environment awareness with operating environment section', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('non-interactive CI environment')
+    expect(prompt).toContain('## Operating Environment')
+    expect(prompt).toContain('assistant messages are logged to the GitHub Actions job output')
+    expect(prompt).toContain('diagnostic information')
   })
 
   it('includes issue context when issue number is present', () => {
@@ -160,7 +180,64 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('session_read')
   })
 
-  it('includes gh CLI operation examples', () => {
+  it('includes Response Protocol requiring single output', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Response Protocol (REQUIRED)')
+    expect(prompt).toContain('exactly ONE')
+    expect(prompt).toContain('NEVER post the Run Summary as a separate comment')
+  })
+
+  it('includes unified response format template with bot marker', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('<!-- fro-bot-agent -->')
+    expect(prompt).toContain('[Your response content here]')
+    expect(prompt).toContain('### Unified Response Format')
+  })
+
+  it('places Response Protocol after Session Management and before GitHub Operations', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    const sessionMgmtIndex = prompt.indexOf('## Session Management (REQUIRED)')
+    const responseProtocolIndex = prompt.indexOf('## Response Protocol (REQUIRED)')
+    const ghOpsIndex = prompt.indexOf('## GitHub Operations (Use gh CLI)')
+
+    expect(sessionMgmtIndex).toBeGreaterThan(-1)
+    expect(responseProtocolIndex).toBeGreaterThan(-1)
+    expect(ghOpsIndex).toBeGreaterThan(-1)
+    expect(responseProtocolIndex).toBeGreaterThan(sessionMgmtIndex)
+    expect(responseProtocolIndex).toBeLessThan(ghOpsIndex)
+  })
+
+  it('includes gh CLI operation examples referencing Response Protocol', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext({issueNumber: 42, defaultBranch: 'develop'}),
@@ -177,9 +254,11 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('gh pr comment 42')
     expect(prompt).toContain('gh pr create')
     expect(prompt).toContain('--base develop')
+    expect(prompt).toContain('See **Response Protocol** above')
+    expect(prompt).not.toContain('# Comment on issue')
   })
 
-  it('includes run summary requirement with template', () => {
+  it('includes run summary template in Response Protocol section', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext({
@@ -195,7 +274,8 @@ describe('buildAgentPrompt', () => {
     const prompt = buildAgentPrompt(options, mockLogger)
 
     // #then
-    expect(prompt).toContain('## Run Summary (REQUIRED)')
+    expect(prompt).not.toContain('## Run Summary (REQUIRED)')
+    expect(prompt).toContain('## Response Protocol (REQUIRED)')
     expect(prompt).toContain('<details>')
     expect(prompt).toContain('<summary>Run Summary</summary>')
     expect(prompt).toContain('| Event | issue_comment |')
@@ -357,6 +437,38 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('## Issue Context')
     expect(prompt).not.toContain('## Pull Request Context')
     expect(prompt).toContain('# Agent Context') // Still has main sections
+  })
+
+  it('omits Response Protocol when issueNumber is null (schedule/workflow_dispatch)', () => {
+    // #given — targetless trigger with no issue/PR to comment on
+    const context = createMockContext({
+      eventName: 'schedule',
+      issueNumber: null,
+      issueTitle: null,
+      issueType: null,
+      commentBody: null,
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'schedule',
+      target: undefined,
+      commentBody: null,
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: 'Run weekly maintenance',
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then — Response Protocol should NOT be included for targetless triggers
+    expect(prompt).not.toContain('## Response Protocol (REQUIRED)')
+    expect(prompt).not.toContain('exactly ONE comment or review')
+    expect(prompt).not.toContain('See **Response Protocol** above')
+    expect(prompt).toContain('## Session Management (REQUIRED)')
+    expect(prompt).toContain('## GitHub Operations (Use gh CLI)')
   })
 
   describe('session context', () => {
@@ -662,7 +774,9 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the comment above.')
+    expect(directive.directive).toBe(
+      'Respond to the comment above. Post your response as a single comment on this thread.',
+    )
     expect(directive.appendMode).toBe(true)
   })
 
@@ -674,7 +788,7 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the discussion comment above.')
+    expect(directive.directive).toBe('Respond to the discussion comment above. Post your response as a single comment.')
     expect(directive.appendMode).toBe(true)
   })
 
@@ -689,7 +803,9 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Triage this issue: summarize, reproduce if possible, propose next steps.')
+    expect(directive.directive).toBe(
+      'Triage this issue: summarize, reproduce if possible, propose next steps. Post your response as a single comment.',
+    )
     expect(directive.appendMode).toBe(true)
   })
 
@@ -704,7 +820,7 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the mention in this issue.')
+    expect(directive.directive).toBe('Respond to the mention in this issue. Post your response as a single comment.')
     expect(directive.appendMode).toBe(true)
   })
 
@@ -726,7 +842,12 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Review this pull request for code quality, potential bugs, and improvements.')
+    expect(directive.directive).toContain(
+      'Review this pull request for code quality, potential bugs, and improvements.',
+    )
+    expect(directive.directive).toContain('If you are a requested reviewer, submit a review via')
+    expect(directive.directive).toContain('Include the Run Summary in the review body')
+    expect(directive.directive).toContain('If the author is a collaborator, prioritize actionable feedback')
     expect(directive.appendMode).toBe(true)
   })
 
@@ -800,7 +921,7 @@ describe('buildTaskSection', () => {
 
     // #then
     expect(section).toContain('## Task')
-    expect(section).toContain('Respond to the comment above.')
+    expect(section).toContain('Respond to the comment above. Post your response as a single comment')
     expect(section).not.toContain('Custom Instructions')
   })
 
@@ -814,7 +935,7 @@ describe('buildTaskSection', () => {
 
     // #then
     expect(section).toContain('## Task')
-    expect(section).toContain('Respond to the comment above.')
+    expect(section).toContain('Respond to the comment above. Post your response as a single comment')
     expect(section).toContain('Focus on security issues')
   })
 
@@ -855,5 +976,158 @@ describe('buildTaskSection', () => {
     expect(section).toContain('**File:** `src/api/handler.ts`')
     expect(section).toContain('**Line:** 100')
     expect(section).toContain('**Commit:** `def456`')
+  })
+})
+
+describe('output contract', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  it('includes output contract section for pull_request trigger', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      issueTitle: 'feat: add feature',
+      commentBody: null,
+      hydratedContext: {
+        type: 'pull_request',
+        number: 99,
+        title: 'feat: add feature',
+        body: '',
+        bodyTruncated: false,
+        state: 'OPEN',
+        author: 'contributor',
+        createdAt: '2024-01-01T00:00:00Z',
+        baseBranch: 'main',
+        headBranch: 'feature',
+        isFork: false,
+        labels: [],
+        assignees: [],
+        comments: [],
+        commentsTruncated: false,
+        totalComments: 0,
+        commits: [],
+        commitsTruncated: false,
+        totalCommits: 0,
+        files: [],
+        filesTruncated: false,
+        totalFiles: 0,
+        reviews: [],
+        reviewsTruncated: false,
+        totalReviews: 0,
+        authorAssociation: 'MEMBER',
+        requestedReviewers: ['fro-bot'],
+        requestedReviewerTeams: [],
+      },
+      isRequestedReviewer: true,
+      authorAssociation: 'MEMBER',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('Requested reviewer: yes')
+    expect(prompt).toContain('Author association: MEMBER')
+  })
+
+  it('shows requested reviewer as no when not requested', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      commentBody: null,
+      isRequestedReviewer: false,
+      authorAssociation: 'CONTRIBUTOR',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('Requested reviewer: no')
+    expect(prompt).toContain('Author association: CONTRIBUTOR')
+  })
+
+  it('places output contract immediately after task section for PR events', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      commentBody: null,
+      isRequestedReviewer: true,
+      authorAssociation: 'MEMBER',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    const taskIndex = prompt.indexOf('## Task')
+    const contractIndex = prompt.indexOf('## Output Contract')
+    const environmentIndex = prompt.indexOf('## Environment')
+
+    expect(taskIndex).toBeGreaterThan(-1)
+    expect(contractIndex).toBeGreaterThan(-1)
+    expect(environmentIndex).toBeGreaterThan(-1)
+    expect(contractIndex).toBeGreaterThan(taskIndex)
+    expect(contractIndex).toBeLessThan(environmentIndex)
+  })
+
+  it('does not include output contract for non-PR triggers', () => {
+    // #given
+    const context = createMockContext({eventName: 'issue_comment'})
+    const triggerContext = createMockTriggerContext({eventType: 'issue_comment'})
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).not.toContain('## Output Contract')
   })
 })

@@ -84,6 +84,19 @@ export async function fallbackPullRequestContext(
       client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
     ])
 
+    // Isolated from Promise.all — insufficient permissions should not lose all PR context
+    const reviewersResponse = await client.rest.pulls
+      .listRequestedReviewers({owner, repo, pull_number: number})
+      .catch((error: unknown) => {
+        logger.warning('Failed to fetch requested reviewers, defaulting to empty', {
+          owner,
+          repo,
+          number,
+          error: toErrorMessage(error),
+        })
+        return {data: {users: [] as {login: string}[], teams: [] as {name: string}[]}}
+      })
+
     const pr = prResponse.data
     const bodyResult = truncateBody(pr.body ?? '', budget.maxBodyBytes)
 
@@ -130,6 +143,9 @@ export async function fallbackPullRequestContext(
       login: a?.login ?? '',
     }))
 
+    const requestedReviewers = (reviewersResponse.data.users ?? []).map(u => u.login)
+    const requestedReviewerTeams = (reviewersResponse.data.teams ?? []).map(t => t.name)
+
     return {
       type: 'pull_request',
       number: pr.number,
@@ -156,6 +172,9 @@ export async function fallbackPullRequestContext(
       reviews,
       reviewsTruncated: reviewsResponse.data.length >= budget.maxReviews,
       totalReviews: reviewsResponse.data.length,
+      authorAssociation: pr.author_association,
+      requestedReviewers,
+      requestedReviewerTeams,
     }
   } catch (error) {
     logger.warning('REST pull request fallback failed', {

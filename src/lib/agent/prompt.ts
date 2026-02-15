@@ -7,7 +7,7 @@
 
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {DiffContext, PromptOptions, SessionContext} from './types.js'
+import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
 import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 
@@ -19,20 +19,38 @@ export interface TriggerDirective {
 export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
   switch (context.eventType) {
     case 'issue_comment':
-      return {directive: 'Respond to the comment above.', appendMode: true}
+      return {
+        directive: 'Respond to the comment above. Post your response as a single comment on this thread.',
+        appendMode: true,
+      }
 
     case 'discussion_comment':
-      return {directive: 'Respond to the discussion comment above.', appendMode: true}
+      return {
+        directive: 'Respond to the discussion comment above. Post your response as a single comment.',
+        appendMode: true,
+      }
 
     case 'issues':
       if (context.action === 'opened') {
-        return {directive: 'Triage this issue: summarize, reproduce if possible, propose next steps.', appendMode: true}
+        return {
+          directive:
+            'Triage this issue: summarize, reproduce if possible, propose next steps. Post your response as a single comment.',
+          appendMode: true,
+        }
       }
-      return {directive: 'Respond to the mention in this issue.', appendMode: true}
+      return {
+        directive: 'Respond to the mention in this issue. Post your response as a single comment.',
+        appendMode: true,
+      }
 
     case 'pull_request':
       return {
-        directive: 'Review this pull request for code quality, potential bugs, and improvements.',
+        directive: [
+          'Review this pull request for code quality, potential bugs, and improvements.',
+          'If you are a requested reviewer, submit a review via `gh pr review` with your full response (including Run Summary) in the --body.',
+          'Include the Run Summary in the review body. Do not post a separate comment.',
+          'If the author is a collaborator, prioritize actionable feedback over style nits.',
+        ].join('\n'),
         appendMode: true,
       }
 
@@ -106,7 +124,14 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
   // System context header
   parts.push(`# Agent Context
 
-You are the Fro Bot Agent running in GitHub Actions.
+You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
+
+## Operating Environment
+
+- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
+- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
+- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
+- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.
 `)
 
   if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
@@ -129,6 +154,14 @@ Execute the requested operation for repository ${context.repo}. Follow all instr
 
 Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
 `)
+  }
+
+  // Output Contract section (PR triggers only)
+  if (options.triggerContext != null) {
+    const eventType = options.triggerContext.eventType
+    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
+      parts.push(buildOutputContractSection(context))
+    }
   }
 
   // Environment context
@@ -192,30 +225,43 @@ Before completing:
 3. This summary will be searchable in future agent runs
 `)
 
+  if (context.issueNumber != null) {
+    parts.push(buildResponseProtocolSection(context, cacheStatus, options.sessionId))
+  }
+
   // GitHub CLI instructions
   const issueNum = context.issueNumber ?? '<number>'
+  const hasResponseProtocol = context.issueNumber != null
   parts.push(`## GitHub Operations (Use gh CLI)
 
-The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations:
+The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
+${
+  hasResponseProtocol
+    ? `
+### Posting Your Response
 
-### Commenting
+See **Response Protocol** above. Post exactly one comment or review per run.
+
 \`\`\`bash
-# Comment on issue
-gh issue comment ${issueNum} --body "Your message"
+# Post response as PR comment (use --body-file for long responses)
+gh pr comment ${issueNum} --body "Your response with Run Summary"
 
-# Comment on PR
-gh pr comment ${issueNum} --body "Your message"
-\`\`\`
+# Submit PR review with response in body
+gh pr review ${issueNum} --approve --body "Your review with Run Summary"
+
+# Post response as issue comment
+gh issue comment ${issueNum} --body "Your response with Run Summary"
+\`\`\``
+    : ''
+}
 
 ### Creating PRs
 \`\`\`bash
-# Create a new PR
 gh pr create --title "feat(scope): description" --body "Details..." --base ${context.defaultBranch} --head feature-branch
 \`\`\`
 
 ### Pushing Commits
 \`\`\`bash
-# Commit and push changes
 git add .
 git commit -m "type(scope): description"
 git push origin HEAD
@@ -223,30 +269,8 @@ git push origin HEAD
 
 ### API Calls
 \`\`\`bash
-# Query the GitHub API
 gh api repos/${context.repo}/issues --jq '.[].title'
 gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
-\`\`\`
-`)
-
-  // Run summary requirement
-  parts.push(`## Run Summary (REQUIRED)
-
-Every comment you post MUST include a collapsed details block at the end:
-
-\`\`\`markdown
-<details>
-<summary>Run Summary</summary>
-
-| Field | Value |
-|-------|-------|
-| Event | ${context.eventName} |
-| Repository | ${context.repo} |
-| Run ID | ${context.runId} |
-| Cache | ${cacheStatus} |
-| Session | ${options.sessionId ?? '<your_session_id>'} |
-
-</details>
 \`\`\`
 `)
 
@@ -257,6 +281,51 @@ Every comment you post MUST include a collapsed details block at the end:
     hasSessionContext: sessionContext != null,
   })
   return prompt
+}
+
+function buildResponseProtocolSection(
+  context: AgentContext,
+  cacheStatus: string,
+  sessionId: string | undefined,
+): string {
+  const issueNum = context.issueNumber ?? '<number>'
+  return `## Response Protocol (REQUIRED)
+
+You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
+
+### Rules
+
+1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
+2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
+3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
+4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
+5. **For PR reviews:** When using \`gh pr review --approve\` or \`gh pr review --request-changes\`, put your full response (analysis + Run Summary) in the \`--body\` argument. Do not post a separate PR comment afterward.
+6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
+
+### Unified Response Format
+
+Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
+
+\`\`\`markdown
+[Your response content here]
+
+---
+
+<!-- fro-bot-agent -->
+<details>
+<summary>Run Summary</summary>
+
+| Field | Value |
+|-------|-------|
+| Event | ${context.eventName} |
+| Repository | ${context.repo} |
+| Run ID | ${context.runId} |
+| Cache | ${cacheStatus} |
+| Session | ${sessionId ?? '<your_session_id>'} |
+
+</details>
+\`\`\`
+`
 }
 
 /**
@@ -335,6 +404,17 @@ function buildDiffContextSection(diffContext: DiffContext): string {
     }
   }
 
+  lines.push('')
+  return lines.join('\n')
+}
+
+function buildOutputContractSection(context: AgentContext): string {
+  const lines: string[] = ['## Output Contract', '']
+  lines.push(`- Review action: approve/request-changes if confident; otherwise comment-only`)
+  lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)
+  if (context.authorAssociation != null) {
+    lines.push(`- Author association: ${context.authorAssociation}`)
+  }
   lines.push('')
   return lines.join('\n')
 }

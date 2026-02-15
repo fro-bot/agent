@@ -101,6 +101,14 @@ export async function hydratePullRequestContext(
     login: a.login,
   }))
 
+  const requestedReviewers = pr.reviewRequests.nodes
+    .map(r => ('login' in r.requestedReviewer ? r.requestedReviewer.login : null))
+    .filter((login): login is string => login != null)
+
+  const requestedReviewerTeams = pr.reviewRequests.nodes
+    .map(r => ('name' in r.requestedReviewer ? r.requestedReviewer.name : null))
+    .filter((name): name is string => name != null)
+
   return {
     type: 'pull_request',
     number: pr.number,
@@ -127,5 +135,8 @@ export async function hydratePullRequestContext(
     reviews,
     reviewsTruncated,
     totalReviews: pr.reviews.totalCount,
+    authorAssociation: pr.authorAssociation,
+    requestedReviewers,
+    requestedReviewerTeams,
   }
 }

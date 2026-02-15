@@ -169,6 +169,7 @@ async function run(): Promise<number> {
       logger: contextLogger,
       octokit: githubClient,
       triggerContext: triggerResult.context,
+      botLogin,
     })
 
     // 4. Build reaction context for acknowledgment

@@ -130,6 +130,7 @@ describe('fallbackPullRequestContext', () => {
               head: {ref: 'feature', repo: {owner: {login: 'owner'}}},
               labels: [],
               assignees: [],
+              author_association: 'COLLABORATOR',
             },
           }),
           listCommits: vi.fn().mockResolvedValue({
@@ -139,6 +140,7 @@ describe('fallbackPullRequestContext', () => {
             data: [{filename: 'src/test.ts', additions: 10, deletions: 5, status: 'modified'}],
           }),
           listReviews: vi.fn().mockResolvedValue({data: []}),
+          listRequestedReviewers: vi.fn().mockResolvedValue({data: {users: [], teams: []}}),
         },
         issues: {
           listComments: vi.fn().mockResolvedValue({data: []}),
@@ -177,11 +179,13 @@ describe('fallbackPullRequestContext', () => {
               head: {ref: 'patch-1', repo: {owner: {login: 'fork-owner'}}},
               labels: [],
               assignees: [],
+              author_association: 'NONE',
             },
           }),
           listCommits: vi.fn().mockResolvedValue({data: []}),
           listFiles: vi.fn().mockResolvedValue({data: []}),
           listReviews: vi.fn().mockResolvedValue({data: []}),
+          listRequestedReviewers: vi.fn().mockResolvedValue({data: {users: [], teams: []}}),
         },
         issues: {
           listComments: vi.fn().mockResolvedValue({data: []}),
@@ -220,5 +224,53 @@ describe('fallbackPullRequestContext', () => {
     // #then
     expect(result).toBeNull()
     expect(logger.warning).toHaveBeenCalled()
+  })
+
+  it('returns PR context with empty reviewers when listRequestedReviewers fails', async () => {
+    // #given — listRequestedReviewers rejects but all other calls succeed
+    const mockOctokit = {
+      rest: {
+        pulls: {
+          get: vi.fn().mockResolvedValue({
+            data: {
+              number: 456,
+              title: 'Test PR',
+              body: 'PR body',
+              state: 'open',
+              created_at: '2024-01-01T00:00:00Z',
+              user: {login: 'contributor'},
+              base: {ref: 'main', repo: {owner: {login: 'owner'}}},
+              head: {ref: 'feature', repo: {owner: {login: 'owner'}}},
+              labels: [],
+              assignees: [],
+              author_association: 'COLLABORATOR',
+            },
+          }),
+          listCommits: vi.fn().mockResolvedValue({
+            data: [{sha: 'abc123', commit: {message: 'Initial commit', author: {name: 'Dev'}}}],
+          }),
+          listFiles: vi.fn().mockResolvedValue({
+            data: [{filename: 'src/test.ts', additions: 10, deletions: 5, status: 'modified'}],
+          }),
+          listReviews: vi.fn().mockResolvedValue({data: []}),
+          listRequestedReviewers: vi.fn().mockRejectedValue(new Error('Resource not accessible by integration')),
+        },
+        issues: {
+          listComments: vi.fn().mockResolvedValue({data: []}),
+        },
+      },
+    } as unknown as Octokit
+
+    // #when
+    const result = await fallbackPullRequestContext(mockOctokit, 'owner', 'repo', 456, DEFAULT_CONTEXT_BUDGET, logger)
+
+    // #then — PR context is returned with empty reviewer arrays, not null
+    expect(result).not.toBeNull()
+    expect(result?.type).toBe('pull_request')
+    expect(result?.number).toBe(456)
+    expect(result?.requestedReviewers).toEqual([])
+    expect(result?.requestedReviewerTeams).toEqual([])
+    expect(result?.commits).toHaveLength(1)
+    expect(result?.files).toHaveLength(1)
   })
 })

@@ -24,6 +24,7 @@ export interface CollectAgentContextOptions {
   readonly logger: Logger
   readonly octokit: Octokit
   readonly triggerContext: TriggerContext
+  readonly botLogin: string | null
 }
 
 /**
@@ -38,7 +39,7 @@ export interface CollectAgentContextOptions {
  * This function augments that with hydrated context and diff context.
  */
 export async function collectAgentContext(options: CollectAgentContextOptions): Promise<AgentContext> {
-  const {logger, octokit, triggerContext} = options
+  const {logger, octokit, triggerContext, botLogin} = options
   const {repo: repoInfo, ref, actor, runId, target, author, commentBody, commentId} = triggerContext
   const repo = `${repoInfo.owner}/${repoInfo.repo}`
 
@@ -50,6 +51,11 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
   const diffContext = await collectDiffContext(triggerContext, octokit, repo, logger)
 
   const hydratedContext = await hydrateContext(octokit, repoInfo.owner, repoInfo.repo, issueNumber, issueType, logger)
+
+  const prContext = hydratedContext?.type === 'pull_request' ? hydratedContext : null
+  const authorAssociation = prContext?.authorAssociation ?? null
+  const isRequestedReviewer =
+    botLogin != null && prContext != null ? prContext.requestedReviewers.includes(botLogin) : false
 
   logger.info('Collected agent context', {
     eventName: triggerContext.eventName,
@@ -76,6 +82,8 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
     defaultBranch: await getDefaultBranch(octokit, repo, logger),
     diffContext,
     hydratedContext,
+    authorAssociation,
+    isRequestedReviewer,
   }
 }
 
