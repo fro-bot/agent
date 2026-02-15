@@ -32,7 +32,11 @@ export function getTriggerDirective(context: TriggerContext, promptInput: string
 
     case 'pull_request':
       return {
-        directive: 'Review this pull request for code quality, potential bugs, and improvements.',
+        directive: [
+          'Review this pull request for code quality, potential bugs, and improvements.',
+          'If you are a requested reviewer, post a review using the GitHub review API.',
+          'If the author is a collaborator, prioritize actionable feedback over style nits.',
+        ].join('\n'),
         appendMode: true,
       }
 

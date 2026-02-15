@@ -728,7 +728,11 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Review this pull request for code quality, potential bugs, and improvements.')
+    expect(directive.directive).toContain(
+      'Review this pull request for code quality, potential bugs, and improvements.',
+    )
+    expect(directive.directive).toContain('If you are a requested reviewer, post a review')
+    expect(directive.directive).toContain('If the author is a collaborator, prioritize actionable feedback')
     expect(directive.appendMode).toBe(true)
   })
 
