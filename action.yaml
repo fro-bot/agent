@@ -42,6 +42,10 @@ inputs:
     description: 'OpenCode CLI version to install if auto-setup is needed (default: latest)'
     required: false
     default: latest
+  omo-version:
+    description: 'oMo (Oh My OpenCode) version to install if auto-setup is needed (default: 3.5.5)'
+    required: false
+    default: 3.5.5
   skip-cache:
     description: Skip session cache restore (default false)
     required: false

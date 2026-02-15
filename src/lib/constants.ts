@@ -21,6 +21,7 @@ export const DEFAULT_MODEL = {
 
 // Setup consolidation defaults
 export const DEFAULT_OPENCODE_VERSION = 'latest'
+export const DEFAULT_OMO_VERSION = '3.5.5'
 export const DEFAULT_OMO_PROVIDERS = 'opencode-zen'
 
 // Retry configuration
