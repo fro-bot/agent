@@ -50,7 +50,7 @@
     "@bfra.me/tsconfig": "0.12.1",
     "@octokit/webhooks-types": "7.6.1",
     "@semantic-release/git": "10.0.1",
-    "@types/node": "24.10.9",
+    "@types/node": "24.10.13",
     "@vitest/eslint-plugin": "1.6.7",
     "conventional-changelog-conventionalcommits": "9.1.0",
     "eslint": "9.39.2",
