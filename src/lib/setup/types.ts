@@ -26,6 +26,7 @@ export interface SetupResult {
   readonly omoInstalled: boolean
   readonly omoError: string | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
+  readonly toolsCacheStatus: 'hit' | 'miss'
   readonly duration: number
 }
 

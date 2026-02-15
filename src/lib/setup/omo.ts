@@ -37,6 +37,7 @@ export interface OmoInstallOptions {
   openai?: 'no' | 'yes'
   opencodeZen?: 'no' | 'yes'
   zaiCodingPlan?: 'no' | 'yes'
+  skipInstall?: boolean
 }
 
 export interface OmoInstallDeps {
@@ -53,7 +54,11 @@ export interface OmoInstallDeps {
  *
  * See RFC-011-RESEARCH-SUMMARY.md for details.
  */
-export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOptions = {}): Promise<OmoInstallResult> {
+export async function installOmo(
+  version: string,
+  deps: OmoInstallDeps,
+  options: OmoInstallOptions = {},
+): Promise<OmoInstallResult> {
   const {logger, execAdapter} = deps
   const {
     claude = 'no',
@@ -62,9 +67,23 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
     openai = 'no',
     opencodeZen = 'no',
     zaiCodingPlan = 'no',
+    skipInstall = false,
   } = options
 
-  logger.info('Installing Oh My OpenCode plugin', {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan})
+  if (skipInstall) {
+    logger.info('Skipping oMo installation (cached)', {version})
+    return {installed: true, version, error: null}
+  }
+
+  logger.info('Installing Oh My OpenCode plugin', {
+    version,
+    claude,
+    copilot,
+    gemini,
+    openai,
+    opencodeZen,
+    zaiCodingPlan,
+  })
 
   const platformPackage = getPlatformPackage()
   logger.debug('Detected platform package', {platformPackage})
@@ -75,7 +94,7 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
   try {
     const installExitCode = await execAdapter.exec(
       'npm',
-      ['install', '-g', 'oh-my-opencode@latest', `${platformPackage}@latest`],
+      ['install', '-g', `oh-my-opencode@${version}`, `${platformPackage}@${version}`],
       {
         listeners: {
           stdout: (data: Buffer) => {
@@ -154,17 +173,25 @@ export async function installOmo(deps: OmoInstallDeps, options: OmoInstallOption
 /**
  * Verify oMo plugin is functional.
  *
- * Checks that OpenCode recognizes the plugin by looking for config file.
+ * Checks config file and binary existence for robust verification.
  */
 export async function verifyOmoInstallation(logger: Logger, execAdapter: ExecAdapter): Promise<boolean> {
   try {
-    const {stdout} = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-opencode.json'], {
+    const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-opencode.json'], {
       silent: true,
       ignoreReturnCode: true,
     })
-    const exists = !stdout.includes('No such file')
-    logger.debug('oMo config file check', {exists})
-    return exists
+    const configExists = !configResult.stdout.includes('No such file')
+
+    const binaryResult = await execAdapter.getExecOutput('which', ['oh-my-opencode'], {
+      silent: true,
+      ignoreReturnCode: true,
+    })
+    const binaryExists = binaryResult.exitCode === 0 && binaryResult.stdout.trim().length > 0
+
+    const verified = configExists && binaryExists
+    logger.debug('oMo verification', {configExists, binaryExists, verified})
+    return verified
   } catch {
     logger.debug('Could not verify oMo installation')
     return false
