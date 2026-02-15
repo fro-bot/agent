@@ -66,8 +66,9 @@ jobs:
         uses: ./.github/actions/setup
 
       - name: Run Fro Bot
-        uses: fro-bot/agent@9abf823ec5c0723219588188d792395237f5b90c # v0.23.27
+        uses: ./
         env:
+          OPENCODE_PROMPT_ARTIFACT: 'true'
           PROMPT: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.prompt || env.DEFAULT_PROMPT)) || (github.event_name == 'schedule' && env.SCHEDULE_PROMPT) || '' }}
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
