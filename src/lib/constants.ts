@@ -30,6 +30,7 @@ export const LLM_RETRY_DELAY_MS = 10_000
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
+export const TOOLS_CACHE_PREFIX = 'opencode-tools' as const
 
 // Storage version (increment on breaking changes)
 export const STORAGE_VERSION = 1
