@@ -70,6 +70,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -92,6 +93,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -115,6 +117,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -134,6 +137,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -156,6 +160,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -178,6 +183,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -202,6 +208,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then
@@ -217,6 +224,7 @@ describe('collectAgentContext', () => {
       logger: mockLogger,
       octokit: mockOctokit,
       triggerContext,
+      botLogin: null,
     })
 
     // #then

@@ -59,6 +59,8 @@ function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): Prompt
       defaultBranch: 'main',
       diffContext: null,
       hydratedContext: null,
+      authorAssociation: null,
+      isRequestedReviewer: false,
     },
     customPrompt: null,
     cacheStatus: 'hit',
