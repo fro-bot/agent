@@ -31,6 +31,8 @@ export interface AgentContext {
   readonly defaultBranch: string
   readonly diffContext: DiffContext | null
   readonly hydratedContext: HydratedContext | null
+  readonly authorAssociation: string | null
+  readonly isRequestedReviewer: boolean
 }
 
 /**

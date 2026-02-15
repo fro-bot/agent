@@ -22,6 +22,8 @@ function createMockContext(overrides: Partial<AgentContext> = {}): AgentContext 
     defaultBranch: 'main',
     diffContext: null,
     hydratedContext: null,
+    authorAssociation: null,
+    isRequestedReviewer: false,
     ...overrides,
   }
 }
@@ -855,5 +857,122 @@ describe('buildTaskSection', () => {
     expect(section).toContain('**File:** `src/api/handler.ts`')
     expect(section).toContain('**Line:** 100')
     expect(section).toContain('**Commit:** `def456`')
+  })
+})
+
+describe('output contract', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  it('includes output contract section for pull_request trigger', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      issueTitle: 'feat: add feature',
+      commentBody: null,
+      hydratedContext: {
+        type: 'pull_request',
+        number: 99,
+        title: 'feat: add feature',
+        body: '',
+        bodyTruncated: false,
+        state: 'OPEN',
+        author: 'contributor',
+        createdAt: '2024-01-01T00:00:00Z',
+        baseBranch: 'main',
+        headBranch: 'feature',
+        isFork: false,
+        labels: [],
+        assignees: [],
+        comments: [],
+        commentsTruncated: false,
+        totalComments: 0,
+        commits: [],
+        commitsTruncated: false,
+        totalCommits: 0,
+        files: [],
+        filesTruncated: false,
+        totalFiles: 0,
+        reviews: [],
+        reviewsTruncated: false,
+        totalReviews: 0,
+        authorAssociation: 'MEMBER',
+        requestedReviewers: ['fro-bot'],
+        requestedReviewerTeams: [],
+      },
+      isRequestedReviewer: true,
+      authorAssociation: 'MEMBER',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('Requested reviewer: yes')
+    expect(prompt).toContain('Author association: MEMBER')
+  })
+
+  it('shows requested reviewer as no when not requested', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      commentBody: null,
+      isRequestedReviewer: false,
+      authorAssociation: 'CONTRIBUTOR',
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Output Contract')
+    expect(prompt).toContain('Requested reviewer: no')
+    expect(prompt).toContain('Author association: CONTRIBUTOR')
+  })
+
+  it('does not include output contract for non-PR triggers', () => {
+    // #given
+    const context = createMockContext({eventName: 'issue_comment'})
+    const triggerContext = createMockTriggerContext({eventType: 'issue_comment'})
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).not.toContain('## Output Contract')
   })
 })

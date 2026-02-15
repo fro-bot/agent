@@ -7,7 +7,7 @@
 
 import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {DiffContext, PromptOptions, SessionContext} from './types.js'
+import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
 import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 
@@ -129,6 +129,14 @@ Execute the requested operation for repository ${context.repo}. Follow all instr
 
 Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
 `)
+  }
+
+  // Output Contract section (PR triggers only)
+  if (options.triggerContext != null) {
+    const eventType = options.triggerContext.eventType
+    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
+      parts.push(buildOutputContractSection(context))
+    }
   }
 
   // Environment context
@@ -335,6 +343,17 @@ function buildDiffContextSection(diffContext: DiffContext): string {
     }
   }
 
+  lines.push('')
+  return lines.join('\n')
+}
+
+function buildOutputContractSection(context: AgentContext): string {
+  const lines: string[] = ['## Output Contract', '']
+  lines.push(`- Review action: approve/request-changes if confident; otherwise comment-only`)
+  lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)
+  if (context.authorAssociation != null) {
+    lines.push(`- Author association: ${context.authorAssociation}`)
+  }
   lines.push('')
   return lines.join('\n')
 }
