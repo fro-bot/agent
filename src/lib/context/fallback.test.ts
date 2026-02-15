@@ -130,6 +130,7 @@ describe('fallbackPullRequestContext', () => {
               head: {ref: 'feature', repo: {owner: {login: 'owner'}}},
               labels: [],
               assignees: [],
+              author_association: 'COLLABORATOR',
             },
           }),
           listCommits: vi.fn().mockResolvedValue({
@@ -139,6 +140,7 @@ describe('fallbackPullRequestContext', () => {
             data: [{filename: 'src/test.ts', additions: 10, deletions: 5, status: 'modified'}],
           }),
           listReviews: vi.fn().mockResolvedValue({data: []}),
+          listRequestedReviewers: vi.fn().mockResolvedValue({data: {users: [], teams: []}}),
         },
         issues: {
           listComments: vi.fn().mockResolvedValue({data: []}),
@@ -177,11 +179,13 @@ describe('fallbackPullRequestContext', () => {
               head: {ref: 'patch-1', repo: {owner: {login: 'fork-owner'}}},
               labels: [],
               assignees: [],
+              author_association: 'NONE',
             },
           }),
           listCommits: vi.fn().mockResolvedValue({data: []}),
           listFiles: vi.fn().mockResolvedValue({data: []}),
           listReviews: vi.fn().mockResolvedValue({data: []}),
+          listRequestedReviewers: vi.fn().mockResolvedValue({data: {users: [], teams: []}}),
         },
         issues: {
           listComments: vi.fn().mockResolvedValue({data: []}),

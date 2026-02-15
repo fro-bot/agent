@@ -76,13 +76,15 @@ export async function fallbackPullRequestContext(
   logger: Logger,
 ): Promise<PullRequestContext | null> {
   try {
-    const [prResponse, commitsResponse, filesResponse, reviewsResponse, commentsResponse] = await Promise.all([
-      client.rest.pulls.get({owner, repo, pull_number: number}),
-      client.rest.pulls.listCommits({owner, repo, pull_number: number, per_page: budget.maxCommits}),
-      client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
-      client.rest.pulls.listReviews({owner, repo, pull_number: number, per_page: budget.maxReviews}),
-      client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
-    ])
+    const [prResponse, commitsResponse, filesResponse, reviewsResponse, commentsResponse, reviewersResponse] =
+      await Promise.all([
+        client.rest.pulls.get({owner, repo, pull_number: number}),
+        client.rest.pulls.listCommits({owner, repo, pull_number: number, per_page: budget.maxCommits}),
+        client.rest.pulls.listFiles({owner, repo, pull_number: number, per_page: budget.maxFiles}),
+        client.rest.pulls.listReviews({owner, repo, pull_number: number, per_page: budget.maxReviews}),
+        client.rest.issues.listComments({owner, repo, issue_number: number, per_page: budget.maxComments}),
+        client.rest.pulls.listRequestedReviewers({owner, repo, pull_number: number}),
+      ])
 
     const pr = prResponse.data
     const bodyResult = truncateBody(pr.body ?? '', budget.maxBodyBytes)
@@ -130,6 +132,9 @@ export async function fallbackPullRequestContext(
       login: a?.login ?? '',
     }))
 
+    const requestedReviewers = (reviewersResponse.data.users ?? []).map(u => u.login)
+    const requestedReviewerTeams = (reviewersResponse.data.teams ?? []).map(t => t.name)
+
     return {
       type: 'pull_request',
       number: pr.number,
@@ -156,6 +161,9 @@ export async function fallbackPullRequestContext(
       reviews,
       reviewsTruncated: reviewsResponse.data.length >= budget.maxReviews,
       totalReviews: reviewsResponse.data.length,
+      authorAssociation: pr.author_association,
+      requestedReviewers,
+      requestedReviewerTeams,
     }
   } catch (error) {
     logger.warning('REST pull request fallback failed', {
