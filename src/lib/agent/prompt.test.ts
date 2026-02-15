@@ -82,6 +82,24 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Cache Status:** hit')
   })
 
+  it('includes CI environment awareness with operating environment section', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('non-interactive CI environment')
+    expect(prompt).toContain('## Operating Environment')
+    expect(prompt).toContain('assistant messages are logged to the GitHub Actions job output')
+    expect(prompt).toContain('diagnostic information')
+  })
+
   it('includes issue context when issue number is present', () => {
     // #given
     const options: PromptOptions = {
@@ -162,7 +180,64 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('session_read')
   })
 
-  it('includes gh CLI operation examples', () => {
+  it('includes Response Protocol requiring single output', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Response Protocol (REQUIRED)')
+    expect(prompt).toContain('exactly ONE')
+    expect(prompt).toContain('NEVER post the Run Summary as a separate comment')
+  })
+
+  it('includes unified response format template with bot marker', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('<!-- fro-bot-agent -->')
+    expect(prompt).toContain('[Your response content here]')
+    expect(prompt).toContain('### Unified Response Format')
+  })
+
+  it('places Response Protocol after Session Management and before GitHub Operations', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    const sessionMgmtIndex = prompt.indexOf('## Session Management (REQUIRED)')
+    const responseProtocolIndex = prompt.indexOf('## Response Protocol (REQUIRED)')
+    const ghOpsIndex = prompt.indexOf('## GitHub Operations (Use gh CLI)')
+
+    expect(sessionMgmtIndex).toBeGreaterThan(-1)
+    expect(responseProtocolIndex).toBeGreaterThan(-1)
+    expect(ghOpsIndex).toBeGreaterThan(-1)
+    expect(responseProtocolIndex).toBeGreaterThan(sessionMgmtIndex)
+    expect(responseProtocolIndex).toBeLessThan(ghOpsIndex)
+  })
+
+  it('includes gh CLI operation examples referencing Response Protocol', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext({issueNumber: 42, defaultBranch: 'develop'}),
@@ -179,9 +254,11 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('gh pr comment 42')
     expect(prompt).toContain('gh pr create')
     expect(prompt).toContain('--base develop')
+    expect(prompt).toContain('See **Response Protocol** above')
+    expect(prompt).not.toContain('# Comment on issue')
   })
 
-  it('includes run summary requirement with template', () => {
+  it('includes run summary template in Response Protocol section', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext({
@@ -197,7 +274,8 @@ describe('buildAgentPrompt', () => {
     const prompt = buildAgentPrompt(options, mockLogger)
 
     // #then
-    expect(prompt).toContain('## Run Summary (REQUIRED)')
+    expect(prompt).not.toContain('## Run Summary (REQUIRED)')
+    expect(prompt).toContain('## Response Protocol (REQUIRED)')
     expect(prompt).toContain('<details>')
     expect(prompt).toContain('<summary>Run Summary</summary>')
     expect(prompt).toContain('| Event | issue_comment |')
@@ -664,7 +742,9 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the comment above.')
+    expect(directive.directive).toBe(
+      'Respond to the comment above. Post your response as a single comment on this thread.',
+    )
     expect(directive.appendMode).toBe(true)
   })
 
@@ -676,7 +756,7 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the discussion comment above.')
+    expect(directive.directive).toBe('Respond to the discussion comment above. Post your response as a single comment.')
     expect(directive.appendMode).toBe(true)
   })
 
@@ -691,7 +771,9 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Triage this issue: summarize, reproduce if possible, propose next steps.')
+    expect(directive.directive).toBe(
+      'Triage this issue: summarize, reproduce if possible, propose next steps. Post your response as a single comment.',
+    )
     expect(directive.appendMode).toBe(true)
   })
 
@@ -706,7 +788,7 @@ describe('getTriggerDirective', () => {
     const directive = getTriggerDirective(context, null)
 
     // #then
-    expect(directive.directive).toBe('Respond to the mention in this issue.')
+    expect(directive.directive).toBe('Respond to the mention in this issue. Post your response as a single comment.')
     expect(directive.appendMode).toBe(true)
   })
 
@@ -731,7 +813,8 @@ describe('getTriggerDirective', () => {
     expect(directive.directive).toContain(
       'Review this pull request for code quality, potential bugs, and improvements.',
     )
-    expect(directive.directive).toContain('If you are a requested reviewer, post a review')
+    expect(directive.directive).toContain('If you are a requested reviewer, submit a review via')
+    expect(directive.directive).toContain('Include the Run Summary in the review body')
     expect(directive.directive).toContain('If the author is a collaborator, prioritize actionable feedback')
     expect(directive.appendMode).toBe(true)
   })
@@ -806,7 +889,7 @@ describe('buildTaskSection', () => {
 
     // #then
     expect(section).toContain('## Task')
-    expect(section).toContain('Respond to the comment above.')
+    expect(section).toContain('Respond to the comment above. Post your response as a single comment')
     expect(section).not.toContain('Custom Instructions')
   })
 
@@ -820,7 +903,7 @@ describe('buildTaskSection', () => {
 
     // #then
     expect(section).toContain('## Task')
-    expect(section).toContain('Respond to the comment above.')
+    expect(section).toContain('Respond to the comment above. Post your response as a single comment')
     expect(section).toContain('Focus on security issues')
   })
 
