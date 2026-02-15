@@ -6,6 +6,7 @@ import * as exec from '@actions/exec'
 import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runSetup} from './setup.js'
+import * as toolsCache from './tools-cache.js'
 
 // Mock @actions/core before importing setup
 vi.mock('@actions/core', () => ({
@@ -59,6 +60,12 @@ vi.mock('node:fs/promises', () => ({
   readFile: vi.fn(),
 }))
 
+// Mock tools-cache module
+vi.mock('./tools-cache.js', () => ({
+  restoreToolsCache: vi.fn(),
+  saveToolsCache: vi.fn(),
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -70,6 +77,7 @@ describe('setup', () => {
     process.env.RUNNER_OS = 'Linux'
     process.env.RUNNER_ARCH = 'X64'
     process.env.XDG_DATA_HOME = '/tmp/test-data'
+    process.env.RUNNER_TOOL_CACHE = '/opt/hostedtoolcache'
 
     // Default mock implementations
     vi.mocked(core.getInput).mockImplementation((name: string) => {
@@ -81,6 +89,18 @@ describe('setup', () => {
       return inputs[name] ?? ''
     })
     vi.mocked(core.getBooleanInput).mockReturnValue(false)
+
+    // Default tools cache: miss (so existing tests run normal install path)
+    vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+    vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+
+    // Default npm config get prefix
+    vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+      if (cmd === 'npm' && args?.[0] === 'config') {
+        return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
+      }
+      return {exitCode: 0, stdout: '', stderr: ''}
+    })
   })
 
   afterEach(() => {
@@ -317,6 +337,117 @@ describe('setup', () => {
       // #then
       expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', expect.any(String)], undefined)
       expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.email', expect.any(String)], undefined)
+    })
+
+    describe('tools cache integration', () => {
+      beforeEach(() => {
+        process.env.RUNNER_TOOL_CACHE = '/opt/hostedtoolcache'
+
+        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          // npm config get prefix
+          if (cmd === 'npm' && args?.[0] === 'config') {
+            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
+        })
+        vi.mocked(exec.exec).mockResolvedValue(0)
+        vi.mocked(fs.writeFile).mockResolvedValue()
+        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+        // Default: tools cache miss
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+      })
+
+      it('calls restoreToolsCache before install functions', async () => {
+        // #given tools cache miss (default in beforeEach)
+
+        // #when
+        await runSetup()
+
+        // #then
+        expect(toolsCache.restoreToolsCache).toHaveBeenCalledTimes(1)
+        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(callArgs).toBeDefined()
+        expect(callArgs?.toolCachePath).toContain('opencode')
+        expect(callArgs?.npmPrefixPath).toContain('oh-my-opencode')
+        expect(callArgs?.omoConfigPath).toContain('opencode')
+      })
+
+      it('calls saveToolsCache after successful installs on cache miss', async () => {
+        // #given tools cache miss
+
+        // #when
+        await runSetup()
+
+        // #then
+        expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
+        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
+        expect(saveArgs).toBeDefined()
+        expect(saveArgs?.toolCachePath).toContain('opencode')
+      })
+
+      it('skips installs and save on tools cache hit', async () => {
+        // #given tools cache hit
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+        })
+
+        // #when
+        const result = await runSetup()
+
+        // #then - no download, no npm install, no save
+        expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(result).not.toBeNull()
+        expect(result?.toolsCacheStatus).toBe('hit')
+      })
+
+      it('includes toolsCacheStatus in SetupResult on cache miss', async () => {
+        // #given tools cache miss (default)
+
+        // #when
+        const result = await runSetup()
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(result?.toolsCacheStatus).toBe('miss')
+      })
+
+      it('does not call saveToolsCache on tools cache hit', async () => {
+        // #given tools cache hit
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+        })
+
+        // #when
+        await runSetup()
+
+        // #then
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+      })
+
+      it('passes skipInstall to installOmo on cache hit', async () => {
+        // #given tools cache hit
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+        })
+
+        // #when
+        const result = await runSetup()
+
+        // #then - oMo skipped but still marked installed
+        expect(result).not.toBeNull()
+        expect(result?.omoInstalled).toBe(true)
+      })
     })
   })
 })

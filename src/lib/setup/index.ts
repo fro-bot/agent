@@ -4,6 +4,8 @@ export {configureGhAuth, configureGitIdentity, getBotUserId} from './gh-auth.js'
 export {installOmo, verifyOmoInstallation} from './omo.js'
 export type {OmoInstallDeps, OmoInstallOptions} from './omo.js'
 export {getLatestVersion, installOpenCode} from './opencode.js'
+export {restoreToolsCache, saveToolsCache} from './tools-cache.js'
+export type {ToolsCacheAdapter, ToolsCacheResult} from './tools-cache.js'
 
 // Types
 export type {
