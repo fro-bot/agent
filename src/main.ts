@@ -90,6 +90,7 @@ async function run(): Promise<number> {
   let attachmentResult: AttachmentResult | null = null
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
+  let backend: SessionBackend | null = null
 
   // Create metrics collector for observability (RFC-007)
   const metrics = createMetricsCollector()
@@ -250,7 +251,7 @@ async function run(): Promise<number> {
     // 6d. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
 
-    const backend: SessionBackend =
+    backend =
       serverHandle == null ? {type: 'json', workspacePath} : {type: 'sdk', workspacePath, client: serverHandle.client}
 
     const recentSessions = await listSessions(backend, {limit: 10}, sessionLogger)
@@ -505,8 +506,9 @@ async function run(): Promise<number> {
 
       // Prune old sessions (RFC-004) before cache save
       const pruneLogger = createLogger({phase: 'prune'})
-      const workspaceForPrune = getGitHubWorkspace()
-      const pruneResult = await pruneSessions(workspaceForPrune, DEFAULT_PRUNING_CONFIG, pruneLogger)
+      const finalWorkspace = getGitHubWorkspace()
+      const pruneBackend: SessionBackend = backend ?? {type: 'json', workspacePath: finalWorkspace}
+      const pruneResult = await pruneSessions(pruneBackend, DEFAULT_PRUNING_CONFIG, pruneLogger)
       if (pruneResult.prunedCount > 0) {
         pruneLogger.info('Pruned old sessions', {
           pruned: pruneResult.prunedCount,
@@ -523,7 +525,6 @@ async function run(): Promise<number> {
       }
 
       const cacheLogger = createLogger({phase: 'cache-save'})
-      const finalWorkspace = getGitHubWorkspace()
       const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
 
       const cacheSaved = await saveCache({
