@@ -151,6 +151,7 @@ async function run(): Promise<number> {
     const triggerResult = routeEvent(githubContext, triggerLogger, {
       botLogin,
       requireMention: true,
+      promptInput: inputs.prompt,
     })
 
     if (!triggerResult.shouldProcess) {
