@@ -1,3 +1,4 @@
+import type {JsonBackend} from './backend.js'
 import type {Logger, PruneResult, PruningConfig} from './types.js'
 
 import {toErrorMessage} from '../../utils/errors.js'
@@ -42,7 +43,8 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  const allSessions = await listSessionsForProject(project.id, logger)
+  const jsonBackend: JsonBackend = {type: 'json', workspacePath: directory}
+  const allSessions = await listSessionsForProject(jsonBackend, project.id, logger)
 
   const mainSessions = allSessions.filter(s => s.parentID == null)
 

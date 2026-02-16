@@ -17,6 +17,22 @@ const mockLogger: Logger = {
   error: vi.fn(),
 }
 
+function createMockSdkClient(options: {
+  listResponse?: {data?: unknown; error?: unknown}
+  getResponse?: {data?: unknown; error?: unknown}
+  messagesResponse?: {data?: unknown; error?: unknown}
+  todosResponse?: {data?: unknown; error?: unknown}
+}) {
+  return {
+    session: {
+      list: vi.fn().mockResolvedValue(options.listResponse ?? {data: []}),
+      get: vi.fn().mockResolvedValue(options.getResponse ?? {data: null}),
+      messages: vi.fn().mockResolvedValue(options.messagesResponse ?? {data: []}),
+      todos: vi.fn().mockResolvedValue(options.todosResponse ?? {data: []}),
+    },
+  }
+}
+
 // Helper to create mock session data
 function createMockSession(id: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -68,7 +84,7 @@ describe('listSessions', () => {
     vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await listSessions('/nonexistent', {}, mockLogger)
+    const result = await listSessions({type: 'json', workspacePath: '/nonexistent'}, {}, mockLogger)
 
     // #then
     expect(result).toEqual([])
@@ -109,7 +125,7 @@ describe('listSessions', () => {
     })
 
     // #when
-    const result = await listSessions('/path/to/repo', {}, mockLogger)
+    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
 
     // #then
     expect(result).toHaveLength(2)
@@ -151,7 +167,7 @@ describe('listSessions', () => {
     })
 
     // #when
-    const result = await listSessions('/path/to/repo', {}, mockLogger)
+    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
@@ -198,7 +214,7 @@ describe('listSessions', () => {
     })
 
     // #when
-    const result = await listSessions('/path/to/repo', {limit: 2}, mockLogger)
+    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {limit: 2}, mockLogger)
 
     // #then
     expect(result).toHaveLength(2)
@@ -246,7 +262,7 @@ describe('listSessions', () => {
     })
 
     // #when
-    const result = await listSessions('/path/to/repo', {}, mockLogger)
+    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
@@ -315,7 +331,7 @@ describe('searchSessions', () => {
     })
 
     // #when
-    const results = await searchSessions('error', '/path/to/repo', {}, mockLogger)
+    const results = await searchSessions('error', {type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
 
     // #then
     expect(results).toHaveLength(1)
@@ -372,13 +388,23 @@ describe('searchSessions', () => {
     })
 
     // #when - case insensitive should find it
-    const caseInsensitive = await searchSessions('error', '/path/to/repo', {caseSensitive: false}, mockLogger)
+    const caseInsensitive = await searchSessions(
+      'error',
+      {type: 'json', workspacePath: '/path/to/repo'},
+      {caseSensitive: false},
+      mockLogger,
+    )
 
     // #then
     expect(caseInsensitive).toHaveLength(1)
 
     // #when - case sensitive should NOT find 'error' (only 'Error' exists)
-    const caseSensitive = await searchSessions('error', '/path/to/repo', {caseSensitive: true}, mockLogger)
+    const caseSensitive = await searchSessions(
+      'error',
+      {type: 'json', workspacePath: '/path/to/repo'},
+      {caseSensitive: true},
+      mockLogger,
+    )
 
     // #then
     expect(caseSensitive).toHaveLength(0)
@@ -441,7 +467,7 @@ describe('searchSessions', () => {
     })
 
     // #when
-    const results = await searchSessions('special data', '/path/to/repo', {}, mockLogger)
+    const results = await searchSessions('special data', {type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
 
     // #then
     expect(results).toHaveLength(1)
@@ -498,7 +524,12 @@ describe('searchSessions', () => {
     })
 
     // #when
-    const results = await searchSessions('match', '/path/to/repo', {limit: 2}, mockLogger)
+    const results = await searchSessions(
+      'match',
+      {type: 'json', workspacePath: '/path/to/repo'},
+      {limit: 2},
+      mockLogger,
+    )
 
     // #then
     expect(results).toHaveLength(1)
@@ -522,7 +553,12 @@ describe('getSessionInfo', () => {
     vi.mocked(fs.readFile).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await getSessionInfo('nonexistent', 'proj1', mockLogger)
+    const result = await getSessionInfo(
+      {type: 'json', workspacePath: '/path/to/repo'},
+      'nonexistent',
+      'proj1',
+      mockLogger,
+    )
 
     // #then
     expect(result).toBeNull()
@@ -563,7 +599,7 @@ describe('getSessionInfo', () => {
     })
 
     // #when
-    const result = await getSessionInfo('ses_1', 'proj1', mockLogger)
+    const result = await getSessionInfo({type: 'json', workspacePath: '/path/to/repo'}, 'ses_1', 'proj1', mockLogger)
 
     // #then
     expect(result).not.toBeNull()
@@ -574,5 +610,82 @@ describe('getSessionInfo', () => {
     expect(result?.hasTodos).toBe(true)
     expect(result?.todoCount).toBe(2)
     expect(result?.completedTodos).toBe(1)
+  })
+})
+
+describe('SDK session search', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('lists sessions via SDK and maps summaries', async () => {
+    // #given
+    const sdkSession = {
+      id: 'ses_sdk',
+      version: '1.1.53',
+      projectId: 'proj_sdk',
+      directory: '/workspace',
+      title: 'SDK Session',
+      time: {created: 1000, updated: 2000},
+    }
+    const sdkMessage = {
+      id: 'msg_1',
+      sessionId: 'ses_sdk',
+      role: 'user',
+      time: {created: 1000},
+      agent: 'Sisyphus',
+      model: {providerID: 'test', modelID: 'test'},
+    }
+    const client = createMockSdkClient({
+      listResponse: {data: [sdkSession]},
+      messagesResponse: {data: [sdkMessage]},
+    })
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await listSessions(backend, {}, mockLogger)
+
+    // #then
+    expect(client.session.list).toHaveBeenCalledWith({query: {directory: '/workspace'}})
+    expect(result).toHaveLength(1)
+    expect(result[0]?.id).toBe('ses_sdk')
+    expect(result[0]?.messageCount).toBe(1)
+  })
+
+  it('searches SDK session content from messages and parts', async () => {
+    // #given
+    const sdkSession = {
+      id: 'ses_sdk',
+      version: '1.1.53',
+      projectId: 'proj_sdk',
+      directory: '/workspace',
+      title: 'SDK Session',
+      time: {created: 1000, updated: 2000},
+    }
+    const sdkMessage = {
+      id: 'msg_1',
+      sessionId: 'ses_sdk',
+      role: 'user',
+      time: {created: 1000},
+      agent: 'Sisyphus',
+      model: {providerID: 'test', modelID: 'test'},
+      parts: [{id: 'prt_1', sessionId: 'ses_sdk', messageId: 'msg_1', type: 'text', text: 'hello sdk match'}],
+    }
+    const client = createMockSdkClient({
+      listResponse: {data: [sdkSession]},
+      messagesResponse: {data: [sdkMessage]},
+    })
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const results = await searchSessions('match', backend, {}, mockLogger)
+
+    // #then
+    expect(results).toHaveLength(1)
+    expect(results[0]?.matches[0]?.excerpt).toContain('match')
   })
 })

@@ -7,6 +7,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
   deleteSession,
+  findLatestSession,
   findProjectByDirectory,
   getMessageParts,
   getOpenCodeStoragePath,
@@ -17,6 +18,10 @@ import {
   listSessionsForProject,
 } from './storage.js'
 
+vi.mock('@opencode-ai/sdk', () => ({
+  createOpencode: vi.fn(),
+}))
+
 // Mock fs module
 vi.mock('node:fs/promises')
 vi.mock('node:os')
@@ -26,6 +31,22 @@ const mockLogger: Logger = {
   info: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
+}
+
+function createMockSdkClient(options: {
+  listResponse?: {data?: unknown; error?: unknown}
+  getResponse?: {data?: unknown; error?: unknown}
+  messagesResponse?: {data?: unknown; error?: unknown}
+  todosResponse?: {data?: unknown; error?: unknown}
+}) {
+  return {
+    session: {
+      list: vi.fn().mockResolvedValue(options.listResponse ?? {data: []}),
+      get: vi.fn().mockResolvedValue(options.getResponse ?? {data: null}),
+      messages: vi.fn().mockResolvedValue(options.messagesResponse ?? {data: []}),
+      todos: vi.fn().mockResolvedValue(options.todosResponse ?? {data: []}),
+    },
+  }
 }
 
 describe('getOpenCodeStoragePath', () => {
@@ -243,7 +264,7 @@ describe('listSessionsForProject', () => {
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(session))
 
     // #when
-    const result = await listSessionsForProject('proj1', mockLogger)
+    const result = await listSessionsForProject({type: 'json', workspacePath: '/path/to/repo'}, 'proj1', mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
@@ -255,7 +276,11 @@ describe('listSessionsForProject', () => {
     vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await listSessionsForProject('nonexistent', mockLogger)
+    const result = await listSessionsForProject(
+      {type: 'json', workspacePath: '/path/to/repo'},
+      'nonexistent',
+      mockLogger,
+    )
 
     // #then
     expect(result).toEqual([])
@@ -287,7 +312,7 @@ describe('getSession', () => {
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(session))
 
     // #when
-    const result = await getSession('proj1', 'ses_abc123', mockLogger)
+    const result = await getSession({type: 'json', workspacePath: '/path/to/repo'}, 'proj1', 'ses_abc123', mockLogger)
 
     // #then
     expect(result).toEqual(session)
@@ -299,7 +324,7 @@ describe('getSession', () => {
     vi.mocked(fs.readFile).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await getSession('proj1', 'nonexistent', mockLogger)
+    const result = await getSession({type: 'json', workspacePath: '/path/to/repo'}, 'proj1', 'nonexistent', mockLogger)
 
     // #then
     expect(result).toBeNull()
@@ -330,7 +355,7 @@ describe('getSessionMessages', () => {
     vi.mocked(fs.readFile).mockResolvedValueOnce(JSON.stringify(msg1)).mockResolvedValueOnce(JSON.stringify(msg2))
 
     // #when
-    const result = await getSessionMessages('ses_1', mockLogger)
+    const result = await getSessionMessages({type: 'json', workspacePath: '/path/to/repo'}, 'ses_1', mockLogger)
 
     // #then
     expect(result).toHaveLength(2)
@@ -343,7 +368,7 @@ describe('getSessionMessages', () => {
     vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await getSessionMessages('nonexistent', mockLogger)
+    const result = await getSessionMessages({type: 'json', workspacePath: '/path/to/repo'}, 'nonexistent', mockLogger)
 
     // #then
     expect(result).toEqual([])
@@ -378,7 +403,7 @@ describe('getMessageParts', () => {
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(part))
 
     // #when
-    const result = await getMessageParts('msg_1', mockLogger)
+    const result = await getMessageParts({type: 'json', workspacePath: '/path/to/repo'}, 'msg_1', mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
@@ -407,7 +432,7 @@ describe('getSessionTodos', () => {
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(todos))
 
     // #when
-    const result = await getSessionTodos('ses_1', mockLogger)
+    const result = await getSessionTodos({type: 'json', workspacePath: '/path/to/repo'}, 'ses_1', mockLogger)
 
     // #then
     expect(result).toEqual(todos)
@@ -418,10 +443,212 @@ describe('getSessionTodos', () => {
     vi.mocked(fs.readFile).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await getSessionTodos('nonexistent', mockLogger)
+    const result = await getSessionTodos({type: 'json', workspacePath: '/path/to/repo'}, 'nonexistent', mockLogger)
 
     // #then
     expect(result).toEqual([])
+  })
+})
+
+describe('SDK session storage', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('lists sessions via SDK', async () => {
+    // #given
+    const sdkSession = {
+      id: 'ses_sdk',
+      version: '1.1.53',
+      projectId: 'proj_sdk',
+      directory: '/workspace',
+      title: 'SDK Session',
+      time: {created: 1000, updated: 2000},
+    }
+    const client = createMockSdkClient({listResponse: {data: [sdkSession]}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await listSessionsForProject(backend, 'proj_sdk', mockLogger)
+
+    // #then
+    expect(client.session.list).toHaveBeenCalledWith({query: {directory: '/workspace'}})
+    expect(result).toEqual([
+      {
+        id: 'ses_sdk',
+        version: '1.1.53',
+        projectID: 'proj_sdk',
+        directory: '/workspace',
+        title: 'SDK Session',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+  })
+
+  it('returns empty list when SDK session list fails', async () => {
+    // #given
+    const client = createMockSdkClient({listResponse: {error: 'boom', data: null}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await listSessionsForProject(backend, 'proj_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session list failed', expect.any(Object))
+  })
+
+  it('gets session via SDK', async () => {
+    // #given
+    const sdkSession = {
+      id: 'ses_sdk',
+      version: '1.1.53',
+      projectId: 'proj_sdk',
+      directory: '/workspace',
+      title: 'SDK Session',
+      time: {created: 1000, updated: 2000},
+    }
+    const client = createMockSdkClient({getResponse: {data: sdkSession}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSession(backend, 'proj_sdk', 'ses_sdk', mockLogger)
+
+    // #then
+    expect(client.session.get).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
+    expect(result).toEqual({
+      id: 'ses_sdk',
+      version: '1.1.53',
+      projectID: 'proj_sdk',
+      directory: '/workspace',
+      title: 'SDK Session',
+      time: {created: 1000, updated: 2000},
+    })
+  })
+
+  it('returns null when SDK session get fails', async () => {
+    // #given
+    const client = createMockSdkClient({getResponse: {error: 'boom', data: null}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSession(backend, 'proj_sdk', 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session get failed', expect.any(Object))
+  })
+
+  it('returns sorted messages via SDK', async () => {
+    // #given
+    const sdkMessages = [
+      {
+        id: 'msg_1',
+        sessionId: 'ses_sdk',
+        role: 'assistant',
+        time: {created: 2000},
+        parentId: 'msg_0',
+        modelId: 'model',
+        providerId: 'provider',
+        mode: 'chat',
+        agent: 'Sisyphus',
+        path: {cwd: '/workspace', root: '/workspace'},
+        cost: 0,
+        tokens: {input: 0, output: 0, reasoning: 0, cache: {read: 0, write: 0}},
+      },
+      {
+        id: 'msg_2',
+        sessionId: 'ses_sdk',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'User',
+        model: {providerID: 'provider', modelID: 'model'},
+      },
+    ]
+    const client = createMockSdkClient({messagesResponse: {data: sdkMessages}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSessionMessages(backend, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(client.session.messages).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
+    expect(result).toHaveLength(2)
+    expect(result[0]?.id).toBe('msg_2')
+    expect(result[1]?.id).toBe('msg_1')
+  })
+
+  it('returns empty messages when SDK messages fail', async () => {
+    // #given
+    const client = createMockSdkClient({messagesResponse: {error: 'boom', data: null}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSessionMessages(backend, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session messages failed', expect.any(Object))
+  })
+
+  it('returns todos via SDK', async () => {
+    // #given
+    const sdkTodos = [
+      {content: 'Task 1', status: 'pending', priority: 'high'},
+      {id: 't2', content: 'Task 2', status: 'completed', priority: 'low'},
+    ]
+    const client = createMockSdkClient({todosResponse: {data: sdkTodos}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSessionTodos(backend, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(client.session.todos).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
+    expect(result).toEqual([
+      {content: 'Task 1', status: 'pending', priority: 'high'},
+      {id: 't2', content: 'Task 2', status: 'completed', priority: 'low'},
+    ])
+  })
+
+  it('returns empty todos when SDK todos fail', async () => {
+    // #given
+    const client = createMockSdkClient({todosResponse: {error: 'boom', data: null}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await getSessionTodos(backend, 'ses_sdk', mockLogger)
+
+    // #then
+    expect(result).toEqual([])
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session todos failed', expect.any(Object))
+  })
+
+  it('finds latest session via SDK', async () => {
+    // #given
+    const sdkSession = {
+      id: 'ses_latest',
+      version: '1.1.53',
+      projectId: 'proj_sdk',
+      directory: '/workspace',
+      title: 'Latest',
+      time: {created: 5000, updated: 6000},
+    }
+    const client = createMockSdkClient({listResponse: {data: [sdkSession]}})
+    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await findLatestSession(backend, 4000, mockLogger)
+
+    // #then
+    expect(client.session.list).toHaveBeenCalledWith({
+      query: {directory: '/workspace', start: 4000, roots: true, limit: 1},
+    })
+    expect(result?.session.id).toBe('ses_latest')
   })
 })
 

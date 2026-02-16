@@ -24,6 +24,7 @@ import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CommentTarget, Octokit} from './lib/github/types.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
+import type {SessionBackend} from './lib/session/backend.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -249,12 +250,15 @@ async function run(): Promise<number> {
     // 6d. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
 
-    const recentSessions = await listSessions(workspacePath, {limit: 10}, sessionLogger)
+    const backend: SessionBackend =
+      serverHandle == null ? {type: 'json', workspacePath} : {type: 'sdk', workspacePath, client: serverHandle.client}
+
+    const recentSessions = await listSessions(backend, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = agentContext.issueTitle ?? agentContext.repo
-    const priorWorkContext = await searchSessions(searchQuery, workspacePath, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(searchQuery, backend, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -346,7 +350,7 @@ async function run(): Promise<number> {
       // Fall back to session discovery for backward compatibility
       let sessionId: string | null = execResult.sessionId
       if (sessionId == null) {
-        const latestSession = await findLatestSession(executionStartTime, sessionLogger)
+        const latestSession = await findLatestSession(backend, executionStartTime, sessionLogger)
         if (latestSession != null) {
           sessionId = latestSession.session.id
           sessionLogger.debug('Identified session from execution', {sessionId})

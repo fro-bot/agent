@@ -209,7 +209,7 @@ export interface ProjectInfo {
  * Todo item (stored in todo/{sessionID}.json)
  */
 export interface TodoItem {
-  readonly id: string
+  readonly id?: string
   readonly content: string
   readonly status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
   readonly priority: 'high' | 'medium' | 'low'
