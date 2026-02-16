@@ -16,8 +16,12 @@ describe('state-keys', () => {
       expect(STATE_KEYS.CACHE_SAVED).toBe('cacheSaved')
     })
 
+    it('contains opencodeVersion key', () => {
+      expect(STATE_KEYS.OPENCODE_VERSION).toBe('opencodeVersion')
+    })
+
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(3)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(4)
     })
 
     it('values are string type compatible', () => {

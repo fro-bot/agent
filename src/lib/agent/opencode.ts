@@ -6,9 +6,11 @@
  * RFC-014 adds file attachment support via SDK file parts.
  */
 
+import type {Result} from '@bfra.me/es/result'
 import type {Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {ErrorInfo} from '../comments/types.js'
 import type {Logger} from '../logger.js'
+import type {SessionClient} from '../session/backend.js'
 import type {TokenUsage} from '../types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
@@ -26,7 +28,14 @@ import {createAgentError, createLLMFetchError, isAgentNotFoundError, isLlmFetchE
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
+import {err, ok} from '../types.js'
 import {buildAgentPrompt} from './prompt.js'
+
+export interface OpenCodeServerHandle {
+  readonly client: SessionClient
+  readonly server: {readonly url: string; close: () => void}
+  readonly shutdown: () => void
+}
 
 /** Log a server event at debug level for troubleshooting. */
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -305,10 +314,35 @@ async function sendPromptToSession(
   }
 }
 
+export async function bootstrapOpenCodeServer(
+  signal: AbortSignal,
+  logger: Logger,
+): Promise<Result<OpenCodeServerHandle, Error>> {
+  try {
+    const opencode = await createOpencode({signal})
+    const {client, server} = opencode
+
+    logger.debug('OpenCode server bootstrapped', {url: server.url})
+
+    return ok({
+      client,
+      server,
+      shutdown: () => {
+        server.close()
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logger.warning('Failed to bootstrap OpenCode server', {error: message})
+    return err(new Error(`Server bootstrap failed: ${message}`))
+  }
+}
+
 export async function executeOpenCode(
   promptOptions: PromptOptions,
   logger: Logger,
   config?: ExecutionConfig,
+  serverHandle?: OpenCodeServerHandle,
 ): Promise<AgentResult> {
   const startTime = Date.now()
   const abortController = new AbortController()
@@ -317,6 +351,7 @@ export async function executeOpenCode(
   let timeoutId: ReturnType<typeof setTimeout> | null = null
   let timedOut = false
 
+  const ownsServer = serverHandle == null
   let server: Awaited<ReturnType<typeof createOpencode>>['server'] | null = null
 
   if (timeoutMs > 0) {
@@ -334,14 +369,19 @@ export async function executeOpenCode(
   })
 
   try {
-    // Create server and session ONCE (outside retry loop)
-    const opencode = await createOpencode({
-      signal: abortController.signal,
-    })
-    const {client} = opencode
-    server = opencode.server
+    let client: SessionClient
 
-    logger.debug('OpenCode server started', {url: server.url})
+    if (serverHandle == null) {
+      const opencode = await createOpencode({
+        signal: abortController.signal,
+      })
+      client = opencode.client
+      server = opencode.server
+      logger.debug('OpenCode server started', {url: server.url})
+    } else {
+      client = serverHandle.client
+      logger.debug('Reusing external OpenCode server', {url: serverHandle.server.url})
+    }
 
     const sessionResponse = await client.session.create()
     if (sessionResponse.data == null || sessionResponse.error != null) {
@@ -553,7 +593,9 @@ export async function executeOpenCode(
       clearTimeout(timeoutId)
     }
     abortController.abort()
-    server?.close()
+    if (ownsServer) {
+      server?.close()
+    }
   }
 }
 
