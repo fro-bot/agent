@@ -47,16 +47,16 @@ export interface SaveCacheOptions {
   readonly cacheAdapter?: CacheAdapter
 }
 
-function buildCachePaths(
+async function buildCachePaths(
   storagePath: string,
   projectIdPath: string | undefined,
   opencodeVersion: string | null | undefined,
-): string[] {
+): Promise<string[]> {
   const paths = [storagePath]
   if (projectIdPath != null) {
     paths.push(projectIdPath)
   }
-  if (isSqliteBackend(opencodeVersion ?? null)) {
+  if (await isSqliteBackend(opencodeVersion ?? null)) {
     const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
     paths.push(dbPath)
   }
@@ -93,7 +93,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
@@ -182,7 +182,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   }
 
   const saveKey = buildSaveCacheKey(components, runId)
-  const cachePaths = buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Saving cache', {saveKey, paths: cachePaths})
 

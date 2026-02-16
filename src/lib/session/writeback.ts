@@ -1,5 +1,5 @@
 import type {RunSummary} from '../types.js'
-import type {SessionBackend} from './backend.js'
+import type {SdkBackend, SessionBackend} from './backend.js'
 import type {Logger} from './types.js'
 
 import * as fs from 'node:fs/promises'
@@ -73,10 +73,53 @@ export async function writeSessionSummary(
   backend: SessionBackend,
   logger: Logger,
 ): Promise<void> {
+  const summaryText = formatSummaryForSession(summary)
+
   if (backend.type === 'sdk') {
-    logger.debug('SDK backend detected, using JSON file writeback (no silent message API available)', {sessionId})
+    const sdkSuccess = await writeSummaryViaSdk(sessionId, summaryText, backend, logger)
+    if (sdkSuccess) {
+      return
+    }
   }
 
+  await writeSummaryViaJson(sessionId, summaryText, logger)
+}
+
+async function writeSummaryViaSdk(
+  sessionId: string,
+  summaryText: string,
+  backend: SdkBackend,
+  logger: Logger,
+): Promise<boolean> {
+  try {
+    const result = await backend.client.session.prompt({
+      path: {id: sessionId},
+      body: {
+        noReply: true,
+        parts: [{type: 'text' as const, text: summaryText}],
+      },
+    })
+
+    if (result.error != null) {
+      logger.warning('SDK prompt writeback failed, falling back to JSON', {
+        sessionId,
+        error: String(result.error),
+      })
+      return false
+    }
+
+    logger.info('Session summary written via SDK', {sessionId})
+    return true
+  } catch (error) {
+    logger.warning('SDK prompt writeback failed, falling back to JSON', {
+      sessionId,
+      error: toErrorMessage(error),
+    })
+    return false
+  }
+}
+
+async function writeSummaryViaJson(sessionId: string, summaryText: string, logger: Logger): Promise<void> {
   const storagePath = getOpenCodeStoragePath()
   const messageDir = path.join(storagePath, 'message', sessionId)
   const partDir = path.join(storagePath, 'part')
@@ -103,7 +146,6 @@ export async function writeSessionSummary(
     },
   }
 
-  const summaryText = formatSummaryForSession(summary)
   const partMetadata = {
     id: partId,
     sessionID: sessionId,

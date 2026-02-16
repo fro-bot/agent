@@ -232,7 +232,7 @@ async function run(): Promise<number> {
     }
 
     // 6c. Bootstrap SDK server for SQLite backend (needed before session introspection)
-    if (isSqliteBackend(detectedOpencodeVersion)) {
+    if (await isSqliteBackend(detectedOpencodeVersion)) {
       const serverLogger = createLogger({phase: 'server-bootstrap'})
       const abortController = new AbortController()
       const bootstrapResult = await bootstrapOpenCodeServer(abortController.signal, serverLogger)

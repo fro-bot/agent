@@ -53,7 +53,7 @@ export type {
 } from './types.js'
 
 // Version detection
-export {compareVersions, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
+export {compareVersions, getOpenCodeDbPath, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
 
 // Writeback
 export {writeSessionSummary} from './writeback.js'

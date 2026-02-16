@@ -279,10 +279,40 @@ describe('writeSessionSummary', () => {
     expect(part.text).not.toContain('Tokens:')
   })
 
-  it('uses JSON file writeback for SDK backend (SDK has no silent message API)', async () => {
+  it('uses SDK prompt with noReply for SDK backend', async () => {
     // #given
     const summary = createMockRunSummary()
-    const client = {session: {}} as unknown as import('./backend.js').SdkBackend['client']
+    const mockPrompt = vi.fn().mockResolvedValue({data: undefined, error: undefined})
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
+
+    // #when
+    await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
+
+    // #then — calls SDK prompt with noReply: true
+    expect(mockPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_test'},
+        body: expect.objectContaining({
+          noReply: true,
+          parts: [
+            expect.objectContaining({
+              type: 'text',
+              text: expect.stringContaining('Fro Bot Run Summary') as unknown,
+            }) as unknown,
+          ],
+        }) as unknown,
+      }),
+    )
+    // Should NOT write JSON files
+    expect(fs.writeFile).not.toHaveBeenCalled()
+  })
+
+  it('falls back to JSON writeback when SDK prompt fails', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const mockPrompt = vi.fn().mockResolvedValue({data: undefined, error: {detail: 'server error'}})
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
     const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
 
     vi.mocked(fs.mkdir).mockResolvedValue(undefined)
@@ -291,12 +321,32 @@ describe('writeSessionSummary', () => {
     // #when
     await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
 
-    // #then — still writes JSON files (SDK has no create-message-without-prompt API)
-    expect(fs.mkdir).toHaveBeenCalledWith(expect.stringContaining('/message/ses_test'), {recursive: true})
-    expect(fs.writeFile).toHaveBeenCalledTimes(2)
-    expect(mockLogger.debug).toHaveBeenCalledWith(
-      'SDK backend detected, using JSON file writeback (no silent message API available)',
+    // #then — falls back to JSON
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'SDK prompt writeback failed, falling back to JSON',
       expect.objectContaining({sessionId: 'ses_test'}),
     )
+    expect(fs.writeFile).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls back to JSON writeback when SDK prompt throws', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const mockPrompt = vi.fn().mockRejectedValue(new Error('connection refused'))
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
+
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined)
+
+    // #when
+    await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
+
+    // #then — falls back to JSON
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'SDK prompt writeback failed, falling back to JSON',
+      expect.objectContaining({sessionId: 'ses_test'}),
+    )
+    expect(fs.writeFile).toHaveBeenCalledTimes(2)
   })
 })
