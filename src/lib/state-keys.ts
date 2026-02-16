@@ -12,6 +12,8 @@ export const STATE_KEYS = {
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */
   CACHE_SAVED: 'cacheSaved',
+  /** OpenCode version detected during main action (for post-action cache path calculation) */
+  OPENCODE_VERSION: 'opencodeVersion',
 } as const
 
 export type StateKey = (typeof STATE_KEYS)[keyof typeof STATE_KEYS]

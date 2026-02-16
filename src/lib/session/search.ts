@@ -1,3 +1,4 @@
+import type {SessionBackend} from './backend.js'
 import type {Logger, Message, Part, SessionInfo, SessionMatch, SessionSearchResult, SessionSummary} from './types.js'
 
 import {
@@ -17,22 +18,25 @@ import {
  * represent temporary branches/experiments that should not clutter the list.
  */
 export async function listSessions(
-  directory: string,
+  backend: SessionBackend,
   options: {limit?: number; fromDate?: Date; toDate?: Date},
   logger: Logger,
 ): Promise<readonly SessionSummary[]> {
   const {limit, fromDate, toDate} = options
 
-  logger.debug('Listing sessions', {directory, limit})
+  logger.debug('Listing sessions', {directory: backend.workspacePath, limit})
 
-  const project = await findProjectByDirectory(directory, logger)
+  const project =
+    backend.type === 'sdk'
+      ? {id: '', worktree: backend.workspacePath}
+      : await findProjectByDirectory(backend.workspacePath, logger)
   if (project == null) {
-    logger.debug('No project found for directory', {directory})
+    logger.debug('No project found for directory', {directory: backend.workspacePath})
     return []
   }
 
   // Get all sessions for this project
-  const sessions = await listSessionsForProject(project.id, logger)
+  const sessions = await listSessionsForProject(backend, project.id, logger)
 
   const filtered = sessions.filter(session => {
     if (session.parentID != null) return false
@@ -49,7 +53,7 @@ export async function listSessions(
   const sessionsToProcess = limit == null ? sorted : sorted.slice(0, limit)
 
   for (const session of sessionsToProcess) {
-    const messages = await getSessionMessages(session.id, logger)
+    const messages = await getSessionMessages(backend, session.id, logger)
     const agents = extractAgentsFromMessages(messages)
 
     summaries.push({
@@ -65,7 +69,7 @@ export async function listSessions(
     })
   }
 
-  logger.info('Listed sessions', {count: summaries.length, directory})
+  logger.info('Listed sessions', {count: summaries.length, directory: backend.workspacePath})
   return summaries
 }
 
@@ -93,32 +97,32 @@ function extractAgentsFromMessages(messages: readonly Message[]): readonly strin
  */
 export async function searchSessions(
   query: string,
-  directory: string,
+  backend: SessionBackend,
   options: {limit?: number; caseSensitive?: boolean; sessionId?: string},
   logger: Logger,
 ): Promise<readonly SessionSearchResult[]> {
   const {limit = 20, caseSensitive = false, sessionId} = options
 
-  logger.debug('Searching sessions', {query, directory, limit, caseSensitive})
+  logger.debug('Searching sessions', {query, directory: backend.workspacePath, limit, caseSensitive})
 
   const searchPattern = caseSensitive ? query : query.toLowerCase()
   const results: SessionSearchResult[] = []
   let totalMatches = 0
 
   if (sessionId != null) {
-    const matches = await searchSessionContent(sessionId, searchPattern, caseSensitive, logger)
+    const matches = await searchSessionContent(backend, sessionId, searchPattern, caseSensitive, logger)
     if (matches.length > 0) {
       results.push({sessionId, matches: matches.slice(0, limit)})
     }
     return results
   }
 
-  const sessions = await listSessions(directory, {}, logger)
+  const sessions = await listSessions(backend, {}, logger)
 
   for (const session of sessions) {
     if (totalMatches >= limit) break
 
-    const matches = await searchSessionContent(session.id, searchPattern, caseSensitive, logger)
+    const matches = await searchSessionContent(backend, session.id, searchPattern, caseSensitive, logger)
 
     if (matches.length > 0) {
       const remainingLimit = limit - totalMatches
@@ -140,16 +144,18 @@ export async function searchSessions(
  * for agents to determine relevance without overwhelming the prompt.
  */
 async function searchSessionContent(
+  backend: SessionBackend,
   sessionId: string,
   pattern: string,
   caseSensitive: boolean,
   logger: Logger,
 ): Promise<readonly SessionMatch[]> {
-  const messages = await getSessionMessages(sessionId, logger)
+  const messages = await getSessionMessages(backend, sessionId, logger)
   const matches: SessionMatch[] = []
 
   for (const message of messages) {
-    const parts = await getMessageParts(message.id, logger)
+    const sdkParts = (message as {parts?: readonly Part[]}).parts
+    const parts = sdkParts ?? (await getMessageParts(backend, message.id, logger))
 
     for (const part of parts) {
       const text = extractTextFromPart(part)
@@ -201,6 +207,7 @@ function extractTextFromPart(part: Part): string | null {
  * Get detailed info about a specific session.
  */
 export async function getSessionInfo(
+  backend: SessionBackend,
   sessionId: string,
   projectID: string,
   logger: Logger,
@@ -212,12 +219,12 @@ export async function getSessionInfo(
   todoCount: number
   completedTodos: number
 } | null> {
-  const session = await getSession(projectID, sessionId, logger)
+  const session = await getSession(backend, projectID, sessionId, logger)
   if (session == null) return null
 
-  const messages = await getSessionMessages(sessionId, logger)
+  const messages = await getSessionMessages(backend, sessionId, logger)
   const agents = extractAgentsFromMessages(messages)
-  const todos = await getSessionTodos(sessionId, logger)
+  const todos = await getSessionTodos(backend, sessionId, logger)
 
   return {
     session,

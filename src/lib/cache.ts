@@ -7,6 +7,7 @@ import * as cache from '@actions/cache'
 import {toErrorMessage} from '../utils/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey, type CacheKeyComponents} from './cache-key.js'
 import {STORAGE_VERSION} from './constants.js'
+import {isSqliteBackend} from './session/version.js'
 
 /**
  * Adapter interface for cache operations.
@@ -31,6 +32,7 @@ export interface RestoreCacheOptions {
   readonly storagePath: string
   readonly authPath: string
   readonly projectIdPath?: string
+  readonly opencodeVersion?: string | null
   readonly cacheAdapter?: CacheAdapter
 }
 
@@ -41,7 +43,24 @@ export interface SaveCacheOptions {
   readonly storagePath: string
   readonly authPath: string
   readonly projectIdPath?: string
+  readonly opencodeVersion?: string | null
   readonly cacheAdapter?: CacheAdapter
+}
+
+async function buildCachePaths(
+  storagePath: string,
+  projectIdPath: string | undefined,
+  opencodeVersion: string | null | undefined,
+): Promise<string[]> {
+  const paths = [storagePath]
+  if (projectIdPath != null) {
+    paths.push(projectIdPath)
+  }
+  if (await isSqliteBackend(opencodeVersion ?? null)) {
+    const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
+    paths.push(dbPath)
+  }
+  return paths
 }
 
 /**
@@ -51,7 +70,15 @@ export interface SaveCacheOptions {
  * Corruption is detected and reported but does not throw.
  */
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
-  const {components, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
+  const {
+    components,
+    logger,
+    storagePath,
+    authPath,
+    projectIdPath,
+    opencodeVersion,
+    cacheAdapter = defaultCacheAdapter,
+  } = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache restore (SKIP_CACHE=true)')
@@ -66,7 +93,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = projectIdPath == null ? [storagePath] : [storagePath, projectIdPath]
+  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
@@ -138,7 +165,16 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
  * Excludes auth.json from being saved.
  */
 export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
-  const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
+  const {
+    components,
+    runId,
+    logger,
+    storagePath,
+    authPath,
+    projectIdPath,
+    opencodeVersion,
+    cacheAdapter = defaultCacheAdapter,
+  } = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache save (SKIP_CACHE=true)')
@@ -146,7 +182,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   }
 
   const saveKey = buildSaveCacheKey(components, runId)
-  const cachePaths = projectIdPath == null ? [storagePath] : [storagePath, projectIdPath]
+  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Saving cache', {saveKey, paths: cachePaths})
 

@@ -16,7 +16,8 @@ export type {CollectAgentContextOptions} from './context.js'
 export {collectDiffContext} from './diff-context.js'
 
 // OpenCode execution (RFC-013: SDK mode)
-export {ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+export {bootstrapOpenCodeServer, ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
+export type {OpenCodeServerHandle} from './opencode.js'
 
 // Prompt construction
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
