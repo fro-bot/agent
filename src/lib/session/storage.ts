@@ -364,7 +364,7 @@ export function mapSdkPartToPart(sdkPart: unknown): Part {
         type: 'tool',
         callID: readString(sdkPart.callID) ?? readString(sdkPart.callId) ?? '',
         tool: readString(sdkPart.tool) ?? '',
-        state: mapSdkToolState(stateRecord) as unknown as Part['type'] extends 'tool' ? never : never,
+        state: mapSdkToolState(stateRecord),
         metadata: isRecord(sdkPart.metadata) ? sdkPart.metadata : undefined,
       }
     }
@@ -515,7 +515,7 @@ async function findLatestSessionViaSDK(
       directory: workspacePath,
       start: afterTimestamp,
       roots: true,
-      limit: 1,
+      limit: 10,
     } as Record<string, unknown>,
   })
   if (response.error != null || response.data == null) {
@@ -527,8 +527,14 @@ async function findLatestSessionViaSDK(
     return null
   }
 
-  const session = mapSdkSessionToSessionInfo(response.data[0])
-  return {projectID: session.projectID, session}
+  const sessions = response.data.map(mapSdkSessionToSessionInfo)
+  if (sessions.length === 0) {
+    return null
+  }
+
+  const latest = sessions.reduce((max, session) => (session.time.created > max.time.created ? session : max))
+
+  return {projectID: latest.projectID, session: latest}
 }
 
 async function deleteSessionViaSdk(client: SessionClient, sessionID: string, logger: Logger): Promise<number> {

@@ -646,7 +646,7 @@ describe('SDK session storage', () => {
 
     // #then
     expect(client.session.list).toHaveBeenCalledWith({
-      query: {directory: '/workspace', start: 4000, roots: true, limit: 1},
+      query: {directory: '/workspace', start: 4000, roots: true, limit: 10},
     })
     expect(result?.session.id).toBe('ses_latest')
   })

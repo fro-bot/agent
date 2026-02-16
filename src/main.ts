@@ -540,14 +540,21 @@ async function run(): Promise<number> {
       if (cacheSaved) {
         core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
       }
-
-      if (serverHandle != null) {
-        serverHandle.shutdown()
-      }
     } catch (cleanupError) {
       bootstrapLogger.warning('Cleanup failed (non-fatal)', {
         error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
       })
+    } finally {
+      // Guaranteed shutdown of SDK server regardless of cleanup success
+      if (serverHandle != null) {
+        try {
+          serverHandle.shutdown()
+        } catch (shutdownError) {
+          bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
+            error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+          })
+        }
+      }
     }
   }
 
