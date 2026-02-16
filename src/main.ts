@@ -19,16 +19,19 @@
  * 12. Save cache (always, in finally block)
  */
 
+import type {OpenCodeServerHandle} from './lib/agent/index.js'
 import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CommentTarget, Octokit} from './lib/github/types.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
+import type {SessionBackend} from './lib/session/backend.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {
   acknowledgeReceipt,
+  bootstrapOpenCodeServer,
   collectAgentContext,
   completeAcknowledgment,
   ensureOpenCodeAvailable,
@@ -52,6 +55,7 @@ import {setActionOutputs} from './lib/outputs.js'
 import {
   DEFAULT_PRUNING_CONFIG,
   findLatestSession,
+  isSqliteBackend,
   listSessions,
   pruneSessions,
   searchSessions,
@@ -84,6 +88,9 @@ async function run(): Promise<number> {
   let exitCode = 0
   let githubClient: Octokit | null = null
   let attachmentResult: AttachmentResult | null = null
+  let detectedOpencodeVersion: string | null = null
+  let serverHandle: OpenCodeServerHandle | null = null
+  let backend: SessionBackend | null = null
 
   // Create metrics collector for observability (RFC-007)
   const metrics = createMetricsCollector()
@@ -127,6 +134,9 @@ async function run(): Promise<number> {
     } else {
       logger.info('OpenCode already available', {version: opencodeResult.version})
     }
+
+    core.saveState(STATE_KEYS.OPENCODE_VERSION, opencodeResult.version)
+    detectedOpencodeVersion = opencodeResult.version
 
     // 3. Parse GitHub context and setup client early (needed for routing and cache)
     const contextLogger = createLogger({phase: 'context'})
@@ -203,6 +213,7 @@ async function run(): Promise<number> {
       storagePath: getOpenCodeStoragePath(),
       authPath: getOpenCodeAuthPath(),
       projectIdPath,
+      opencodeVersion: opencodeResult.version,
     })
 
     const cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted
@@ -221,15 +232,34 @@ async function run(): Promise<number> {
       cacheLogger.debug('Project ID ready', {projectId: projectIdResult.projectId, source: projectIdResult.source})
     }
 
-    // 6c. Session introspection (RFC-004) - gather prior session context
+    // 6c. Bootstrap SDK server for SQLite backend (needed before session introspection)
+    if (await isSqliteBackend(detectedOpencodeVersion)) {
+      const serverLogger = createLogger({phase: 'server-bootstrap'})
+      const abortController = new AbortController()
+      const bootstrapResult = await bootstrapOpenCodeServer(abortController.signal, serverLogger)
+
+      if (bootstrapResult.success) {
+        serverHandle = bootstrapResult.data
+        serverLogger.info('SDK server bootstrapped for SQLite backend')
+      } else {
+        serverLogger.warning('SDK server bootstrap failed, falling back to JSON backend', {
+          error: bootstrapResult.error.message,
+        })
+      }
+    }
+
+    // 6d. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
 
-    const recentSessions = await listSessions(workspacePath, {limit: 10}, sessionLogger)
+    backend =
+      serverHandle == null ? {type: 'json', workspacePath} : {type: 'sdk', workspacePath, client: serverHandle.client}
+
+    const recentSessions = await listSessions(backend, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = agentContext.issueTitle ?? agentContext.repo
-    const priorWorkContext = await searchSessions(searchQuery, workspacePath, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(searchQuery, backend, {limit: 5}, sessionLogger)
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -240,7 +270,7 @@ async function run(): Promise<number> {
       metrics.addSessionUsed(session.sessionId)
     }
 
-    // 6d. Process attachments from comment body (RFC-014)
+    // 6e. Process attachments from comment body (RFC-014)
     const attachmentLogger = createLogger({phase: 'attachments'})
 
     const commentBody = agentContext.commentBody ?? ''
@@ -315,13 +345,13 @@ async function run(): Promise<number> {
         timeoutMs: inputs.timeoutMs,
       }
 
-      const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig)
+      const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, serverHandle ?? undefined)
 
       // SDK mode returns sessionId directly (RFC-013)
       // Fall back to session discovery for backward compatibility
       let sessionId: string | null = execResult.sessionId
       if (sessionId == null) {
-        const latestSession = await findLatestSession(executionStartTime, sessionLogger)
+        const latestSession = await findLatestSession(backend, executionStartTime, sessionLogger)
         if (latestSession != null) {
           sessionId = latestSession.session.id
           sessionLogger.debug('Identified session from execution', {sessionId})
@@ -367,7 +397,7 @@ async function run(): Promise<number> {
         duration: Math.round((Date.now() - startTime) / 1000),
         tokenUsage: result.tokenUsage,
       }
-      await writeSessionSummary(result.sessionId, runSummary, sessionLogger)
+      await writeSessionSummary(result.sessionId, runSummary, backend, sessionLogger)
       sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
     }
 
@@ -476,8 +506,9 @@ async function run(): Promise<number> {
 
       // Prune old sessions (RFC-004) before cache save
       const pruneLogger = createLogger({phase: 'prune'})
-      const storagePath = getOpenCodeStoragePath()
-      const pruneResult = await pruneSessions(storagePath, DEFAULT_PRUNING_CONFIG, pruneLogger)
+      const finalWorkspace = getGitHubWorkspace()
+      const pruneBackend: SessionBackend = backend ?? {type: 'json', workspacePath: finalWorkspace}
+      const pruneResult = await pruneSessions(pruneBackend, DEFAULT_PRUNING_CONFIG, pruneLogger)
       if (pruneResult.prunedCount > 0) {
         pruneLogger.info('Pruned old sessions', {
           pruned: pruneResult.prunedCount,
@@ -494,7 +525,6 @@ async function run(): Promise<number> {
       }
 
       const cacheLogger = createLogger({phase: 'cache-save'})
-      const finalWorkspace = getGitHubWorkspace()
       const finalProjectIdPath = path.join(finalWorkspace, '.git', 'opencode')
 
       const cacheSaved = await saveCache({
@@ -504,6 +534,7 @@ async function run(): Promise<number> {
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
         projectIdPath: finalProjectIdPath,
+        opencodeVersion: detectedOpencodeVersion,
       })
 
       if (cacheSaved) {
@@ -513,6 +544,17 @@ async function run(): Promise<number> {
       bootstrapLogger.warning('Cleanup failed (non-fatal)', {
         error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
       })
+    } finally {
+      // Guaranteed shutdown of SDK server regardless of cleanup success
+      if (serverHandle != null) {
+        try {
+          serverHandle.shutdown()
+        } catch (shutdownError) {
+          bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
+            error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+          })
+        }
+      }
     }
   }
 

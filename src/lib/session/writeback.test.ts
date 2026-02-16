@@ -1,5 +1,6 @@
 import type {RunSummary} from '../types.js'
 
+import type {JsonBackend, SdkBackend} from './backend.js'
 import type {Logger} from './types.js'
 
 import * as fs from 'node:fs/promises'
@@ -17,6 +18,8 @@ const mockLogger: Logger = {
   warning: vi.fn(),
   error: vi.fn(),
 }
+
+const jsonBackend: JsonBackend = {type: 'json', workspacePath: '/workspace'}
 
 // Helper to create mock run summary
 function createMockRunSummary(overrides: Partial<RunSummary> = {}): RunSummary {
@@ -53,7 +56,7 @@ describe('writeSessionSummary', () => {
     vi.mocked(fs.writeFile).mockResolvedValue(undefined)
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     expect(fs.mkdir).toHaveBeenCalledWith(expect.stringContaining('/message/ses_test'), {recursive: true})
@@ -75,7 +78,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     expect(writtenMessage).not.toBeNull()
@@ -108,7 +111,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     expect(writtenPart).not.toBeNull()
@@ -137,7 +140,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     const part = writtenPart as {text: string}
@@ -160,7 +163,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     const part = writtenPart as {text: string}
@@ -187,7 +190,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     expect(messageId).toMatch(/^msg_[0-9a-f][0-9A-Za-z]+$/)
@@ -201,7 +204,7 @@ describe('writeSessionSummary', () => {
     vi.mocked(fs.writeFile).mockResolvedValue(undefined)
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     expect(mockLogger.info).toHaveBeenCalledWith(
@@ -217,7 +220,7 @@ describe('writeSessionSummary', () => {
     vi.mocked(fs.writeFile).mockRejectedValue(new Error('Permission denied'))
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then - should not throw, just log warning
     expect(mockLogger.warning).toHaveBeenCalledWith(
@@ -235,7 +238,7 @@ describe('writeSessionSummary', () => {
     vi.mocked(fs.mkdir).mockRejectedValue(new Error('No space left'))
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then - should not throw, just log warning
     expect(mockLogger.warning).toHaveBeenCalledWith(
@@ -266,7 +269,7 @@ describe('writeSessionSummary', () => {
     })
 
     // #when
-    await writeSessionSummary('ses_test', summary, mockLogger)
+    await writeSessionSummary('ses_test', summary, jsonBackend, mockLogger)
 
     // #then
     const part = writtenPart as {text: string}
@@ -274,5 +277,76 @@ describe('writeSessionSummary', () => {
     expect(part.text).not.toContain('PRs created:')
     expect(part.text).not.toContain('Commits:')
     expect(part.text).not.toContain('Tokens:')
+  })
+
+  it('uses SDK prompt with noReply for SDK backend', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const mockPrompt = vi.fn().mockResolvedValue({data: undefined, error: undefined})
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
+
+    // #when
+    await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
+
+    // #then — calls SDK prompt with noReply: true
+    expect(mockPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: {id: 'ses_test'},
+        body: expect.objectContaining({
+          noReply: true,
+          parts: [
+            expect.objectContaining({
+              type: 'text',
+              text: expect.stringContaining('Fro Bot Run Summary') as unknown,
+            }) as unknown,
+          ],
+        }) as unknown,
+      }),
+    )
+    // Should NOT write JSON files
+    expect(fs.writeFile).not.toHaveBeenCalled()
+  })
+
+  it('falls back to JSON writeback when SDK prompt fails', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const mockPrompt = vi.fn().mockResolvedValue({data: undefined, error: {detail: 'server error'}})
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
+
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined)
+
+    // #when
+    await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
+
+    // #then — falls back to JSON
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'SDK prompt writeback failed, falling back to JSON',
+      expect.objectContaining({sessionId: 'ses_test'}),
+    )
+    expect(fs.writeFile).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls back to JSON writeback when SDK prompt throws', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const mockPrompt = vi.fn().mockRejectedValue(new Error('connection refused'))
+    const client = {session: {prompt: mockPrompt}} as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client}
+
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined)
+
+    // #when
+    await writeSessionSummary('ses_test', summary, sdkBackend, mockLogger)
+
+    // #then — falls back to JSON
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'SDK prompt writeback failed, falling back to JSON',
+      expect.objectContaining({sessionId: 'ses_test'}),
+    )
+    expect(fs.writeFile).toHaveBeenCalledTimes(2)
   })
 })

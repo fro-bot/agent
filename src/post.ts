@@ -35,8 +35,9 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
   const cacheSaved = core.getState(STATE_KEYS.CACHE_SAVED)
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
+  const opencodeVersion = core.getState(STATE_KEYS.OPENCODE_VERSION) || null
 
-  logger.debug('Post-action state', {shouldSaveCache, cacheSaved, sessionId})
+  logger.debug('Post-action state', {shouldSaveCache, cacheSaved, sessionId, opencodeVersion})
 
   if (shouldSaveCache !== 'true') {
     logger.info('Skipping post-action: event was not processed', {shouldSaveCache})
@@ -62,6 +63,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       logger,
       storagePath: getOpenCodeStoragePath(),
       authPath: getOpenCodeAuthPath(),
+      opencodeVersion,
     })
 
     if (saved) {

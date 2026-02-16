@@ -1,3 +1,4 @@
+import type {JsonBackend} from './backend.js'
 import type {Logger} from './types.js'
 
 import * as fs from 'node:fs/promises'
@@ -64,9 +65,10 @@ describe('pruneSessions', () => {
   it('returns empty result when no project found', async () => {
     // #given
     vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'))
+    const backend: JsonBackend = {type: 'json', workspacePath: '/nonexistent'}
 
     // #when
-    const result = await pruneSessions('/nonexistent', DEFAULT_PRUNING_CONFIG, mockLogger)
+    const result = await pruneSessions(backend, DEFAULT_PRUNING_CONFIG, mockLogger)
 
     // #then
     expect(result.prunedCount).toBe(0)
@@ -121,9 +123,10 @@ describe('pruneSessions', () => {
     vi.mocked(fs.stat).mockResolvedValue({size: 100} as Awaited<ReturnType<typeof fs.stat>>)
     vi.mocked(fs.unlink).mockResolvedValue(undefined)
     vi.mocked(fs.rm).mockResolvedValue(undefined)
+    const backend: JsonBackend = {type: 'json', workspacePath: '/path/to/repo'}
 
     // #when - maxSessions=3 should keep 3 most recent even though all are older than 30 days
-    const result = await pruneSessions('/path/to/repo', {maxSessions: 3, maxAgeDays: 30}, mockLogger)
+    const result = await pruneSessions(backend, {maxSessions: 3, maxAgeDays: 30}, mockLogger)
 
     // #then
     expect(result.remainingCount).toBe(3)
@@ -172,9 +175,10 @@ describe('pruneSessions', () => {
       }
       throw new Error('ENOENT')
     })
+    const backend: JsonBackend = {type: 'json', workspacePath: '/path/to/repo'}
 
     // #when - maxSessions=2 but all are within 30 days, so all should be kept
-    const result = await pruneSessions('/path/to/repo', {maxSessions: 2, maxAgeDays: 30}, mockLogger)
+    const result = await pruneSessions(backend, {maxSessions: 2, maxAgeDays: 30}, mockLogger)
 
     // #then - all 5 sessions are within 30 days, so none should be pruned
     expect(result.prunedCount).toBe(0)
@@ -226,9 +230,10 @@ describe('pruneSessions', () => {
     vi.mocked(fs.stat).mockResolvedValue({size: 100} as Awaited<ReturnType<typeof fs.stat>>)
     vi.mocked(fs.unlink).mockResolvedValue(undefined)
     vi.mocked(fs.rm).mockResolvedValue(undefined)
+    const backend: JsonBackend = {type: 'json', workspacePath: '/path/to/repo'}
 
     // #when - maxSessions=1 should keep only the most recent
-    const result = await pruneSessions('/path/to/repo', {maxSessions: 1, maxAgeDays: 30}, mockLogger)
+    const result = await pruneSessions(backend, {maxSessions: 1, maxAgeDays: 30}, mockLogger)
 
     // #then - both parent and child should be pruned
     expect(result.prunedSessionIds).toContain('ses_parent')
@@ -277,9 +282,10 @@ describe('pruneSessions', () => {
     vi.mocked(fs.stat).mockResolvedValue({size: 500} as Awaited<ReturnType<typeof fs.stat>>)
     vi.mocked(fs.unlink).mockResolvedValue(undefined)
     vi.mocked(fs.rm).mockResolvedValue(undefined)
+    const backend: JsonBackend = {type: 'json', workspacePath: '/path/to/repo'}
 
     // #when
-    const result = await pruneSessions('/path/to/repo', {maxSessions: 1, maxAgeDays: 30}, mockLogger)
+    const result = await pruneSessions(backend, {maxSessions: 1, maxAgeDays: 30}, mockLogger)
 
     // #then
     expect(result.freedBytes).toBeGreaterThanOrEqual(0)
@@ -325,9 +331,10 @@ describe('pruneSessions', () => {
     vi.mocked(fs.stat).mockRejectedValue(new Error('Permission denied'))
     vi.mocked(fs.unlink).mockRejectedValue(new Error('Permission denied'))
     vi.mocked(fs.rm).mockRejectedValue(new Error('Permission denied'))
+    const backend: JsonBackend = {type: 'json', workspacePath: '/path/to/repo'}
 
     // #when
-    const result = await pruneSessions('/path/to/repo', {maxSessions: 1, maxAgeDays: 30}, mockLogger)
+    const result = await pruneSessions(backend, {maxSessions: 1, maxAgeDays: 30}, mockLogger)
 
     // #then - should complete without throwing, with 0 freed bytes
     expect(result.prunedCount).toBe(1) // Still counts as pruned even if deletion failed

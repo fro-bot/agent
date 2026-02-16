@@ -1,3 +1,4 @@
+import type {SessionBackend} from './backend.js'
 import type {Logger, PruneResult, PruningConfig} from './types.js'
 
 import {toErrorMessage} from '../../utils/errors.js'
@@ -26,14 +27,19 @@ export const DEFAULT_PRUNING_CONFIG: PruningConfig = {
  * Cache size is a critical concern: sessions accumulate 1-10MB each, and without
  * pruning, cache restore/save becomes the workflow bottleneck.
  */
-export async function pruneSessions(directory: string, config: PruningConfig, logger: Logger): Promise<PruneResult> {
+export async function pruneSessions(
+  backend: SessionBackend,
+  config: PruningConfig,
+  logger: Logger,
+): Promise<PruneResult> {
   const {maxSessions, maxAgeDays} = config
+  const {workspacePath} = backend
 
-  logger.info('Starting session pruning', {directory, maxSessions, maxAgeDays})
+  logger.info('Starting session pruning', {workspacePath, maxSessions, maxAgeDays})
 
-  const project = await findProjectByDirectory(directory, logger)
+  const project = await findProjectByDirectory(workspacePath, logger)
   if (project == null) {
-    logger.debug('No project found for pruning', {directory})
+    logger.debug('No project found for pruning', {workspacePath})
     return {
       prunedCount: 0,
       prunedSessionIds: [],
@@ -42,7 +48,7 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
     }
   }
 
-  const allSessions = await listSessionsForProject(project.id, logger)
+  const allSessions = await listSessionsForProject(backend, project.id, logger)
 
   const mainSessions = allSessions.filter(s => s.parentID == null)
 
@@ -103,7 +109,7 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
 
   for (const sessionId of allSessionsToPrune) {
     try {
-      const bytes = await deleteSession(project.id, sessionId, logger)
+      const bytes = await deleteSession(backend, project.id, sessionId, logger)
       freedBytes += bytes
       prunedIds.push(sessionId)
       logger.debug('Pruned session', {sessionId, bytes})

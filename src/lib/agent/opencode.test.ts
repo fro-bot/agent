@@ -1,5 +1,6 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../logger.js'
+import type {OpenCodeServerHandle} from './opencode.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
@@ -10,7 +11,14 @@ import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as envUtils from '../../utils/env.js'
 import {createMockLogger} from '../test-helpers.js'
-import {ensureOpenCodeAvailable, executeOpenCode, logServerEvent, verifyOpenCodeAvailable} from './opencode.js'
+
+import {
+  bootstrapOpenCodeServer,
+  ensureOpenCodeAvailable,
+  executeOpenCode,
+  logServerEvent,
+  verifyOpenCodeAvailable,
+} from './opencode.js'
 
 // Mock node:fs/promises
 vi.mock('node:fs/promises', () => ({
@@ -123,6 +131,21 @@ function createMockOpencode(options: {
   return {
     client: options.client,
     server: options.server ?? createMockServer(),
+  }
+}
+
+function createMockServerHandle(options: {
+  client: ReturnType<typeof createMockClient>
+  server?: ReturnType<typeof createMockServer>
+}): {handle: OpenCodeServerHandle; mockServer: ReturnType<typeof createMockServer>} {
+  const mockServer = options.server ?? createMockServer()
+  return {
+    handle: {
+      client: options.client as unknown as OpenCodeServerHandle['client'],
+      server: mockServer as unknown as OpenCodeServerHandle['server'],
+      shutdown: vi.fn() as unknown as () => void,
+    },
+    mockServer,
   }
 }
 
@@ -1011,5 +1034,187 @@ describe('logServerEvent', () => {
         error: 'Connection timeout',
       },
     })
+  })
+})
+
+describe('bootstrapOpenCodeServer', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('returns ok with server handle on success', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockServer = createMockServer()
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const abortController = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+    const handle = (result as {success: true; data: OpenCodeServerHandle}).data
+    expect(handle.client).toBe(mockClient)
+    expect(handle.server.url).toBe('http://127.0.0.1:4096')
+    expect(typeof handle.shutdown).toBe('function')
+  })
+
+  it('passes signal to createOpencode', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockServer = createMockServer()
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const abortController = new AbortController()
+
+    // #when
+    await bootstrapOpenCodeServer(abortController.signal, mockLogger)
+
+    // #then
+    expect(createOpencode).toHaveBeenCalledWith({signal: abortController.signal})
+  })
+
+  it('returns err when createOpencode fails', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('Connection refused'))
+
+    const abortController = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    const error = (result as {success: false; error: Error}).error
+    expect(error.message).toContain('Server bootstrap failed')
+    expect(error.message).toContain('Connection refused')
+  })
+
+  it('logs warning on failure', async () => {
+    // #given
+    vi.mocked(createOpencode).mockRejectedValue(new Error('Connection refused'))
+
+    const abortController = new AbortController()
+
+    // #when
+    await bootstrapOpenCodeServer(abortController.signal, mockLogger)
+
+    // #then
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'Failed to bootstrap OpenCode server',
+      expect.objectContaining({error: 'Connection refused'}),
+    )
+  })
+
+  it('shutdown calls server.close', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockServer = createMockServer()
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const abortController = new AbortController()
+
+    // #when
+    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
+
+    // #then
+    expect(result.success).toBe(true)
+    const handle = (result as {success: true; data: OpenCodeServerHandle}).data
+    handle.shutdown()
+    expect(mockServer.close).toHaveBeenCalled()
+  })
+})
+
+describe('executeOpenCode with serverHandle', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('reuses external server handle instead of creating a new one', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const {handle} = createMockServerHandle({client: mockClient})
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger, undefined, handle)
+
+    // #then
+    expect(createOpencode).not.toHaveBeenCalled()
+    expect(result.success).toBe(true)
+  })
+
+  it('does NOT close server when serverHandle is provided', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const {handle, mockServer} = createMockServerHandle({client: mockClient})
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, undefined, handle)
+
+    // #then
+    expect(mockServer.close).not.toHaveBeenCalled()
+  })
+
+  it('does NOT close server on error when serverHandle is provided', async () => {
+    // #given
+    const mockClient = createMockClient({throwOnCreate: true})
+    const {handle, mockServer} = createMockServerHandle({client: mockClient})
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, undefined, handle)
+
+    // #then
+    expect(mockServer.close).not.toHaveBeenCalled()
+  })
+
+  it('still closes server when no serverHandle is provided (backward compat)', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockServer = createMockServer()
+    const mockOpencode = createMockOpencode({client: mockClient, server: mockServer})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(mockServer.close).toHaveBeenCalled()
   })
 })
