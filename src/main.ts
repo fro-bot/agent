@@ -396,7 +396,7 @@ async function run(): Promise<number> {
         duration: Math.round((Date.now() - startTime) / 1000),
         tokenUsage: result.tokenUsage,
       }
-      await writeSessionSummary(result.sessionId, runSummary, sessionLogger)
+      await writeSessionSummary(result.sessionId, runSummary, backend, sessionLogger)
       sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
     }
 

@@ -531,6 +531,20 @@ async function findLatestSessionViaSDK(
   return {projectID: session.projectID, session}
 }
 
+async function deleteSessionViaSdk(client: SessionClient, sessionID: string, logger: Logger): Promise<number> {
+  const sessionClient = client.session as unknown as {
+    delete: (args: {path: {id: string}}) => Promise<{data?: unknown; error?: unknown}>
+  }
+  const response = await sessionClient.delete({path: {id: sessionID}})
+  if (response.error != null) {
+    logger.warning('SDK session delete failed', {sessionID, error: String(response.error)})
+    return 0
+  }
+
+  logger.debug('Deleted session via SDK', {sessionID})
+  return 0
+}
+
 /**
  * Get all projects from storage.
  */
@@ -704,7 +718,16 @@ async function deleteDirectoryRecursive(dirPath: string): Promise<number> {
 /**
  * Delete a session and all its associated data.
  */
-export async function deleteSession(projectID: string, sessionID: string, logger: Logger): Promise<number> {
+export async function deleteSession(
+  backend: SessionBackend,
+  projectID: string,
+  sessionID: string,
+  logger: Logger,
+): Promise<number> {
+  if (backend.type === 'sdk') {
+    return deleteSessionViaSdk(backend.client, sessionID, logger)
+  }
+
   const storagePath = getOpenCodeStoragePath()
   let freedBytes = 0
 

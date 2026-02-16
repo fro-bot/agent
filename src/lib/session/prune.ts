@@ -105,7 +105,7 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
 
   for (const sessionId of allSessionsToPrune) {
     try {
-      const bytes = await deleteSession(project.id, sessionId, logger)
+      const bytes = await deleteSession(jsonBackend, project.id, sessionId, logger)
       freedBytes += bytes
       prunedIds.push(sessionId)
       logger.debug('Pruned session', {sessionId, bytes})

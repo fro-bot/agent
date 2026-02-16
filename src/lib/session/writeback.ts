@@ -1,4 +1,5 @@
 import type {RunSummary} from '../types.js'
+import type {SessionBackend} from './backend.js'
 import type {Logger} from './types.js'
 
 import * as fs from 'node:fs/promises'
@@ -66,7 +67,16 @@ function formatSummaryForSession(summary: RunSummary): string {
  * but uses special agent="fro-bot" and modelID="run-summary" to identify it
  * as GitHub Action metadata rather than human input.
  */
-export async function writeSessionSummary(sessionId: string, summary: RunSummary, logger: Logger): Promise<void> {
+export async function writeSessionSummary(
+  sessionId: string,
+  summary: RunSummary,
+  backend: SessionBackend,
+  logger: Logger,
+): Promise<void> {
+  if (backend.type === 'sdk') {
+    logger.debug('SDK backend detected, using JSON file writeback (no silent message API available)', {sessionId})
+  }
+
   const storagePath = getOpenCodeStoragePath()
   const messageDir = path.join(storagePath, 'message', sessionId)
   const partDir = path.join(storagePath, 'part')

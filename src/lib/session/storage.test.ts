@@ -689,7 +689,7 @@ describe('deleteSession', () => {
     vi.mocked(fs.rm).mockResolvedValue(undefined)
 
     // #when
-    const result = await deleteSession('proj1', 'ses_1', mockLogger)
+    const result = await deleteSession({type: 'json', workspacePath: '/path/to/repo'}, 'proj1', 'ses_1', mockLogger)
 
     // #then
     expect(result).toBeGreaterThan(0)
@@ -704,9 +704,53 @@ describe('deleteSession', () => {
     vi.mocked(fs.rm).mockRejectedValue(new Error('ENOENT'))
 
     // #when
-    const result = await deleteSession('proj1', 'nonexistent', mockLogger)
+    const result = await deleteSession(
+      {type: 'json', workspacePath: '/path/to/repo'},
+      'proj1',
+      'nonexistent',
+      mockLogger,
+    )
 
     // #then
     expect(result).toBe(0)
+  })
+
+  it('deletes session via SDK when using sdk backend', async () => {
+    // #given
+    const deleteFn = vi.fn().mockResolvedValue({data: null})
+    const client = {
+      session: {delete: deleteFn},
+    } as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend = {type: 'sdk', workspacePath: '/workspace', client} as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await deleteSession(sdkBackend, 'proj1', 'ses_sdk', mockLogger)
+
+    // #then
+    expect(deleteFn).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
+    expect(result).toBe(0)
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      'Deleted session via SDK',
+      expect.objectContaining({sessionID: 'ses_sdk'}),
+    )
+  })
+
+  it('handles SDK delete errors gracefully', async () => {
+    // #given
+    const deleteFn = vi.fn().mockResolvedValue({error: 'Not found'})
+    const client = {
+      session: {delete: deleteFn},
+    } as unknown as import('./backend.js').SdkBackend['client']
+    const sdkBackend = {type: 'sdk', workspacePath: '/workspace', client} as import('./backend.js').SdkBackend
+
+    // #when
+    const result = await deleteSession(sdkBackend, 'proj1', 'ses_missing', mockLogger)
+
+    // #then
+    expect(result).toBe(0)
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'SDK session delete failed',
+      expect.objectContaining({sessionID: 'ses_missing'}),
+    )
   })
 })
