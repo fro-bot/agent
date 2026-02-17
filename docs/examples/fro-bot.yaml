@@ -1,30 +1,46 @@
 ---
-name: Fro Bot
+name: Fro Bot Agent
 
 on:
+  # Required: core mention trigger for issues and PRs.
   issue_comment:
     types: [created]
+  # Optional: respond in PR review threads.
   pull_request_review_comment:
     types: [created]
+  # Optional: respond in Discussions (requires Discussions enabled).
   discussion_comment:
     types: [created]
+  # Recommended: auto-triage new issues; edits require @mention.
   issues:
     types: [opened, edited]
+  # Recommended: AI code review (distinct from CI).
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Recommended: weekly maintenance report.
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '0 9 * * 1' # Weekly Monday at 9 AM UTC
+  # Optional: manual prompt execution.
   workflow_dispatch:
     inputs:
       prompt:
         description: Custom prompt for the Fro Bot agent
         required: true
 
+# Full mode: PAT or GitHub App token whose login matches the @mention users type.
+# Mention-less mode: remove comment triggers and use GITHUB_TOKEN only.
 permissions:
+  # Required: content access for checkout and diff context.
   contents: read
+  # Required for discussion_comment responses.
   discussions: write
+  # Required for issue comments and schedule reports.
   issues: write
+  # Required for PR reviews and comments.
   pull-requests: write
 
 concurrency:
+  # Prevent duplicate runs per issue/PR/discussion; fall back to run_id for schedule/dispatch.
   group: >-
     fro-bot-${{
       github.event.issue.number ||
@@ -35,6 +51,18 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Comment-based triggers use the comment body as the prompt.
+
+  # PR review prompt (pull_request trigger).
+  PR_REVIEW_PROMPT: |
+    Focus your review on:
+    - Correctness and edge cases
+    - Security implications
+    - Breaking changes to public API
+    - Test coverage for new/changed behavior
+    Skip style nits — the linter handles those.
+
+  # Schedule prompt (schedule trigger).
   SCHEDULE_PROMPT: |
     Perform weekly repository maintenance and create a SINGLE issue titled
     "Weekly Maintenance Report — YYYY-MM-DD" containing:
@@ -46,16 +74,21 @@ env:
 
 jobs:
   fro-bot:
+    name: Fro Bot Agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: >-
       (
         github.event.pull_request == null ||
         !github.event.pull_request.head.repo.fork
-      ) &&
-      (
+      ) && (
+        # Non-mention triggers.
         github.event_name == 'issues' ||
         github.event_name == 'schedule' ||
         github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'pull_request' ||
         (
+          # Mention triggers with association gate.
           (github.event_name == 'issue_comment' ||
            github.event_name == 'pull_request_review_comment' ||
            github.event_name == 'discussion_comment') &&
@@ -64,30 +97,24 @@ jobs:
           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
         )
       )
-    name: Fro Bot
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.FRO_BOT_PAT }}
-
-      - name: Setup Node.js and pnpm
-        uses: ./.github/actions/setup
+        uses: actions/checkout@v4
 
       - name: Run Fro Bot
-        uses: ./
+        uses: fro-bot/agent@v0
         env:
           OPENCODE_PROMPT_ARTIFACT: 'true'
+          # Route event-specific prompts into the action input.
           PROMPT: >-
             ${{
               (github.event_name == 'workflow_dispatch' && (github.event.inputs.prompt || ''))
               || (github.event_name == 'schedule' && env.SCHEDULE_PROMPT)
+              || (github.event_name == 'pull_request' && env.PR_REVIEW_PROMPT)
               || ''
             }}
         with:
-          auth-json: ${{ secrets.AUTH_JSON }}
+          # Use PAT or App token for mention-based triggers.
           github-token: ${{ secrets.FRO_BOT_PAT }}
+          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: ${{ env.PROMPT }}
