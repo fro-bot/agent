@@ -392,21 +392,104 @@ describe('setup', () => {
         expect(saveArgs?.toolCachePath).toContain('opencode')
       })
 
-      it('skips installs and save on tools cache hit', async () => {
-        // #given tools cache hit
+      it('skips installs and save on tools cache hit when binary is findable', async () => {
+        // #given tools cache hit and tc.find returns a valid path
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
           restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+
+        // #when
+        const result = await runSetup()
+
+        // #then
+        expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(result).not.toBeNull()
+        expect(result?.toolsCacheStatus).toBe('hit')
+      })
+
+      it('falls through to install when tools cache hits but binary not findable', async () => {
+        // #given tools cache hit but tc.find returns empty (version mismatch)
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc1.0.299-omo3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('')
+        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
+        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({tag_name: 'v1.0.300'}),
+          }),
+        )
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          if (cmd === 'file') {
+            const isZip = process.platform === 'darwin' || process.platform === 'win32'
+            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
+          }
+          if (cmd === 'npm' && args?.[0] === 'config') {
+            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
         })
 
         // #when
         const result = await runSetup()
 
-        // #then - no download, no npm install, no save
-        expect(tc.downloadTool).not.toHaveBeenCalled()
-        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        // #then
+        expect(tc.downloadTool).toHaveBeenCalled()
         expect(result).not.toBeNull()
-        expect(result?.toolsCacheStatus).toBe('hit')
+        expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/1.0.300/x64')
+      })
+
+      it('never adds raw toolCachePath directory to PATH', async () => {
+        // #given tools cache hit but tc.find returns empty
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc1.0.299-omo3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('')
+        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
+        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({tag_name: 'v1.0.300'}),
+          }),
+        )
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          if (cmd === 'file') {
+            const isZip = process.platform === 'darwin' || process.platform === 'win32'
+            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
+          }
+          if (cmd === 'npm' && args?.[0] === 'config') {
+            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
+        })
+
+        // #when
+        const result = await runSetup()
+
+        // #then
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode')
+        expect(result).not.toBeNull()
       })
 
       it('includes toolsCacheStatus in SetupResult on cache miss', async () => {

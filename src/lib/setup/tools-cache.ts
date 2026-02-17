@@ -54,7 +54,7 @@ export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string 
 export function buildToolsRestoreKeys(components: ToolsCacheKeyComponents): readonly string[] {
   const {os, opencodeVersion, omoVersion} = components
 
-  return [`${TOOLS_CACHE_PREFIX}-${os}-oc${opencodeVersion}-omo${omoVersion}-`, `${TOOLS_CACHE_PREFIX}-${os}-`] as const
+  return [`${TOOLS_CACHE_PREFIX}-${os}-oc${opencodeVersion}-omo${omoVersion}-`] as const
 }
 
 export async function restoreToolsCache(options: RestoreToolsCacheOptions): Promise<ToolsCacheResult> {
