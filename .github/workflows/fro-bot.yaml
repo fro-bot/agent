@@ -20,9 +20,6 @@ on:
 
 permissions:
   contents: read
-  discussions: write
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: >-
