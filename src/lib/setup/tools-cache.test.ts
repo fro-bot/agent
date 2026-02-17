@@ -68,7 +68,7 @@ describe('buildToolsCacheKey', () => {
 })
 
 describe('buildToolsRestoreKeys', () => {
-  it('generates fallback keys with correct priority', () => {
+  it('generates restore keys scoped to exact opencode+omo versions only', () => {
     // #given version info
     const os = 'Linux'
     const opencodeVersion = '1.0.0'
@@ -77,11 +77,22 @@ describe('buildToolsRestoreKeys', () => {
     // #when building restore keys
     const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
 
-    // #then keys are ordered from most to least specific
-    expect(keys).toEqual([
-      'opencode-tools-Linux-oc1.0.0-omo3.5.5-', // Same versions, any OS
-      'opencode-tools-Linux-', // Same OS, any versions
-    ])
+    // #then only version-specific prefix key is returned (no broad OS-only fallback)
+    expect(keys).toEqual(['opencode-tools-Linux-oc1.0.0-omo3.5.5-'])
+  })
+
+  it('does not include broad OS-only fallback key', () => {
+    // #given version info
+    const os = 'Linux'
+    const opencodeVersion = '1.0.0'
+    const omoVersion = '3.5.5'
+
+    // #when building restore keys
+    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
+
+    // #then no OS-only key that could match stale versions
+    const broadKeys = [...keys].filter(k => k === `opencode-tools-${os}-`)
+    expect(broadKeys).toHaveLength(0)
   })
 
   it('generates restore keys for different OS', () => {
@@ -93,8 +104,8 @@ describe('buildToolsRestoreKeys', () => {
     // #when building restore keys
     const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
 
-    // #then keys include macOS
-    expect(keys[1]).toBe('opencode-tools-macOS-')
+    // #then keys include macOS prefix
+    expect(keys[0]).toBe('opencode-tools-macOS-oc1.0.0-omo3.5.5-')
   })
 })
 
