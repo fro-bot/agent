@@ -122,10 +122,22 @@ jobs:
         uses: ./
         env:
           OPENCODE_PROMPT_ARTIFACT: 'true'
+          PR_REVIEW_PROMPT: |
+            Focus your review on:
+            - Correctness and edge cases
+            - Security implications
+            - Breaking changes to public API
+            - Test coverage for new/changed behavior
+            Skip style nits — the linter handles those.
+          PROMPT: >-
+            ${{
+              (github.event_name == 'pull_request' && env.PR_REVIEW_PROMPT)
+              || ''
+            }}
         with:
           github-token: ${{ secrets.FRO_BOT_PAT }}
           auth-json: ${{ secrets.AUTH_JSON }}
-
+          prompt: ${{ env.PROMPT }}
       - if: always()
         name: Introspect main action execution
         run: |
