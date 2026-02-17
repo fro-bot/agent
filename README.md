@@ -183,6 +183,161 @@ For security, the agent only responds to trusted users:
 
 Bot accounts and first-time contributors from forks are automatically skipped to prevent abuse.
 
+## Event Trigger Reference
+
+The action supports seven event types. Use this section to wire triggers correctly and understand prompt, permissions, and concurrency expectations.
+
+| Event | Actions | @mention required | Prompt source | Minimum permissions | Concurrency key |
+| --- | --- | --- | --- | --- | --- |
+| `issue_comment` | `created` | Yes | Comment body | `contents: read`, `issues: write`, `pull-requests: write` | `issue.number` or `run_id` |
+| `pull_request_review_comment` | `created` | Yes | Comment body | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
+| `discussion_comment` | `created` | Yes | Comment body | `contents: read`, `discussions: write` | `discussion.number` or `run_id` |
+| `issues` | `opened`, `edited` | No (opened), Yes (edited) | Built-in directives | `contents: read`, `issues: write` | `issue.number` or `run_id` |
+| `pull_request` | `opened`, `synchronize`, `reopened` | No | `prompt` input (review prompt) | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
+| `schedule` | Cron | No | `prompt` input (schedule prompt) | `contents: read`, `issues: write` | `run_id` |
+| `workflow_dispatch` | Manual | No | `prompt` input (required) | Varies by task | `run_id` |
+
+### Trigger Details
+
+<details>
+<summary><strong>issue_comment</strong> — comment mentions in issues and PRs</summary>
+
+- **Behavior:** Responds to comments with `@fro-bot`.
+- **Skip conditions:** Bot comments, missing mention, or author association not in `OWNER`, `MEMBER`, `COLLABORATOR`.
+- **Guard example:**
+  ```yaml
+  if: >-
+    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) &&
+    github.event_name == 'issue_comment' &&
+    contains(github.event.comment.body || '', '@fro-bot') &&
+    (github.event.comment.user.login || '') != 'fro-bot' &&
+    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+  ```
+
+</details>
+
+<details>
+<summary><strong>pull_request_review_comment</strong> — review thread mentions</summary>
+
+- **Behavior:** Responds to `@fro-bot` mentions inside PR review threads.
+- **Skip conditions:** Same gating as `issue_comment` (mention + association + bot check).
+- **Guard example:**
+  ```yaml
+  if: >-
+    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) &&
+    github.event_name == 'pull_request_review_comment' &&
+    contains(github.event.comment.body || '', '@fro-bot') &&
+    (github.event.comment.user.login || '') != 'fro-bot' &&
+    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+  ```
+
+</details>
+
+<details>
+<summary><strong>discussion_comment</strong> — discussion mentions</summary>
+
+- **Behavior:** Responds to `@fro-bot` mentions in discussion threads (if Discussions are enabled).
+- **Skip conditions:** Missing mention, bot comments, or untrusted author association.
+- **Guard example:**
+  ```yaml
+  if: >-
+    github.event_name == 'discussion_comment' &&
+    contains(github.event.comment.body || '', '@fro-bot') &&
+    (github.event.comment.user.login || '') != 'fro-bot' &&
+    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+  ```
+
+</details>
+
+<details>
+<summary><strong>issues</strong> — issue opened/edited</summary>
+
+- **Behavior:** Auto-triage on `opened`. `edited` requires a mention.
+- **Skip conditions:** Locked issues, bot authors, or untrusted author association.
+- **Guard example:**
+  ```yaml
+  if: github.event_name == 'issues'
+  ```
+
+</details>
+
+<details>
+<summary><strong>pull_request</strong> — AI code review (not CI)</summary>
+
+- **Behavior:** Runs an AI review on `opened`, `synchronize`, `reopened`.
+- **Skip conditions:** Draft PRs, fork PRs, or untrusted author association.
+- **Guard example:**
+  ```yaml
+  if: >-
+    github.event_name == 'pull_request' &&
+    !github.event.pull_request.head.repo.fork
+  ```
+
+</details>
+
+<details>
+<summary><strong>schedule</strong> — periodic maintenance</summary>
+
+- **Behavior:** Executes a scheduled prompt (must be provided via `prompt` input).
+- **Skip conditions:** Missing prompt (the action exits cleanly).
+- **Guard example:**
+  ```yaml
+  if: github.event_name == 'schedule'
+  ```
+
+</details>
+
+<details>
+<summary><strong>workflow_dispatch</strong> — manual prompt execution</summary>
+
+- **Behavior:** Runs the user-supplied prompt.
+- **Skip conditions:** Missing prompt input when marked `required: true`.
+- **Guard example:**
+  ```yaml
+  if: github.event_name == 'workflow_dispatch'
+  ```
+
+</details>
+
+### Permissions Guide
+
+Use the minimum permissions needed for the triggers you enable.
+
+```yaml
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  discussions: write
+```
+
+- `discussion_comment` requires `discussions: write`.
+- `issues` and `schedule` need `issues: write` to create or comment on issues.
+- `pull_request` reviews require `pull-requests: write`.
+
+### Concurrency Strategy
+
+Use a single concurrency group that scopes to the relevant issue/PR/discussion and falls back to the run ID for schedule/dispatch.
+
+```yaml
+concurrency:
+  group: >-
+    fro-bot-${{
+      github.event.issue.number ||
+      github.event.pull_request.number ||
+      github.event.discussion.number ||
+      github.run_id
+    }}
+  cancel-in-progress: false
+```
+
+### Security Model
+
+- **Association gating:** The router only processes events from `OWNER`, `MEMBER`, and `COLLABORATOR` users.
+- **Bot protection:** Bot comments are ignored to avoid loops.
+- **Fork protection:** `pull_request` runs are skipped for forks; comment triggers are still gated by association.
+- **Mention identity:** Mention-based triggers require a token whose login matches the `@` mention users type. Using `GITHUB_TOKEN` means the mention would be `@github-actions`, so `@fro-bot` requires a PAT or GitHub App token.
+
 ## Configuration
 
 ### Action Inputs
