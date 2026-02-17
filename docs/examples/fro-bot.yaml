@@ -1,4 +1,4 @@
-# Fro Bot Agent — Example Workflow
+# Fro Bot agent — Example Workflow
 #
 # Copy this file to .github/workflows/fro-bot.yaml and customize it for your
 # repository. The sections marked CUSTOMIZE are the ones you'll most likely
@@ -70,7 +70,7 @@
 #    Default is 15 minutes. Increase timeout-minutes if your agent tasks
 #    routinely take longer (e.g. large code reviews or multi-step work).
 ---
-name: Fro Bot Agent
+name: Fro Bot
 
 on:
   issue_comment:
@@ -93,9 +93,6 @@ on:
 
 permissions:
   contents: read
-  discussions: write
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: >-
@@ -128,7 +125,7 @@ env:
 
 jobs:
   fro-bot:
-    name: Fro Bot Agent
+    name: Fro Bot
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
