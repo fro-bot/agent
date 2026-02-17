@@ -171,18 +171,23 @@ interface WorkflowDispatchContextData {
   action: null
 }
 
-function buildWorkflowDispatchContextData(event: GitHubContext['event'], actor: string): WorkflowDispatchContextData {
+function buildWorkflowDispatchContextData(
+  event: GitHubContext['event'],
+  actor: string,
+  promptInput: string | null,
+): WorkflowDispatchContextData {
   if (event.type !== 'workflow_dispatch') {
     throw new Error('Event type must be workflow_dispatch')
   }
 
-  const promptInput = event.inputs.prompt ?? ''
+  // Fallback to event.inputs.prompt if parameter not provided
+  const effectivePrompt = (promptInput ?? event.inputs?.prompt ?? '').trim()
 
   const target: TriggerTarget = {
     kind: 'manual',
     number: 0,
     title: 'Manual workflow dispatch',
-    body: promptInput === '' ? null : promptInput,
+    body: effectivePrompt === '' ? null : effectivePrompt,
     locked: false,
   }
 
@@ -195,7 +200,7 @@ function buildWorkflowDispatchContextData(event: GitHubContext['event'], actor: 
   return {
     author,
     target,
-    commentBody: promptInput === '' ? null : promptInput,
+    commentBody: effectivePrompt === '' ? null : effectivePrompt,
     commentId: null,
     hasMention: false,
     command: null,
@@ -771,7 +776,7 @@ function buildTriggerContext(
     }
 
     case 'workflow_dispatch': {
-      const data = buildWorkflowDispatchContextData(githubContext.event, githubContext.actor)
+      const data = buildWorkflowDispatchContextData(githubContext.event, githubContext.actor, promptInput)
       return {
         ...baseContext,
         action: data.action,
