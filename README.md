@@ -97,9 +97,13 @@ Comment `@fro-bot` on any issue or pull request. The agent will:
 3. Execute the requested task using OpenCode
 4. Post a response with a run summary
 
-> [!NOTE] On first run, the action automatically installs OpenCode and oMo—no manual setup required!
+> [!NOTE]
+>
+> On first run, the action automatically installs OpenCode and oMo—no manual setup required!
 
-> [!TIP] **Full workflow reference** — The Quick Start above covers a single trigger. For the complete workflow with all supported triggers, conditional token selection, scheduled tasks, and PR reviews, see [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
+> [!TIP]
+>
+> **Full workflow reference** — The Quick Start above covers a single trigger. For the complete workflow with all supported triggers, conditional token selection, scheduled tasks, and PR reviews, see [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
 >
 > **AI-assisted setup** — To have an AI agent set up the workflow for your repository, point it at the example file and tell it to follow the instructions in the header:
 >
@@ -469,7 +473,9 @@ When enabled, sessions are:
 2. Restored from cache first (faster)
 3. Fallen back to S3 if cache misses or is corrupted
 
-> [!TIP] S3 backup is recommended for production deployments where losing agent memory would significantly impact operations.
+> [!TIP]
+>
+> S3 backup is recommended for production deployments where losing agent memory would significantly impact operations.
 
 ## Troubleshooting
 
