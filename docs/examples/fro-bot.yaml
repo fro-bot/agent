@@ -1,46 +1,103 @@
+# Fro Bot Agent — Example Workflow
+#
+# Copy this file to .github/workflows/fro-bot.yaml and customize it for your
+# repository. The sections marked CUSTOMIZE are the ones you'll most likely
+# want to change.
+#
+# ── TRIGGERS ────────────────────────────────────────────────────────────────
+# The `on:` block below enables every supported trigger. Remove any you don't
+# need:
+#   issue_comment              — (core) respond to @fro-bot mentions in issues/PRs
+#   pull_request_review_comment — respond in PR review threads
+#   discussion_comment         — respond in Discussions (requires Discussions enabled)
+#   issues                     — auto-triage new issues; edits require @mention
+#   pull_request               — AI code review on PR open/sync/reopen
+#   schedule                   — periodic maintenance (weekly by default)
+#   workflow_dispatch          — manual prompt execution via "Run workflow" button
+#
+# ── TOKENS & IDENTITY ──────────────────────────────────────────────────────
+# Most triggers use FRO_BOT_PAT — a Personal Access Token whose login
+# matches the @mention name (e.g. a PAT for the "fro-bot" user so @fro-bot
+# works). This includes mention-based triggers, schedule (so maintenance
+# issues appear under @fro-bot), pull_request reviews, and issue triage.
+# Store the token as the FRO_BOT_PAT repository secret.
+#
+# Alternatively, a GitHub App installation token can be used instead of a
+# PAT. Generate one with the actions/create-github-app-token action in a
+# step before checkout and pass it the same way. This is useful when the
+# repository already uses a GitHub App for other workflows.
+#
+# workflow_dispatch is the exception: it uses the built-in GITHUB_TOKEN
+# because the caller typed a manual prompt — no @mention identity needed.
+#
+# ── PERMISSIONS ─────────────────────────────────────────────────────────────
+# The workflow-level `permissions` block sets a read-only baseline. The
+# job-level block grants `contents: write` which is needed when the agent
+# creates branches, commits, or pushes changes (common for workflow_dispatch
+# and pull_request events). Adjust if your use case requires fewer
+# permissions.
+#
+# ── SECRETS ──────────────────────────────────────────────────────────────────
+# FRO_BOT_PAT        — (required) Personal Access Token for the bot user.
+# OPENCODE_AUTH_JSON  — (required) JSON mapping LLM provider IDs to auth
+#                       configs. Example:
+#                         {"anthropic":{"apiKey":"sk-ant-..."}}
+#                       See https://opencode.ai/docs/ for supported providers.
+#
+# ── CUSTOMIZATION GUIDE ─────────────────────────────────────────────────────
+# 1. PROMPTS (env section)
+#    - PR_REVIEW_PROMPT: Instructions for AI code reviews on pull_request
+#      events. Tailor to your project's review standards.
+#    - SCHEDULE_PROMPT: Instructions for the weekly maintenance run.
+#    - workflow_dispatch prompts are typed by the user at trigger time.
+#
+# 2. SETUP STEPS
+#    The agent auto-installs its own tooling, but your project may need
+#    additional setup before the agent can build/test/lint. Insert steps
+#    between "Checkout repository" and "Run Fro Bot" to install project
+#    dependencies. Examples:
+#      - Node.js:  actions/setup-node + npm ci / pnpm install
+#      - Python:   actions/setup-python + pip install
+#      - Rust:     dtolnay/rust-toolchain + cargo fetch
+#      - Go:       actions/setup-go (go mod download is automatic)
+#      - Docker:   build/pull any required service containers
+#
+# 3. CONCURRENCY
+#    The default group scopes to issue/PR/discussion number so parallel
+#    runs don't collide. Adjust if you want stricter or looser grouping.
+#
+# 4. TIMEOUT
+#    Default is 15 minutes. Increase timeout-minutes if your agent tasks
+#    routinely take longer (e.g. large code reviews or multi-step work).
 ---
 name: Fro Bot Agent
 
 on:
-  # Required: core mention trigger for issues and PRs.
   issue_comment:
     types: [created]
-  # Optional: respond in PR review threads.
   pull_request_review_comment:
     types: [created]
-  # Optional: respond in Discussions (requires Discussions enabled).
   discussion_comment:
     types: [created]
-  # Recommended: auto-triage new issues; edits require @mention.
   issues:
     types: [opened, edited]
-  # Recommended: AI code review (distinct from CI).
   pull_request:
     types: [opened, synchronize, reopened]
-  # Recommended: weekly maintenance report.
   schedule:
-    - cron: '0 9 * * 1' # Weekly Monday at 9 AM UTC
-  # Optional: manual prompt execution.
+    - cron: '0 9 * * 1'
   workflow_dispatch:
     inputs:
       prompt:
         description: Custom prompt for the Fro Bot agent
         required: true
 
-# Full mode: PAT or GitHub App token whose login matches the @mention users type.
-# Mention-less mode: remove comment triggers and use GITHUB_TOKEN only.
 permissions:
-  # Required: content access for checkout and diff context.
   contents: read
-  # Required for discussion_comment responses.
   discussions: write
-  # Required for issue comments and schedule reports.
   issues: write
-  # Required for PR reviews and comments.
   pull-requests: write
 
 concurrency:
-  # Prevent duplicate runs per issue/PR/discussion; fall back to run_id for schedule/dispatch.
   group: >-
     fro-bot-${{
       github.event.issue.number ||
@@ -51,9 +108,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Comment-based triggers use the comment body as the prompt.
-
-  # PR review prompt (pull_request trigger).
+  # CUSTOMIZE: Tailor these prompts to your project's conventions and tech stack.
   PR_REVIEW_PROMPT: |
     Focus your review on:
     - Correctness and edge cases
@@ -62,7 +117,6 @@ env:
     - Test coverage for new/changed behavior
     Skip style nits — the linter handles those.
 
-  # Schedule prompt (schedule trigger).
   SCHEDULE_PROMPT: |
     Perform weekly repository maintenance and create a SINGLE issue titled
     "Weekly Maintenance Report — YYYY-MM-DD" containing:
@@ -77,18 +131,21 @@ jobs:
     name: Fro Bot Agent
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write
     if: >-
       (
         github.event.pull_request == null ||
         !github.event.pull_request.head.repo.fork
       ) && (
-        # Non-mention triggers.
         github.event_name == 'issues' ||
         github.event_name == 'schedule' ||
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'pull_request' ||
         (
-          # Mention triggers with association gate.
           (github.event_name == 'issue_comment' ||
            github.event_name == 'pull_request_review_comment' ||
            github.event_name == 'discussion_comment') &&
@@ -99,13 +156,22 @@ jobs:
       )
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: >-
+            ${{
+              github.event_name == 'workflow_dispatch'
+              && secrets.GITHUB_TOKEN
+              || secrets.FRO_BOT_PAT
+            }}
+
+      # CUSTOMIZE: Add project-specific setup steps here (e.g. install deps).
 
       - name: Run Fro Bot
         uses: fro-bot/agent@v0
         env:
           OPENCODE_PROMPT_ARTIFACT: 'true'
-          # Route event-specific prompts into the action input.
           PROMPT: >-
             ${{
               (github.event_name == 'workflow_dispatch' && (github.event.inputs.prompt || ''))
@@ -114,7 +180,11 @@ jobs:
               || ''
             }}
         with:
-          # Use PAT or App token for mention-based triggers.
-          github-token: ${{ secrets.FRO_BOT_PAT }}
+          github-token: >-
+            ${{
+              github.event_name == 'workflow_dispatch'
+              && secrets.GITHUB_TOKEN
+              || secrets.FRO_BOT_PAT
+            }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: ${{ env.PROMPT }}

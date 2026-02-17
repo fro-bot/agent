@@ -67,12 +67,22 @@ jobs:
     name: Fro Bot
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          token: ${{ secrets.FRO_BOT_PAT }}
+          token: >-
+            ${{
+              github.event_name == 'workflow_dispatch'
+              && secrets.GITHUB_TOKEN
+              || secrets.FRO_BOT_PAT
+            }}
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
@@ -89,5 +99,10 @@ jobs:
             }}
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
-          github-token: ${{ secrets.FRO_BOT_PAT }}
+          github-token: >-
+            ${{
+              github.event_name == 'workflow_dispatch'
+              && secrets.GITHUB_TOKEN
+              || secrets.FRO_BOT_PAT
+            }}
           prompt: ${{ env.PROMPT }}

@@ -99,6 +99,12 @@ Comment `@fro-bot` on any issue or pull request. The agent will:
 
 > [!NOTE] On first run, the action automatically installs OpenCode and oMo—no manual setup required!
 
+> [!TIP] **Full workflow reference** — The Quick Start above covers a single trigger. For the complete workflow with all supported triggers, conditional token selection, scheduled tasks, and PR reviews, see [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
+>
+> **AI-assisted setup** — To have an AI agent set up the workflow for your repository, point it at the example file and tell it to follow the instructions in the header:
+>
+> > Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+
 ## How It Works
 
 Fro Bot uses a multi-phase execution model to provide stateful AI assistance:
@@ -207,11 +213,7 @@ The action supports seven event types. Use this section to wire triggers correct
 - **Guard example:**
   ```yaml
   if: >-
-    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) &&
-    github.event_name == 'issue_comment' &&
-    contains(github.event.comment.body || '', '@fro-bot') &&
-    (github.event.comment.user.login || '') != 'fro-bot' &&
-    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) && github.event_name == 'issue_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
   ```
 
 </details>
@@ -224,11 +226,7 @@ The action supports seven event types. Use this section to wire triggers correct
 - **Guard example:**
   ```yaml
   if: >-
-    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) &&
-    github.event_name == 'pull_request_review_comment' &&
-    contains(github.event.comment.body || '', '@fro-bot') &&
-    (github.event.comment.user.login || '') != 'fro-bot' &&
-    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) && github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
   ```
 
 </details>
@@ -241,10 +239,7 @@ The action supports seven event types. Use this section to wire triggers correct
 - **Guard example:**
   ```yaml
   if: >-
-    github.event_name == 'discussion_comment' &&
-    contains(github.event.comment.body || '', '@fro-bot') &&
-    (github.event.comment.user.login || '') != 'fro-bot' &&
-    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+    github.event_name == 'discussion_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
   ```
 
 </details>
@@ -269,8 +264,7 @@ The action supports seven event types. Use this section to wire triggers correct
 - **Guard example:**
   ```yaml
   if: >-
-    github.event_name == 'pull_request' &&
-    !github.event.pull_request.head.repo.fork
+    github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
   ```
 
 </details>
@@ -328,6 +322,7 @@ concurrency:
       github.event.discussion.number ||
       github.run_id
     }}
+
   cancel-in-progress: false
 ```
 
@@ -397,7 +392,7 @@ Run the agent on a schedule for periodic repository maintenance:
 name: Weekly Repository Audit
 on:
   schedule:
-    - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
+    - cron: "0 9 * * 1" # Every Monday at 9 AM UTC
 
 jobs:
   audit:
