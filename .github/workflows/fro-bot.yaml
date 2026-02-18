@@ -66,7 +66,7 @@ jobs:
       )
     name: Fro Bot
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
       discussions: write
@@ -105,4 +105,5 @@ jobs:
               && secrets.GITHUB_TOKEN
               || secrets.FRO_BOT_PAT
             }}
+          model: ${{ vars.FRO_BOT_MODEL }}
           prompt: ${{ env.PROMPT }}
