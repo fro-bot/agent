@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
+import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runSetup} from './setup.js'
@@ -44,6 +45,10 @@ vi.mock('@actions/exec', () => ({
 vi.mock('@actions/cache', () => ({
   restoreCache: vi.fn(),
   saveCache: vi.fn(),
+}))
+
+vi.mock('@actions/github', () => ({
+  getOctokit: vi.fn(),
 }))
 
 // Mock @octokit/auth-app
@@ -89,6 +94,15 @@ describe('setup', () => {
       return inputs[name] ?? ''
     })
     vi.mocked(core.getBooleanInput).mockReturnValue(false)
+
+    vi.mocked(github.getOctokit).mockReturnValue({
+      rest: {
+        users: {
+          getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
+          getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
+        },
+      },
+    } as never)
 
     // Default tools cache: miss (so existing tests run normal install path)
     vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
@@ -312,17 +326,12 @@ describe('setup', () => {
       expect(core.setFailed).toHaveBeenCalled()
     })
 
-    it('configures git identity', async () => {
+    it('configures git identity from GitHub token user', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-        // Mock version check
-        if (cmd === 'gh' && args?.[0] === 'api' && args?.[1]?.includes('releases')) {
-          return {exitCode: 0, stdout: '{"tag_name": "v1.0.300"}', stderr: ''}
-        }
-        // Mock bot login
-        if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
-          return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+        if (cmd === 'npm' && args?.[0] === 'config') {
+          return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
         }
         return {exitCode: 0, stdout: '', stderr: ''}
       })
@@ -335,8 +344,40 @@ describe('setup', () => {
       await runSetup()
 
       // #then
-      expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', expect.any(String)], undefined)
-      expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.email', expect.any(String)], undefined)
+      expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'fro-bot[bot]'], undefined)
+      expect(exec.exec).toHaveBeenCalledWith(
+        'git',
+        ['config', '--global', 'user.email', '123456+fro-bot[bot]@users.noreply.github.com'],
+        undefined,
+      )
+    })
+
+    it('skips git identity when already configured', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+        if (cmd === 'npm' && args?.[0] === 'config') {
+          return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
+        }
+        if (cmd === 'git' && args?.[0] === 'config' && args?.[1] === 'user.name') {
+          return {exitCode: 0, stdout: 'Existing User\n', stderr: ''}
+        }
+        if (cmd === 'git' && args?.[0] === 'config' && args?.[1] === 'user.email') {
+          return {exitCode: 0, stdout: 'existing@example.com\n', stderr: ''}
+        }
+        return {exitCode: 0, stdout: '', stderr: ''}
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup()
+
+      // #then
+      expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.name']), expect.anything())
+      expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.email']), expect.anything())
     })
 
     describe('tools cache integration', () => {

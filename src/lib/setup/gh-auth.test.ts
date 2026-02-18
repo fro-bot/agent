@@ -11,6 +11,18 @@ function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapte
   }
 }
 
+function createGitConfigMock(name: string | null, email: string | null) {
+  return vi.fn().mockImplementation(async (_cmd: string, args?: string[]) => {
+    if (args?.[0] === 'config' && args?.[1] === 'user.name') {
+      return name == null ? {exitCode: 1, stdout: '', stderr: ''} : {exitCode: 0, stdout: `${name}\n`, stderr: ''}
+    }
+    if (args?.[0] === 'config' && args?.[1] === 'user.email') {
+      return email == null ? {exitCode: 1, stdout: '', stderr: ''} : {exitCode: 0, stdout: `${email}\n`, stderr: ''}
+    }
+    return {exitCode: 0, stdout: '', stderr: ''}
+  })
+}
+
 describe('gh-auth', () => {
   let mockLogger: Logger
   let originalEnv: NodeJS.ProcessEnv
@@ -121,13 +133,33 @@ describe('gh-auth', () => {
   })
 
   describe('configureGitIdentity', () => {
-    it('configures git identity with app slug', async () => {
+    it('skips configuration when both user.name and user.email are already set', async () => {
       // #given
-      const mockExec = createMockExecAdapter()
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock('Existing User', 'existing@example.com'),
+      })
+      const mockOctokit = createMockOctokit()
       const execFn = mockExec.exec as ReturnType<typeof vi.fn>
 
       // #when
-      await configureGitIdentity('fro-bot', '123456', mockLogger, mockExec)
+      await configureGitIdentity(mockOctokit, 'fro-bot[bot]', mockLogger, mockExec)
+
+      // #then
+      expect(execFn).not.toHaveBeenCalled()
+    })
+
+    it('configures both name and email when neither is set', async () => {
+      // #given
+      const mockOctokit = createMockOctokit({
+        getUserByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock(null, null),
+      })
+      const execFn = mockExec.exec as ReturnType<typeof vi.fn>
+
+      // #when
+      await configureGitIdentity(mockOctokit, 'fro-bot[bot]', mockLogger, mockExec)
 
       // #then
       expect(execFn).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'fro-bot[bot]'], undefined)
@@ -138,30 +170,102 @@ describe('gh-auth', () => {
       )
     })
 
-    it('uses default identity when app slug is null', async () => {
+    it('configures only email when user.name is already set', async () => {
       // #given
-      const mockExec = createMockExecAdapter()
+      const mockOctokit = createMockOctokit({
+        getUserByUsername: vi.fn().mockResolvedValue({data: {id: 789, login: 'fro-bot[bot]'}}),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock('Existing User', null),
+      })
       const execFn = mockExec.exec as ReturnType<typeof vi.fn>
 
       // #when
-      await configureGitIdentity(null, null, mockLogger, mockExec)
+      await configureGitIdentity(mockOctokit, 'fro-bot[bot]', mockLogger, mockExec)
 
       // #then
-      expect(execFn).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'fro-bot[bot]'], undefined)
-      expect(execFn).toHaveBeenCalledWith('git', ['config', '--global', 'user.email', 'agent@fro.bot'], undefined)
+      expect(execFn).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.name']), expect.anything())
+      expect(execFn).toHaveBeenCalledWith(
+        'git',
+        ['config', '--global', 'user.email', '789+fro-bot[bot]@users.noreply.github.com'],
+        undefined,
+      )
     })
 
-    it('uses default email when userId is null but slug exists', async () => {
+    it('configures only name when user.email is already set', async () => {
       // #given
-      const mockExec = createMockExecAdapter()
+      const mockOctokit = createMockOctokit()
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock(null, 'existing@example.com'),
+      })
       const execFn = mockExec.exec as ReturnType<typeof vi.fn>
 
       // #when
-      await configureGitIdentity('my-app', null, mockLogger, mockExec)
+      await configureGitIdentity(mockOctokit, 'my-app[bot]', mockLogger, mockExec)
 
       // #then
       expect(execFn).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'my-app[bot]'], undefined)
-      expect(execFn).toHaveBeenCalledWith('git', ['config', '--global', 'user.email', 'agent@fro.bot'], undefined)
+      expect(execFn).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.email']), expect.anything())
+    })
+
+    it('throws when botLogin is null and config is not already set', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock(null, null),
+      })
+
+      // #when / #then
+      await expect(configureGitIdentity(mockOctokit, null, mockLogger, mockExec)).rejects.toThrow(
+        'Cannot configure Git identity: no authenticated GitHub user',
+      )
+    })
+
+    it('throws when user ID lookup fails', async () => {
+      // #given
+      const mockOctokit = createMockOctokit({
+        getUserByUsername: vi.fn().mockRejectedValue(new Error('Not found')),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock(null, null),
+      })
+
+      // #when / #then
+      await expect(configureGitIdentity(mockOctokit, 'unknown-bot[bot]', mockLogger, mockExec)).rejects.toThrow(
+        "Cannot configure Git identity: failed to look up user ID for 'unknown-bot[bot]'",
+      )
+    })
+
+    it('does not require botLogin when identity is already fully configured', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock('Some User', 'user@example.com'),
+      })
+
+      // #when / #then — should not throw despite null botLogin
+      await expect(configureGitIdentity(mockOctokit, null, mockLogger, mockExec)).resolves.toBeUndefined()
+    })
+
+    it('looks up user by login to build noreply email', async () => {
+      // #given
+      const getUserByUsername = vi.fn().mockResolvedValue({data: {id: 42, login: 'mrbrown'}})
+      const mockOctokit = createMockOctokit({getUserByUsername})
+      const mockExec = createMockExecAdapter({
+        getExecOutput: createGitConfigMock(null, null),
+      })
+
+      // #when
+      await configureGitIdentity(mockOctokit, 'mrbrown', mockLogger, mockExec)
+
+      // #then
+      expect(getUserByUsername).toHaveBeenCalledWith({username: 'mrbrown'})
+      const execFn = mockExec.exec as ReturnType<typeof vi.fn>
+      expect(execFn).toHaveBeenCalledWith(
+        'git',
+        ['config', '--global', 'user.email', '42+mrbrown@users.noreply.github.com'],
+        undefined,
+      )
     })
   })
 

@@ -254,10 +254,7 @@ export async function runSetup(): Promise<SetupResult | null> {
     core.exportVariable('GH_TOKEN', githubToken)
     logger.info('GitHub CLI configured')
 
-    // Configure git identity - extract app slug from botLogin (e.g., "fro-bot[bot]" -> "fro-bot")
-    const appSlug = ghResult.botLogin?.replace(/\[bot\]$/, '') ?? null
-    await configureGitIdentity(appSlug, null, logger, execAdapter)
-    logger.info('Git identity configured', {user: ghResult.botLogin ?? 'fro-bot[bot]'})
+    await configureGitIdentity(octokit, ghResult.botLogin, logger, execAdapter)
 
     // Populate auth.json
     const storagePath = join(getXdgDataHome(), 'opencode')
