@@ -21,7 +21,18 @@ branches:
       required_pull_request_reviews: null
       required_status_checks:
         strict: false
-        contexts: [Build, Lint, Release, Test, Test GitHub Actions, Setup, Renovate / Renovate, Analyze]
+        contexts:
+          - Analyze
+          - Build
+          - CodeQL
+          - Dependency Review
+          - Lint
+          - Release
+          - Test
+          - Test GitHub Action
+          - Setup
+          - Renovate / Renovate
+
       restrictions: null
 
   - name: v?
