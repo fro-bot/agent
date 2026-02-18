@@ -104,11 +104,11 @@ jobs:
       - name: Run tests
         run: pnpm test
 
-  test-actions:
+  test-action:
     if: ${{ github.event_name != 'push' }}
-    name: Test GitHub Actions
-    needs: build
+    name: Test GitHub Action
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -137,6 +137,7 @@ jobs:
         with:
           github-token: ${{ secrets.FRO_BOT_PAT }}
           auth-json: ${{ secrets.AUTH_JSON }}
+          model: ${{ vars.FRO_BOT_MODEL }}
           prompt: ${{ env.PROMPT }}
       - if: always()
         name: Introspect main action execution
@@ -189,6 +190,9 @@ jobs:
         uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261 # v4.8.2
 
   release:
+    concurrency:
+      group: release
+      cancel-in-progress: false
     env:
       DRY_RUN: ${{ github.ref_name != github.event.repository.default_branch }}
       RELEASE_BRANCH: v0
