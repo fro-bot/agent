@@ -11,7 +11,6 @@ import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as envUtils from '../../utils/env.js'
 import {createMockLogger} from '../test-helpers.js'
-
 import {
   bootstrapOpenCodeServer,
   ensureOpenCodeAvailable,
