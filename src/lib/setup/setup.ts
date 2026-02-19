@@ -6,7 +6,6 @@ import process from 'node:process'
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
-
 import {getOctokit} from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'

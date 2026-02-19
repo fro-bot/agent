@@ -1,6 +1,5 @@
 import type {Logger} from './types.js'
 import * as fs from 'node:fs/promises'
-
 import * as os from 'node:os'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'

@@ -45,9 +45,9 @@
     "@opencode-ai/sdk": "1.2.5"
   },
   "devDependencies": {
-    "@bfra.me/eslint-config": "0.47.9",
-    "@bfra.me/prettier-config": "0.16.6",
-    "@bfra.me/tsconfig": "0.12.1",
+    "@bfra.me/eslint-config": "0.48.0",
+    "@bfra.me/prettier-config": "0.16.7",
+    "@bfra.me/tsconfig": "0.12.2",
     "@octokit/webhooks-types": "7.6.1",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.10.13",
