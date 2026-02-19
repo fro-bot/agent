@@ -1,5 +1,4 @@
 import type {RunSummary} from '../types.js'
-
 import type {JsonBackend, SdkBackend} from './backend.js'
 import type {Logger} from './types.js'
 
