@@ -25,7 +25,6 @@ export interface RestoreToolsCacheOptions {
   readonly opencodeVersion: string
   readonly omoVersion: string
   readonly toolCachePath: string
-  readonly npmPrefixPath: string
   readonly omoConfigPath: string
   readonly cacheAdapter?: ToolsCacheAdapter
 }
@@ -36,7 +35,6 @@ export interface SaveToolsCacheOptions {
   readonly opencodeVersion: string
   readonly omoVersion: string
   readonly toolCachePath: string
-  readonly npmPrefixPath: string
   readonly omoConfigPath: string
   readonly cacheAdapter?: ToolsCacheAdapter
 }
@@ -48,13 +46,13 @@ export interface ToolsCacheResult {
 
 export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
   const {os, opencodeVersion, omoVersion} = components
-  return `${TOOLS_CACHE_PREFIX}-${os}-oc${opencodeVersion}-omo${omoVersion}`
+  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-omo-${omoVersion}`
 }
 
 export function buildToolsRestoreKeys(components: ToolsCacheKeyComponents): readonly string[] {
   const {os, opencodeVersion, omoVersion} = components
 
-  return [`${TOOLS_CACHE_PREFIX}-${os}-oc${opencodeVersion}-omo${omoVersion}-`] as const
+  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-omo-${omoVersion}-`] as const
 }
 
 export async function restoreToolsCache(options: RestoreToolsCacheOptions): Promise<ToolsCacheResult> {
@@ -64,14 +62,13 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
     opencodeVersion,
     omoVersion,
     toolCachePath,
-    npmPrefixPath,
     omoConfigPath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
   const primaryKey = buildToolsCacheKey({os, opencodeVersion, omoVersion})
   const restoreKeys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
-  const cachePaths = [toolCachePath, npmPrefixPath, omoConfigPath]
+  const cachePaths = [toolCachePath, omoConfigPath]
 
   logger.info('Restoring tools cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
@@ -109,13 +106,12 @@ export async function saveToolsCache(options: SaveToolsCacheOptions): Promise<bo
     opencodeVersion,
     omoVersion,
     toolCachePath,
-    npmPrefixPath,
     omoConfigPath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
   const saveKey = buildToolsCacheKey({os, opencodeVersion, omoVersion})
-  const cachePaths = [toolCachePath, npmPrefixPath, omoConfigPath]
+  const cachePaths = [toolCachePath, omoConfigPath]
 
   logger.info('Saving tools cache', {saveKey, paths: cachePaths})
 

@@ -98,15 +98,6 @@ function createExecAdapter(): ExecAdapter {
   }
 }
 
-async function discoverNpmPrefix(execAdapter: ExecAdapter): Promise<string> {
-  try {
-    const {stdout} = await execAdapter.getExecOutput('npm', ['config', 'get', 'prefix'], {silent: true})
-    return stdout.trim()
-  } catch {
-    return '/usr/local'
-  }
-}
-
 /**
  * Parse setup action inputs from environment.
  */
@@ -171,8 +162,6 @@ export async function runSetup(): Promise<SetupResult | null> {
 
     // Restore tools cache before installs
     const toolCachePath = join(process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache', 'opencode')
-    const npmPrefix = await discoverNpmPrefix(execAdapter)
-    const npmPrefixPath = join(npmPrefix, 'lib', 'node_modules', 'oh-my-opencode')
     const omoConfigPath = join(homedir(), '.config', 'opencode')
     const runnerOS = getRunnerOS()
 
@@ -182,7 +171,6 @@ export async function runSetup(): Promise<SetupResult | null> {
       opencodeVersion: version,
       omoVersion,
       toolCachePath,
-      npmPrefixPath,
       omoConfigPath,
     })
 
@@ -196,8 +184,7 @@ export async function runSetup(): Promise<SetupResult | null> {
       const cachedPath = toolCache.find('opencode', version)
       if (cachedPath.length > 0) {
         opencodeResult = {path: cachedPath, version, cached: true}
-        omoInstalled = true
-        logger.info('Tools cache hit, skipping installs', {version, omoVersion})
+        logger.info('Tools cache hit, using cached OpenCode CLI', {version, omoVersion})
       } else {
         logger.warning('Tools cache hit but binary not found in tool-cache, falling through to install', {
           requestedVersion: version,
@@ -213,28 +200,28 @@ export async function runSetup(): Promise<SetupResult | null> {
         core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
         return null
       }
+    }
 
-      if (!omoInstalled) {
-        const omoProvidersRaw = core.getInput('omo-providers').trim()
-        const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-        const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
-        if (omoResult.installed) {
-          logger.info('oMo installed', {version: omoResult.version})
-          omoInstalled = true
-        } else {
-          core.setFailed(`oMo installation failed: ${omoResult.error ?? 'unknown error'}`)
-          return null
-        }
-        omoError = omoResult.error
-      }
+    // Always run oMo installer to ensure config values (e.g. provider settings) are current
+    const omoProvidersRaw = core.getInput('omo-providers').trim()
+    const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+    const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
+    if (omoResult.installed) {
+      logger.info('oMo installed', {version: omoResult.version})
+      omoInstalled = true
+    } else {
+      core.setFailed(`oMo installation failed: ${omoResult.error ?? 'unknown error'}`)
+      return null
+    }
+    omoError = omoResult.error
 
+    if (!toolsCacheResult.hit) {
       await saveToolsCache({
         logger,
         os: runnerOS,
         opencodeVersion: version,
         omoVersion,
         toolCachePath,
-        npmPrefixPath,
         omoConfigPath,
       })
     }
