@@ -37,6 +37,16 @@ export interface OpenCodeServerHandle {
   readonly shutdown: () => void
 }
 
+// Mirror SDK schema — SessionStatus is not directly exported by @opencode-ai/sdk
+type SessionStatus =
+  | {readonly type: 'idle'}
+  | {readonly type: 'retry'; readonly attempt: number; readonly message: string; readonly next: number}
+  | {readonly type: 'busy'}
+
+const POLL_INTERVAL_MS = 500
+const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
+const ERROR_GRACE_CYCLES = 3
+
 /** Log a server event at debug level for troubleshooting. */
 export function logServerEvent(event: Event, logger: Logger): void {
   logger.debug('Server event', {
@@ -104,6 +114,7 @@ export function detectArtifacts(
 async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
+  signal: AbortSignal,
   logger: Logger,
 ): Promise<EventStreamResult> {
   let lastText = ''
@@ -116,6 +127,8 @@ async function processEventStream(
   let llmError: ErrorInfo | null = null
 
   for await (const event of stream) {
+    if (signal.aborted) break
+
     logServerEvent(event, logger)
 
     if (event.type === 'message.part.updated') {
@@ -199,6 +212,85 @@ async function processEventStream(
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
 }
 
+interface PollResult {
+  readonly completed: boolean
+  readonly error: string | null
+}
+
+export async function pollForSessionCompletion(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  signal: AbortSignal,
+  logger: Logger,
+  maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<PollResult> {
+  const pollStart = Date.now()
+  let errorCycleCount = 0
+
+  while (!signal.aborted) {
+    await sleep(POLL_INTERVAL_MS)
+    if (signal.aborted) return {completed: false, error: 'Aborted'}
+
+    const elapsed = Date.now() - pollStart
+    if (maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
+      logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
+      return {completed: false, error: `Poll timeout after ${elapsed}ms`}
+    }
+
+    try {
+      const statusResponse = await client.session.status({query: {directory}})
+      const statuses = statusResponse.data ?? {}
+      const sessionStatus = statuses[sessionId] as SessionStatus | undefined
+
+      if (sessionStatus == null) {
+        logger.debug('Session status not found in poll response', {sessionId})
+        continue
+      }
+
+      if (sessionStatus.type === 'idle') {
+        logger.debug('Session idle detected via polling', {sessionId})
+        return {completed: true, error: null}
+      }
+
+      if (sessionStatus.type === 'retry') {
+        errorCycleCount++
+        logger.debug('Session in retry state', {
+          sessionId,
+          attempt: sessionStatus.attempt,
+          message: sessionStatus.message,
+          errorCycleCount,
+        })
+        if (errorCycleCount >= ERROR_GRACE_CYCLES) {
+          return {
+            completed: false,
+            error: `Session error after ${errorCycleCount} retry cycles: ${sessionStatus.message}`,
+          }
+        }
+        continue
+      }
+
+      errorCycleCount = 0
+    } catch (pollError) {
+      logger.debug('Poll request failed', {error: toErrorMessage(pollError)})
+    }
+  }
+
+  return {completed: false, error: 'Aborted'}
+}
+
+export async function waitForEventProcessorShutdown(
+  eventProcessor: Promise<void>,
+  timeoutMs: number = EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS,
+): Promise<void> {
+  await Promise.race([
+    eventProcessor,
+    new Promise<void>(resolve => {
+      setTimeout(resolve, timeoutMs)
+    }),
+  ])
+}
+
 const MAX_LLM_RETRIES = 3
 const RETRY_DELAY_MS = 5000
 
@@ -223,11 +315,10 @@ async function sendPromptToSession(
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
-  const agentName = (config?.agent ?? 'Sisyphus').toLowerCase()
+  const agentName = config?.agent ?? 'Sisyphus'
+  const eventAbortController = new AbortController()
 
   const events = await client.event.subscribe()
-  const eventController =
-    'controller' in events ? ((events as {controller?: AbortController}).controller ?? null) : null
 
   let eventStreamResult: EventStreamResult = {
     tokens: null,
@@ -239,7 +330,12 @@ async function sendPromptToSession(
     llmError: null,
   }
 
-  const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<Event>, sessionId, logger)
+  const eventProcessor = processEventStream(
+    events.stream as AsyncIterable<Event>,
+    sessionId,
+    eventAbortController.signal,
+    logger,
+  )
     .then(result => {
       eventStreamResult = result
     })
@@ -273,44 +369,62 @@ async function sendPromptToSession(
   }
 
   logger.debug('Sending prompt to OpenCode', {sessionId})
-  const promptResponse = await client.session.promptAsync({
-    path: {id: sessionId},
-    body: promptBody,
-    query: {directory},
-  })
+  try {
+    const promptResponse = await client.session.promptAsync({
+      path: {id: sessionId},
+      body: promptBody,
+      query: {directory},
+    })
 
-  if (promptResponse.error != null && eventController != null) {
-    eventController.abort()
-  }
+    if (promptResponse.error != null) {
+      logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
 
-  await eventProcessingPromise
+      const promptErrorLlm = isLlmFetchError(promptResponse.error)
+        ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
+        : eventStreamResult.llmError
 
-  if (eventController != null) {
-    eventController.abort()
-  }
+      return {
+        success: false,
+        error: String(promptResponse.error),
+        llmError: promptErrorLlm,
+        shouldRetry: promptErrorLlm != null,
+        eventStreamResult,
+      }
+    }
 
-  if (promptResponse.error != null) {
-    logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
+    const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    const pollResult = await pollForSessionCompletion(
+      client,
+      sessionId,
+      directory,
+      eventAbortController.signal,
+      logger,
+      timeoutMs,
+    )
 
-    const promptErrorLlm = isLlmFetchError(promptResponse.error)
-      ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
-      : eventStreamResult.llmError
+    if (!pollResult.completed) {
+      const pollError = pollResult.error ?? 'Session did not reach idle state'
+      logger.error('Session completion polling failed', {error: pollError, sessionId})
+
+      return {
+        success: false,
+        error: pollError,
+        llmError: eventStreamResult.llmError,
+        shouldRetry: false,
+        eventStreamResult,
+      }
+    }
 
     return {
-      success: false,
-      error: String(promptResponse.error),
-      llmError: promptErrorLlm,
-      shouldRetry: promptErrorLlm != null,
+      success: true,
+      error: null,
+      llmError: null,
+      shouldRetry: false,
       eventStreamResult,
     }
-  }
-
-  return {
-    success: true,
-    error: null,
-    llmError: null,
-    shouldRetry: false,
-    eventStreamResult,
+  } finally {
+    eventAbortController.abort()
+    await waitForEventProcessorShutdown(eventProcessor)
   }
 }
 

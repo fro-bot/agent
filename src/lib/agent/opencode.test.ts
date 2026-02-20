@@ -16,7 +16,9 @@ import {
   ensureOpenCodeAvailable,
   executeOpenCode,
   logServerEvent,
+  pollForSessionCompletion,
   verifyOpenCodeAvailable,
+  waitForEventProcessorShutdown,
 } from './opencode.js'
 
 // Mock node:fs/promises
@@ -89,13 +91,19 @@ function createMockEventStream(events: Event[] = []): {
   }
 }
 
+type SessionStatus = {type: 'idle'} | {type: 'retry'; attempt: number; message: string; next: number} | {type: 'busy'}
+
 function createMockClient(options: {
   promptResponse?: {parts: {type: string; text?: string}[]}
   throwOnPrompt?: boolean
   throwOnCreate?: boolean
   throwOnLog?: boolean
   events?: Event[]
+  sessionStatus?: Record<string, SessionStatus>
+  statusSequence?: Record<string, SessionStatus>[]
 }) {
+  const statusSequence = options.statusSequence ?? [options.sessionStatus ?? {ses_123: {type: 'idle'}}]
+  let statusIndex = 0
   return {
     app: {
       log: options.throwOnLog
@@ -109,6 +117,11 @@ function createMockClient(options: {
       promptAsync: options.throwOnPrompt
         ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
         : vi.fn().mockResolvedValue({data: options.promptResponse}),
+      status: vi.fn().mockImplementation(async () => {
+        const statusResponse = statusSequence[Math.min(statusIndex, statusSequence.length - 1)]
+        statusIndex += 1
+        return {data: statusResponse}
+      }),
     },
     event: {
       subscribe: vi.fn().mockResolvedValue(createMockEventStream(options.events ?? [])),
@@ -202,7 +215,7 @@ describe('executeOpenCode', () => {
       | undefined
 
     expect(promptCall?.path?.id).toBe('ses_123')
-    expect(promptCall?.body?.agent).toBe('sisyphus')
+    expect(promptCall?.body?.agent).toBe('Sisyphus')
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
@@ -288,7 +301,7 @@ describe('executeOpenCode', () => {
     const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
-    expect(callArgs?.body?.agent).toBe('customagent')
+    expect(callArgs?.body?.agent).toBe('CustomAgent')
   })
 
   it('returns success result on successful execution', async () => {
@@ -598,6 +611,7 @@ describe('executeOpenCode retry behavior', () => {
           }
           return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
         }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
         subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
@@ -636,6 +650,7 @@ describe('executeOpenCode retry behavior', () => {
           promptCallCount++
           return Promise.resolve({error: 'fetch failed: network error'})
         }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
         subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
@@ -674,6 +689,7 @@ describe('executeOpenCode retry behavior', () => {
           promptCallCount++
           return Promise.resolve({error: 'Invalid API key'})
         }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
         subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
@@ -710,6 +726,7 @@ describe('executeOpenCode retry behavior', () => {
           }
           return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
         }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
         subscribe: vi.fn().mockImplementation(async () => {
@@ -777,6 +794,7 @@ describe('executeOpenCode retry behavior', () => {
           }
           return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
         }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
         subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
@@ -944,7 +962,9 @@ describe('LLM error detection', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     // #when
-    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(1000)
+    const result = await resultPromise
 
     // #then
     expect(result.success).toBe(true)
@@ -1215,5 +1235,200 @@ describe('executeOpenCode with serverHandle', () => {
 
     // #then
     expect(mockServer.close).toHaveBeenCalled()
+  })
+})
+
+describe('pollForSessionCompletion', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('returns completed when session status is idle', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(true)
+    expect(result.error).toBeNull()
+  })
+
+  it('keeps polling when session is busy then returns on idle', async () => {
+    // #given
+    let callCount = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          callCount++
+          if (callCount < 3) {
+            return {data: {ses_123: {type: 'busy'}}}
+          }
+          return {data: {ses_123: {type: 'idle'}}}
+        }),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(true)
+    expect(callCount).toBeGreaterThanOrEqual(3)
+  })
+
+  it('returns error after retry grace cycles exhausted', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({
+          data: {ses_123: {type: 'retry', attempt: 1, message: 'Server crashed', next: 0}},
+        }),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('retry cycles')
+  })
+
+  it('returns aborted when signal is already aborted', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const abortController = new AbortController()
+    abortController.abort()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toBe('Aborted')
+  })
+
+  it('returns timeout error when maxPollTimeMs exceeded', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      1000,
+    )
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
+  it('continues polling when session status is not found', async () => {
+    // #given
+    let callCount = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          callCount++
+          if (callCount < 3) {
+            return {data: {}}
+          }
+          return {data: {ses_123: {type: 'idle'}}}
+        }),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(true)
+    expect(callCount).toBeGreaterThanOrEqual(3)
+  })
+})
+
+describe('waitForEventProcessorShutdown', () => {
+  it('resolves when processor completes quickly', async () => {
+    // #given
+    const processor = Promise.resolve()
+
+    // #when / #then
+    await expect(waitForEventProcessorShutdown(processor, 5000)).resolves.toBeUndefined()
+  })
+
+  it('resolves after timeout when processor hangs', async () => {
+    // #given
+    const processor = new Promise<void>(() => {
+      // intentionally never resolves
+    })
+
+    // #when
+    const start = Date.now()
+    await waitForEventProcessorShutdown(processor, 100)
+    const elapsed = Date.now() - start
+
+    // #then
+    expect(elapsed).toBeGreaterThanOrEqual(90)
+    expect(elapsed).toBeLessThan(1000)
   })
 })
