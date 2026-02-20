@@ -227,7 +227,7 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(true)
-      expect(result.success && result.data.agent).toBe('Sisyphus')
+      expect(result.success && result.data.agent).toBe('sisyphus')
     })
 
     it('parses custom agent input', () => {
