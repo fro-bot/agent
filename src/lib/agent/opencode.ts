@@ -68,6 +68,7 @@ interface EventStreamResult {
 
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
+  sessionIdle: boolean
 }
 
 /**
@@ -208,6 +209,9 @@ export async function processEventStream(
     } else if (event.type === 'session.idle') {
       const idleSessionID = event.properties.sessionID
       if (idleSessionID === sessionId) {
+        if (activityTracker != null) {
+          activityTracker.sessionIdle = true
+        }
         if (lastText.length > 0) {
           outputTextContent(lastText)
           lastText = ''
@@ -244,6 +248,11 @@ export async function pollForSessionCompletion(
   while (!signal.aborted) {
     await sleep(POLL_INTERVAL_MS)
     if (signal.aborted) return {completed: false, error: 'Aborted'}
+
+    if (activityTracker?.sessionIdle === true) {
+      logger.debug('Session idle detected via event stream', {sessionId})
+      return {completed: true, error: null}
+    }
 
     const elapsed = Date.now() - pollStart
     if (maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
@@ -338,7 +347,7 @@ async function sendPromptToSession(
 ): Promise<PromptAttemptResult> {
   const agentName = config?.agent ?? DEFAULT_AGENT
   const eventAbortController = new AbortController()
-  const activityTracker: ActivityTracker = {firstMeaningfulEventReceived: false}
+  const activityTracker: ActivityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
 
   const events = await client.event.subscribe()
 

@@ -1414,7 +1414,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
     vi.useFakeTimers()
 
     // #when
@@ -1469,6 +1469,40 @@ describe('pollForSessionCompletion', () => {
     expect(result.completed).toBe(true)
     expect(callCount).toBeGreaterThanOrEqual(3)
   })
+
+  it('returns completed when activityTracker.sessionIdle is set by event stream', async () => {
+    // #given — session status never returns idle, but event stream signals it
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {}}),
+      },
+    }
+    const abortController = new AbortController()
+    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false}
+    vi.useFakeTimers()
+
+    // #when — start polling, then simulate event stream setting sessionIdle
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // After first poll cycle, simulate the event stream detecting session.idle
+    await vi.advanceTimersByTimeAsync(500)
+    activityTracker.sessionIdle = true
+    await vi.advanceTimersByTimeAsync(500)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    // #then
+    expect(result.completed).toBe(true)
+    expect(result.error).toBeNull()
+  })
 })
 
 describe('waitForEventProcessorShutdown', () => {
@@ -1504,7 +1538,7 @@ describe('waitForEventProcessorShutdown', () => {
 describe('processEventStream', () => {
   it('marks activity tracker when message part updates arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -1524,5 +1558,45 @@ describe('processEventStream', () => {
 
     // #then
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
+  it('sets sessionIdle on activity tracker when session.idle received', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionIdle).toBe(true)
+  })
+
+  it('sets sessionIdle only for matching session', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_other'},
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionIdle).toBe(true)
   })
 })
