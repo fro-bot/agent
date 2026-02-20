@@ -243,7 +243,8 @@ export async function pollForSessionCompletion(
   activityTracker?: ActivityTracker,
 ): Promise<PollResult> {
   const pollStart = Date.now()
-  let errorCycleCount = 0
+  let lastRetryAttempt = 0
+  let retryAttemptCount = 0
 
   while (!signal.aborted) {
     await sleep(POLL_INTERVAL_MS)
@@ -271,21 +272,28 @@ export async function pollForSessionCompletion(
         logger.debug('Session idle detected via polling', {sessionId})
         return {completed: true, error: null}
       } else if (sessionStatus.type === 'retry') {
-        errorCycleCount++
+        // Count actual server retry attempts, not poll cycles seeing the same attempt.
+        // Rate limit backoff can take 30-60s per attempt — polling at 500ms would
+        // exhaust grace cycles in <2s if we counted every poll tick.
+        if (sessionStatus.attempt > lastRetryAttempt) {
+          lastRetryAttempt = sessionStatus.attempt
+          retryAttemptCount++
+        }
         logger.debug('Session in retry state', {
           sessionId,
           attempt: sessionStatus.attempt,
           message: sessionStatus.message,
-          errorCycleCount,
+          retryAttemptCount,
         })
-        if (errorCycleCount >= ERROR_GRACE_CYCLES) {
+        if (retryAttemptCount >= ERROR_GRACE_CYCLES) {
           return {
             completed: false,
-            error: `Session error after ${errorCycleCount} retry cycles: ${sessionStatus.message}`,
+            error: `Session error after ${retryAttemptCount} retry attempts: ${sessionStatus.message}`,
           }
         }
       } else {
-        errorCycleCount = 0
+        lastRetryAttempt = 0
+        retryAttemptCount = 0
       }
 
       if (activityTracker != null && !activityTracker.firstMeaningfulEventReceived) {

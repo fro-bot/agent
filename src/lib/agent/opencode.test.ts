@@ -1329,12 +1329,14 @@ describe('pollForSessionCompletion', () => {
     expect(callCount).toBeGreaterThanOrEqual(3)
   })
 
-  it('returns error after retry grace cycles exhausted', async () => {
-    // #given
+  it('returns error after retry grace attempts exhausted', async () => {
+    // #given — each poll returns an incrementing attempt number (distinct server retries)
+    let attemptNum = 0
     const mockClient = {
       session: {
-        status: vi.fn().mockResolvedValue({
-          data: {ses_123: {type: 'retry', attempt: 1, message: 'Server crashed', next: 0}},
+        status: vi.fn().mockImplementation(async () => {
+          attemptNum++
+          return {data: {ses_123: {type: 'retry', attempt: attemptNum, message: 'Server crashed', next: 0}}}
         }),
       },
     }
@@ -1351,7 +1353,37 @@ describe('pollForSessionCompletion', () => {
 
     // #then
     expect(result.completed).toBe(false)
-    expect(result.error).toContain('retry cycles')
+    expect(result.error).toContain('retry attempts')
+  })
+
+  it('does not fail when same retry attempt is seen across multiple poll cycles', async () => {
+    // #given — same attempt number repeated (rate limit backoff in progress), then idle
+    let callCount = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          callCount++
+          if (callCount <= 5) {
+            return {data: {ses_123: {type: 'retry', attempt: 1, message: 'Rate limited', next: 0}}}
+          }
+          return {data: {ses_123: {type: 'idle'}}}
+        }),
+      },
+    }
+    const abortController = new AbortController()
+
+    // #when
+    const result = await pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+    )
+
+    // #then
+    expect(result.completed).toBe(true)
+    expect(callCount).toBeGreaterThan(5)
   })
 
   it('returns aborted when signal is already aborted', async () => {
