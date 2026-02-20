@@ -28,9 +28,9 @@ inputs:
     description: AWS region for S3 bucket
     required: false
   agent:
-    description: 'Agent to use (default: Sisyphus). Must be a primary agent, not subagent.'
+    description: 'Agent to use (default: sisyphus). Must be a primary agent, not subagent.'
     required: false
-    default: Sisyphus
+    default: sisyphus
   model:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
