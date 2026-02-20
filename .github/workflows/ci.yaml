@@ -146,7 +146,7 @@ jobs:
           echo "Installed versions:"
           which bun && bun --version || true
           which opencode && opencode --version || true
-          bunx oh-my-opencode get-local-version || true
+          npx oh-my-opencode get-local-version || true
 
           echo "OpenCode config files:"
           find ~/.config/opencode -maxdepth 2 -type f | sort
@@ -158,7 +158,7 @@ jobs:
           ls -lA ~/.local/share/opencode/log || true
 
           echo "Check oh-my-opencode installation:"
-          bunx oh-my-opencode doctor || true
+          npx oh-my-opencode doctor || true
 
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true
