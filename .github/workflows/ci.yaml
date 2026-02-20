@@ -146,7 +146,7 @@ jobs:
           echo "Installed versions:"
           which bun && bun --version || true
           which opencode && opencode --version || true
-          npx oh-my-opencode get-local-version || true
+          bunx oh-my-opencode get-local-version || true
 
           echo "OpenCode config files:"
           find ~/.config/opencode -maxdepth 2 -type f | sort
@@ -158,14 +158,10 @@ jobs:
           ls -lA ~/.local/share/opencode/log || true
 
           echo "Check oh-my-opencode installation:"
-          npx oh-my-opencode doctor || true
+          bunx oh-my-opencode doctor --verbose || true
 
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true
-
-          # Output the contents of each project json file
-          echo "OpenCode projects:"
-          find ~/.local/share/opencode/storage/project -name '*.json' -exec echo "Project file: {}" \; -exec cat {} \; || true
 
           echo "OpenCode cache files:"
           ls -lA ~/.cache/opencode || true

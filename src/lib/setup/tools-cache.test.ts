@@ -49,7 +49,7 @@ describe('buildToolsCacheKey', () => {
     const key = buildToolsCacheKey({os, opencodeVersion, omoVersion})
 
     // #then key uses opencode-tools prefix
-    expect(key).toBe('opencode-tools-Linux-oc1.0.0-omo3.5.5')
+    expect(key).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5')
     expect(key).toMatch(/^opencode-tools-/)
   })
 
@@ -63,7 +63,7 @@ describe('buildToolsCacheKey', () => {
     const key = buildToolsCacheKey({os, opencodeVersion, omoVersion})
 
     // #then key includes latest
-    expect(key).toBe('opencode-tools-Linux-oclatest-omo3.5.5')
+    expect(key).toBe('opencode-tools-Linux-oc-latest-omo-3.5.5')
   })
 })
 
@@ -78,7 +78,7 @@ describe('buildToolsRestoreKeys', () => {
     const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
 
     // #then only version-specific prefix key is returned (no broad OS-only fallback)
-    expect(keys).toEqual(['opencode-tools-Linux-oc1.0.0-omo3.5.5-'])
+    expect(keys).toEqual(['opencode-tools-Linux-oc-1.0.0-omo-3.5.5-'])
   })
 
   it('does not include broad OS-only fallback key', () => {
@@ -105,20 +105,20 @@ describe('buildToolsRestoreKeys', () => {
     const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
 
     // #then keys include macOS prefix
-    expect(keys[0]).toBe('opencode-tools-macOS-oc1.0.0-omo3.5.5-')
+    expect(keys[0]).toBe('opencode-tools-macOS-oc-1.0.0-omo-3.5.5-')
   })
 })
 
 describe('restoreToolsCache', () => {
   let tempDir: string
   let toolCachePath: string
-  let npmPrefixPath: string
+  let bunCachePath: string
   let omoConfigPath: string
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tools-cache-test-'))
     toolCachePath = path.join(tempDir, 'tool-cache', 'opencode')
-    npmPrefixPath = path.join(tempDir, 'npm', 'lib', 'node_modules', 'oh-my-opencode')
+    bunCachePath = path.join(tempDir, 'tool-cache', 'bun')
     omoConfigPath = path.join(tempDir, 'config', 'opencode')
   })
 
@@ -137,7 +137,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -149,7 +149,7 @@ describe('restoreToolsCache', () => {
 
   it('returns hit: true with key on cache hit', async () => {
     // #given a cache adapter that returns a key (hit)
-    const restoredKey = 'opencode-tools-Linux-oc1.0.0-omo3.5.5'
+    const restoredKey = 'opencode-tools-Linux-oc-1.0.0-omo-3.5.5'
     const adapter = createMockToolsCacheAdapter({restoreResult: restoredKey})
 
     // #when restoring cache
@@ -159,7 +159,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -187,13 +187,13 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
 
     // #then adapter receives all three paths
-    expect(capturedPaths).toEqual([toolCachePath, npmPrefixPath, omoConfigPath])
+    expect(capturedPaths).toEqual([toolCachePath, bunCachePath, omoConfigPath])
   })
 
   it('handles restore errors gracefully', async () => {
@@ -212,7 +212,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -226,13 +226,13 @@ describe('restoreToolsCache', () => {
 describe('saveToolsCache', () => {
   let tempDir: string
   let toolCachePath: string
-  let npmPrefixPath: string
+  let bunCachePath: string
   let omoConfigPath: string
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tools-cache-test-'))
     toolCachePath = path.join(tempDir, 'tool-cache', 'opencode')
-    npmPrefixPath = path.join(tempDir, 'npm', 'lib', 'node_modules', 'oh-my-opencode')
+    bunCachePath = path.join(tempDir, 'tool-cache', 'bun')
     omoConfigPath = path.join(tempDir, 'config', 'opencode')
   })
 
@@ -251,7 +251,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -278,13 +278,13 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
 
     // #then adapter receives all three paths
-    expect(capturedPaths).toEqual([toolCachePath, npmPrefixPath, omoConfigPath])
+    expect(capturedPaths).toEqual([toolCachePath, bunCachePath, omoConfigPath])
   })
 
   it('uses correct save key', async () => {
@@ -305,13 +305,13 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
 
     // #then uses correct key
-    expect(capturedKey).toBe('opencode-tools-Linux-oc1.0.0-omo3.5.5')
+    expect(capturedKey).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5')
   })
 
   it('handles cache already exists error', async () => {
@@ -327,7 +327,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -349,7 +349,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
-      npmPrefixPath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
