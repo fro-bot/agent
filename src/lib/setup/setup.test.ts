@@ -71,6 +71,12 @@ vi.mock('./tools-cache.js', () => ({
   saveToolsCache: vi.fn(),
 }))
 
+// Mock bun module
+vi.mock('./bun.js', () => ({
+  installBun: vi.fn().mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true}),
+  DEFAULT_BUN_VERSION: '1.3.5',
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -108,13 +114,8 @@ describe('setup', () => {
     vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
     vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
 
-    // Default npm config get prefix
-    vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-      if (cmd === 'npm' && args?.[0] === 'config') {
-        return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
-      }
-      return {exitCode: 0, stdout: '', stderr: ''}
-    })
+    // Default exec.getExecOutput mock
+    vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
   })
 
   afterEach(() => {
@@ -248,15 +249,20 @@ describe('setup', () => {
       expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
     })
 
-    it('fails setup when oMo installation fails', async () => {
-      // #given
+    it('warns when oMo installation fails but continues setup', async () => {
+      // #given - bunx oMo fails, other exec calls succeed
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({
         exitCode: 0,
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
-      vi.mocked(exec.exec).mockRejectedValue(new Error('bunx failed'))
+      vi.mocked(exec.exec).mockImplementation(async (cmd: string) => {
+        if (cmd === 'bunx') {
+          throw new Error('bunx failed')
+        }
+        return 0
+      })
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -264,9 +270,38 @@ describe('setup', () => {
       // #when
       const result = await runSetup()
 
-      // #then - should fail the action
-      expect(result).toBeNull()
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('oMo'))
+      // #then - should warn but continue (RFC-011 graceful degradation)
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('oMo installation failed'))
+    })
+
+    it('skips oMo install when Bun installation fails', async () => {
+      // #given - Bun install throws
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      const bunModule = await import('./bun.js')
+      vi.mocked(bunModule.installBun).mockRejectedValueOnce(new Error('download failed'))
+
+      // #when
+      const result = await runSetup()
+
+      // #then - setup continues but oMo is not attempted
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Bun installation failed'))
+      expect(exec.exec).not.toHaveBeenCalledWith('bunx', expect.anything(), expect.anything())
     })
 
     it('restores cache when available', async () => {
@@ -329,12 +364,7 @@ describe('setup', () => {
     it('configures git identity from GitHub token user', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-        if (cmd === 'npm' && args?.[0] === 'config') {
-          return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
-        }
-        return {exitCode: 0, stdout: '', stderr: ''}
-      })
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
@@ -356,9 +386,6 @@ describe('setup', () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-        if (cmd === 'npm' && args?.[0] === 'config') {
-          return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
-        }
         if (cmd === 'git' && args?.[0] === 'config' && args?.[1] === 'user.name') {
           return {exitCode: 0, stdout: 'Existing User\n', stderr: ''}
         }
@@ -389,10 +416,6 @@ describe('setup', () => {
           if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
             return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
           }
-          // npm config get prefix
-          if (cmd === 'npm' && args?.[0] === 'config') {
-            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
-          }
           return {exitCode: 0, stdout: '', stderr: ''}
         })
         vi.mocked(exec.exec).mockResolvedValue(0)
@@ -416,7 +439,6 @@ describe('setup', () => {
         const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
         expect(callArgs).toBeDefined()
         expect(callArgs?.toolCachePath).toContain('opencode')
-        expect(callArgs?.npmPrefixPath).toContain('oh-my-opencode')
         expect(callArgs?.omoConfigPath).toContain('opencode')
       })
 
@@ -437,7 +459,7 @@ describe('setup', () => {
         // #given tools cache hit and tc.find returns a valid path
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
         })
         vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
 
@@ -455,7 +477,7 @@ describe('setup', () => {
         // #given tools cache hit but tc.find returns empty (version mismatch)
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc1.0.299-omo3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -476,9 +498,6 @@ describe('setup', () => {
           if (cmd === 'file') {
             const isZip = process.platform === 'darwin' || process.platform === 'win32'
             return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
-          }
-          if (cmd === 'npm' && args?.[0] === 'config') {
-            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
           }
           return {exitCode: 0, stdout: '', stderr: ''}
         })
@@ -496,7 +515,7 @@ describe('setup', () => {
         // #given tools cache hit but tc.find returns empty
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc1.0.299-omo3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -517,9 +536,6 @@ describe('setup', () => {
           if (cmd === 'file') {
             const isZip = process.platform === 'darwin' || process.platform === 'win32'
             return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
-          }
-          if (cmd === 'npm' && args?.[0] === 'config') {
-            return {exitCode: 0, stdout: '/usr/local\n', stderr: ''}
           }
           return {exitCode: 0, stdout: '', stderr: ''}
         })
@@ -548,7 +564,7 @@ describe('setup', () => {
         // #given tools cache hit
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
         })
 
         // #when
@@ -558,17 +574,17 @@ describe('setup', () => {
         expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
       })
 
-      it('passes skipInstall to installOmo on cache hit', async () => {
+      it('always runs oMo installer even on cache hit', async () => {
         // #given tools cache hit
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc1.0.300-omo3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
         })
 
         // #when
         const result = await runSetup()
 
-        // #then - oMo skipped but still marked installed
+        // #then - oMo always runs to ensure config is current
         expect(result).not.toBeNull()
         expect(result?.omoInstalled).toBe(true)
       })

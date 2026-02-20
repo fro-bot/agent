@@ -587,7 +587,7 @@ describe('verifyOpenCodeAvailable', () => {
     // #then
     expect(result.available).toBe(false)
     expect(result.version).toBeNull()
-    expect(mockLogger.warning).toHaveBeenCalledWith('OpenCode not available')
+    expect(mockLogger.debug).toHaveBeenCalledWith('OpenCode not available, will attempt auto-setup')
   })
 
   it('returns version=null when version not parseable', async () => {

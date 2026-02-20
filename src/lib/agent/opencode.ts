@@ -790,7 +790,7 @@ export async function verifyOpenCodeAvailable(
     logger.debug('OpenCode version verified', {version: parsedVersion})
     return {available: true, version: parsedVersion}
   } catch {
-    logger.warning('OpenCode not available')
+    logger.debug('OpenCode not available, will attempt auto-setup')
     return {available: false, version: null}
   }
 }

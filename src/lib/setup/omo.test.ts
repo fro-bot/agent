@@ -33,7 +33,7 @@ describe('omo', () => {
 
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
-      // #given - both npm install and oh-my-opencode install succeed
+      // #given - bunx oh-my-opencode install succeeds
       const execMock = vi
         .fn()
         .mockImplementation(
@@ -55,17 +55,20 @@ describe('omo', () => {
       expect(result.installed).toBe(true)
       expect(result.version).toBe('1.2.3')
       expect(result.error).toBeNull()
-      expect(execMock).toHaveBeenCalledTimes(2)
-      expect(execMock).toHaveBeenNthCalledWith(
-        1,
-        'npm',
-        expect.arrayContaining(['install', '-g', 'oh-my-opencode@1.2.3']),
-        expect.any(Object),
-      )
-      expect(execMock).toHaveBeenNthCalledWith(
-        2,
-        'oh-my-opencode',
-        expect.arrayContaining(['install']),
+      expect(execMock).toHaveBeenCalledTimes(1)
+      expect(execMock).toHaveBeenCalledWith(
+        'bunx',
+        [
+          'oh-my-opencode@1.2.3',
+          'install',
+          '--no-tui',
+          '--claude=no',
+          '--copilot=no',
+          '--gemini=no',
+          '--openai=no',
+          '--opencode-zen=no',
+          '--zai-coding-plan=no',
+        ],
         expect.any(Object),
       )
     })
@@ -90,14 +93,14 @@ describe('omo', () => {
       // #when
       const result = await installOmo('3.5.5', mockDeps)
 
-      // #then
+      // #then - falls back to input version when regex detection fails
       expect(result.installed).toBe(true)
-      expect(result.version).toBeNull()
+      expect(result.version).toBe('3.5.5')
       expect(result.error).toBeNull()
     })
 
-    it('returns failure when npm install -g fails', async () => {
-      // #given - first command (npm install -g) fails
+    it('returns failure when bunx oh-my-opencode install fails', async () => {
+      // #given - bunx command fails
       const execMock = vi.fn().mockResolvedValue(1)
       const mockDeps = createMockDeps({
         execAdapter: createMockExecAdapter({exec: execMock}),
@@ -111,22 +114,6 @@ describe('omo', () => {
       expect(result.version).toBeNull()
       expect(result.error).toContain('exit code 1')
       expect(execMock).toHaveBeenCalledTimes(1)
-    })
-
-    it('returns failure when oh-my-opencode install fails', async () => {
-      // #given - npm install succeeds but oh-my-opencode install fails
-      const execMock = vi.fn().mockResolvedValueOnce(0).mockResolvedValueOnce(1)
-      const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({exec: execMock}),
-      })
-
-      // #when
-      const result = await installOmo('3.5.5', mockDeps)
-
-      // #then
-      expect(result.installed).toBe(false)
-      expect(result.error).toContain('exit code 1')
-      expect(execMock).toHaveBeenCalledTimes(2)
     })
 
     it('returns failure on exception', async () => {
@@ -161,7 +148,7 @@ describe('omo', () => {
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('uses pinned version in npm install', async () => {
+    it('uses pinned version in bunx call', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -171,16 +158,15 @@ describe('omo', () => {
       // #when
       await installOmo('3.5.5', mockDeps)
 
-      // #then - first call should use version parameter
-      expect(execMock).toHaveBeenNthCalledWith(
-        1,
-        'npm',
-        expect.arrayContaining(['install', '-g', 'oh-my-opencode@3.5.5']),
+      // #then - bunx call should use version parameter
+      expect(execMock).toHaveBeenCalledWith(
+        'bunx',
+        expect.arrayContaining(['oh-my-opencode@3.5.5']),
         expect.any(Object),
       )
     })
 
-    it('uses version parameter for platform package', async () => {
+    it('calls bunx with headless options using defaults', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -190,51 +176,11 @@ describe('omo', () => {
       // #when
       await installOmo('3.5.5', mockDeps)
 
-      // #then - first call should include platform package with version
-      expect(execMock).toHaveBeenNthCalledWith(
-        1,
-        'npm',
-        expect.arrayContaining([
-          expect.stringMatching(
-            /^oh-my-opencode-.[^-\n\r\u2028\u2029]*-(?:[^\n\r@\u2028\u2029]*@[^-\n\r\u2028\u2029]*-)*(?:[\n\r\u2028\u2029][^@]*|[^\n\r@\u2028\u2029]+(?:[\n\r\u2028\u2029][^@]*)?)@3\.5\.5$/,
-          ),
-        ]),
-        expect.any(Object),
-      )
-    })
-
-    it('bypasses install when skipInstall is true', async () => {
-      // #given
-      const execMock = vi.fn().mockResolvedValue(0)
-      const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({exec: execMock}),
-      })
-
-      // #when
-      const result = await installOmo('3.5.5', mockDeps, {skipInstall: true})
-
-      // #then
-      expect(result.installed).toBe(true)
-      expect(result.version).toBe('3.5.5')
-      expect(result.error).toBeNull()
-      expect(execMock).not.toHaveBeenCalled()
-    })
-
-    it('calls oh-my-opencode with headless options using defaults', async () => {
-      // #given
-      const execMock = vi.fn().mockResolvedValue(0)
-      const mockDeps = createMockDeps({
-        execAdapter: createMockExecAdapter({exec: execMock}),
-      })
-
-      // #when
-      await installOmo('3.5.5', mockDeps)
-
-      // #then - second call is oh-my-opencode install
-      expect(execMock).toHaveBeenNthCalledWith(
-        2,
-        'oh-my-opencode',
+      // #then - bunx call includes headless options
+      expect(execMock).toHaveBeenCalledWith(
+        'bunx',
         [
+          'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
           '--claude=no',
@@ -248,7 +194,7 @@ describe('omo', () => {
       )
     })
 
-    it('calls oh-my-opencode with custom options when provided', async () => {
+    it('calls bunx with custom options when provided', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -265,11 +211,11 @@ describe('omo', () => {
         zaiCodingPlan: 'no',
       })
 
-      // #then - second call is oh-my-opencode install with custom options
-      expect(execMock).toHaveBeenNthCalledWith(
-        2,
-        'oh-my-opencode',
+      // #then - bunx call includes custom options
+      expect(execMock).toHaveBeenCalledWith(
+        'bunx',
         [
+          'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
           '--claude=yes',
@@ -312,7 +258,7 @@ describe('omo', () => {
       // #when
       const result = await installOmo('3.5.5', mockDeps)
 
-      // #then
+      // #then - single bunx call captures both stdout and stderr
       expect(result.installed).toBe(false)
       const errorCalls = (mockLogger.error as ReturnType<typeof vi.fn>).mock.calls
       expect(errorCalls.length).toBeGreaterThan(0)
@@ -339,8 +285,14 @@ describe('omo', () => {
       // #when
       const result = await verifyOmoInstallation(mockLogger, mockExec)
 
-      // #then
+      // #then - only checks config file, not binary
       expect(result).toBe(true)
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1)
+      expect(mockExec.getExecOutput).toHaveBeenCalledWith(
+        'ls',
+        ['-la', '~/.config/opencode/oh-my-opencode.json'],
+        expect.any(Object),
+      )
     })
 
     it('returns false when config file does not exist', async () => {
@@ -357,8 +309,9 @@ describe('omo', () => {
       // #when
       const result = await verifyOmoInstallation(mockLogger, mockExec)
 
-      // #then
+      // #then - detects missing config file
       expect(result).toBe(false)
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1)
     })
 
     it('returns false on exception', async () => {
@@ -371,9 +324,10 @@ describe('omo', () => {
       // #when
       const result = await verifyOmoInstallation(mockLogger, mockExec)
 
-      // #then
+      // #then - handles errors gracefully
       expect(result).toBe(false)
       expect(mockLogger.debug).toHaveBeenCalledWith('Could not verify oMo installation')
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1)
     })
   })
 })
