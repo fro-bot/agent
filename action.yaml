@@ -53,10 +53,9 @@ inputs:
   omo-providers:
     description: >-
       Comma-separated list of oMo providers to enable. Values: claude, claude-max20,
-      copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: opencode-zen
-      (uses free OpenCode models).
+      copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: empty
+      (uses free OpenCode models)
     required: false
-    default: opencode-zen
 
 outputs:
   session-id:

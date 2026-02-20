@@ -71,6 +71,12 @@ vi.mock('./tools-cache.js', () => ({
   saveToolsCache: vi.fn(),
 }))
 
+// Mock bun module
+vi.mock('./bun.js', () => ({
+  installBun: vi.fn().mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true}),
+  DEFAULT_BUN_VERSION: '1.3.5',
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -243,15 +249,20 @@ describe('setup', () => {
       expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
     })
 
-    it('fails setup when oMo installation fails', async () => {
-      // #given
+    it('warns when oMo installation fails but continues setup', async () => {
+      // #given - bunx oMo fails, other exec calls succeed
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({
         exitCode: 0,
         stdout: '{"tag_name": "v1.0.300"}',
         stderr: '',
       })
-      vi.mocked(exec.exec).mockRejectedValue(new Error('bunx failed'))
+      vi.mocked(exec.exec).mockImplementation(async (cmd: string) => {
+        if (cmd === 'bunx') {
+          throw new Error('bunx failed')
+        }
+        return 0
+      })
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
@@ -259,9 +270,38 @@ describe('setup', () => {
       // #when
       const result = await runSetup()
 
-      // #then - should fail the action
-      expect(result).toBeNull()
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('oMo'))
+      // #then - should warn but continue (RFC-011 graceful degradation)
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('oMo installation failed'))
+    })
+
+    it('skips oMo install when Bun installation fails', async () => {
+      // #given - Bun install throws
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      const bunModule = await import('./bun.js')
+      vi.mocked(bunModule.installBun).mockRejectedValueOnce(new Error('download failed'))
+
+      // #when
+      const result = await runSetup()
+
+      // #then - setup continues but oMo is not attempted
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Bun installation failed'))
+      expect(exec.exec).not.toHaveBeenCalledWith('bunx', expect.anything(), expect.anything())
     })
 
     it('restores cache when available', async () => {

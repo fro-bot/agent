@@ -33,7 +33,7 @@ describe('omo', () => {
 
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
-      // #given - npx oh-my-opencode install succeeds
+      // #given - bunx oh-my-opencode install succeeds
       const execMock = vi
         .fn()
         .mockImplementation(
@@ -57,9 +57,8 @@ describe('omo', () => {
       expect(result.error).toBeNull()
       expect(execMock).toHaveBeenCalledTimes(1)
       expect(execMock).toHaveBeenCalledWith(
-        'npx',
+        'bunx',
         [
-          '-y',
           'oh-my-opencode@1.2.3',
           'install',
           '--no-tui',
@@ -94,14 +93,14 @@ describe('omo', () => {
       // #when
       const result = await installOmo('3.5.5', mockDeps)
 
-      // #then
+      // #then - falls back to input version when regex detection fails
       expect(result.installed).toBe(true)
-      expect(result.version).toBeNull()
+      expect(result.version).toBe('3.5.5')
       expect(result.error).toBeNull()
     })
 
-    it('returns failure when npx oh-my-opencode install fails', async () => {
-      // #given - npx command fails
+    it('returns failure when bunx oh-my-opencode install fails', async () => {
+      // #given - bunx command fails
       const execMock = vi.fn().mockResolvedValue(1)
       const mockDeps = createMockDeps({
         execAdapter: createMockExecAdapter({exec: execMock}),
@@ -149,7 +148,7 @@ describe('omo', () => {
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('uses pinned version in npx call', async () => {
+    it('uses pinned version in bunx call', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -159,11 +158,15 @@ describe('omo', () => {
       // #when
       await installOmo('3.5.5', mockDeps)
 
-      // #then - npx call should use version parameter
-      expect(execMock).toHaveBeenCalledWith('npx', expect.arrayContaining(['oh-my-opencode@3.5.5']), expect.any(Object))
+      // #then - bunx call should use version parameter
+      expect(execMock).toHaveBeenCalledWith(
+        'bunx',
+        expect.arrayContaining(['oh-my-opencode@3.5.5']),
+        expect.any(Object),
+      )
     })
 
-    it('calls npx with headless options using defaults', async () => {
+    it('calls bunx with headless options using defaults', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -173,11 +176,10 @@ describe('omo', () => {
       // #when
       await installOmo('3.5.5', mockDeps)
 
-      // #then - npx call includes headless options
+      // #then - bunx call includes headless options
       expect(execMock).toHaveBeenCalledWith(
-        'npx',
+        'bunx',
         [
-          '-y',
           'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
@@ -192,7 +194,7 @@ describe('omo', () => {
       )
     })
 
-    it('calls npx with custom options when provided', async () => {
+    it('calls bunx with custom options when provided', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
       const mockDeps = createMockDeps({
@@ -209,11 +211,10 @@ describe('omo', () => {
         zaiCodingPlan: 'no',
       })
 
-      // #then - npx call includes custom options
+      // #then - bunx call includes custom options
       expect(execMock).toHaveBeenCalledWith(
-        'npx',
+        'bunx',
         [
-          '-y',
           'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
@@ -257,7 +258,7 @@ describe('omo', () => {
       // #when
       const result = await installOmo('3.5.5', mockDeps)
 
-      // #then - single npx call captures both stdout and stderr
+      // #then - single bunx call captures both stdout and stderr
       expect(result.installed).toBe(false)
       const errorCalls = (mockLogger.error as ReturnType<typeof vi.fn>).mock.calls
       expect(errorCalls.length).toBeGreaterThan(0)

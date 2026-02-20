@@ -11,9 +11,10 @@ import * as tc from '@actions/tool-cache'
 import {getRunnerOS, getXdgDataHome} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from '../cache-key.js'
-import {DEFAULT_OMO_PROVIDERS, DEFAULT_OMO_VERSION} from '../constants.js'
+import {DEFAULT_BUN_VERSION, DEFAULT_OMO_PROVIDERS, DEFAULT_OMO_VERSION} from '../constants.js'
 import {createLogger} from '../logger.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
+import {installBun} from './bun.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
@@ -161,7 +162,9 @@ export async function runSetup(): Promise<SetupResult | null> {
     const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
 
     // Restore tools cache before installs
-    const toolCachePath = join(process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache', 'opencode')
+    const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
+    const toolCachePath = join(runnerToolCache, 'opencode')
+    const bunCachePath = join(runnerToolCache, 'bun')
     const omoConfigPath = join(homedir(), '.config', 'opencode')
     const runnerOS = getRunnerOS()
 
@@ -171,6 +174,7 @@ export async function runSetup(): Promise<SetupResult | null> {
       opencodeVersion: version,
       omoVersion,
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
     })
 
@@ -202,18 +206,33 @@ export async function runSetup(): Promise<SetupResult | null> {
       }
     }
 
-    // Always run oMo installer to ensure config values (e.g. provider settings) are current
-    const omoProvidersRaw = core.getInput('omo-providers').trim()
-    const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-    const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
-    if (omoResult.installed) {
-      logger.info('oMo installed', {version: omoResult.version})
-      omoInstalled = true
-    } else {
-      core.setFailed(`oMo installation failed: ${omoResult.error ?? 'unknown error'}`)
-      return null
+    // Install Bun runtime (required for bunx to run oMo installer)
+    let bunInstalled = false
+    try {
+      await installBun(logger, toolCache, execAdapter, core.addPath, DEFAULT_BUN_VERSION)
+      bunInstalled = true
+    } catch (error) {
+      logger.warning('Bun installation failed, oMo will be unavailable', {
+        error: toErrorMessage(error),
+      })
     }
-    omoError = omoResult.error
+
+    // Run oMo installer to ensure config values (e.g. provider settings) are current.
+    // Skip if Bun install failed — bunx won't be available.
+    if (bunInstalled) {
+      const omoProvidersRaw = core.getInput('omo-providers').trim()
+      const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+      const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
+      if (omoResult.installed) {
+        logger.info('oMo installed', {version: omoResult.version})
+        omoInstalled = true
+      } else {
+        logger.warning(`oMo installation failed, continuing without oMo`, {
+          error: omoResult.error ?? 'unknown error',
+        })
+      }
+      omoError = omoResult.error
+    }
 
     if (!toolsCacheResult.hit) {
       await saveToolsCache({
@@ -222,6 +241,7 @@ export async function runSetup(): Promise<SetupResult | null> {
         opencodeVersion: version,
         omoVersion,
         toolCachePath,
+        bunCachePath,
         omoConfigPath,
       })
     }

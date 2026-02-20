@@ -22,7 +22,7 @@ export interface OmoInstallDeps {
  * Install Oh My OpenCode (oMo) plugin in headless mode.
  *
  * Adds Sisyphus agent capabilities to OpenCode with configurable model providers.
- * Uses npx to download and run the installer in a single step. Platform-specific
+ * Uses bunx to download and run the installer ephemerally. Platform-specific
  * binaries are resolved automatically via npm's optionalDependencies mechanism.
  *
  * This function runs on every invocation (even on cache hits) to ensure
@@ -58,7 +58,6 @@ export async function installOmo(
   let output = ''
 
   const args = [
-    '-y',
     `oh-my-opencode@${version}`,
     'install',
     '--no-tui',
@@ -71,7 +70,7 @@ export async function installOmo(
   ]
 
   try {
-    const exitCode = await execAdapter.exec('npx', args, {
+    const exitCode = await execAdapter.exec('bunx', args, {
       listeners: {
         stdout: (data: Buffer) => {
           output += data.toString()
@@ -85,13 +84,13 @@ export async function installOmo(
     })
 
     if (exitCode !== 0) {
-      const errorMsg = `npx oh-my-opencode install returned exit code ${exitCode}`
+      const errorMsg = `bunx oh-my-opencode install returned exit code ${exitCode}`
       logger.error(errorMsg, {output: output.slice(0, 1000)})
       return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
 
     const versionMatch = /oh-my-opencode@(\d+\.\d+\.\d+)/i.exec(output)
-    const detectedVersion = versionMatch != null && versionMatch[1] != null ? versionMatch[1] : null
+    const detectedVersion = versionMatch != null && versionMatch[1] != null ? versionMatch[1] : version
 
     logger.info('oMo plugin installed', {version: detectedVersion})
     return {installed: true, version: detectedVersion, error: null}
@@ -99,13 +98,13 @@ export async function installOmo(
     const errorMsg = toErrorMessage(error)
     const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
     logger.error('Failed to run oMo installer', {error: errorMsg, output: output.slice(0, 500)})
-    return {installed: false, version: null, error: `npx oh-my-opencode install failed: ${fullError}`}
+    return {installed: false, version: null, error: `bunx oh-my-opencode install failed: ${fullError}`}
   }
 }
 
 export async function verifyOmoInstallation(logger: Logger, execAdapter: ExecAdapter): Promise<boolean> {
   try {
-    // npx runs ephemerally so the binary won't be in PATH — verify config file only
+    // bunx runs ephemerally so the binary won't be in PATH — verify config file only
     const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-opencode.json'], {
       silent: true,
       ignoreReturnCode: true,

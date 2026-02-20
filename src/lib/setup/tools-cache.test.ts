@@ -112,11 +112,13 @@ describe('buildToolsRestoreKeys', () => {
 describe('restoreToolsCache', () => {
   let tempDir: string
   let toolCachePath: string
+  let bunCachePath: string
   let omoConfigPath: string
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tools-cache-test-'))
     toolCachePath = path.join(tempDir, 'tool-cache', 'opencode')
+    bunCachePath = path.join(tempDir, 'tool-cache', 'bun')
     omoConfigPath = path.join(tempDir, 'config', 'opencode')
   })
 
@@ -135,6 +137,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -156,6 +159,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -183,12 +187,13 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
 
-    // #then adapter receives both paths
-    expect(capturedPaths).toEqual([toolCachePath, omoConfigPath])
+    // #then adapter receives all three paths
+    expect(capturedPaths).toEqual([toolCachePath, bunCachePath, omoConfigPath])
   })
 
   it('handles restore errors gracefully', async () => {
@@ -207,6 +212,7 @@ describe('restoreToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -220,11 +226,13 @@ describe('restoreToolsCache', () => {
 describe('saveToolsCache', () => {
   let tempDir: string
   let toolCachePath: string
+  let bunCachePath: string
   let omoConfigPath: string
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tools-cache-test-'))
     toolCachePath = path.join(tempDir, 'tool-cache', 'opencode')
+    bunCachePath = path.join(tempDir, 'tool-cache', 'bun')
     omoConfigPath = path.join(tempDir, 'config', 'opencode')
   })
 
@@ -243,6 +251,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -269,12 +278,13 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
 
-    // #then adapter receives both paths
-    expect(capturedPaths).toEqual([toolCachePath, omoConfigPath])
+    // #then adapter receives all three paths
+    expect(capturedPaths).toEqual([toolCachePath, bunCachePath, omoConfigPath])
   })
 
   it('uses correct save key', async () => {
@@ -295,6 +305,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -316,6 +327,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
@@ -337,6 +349,7 @@ describe('saveToolsCache', () => {
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       toolCachePath,
+      bunCachePath,
       omoConfigPath,
       cacheAdapter: adapter,
     })
