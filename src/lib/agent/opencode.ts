@@ -46,6 +46,7 @@ type SessionStatus =
 const POLL_INTERVAL_MS = 500
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
+export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
 /** Log a server event at debug level for troubleshooting. */
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -63,6 +64,10 @@ interface EventStreamResult {
   commitsCreated: string[]
   commentsPosted: number
   llmError: ErrorInfo | null
+}
+
+export interface ActivityTracker {
+  firstMeaningfulEventReceived: boolean
 }
 
 /**
@@ -111,11 +116,12 @@ export function detectArtifacts(
   }
 }
 
-async function processEventStream(
+export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
   signal: AbortSignal,
   logger: Logger,
+  activityTracker?: ActivityTracker,
 ): Promise<EventStreamResult> {
   let lastText = ''
   let tokens: TokenUsage | null = null
@@ -134,6 +140,9 @@ async function processEventStream(
     if (event.type === 'message.part.updated') {
       const part = event.properties.part
       if (part.sessionID !== sessionId) continue
+      if (activityTracker != null) {
+        activityTracker.firstMeaningfulEventReceived = true
+      }
 
       if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
         lastText = part.text
@@ -163,6 +172,9 @@ async function processEventStream(
     } else if (event.type === 'message.updated') {
       const msg = event.properties.info
       if (msg.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+        if (activityTracker != null) {
+          activityTracker.firstMeaningfulEventReceived = true
+        }
         tokens = {
           input: msg.tokens.input ?? 0,
           output: msg.tokens.output ?? 0,
@@ -224,6 +236,7 @@ export async function pollForSessionCompletion(
   signal: AbortSignal,
   logger: Logger,
   maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
+  activityTracker?: ActivityTracker,
 ): Promise<PollResult> {
   const pollStart = Date.now()
   let errorCycleCount = 0
@@ -245,15 +258,10 @@ export async function pollForSessionCompletion(
 
       if (sessionStatus == null) {
         logger.debug('Session status not found in poll response', {sessionId})
-        continue
-      }
-
-      if (sessionStatus.type === 'idle') {
+      } else if (sessionStatus.type === 'idle') {
         logger.debug('Session idle detected via polling', {sessionId})
         return {completed: true, error: null}
-      }
-
-      if (sessionStatus.type === 'retry') {
+      } else if (sessionStatus.type === 'retry') {
         errorCycleCount++
         logger.debug('Session in retry state', {
           sessionId,
@@ -267,10 +275,23 @@ export async function pollForSessionCompletion(
             error: `Session error after ${errorCycleCount} retry cycles: ${sessionStatus.message}`,
           }
         }
-        continue
+      } else {
+        errorCycleCount = 0
       }
 
-      errorCycleCount = 0
+      if (activityTracker != null && !activityTracker.firstMeaningfulEventReceived) {
+        const activityElapsed = Date.now() - pollStart
+        if (activityElapsed >= INITIAL_ACTIVITY_TIMEOUT_MS) {
+          logger.error('No agent activity detected — server may have crashed during prompt processing', {
+            elapsedMs: activityElapsed,
+            sessionId,
+          })
+          return {
+            completed: false,
+            error: `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
+          }
+        }
+      }
     } catch (pollError) {
       logger.debug('Poll request failed', {error: toErrorMessage(pollError)})
     }
@@ -317,6 +338,7 @@ async function sendPromptToSession(
 ): Promise<PromptAttemptResult> {
   const agentName = config?.agent ?? DEFAULT_AGENT
   const eventAbortController = new AbortController()
+  const activityTracker: ActivityTracker = {firstMeaningfulEventReceived: false}
 
   const events = await client.event.subscribe()
 
@@ -335,6 +357,7 @@ async function sendPromptToSession(
     sessionId,
     eventAbortController.signal,
     logger,
+    activityTracker,
   )
     .then(result => {
       eventStreamResult = result
@@ -363,9 +386,17 @@ async function sendPromptToSession(
     model?: {modelID: string; providerID: string}
     parts: (TextPartInput | FilePartInput)[]
   } = {
-    agent: agentName,
     model,
     parts,
+  }
+
+  // Only include agent in prompt body for non-default agents.
+  // oMo 3.7.4 remaps agent config keys to display names (e.g. "sisyphus" → "Sisyphus (Ultraworker)").
+  // Passing the config key causes a crash because the remapped config doesn't have that key.
+  // The server's default_agent is already set correctly by oMo, so omitting the field for the
+  // default agent lets the server use its properly-resolved default.
+  if (agentName !== DEFAULT_AGENT) {
+    promptBody.agent = agentName
   }
 
   logger.debug('Sending prompt to OpenCode', {sessionId})
@@ -400,6 +431,7 @@ async function sendPromptToSession(
       eventAbortController.signal,
       logger,
       timeoutMs,
+      activityTracker,
     )
 
     if (!pollResult.completed) {

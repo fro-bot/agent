@@ -15,8 +15,10 @@ import {
   bootstrapOpenCodeServer,
   ensureOpenCodeAvailable,
   executeOpenCode,
+  INITIAL_ACTIVITY_TIMEOUT_MS,
   logServerEvent,
   pollForSessionCompletion,
+  processEventStream,
   verifyOpenCodeAvailable,
   waitForEventProcessorShutdown,
 } from './opencode.js'
@@ -215,7 +217,7 @@ describe('executeOpenCode', () => {
       | undefined
 
     expect(promptCall?.path?.id).toBe('ses_123')
-    expect(promptCall?.body?.agent).toBe('sisyphus')
+    expect(promptCall?.body?.agent).toBeUndefined()
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
@@ -302,6 +304,30 @@ describe('executeOpenCode', () => {
       body?: {agent?: string}
     }
     expect(callArgs?.body?.agent).toBe('CustomAgent')
+  })
+
+  it('includes agent field when non-default agent is configured', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const config: ExecutionConfig = {
+      agent: 'oracle',
+      model: null,
+      timeoutMs: 1800000,
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {agent?: string}
+    }
+    expect(callArgs?.body?.agent).toBe('oracle')
   })
 
   it('returns success result on successful execution', async () => {
@@ -1360,9 +1386,10 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
+    vi.useFakeTimers()
 
     // #when
-    const result = await pollForSessionCompletion(
+    const resultPromise = pollForSessionCompletion(
       mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
       'ses_123',
       '/workspace',
@@ -1370,10 +1397,43 @@ describe('pollForSessionCompletion', () => {
       mockLogger,
       1000,
     )
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+    vi.useRealTimers()
 
     // #then
     expect(result.completed).toBe(false)
     expect(result.error).toContain('Poll timeout')
+  })
+
+  it('fails fast when no activity detected within initial timeout', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const abortController = new AbortController()
+    const activityTracker = {firstMeaningfulEventReceived: false}
+    vi.useFakeTimers()
+
+    // #when
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      INITIAL_ACTIVITY_TIMEOUT_MS * 2,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(INITIAL_ACTIVITY_TIMEOUT_MS + 1000)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('No agent activity detected')
   })
 
   it('continues polling when session status is not found', async () => {
@@ -1391,15 +1451,19 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
+    vi.useFakeTimers()
 
     // #when
-    const result = await pollForSessionCompletion(
+    const resultPromise = pollForSessionCompletion(
       mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
       'ses_123',
       '/workspace',
       abortController.signal,
       mockLogger,
     )
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+    vi.useRealTimers()
 
     // #then
     expect(result.completed).toBe(true)
@@ -1421,14 +1485,44 @@ describe('waitForEventProcessorShutdown', () => {
     const processor = new Promise<void>(() => {
       // intentionally never resolves
     })
+    vi.useFakeTimers()
 
     // #when
     const start = Date.now()
-    await waitForEventProcessorShutdown(processor, 100)
+    const waitPromise = waitForEventProcessorShutdown(processor, 100)
+    await vi.advanceTimersByTimeAsync(150)
+    await waitPromise
     const elapsed = Date.now() - start
+    vi.useRealTimers()
 
     // #then
     expect(elapsed).toBeGreaterThanOrEqual(90)
     expect(elapsed).toBeLessThan(1000)
+  })
+})
+
+describe('processEventStream', () => {
+  it('marks activity tracker when message part updates arrive', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: {sessionID: 'ses_123', type: 'text', text: 'Hello', time: {}},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
   })
 })
