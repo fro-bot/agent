@@ -28,9 +28,9 @@ inputs:
     description: AWS region for S3 bucket
     required: false
   agent:
-    description: 'Agent to use (default: Sisyphus). Must be a primary agent, not subagent.'
+    description: 'Agent to use (default: sisyphus). Must be a primary agent, not subagent.'
     required: false
-    default: Sisyphus
+    default: sisyphus
   model:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
@@ -43,9 +43,9 @@ inputs:
     required: false
     default: latest
   omo-version:
-    description: 'oMo (Oh My OpenCode) version to install if auto-setup is needed (default: 3.5.5)'
+    description: 'oMo (Oh My OpenCode) version to install if auto-setup is needed (default: 3.7.4)'
     required: false
-    default: 3.5.5
+    default: 3.7.4
   skip-cache:
     description: Skip session cache restore (default false)
     required: false

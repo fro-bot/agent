@@ -8,7 +8,7 @@ const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 
 /** Known stable version for fallback when latest fails */
-export const FALLBACK_VERSION = '1.1.1'
+export const FALLBACK_VERSION = '1.2.9'
 
 /**
  * Get platform information for binary downloads.

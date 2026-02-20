@@ -25,7 +25,7 @@ import {outputTextContent, outputToolExecution} from '../../utils/console.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
 import {createAgentError, createLLMFetchError, isAgentNotFoundError, isLlmFetchError} from '../comments/error-format.js'
-import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
 import {err, ok} from '../types.js'
@@ -36,6 +36,17 @@ export interface OpenCodeServerHandle {
   readonly server: {readonly url: string; close: () => void}
   readonly shutdown: () => void
 }
+
+// Mirror SDK schema — SessionStatus is not directly exported by @opencode-ai/sdk
+type SessionStatus =
+  | {readonly type: 'idle'}
+  | {readonly type: 'retry'; readonly attempt: number; readonly message: string; readonly next: number}
+  | {readonly type: 'busy'}
+
+const POLL_INTERVAL_MS = 500
+const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
+const ERROR_GRACE_CYCLES = 3
+export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
 /** Log a server event at debug level for troubleshooting. */
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -53,6 +64,11 @@ interface EventStreamResult {
   commitsCreated: string[]
   commentsPosted: number
   llmError: ErrorInfo | null
+}
+
+export interface ActivityTracker {
+  firstMeaningfulEventReceived: boolean
+  sessionIdle: boolean
 }
 
 /**
@@ -101,10 +117,12 @@ export function detectArtifacts(
   }
 }
 
-async function processEventStream(
+export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
+  signal: AbortSignal,
   logger: Logger,
+  activityTracker?: ActivityTracker,
 ): Promise<EventStreamResult> {
   let lastText = ''
   let tokens: TokenUsage | null = null
@@ -116,11 +134,16 @@ async function processEventStream(
   let llmError: ErrorInfo | null = null
 
   for await (const event of stream) {
+    if (signal.aborted) break
+
     logServerEvent(event, logger)
 
     if (event.type === 'message.part.updated') {
       const part = event.properties.part
       if (part.sessionID !== sessionId) continue
+      if (activityTracker != null) {
+        activityTracker.firstMeaningfulEventReceived = true
+      }
 
       if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
         lastText = part.text
@@ -150,6 +173,9 @@ async function processEventStream(
     } else if (event.type === 'message.updated') {
       const msg = event.properties.info
       if (msg.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+        if (activityTracker != null) {
+          activityTracker.firstMeaningfulEventReceived = true
+        }
         tokens = {
           input: msg.tokens.input ?? 0,
           output: msg.tokens.output ?? 0,
@@ -183,6 +209,9 @@ async function processEventStream(
     } else if (event.type === 'session.idle') {
       const idleSessionID = event.properties.sessionID
       if (idleSessionID === sessionId) {
+        if (activityTracker != null) {
+          activityTracker.sessionIdle = true
+        }
         if (lastText.length > 0) {
           outputTextContent(lastText)
           lastText = ''
@@ -197,6 +226,107 @@ async function processEventStream(
   }
 
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
+}
+
+interface PollResult {
+  readonly completed: boolean
+  readonly error: string | null
+}
+
+export async function pollForSessionCompletion(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  signal: AbortSignal,
+  logger: Logger,
+  maxPollTimeMs: number = DEFAULT_TIMEOUT_MS,
+  activityTracker?: ActivityTracker,
+): Promise<PollResult> {
+  const pollStart = Date.now()
+  let lastRetryAttempt = 0
+  let retryAttemptCount = 0
+
+  while (!signal.aborted) {
+    await sleep(POLL_INTERVAL_MS)
+    if (signal.aborted) return {completed: false, error: 'Aborted'}
+
+    if (activityTracker?.sessionIdle === true) {
+      logger.debug('Session idle detected via event stream', {sessionId})
+      return {completed: true, error: null}
+    }
+
+    const elapsed = Date.now() - pollStart
+    if (maxPollTimeMs > 0 && elapsed >= maxPollTimeMs) {
+      logger.warning('Poll timeout reached', {elapsedMs: elapsed, maxPollTimeMs})
+      return {completed: false, error: `Poll timeout after ${elapsed}ms`}
+    }
+
+    try {
+      const statusResponse = await client.session.status({query: {directory}})
+      const statuses = statusResponse.data ?? {}
+      const sessionStatus = statuses[sessionId] as SessionStatus | undefined
+
+      if (sessionStatus == null) {
+        logger.debug('Session status not found in poll response', {sessionId})
+      } else if (sessionStatus.type === 'idle') {
+        logger.debug('Session idle detected via polling', {sessionId})
+        return {completed: true, error: null}
+      } else if (sessionStatus.type === 'retry') {
+        // Count actual server retry attempts, not poll cycles seeing the same attempt.
+        // Rate limit backoff can take 30-60s per attempt — polling at 500ms would
+        // exhaust grace cycles in <2s if we counted every poll tick.
+        if (sessionStatus.attempt > lastRetryAttempt) {
+          lastRetryAttempt = sessionStatus.attempt
+          retryAttemptCount++
+        }
+        logger.debug('Session in retry state', {
+          sessionId,
+          attempt: sessionStatus.attempt,
+          message: sessionStatus.message,
+          retryAttemptCount,
+        })
+        if (retryAttemptCount >= ERROR_GRACE_CYCLES) {
+          return {
+            completed: false,
+            error: `Session error after ${retryAttemptCount} retry attempts: ${sessionStatus.message}`,
+          }
+        }
+      } else {
+        lastRetryAttempt = 0
+        retryAttemptCount = 0
+      }
+
+      if (activityTracker != null && !activityTracker.firstMeaningfulEventReceived) {
+        const activityElapsed = Date.now() - pollStart
+        if (activityElapsed >= INITIAL_ACTIVITY_TIMEOUT_MS) {
+          logger.error('No agent activity detected — server may have crashed during prompt processing', {
+            elapsedMs: activityElapsed,
+            sessionId,
+          })
+          return {
+            completed: false,
+            error: `No agent activity detected after ${activityElapsed}ms — server may have crashed during prompt processing`,
+          }
+        }
+      }
+    } catch (pollError) {
+      logger.debug('Poll request failed', {error: toErrorMessage(pollError)})
+    }
+  }
+
+  return {completed: false, error: 'Aborted'}
+}
+
+export async function waitForEventProcessorShutdown(
+  eventProcessor: Promise<void>,
+  timeoutMs: number = EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS,
+): Promise<void> {
+  await Promise.race([
+    eventProcessor,
+    new Promise<void>(resolve => {
+      setTimeout(resolve, timeoutMs)
+    }),
+  ])
 }
 
 const MAX_LLM_RETRIES = 3
@@ -223,11 +353,11 @@ async function sendPromptToSession(
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
-  const agentName = (config?.agent ?? 'Sisyphus').toLowerCase()
+  const agentName = config?.agent ?? DEFAULT_AGENT
+  const eventAbortController = new AbortController()
+  const activityTracker: ActivityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
 
   const events = await client.event.subscribe()
-  const eventController =
-    'controller' in events ? ((events as {controller?: AbortController}).controller ?? null) : null
 
   let eventStreamResult: EventStreamResult = {
     tokens: null,
@@ -239,7 +369,13 @@ async function sendPromptToSession(
     llmError: null,
   }
 
-  const eventProcessingPromise = processEventStream(events.stream as AsyncIterable<Event>, sessionId, logger)
+  const eventProcessor = processEventStream(
+    events.stream as AsyncIterable<Event>,
+    sessionId,
+    eventAbortController.signal,
+    logger,
+    activityTracker,
+  )
     .then(result => {
       eventStreamResult = result
     })
@@ -267,50 +403,77 @@ async function sendPromptToSession(
     model?: {modelID: string; providerID: string}
     parts: (TextPartInput | FilePartInput)[]
   } = {
-    agent: agentName,
     model,
     parts,
   }
 
+  // Only include agent in prompt body for non-default agents.
+  // oMo 3.7.4 remaps agent config keys to display names (e.g. "sisyphus" → "Sisyphus (Ultraworker)").
+  // Passing the config key causes a crash because the remapped config doesn't have that key.
+  // The server's default_agent is already set correctly by oMo, so omitting the field for the
+  // default agent lets the server use its properly-resolved default.
+  if (agentName !== DEFAULT_AGENT) {
+    promptBody.agent = agentName
+  }
+
   logger.debug('Sending prompt to OpenCode', {sessionId})
-  const promptResponse = await client.session.promptAsync({
-    path: {id: sessionId},
-    body: promptBody,
-    query: {directory},
-  })
+  try {
+    const promptResponse = await client.session.promptAsync({
+      path: {id: sessionId},
+      body: promptBody,
+      query: {directory},
+    })
 
-  if (promptResponse.error != null && eventController != null) {
-    eventController.abort()
-  }
+    if (promptResponse.error != null) {
+      logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
 
-  await eventProcessingPromise
+      const promptErrorLlm = isLlmFetchError(promptResponse.error)
+        ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
+        : eventStreamResult.llmError
 
-  if (eventController != null) {
-    eventController.abort()
-  }
+      return {
+        success: false,
+        error: String(promptResponse.error),
+        llmError: promptErrorLlm,
+        shouldRetry: promptErrorLlm != null,
+        eventStreamResult,
+      }
+    }
 
-  if (promptResponse.error != null) {
-    logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
+    const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    const pollResult = await pollForSessionCompletion(
+      client,
+      sessionId,
+      directory,
+      eventAbortController.signal,
+      logger,
+      timeoutMs,
+      activityTracker,
+    )
 
-    const promptErrorLlm = isLlmFetchError(promptResponse.error)
-      ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
-      : eventStreamResult.llmError
+    if (!pollResult.completed) {
+      const pollError = pollResult.error ?? 'Session did not reach idle state'
+      logger.error('Session completion polling failed', {error: pollError, sessionId})
+
+      return {
+        success: false,
+        error: pollError,
+        llmError: eventStreamResult.llmError,
+        shouldRetry: false,
+        eventStreamResult,
+      }
+    }
 
     return {
-      success: false,
-      error: String(promptResponse.error),
-      llmError: promptErrorLlm,
-      shouldRetry: promptErrorLlm != null,
+      success: true,
+      error: null,
+      llmError: null,
+      shouldRetry: false,
       eventStreamResult,
     }
-  }
-
-  return {
-    success: true,
-    error: null,
-    llmError: null,
-    shouldRetry: false,
-    eventStreamResult,
+  } finally {
+    eventAbortController.abort()
+    await waitForEventProcessorShutdown(eventProcessor)
   }
 }
 
@@ -363,7 +526,7 @@ export async function executeOpenCode(
   }
 
   logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? 'Sisyphus',
+    agent: config?.agent ?? DEFAULT_AGENT,
     hasModelOverride: config?.model != null,
     timeoutMs,
   })

@@ -56,7 +56,7 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     runId: 12345,
     runUrl: 'https://github.com/owner/repo/actions/runs/12345',
     metrics: createMockMetrics(),
-    agent: 'Sisyphus',
+    agent: 'sisyphus',
     ...overrides,
   }
 }
