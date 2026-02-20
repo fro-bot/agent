@@ -10,7 +10,7 @@ export const DEFAULT_SESSION_RETENTION = 50
 export const DEFAULT_MAX_AGE_DAYS = 30
 
 // SDK execution defaults - per RFC-013
-export const DEFAULT_AGENT = 'Sisyphus'
+export const DEFAULT_AGENT = 'sisyphus'
 export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 
 // Default model for OpenCode Zen - ensures inference starts

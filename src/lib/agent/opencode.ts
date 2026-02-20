@@ -25,7 +25,7 @@ import {outputTextContent, outputToolExecution} from '../../utils/console.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
 import {createAgentError, createLLMFetchError, isAgentNotFoundError, isLlmFetchError} from '../comments/error-format.js'
-import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
+import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
 import {err, ok} from '../types.js'
@@ -315,7 +315,7 @@ async function sendPromptToSession(
   config: ExecutionConfig | undefined,
   logger: Logger,
 ): Promise<PromptAttemptResult> {
-  const agentName = config?.agent ?? 'Sisyphus'
+  const agentName = config?.agent ?? DEFAULT_AGENT
   const eventAbortController = new AbortController()
 
   const events = await client.event.subscribe()
@@ -477,7 +477,7 @@ export async function executeOpenCode(
   }
 
   logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? 'Sisyphus',
+    agent: config?.agent ?? DEFAULT_AGENT,
     hasModelOverride: config?.model != null,
     timeoutMs,
   })

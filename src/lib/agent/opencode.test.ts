@@ -215,7 +215,7 @@ describe('executeOpenCode', () => {
       | undefined
 
     expect(promptCall?.path?.id).toBe('ses_123')
-    expect(promptCall?.body?.agent).toBe('Sisyphus')
+    expect(promptCall?.body?.agent).toBe('sisyphus')
     expect(promptCall?.body?.parts).toEqual([{type: 'text', text: 'Built prompt with sessionId'}])
     expect(promptCall?.query?.directory).toEqual(expect.any(String))
     expect(result.sessionId).toBe('ses_123')
@@ -397,7 +397,7 @@ describe('executeOpenCode', () => {
     expect(mockLogger.info).toHaveBeenCalledWith(
       'Executing OpenCode agent (SDK mode)',
       expect.objectContaining({
-        agent: 'Sisyphus',
+        agent: 'sisyphus',
       }),
     )
   })
