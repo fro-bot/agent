@@ -43,9 +43,8 @@ inputs:
     required: false
     default: latest
   omo-version:
-    description: 'oMo (Oh My OpenCode) version to install if auto-setup is needed (default: latest)'
+    description: oMo (Oh My OpenCode) version to install if auto-setup is needed
     required: false
-    default: latest
   skip-cache:
     description: Skip session cache restore (default false)
     required: false
