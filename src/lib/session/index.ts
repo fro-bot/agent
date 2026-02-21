@@ -1,5 +1,5 @@
-// Backend types (version-gated dual backend)
-export type {JsonBackend, SdkBackend, SessionBackend, SessionClient} from './backend.js'
+// Backend types (SDK-only)
+export type {SessionClient} from './backend.js'
 
 // Pruning
 export {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
@@ -11,13 +11,11 @@ export {getSessionInfo, listSessions, searchSessions} from './search.js'
 export {
   deleteSession,
   findLatestSession,
-  findProjectByDirectory,
-  getMessageParts,
-  getOpenCodeStoragePath,
+  findProjectByWorkspace,
   getSession,
   getSessionMessages,
   getSessionTodos,
-  listProjects,
+  listProjectsViaSDK,
   listSessionsForProject,
 } from './storage.js'
 
@@ -53,7 +51,7 @@ export type {
 } from './types.js'
 
 // Version detection
-export {compareVersions, getOpenCodeDbPath, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
+export {compareVersions, getOpenCodeDbPath, OPENCODE_SQLITE_VERSION} from './version.js'
 
 // Writeback
 export {writeSessionSummary} from './writeback.js'
