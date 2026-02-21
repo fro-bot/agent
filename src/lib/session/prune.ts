@@ -1,8 +1,8 @@
-import type {SessionBackend} from './backend.js'
+import type {SessionClient} from './backend.js'
 import type {Logger, PruneResult, PruningConfig} from './types.js'
 
 import {toErrorMessage} from '../../utils/errors.js'
-import {deleteSession, findProjectByDirectory, listSessionsForProject} from './storage.js'
+import {deleteSession, findProjectByWorkspace, listSessionsForProject} from './storage.js'
 
 /**
  * Default pruning configuration.
@@ -28,16 +28,16 @@ export const DEFAULT_PRUNING_CONFIG: PruningConfig = {
  * pruning, cache restore/save becomes the workflow bottleneck.
  */
 export async function pruneSessions(
-  backend: SessionBackend,
+  client: SessionClient,
+  workspacePath: string,
   config: PruningConfig,
   logger: Logger,
 ): Promise<PruneResult> {
   const {maxSessions, maxAgeDays} = config
-  const {workspacePath} = backend
 
   logger.info('Starting session pruning', {workspacePath, maxSessions, maxAgeDays})
 
-  const project = await findProjectByDirectory(workspacePath, logger)
+  const project = await findProjectByWorkspace(client, workspacePath, logger)
   if (project == null) {
     logger.debug('No project found for pruning', {workspacePath})
     return {
@@ -48,7 +48,7 @@ export async function pruneSessions(
     }
   }
 
-  const allSessions = await listSessionsForProject(backend, project.id, logger)
+  const allSessions = await listSessionsForProject(client, workspacePath, logger)
 
   const mainSessions = allSessions.filter(s => s.parentID == null)
 
@@ -109,7 +109,7 @@ export async function pruneSessions(
 
   for (const sessionId of allSessionsToPrune) {
     try {
-      const bytes = await deleteSession(backend, project.id, sessionId, logger)
+      const bytes = await deleteSession(client, sessionId, logger)
       freedBytes += bytes
       prunedIds.push(sessionId)
       logger.debug('Pruned session', {sessionId, bytes})
