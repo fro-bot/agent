@@ -1329,42 +1329,15 @@ describe('pollForSessionCompletion', () => {
     expect(callCount).toBeGreaterThanOrEqual(3)
   })
 
-  it('returns error after retry grace attempts exhausted', async () => {
-    // #given — each poll returns an incrementing attempt number (distinct server retries)
-    let attemptNum = 0
-    const mockClient = {
-      session: {
-        status: vi.fn().mockImplementation(async () => {
-          attemptNum++
-          return {data: {ses_123: {type: 'retry', attempt: attemptNum, message: 'Server crashed', next: 0}}}
-        }),
-      },
-    }
-    const abortController = new AbortController()
-
-    // #when
-    const result = await pollForSessionCompletion(
-      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-      'ses_123',
-      '/workspace',
-      abortController.signal,
-      mockLogger,
-    )
-
-    // #then
-    expect(result.completed).toBe(false)
-    expect(result.error).toContain('retry attempts')
-  })
-
-  it('does not fail when same retry attempt is seen across multiple poll cycles', async () => {
-    // #given — same attempt number repeated (rate limit backoff in progress), then idle
+  it('treats retry status as busy and keeps polling until idle', async () => {
+    // #given — retry is not an error; the server is handling backoff internally
     let callCount = 0
     const mockClient = {
       session: {
         status: vi.fn().mockImplementation(async () => {
           callCount++
           if (callCount <= 5) {
-            return {data: {ses_123: {type: 'retry', attempt: 1, message: 'Rate limited', next: 0}}}
+            return {data: {ses_123: {type: 'retry', attempt: callCount, message: 'Rate limited', next: 0}}}
           }
           return {data: {ses_123: {type: 'idle'}}}
         }),
@@ -1384,6 +1357,37 @@ describe('pollForSessionCompletion', () => {
     // #then
     expect(result.completed).toBe(true)
     expect(callCount).toBeGreaterThan(5)
+  })
+
+  it('returns error after session.error grace cycles exhausted', async () => {
+    // #given — session.error set via activityTracker (from event stream)
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const abortController = new AbortController()
+    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false, sessionError: 'LLM fetch failed'}
+    vi.useFakeTimers()
+
+    // #when
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    // #then
+    expect(result.completed).toBe(false)
+    expect(result.error).toContain('Session error')
+    expect(result.error).toContain('LLM fetch failed')
   })
 
   it('returns aborted when signal is already aborted', async () => {
@@ -1446,7 +1450,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
     vi.useFakeTimers()
 
     // #when
@@ -1510,7 +1514,7 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false}
+    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false, sessionError: null}
     vi.useFakeTimers()
 
     // #when — start polling, then simulate event stream setting sessionIdle
@@ -1570,7 +1574,7 @@ describe('waitForEventProcessorShutdown', () => {
 describe('processEventStream', () => {
   it('marks activity tracker when message part updates arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -1594,7 +1598,7 @@ describe('processEventStream', () => {
 
   it('sets sessionIdle on activity tracker when session.idle received', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -1612,7 +1616,7 @@ describe('processEventStream', () => {
 
   it('sets sessionIdle only for matching session', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -1630,5 +1634,93 @@ describe('processEventStream', () => {
 
     // #then
     expect(activityTracker.sessionIdle).toBe(true)
+  })
+
+  it('sets sessionError on activity tracker when session.error received', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Rate limit exceeded'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionError).toBe('Rate limit exceeded')
+  })
+
+  it('continues processing events after session.error without breaking', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.error',
+        properties: {sessionID: 'ses_123', error: 'Transient failure'},
+      } as unknown as Event,
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: {sessionID: 'ses_123', type: 'text', text: 'Recovery output', time: {end: 1}},
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — both error flag and meaningful work should be set
+    expect(activityTracker.sessionError).toBe('Transient failure')
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+    expect(result.llmError).not.toBeNull()
+  })
+
+  it('continues processing events after session.idle without breaking', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ses_123',
+            role: 'assistant',
+            tokens: {input: 100, output: 50, reasoning: 0},
+            modelID: 'claude-3',
+            cost: 0.01,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then — idle flag set AND late-arriving token counts captured
+    expect(activityTracker.sessionIdle).toBe(true)
+    expect(result.tokens).not.toBeNull()
+    expect(result.tokens?.input).toBe(100)
   })
 })

@@ -69,6 +69,7 @@ interface EventStreamResult {
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
   sessionIdle: boolean
+  sessionError: string | null
 }
 
 /**
@@ -204,7 +205,10 @@ export async function processEventStream(
         } else {
           llmError = createAgentError(errorStr)
         }
-        break
+
+        if (activityTracker != null) {
+          activityTracker.sessionError = errorStr
+        }
       }
     } else if (event.type === 'session.idle') {
       const idleSessionID = event.properties.sessionID
@@ -216,7 +220,6 @@ export async function processEventStream(
           outputTextContent(lastText)
           lastText = ''
         }
-        break
       }
     }
   }
@@ -243,12 +246,28 @@ export async function pollForSessionCompletion(
   activityTracker?: ActivityTracker,
 ): Promise<PollResult> {
   const pollStart = Date.now()
-  let lastRetryAttempt = 0
-  let retryAttemptCount = 0
+  let errorGraceCycles = 0
 
   while (!signal.aborted) {
     await sleep(POLL_INTERVAL_MS)
     if (signal.aborted) return {completed: false, error: 'Aborted'}
+
+    // Error check first — errors must not be masked by other gates (matches oMo pattern).
+    // session.error means the server gave up; retry status just means it's still trying.
+    if (activityTracker?.sessionError == null) {
+      errorGraceCycles = 0
+    } else {
+      errorGraceCycles++
+      if (errorGraceCycles >= ERROR_GRACE_CYCLES) {
+        logger.error('Session error persisted through grace period', {
+          sessionId,
+          error: activityTracker.sessionError,
+          graceCycles: errorGraceCycles,
+        })
+        return {completed: false, error: `Session error: ${activityTracker.sessionError}`}
+      }
+      continue
+    }
 
     if (activityTracker?.sessionIdle === true) {
       logger.debug('Session idle detected via event stream', {sessionId})
@@ -271,29 +290,8 @@ export async function pollForSessionCompletion(
       } else if (sessionStatus.type === 'idle') {
         logger.debug('Session idle detected via polling', {sessionId})
         return {completed: true, error: null}
-      } else if (sessionStatus.type === 'retry') {
-        // Count actual server retry attempts, not poll cycles seeing the same attempt.
-        // Rate limit backoff can take 30-60s per attempt — polling at 500ms would
-        // exhaust grace cycles in <2s if we counted every poll tick.
-        if (sessionStatus.attempt > lastRetryAttempt) {
-          lastRetryAttempt = sessionStatus.attempt
-          retryAttemptCount++
-        }
-        logger.debug('Session in retry state', {
-          sessionId,
-          attempt: sessionStatus.attempt,
-          message: sessionStatus.message,
-          retryAttemptCount,
-        })
-        if (retryAttemptCount >= ERROR_GRACE_CYCLES) {
-          return {
-            completed: false,
-            error: `Session error after ${retryAttemptCount} retry attempts: ${sessionStatus.message}`,
-          }
-        }
       } else {
-        lastRetryAttempt = 0
-        retryAttemptCount = 0
+        logger.debug('Session status', {sessionId, type: sessionStatus.type})
       }
 
       if (activityTracker != null && !activityTracker.firstMeaningfulEventReceived) {
@@ -355,7 +353,11 @@ async function sendPromptToSession(
 ): Promise<PromptAttemptResult> {
   const agentName = config?.agent ?? DEFAULT_AGENT
   const eventAbortController = new AbortController()
-  const activityTracker: ActivityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false}
+  const activityTracker: ActivityTracker = {
+    firstMeaningfulEventReceived: false,
+    sessionIdle: false,
+    sessionError: null,
+  }
 
   const events = await client.event.subscribe()
 
@@ -384,6 +386,11 @@ async function sendPromptToSession(
         logger.debug('Event stream error', {error: error.message})
       }
     })
+
+  const collectEventResults = async () => {
+    eventAbortController.abort()
+    await waitForEventProcessorShutdown(eventProcessor)
+  }
 
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart]
@@ -426,6 +433,7 @@ async function sendPromptToSession(
 
     if (promptResponse.error != null) {
       logger.error('OpenCode prompt failed', {error: String(promptResponse.error)})
+      await collectEventResults()
 
       const promptErrorLlm = isLlmFetchError(promptResponse.error)
         ? createLLMFetchError(String(promptResponse.error), eventStreamResult.model ?? undefined)
@@ -451,6 +459,10 @@ async function sendPromptToSession(
       activityTracker,
     )
 
+    // Abort event stream and wait for processor to finish so eventStreamResult
+    // is fully populated before we read llmError from it.
+    await collectEventResults()
+
     if (!pollResult.completed) {
       const pollError = pollResult.error ?? 'Session did not reach idle state'
       logger.error('Session completion polling failed', {error: pollError, sessionId})
@@ -459,7 +471,7 @@ async function sendPromptToSession(
         success: false,
         error: pollError,
         llmError: eventStreamResult.llmError,
-        shouldRetry: false,
+        shouldRetry: eventStreamResult.llmError != null,
         eventStreamResult,
       }
     }
@@ -472,6 +484,7 @@ async function sendPromptToSession(
       eventStreamResult,
     }
   } finally {
+    // Safety net: ensure cleanup even if above throws
     eventAbortController.abort()
     await waitForEventProcessorShutdown(eventProcessor)
   }
