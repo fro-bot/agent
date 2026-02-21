@@ -612,7 +612,8 @@ export async function deleteSession(client: SessionClient, sessionID: string, lo
  * 2. Session IDs contain hex timestamps making them monotonic
  * 3. We record execution start time before calling OpenCode
  *
- * @param backend - Session backend to query
+ * @param client - SDK session client
+ * @param workspacePath - Normalized workspace path
  * @param afterTimestamp - Only consider sessions created after this timestamp (ms)
  * @param logger - Logger instance
  * @returns The most recent session, or null if none found

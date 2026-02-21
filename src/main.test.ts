@@ -99,3 +99,31 @@ it('fails gracefully with missing required inputs', async () => {
 
   expect(code).not.toBe(0)
 })
+
+it('fails when server bootstrap fails', async () => {
+  // For workflow_dispatch, routing proceeds (has prompt) and acknowledge is no-op (no commentId/issueNumber)
+  // The mock binary cannot start an SDK server → bootstrap fails → exit code 1
+  const eventPayload = {inputs: {}}
+  const eventFile = path.join(testDataDir, 'event.json')
+  writeFileSync(eventFile, JSON.stringify(eventPayload), 'utf8')
+
+  const {stdout, code} = await runMain({
+    'INPUT_GITHUB-TOKEN': 'ghp_test123',
+    'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+    INPUT_PROMPT: 'test task',
+    GITHUB_OUTPUT: '/dev/null',
+    GITHUB_REPOSITORY: 'test/repo',
+    GITHUB_REF_NAME: 'main',
+    GITHUB_RUN_ID: '12345',
+    RUNNER_OS: 'Linux',
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_EVENT_PATH: eventFile,
+    GITHUB_ACTOR: 'testuser',
+    GITHUB_WORKSPACE: testDataDir,
+    SKIP_CACHE: 'true',
+    XDG_DATA_HOME: testDataDir,
+  })
+
+  expect(code).not.toBe(0)
+  expect(stdout).toContain('bootstrap')
+})
