@@ -24,7 +24,7 @@ import {sleep} from '../../utils/async.js'
 import {outputTextContent, outputToolExecution} from '../../utils/console.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../utils/env.js'
 import {toErrorMessage} from '../../utils/errors.js'
-import {createAgentError, createLLMFetchError, isAgentNotFoundError, isLlmFetchError} from '../comments/error-format.js'
+import {createAgentError, createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../constants.js'
 import {extractCommitShas, extractGithubUrls} from '../github/urls.js'
 import {runSetup} from '../setup/setup.js'
@@ -66,9 +66,15 @@ interface EventStreamResult {
   llmError: ErrorInfo | null
 }
 
+/**
+ * Shared state between the event stream processor and the poll loop.
+ * The event processor writes flags; the poll loop reads them to decide when to exit.
+ * Both run concurrently — fields must be safe for cross-async-context mutation.
+ */
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
   sessionIdle: boolean
+  /** Last session.error message. Once set, triggers error grace cycles in the poll loop. */
   sessionError: string | null
 }
 
@@ -198,13 +204,9 @@ export async function processEventStream(
 
         const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
 
-        if (isLlmFetchError(sessionError)) {
-          llmError = createLLMFetchError(errorStr, model ?? undefined)
-        } else if (isAgentNotFoundError(errorStr)) {
-          llmError = createAgentError(errorStr)
-        } else {
-          llmError = createAgentError(errorStr)
-        }
+        llmError = isLlmFetchError(sessionError)
+          ? createLLMFetchError(errorStr, model ?? undefined)
+          : createAgentError(errorStr)
 
         if (activityTracker != null) {
           activityTracker.sessionError = errorStr
