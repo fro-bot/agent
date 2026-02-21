@@ -1,49 +1,14 @@
-import type {JsonBackend, SdkBackend, SessionBackend} from './backend.js'
+import type {SessionClient} from './backend.js'
 import {describe, expect, it} from 'vitest'
 
-describe('SessionBackend', () => {
-  describe('json backend', () => {
-    it('has type discriminator "json"', () => {
-      // #given
-      const backend: JsonBackend = {type: 'json', workspacePath: '/workspace'}
+describe('SessionClient', () => {
+  it('is a valid type alias for SDK client', () => {
+    // #given
+    // SessionClient is a type alias for the SDK client returned by createOpencode()
 
-      // #then
-      expect(backend.type).toBe('json')
-      expect(backend.workspacePath).toBe('/workspace')
-    })
-  })
-
-  describe('sdk backend', () => {
-    it('has type discriminator "sdk" with client', () => {
-      // #given
-      const mockClient = {} as SdkBackend['client']
-      const backend: SdkBackend = {type: 'sdk', workspacePath: '/workspace', client: mockClient}
-
-      // #then
-      expect(backend.type).toBe('sdk')
-      expect(backend.workspacePath).toBe('/workspace')
-      expect(backend.client).toBe(mockClient)
-    })
-  })
-
-  describe('discriminated union', () => {
-    it('narrows to json backend via type check', () => {
-      // #given
-      const backend: SessionBackend = {type: 'json', workspacePath: '/workspace'}
-
-      // #then
-      expect(backend.type).toBe('json')
-      expect(backend.workspacePath).toBe('/workspace')
-    })
-
-    it('narrows to sdk backend via type check', () => {
-      // #given
-      const mockClient = {} as SdkBackend['client']
-      const backend: SessionBackend = {type: 'sdk', workspacePath: '/workspace', client: mockClient}
-
-      // #then
-      expect(backend.type).toBe('sdk')
-      expect(backend.client).toBe(mockClient)
-    })
+    // #then
+    // Type assertion verifies SessionClient can be used as a type
+    const client: SessionClient = {} as SessionClient
+    expect(client).toBeDefined()
   })
 })
