@@ -105,7 +105,15 @@ jobs:
         run: pnpm test
 
   test-action:
-    if: ${{ github.event_name != 'push' }}
+    if: >-
+      github.event_name != 'push' && (
+        github.event.pull_request == null ||
+        (
+          !github.event.pull_request.head.repo.fork &&
+          !endsWith(github.event.pull_request.user.login || '', '[bot]') &&
+          (github.event.pull_request.user.login || '') != 'fro-bot'
+        )
+      )
     name: Test GitHub Action
     needs: build
     runs-on: ubuntu-latest
