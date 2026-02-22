@@ -223,7 +223,7 @@ function mapSdkMessageWithParts(sdkMessage: unknown): Message {
   return {
     ...message,
     parts,
-  } as unknown as Message
+  } as unknown as Message // TODO: Remove cast when SDK types include `parts` on Message
 }
 
 function mapSdkPartBase(sdkPart: Record<string, unknown>): {id: string; sessionID: string; messageID: string} {
@@ -425,6 +425,7 @@ async function getSessionTodosViaSDK(
   sessionID: string,
   logger: Logger,
 ): Promise<readonly TodoItem[]> {
+  // TODO: Remove cast when SDK types expose session.todos()
   const sessionClient = client.session as unknown as {
     todos: (args: {path: {id: string}}) => Promise<{data?: unknown; error?: unknown}>
   }
@@ -483,6 +484,7 @@ async function findLatestSessionViaSDK(
 }
 
 async function deleteSessionViaSdk(client: SessionClient, sessionID: string, logger: Logger): Promise<number> {
+  // TODO: Remove cast when SDK types expose session.delete()
   const sessionClient = client.session as unknown as {
     delete: (args: {path: {id: string}}) => Promise<{data?: unknown; error?: unknown}>
   }
@@ -517,6 +519,7 @@ export async function listProjectsViaSDK(client: SessionClient, logger: Logger):
       continue
     }
 
+    // TODO: Remove cast when SDK Project type aligns with ProjectInfo
     projects.push({id, worktree, path: projectPath} as unknown as ProjectInfo)
   }
 

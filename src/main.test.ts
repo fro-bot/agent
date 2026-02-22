@@ -74,6 +74,11 @@ async function runMain(env: Record<string, string>): Promise<{stdout: string; st
 }
 
 it('runs successfully with valid inputs', async () => {
+  // Use 'push' event so routing skips — avoids unconditional bootstrap in test env
+  const eventPayload = {ref: 'refs/heads/main'}
+  const eventFile = path.join(testDataDir, 'push-event.json')
+  writeFileSync(eventFile, JSON.stringify(eventPayload), 'utf8')
+
   const {stdout, code} = await runMain({
     'INPUT_GITHUB-TOKEN': 'ghp_test123',
     'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
@@ -83,6 +88,8 @@ it('runs successfully with valid inputs', async () => {
     GITHUB_REF_NAME: 'main',
     GITHUB_RUN_ID: '12345',
     RUNNER_OS: 'Linux',
+    GITHUB_EVENT_NAME: 'push',
+    GITHUB_EVENT_PATH: eventFile,
     SKIP_CACHE: 'true',
     SKIP_AGENT_EXECUTION: 'true',
   })
