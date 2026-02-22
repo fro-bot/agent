@@ -46,12 +46,16 @@ jobs:
     if: >-
       (
         github.event.pull_request == null ||
-        !github.event.pull_request.head.repo.fork
+        (
+          !github.event.pull_request.head.repo.fork &&
+          !endsWith(github.event.pull_request.user.login || '', '[bot]')
+        )
       ) &&
       (
         (
           github.event_name == 'issues' &&
-          !endsWith(github.event.issue.user.login || '', '[bot]')
+          !endsWith(github.event.issue.user.login || '', '[bot]') &&
+          (github.event.issue.user.login || '') != 'fro-bot'
         ) ||
         github.event_name == 'schedule' ||
         github.event_name == 'workflow_dispatch' ||
