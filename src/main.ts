@@ -24,7 +24,6 @@ import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CommentTarget, Octokit} from './lib/github/types.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
-import type {SessionBackend} from './lib/session/backend.js'
 import type {CacheResult, RunSummary} from './lib/types.js'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -55,7 +54,6 @@ import {setActionOutputs} from './lib/outputs.js'
 import {
   DEFAULT_PRUNING_CONFIG,
   findLatestSession,
-  isSqliteBackend,
   listSessions,
   pruneSessions,
   searchSessions,
@@ -73,6 +71,7 @@ import {
   getOpenCodeStoragePath,
   getRunnerOS,
 } from './utils/env.js'
+import {normalizeWorkspacePath} from './utils/paths.js'
 
 /**
  * Main action entry point.
@@ -90,7 +89,6 @@ async function run(): Promise<number> {
   let attachmentResult: AttachmentResult | null = null
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
-  let backend: SessionBackend | null = null
 
   // Create metrics collector for observability (RFC-007)
   const metrics = createMetricsCollector()
@@ -233,34 +231,35 @@ async function run(): Promise<number> {
       cacheLogger.debug('Project ID ready', {projectId: projectIdResult.projectId, source: projectIdResult.source})
     }
 
-    // 6c. Bootstrap SDK server for SQLite backend (needed before session introspection)
-    if (await isSqliteBackend(detectedOpencodeVersion)) {
-      const serverLogger = createLogger({phase: 'server-bootstrap'})
-      const abortController = new AbortController()
-      const bootstrapResult = await bootstrapOpenCodeServer(abortController.signal, serverLogger)
+    // 6c. Bootstrap SDK server (required — session persistence is core, no fallback)
+    const serverLogger = createLogger({phase: 'server-bootstrap'})
+    const abortController = new AbortController()
+    const bootstrapResult = await bootstrapOpenCodeServer(abortController.signal, serverLogger)
 
-      if (bootstrapResult.success) {
-        serverHandle = bootstrapResult.data
-        serverLogger.info('SDK server bootstrapped for SQLite backend')
-      } else {
-        serverLogger.warning('SDK server bootstrap failed, falling back to JSON backend', {
-          error: bootstrapResult.error.message,
-        })
-      }
+    if (!bootstrapResult.success) {
+      core.setFailed(`OpenCode server bootstrap failed: ${bootstrapResult.error.message}`)
+      return 1
     }
+
+    serverHandle = bootstrapResult.data
+    serverLogger.info('SDK server bootstrapped successfully')
 
     // 6d. Session introspection (RFC-004) - gather prior session context
     const sessionLogger = createLogger({phase: 'session'})
+    const normalizedWorkspace = normalizeWorkspacePath(workspacePath)
 
-    backend =
-      serverHandle == null ? {type: 'json', workspacePath} : {type: 'sdk', workspacePath, client: serverHandle.client}
-
-    const recentSessions = await listSessions(backend, {limit: 10}, sessionLogger)
+    const recentSessions = await listSessions(serverHandle.client, normalizedWorkspace, {limit: 10}, sessionLogger)
     sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
     // Search for prior work related to current issue (if applicable)
     const searchQuery = agentContext.issueTitle ?? agentContext.repo
-    const priorWorkContext = await searchSessions(searchQuery, backend, {limit: 5}, sessionLogger)
+    const priorWorkContext = await searchSessions(
+      searchQuery,
+      serverHandle.client,
+      normalizedWorkspace,
+      {limit: 5},
+      sessionLogger,
+    )
     sessionLogger.debug('Searched prior sessions', {
       query: searchQuery,
       resultCount: priorWorkContext.length,
@@ -352,7 +351,12 @@ async function run(): Promise<number> {
       // Fall back to session discovery for backward compatibility
       let sessionId: string | null = execResult.sessionId
       if (sessionId == null) {
-        const latestSession = await findLatestSession(backend, executionStartTime, sessionLogger)
+        const latestSession = await findLatestSession(
+          serverHandle.client,
+          normalizedWorkspace,
+          executionStartTime,
+          sessionLogger,
+        )
         if (latestSession != null) {
           sessionId = latestSession.session.id
           sessionLogger.debug('Identified session from execution', {sessionId})
@@ -398,7 +402,7 @@ async function run(): Promise<number> {
         duration: Math.round((Date.now() - startTime) / 1000),
         tokenUsage: result.tokenUsage,
       }
-      await writeSessionSummary(result.sessionId, runSummary, backend, sessionLogger)
+      await writeSessionSummary(result.sessionId, runSummary, serverHandle.client, sessionLogger)
       sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
     }
 
@@ -508,13 +512,20 @@ async function run(): Promise<number> {
       // Prune old sessions (RFC-004) before cache save
       const pruneLogger = createLogger({phase: 'prune'})
       const finalWorkspace = getGitHubWorkspace()
-      const pruneBackend: SessionBackend = backend ?? {type: 'json', workspacePath: finalWorkspace}
-      const pruneResult = await pruneSessions(pruneBackend, DEFAULT_PRUNING_CONFIG, pruneLogger)
-      if (pruneResult.prunedCount > 0) {
-        pruneLogger.info('Pruned old sessions', {
-          pruned: pruneResult.prunedCount,
-          remaining: pruneResult.remainingCount,
-        })
+      if (serverHandle != null) {
+        const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
+        const pruneResult = await pruneSessions(
+          serverHandle.client,
+          normalizedFinalWorkspace,
+          DEFAULT_PRUNING_CONFIG,
+          pruneLogger,
+        )
+        if (pruneResult.prunedCount > 0) {
+          pruneLogger.info('Pruned old sessions', {
+            pruned: pruneResult.prunedCount,
+            remaining: pruneResult.remainingCount,
+          })
+        }
       }
 
       // Save cache

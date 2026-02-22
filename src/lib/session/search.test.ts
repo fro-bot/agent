@@ -1,14 +1,17 @@
+import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
-
-import * as fs from 'node:fs/promises'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {getSessionInfo, listSessions, searchSessions} from './search.js'
+import {getSession, getSessionMessages, getSessionTodos, listSessionsForProject} from './storage.js'
 
-// Mock fs and os modules
-vi.mock('node:fs/promises')
-vi.mock('node:os')
+vi.mock('./storage.js', () => ({
+  listSessionsForProject: vi.fn(),
+  getSession: vi.fn(),
+  getSessionMessages: vi.fn(),
+  getSessionTodos: vi.fn(),
+}))
 
 const mockLogger: Logger = {
   debug: vi.fn(),
@@ -17,204 +20,169 @@ const mockLogger: Logger = {
   error: vi.fn(),
 }
 
-function createMockSdkClient(options: {
-  listResponse?: {data?: unknown; error?: unknown}
-  getResponse?: {data?: unknown; error?: unknown}
-  messagesResponse?: {data?: unknown; error?: unknown}
-  todosResponse?: {data?: unknown; error?: unknown}
-}) {
-  return {
-    session: {
-      list: vi.fn().mockResolvedValue(options.listResponse ?? {data: []}),
-      get: vi.fn().mockResolvedValue(options.getResponse ?? {data: null}),
-      messages: vi.fn().mockResolvedValue(options.messagesResponse ?? {data: []}),
-      todos: vi.fn().mockResolvedValue(options.todosResponse ?? {data: []}),
-    },
-  }
-}
-
-// Helper to create mock session data
-function createMockSession(id: string, overrides: Record<string, unknown> = {}) {
-  return {
-    id,
-    version: '1.0.0',
-    projectID: 'proj1',
-    directory: '/path/to/repo',
-    title: `Session ${id}`,
-    time: {created: 1000, updated: 2000},
-    ...overrides,
-  }
-}
-
-// Helper to create mock project data
-function createMockProject(id: string, worktree: string) {
-  return {
-    id,
-    worktree,
-    vcs: 'git',
-    time: {created: 1000, updated: 2000},
-  }
-}
-
-// Helper to create mock message data
-function createMockMessage(id: string, role: 'user' | 'assistant', agent: string, created: number) {
-  return {
-    id,
-    sessionID: 'ses_1',
-    role,
-    time: {created},
-    agent,
-    model: {providerID: 'test', modelID: 'test'},
-  }
-}
+const mockClient = {
+  session: {
+    list: vi.fn(),
+    get: vi.fn(),
+    messages: vi.fn(),
+    todos: vi.fn(),
+  },
+  project: {
+    list: vi.fn(),
+    current: vi.fn(),
+  },
+} as unknown as SessionClient
 
 describe('listSessions', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    process.env.XDG_DATA_HOME = '/test/data'
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    delete process.env.XDG_DATA_HOME
   })
 
-  it('returns empty array when no project found', async () => {
+  it('returns sessions sorted by updatedAt descending', async () => {
     // #given
-    vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'))
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 1000},
+      },
+      {
+        id: 'ses_2',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 2',
+        time: {created: 2000, updated: 3000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([])
 
     // #when
-    const result = await listSessions({type: 'json', workspacePath: '/nonexistent'}, {}, mockLogger)
+    const result = await listSessions(mockClient, '/workspace', {}, mockLogger)
+
+    // #then
+    expect(listSessionsForProject).toHaveBeenCalledWith(mockClient, '/workspace', mockLogger)
+    expect(result).toHaveLength(2)
+    expect(result[0]?.id).toBe('ses_2')
+    expect(result[1]?.id).toBe('ses_1')
+  })
+
+  it('returns empty array when no sessions exist', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([])
+
+    // #when
+    const result = await listSessions(mockClient, '/workspace', {}, mockLogger)
 
     // #then
     expect(result).toEqual([])
   })
 
-  it('returns sessions sorted by updatedAt descending', async () => {
-    // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session1 = createMockSession('ses_1', {time: {created: 1000, updated: 1000}})
-    const session2 = createMockSession('ses_2', {time: {created: 2000, updated: 3000}})
-
-    // Mock project lookup
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [
-          {name: 'ses_1.json', isFile: () => true, isDirectory: () => false},
-          {name: 'ses_2.json', isFile: () => true, isDirectory: () => false},
-        ] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      if (pathStr.includes('/message/')) {
-        return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session1)
-      if (pathStr.includes('ses_2.json')) return JSON.stringify(session2)
-      throw new Error('ENOENT')
-    })
-
-    // #when
-    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
-
-    // #then
-    expect(result).toHaveLength(2)
-    expect(result[0]?.id).toBe('ses_2') // Higher updatedAt first
-    expect(result[1]?.id).toBe('ses_1')
-  })
-
   it('excludes child sessions (those with parentID)', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const mainSession = createMockSession('ses_main', {})
-    const childSession = createMockSession('ses_child', {parentID: 'ses_main'})
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [
-          {name: 'ses_main.json', isFile: () => true, isDirectory: () => false},
-          {name: 'ses_child.json', isFile: () => true, isDirectory: () => false},
-        ] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      if (pathStr.includes('/message/')) {
-        return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_main.json')) return JSON.stringify(mainSession)
-      if (pathStr.includes('ses_child.json')) return JSON.stringify(childSession)
-      throw new Error('ENOENT')
-    })
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_main',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Main Session',
+        time: {created: 1000, updated: 2000},
+      },
+      {
+        id: 'ses_child',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Child Session',
+        parentID: 'ses_main',
+        time: {created: 1500, updated: 2500},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([])
 
     // #when
-    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
+    const result = await listSessions(mockClient, '/workspace', {}, mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
     expect(result[0]?.id).toBe('ses_main')
-    expect(result.every(s => !s.isChild)).toBe(true)
+  })
+
+  it('filters sessions by date range', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_old',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Old',
+        time: {created: 1000, updated: 1500},
+      },
+      {
+        id: 'ses_new',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'New',
+        time: {created: 5000, updated: 6000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([])
+
+    // #when
+    const result = await listSessions(
+      mockClient,
+      '/workspace',
+      {fromDate: new Date(2000), toDate: new Date(6000)},
+      mockLogger,
+    )
+
+    // #then
+    expect(result).toHaveLength(1)
+    expect(result[0]?.id).toBe('ses_new')
   })
 
   it('respects limit parameter', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const sessions = [
-      createMockSession('ses_1', {time: {created: 1000, updated: 1000}}),
-      createMockSession('ses_2', {time: {created: 2000, updated: 2000}}),
-      createMockSession('ses_3', {time: {created: 3000, updated: 3000}}),
-    ]
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return sessions.map(s => ({
-          name: `${s.id}.json`,
-          isFile: () => true,
-          isDirectory: () => false,
-        })) as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      if (pathStr.includes('/message/')) {
-        return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      for (const session of sessions) {
-        if (pathStr.includes(`${session.id}.json`)) return JSON.stringify(session)
-      }
-      throw new Error('ENOENT')
-    })
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'S1',
+        time: {created: 1000, updated: 1000},
+      },
+      {
+        id: 'ses_2',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'S2',
+        time: {created: 2000, updated: 2000},
+      },
+      {
+        id: 'ses_3',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'S3',
+        time: {created: 3000, updated: 3000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([])
 
     // #when
-    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {limit: 2}, mockLogger)
+    const result = await listSessions(mockClient, '/workspace', {limit: 2}, mockLogger)
 
     // #then
     expect(result).toHaveLength(2)
@@ -222,47 +190,37 @@ describe('listSessions', () => {
 
   it('includes message count and agents in summary', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session = createMockSession('ses_1', {})
-    const messages = [
-      createMockMessage('msg_1', 'user', 'Sisyphus', 1000),
-      createMockMessage('msg_2', 'assistant', 'oracle', 2000),
-    ]
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [{name: 'ses_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/message/')) {
-        return messages.map(m => ({
-          name: `${m.id}.json`,
-          isFile: () => true,
-          isDirectory: () => false,
-        })) as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session)
-      for (const msg of messages) {
-        if (pathStr.includes(`${msg.id}.json`)) return JSON.stringify(msg)
-      }
-      throw new Error('ENOENT')
-    })
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'Sisyphus',
+        model: {providerID: 'test', modelID: 'test'},
+      },
+      {
+        id: 'msg_2',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 2000},
+        agent: 'oracle',
+        model: {providerID: 'test', modelID: 'test'},
+      },
+    ])
 
     // #when
-    const result = await listSessions({type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
+    const result = await listSessions(mockClient, '/workspace', {}, mockLogger)
 
     // #then
     expect(result).toHaveLength(1)
@@ -275,63 +233,40 @@ describe('listSessions', () => {
 describe('searchSessions', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    process.env.XDG_DATA_HOME = '/test/data'
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    delete process.env.XDG_DATA_HOME
   })
 
-  it('searches text parts for matching content', async () => {
+  it('finds matching text in message parts', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session = createMockSession('ses_1', {})
-    const message = createMockMessage('msg_1', 'user', 'test', 1000)
-    const part = {
-      id: 'prt_1',
-      sessionID: 'ses_1',
-      messageID: 'msg_1',
-      type: 'text',
-      text: 'This contains an error message',
-    }
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [{name: 'ses_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/message/')) {
-        return [{name: 'msg_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/part/')) {
-        return [{name: 'prt_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session)
-      if (pathStr.includes('msg_1.json')) return JSON.stringify(message)
-      if (pathStr.includes('prt_1.json')) return JSON.stringify(part)
-      throw new Error('ENOENT')
-    })
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'Sisyphus',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {id: 'prt_1', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'This contains an error message'},
+        ],
+      } as never,
+    ])
 
     // #when
-    const results = await searchSessions('error', {type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
+    const results = await searchSessions('error', mockClient, '/workspace', {}, mockLogger)
 
     // #then
     expect(results).toHaveLength(1)
@@ -340,71 +275,71 @@ describe('searchSessions', () => {
     expect(results[0]?.matches[0]?.excerpt).toContain('error')
   })
 
+  it('returns empty results when no matches found', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [{id: 'prt_1', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'nothing relevant here'}],
+      } as never,
+    ])
+
+    // #when
+    const results = await searchSessions('nonexistent', mockClient, '/workspace', {}, mockLogger)
+
+    // #then
+    expect(results).toEqual([])
+  })
+
   it('respects caseSensitive option', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session = createMockSession('ses_1', {})
-    const message = createMockMessage('msg_1', 'user', 'test', 1000)
-    const part = {
-      id: 'prt_1',
-      sessionID: 'ses_1',
-      messageID: 'msg_1',
-      type: 'text',
-      text: 'This contains an Error message',
-    }
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {id: 'prt_1', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'This contains an Error message'},
+        ],
+      } as never,
+    ])
 
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [{name: 'ses_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/message/')) {
-        return [{name: 'msg_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/part/')) {
-        return [{name: 'prt_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session)
-      if (pathStr.includes('msg_1.json')) return JSON.stringify(message)
-      if (pathStr.includes('prt_1.json')) return JSON.stringify(part)
-      throw new Error('ENOENT')
-    })
-
-    // #when - case insensitive should find it
-    const caseInsensitive = await searchSessions(
-      'error',
-      {type: 'json', workspacePath: '/path/to/repo'},
-      {caseSensitive: false},
-      mockLogger,
-    )
+    // #when — case insensitive should find it
+    const caseInsensitive = await searchSessions('error', mockClient, '/workspace', {caseSensitive: false}, mockLogger)
 
     // #then
     expect(caseInsensitive).toHaveLength(1)
 
-    // #when - case sensitive should NOT find 'error' (only 'Error' exists)
-    const caseSensitive = await searchSessions(
-      'error',
-      {type: 'json', workspacePath: '/path/to/repo'},
-      {caseSensitive: true},
-      mockLogger,
-    )
+    // #when — case sensitive should NOT find 'error' (only 'Error' exists)
+    const caseSensitive = await searchSessions('error', mockClient, '/workspace', {caseSensitive: true}, mockLogger)
 
     // #then
     expect(caseSensitive).toHaveLength(0)
@@ -412,124 +347,113 @@ describe('searchSessions', () => {
 
   it('searches tool output in completed tool parts', async () => {
     // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session = createMockSession('ses_1', {})
-    const message = createMockMessage('msg_1', 'assistant', 'test', 1000)
-    const part = {
-      id: 'prt_1',
-      sessionID: 'ses_1',
-      messageID: 'msg_1',
-      type: 'tool',
-      callID: 'call_1',
-      tool: 'bash',
-      state: {
-        status: 'completed',
-        input: {command: 'ls'},
-        output: 'command output with special data',
-        title: 'Run bash',
-        metadata: {},
-        time: {start: 1000, end: 2000},
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
       },
-    }
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [{name: 'ses_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/message/')) {
-        return [{name: 'msg_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/part/')) {
-        return [{name: 'prt_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session)
-      if (pathStr.includes('msg_1.json')) return JSON.stringify(message)
-      if (pathStr.includes('prt_1.json')) return JSON.stringify(part)
-      throw new Error('ENOENT')
-    })
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'assistant',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {
+            id: 'prt_1',
+            sessionID: 'ses_1',
+            messageID: 'msg_1',
+            type: 'tool',
+            callID: 'call_1',
+            tool: 'bash',
+            state: {
+              status: 'completed',
+              input: {command: 'ls'},
+              output: 'command output with special data',
+              title: 'Run bash',
+              metadata: {},
+              time: {start: 1000, end: 2000},
+            },
+          },
+        ],
+      } as never,
+    ])
 
     // #when
-    const results = await searchSessions('special data', {type: 'json', workspacePath: '/path/to/repo'}, {}, mockLogger)
+    const results = await searchSessions('special data', mockClient, '/workspace', {}, mockLogger)
 
     // #then
     expect(results).toHaveLength(1)
     expect(results[0]?.matches[0]?.excerpt).toContain('special data')
   })
 
-  it('respects limit parameter', async () => {
-    // #given
-    const project = createMockProject('proj1', '/path/to/repo')
-    const session = createMockSession('ses_1', {})
-    const message = createMockMessage('msg_1', 'user', 'test', 1000)
-    const parts = [
-      {id: 'prt_1', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match one'},
-      {id: 'prt_2', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match two'},
-      {id: 'prt_3', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match three'},
-    ]
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/project')) {
-        return [{name: 'proj1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/session/')) {
-        return [{name: 'ses_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/message/')) {
-        return [{name: 'msg_1.json', isFile: () => true, isDirectory: () => false}] as unknown as Awaited<
-          ReturnType<typeof fs.readdir>
-        >
-      }
-      if (pathStr.includes('/part/')) {
-        return parts.map(p => ({
-          name: `${p.id}.json`,
-          isFile: () => true,
-          isDirectory: () => false,
-        })) as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('/project/')) return JSON.stringify(project)
-      if (pathStr.includes('ses_1.json')) return JSON.stringify(session)
-      if (pathStr.includes('msg_1.json')) return JSON.stringify(message)
-      for (const part of parts) {
-        if (pathStr.includes(`${part.id}.json`)) return JSON.stringify(part)
-      }
-      throw new Error('ENOENT')
-    })
+  it('returns empty parts when message has no inline parts', async () => {
+    // #given — message without parts property; fallback should be []
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+      },
+    ])
 
     // #when
-    const results = await searchSessions(
-      'match',
-      {type: 'json', workspacePath: '/path/to/repo'},
-      {limit: 2},
-      mockLogger,
-    )
+    const results = await searchSessions('anything', mockClient, '/workspace', {}, mockLogger)
+
+    // #then
+    expect(results).toEqual([])
+  })
+
+  it('respects limit parameter', async () => {
+    // #given
+    vi.mocked(listSessionsForProject).mockResolvedValue([
+      {
+        id: 'ses_1',
+        version: '1.0.0',
+        projectID: 'proj1',
+        directory: '/workspace',
+        title: 'Session 1',
+        time: {created: 1000, updated: 2000},
+      },
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'test',
+        model: {providerID: 'test', modelID: 'test'},
+        parts: [
+          {id: 'prt_1', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match one here'},
+          {id: 'prt_2', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match two here'},
+          {id: 'prt_3', sessionID: 'ses_1', messageID: 'msg_1', type: 'text', text: 'match three here'},
+        ],
+      } as never,
+    ])
+
+    // #when
+    const results = await searchSessions('match', mockClient, '/workspace', {limit: 2}, mockLogger)
 
     // #then
     expect(results).toHaveLength(1)
@@ -540,66 +464,59 @@ describe('searchSessions', () => {
 describe('getSessionInfo', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    process.env.XDG_DATA_HOME = '/test/data'
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    delete process.env.XDG_DATA_HOME
   })
 
   it('returns null when session does not exist', async () => {
     // #given
-    vi.mocked(fs.readFile).mockRejectedValue(new Error('ENOENT'))
+    vi.mocked(getSession).mockResolvedValue(null)
 
     // #when
-    const result = await getSessionInfo(
-      {type: 'json', workspacePath: '/path/to/repo'},
-      'nonexistent',
-      'proj1',
-      mockLogger,
-    )
+    const result = await getSessionInfo(mockClient, 'nonexistent', mockLogger)
 
     // #then
     expect(result).toBeNull()
+    expect(getSession).toHaveBeenCalledWith(mockClient, 'nonexistent', mockLogger)
   })
 
-  it('returns session info with message count and agents', async () => {
+  it('returns session info with message count, agents, and todos', async () => {
     // #given
-    const session = createMockSession('ses_1', {})
-    const messages = [
-      createMockMessage('msg_1', 'user', 'Sisyphus', 1000),
-      createMockMessage('msg_2', 'assistant', 'oracle', 2000),
-    ]
-    const todos = [
+    vi.mocked(getSession).mockResolvedValue({
+      id: 'ses_1',
+      version: '1.0.0',
+      projectID: 'proj1',
+      directory: '/workspace',
+      title: 'Session 1',
+      time: {created: 1000, updated: 2000},
+    })
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg_1',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 1000},
+        agent: 'Sisyphus',
+        model: {providerID: 'test', modelID: 'test'},
+      },
+      {
+        id: 'msg_2',
+        sessionID: 'ses_1',
+        role: 'user',
+        time: {created: 2000},
+        agent: 'oracle',
+        model: {providerID: 'test', modelID: 'test'},
+      },
+    ])
+    vi.mocked(getSessionTodos).mockResolvedValue([
       {id: '1', content: 'Task 1', status: 'completed', priority: 'high'},
       {id: '2', content: 'Task 2', status: 'pending', priority: 'low'},
-    ]
-
-    vi.mocked(fs.readdir).mockImplementation(async dirPath => {
-      const pathStr = String(dirPath)
-      if (pathStr.includes('/message/')) {
-        return messages.map(m => ({
-          name: `${m.id}.json`,
-          isFile: () => true,
-          isDirectory: () => false,
-        })) as unknown as Awaited<ReturnType<typeof fs.readdir>>
-      }
-      return [] as unknown as Awaited<ReturnType<typeof fs.readdir>>
-    })
-
-    vi.mocked(fs.readFile).mockImplementation(async filePath => {
-      const pathStr = String(filePath)
-      if (pathStr.includes('ses_1.json') && pathStr.includes('/session/')) return JSON.stringify(session)
-      if (pathStr.includes('/todo/')) return JSON.stringify(todos)
-      for (const msg of messages) {
-        if (pathStr.includes(`${msg.id}.json`)) return JSON.stringify(msg)
-      }
-      throw new Error('ENOENT')
-    })
+    ])
 
     // #when
-    const result = await getSessionInfo({type: 'json', workspacePath: '/path/to/repo'}, 'ses_1', 'proj1', mockLogger)
+    const result = await getSessionInfo(mockClient, 'ses_1', mockLogger)
 
     // #then
     expect(result).not.toBeNull()
@@ -611,81 +528,27 @@ describe('getSessionInfo', () => {
     expect(result?.todoCount).toBe(2)
     expect(result?.completedTodos).toBe(1)
   })
-})
 
-describe('SDK session search', () => {
-  beforeEach(() => {
-    vi.resetAllMocks()
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('lists sessions via SDK and maps summaries', async () => {
+  it('handles session with no todos', async () => {
     // #given
-    const sdkSession = {
-      id: 'ses_sdk',
-      version: '1.1.53',
-      projectId: 'proj_sdk',
+    vi.mocked(getSession).mockResolvedValue({
+      id: 'ses_1',
+      version: '1.0.0',
+      projectID: 'proj1',
       directory: '/workspace',
-      title: 'SDK Session',
+      title: 'Session 1',
       time: {created: 1000, updated: 2000},
-    }
-    const sdkMessage = {
-      id: 'msg_1',
-      sessionId: 'ses_sdk',
-      role: 'user',
-      time: {created: 1000},
-      agent: 'Sisyphus',
-      model: {providerID: 'test', modelID: 'test'},
-    }
-    const client = createMockSdkClient({
-      listResponse: {data: [sdkSession]},
-      messagesResponse: {data: [sdkMessage]},
     })
-    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
+    vi.mocked(getSessionMessages).mockResolvedValue([])
+    vi.mocked(getSessionTodos).mockResolvedValue([])
 
     // #when
-    const result = await listSessions(backend, {}, mockLogger)
+    const result = await getSessionInfo(mockClient, 'ses_1', mockLogger)
 
     // #then
-    expect(client.session.list).toHaveBeenCalledWith({query: {directory: '/workspace'}})
-    expect(result).toHaveLength(1)
-    expect(result[0]?.id).toBe('ses_sdk')
-    expect(result[0]?.messageCount).toBe(1)
-  })
-
-  it('searches SDK session content from messages and parts', async () => {
-    // #given
-    const sdkSession = {
-      id: 'ses_sdk',
-      version: '1.1.53',
-      projectId: 'proj_sdk',
-      directory: '/workspace',
-      title: 'SDK Session',
-      time: {created: 1000, updated: 2000},
-    }
-    const sdkMessage = {
-      id: 'msg_1',
-      sessionId: 'ses_sdk',
-      role: 'user',
-      time: {created: 1000},
-      agent: 'Sisyphus',
-      model: {providerID: 'test', modelID: 'test'},
-      parts: [{id: 'prt_1', sessionId: 'ses_sdk', messageId: 'msg_1', type: 'text', text: 'hello sdk match'}],
-    }
-    const client = createMockSdkClient({
-      listResponse: {data: [sdkSession]},
-      messagesResponse: {data: [sdkMessage]},
-    })
-    const backend = {type: 'sdk', workspacePath: '/workspace', client} as unknown as import('./backend.js').SdkBackend
-
-    // #when
-    const results = await searchSessions('match', backend, {}, mockLogger)
-
-    // #then
-    expect(results).toHaveLength(1)
-    expect(results[0]?.matches[0]?.excerpt).toContain('match')
+    expect(result).not.toBeNull()
+    expect(result?.hasTodos).toBe(false)
+    expect(result?.todoCount).toBe(0)
+    expect(result?.completedTodos).toBe(0)
   })
 })
