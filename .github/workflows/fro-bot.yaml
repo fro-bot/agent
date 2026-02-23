@@ -99,5 +99,6 @@ jobs:
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
           github-token: ${{ secrets.FRO_BOT_PAT }}
+          model: ${{ vars.FRO_BOT_MODEL }}
           omo-providers: ${{ secrets.OMO_PROVIDERS }}
           prompt: ${{ env.PROMPT }}
