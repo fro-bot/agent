@@ -10,7 +10,7 @@ import type {ErrorInfo} from '../comments/types.js'
 import type {HydratedContext} from '../context/types.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {ModelConfig, TokenUsage} from '../types.js'
+import type {ModelConfig, OmoProviders, TokenUsage} from '../types.js'
 
 /**
  * Context collected from GitHub Actions for agent prompt construction.
@@ -128,6 +128,7 @@ export interface ExecutionConfig {
   readonly agent: string
   readonly model: ModelConfig | null
   readonly timeoutMs: number
+  readonly omoProviders: OmoProviders
 }
 
 export interface EnsureOpenCodeResult {
