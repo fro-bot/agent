@@ -56,7 +56,6 @@ export async function installOmo(
   })
 
   let output = ''
-
   const args = [
     `oh-my-opencode@${version}`,
     'install',
@@ -79,19 +78,15 @@ export async function installOmo(
           output += data.toString()
         },
       },
-      silent: true,
       ignoreReturnCode: true,
     })
-
     if (exitCode !== 0) {
       const errorMsg = `bunx oh-my-opencode install returned exit code ${exitCode}`
       logger.error(errorMsg, {output: output.slice(0, 1000)})
       return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
-
     const versionMatch = /oh-my-opencode@(\d+\.\d+\.\d+)/i.exec(output)
     const detectedVersion = versionMatch != null && versionMatch[1] != null ? versionMatch[1] : version
-
     logger.info('oMo plugin installed', {version: detectedVersion})
     return {installed: true, version: detectedVersion, error: null}
   } catch (error) {
