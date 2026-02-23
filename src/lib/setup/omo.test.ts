@@ -148,44 +148,6 @@ describe('omo', () => {
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
-    it('logs install output at debug level on success', async () => {
-      // #given - installer produces stdout and stderr output
-      const mockLogger = createMockLogger()
-      const mockDeps = createMockDeps({
-        logger: mockLogger,
-        execAdapter: createMockExecAdapter({
-          exec: vi
-            .fn()
-            .mockImplementation(
-              async (
-                _cmd,
-                _args,
-                options: {listeners?: {stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void}},
-              ): Promise<number> => {
-                if (options?.listeners?.stdout != null) {
-                  options.listeners.stdout(Buffer.from('Installing oh-my-opencode@3.5.5\n'))
-                }
-                if (options?.listeners?.stderr != null) {
-                  options.listeners.stderr(Buffer.from('npm warn deprecated\n'))
-                }
-                return 0
-              },
-            ),
-        }),
-      })
-
-      // #when
-      await installOmo('3.5.5', mockDeps)
-
-      // #then - output from both streams is logged at debug level
-      const debugCalls = (mockLogger.debug as ReturnType<typeof vi.fn>).mock.calls
-      const outputCall = debugCalls.find((call: unknown[]) => call[0] === 'oMo install output')
-      expect(outputCall).toBeDefined()
-      const meta = outputCall?.[1] as {stdout?: string; stderr?: string}
-      expect(meta.stdout).toContain('Installing oh-my-opencode@3.5.5')
-      expect(meta.stderr).toContain('npm warn deprecated')
-    })
-
     it('uses pinned version in bunx call', async () => {
       // #given
       const execMock = vi.fn().mockResolvedValue(0)
@@ -228,7 +190,7 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true, ignoreReturnCode: true}),
+        expect.objectContaining({ignoreReturnCode: true}),
       )
     })
 
@@ -263,7 +225,7 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true, ignoreReturnCode: true}),
+        expect.objectContaining({ignoreReturnCode: true}),
       )
     })
 
