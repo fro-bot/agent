@@ -145,10 +145,11 @@ jobs:
               || ''
             }}
         with:
-          github-token: ${{ secrets.FRO_BOT_PAT }}
           auth-json: ${{ secrets.AUTH_JSON }}
-          model: ${{ vars.FRO_BOT_MODEL }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
+          omo-providers: ${{ secrets.OMO_PROVIDERS }}
           prompt: ${{ env.PROMPT }}
+
       - if: always()
         name: Introspect main action execution
         run: |
