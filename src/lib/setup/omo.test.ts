@@ -190,7 +190,7 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true, ignoreReturnCode: true}),
+        expect.objectContaining({ignoreReturnCode: true}),
       )
     })
 
@@ -225,7 +225,7 @@ describe('omo', () => {
           '--opencode-zen=no',
           '--zai-coding-plan=no',
         ],
-        expect.objectContaining({silent: true, ignoreReturnCode: true}),
+        expect.objectContaining({ignoreReturnCode: true}),
       )
     })
 
