@@ -4,6 +4,10 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "paths": {
+      "@opencode-ai/sdk": ["./node_modules/@opencode-ai/sdk/dist/src/index.d.ts"],
+      "@opencode-ai/sdk/*": ["./node_modules/@opencode-ai/sdk/dist/src/*"]
+    },
     "noEmit": true
   },
   "include": ["**/*.ts"],
