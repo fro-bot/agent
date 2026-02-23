@@ -332,6 +332,28 @@ export async function waitForEventProcessorShutdown(
 const MAX_LLM_RETRIES = 3
 const RETRY_DELAY_MS = 5000
 
+function hasConfiguredOmoProviders(config: ExecutionConfig | undefined): boolean {
+  if (config == null) {
+    return false
+  }
+
+  return Object.values(config.omoProviders).some(provider => provider !== 'no')
+}
+
+function resolvePromptModel(config: ExecutionConfig | undefined): {providerID: string; modelID: string} | undefined {
+  if (config?.model != null) {
+    return {providerID: config.model.providerID, modelID: config.model.modelID}
+  }
+
+  // Keep default behavior free-by-default: only force the free model when no paid
+  // oMo provider is configured. If a provider is configured, let server defaults decide.
+  if (!hasConfiguredOmoProviders(config)) {
+    return {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
+  }
+
+  return undefined
+}
+
 const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
 Please continue where you left off. If you were in the middle of a task, resume it.
 If you had completed the task, confirm the completion.`
@@ -402,18 +424,18 @@ async function sendPromptToSession(
     logger.info('Including file attachments in prompt', {count: fileParts.length})
   }
 
-  const model =
-    config?.model == null
-      ? {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
-      : {providerID: config.model.providerID, modelID: config.model.modelID}
+  const model = resolvePromptModel(config)
 
   const promptBody: {
     agent?: string
     model?: {modelID: string; providerID: string}
     parts: (TextPartInput | FilePartInput)[]
   } = {
-    model,
     parts,
+  }
+
+  if (model != null) {
+    promptBody.model = model
   }
 
   // Only include agent in prompt body for non-default agents.

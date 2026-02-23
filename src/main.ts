@@ -343,6 +343,7 @@ async function run(): Promise<number> {
         agent: inputs.agent,
         model: inputs.model,
         timeoutMs: inputs.timeoutMs,
+        omoProviders: inputs.omoProviders,
       }
 
       const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, serverHandle ?? undefined)

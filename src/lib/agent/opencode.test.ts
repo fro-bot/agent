@@ -235,6 +235,7 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
+      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
     }
 
     // #when
@@ -266,6 +267,7 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: null,
       timeoutMs: 1800000,
+      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
     }
 
     // #when
@@ -281,6 +283,56 @@ describe('executeOpenCode', () => {
     })
   })
 
+  it('omits default model when omo providers are configured', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const config: ExecutionConfig = {
+      agent: 'sisyphus',
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: {claude: 'yes', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
+    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
+    const promptCall = firstCall?.[0]
+    expect(promptCall?.body?.model).toBeUndefined()
+  })
+
+  it('keeps explicit model override when omo providers are configured', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    const config: ExecutionConfig = {
+      agent: 'sisyphus',
+      model: {providerID: 'openai', modelID: 'gpt-5'},
+      timeoutMs: 1800000,
+      omoProviders: {claude: 'yes', copilot: 'no', gemini: 'no', openai: 'yes', opencodeZen: 'no', zaiCodingPlan: 'no'},
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
+    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
+    const promptCall = firstCall?.[0]
+    expect(promptCall?.body?.model).toEqual({providerID: 'openai', modelID: 'gpt-5'})
+  })
+
   it('uses custom agent from config', async () => {
     // #given
     const mockClient = createMockClient({
@@ -293,6 +345,7 @@ describe('executeOpenCode', () => {
       agent: 'CustomAgent',
       model: null,
       timeoutMs: 1800000,
+      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
     }
 
     // #when
@@ -318,6 +371,7 @@ describe('executeOpenCode', () => {
       agent: 'oracle',
       model: null,
       timeoutMs: 1800000,
+      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
     }
 
     // #when
