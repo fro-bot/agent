@@ -141,7 +141,7 @@ jobs:
             Skip style nits — the linter handles those.
 
             Output:
-            ## Verdict: PASS / CONDITIONAL / REJECT
+            ## Verdict: [PASS | CONDITIONAL | REJECT]
             ### Blocking issues
             ### Non-blocking concerns
             ### Missing tests

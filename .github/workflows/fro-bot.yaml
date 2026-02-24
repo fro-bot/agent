@@ -35,10 +35,13 @@ env:
   SCHEDULE_PROMPT: |
     Perform daily repository maintenance and update a SINGLE rolling issue titled
     "Daily Maintenance Report" in this repository. If the issue does not exist,
-    create it.
+    create it. If the most recent matching issue is closed, reopen it and append
+    to that same issue instead of creating a new one.
 
     Append a new dated section for each run using:
     "## YYYY-MM-DD (UTC)" and do not remove prior sections.
+    Keep the issue bounded: after appending today's section, collapse older
+    sections into a brief "Historical Summary" so the issue remains concise.
 
     Include links only (no full content duplication). Keep it concise and actionable.
 
