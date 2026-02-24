@@ -139,6 +139,13 @@ jobs:
             - Breaking changes to public API
             - Test coverage for new/changed behavior
             Skip style nits — the linter handles those.
+
+            Output:
+            ## Verdict: [PASS | CONDITIONAL | REJECT]
+            ### Blocking issues
+            ### Non-blocking concerns
+            ### Missing tests
+            ### Risk assessment (LOW/MED/HIGH) + rationale
           PROMPT: >-
             ${{
               (github.event_name == 'pull_request' && env.PR_REVIEW_PROMPT)
