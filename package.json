@@ -53,7 +53,7 @@
     "@types/node": "24.10.13",
     "@vitest/eslint-plugin": "1.6.9",
     "conventional-changelog-conventionalcommits": "9.1.0",
-    "eslint": "10.0.0",
+    "eslint": "10.0.1",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
     "generate-license-file": "4.1.1",
@@ -68,5 +68,17 @@
     "typescript": "5.9.3",
     "vitest": "4.0.18"
   },
-  "packageManager": "pnpm@10.30.1"
+  "packageManager": "pnpm@10.30.1",
+  "pnpm": {
+    "overrides": {
+      "@eslint/config-array>minimatch": "10.2.2",
+      "@isaacs/brace-expansion": "5.0.1",
+      "eslint-plugin-json-schema-validator>ajv": "8.18.0",
+      "eslint>ajv": "6.14.0",
+      "fast-xml-parser": "5.3.7",
+      "lodash": "4.17.23",
+      "lodash-es": "4.17.23",
+      "tar": "7.5.9"
+    }
+  }
 }
