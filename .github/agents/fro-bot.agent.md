@@ -21,7 +21,7 @@ description: Specialized for fro-bot/agent: project-scoped coding agent that imp
 
 - ESM-only: `"type": "module"`, `.js` extensions in imports
 - Function-based only: no ES6 classes
-- Strict booleans: use `!== null`, `Boolean()`, `> 0`, `!== ''`; never `if (!value)`
+- Strict booleans: use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types
 - No `as any`, `@ts-ignore`, `@ts-expect-error`
 - Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
 - Inject `logger: Logger` into all functions as a parameter
@@ -48,7 +48,7 @@ description: Specialized for fro-bot/agent: project-scoped coding agent that imp
 - Use `createOpencode({ port, timeout })` for server + client lifecycle
 - Always `server.close()` in a `finally` block — never leak the server
 - Create sessions with `client.session.create({ body: { title } })`
-- Send prompts with `agent` always set (default: `"Sisyphus"`); model override is optional
+- Only set `agent` on the prompt body for non-default agents; omit it for `DEFAULT_AGENT` (`'sisyphus'`) so the server uses its properly-resolved default. Model override is optional.
 - Subscribe to events with `client.event.subscribe()` and process `session.idle` for completion
 - Cancel subscription with `events.controller.abort()` after completion
 
