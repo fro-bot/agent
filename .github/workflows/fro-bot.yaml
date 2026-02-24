@@ -40,8 +40,8 @@ env:
 
     Append a new dated section for each run using:
     "## YYYY-MM-DD (UTC)" and do not remove prior sections.
-    Keep the issue bounded: after appending today's section, collapse older
-    sections into a brief "Historical Summary" so the issue remains concise.
+    Keep the issue bounded: after appending today's section, collapse sections
+    older than 14 days into a running Historical Summary so the issue remains concise.
 
     Include links only (no full content duplication). Keep it concise and actionable.
 
