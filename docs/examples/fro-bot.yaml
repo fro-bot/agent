@@ -85,11 +85,15 @@
 # │ It does NOT push commits, open PRs, or modify code.
 # │ → Already set as SCHEDULE_PROMPT below. No changes needed.
 #
-# ┌─ Option B: Autohealing (active repair — high autonomy) ────────────
+# ┌─ Option B: Autohealing (active repair — high autonomy) ────────────────
 # │ The agent fixes broken PRs, patches vulnerabilities, upgrades stale
 # │ deps, and corrects lint/type drift — then reports what it did.
 # │ It WILL push commits to PR branches and the default branch.
 # │ Use only when that level of autonomy is acceptable.
+# │
+# │ Unlike Option A (rolling issue), Option B creates a NEW dated issue
+# │ per run ("Daily Autohealing Report — YYYY-MM-DD") because each run
+# │ documents specific commits and PRs that were modified.
 # │
 # │ To enable: replace the SCHEDULE_PROMPT value in the env section
 # │ with the prompt below (uncomment and paste as a YAML block scalar).
@@ -290,7 +294,7 @@ env:
     for the structured summary below.
 
     You MUST structure your review using exactly these headings:
-    ## Verdict: PASS / CONDITIONAL / REJECT
+    ## Verdict: [PASS | CONDITIONAL | REJECT]
     CONDITIONAL = can merge after addressing the listed blocking issues.
     ### Blocking issues
     ### Non-blocking concerns
@@ -313,7 +317,7 @@ env:
     To keep the issue bounded: after appending today's section, replace any
     individual daily sections older than 14 days with a single
     "## Historical Summary" section that lists only the count of prior runs
-    and any items that remained unresolved across those runs.
+    and any items that remained unresolved across those runs. If a Historical Summary already exists, update it in place — do not create a second one.
 
     Include links only (no full content duplication). Keep it concise and actionable.
     Flag items that appear in the stale list for the first time (not present in

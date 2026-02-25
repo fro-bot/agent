@@ -45,7 +45,7 @@ env:
     To keep the issue bounded: after appending today's section, replace any
     individual daily sections older than 14 days with a single
     "## Historical Summary" section that lists only the count of prior runs
-    and any items that remained unresolved across those runs.
+    and any items that remained unresolved across those runs. If a Historical Summary already exists, update it in place — do not create a second one.
 
     Include links only (no full content duplication). Keep it concise and actionable.
     Flag items that appear in the stale list for the first time (not present in the previous dated section) with a ★ marker.
