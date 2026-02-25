@@ -1,11 +1,6 @@
 ---
-# Fill in the fields below to create a basic custom agent for your repository.
-# The Copilot CLI can be used for local testing: https://gh.io/customagents/cli
-# To make this agent available, merge this file into the default repository branch.
-# For format details, see: https://gh.io/customagents/config
-
 name: Fro Bot Coding Agent
-description: Specialized for fro-bot/agent: project-scoped coding agent that implements repo-specific features, fixes, and maintenance while following this repo's TDD, TypeScript/ESM, and CI/build conventions.
+description: "Specialized for fro-bot/agent: project-scoped coding agent that implements repo-specific features, fixes, and maintenance while following this repo's TDD, TypeScript/ESM, and CI/build conventions."
 ---
 
 ## Role & Scope
