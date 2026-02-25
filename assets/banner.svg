@@ -1,0 +1,430 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+
+    <!-- ── Backgrounds ───────────────────────────────────────────── -->
+    <radialGradient id="bgGrad" cx="32%" cy="48%" r="78%" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#2D1B4E"/>
+      <stop offset="48%"  stop-color="#1A0B2E"/>
+      <stop offset="100%" stop-color="#0D0216"/>
+    </radialGradient>
+
+    <radialGradient id="rightGlow" cx="75%" cy="50%" r="35%" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#00BCD4" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#00BCD4" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Cyber grid pattern -->
+    <pattern id="grid" x="0" y="0" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#00BCD4" stroke-width="0.35" opacity="0.12"/>
+    </pattern>
+
+    <!-- Afro curl texture — hex-packed circles -->
+    <pattern id="curls" x="946" y="188" width="28" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="14" cy="12" r="11.5" fill="none" stroke="#00E5FF" stroke-width="1.6" opacity="0.55"/>
+      <circle cx="0"  cy="0"  r="11.5" fill="none" stroke="#00E5FF" stroke-width="1.6" opacity="0.55"/>
+      <circle cx="28" cy="0"  r="11.5" fill="none" stroke="#00E5FF" stroke-width="1.6" opacity="0.55"/>
+      <circle cx="0"  cy="24" r="11.5" fill="none" stroke="#00E5FF" stroke-width="1.6" opacity="0.55"/>
+      <circle cx="28" cy="24" r="11.5" fill="none" stroke="#00E5FF" stroke-width="1.6" opacity="0.55"/>
+    </pattern>
+
+    <!-- Afro fill gradient -->
+    <radialGradient id="afroFill" cx="38%" cy="30%" r="68%" gradientUnits="userSpaceOnUse"
+      x1="790" y1="50" x2="1130" y2="385">
+      <stop offset="0%"   stop-color="#006080" stop-opacity="0.85"/>
+      <stop offset="40%"  stop-color="#1A0B2E" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="1"/>
+    </radialGradient>
+
+    <!-- Bottom bar gradient -->
+    <linearGradient id="colorBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"    stop-color="#E91E63"/>
+      <stop offset="33%"   stop-color="#00BCD4"/>
+      <stop offset="66%"   stop-color="#FFC107"/>
+      <stop offset="100%"  stop-color="#E91E63"/>
+    </linearGradient>
+
+    <!-- Title text gradient -->
+    <linearGradient id="titleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="80%"  stop-color="#F5EBEB"/>
+      <stop offset="100%" stop-color="#C8E8ED"/>
+    </linearGradient>
+
+    <!-- Vignette fade for bottom -->
+    <linearGradient id="vigBottom" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#0D0216" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0.55"/>
+    </linearGradient>
+
+    <!-- ── Filters ──────────────────────────────────────────────── -->
+
+    <!-- Glow: afro halo -->
+    <filter id="afroHalo" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Glow: general soft -->
+    <filter id="glowSoft" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Glow: strong for decorative circles -->
+    <filter id="glowStrong" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- ── Clip Paths ──────────────────────────────────────────── -->
+    <clipPath id="afroClip">
+      <circle cx="960" cy="200" r="172"/>
+    </clipPath>
+
+    <clipPath id="bannerClip">
+      <rect width="1280" height="640"/>
+    </clipPath>
+
+  </defs>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 0: BACKGROUND                                        -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <g clip-path="url(#bannerClip)">
+
+  <!-- Base gradient -->
+  <rect width="1280" height="640" fill="url(#bgGrad)"/>
+
+  <!-- Grid overlay -->
+  <rect width="1280" height="640" fill="url(#grid)"/>
+
+  <!-- Right-side character ambient glow -->
+  <rect width="1280" height="640" fill="url(#rightGlow)"/>
+
+  <!-- Bottom vignette -->
+  <rect y="460" width="1280" height="180" fill="url(#vigBottom)"/>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 1: CIRCUIT BOARD TRACINGS                            -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- Left edge circuit traces -->
+  <g stroke="#00BCD4" stroke-width="1" fill="none" opacity="0.14">
+    <polyline points="0,145 55,145 55,92 200,92"/>
+    <circle cx="55"  cy="145" r="3.5" fill="#00BCD4"/>
+    <circle cx="200" cy="92"  r="3.5" fill="#00BCD4"/>
+    <circle cx="200" cy="92"  r="6"   fill="none"/>
+
+    <polyline points="0,380 38,380 38,320 130,320 130,270"/>
+    <circle cx="38"  cy="380" r="3.5" fill="#00BCD4"/>
+    <circle cx="130" cy="270" r="3.5" fill="#00BCD4"/>
+
+    <polyline points="0,510 28,510 28,560 90,560"/>
+    <circle cx="28" cy="510" r="3.5" fill="#00BCD4"/>
+  </g>
+
+  <!-- Right edge circuit traces -->
+  <g stroke="#E91E63" stroke-width="1" fill="none" opacity="0.16">
+    <polyline points="1280,180 1218,180 1218,240 1120,240"/>
+    <circle cx="1218" cy="180" r="3.5" fill="#E91E63"/>
+    <circle cx="1120" cy="240" r="3.5" fill="#E91E63"/>
+    <circle cx="1120" cy="240" r="6"   fill="none"/>
+
+    <polyline points="1280,490 1240,490 1240,540 1165,540"/>
+    <circle cx="1240" cy="490" r="3.5" fill="#E91E63"/>
+    <circle cx="1165" cy="540" r="3.5" fill="#E91E63"/>
+  </g>
+
+  <!-- Amber trace (bottom mid) -->
+  <g stroke="#FFC107" stroke-width="1" fill="none" opacity="0.13">
+    <polyline points="640,640 640,595 700,595 700,570"/>
+    <circle cx="700" cy="570" r="3.5" fill="#FFC107"/>
+  </g>
+
+  <!-- Vertical divider — dashed -->
+  <line x1="632" y1="52" x2="632" y2="588"
+        stroke="#00BCD4" stroke-width="0.6" opacity="0.18"
+        stroke-dasharray="5 9"/>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 2: FRO BOT CHARACTER (right half)                    -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- ── Afro: outer halo glow ──────────────────────── -->
+  <circle cx="960" cy="200" r="196" fill="#00BCD4" opacity="0.045" filter="url(#afroHalo)"/>
+  <circle cx="960" cy="200" r="182" fill="#00ACC1" opacity="0.035" filter="url(#afroHalo)"/>
+
+  <!-- ── Afro: main shape fill ──────────────────────── -->
+  <circle cx="960" cy="200" r="172">
+    <animate attributeName="opacity" dur="0s" values="1" fill="freeze"/>
+  </circle>
+  <!-- Dark base -->
+  <circle cx="960" cy="200" r="172" fill="#0A0618"/>
+
+  <!-- Deep gradient overlay -->
+  <circle cx="960" cy="200" r="172" fill="none"
+          stroke="url(#colorBar)" stroke-width="2" opacity="0.3"/>
+
+  <!-- Radial teal glow from top-left of afro -->
+  <radialGradient id="afroInner" cx="38%" cy="28%" r="65%" gradientUnits="objectBoundingBox">
+    <stop offset="0%"   stop-color="#007090" stop-opacity="0.75"/>
+    <stop offset="55%"  stop-color="#1A0B2E" stop-opacity="0.9"/>
+    <stop offset="100%" stop-color="#0D0216" stop-opacity="1"/>
+  </radialGradient>
+  <circle cx="960" cy="200" r="172" fill="url(#afroInner)"/>
+
+  <!-- ── Afro: curl texture (clipped) ──────────────── -->
+  <rect x="785" y="25" width="350" height="350"
+        fill="url(#curls)" clip-path="url(#afroClip)" opacity="0.72"/>
+
+  <!-- ── Afro: rim highlight ────────────────────────── -->
+  <circle cx="960" cy="200" r="172"
+          fill="none" stroke="#00E5FF" stroke-width="1.8" opacity="0.35"/>
+
+  <!-- Top-left specular highlight on afro -->
+  <ellipse cx="875" cy="118" rx="55" ry="35" fill="#FFFFFF" opacity="0.05"
+           transform="rotate(-25, 875, 118)"/>
+
+  <!-- ── Ear pieces (headphone style) ──────────────── -->
+  <!-- Left ear -->
+  <circle cx="786" cy="318" r="26" fill="#1A0B2E" stroke="#00ACC1" stroke-width="2"
+          filter="url(#glowSoft)"/>
+  <circle cx="786" cy="318" r="18" fill="#0D0216" opacity="0.7"/>
+  <circle cx="786" cy="318" r="10" fill="#E91E63" opacity="0.9" filter="url(#glowStrong)"/>
+  <circle cx="786" cy="318" r="4"  fill="#FF6090" opacity="0.8"/>
+
+  <!-- Right ear -->
+  <circle cx="1134" cy="318" r="26" fill="#1A0B2E" stroke="#00ACC1" stroke-width="2"
+          filter="url(#glowSoft)"/>
+  <circle cx="1134" cy="318" r="18" fill="#0D0216" opacity="0.7"/>
+  <circle cx="1134" cy="318" r="10" fill="#E91E63" opacity="0.9" filter="url(#glowStrong)"/>
+  <circle cx="1134" cy="318"  r="4" fill="#FF6090" opacity="0.8"/>
+
+  <!-- ── Face Plate ─────────────────────────────────── -->
+  <!-- Face shadow/depth -->
+  <rect x="894" y="366" width="132" height="115" rx="14"
+        fill="#000000" opacity="0.4" transform="translate(4,4)"/>
+
+  <!-- Face main -->
+  <rect x="894" y="366" width="132" height="115" rx="14" fill="#F0F0F0"/>
+
+  <!-- Face center vertical stripe (cyan) -->
+  <rect x="951" y="366" width="18" height="115" fill="#00BCD4" opacity="0.75"
+        clip-path="url(#faceClipInner)"/>
+  <!-- Clip the stripe to the face rounded rect -->
+  <defs>
+    <clipPath id="faceClipInner">
+      <rect x="894" y="366" width="132" height="115" rx="14"/>
+    </clipPath>
+  </defs>
+  <rect x="951" y="366" width="18" height="115" fill="#00BCD4" opacity="0.7"
+        clip-path="url(#faceClipInner)"/>
+
+  <!-- Left eye slit -->
+  <rect x="904" y="408" width="42" height="11" rx="5.5" fill="#1A0B2E" opacity="0.9"/>
+  <!-- Right eye slit -->
+  <rect x="974" y="408" width="42" height="11" rx="5.5" fill="#1A0B2E" opacity="0.9"/>
+
+  <!-- Eye inner glow -->
+  <rect x="908" y="410" width="34" height="7" rx="3.5" fill="#00BCD4" opacity="0.3"/>
+  <rect x="978" y="410" width="34" height="7" rx="3.5" fill="#00BCD4" opacity="0.3"/>
+
+  <!-- Face specular highlight -->
+  <ellipse cx="916" cy="376" rx="18" ry="10" fill="#FFFFFF" opacity="0.45"
+           transform="rotate(-15, 916, 376)"/>
+
+  <!-- ── Neck hydraulics ────────────────────────────── -->
+  <rect x="942" y="479" width="36" height="50" rx="4" fill="#00ACC1"/>
+  <!-- Hydraulic lines -->
+  <line x1="950" y1="480" x2="950" y2="528" stroke="#0D0216" stroke-width="2.5" opacity="0.45"/>
+  <line x1="960" y1="480" x2="960" y2="528" stroke="#0D0216" stroke-width="2.5" opacity="0.45"/>
+  <line x1="970" y1="480" x2="970" y2="528" stroke="#0D0216" stroke-width="2.5" opacity="0.45"/>
+  <!-- Neck highlight -->
+  <rect x="942" y="479" width="10" height="50" rx="3" fill="#FFFFFF" opacity="0.12"/>
+
+  <!-- ── Jacket / Shoulders ─────────────────────────── -->
+  <!-- Left shoulder panel (amber) -->
+  <path d="M 812 640 L 862 528 L 942 528 L 920 640 Z" fill="#FFC107"/>
+  <path d="M 812 640 L 862 528 L 942 528 L 920 640 Z"
+        fill="none" stroke="#E65100" stroke-width="1" opacity="0.4"/>
+
+  <!-- Right shoulder panel (amber) -->
+  <path d="M 1108 640 L 1058 528 L 978 528 L 1000 640 Z" fill="#FFC107"/>
+  <path d="M 1108 640 L 1058 528 L 978 528 L 1000 640 Z"
+        fill="none" stroke="#E65100" stroke-width="1" opacity="0.4"/>
+
+  <!-- Jacket center body (magenta) -->
+  <path d="M 942 528 L 978 528 L 1000 640 L 920 640 Z" fill="#E91E63"/>
+  <path d="M 942 528 L 978 528 L 1000 640 L 920 640 Z"
+        fill="none" stroke="#C0174F" stroke-width="1" opacity="0.5"/>
+
+  <!-- Jacket collar/neckline (teal) -->
+  <path d="M 942 528 L 960 510 L 978 528 L 960 535 Z" fill="#00BCD4"/>
+
+  <!-- Jacket highlight / sheen on left panel -->
+  <path d="M 820 640 L 865 535 L 878 535 L 832 640 Z" fill="#FFFFFF" opacity="0.08"/>
+
+  <!-- Jacket chest highlight on magenta panel -->
+  <path d="M 950 530 L 960 512 L 965 530 Z" fill="#FFFFFF" opacity="0.2"/>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 3: TEXT CONTENT (left half)                          -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- ── Pre-header label ──────────────────────────────────── -->
+  <text x="80" y="158"
+        font-family="'Courier New', 'Monaco', 'Consolas', monospace"
+        font-size="19" font-weight="400"
+        fill="#00BCD4" letter-spacing="2.5" opacity="0.88">github.com / fro-bot</text>
+
+  <!-- ── Main title ─────────────────────────────────────────── -->
+  <text x="76" y="302"
+        font-family="'Arial Black', 'Impact', 'Inter', system-ui, sans-serif"
+        font-size="118" font-weight="900"
+        fill="url(#titleGrad)"
+        letter-spacing="-3">agent</text>
+
+  <!-- Title glow layer (subtle) -->
+  <text x="76" y="302"
+        font-family="'Arial Black', 'Impact', 'Inter', system-ui, sans-serif"
+        font-size="118" font-weight="900"
+        fill="#00BCD4" opacity="0.07"
+        letter-spacing="-3" filter="url(#afroHalo)">agent</text>
+
+  <!-- ── Accent underbar ────────────────────────────────────── -->
+  <rect x="80" y="318" width="492" height="5" rx="2.5" fill="url(#colorBar)" opacity="0.95"/>
+
+  <!-- ── Tagline ────────────────────────────────────────────── -->
+  <text x="80" y="370"
+        font-family="'Inter', 'Segoe UI', system-ui, sans-serif"
+        font-size="25" font-weight="400"
+        fill="#F5EBEB" opacity="0.95"
+        letter-spacing="0.3">AI-powered GitHub automation</text>
+
+  <text x="80" y="406"
+        font-family="'Inter', 'Segoe UI', system-ui, sans-serif"
+        font-size="21" font-weight="400"
+        fill="#00BCD4" opacity="0.82"
+        letter-spacing="0.3">with persistent session memory</text>
+
+  <!-- ── Tech badges ────────────────────────────────────────── -->
+
+  <!-- TypeScript -->
+  <rect x="80" y="448" width="122" height="31" rx="4"
+        fill="#1A0B2E" stroke="#00BCD4" stroke-width="1.2" opacity="0.95"/>
+  <text x="141" y="469" text-anchor="middle"
+        font-family="'Courier New', monospace" font-size="13" font-weight="500"
+        fill="#00BCD4" letter-spacing="0.5">TypeScript</text>
+
+  <!-- ESM -->
+  <rect x="216" y="448" width="68" height="31" rx="4"
+        fill="#1A0B2E" stroke="#FFC107" stroke-width="1.2" opacity="0.95"/>
+  <text x="250" y="469" text-anchor="middle"
+        font-family="'Courier New', monospace" font-size="13" font-weight="500"
+        fill="#FFC107" letter-spacing="0.5">ESM</text>
+
+  <!-- Node 24 -->
+  <rect x="298" y="448" width="90" height="31" rx="4"
+        fill="#1A0B2E" stroke="#E91E63" stroke-width="1.2" opacity="0.95"/>
+  <text x="343" y="469" text-anchor="middle"
+        font-family="'Courier New', monospace" font-size="13" font-weight="500"
+        fill="#E91E63" letter-spacing="0.5">Node 24</text>
+
+  <!-- MIT License -->
+  <rect x="402" y="448" width="82" height="31" rx="4"
+        fill="#1A0B2E" stroke="#F5EBEB" stroke-width="1.2" opacity="0.95"/>
+  <text x="443" y="469" text-anchor="middle"
+        font-family="'Courier New', monospace" font-size="13" font-weight="500"
+        fill="#F5EBEB" letter-spacing="0.5">MIT</text>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 4: FLOATING PARTICLES / STARS                        -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- Scattered glowing dots — depth/parallax feel -->
+  <!-- Cyan particles -->
+  <circle cx="142" cy="56"  r="2.2" fill="#00BCD4" opacity="0.65" filter="url(#glowSoft)"/>
+  <circle cx="340" cy="88"  r="1.6" fill="#00E5FF" opacity="0.55"/>
+  <circle cx="510" cy="44"  r="1.8" fill="#00BCD4" opacity="0.5"/>
+  <circle cx="58"  cy="492" r="2"   fill="#00BCD4" opacity="0.45"/>
+  <circle cx="275" cy="525" r="1.4" fill="#00BCD4" opacity="0.4"/>
+  <circle cx="555" cy="540" r="1.8" fill="#00BCD4" opacity="0.38"/>
+
+  <!-- Magenta particles -->
+  <circle cx="220" cy="72"  r="2"   fill="#E91E63" opacity="0.5"  filter="url(#glowSoft)"/>
+  <circle cx="455" cy="62"  r="1.5" fill="#FF4080" opacity="0.45"/>
+  <circle cx="180" cy="570" r="2"   fill="#E91E63" opacity="0.42"/>
+  <circle cx="590" cy="76"  r="1.8" fill="#E91E63" opacity="0.38"/>
+
+  <!-- Amber particles -->
+  <circle cx="380" cy="54"  r="2.2" fill="#FFC107" opacity="0.55" filter="url(#glowSoft)"/>
+  <circle cx="90"  cy="118" r="1.6" fill="#FFD740" opacity="0.4"/>
+  <circle cx="490" cy="552" r="1.8" fill="#FFC107" opacity="0.38"/>
+
+  <!-- Right side particles around character -->
+  <circle cx="1230" cy="80"  r="2"   fill="#00BCD4" opacity="0.5"  filter="url(#glowSoft)"/>
+  <circle cx="1190" cy="130" r="1.5" fill="#E91E63" opacity="0.45"/>
+  <circle cx="1255" cy="290" r="2.2" fill="#FFC107" opacity="0.45" filter="url(#glowSoft)"/>
+  <circle cx="758"  cy="58"  r="1.8" fill="#00BCD4" opacity="0.5"/>
+  <circle cx="1172" cy="55"  r="1.6" fill="#E91E63" opacity="0.4"/>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 5: CORNER BRACKETS + SCANLINE ACCENTS                -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- Top-left corner bracket -->
+  <path d="M 22 22 H 68 M 22 22 V 68"
+        fill="none" stroke="#00BCD4" stroke-width="2.5" opacity="0.55"
+        stroke-linecap="square"/>
+
+  <!-- Top-right corner bracket -->
+  <path d="M 1258 22 H 1212 M 1258 22 V 68"
+        fill="none" stroke="#E91E63" stroke-width="2.5" opacity="0.55"
+        stroke-linecap="square"/>
+
+  <!-- Bottom-left corner bracket -->
+  <path d="M 22 618 H 68 M 22 618 V 572"
+        fill="none" stroke="#FFC107" stroke-width="2.5" opacity="0.55"
+        stroke-linecap="square"/>
+
+  <!-- Bottom-right corner bracket -->
+  <path d="M 1258 618 H 1212 M 1258 618 V 572"
+        fill="none" stroke="#00BCD4" stroke-width="2.5" opacity="0.55"
+        stroke-linecap="square"/>
+
+  <!-- Thin horizontal scanline accent mid-left -->
+  <line x1="80" y1="132" x2="560" y2="132"
+        stroke="#00BCD4" stroke-width="0.8" opacity="0.25"/>
+
+  <!-- Small diamond at scanline end -->
+  <polygon points="562,128 568,132 562,136 556,132"
+           fill="#00BCD4" opacity="0.45"/>
+
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!--  LAYER 6: BOTTOM ACCENT BAR                                 -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- Thin glow line above bar -->
+  <rect y="626" width="1280" height="1" fill="url(#colorBar)" opacity="0.5"/>
+  <!-- Main color bar -->
+  <rect y="627" width="1280" height="13" fill="url(#colorBar)"/>
+
+  </g><!-- end bannerClip -->
+
+</svg>
