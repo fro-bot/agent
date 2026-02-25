@@ -62,6 +62,7 @@ describe('omo', () => {
           'oh-my-opencode@1.2.3',
           'install',
           '--no-tui',
+          '--skip-auth',
           '--claude=no',
           '--copilot=no',
           '--gemini=no',
@@ -183,6 +184,7 @@ describe('omo', () => {
           'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
+          '--skip-auth',
           '--claude=no',
           '--copilot=no',
           '--gemini=no',
@@ -218,6 +220,7 @@ describe('omo', () => {
           'oh-my-opencode@3.5.5',
           'install',
           '--no-tui',
+          '--skip-auth',
           '--claude=yes',
           '--copilot=yes',
           '--gemini=yes',
@@ -227,6 +230,24 @@ describe('omo', () => {
         ],
         expect.objectContaining({ignoreReturnCode: true}),
       )
+    })
+
+    it('includes --skip-auth flag for CI reliability', async () => {
+      // #given - a standard install invocation
+      const execMock = vi.fn().mockResolvedValue(0)
+      const mockDeps = createMockDeps({
+        execAdapter: createMockExecAdapter({exec: execMock}),
+      })
+
+      // #when
+      await installOmo('3.5.5', mockDeps)
+
+      // #then - --skip-auth must appear after --no-tui in the args
+      const calledArgs: string[] = (execMock.mock.calls[0] as [string, string[], unknown])[1]
+      const noTuiIndex = calledArgs.indexOf('--no-tui')
+      const skipAuthIndex = calledArgs.indexOf('--skip-auth')
+      expect(skipAuthIndex).toBeGreaterThan(-1)
+      expect(skipAuthIndex).toBe(noTuiIndex + 1)
     })
 
     it('captures both stdout and stderr', async () => {
