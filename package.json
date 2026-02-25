@@ -1,6 +1,6 @@
 {
   "name": "@fro-bot/agent",
-  "version": "0.26.21",
+  "version": "0.27.0",
   "private": true,
   "description": "@fro-bot Agent",
   "keywords": [
