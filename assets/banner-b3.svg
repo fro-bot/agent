@@ -1,0 +1,97 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="b3-bg-grad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1A0B2E"/>
+      <stop offset="100%" stop-color="#0D0216"/>
+    </radialGradient>
+    <radialGradient id="b3-nebula" cx="30%" cy="60%" r="60%">
+      <stop offset="0%" stop-color="#E91E63" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b3-nebula2" cx="80%" cy="20%" r="60%">
+      <stop offset="0%" stop-color="#00BCD4" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="b3-text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="100%" stop-color="#00BCD4"/>
+    </linearGradient>
+    <linearGradient id="b3-bar-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFC107"/>
+      <stop offset="50%" stop-color="#E91E63"/>
+      <stop offset="100%" stop-color="#00BCD4"/>
+    </linearGradient>
+    <filter id="b3-glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#b3-bg-grad)"/>
+  <rect width="1280" height="640" fill="url(#b3-nebula)"/>
+  <rect width="1280" height="640" fill="url(#b3-nebula2)"/>
+
+  <!-- Concentric Rings (Void Pulse) -->
+  <g fill="none" stroke-width="1" opacity="0.3">
+    <circle cx="640" cy="320" r="100" stroke="#00BCD4" opacity="0.3"/>
+    <circle cx="640" cy="320" r="180" stroke="#E91E63" opacity="0.25"/>
+    <circle cx="640" cy="320" r="260" stroke="#00BCD4" opacity="0.2"/>
+    <circle cx="640" cy="320" r="340" stroke="#E91E63" opacity="0.15"/>
+    <circle cx="640" cy="320" r="420" stroke="#00BCD4" opacity="0.1"/>
+  </g>
+
+  <!-- Stars (Scattered) -->
+  <g fill="#F5EBEB" opacity="0.7">
+    <circle cx="50" cy="50" r="1"/> <circle cx="1200" cy="600" r="1.5"/>
+    <circle cx="300" cy="100" r="1"/> <circle cx="900" cy="500" r="2"/>
+    <circle cx="600" cy="50" r="1"/> <circle cx="400" cy="550" r="1"/>
+    <circle cx="800" cy="100" r="1.5"/> <circle cx="200" cy="400" r="1"/>
+    <circle cx="1100" cy="200" r="1"/> <circle cx="100" cy="300" r="1.5"/>
+    <circle cx="500" cy="200" r="1"/> <circle cx="700" cy="450" r="1"/>
+    <circle cx="1000" cy="50" r="2"/> <circle cx="150" cy="150" r="1"/>
+    <circle cx="1250" cy="300" r="1"/> <circle cx="50" cy="600" r="1.5"/>
+    <circle cx="350" cy="350" r="1"/> <circle cx="950" cy="250" r="1"/>
+    <circle cx="650" cy="600" r="1"/> <circle cx="850" cy="50" r="1"/>
+    <circle cx="250" cy="500" r="1.5"/> <circle cx="1150" cy="400" r="1"/>
+    <circle cx="450" cy="100" r="1"/> <circle cx="750" cy="550" r="1"/>
+    <circle cx="1050" cy="150" r="1"/> <circle cx="550" cy="300" r="1.5"/>
+    <circle cx="150" cy="450" r="1"/> <circle cx="1200" cy="100" r="1"/>
+    <circle cx="900" cy="350" r="1"/> <circle cx="300" cy="600" r="1"/>
+    <circle cx="700" cy="100" r="1.5"/> <circle cx="500" cy="500" r="1"/>
+    <circle cx="1100" cy="550" r="1"/> <circle cx="200" cy="200" r="1"/>
+    <circle cx="800" cy="400" r="1"/> <circle cx="400" cy="50" r="1.5"/>
+    <circle cx="1000" cy="300" r="1"/> <circle cx="600" cy="250" r="1"/>
+    <circle cx="100" cy="500" r="1"/> <circle cx="1250" cy="500" r="1"/>
+  </g>
+
+  <!-- Rotating Globe Right -->
+  <g transform="translate(950, 320)">
+    <ellipse cx="0" cy="0" rx="150" ry="50" stroke="#FFC107" stroke-width="1" fill="none" opacity="0.6" transform="rotate(0)"/>
+    <ellipse cx="0" cy="0" rx="150" ry="50" stroke="#00BCD4" stroke-width="1" fill="none" opacity="0.6" transform="rotate(45)"/>
+    <ellipse cx="0" cy="0" rx="150" ry="50" stroke="#E91E63" stroke-width="1" fill="none" opacity="0.6" transform="rotate(90)"/>
+    <ellipse cx="0" cy="0" rx="150" ry="50" stroke="#FFC107" stroke-width="1" fill="none" opacity="0.6" transform="rotate(135)"/>
+    <circle cx="0" cy="0" r="10" fill="#F5EBEB" filter="url(#b3-glow)"/>
+  </g>
+
+  <!-- Signal Arc -->
+  <path d="M 550 320 Q 750 250 850 320" stroke="#00BCD4" stroke-width="2" stroke-dasharray="10 10" fill="none" opacity="0.5"/>
+
+  <!-- Main Content Left -->
+  <g transform="translate(80, 300)">
+    <!-- URL -->
+    <text x="0" y="-120" font-family="'Courier New', monospace" font-size="20" fill="#00BCD4">fro-bot/agent</text>
+    
+    <!-- Title -->
+    <text x="-5" y="30" font-family="'Arial Black', 'Arial', sans-serif" font-weight="bold" font-size="170" fill="url(#b3-text-grad)" filter="url(#b3-glow)">agent</text>
+    
+    <!-- Tagline -->
+    <text x="0" y="90" font-family="'Arial', sans-serif" font-size="26" fill="#F5EBEB">Autonomous AI for every channel, every workflow</text>
+    
+    <!-- CTA -->
+    <text x="0" y="130" font-family="'Arial', sans-serif" font-size="18" fill="#FFC107" opacity="0.9">▸ @fro-bot — mention it anywhere. Watch it work.</text>
+  </g>
+
+  <!-- Bottom Accent Bar (Reversed) -->
+  <rect x="0" y="632" width="1280" height="8" fill="url(#b3-bar-grad)"/>
+</svg>

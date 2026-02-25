@@ -1,0 +1,90 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="b2-bg-grad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1A0B2E"/>
+      <stop offset="100%" stop-color="#0D0216"/>
+    </radialGradient>
+    <radialGradient id="b2-nebula" cx="80%" cy="20%" r="60%">
+      <stop offset="0%" stop-color="#E91E63" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b2-nebula2" cx="20%" cy="80%" r="60%">
+      <stop offset="0%" stop-color="#00BCD4" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="b2-text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="100%" stop-color="#00BCD4"/>
+    </linearGradient>
+    <linearGradient id="b2-bar-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="50%" stop-color="#00BCD4"/>
+      <stop offset="100%" stop-color="#FFC107"/>
+    </linearGradient>
+    <filter id="b2-glow">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <pattern id="b2-stripes" width="40" height="40" patternUnits="userSpaceOnUse" patternTransform="rotate(30)">
+      <line x1="0" y1="0" x2="0" y2="40" stroke="#F5EBEB" stroke-width="1" opacity="0.05"/>
+    </pattern>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#b2-bg-grad)"/>
+  <rect width="1280" height="640" fill="url(#b2-nebula)"/>
+  <rect width="1280" height="640" fill="url(#b2-nebula2)"/>
+  
+  <!-- Diagonal Stripes Pattern -->
+  <rect width="1280" height="640" fill="url(#b2-stripes)"/>
+
+  <!-- Diffuse Glow Circles -->
+  <circle cx="200" cy="100" r="150" fill="#00BCD4" opacity="0.1" filter="url(#b2-glow)"/>
+  <circle cx="1100" cy="500" r="200" fill="#E91E63" opacity="0.1" filter="url(#b2-glow)"/>
+  <circle cx="600" cy="300" r="100" fill="#FFC107" opacity="0.05" filter="url(#b2-glow)"/>
+
+  <!-- Decorative Triangles Corners -->
+  <polygon points="0,0 100,0 0,100" fill="#FFC107" opacity="0.2"/>
+  <polygon points="1280,640 1180,640 1280,540" fill="#FFC107" opacity="0.2"/>
+
+  <!-- Abstract Hexagonal Prism Right -->
+  <g transform="translate(1050, 320)">
+    <!-- Back Face -->
+    <polygon points="0,-150 130,-75 130,75 0,150 -130,75 -130,-75" fill="#1A0B2E" stroke="#00BCD4" stroke-width="2" opacity="0.5"/>
+    
+    <!-- Inner Diamond / Prism Core -->
+    <path d="M 0 -100 L 80 0 L 0 100 L -80 0 Z" fill="none" stroke="#E91E63" stroke-width="3" filter="url(#b2-glow)"/>
+    
+    <!-- Connecting Lines for Depth -->
+    <line x1="0" y1="-150" x2="0" y2="-100" stroke="#00BCD4" stroke-width="1" opacity="0.5"/>
+    <line x1="0" y1="150" x2="0" y2="100" stroke="#00BCD4" stroke-width="1" opacity="0.5"/>
+    <line x1="130" y1="0" x2="80" y2="0" stroke="#00BCD4" stroke-width="1" opacity="0.5"/> <!-- Approx side -->
+    <line x1="-130" y1="0" x2="-80" y2="0" stroke="#00BCD4" stroke-width="1" opacity="0.5"/>
+    
+    <!-- Floating Elements around Prism -->
+    <circle cx="100" cy="-100" r="5" fill="#FFC107" opacity="0.8"/>
+    <circle cx="-100" cy="100" r="8" fill="#00BCD4" opacity="0.8"/>
+    <circle cx="120" cy="50" r="4" fill="#E91E63" opacity="0.8"/>
+  </g>
+
+  <!-- Main Content Left-Center -->
+  <g transform="translate(80, 320)">
+    <!-- URL -->
+    <text x="0" y="-100" font-family="'Courier New', monospace" font-size="22" fill="#00BCD4">fro-bot/agent</text>
+    
+    <!-- Title -->
+    <text x="-5" y="40" font-family="'Arial Black', 'Arial', sans-serif" font-weight="bold" font-size="150" fill="url(#b2-text-grad)" filter="url(#b2-glow)">agent</text>
+    
+    <!-- Tagline -->
+    <text x="0" y="90" font-family="'Arial', sans-serif" font-size="28" fill="#F5EBEB">Autonomous AI for every channel, every workflow</text>
+    
+    <!-- CTA -->
+    <text x="0" y="130" font-family="'Arial', sans-serif" font-size="18" fill="#FFC107" opacity="0.9">@fro-bot — mention it anywhere. Watch it work.</text>
+  </g>
+
+  <!-- Top Accent Bar -->
+  <rect x="0" y="0" width="1280" height="4" fill="url(#b2-bar-grad)"/>
+  
+  <!-- Bottom Accent Bar -->
+  <rect x="0" y="632" width="1280" height="8" fill="url(#b2-bar-grad)"/>
+</svg>
