@@ -1,0 +1,88 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="a-bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0D0216"/>
+      <stop offset="100%" stop-color="#1A0B2E"/>
+    </linearGradient>
+    <pattern id="a-grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#00BCD4" stroke-width="0.5" opacity="0.1"/>
+    </pattern>
+    <filter id="a-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="a-text-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#a-bg-grad)"/>
+  <rect width="1280" height="640" fill="url(#a-grid)"/>
+
+  <!-- Circuit Traces -->
+  <g stroke="#00E5FF" stroke-width="2" fill="none" opacity="0.4" filter="url(#a-glow)">
+    <path d="M 100 640 L 100 500 L 200 500 L 200 300 L 50 300"/>
+    <circle cx="50" cy="300" r="4" fill="#00E5FF"/>
+    <path d="M 1180 0 L 1180 150 L 1000 150 L 1000 400 L 1280 400"/>
+    <circle cx="1000" cy="400" r="4" fill="#00E5FF"/>
+    <path d="M 600 640 L 600 580 L 800 580 L 800 640"/>
+  </g>
+
+  <!-- Decorative Circuit/Hex Element Right -->
+  <g transform="translate(900, 320)" opacity="0.3">
+    <circle cx="0" cy="0" r="150" stroke="#00BCD4" stroke-width="2" fill="none" stroke-dasharray="20 10"/>
+    <circle cx="0" cy="0" r="120" stroke="#E91E63" stroke-width="2" fill="none" stroke-dasharray="40 20"/>
+    <circle cx="0" cy="0" r="90" stroke="#FFC107" stroke-width="1" fill="none"/>
+    <path d="M -150 0 L 150 0 M 0 -150 L 0 150" stroke="#00BCD4" stroke-width="1"/>
+    <circle cx="0" cy="0" r="20" fill="#00E5FF" filter="url(#a-glow)"/>
+  </g>
+
+  <!-- Main Content Left -->
+  <g transform="translate(120, 280)">
+    <!-- Title -->
+    <text x="0" y="0" font-family="'Courier New', monospace" font-weight="bold" font-size="120" fill="#F5EBEB" filter="url(#a-text-glow)">
+      agent<tspan fill="#00E5FF" font-size="120">_</tspan>
+    </text>
+    
+    <!-- Subtitle -->
+    <text x="5" y="60" font-family="'Courier New', monospace" font-size="32" fill="#00BCD4" letter-spacing="2">
+      AI-powered GitHub automation
+    </text>
+
+    <!-- URL -->
+    <text x="5" y="110" font-family="'Courier New', monospace" font-size="20" fill="#E91E63" opacity="0.8">
+      github.com/fro-bot
+    </text>
+
+    <!-- Badges -->
+    <g transform="translate(5, 150)">
+      <rect x="0" y="0" width="110" height="30" rx="4" fill="#1A0B2E" stroke="#00BCD4" stroke-width="1"/>
+      <text x="55" y="20" font-family="sans-serif" font-size="14" fill="#00BCD4" text-anchor="middle">TypeScript</text>
+      
+      <rect x="120" y="0" width="60" height="30" rx="4" fill="#1A0B2E" stroke="#E91E63" stroke-width="1"/>
+      <text x="150" y="20" font-family="sans-serif" font-size="14" fill="#E91E63" text-anchor="middle">ESM</text>
+
+      <rect x="190" y="0" width="80" height="30" rx="4" fill="#1A0B2E" stroke="#FFC107" stroke-width="1"/>
+      <text x="230" y="20" font-family="sans-serif" font-size="14" fill="#FFC107" text-anchor="middle">Node 24</text>
+
+      <rect x="280" y="0" width="50" height="30" rx="4" fill="#1A0B2E" stroke="#F5EBEB" stroke-width="1"/>
+      <text x="305" y="20" font-family="sans-serif" font-size="14" fill="#F5EBEB" text-anchor="middle">MIT</text>
+    </g>
+  </g>
+
+  <!-- Bottom Accent Bar -->
+  <defs>
+    <linearGradient id="a-bar-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="50%" stop-color="#00BCD4"/>
+      <stop offset="100%" stop-color="#FFC107"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="632" width="1280" height="8" fill="url(#a-bar-grad)"/>
+
+</svg>
