@@ -34,24 +34,29 @@ concurrency:
 env:
   SCHEDULE_PROMPT: |
     Perform daily repository maintenance and update a SINGLE rolling issue titled
-    "Daily Maintenance Report" in this repository. If the issue does not exist,
-    create it. If the most recent matching issue is closed, reopen it and append
-    to that same issue instead of creating a new one.
+    "Daily Maintenance Report" in this repository.
+
+    Search for an open issue with this exact title. If multiple matches exist,
+    use the most recently updated one. If no open issue exists, create it.
+    If the most recent matching issue is closed, reopen it instead of creating
+    a new one.
 
     Append a new dated section for each run using:
     "## YYYY-MM-DD (UTC)" and do not remove prior sections.
     Keep the issue bounded: after appending today's section, collapse sections
-    older than 14 days into a running Historical Summary so the issue remains concise.
+    older than 14 days into a running Historical Summary so the issue stays concise.
 
     Include links only (no full content duplication). Keep it concise and actionable.
+    Flag items that newly crossed the stale threshold since the last run with a ★ marker.
 
     Sections (in order):
-    - Summary metrics (new issues, open PRs, stale issues/PRs, failing main checks, security alerts)
+    - Summary metrics (issues opened since last run, currently open PRs, stale
+      issues/PRs count, main branch check status, security alerts if accessible)
     - Stale issues (no activity >30 days; recommend next step)
     - Stale PRs (no activity >7 days; stale >14 days)
     - Unassigned bugs (label bug, no assignee)
     - Recommended actions (bulleted checklist)
-    - Notes (use "data unavailable" where needed)
+    - Notes (use "data unavailable" for any inaccessible data source)
 
     Do NOT comment on or modify individual issues/PRs. Do NOT apply labels.
     Do NOT open PRs. This run must update ONE issue only.
