@@ -1,80 +1,146 @@
 <svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="c-bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0D0216"/>
-      <stop offset="100%" stop-color="#1A0B2E"/>
+
+    <radialGradient id="b1-bg-grad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1A0B2E"/>
+      <stop offset="100%" stop-color="#0D0216"/>
+    </radialGradient>
+    <radialGradient id="b1-nebula" cx="80%" cy="20%" r="60%">
+      <stop offset="0%" stop-color="#E91E63" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b1-nebula2" cx="20%" cy="80%" r="60%">
+      <stop offset="0%" stop-color="#00BCD4" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#0D0216" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="b1-text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="100%" stop-color="#00BCD4"/>
     </linearGradient>
-    <filter id="c-blur" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="10" result="blur"/>
-      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-    <filter id="c-glass" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="5" result="blur"/>
-      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="goo"/>
-      <feComposite in="SourceGraphic" in2="goo" operator="atop"/>
-    </filter>
-    <pattern id="c-scanlines" width="10" height="4" patternUnits="userSpaceOnUse">
-      <rect width="10" height="1" fill="#000" opacity="0.2"/>
-    </pattern>
-  </defs>
-
-  <!-- Background -->
-  <rect width="1280" height="640" fill="url(#c-bg-grad)"/>
-  <rect width="1280" height="640" fill="url(#c-scanlines)"/>
-
-  <!-- Abstract Shapes -->
-  <circle cx="200" cy="100" r="150" fill="#E91E63" opacity="0.1" filter="url(#c-blur)"/>
-  <circle cx="1000" cy="500" r="200" fill="#00BCD4" opacity="0.1" filter="url(#c-blur)"/>
-  <rect x="500" y="200" width="300" height="300" fill="#FFC107" opacity="0.05" transform="rotate(45 650 350)"/>
-
-  <!-- Glass Panel -->
-  <rect x="100" y="100" width="1080" height="440" rx="20" fill="#F5EBEB" fill-opacity="0.05" stroke="#F5EBEB" stroke-opacity="0.2" stroke-width="1"/>
-
-  <!-- Neon Accents -->
-  <line x1="100" y1="140" x2="1180" y2="140" stroke="#00E5FF" stroke-width="2" opacity="0.5"/>
-  <line x1="100" y1="500" x2="1180" y2="500" stroke="#E91E63" stroke-width="2" opacity="0.5"/>
-
-  <!-- Main Content Center -->
-  <g transform="translate(640, 320)" text-anchor="middle">
-    <!-- Title -->
-    <text x="0" y="20" font-family="'Arial', sans-serif" font-weight="900" font-size="200" fill="#F5EBEB" opacity="0.9" letter-spacing="-5">
-      agent
-    </text>
-    
-    <!-- Subtitle -->
-    <text x="0" y="80" font-family="'Arial', sans-serif" font-size="24" fill="#00BCD4" letter-spacing="4" text-transform="uppercase">
-      AI-powered GitHub automation
-    </text>
-
-    <!-- URL -->
-    <text x="0" y="120" font-family="'Courier New', monospace" font-size="16" fill="#E91E63" opacity="0.8">
-      github.com/fro-bot
-    </text>
-
-    <!-- Badges -->
-    <g transform="translate(-135, 150)">
-      <rect x="0" y="0" width="80" height="24" rx="4" fill="#1A0B2E" stroke="#00BCD4" stroke-width="1"/>
-      <text x="40" y="16" font-family="sans-serif" font-size="10" fill="#00BCD4" text-anchor="middle">TypeScript</text>
-      
-      <rect x="90" y="0" width="50" height="24" rx="4" fill="#1A0B2E" stroke="#E91E63" stroke-width="1"/>
-      <text x="115" y="16" font-family="sans-serif" font-size="10" fill="#E91E63" text-anchor="middle">ESM</text>
-
-      <rect x="150" y="0" width="70" height="24" rx="4" fill="#1A0B2E" stroke="#FFC107" stroke-width="1"/>
-      <text x="185" y="16" font-family="sans-serif" font-size="10" fill="#FFC107" text-anchor="middle">Node 24</text>
-
-      <rect x="230" y="0" width="40" height="24" rx="4" fill="#1A0B2E" stroke="#F5EBEB" stroke-width="1"/>
-      <text x="250" y="16" font-family="sans-serif" font-size="10" fill="#F5EBEB" text-anchor="middle">MIT</text>
-    </g>
-  </g>
-
-  <!-- Bottom Accent Bar -->
-  <defs>
-    <linearGradient id="c-bar-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+    <linearGradient id="b1-bar-grad" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#E91E63"/>
       <stop offset="50%" stop-color="#00BCD4"/>
       <stop offset="100%" stop-color="#FFC107"/>
     </linearGradient>
-  </defs>
-  <rect x="0" y="632" width="1280" height="8" fill="url(#c-bar-grad)"/>
+    <filter id="b1-glow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
 
+
+    <clipPath id="v3-avatar-clip">
+      <circle cx="0" cy="0" r="195"/>
+    </clipPath>
+    <radialGradient id="v3-portal-bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#E91E63" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#E91E63" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="v3-ring-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E91E63"/>
+      <stop offset="33%" stop-color="#00BCD4"/>
+      <stop offset="66%" stop-color="#FFC107"/>
+      <stop offset="100%" stop-color="#E91E63"/>
+    </linearGradient>
+    <filter id="v3-strong-glow">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#b1-bg-grad)"/>
+  <rect width="1280" height="640" fill="url(#b1-nebula)"/>
+  <rect width="1280" height="640" fill="url(#b1-nebula2)"/>
+
+  <!-- B3 Concentric Rings (Background Layer) -->
+  <g transform="translate(640, 320)" fill="none" stroke-width="1.5">
+    <circle r="100" stroke="#00BCD4" opacity="0.25"/>
+    <circle r="180" stroke="#E91E63" opacity="0.20"/>
+    <circle r="260" stroke="#00BCD4" opacity="0.15"/>
+    <circle r="340" stroke="#E91E63" opacity="0.12"/>
+    <circle r="420" stroke="#00BCD4" opacity="0.08"/>
+  </g>
+
+  <!-- Stars (Denser top-right) -->
+  <g fill="#F5EBEB" opacity="0.6">
+    <!-- Scattered -->
+    <circle cx="50" cy="50" r="1"/>
+    <circle cx="150" cy="550" r="1.5"/>
+    <circle cx="300" cy="100" r="1"/>
+    <circle cx="450" cy="500" r="1"/>
+    <circle cx="600" cy="50" r="1.5"/>
+    <circle cx="200" cy="300" r="1"/>
+    <circle cx="100" cy="600" r="1"/>
+    
+    <!-- Top Right Cluster -->
+    <circle cx="800" cy="100" r="1.5"/>
+    <circle cx="850" cy="50" r="1"/>
+    <circle cx="900" cy="150" r="2"/>
+    <circle cx="950" cy="80" r="1"/>
+    <circle cx="1000" cy="200" r="1"/>
+    <circle cx="1050" cy="40" r="1.5"/>
+    <circle cx="1100" cy="120" r="1"/>
+    <circle cx="1150" cy="60" r="2"/>
+    <circle cx="1200" cy="180" r="1"/>
+    <circle cx="1250" cy="30" r="1.5"/>
+    <circle cx="1180" cy="250" r="1"/>
+    <circle cx="1080" cy="300" r="1"/>
+    <circle cx="980" cy="280" r="1"/>
+    <circle cx="1220" cy="100" r="1"/>
+    <circle cx="1120" cy="150" r="1.5"/>
+    <circle cx="1020" cy="90" r="1"/>
+    <circle cx="920" cy="180" r="1"/>
+    <circle cx="880" cy="220" r="1"/>
+    <circle cx="1160" cy="320" r="1"/>
+    <circle cx="1240" cy="280" r="1.5"/>
+    <circle cx="1060" cy="350" r="1"/>
+    <circle cx="940" cy="380" r="1"/>
+    <circle cx="1140" cy="400" r="1"/>
+  </g>
+
+  <!-- Signal Arc -->
+  <path d="M 550 320 Q 750 250 840 320" stroke="#00BCD4" stroke-width="1.5" stroke-dasharray="8 8" fill="none" opacity="0.35"/>
+
+
+  <!-- Variant 3: Portal Glow -->
+  <g transform="translate(950, 320)">
+    <!-- Glowing Backdrop -->
+    <circle r="220" fill="url(#v3-portal-bg)"/>
+    
+    <!-- Avatar -->
+    <g clip-path="url(#v3-avatar-clip)">
+      <image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAEAAElEQVR42uz9d7xl2VUfiH/X3ueml+pVzl3d1VHdiq0MyJIQNvZgMNkePGbwGGOPk7A9YDP8/BuZYGMMDMaDEbbBAmNkMAaRJaEAKLXUQVLn6lA5v6p6+d1wzt5r/jg7rL3Pea+qOgAeu/QpdXfVffeee8Lea33XN9DlE8eZmaFIAQAsWxARwAAIACzyX8wMAPXrWn75vwcABfEa97b+zYkAMANsobQGmGEtQykFgMFc/1ZKgd3fae2O07L7fOXf2r2zBaj+b/8VmOvX+n9C/Jklf2jhX+LhEsEYE78nAyDlv0T4nvXxNs9B/XNWvCeBoJLz03YurbVQSoHInR5x3G2vlb/892z795YrFb6wPKYbvbbp+9ffr+0ct71//AxOT7p4X/+77VjyP4vH0ny/zb6z/zkiCufcWgtmQKnNv396Lepr5P/Z9qv+DIT79kZ/+fNT3wMWROoGz2n737Xdb/nr5feQ1/dG1oD62NLzkJ+vzd5vq/tNHkf+XGx1bTa7Z/Nrt9nzU/+3uw/Bbo1QuNlfyXOiOL4/A8wU7sG21/v7Ml/D/J/771efl3S9an4/Tp5RIsBaA3L3OgGwljY9/rb7oXn/pOdXvn/9QhXu6fql7twSgS2DmaC1du9pERZbAtgyAAWttVv3eNPr17YGtd1n+WvjeeXkOUj2DGvd+kBb3s/131H8Dsnf+3WDknWc/LUBgQFwdjncKQvrrQU3ro/8d2sttNbZM0Thu6nkhBBA3NwImxeWGifSGJNsRkRuF5Z3Ydg448lXBBApWGPrv6b6woeT57+U3Bj826JecHy94v8byQbbXP7bblwGu892D54xsMY0Fl35hv6hqzcNbiw2zAxyD6/fnCzbLbam+oL571lVJnlf+dtam3xuuqi3LYjNn4uLKG/6QPuf2XpR3Xzz95+TbzjxOzXf1xgTft7fvFst8um5id+fCC1FBDXPelhs69fVDwi3XtPNNhi5IeXn3VoLYwyMsdctqvJr4AuGzTb/5vnkpMjYbIHa7O9jMcNbFpdtC2PcWAgv9Fd+f+fftb4/0vve2mahmD8b7Ys/Nr2P/OZk2TUULYVVWwHSViDJ4io5p+5cbXbslP29tdYVDeli7+9Xv/nHwhrJM2ytu6ZyfVDiXuN87UyvtV+b2jbQ9nVDPJf+s8XG6teF8B0VhSI8uX5u8yelQEqF9aGt8aqf3/ge+T3rz4Xcr+rXmrA5+iYgFiLNdS2s+2geR1qccuuz47+7taZxT7Cti6LN+pfkvcVz2nbP5Zt//ZnxGVPhZvIdN6WbNVB/UWNNa9fgNzRFqtm5cV0zk6hUWVY4nD50bg9O/hzi50Fu0/UbdrI5WldB1qfOuv+LVZiottxrOClKGNYYgOsbgpSqXyNuoustbHLxCv9t43HVDzC3drf++/uigplRFEVYjDfroqhlEfE3V7qJpZtw/fdI/pkv4vkNxVnxEz+TXAFFWVHg34tbOwj53eX5UKJo8ufNvzb/u7ZN2m8Qm22EbZtH7DjS19RFARqflX9u2/GkBQ5d9/UpqhMLs/g6ajxH8WfjRiB/LqJndlM0KD0GTlAnubjblmdBHnfdmXHrxpHfP5sVPPL9/cKa34/5sWutsvdA0h3nz2cbsiA3Rr9IAgSldLgU+fqXPxc5UpEjK9bWKEJ4nTufbc+FvO/lZhaKEY5FN2dFgTHGrdvZ9fbXUiI8lhMEgZTa9P6Q5zffUNvOLRFBaRW+vyLVeCb9/uGPJW+Tw3dX5NZSkzznfv1JCx0bvk9+fxljA8qc3pOyWVGuAasaSKt8rpVSUOQLkibalzdR+X1T/1nzfJNS9X2S7YVs4x5RXzeExji/j/z9lz/3Hs3yf65k9+lBaoLsGk2yKTU2IH+A4FB5hoMBh+pKVtXMFgwbOnelHBzFNnY... (line truncated to 2000 chars)
+    </g>
+    
+    <!-- Rings -->
+    <circle r="200" stroke="url(#v3-ring-grad)" stroke-width="5" fill="none" filter="url(#v3-strong-glow)"/>
+    
+    <!-- Diamond Markers -->
+    <g fill="#FFC107">
+      <rect x="-4" y="-214" width="8" height="8" transform="rotate(45 0 -210)"/>
+      <rect x="-4" y="206" width="8" height="8" transform="rotate(45 0 210)"/>
+      <rect x="-214" y="-4" width="8" height="8" transform="rotate(45 -210 0)"/>
+      <rect x="206" y="-4" width="8" height="8" transform="rotate(45 210 0)"/>
+    </g>
+  </g>
+
+
+  <!-- Main Content Left -->
+  <g transform="translate(100, 300)">
+    <!-- URL -->
+    <text x="0" y="-120" font-family="'Courier New', monospace" font-size="20" fill="#00BCD4" opacity="0.9">fro-bot/agent</text>
+    
+    <!-- Title (High Contrast) -->
+    <text x="-5" y="20" font-family="'Arial Black', 'Arial', sans-serif" font-weight="bold" font-size="160" fill="#FFFFFF" stroke="#00BCD4" stroke-width="2" paint-order="stroke" filter="url(#b1-glow)">agent</text>
+    
+    <!-- Tagline (Smaller to fit) -->
+    <text x="0" y="80" font-family="'Arial', sans-serif" font-size="22" fill="#F5EBEB" letter-spacing="0.5">Autonomous AI for every channel, every workflow</text>
+    
+    <!-- CTA (Smaller to fit) -->
+    <text x="0" y="120" font-family="'Arial', sans-serif" font-size="18" fill="#FFC107" opacity="0.8">@fro-bot — mention it anywhere. Watch it work.</text>
+  </g>
+
+  <!-- Bottom Accent Bar -->
+  <rect x="0" y="632" width="1280" height="8" fill="url(#b1-bar-grad)"/>
 </svg>
