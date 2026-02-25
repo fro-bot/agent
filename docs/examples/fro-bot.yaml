@@ -12,7 +12,7 @@
 #   discussion_comment         — respond in Discussions (requires Discussions enabled)
 #   issues                     — auto-triage new issues; edits require @mention
 #   pull_request               — AI code review on PR open/sync/reopen
-#   schedule                   — periodic maintenance (weekly by default)
+#   schedule                   — periodic maintenance (daily by default)
 #   workflow_dispatch          — manual prompt execution via "Run workflow" button
 #
 # ── TOKENS & IDENTITY ──────────────────────────────────────────────────────
@@ -48,7 +48,7 @@
 # 1. PROMPTS (env section)
 #    - PR_REVIEW_PROMPT: Instructions for AI code reviews on pull_request
 #      events. Tailor to your project's review standards.
-#    - SCHEDULE_PROMPT: Instructions for the weekly maintenance run.
+#    - SCHEDULE_PROMPT: Instructions for the daily maintenance run.
 #    - workflow_dispatch prompts are typed by the user at trigger time.
 #
 # 2. SETUP STEPS
@@ -69,6 +69,177 @@
 # 4. TIMEOUT
 #    Default is 30 minutes. Increase timeout-minutes if your agent tasks
 #    routinely take longer (e.g. large code reviews or multi-step work).
+#
+# ── SCHEDULE PROMPT ALTERNATIVES ───────────────────────────────────────
+# The SCHEDULE_PROMPT defined in the env section below uses a read-only
+# "Daily Maintenance Report" strategy: it observes and reports but never
+# modifies code. This is the safe default.
+#
+# If you want the agent to actively fix problems on each scheduled run,
+# replace SCHEDULE_PROMPT with the autohealing variant below. Adapt the
+# commands (pnpm validate, pnpm lint, etc.) to match your project.
+#
+# ┌─ Option A: Maintenance Report (default — read-only) ───────────────
+# │ The agent scans for stale issues/PRs, failing checks, and security
+# │ alerts, then updates a single rolling issue with findings.
+# │ It does NOT push commits, open PRs, or modify code.
+# │ → Already set as SCHEDULE_PROMPT below. No changes needed.
+#
+# ┌─ Option B: Autohealing (active repair — high autonomy) ────────────
+# │ The agent fixes broken PRs, patches vulnerabilities, upgrades stale
+# │ deps, and corrects lint/type drift — then reports what it did.
+# │ It WILL push commits to PR branches and the default branch.
+# │ Use only when that level of autonomy is acceptable.
+# │
+# │ To enable: replace the SCHEDULE_PROMPT value in the env section
+# │ with the prompt below (uncomment and paste as a YAML block scalar).
+#
+#   Perform daily repository autohealing. Work through each category in
+#   order, making commits and pushing fixes directly where possible.
+#   Prefer minimal diffs and avoid destructive changes.
+#
+#   1. ERRORED PRs
+#      Find open PRs with failing CI checks. For each failing PR:
+#      a. Check out the PR branch.
+#      b. Read the failing check logs to diagnose the root cause.
+#      c. Fix the issue (type errors, lint failures, test regressions,
+#         build breaks).
+#      d. Commit with a clear message and push to the PR branch.
+#      e. Comment on the PR explaining what failed and what was fixed.
+#
+#   2. SECURITY
+#      Review Dependabot/Renovate alerts and open PRs for vulnerable deps.
+#      - If a security update PR exists but has conflicts or failures,
+#        fix and push to that PR branch.
+#      - For unaddressed critical/high advisories with no existing PR,
+#        create a new PR with the remediation.
+#      - Do NOT bulk-update unrelated deps in a security PR.
+#
+#   3. HEALTH & MAINTENANCE
+#      Check for outdated dependencies:
+#      - package.json: major version bumps.
+#      - GitHub Actions workflow files: pin unpinned actions to full SHA;
+#        update outdated pinned SHAs.
+#      Create one PR per major dependency bump. Do NOT combine unrelated
+#      upgrades.
+#
+#   4. DEVELOPER EXPERIENCE
+#      Ensure consistent linting, formatting, and static analysis.
+#      Run the project's lint and type-check commands; fix any failures.
+#      Commit safe fixes (formatting-only, lint auto-fixes) directly to
+#      the default branch. Otherwise, open a PR.
+#
+#   OUTPUT FORMAT — SINGLE SUMMARY ISSUE
+#   After completing all work, find an existing open issue titled
+#   "Daily Autohealing Report — YYYY-MM-DD" (using today's date).
+#   If it exists, UPDATE its body. If not, CREATE it.
+#
+#   The issue body MUST use this structure:
+#
+#   ## Daily Autohealing Report — YYYY-MM-DD
+#
+#   ### Errored PRs
+#   | PR | Failure | Fix | Status |
+#   | --- | --- | --- | --- |
+#   | #N | [root cause] | [what was fixed] | ✅ Fixed / ⚠️ Needs review |
+#
+#   ### Security
+#   | Advisory / PR | Severity | Action Taken |
+#   | --- | --- | --- |
+#   | [advisory or #N] | Critical/High/Medium | [fix pushed / PR created / skipped] |
+#
+#   ### Health & Maintenance
+#   | Dependency | From → To | PR |
+#   | --- | --- | --- |
+#   | [package] | vX → vY | #N |
+#
+#   ### Developer Experience
+#   - [list of fixes applied]
+#
+#   ### Needs Human Attention
+#   - [items that could not be auto-fixed, with context]
+#
+#   Do NOT create multiple issues. Do NOT comment on individual issues.
+#   Produce exactly one summary issue per run.
+#
+# ── WORKFLOW_DISPATCH PROMPT EXAMPLES ────────────────────────────────────
+# The workflow_dispatch trigger accepts a free-form prompt typed in the
+# GitHub UI. Below are ready-to-paste examples grouped by intent.
+# Each prompt follows a safety pattern: explicit output target, explicit
+# prohibitions, and date-stamped titles for traceability.
+#
+# ┌─ Investigation ──────────────────────────────────────────────────────
+# │ Intent:  Diagnose a specific problem.
+# │ Outcome: A single issue with findings and recommended fixes.
+#
+#   Investigate why CI has been flaky this week. Analyze the last 10
+#   failed workflow runs on main, identify common failure patterns, and
+#   create a single issue titled "CI Flakiness Investigation —
+#   YYYY-MM-DD" with findings and recommended fixes.
+#   Do NOT modify any workflow files.
+#
+# ┌─ Security & Dependency Audit ────────────────────────────────────────
+# │ Intent:  Surface dependency risk early.
+# │ Outcome: A single issue with prioritized upgrade guidance.
+#
+#   Run a security-focused audit of all direct dependencies. Check for
+#   known vulnerabilities, outdated packages, and unused dependencies.
+#   Create a single issue titled "Dependency Audit — YYYY-MM-DD" with
+#   findings prioritized by severity.
+#   Do NOT open PRs or modify package.json.
+#
+# ┌─ Documentation Sync ────────────────────────────────────────────────
+# │ Intent:  Keep docs aligned with actual behavior.
+# │ Outcome: A single issue listing discrepancies with suggested fixes.
+#
+#   Compare README.md against the current codebase. Identify outdated
+#   examples, missing configuration options, and incorrect instructions.
+#   Create a single issue titled "README Accuracy Review — YYYY-MM-DD"
+#   listing discrepancies with suggested corrections.
+#   Do NOT edit README.md directly.
+#
+# ┌─ Housekeeping ──────────────────────────────────────────────────────
+# │ Intent:  Clean up stale backlog items.
+# │ Outcome: A single issue with a prioritized cleanup checklist.
+#
+#   Review all open issues and PRs. Identify items that are stale (>60
+#   days), duplicates, or resolved-but-not-closed. Create a single issue
+#   titled "Repository Housekeeping — YYYY-MM-DD" with a prioritized
+#   cleanup checklist.
+#   Do NOT close issues, merge PRs, or apply labels.
+#
+# ┌─ Modernization: Major Upgrade ──────────────────────────────────────
+# │ Intent:  Plan a migration to a new major version of a dependency.
+# │ Outcome: A single issue with a phased migration checklist.
+#
+#   Analyze the feasibility of upgrading from [library@current] to
+#   [library@target]. Identify breaking changes, required code
+#   modifications, and estimated effort. Create a single issue titled
+#   "Migration Plan: [library] vCurrent → vTarget" with a phased
+#   migration checklist.
+#   Do NOT modify source code or open PRs.
+#
+# ┌─ Modernization: Build & Tooling ────────────────────────────────────
+# │ Intent:  Proactively improve build reliability and speed.
+# │ Outcome: A single issue with an investigation plan.
+#
+#   Assess whether build tooling or bundler configuration should be
+#   updated for performance or maintainability. Create a single issue
+#   titled "Build Tooling Modernization — YYYY-MM-DD" with pain points,
+#   candidate improvements (no new deps unless justified), and suggested
+#   experiments.
+#   Do NOT modify code or open PRs.
+#
+# ┌─ Quality & Regression Watch ────────────────────────────────────────
+# │ Intent:  Preempt regressions after a burst of changes.
+# │ Outcome: A single issue highlighting risky areas and next steps.
+#
+#   Scan the last 10 merged PRs on main and summarize potential
+#   regression hotspots. Create a single issue titled "Regression
+#   Watchlist — YYYY-MM-DD" with files/modules changed repeatedly,
+#   areas lacking tests, and recommended follow-up checks.
+#   Do NOT open PRs or modify code.
+#
 ---
 name: Fro Bot
 
@@ -84,7 +255,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '30 15 * * *'
   workflow_dispatch:
     inputs:
       prompt:
@@ -114,14 +285,51 @@ env:
     - Test coverage for new/changed behavior
     Skip style nits — the linter handles those.
 
+    Do NOT push commits, modify code, or create branches. Review only.
+    Use inline comments for file-specific issues. Reserve the review body
+    for the structured summary below.
+
+    You MUST structure your review using exactly these headings:
+    ## Verdict: PASS / CONDITIONAL / REJECT
+    CONDITIONAL = can merge after addressing the listed blocking issues.
+    ### Blocking issues
+    ### Non-blocking concerns
+    ### Missing tests
+    ### Risk assessment (LOW/MED/HIGH) + rationale
+    Evaluate likelihood of regression, security exposure, or blast radius.
+    If a section has no items, write "None" under the heading.
+    Do not omit any heading.
+
   SCHEDULE_PROMPT: |
-    Perform weekly repository maintenance and create a SINGLE issue titled
-    "Weekly Maintenance Report — YYYY-MM-DD" containing:
-    - Open issues with no activity in 14+ days (list with links)
-    - Open PRs with no review activity in 7+ days (list with links)
-    - Issues labeled 'bug' without assignees (list with links)
-    - Recommended actions for each item
-    Do NOT comment on individual issues or PRs. Produce one summary issue only.
+    Perform daily repository maintenance and update a SINGLE rolling issue titled
+    "Daily Maintenance Report" in this repository.
+
+    Search for an issue with this exact title. If multiple matches exist,
+    use the most recently updated one. If no open issue exists, create it.
+    If the most recent matching issue is closed, reopen it instead of creating
+    a new one.
+
+    Append a new dated section for each run using "## YYYY-MM-DD (UTC)".
+    To keep the issue bounded: after appending today's section, replace any
+    individual daily sections older than 14 days with a single
+    "## Historical Summary" section that lists only the count of prior runs
+    and any items that remained unresolved across those runs.
+
+    Include links only (no full content duplication). Keep it concise and actionable.
+    Flag items that appear in the stale list for the first time (not present in
+    the previous dated section) with a ★ marker.
+
+    Sections (in order):
+    - Summary metrics (issues opened since last run, currently open PRs, stale
+      issues/PRs count, main branch check status, security alerts if accessible)
+    - Stale issues (no activity >30 days; recommend next step)
+    - Stale PRs (no activity >7 days; stale >14 days)
+    - Unassigned bugs (label bug, no assignee)
+    - Recommended actions (bulleted checklist)
+    - Notes (use "data unavailable" for any inaccessible data source)
+
+    Do NOT comment on or modify individual issues/PRs. Do NOT apply labels.
+    Do NOT open PRs. This run must update ONE issue only.
 
 jobs:
   fro-bot:
