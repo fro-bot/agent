@@ -1,5 +1,5 @@
 ---
-name: Fro Bot Coding Agent
+name: Fro Bot
 description: "Specialized for fro-bot/agent: project-scoped coding agent that implements repo-specific features, fixes, and maintenance while following this repo's TDD, TypeScript/ESM, and CI/build conventions."
 ---
 
