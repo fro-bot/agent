@@ -140,12 +140,19 @@ jobs:
             - Test coverage for new/changed behavior
             Skip style nits — the linter handles those.
 
-            Output:
+            Use inline comments for file-specific issues. Reserve the review
+            body for the structured summary below.
+
+            Do NOT push commits, modify code, or create branches. Review only.
+
+            You MUST structure your review using exactly these headings:
             ## Verdict: [PASS | CONDITIONAL | REJECT]
+            CONDITIONAL = can merge after addressing the listed blocking issues.
             ### Blocking issues
             ### Non-blocking concerns
             ### Missing tests
-            ### Risk assessment (LOW/MED/HIGH) + rationale
+            ### Risk assessment (LOW/MED/HIGH): likelihood of regression, security exposure, or blast radius
+            If a section has no items, write "None" under the heading. Do not omit any heading.
           PROMPT: >-
             ${{
               (github.event_name == 'pull_request' && env.PR_REVIEW_PROMPT)
