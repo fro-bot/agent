@@ -22,7 +22,7 @@
       <stop offset="100%" stop-color="#FFC107"/>
     </linearGradient>
     <filter id="b1-glow">
-      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feGaussianBlur stdDeviation="8" result="blur"/>
       <feComposite in="SourceGraphic" in2="blur" operator="over"/>
     </filter>
   </defs>
@@ -31,6 +31,15 @@
   <rect width="1280" height="640" fill="url(#b1-bg-grad)"/>
   <rect width="1280" height="640" fill="url(#b1-nebula)"/>
   <rect width="1280" height="640" fill="url(#b1-nebula2)"/>
+
+  <!-- B3 Concentric Rings (Background Layer) -->
+  <g transform="translate(640, 320)" fill="none" stroke-width="1.5">
+    <circle r="100" stroke="#00BCD4" opacity="0.25"/>
+    <circle r="180" stroke="#E91E63" opacity="0.20"/>
+    <circle r="260" stroke="#00BCD4" opacity="0.15"/>
+    <circle r="340" stroke="#E91E63" opacity="0.12"/>
+    <circle r="420" stroke="#00BCD4" opacity="0.08"/>
+  </g>
 
   <!-- Stars (Denser top-right) -->
   <g fill="#F5EBEB" opacity="0.6">
@@ -69,17 +78,23 @@
     <circle cx="1140" cy="400" r="1"/>
   </g>
 
-  <!-- Decorative Sphere Right (Refined) -->
+  <!-- Signal Arc -->
+  <path d="M 550 320 Q 750 250 840 320" stroke="#00BCD4" stroke-width="1.5" stroke-dasharray="8 8" fill="none" opacity="0.35"/>
+
+  <!-- Decorative Sphere Right (Hybrid B1/B3) -->
   <g transform="translate(950, 320)">
     <!-- Main Sphere Outline -->
     <circle cx="0" cy="0" r="200" stroke="url(#b1-text-grad)" stroke-width="2" fill="none" opacity="0.8"/>
     
-    <!-- Dashed Geodesic Rings -->
-    <ellipse cx="0" cy="0" rx="200" ry="70" stroke="#FFC107" stroke-width="1" fill="none" opacity="0.6" transform="rotate(30)" stroke-dasharray="10 10"/>
-    <ellipse cx="0" cy="0" rx="200" ry="70" stroke="#E91E63" stroke-width="1" fill="none" opacity="0.6" transform="rotate(-30)" stroke-dasharray="10 10"/>
-    <ellipse cx="0" cy="0" rx="70" ry="200" stroke="#00BCD4" stroke-width="1" fill="none" opacity="0.4" stroke-dasharray="5 15"/>
+    <!-- Rotating Ellipses (B3 Style) -->
+    <g fill="none" stroke-width="1.5">
+      <ellipse cx="0" cy="0" rx="170" ry="65" stroke="#FFC107" opacity="0.7" transform="rotate(0)"/>
+      <ellipse cx="0" cy="0" rx="170" ry="65" stroke="#00BCD4" opacity="0.7" transform="rotate(45)"/>
+      <ellipse cx="0" cy="0" rx="170" ry="65" stroke="#E91E63" opacity="0.7" transform="rotate(90)"/>
+      <ellipse cx="0" cy="0" rx="170" ry="65" stroke="#FFC107" opacity="0.5" transform="rotate(135)"/>
+    </g>
 
-    <!-- Inner Dot Grid (5x5 approx projection) -->
+    <!-- Inner Dot Grid (B1 Style) -->
     <g fill="#00BCD4" opacity="0.7">
       <!-- Center Row -->
       <circle cx="-100" cy="0" r="2"/> <circle cx="-50" cy="0" r="2.5"/> <circle cx="0" cy="0" r="3"/> <circle cx="50" cy="0" r="2.5"/> <circle cx="100" cy="0" r="2"/>
@@ -94,7 +109,7 @@
     </g>
     
     <!-- Core Glow -->
-    <circle cx="0" cy="0" r="30" fill="#F5EBEB" filter="url(#b1-glow)" opacity="0.8"/>
+    <circle cx="0" cy="0" r="20" fill="#F5EBEB" filter="url(#b1-glow)" opacity="0.8"/>
   </g>
 
   <!-- Main Content Left -->
@@ -102,8 +117,8 @@
     <!-- URL -->
     <text x="0" y="-120" font-family="'Courier New', monospace" font-size="20" fill="#00BCD4" opacity="0.9">fro-bot/agent</text>
     
-    <!-- Title -->
-    <text x="-5" y="20" font-family="'Arial Black', 'Arial', sans-serif" font-weight="bold" font-size="160" fill="url(#b1-text-grad)" filter="url(#b1-glow)">agent</text>
+    <!-- Title (High Contrast) -->
+    <text x="-5" y="20" font-family="'Arial Black', 'Arial', sans-serif" font-weight="bold" font-size="160" fill="#FFFFFF" stroke="#00BCD4" stroke-width="2" paint-order="stroke" filter="url(#b1-glow)">agent</text>
     
     <!-- Tagline -->
     <text x="0" y="80" font-family="'Arial', sans-serif" font-size="30" fill="#F5EBEB" letter-spacing="0.5">Autonomous AI for every channel, every workflow</text>
