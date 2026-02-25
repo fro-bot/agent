@@ -390,19 +390,19 @@ The IAM user needs `s3:PutObject` and `s3:GetObject` permissions for the configu
 
 ### Scheduled Maintenance Tasks
 
-Run the agent on a schedule for periodic repository maintenance:
+Run the agent daily to maintain a rolling maintenance report:
 
 ```yaml
-name: Weekly Repository Audit
+name: Daily Maintenance Report
 on:
   schedule:
-    - cron: "0 9 * * 1" # Every Monday at 9 AM UTC
+    - cron: "30 15 * * *" # Daily at 15:30 UTC (8:30 AM Arizona)
 
 jobs:
-  audit:
+  maintenance:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v4
@@ -412,12 +412,19 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: |
-            Review open issues and PRs. Identify:
-            - Stale issues that need follow-up
-            - PRs ready for review
-            - Items needing triage
-            Post a summary as a new issue.
+            Perform daily repository maintenance and update a SINGLE rolling
+            issue titled "Daily Maintenance Report". Search for an existing
+            issue with this exact title; create it if none exists.
+            Append a dated "## YYYY-MM-DD (UTC)" section with:
+            - Summary metrics (new issues, open PRs, stale items)
+            - Stale issues (>30 days) and PRs (>7 days)
+            - Unassigned bugs and recommended actions
+            Do NOT comment on individual issues/PRs. Update ONE issue only.
 ```
+
+> [!TIP]
+>
+> The example above uses a read-only maintenance report. For an **autohealing** variant that actively fixes failing PRs, patches vulnerabilities, and upgrades dependencies, see the "Schedule Prompt Alternatives" section in [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
 
 ### Manual Workflow with Custom Prompt
 

@@ -41,13 +41,14 @@ env:
     If the most recent matching issue is closed, reopen it instead of creating
     a new one.
 
-    Append a new dated section for each run using:
-    "## YYYY-MM-DD (UTC)" and do not remove prior sections.
-    Keep the issue bounded: after appending today's section, collapse sections
-    older than 14 days into a running Historical Summary so the issue stays concise.
+    Append a new dated section for each run using "## YYYY-MM-DD (UTC)".
+    To keep the issue bounded: after appending today's section, replace any
+    individual daily sections older than 14 days with a single
+    "## Historical Summary" section that lists only the count of prior runs
+    and any items that remained unresolved across those runs. If a Historical Summary already exists, update it in place — do not create a second one.
 
     Include links only (no full content duplication). Keep it concise and actionable.
-    Flag items that newly crossed the stale threshold since the last run with a ★ marker.
+    Flag items that appear in the stale list for the first time (not present in the previous dated section) with a ★ marker.
 
     Sections (in order):
     - Summary metrics (issues opened since last run, currently open PRs, stale
