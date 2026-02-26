@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="./assets/fro-bot.png" alt="Fro Bot" height="180" />
+<img src="./assets/banner.svg" alt="Fro Bot Agent Banner" width="100%" />
 
 # Fro Bot Agent
 
 > AI-powered GitHub automation with persistent memory
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/fro-bot/agent/ci.yaml?style=for-the-badge&label=Build)](https://github.com/fro-bot/agent/actions) [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/fro-bot/agent/badge?style=for-the-badge)](https://securityscorecards.dev/viewer/?uri=github.com/fro-bot/agent) [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/fro-bot/agent/ci.yaml?style=for-the-badge&label=Build&labelColor=0D0216&color=00BCD4)](https://github.com/fro-bot/agent/actions) [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/fro-bot/agent/badge?style=for-the-badge&labelColor=0D0216&color=E91E63)](https://securityscorecards.dev/viewer/?uri=github.com/fro-bot/agent) [![License](https://img.shields.io/badge/License-MIT-FFC107?style=for-the-badge&labelColor=0D0216&color=FFC107)](LICENSE)
 
 [Overview](#overview) · [Quick Start](#quick-start) · [Usage](#usage) · [Configuration](#configuration) · [Development](#development)
 
@@ -114,18 +114,36 @@ Comment `@fro-bot` on any issue or pull request. The agent will:
 Fro Bot uses a multi-phase execution model to provide stateful AI assistance:
 
 ```mermaid
-flowchart TB
-    A[Trigger Event] --> B[Restore Cache]
-    B --> C[Load Session History]
-    C --> D[Acknowledge Request]
-    D --> E[Execute Agent]
-    E --> F[Post Response]
-    F --> G[Save Session State]
-    G --> H[Update Cache]
+graph TB
+%% Brand Colors: Void=#0D0216, Purple=#1A0B2E, Cyan=#00BCD4, Magenta=#E91E63, Amber=#FFC107
+%% Nodes
+A[Trigger Event] --> B[Restore Cache]
+B --> C[Load Session History]
+C --> D[Acknowledge Request]
+D --> E[Execute Agent]
+E --> F[Post Response]
+F --> G[Save Session State]
+G --> H[Update Cache]
 
-    style A fill:#e1f5fe
-    style E fill:#fff3e0
-    style H fill:#f1f8e9
+%% Styles
+classDef default fill:#1A0B2E,stroke:#3D2A5F,stroke-width:1px,color:#FFFFFF
+classDef start fill:#1A0B2E,stroke:#00BCD4,stroke-width:2px,color:#00BCD4
+classDef action fill:#2D1B4E,stroke:#E91E63,stroke-width:2px,color:#FFFFFF
+classDef endNode fill:#1A0B2E,stroke:#FFC107,stroke-width:2px,color:#FFC107
+
+%% Apply Styles
+class A start
+class E action
+class H endNode
+
+%% Link Styles (explicit indexes for broad Mermaid compatibility)
+linkStyle 0 stroke:#3D2A5F,stroke-width:2px
+linkStyle 1 stroke:#3D2A5F,stroke-width:2px
+linkStyle 2 stroke:#3D2A5F,stroke-width:2px
+linkStyle 3 stroke:#3D2A5F,stroke-width:2px
+linkStyle 4 stroke:#3D2A5F,stroke-width:2px
+linkStyle 5 stroke:#3D2A5F,stroke-width:2px
+linkStyle 6 stroke:#3D2A5F,stroke-width:2px
 ```
 
 ### Execution Phases
