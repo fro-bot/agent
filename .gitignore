@@ -104,7 +104,8 @@ docs/brainstorms/
 eslint-typegen.d.ts
 
 # Opencode
-.opencode/
+!.opencode/
+.opencode/*
 !.opencode/themes/
 !.opencode/tui.json
 
