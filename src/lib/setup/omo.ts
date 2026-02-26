@@ -11,6 +11,7 @@ export interface OmoInstallOptions {
   openai?: 'no' | 'yes'
   opencodeZen?: 'no' | 'yes'
   zaiCodingPlan?: 'no' | 'yes'
+  kimiForCoding?: 'no' | 'yes'
 }
 
 export interface OmoInstallDeps {
@@ -43,6 +44,7 @@ export async function installOmo(
     openai = 'no',
     opencodeZen = 'no',
     zaiCodingPlan = 'no',
+    kimiForCoding = 'no',
   } = options
 
   logger.info('Installing Oh My OpenCode plugin', {
@@ -53,6 +55,7 @@ export async function installOmo(
     openai,
     opencodeZen,
     zaiCodingPlan,
+    kimiForCoding,
   })
 
   let output = ''
@@ -66,6 +69,7 @@ export async function installOmo(
     `--openai=${openai}`,
     `--opencode-zen=${opencodeZen}`,
     `--zai-coding-plan=${zaiCodingPlan}`,
+    `--kimi-for-coding=${kimiForCoding}`,
   ]
 
   try {
