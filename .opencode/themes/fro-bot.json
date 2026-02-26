@@ -1,0 +1,130 @@
+{
+  "$schema": "https://opencode.ai/theme.json",
+  "defs": {
+    "void": "#0D0216",
+    "purple": "#1A0B2E",
+    "purple_mid": "#2D1B4E",
+    "purple_muted": "#3D2A5F",
+    "cyan": "#00BCD4",
+    "cyan_aaa": "#006064",
+    "magenta": "#E91E63",
+    "magenta_aaa": "#880E4F",
+    "amber": "#FFC107",
+    "amber_large": "#E65100",
+    "white": "#FFFFFF",
+    "cream": "#F5EBEB",
+    "text_muted_light": "#5C4569",
+    "success": "#69F0AE",
+    "error": "#F44336"
+  },
+  "theme": {
+    "primary": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "secondary": {
+      "dark": "magenta",
+      "light": "magenta_aaa"
+    },
+    "accent": {
+      "dark": "amber",
+      "light": "amber_large"
+    },
+    "text": {
+      "dark": "white",
+      "light": "purple"
+    },
+    "textMuted": {
+      "dark": "cream",
+      "light": "text_muted_light"
+    },
+    "background": {
+      "dark": "void",
+      "light": "white"
+    },
+    "backgroundPanel": {
+      "dark": "purple",
+      "light": "cream"
+    },
+    "backgroundElement": {
+      "dark": "purple_mid",
+      "light": "cream"
+    },
+    "border": {
+      "dark": "purple_muted",
+      "light": "purple_mid"
+    },
+    "borderActive": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "borderSubtle": {
+      "dark": "purple_mid",
+      "light": "cream"
+    },
+    "error": {
+      "dark": "error",
+      "light": "error"
+    },
+    "warning": {
+      "dark": "amber",
+      "light": "amber_large"
+    },
+    "success": {
+      "dark": "success",
+      "light": "success"
+    },
+    "info": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "diffAdded": {
+      "dark": "success",
+      "light": "success"
+    },
+    "diffRemoved": {
+      "dark": "error",
+      "light": "error"
+    },
+    "diffContext": {
+      "dark": "cream",
+      "light": "text_muted_light"
+    },
+    "diffHunkHeader": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "markdownHeading": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "markdownLink": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "markdownCode": {
+      "dark": "amber",
+      "light": "amber_large"
+    },
+    "syntaxComment": {
+      "dark": "cream",
+      "light": "text_muted_light"
+    },
+    "syntaxKeyword": {
+      "dark": "magenta",
+      "light": "magenta_aaa"
+    },
+    "syntaxString": {
+      "dark": "amber",
+      "light": "amber_large"
+    },
+    "syntaxFunction": {
+      "dark": "cyan",
+      "light": "cyan_aaa"
+    },
+    "syntaxType": {
+      "dark": "magenta",
+      "light": "magenta_aaa"
+    }
+  }
+}
