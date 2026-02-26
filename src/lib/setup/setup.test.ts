@@ -228,6 +228,50 @@ describe('setup', () => {
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
     })
 
+    it('exports OPENCODE_CONFIG_CONTENT with autoupdate:false baseline', async () => {
+      // #given - no opencode-config input
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup()
+
+      // #then
+      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
+    })
+
+    it('merges user opencode-config input on top of OPENCODE_CONFIG_CONTENT baseline', async () => {
+      // #given - user supplies opencode-config with custom settings
+      vi.mocked(core.getInput).mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghs_test_token',
+          'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
+          'opencode-version': 'latest',
+          'opencode-config': '{"model": "claude-opus-4-5", "autoupdate": true}',
+        }
+        return inputs[name] ?? ''
+      })
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup()
+
+      // #then - user config wins on conflicting keys (autoupdate:true overrides false baseline)
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'OPENCODE_CONFIG_CONTENT',
+        JSON.stringify({autoupdate: true, model: 'claude-opus-4-5'}),
+      )
+    })
+
     it('sets outputs for opencode-path and auth-json-path', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
