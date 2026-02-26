@@ -45,6 +45,7 @@ jobs:
             dist-changed: &dist-changed
               - dist/**
             src-changed: &src-changed
+              - assets/**
               - src/**
               - action.yaml
               - package.json
