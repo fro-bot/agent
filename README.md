@@ -126,7 +126,7 @@ F --> G[Save Session State]
 G --> H[Update Cache]
 
 %% Styles
-classDef default fill:#1A0B2E,stroke:#3D2A5F,stroke-width:1px,color:#FFFFFF,rx:4px,ry:4px
+classDef default fill:#1A0B2E,stroke:#3D2A5F,stroke-width:1px,color:#FFFFFF
 classDef start fill:#1A0B2E,stroke:#00BCD4,stroke-width:2px,color:#00BCD4
 classDef action fill:#2D1B4E,stroke:#E91E63,stroke-width:2px,color:#FFFFFF
 classDef endNode fill:#1A0B2E,stroke:#FFC107,stroke-width:2px,color:#FFC107

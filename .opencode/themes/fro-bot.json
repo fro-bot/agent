@@ -15,7 +15,11 @@
     "cream": "#F5EBEB",
     "text_muted_light": "#5C4569",
     "success": "#69F0AE",
-    "error": "#F44336"
+    "success_light": "#2E7D32",
+    "error": "#F44336",
+    "error_light": "#C62828",
+    "surface_raised": "#EDD8D8",
+    "border_muted": "#D4B8B8"
   },
   "theme": {
     "primary": {
@@ -48,7 +52,7 @@
     },
     "backgroundElement": {
       "dark": "purple_mid",
-      "light": "cream"
+      "light": "surface_raised"
     },
     "border": {
       "dark": "purple_muted",
@@ -60,11 +64,11 @@
     },
     "borderSubtle": {
       "dark": "purple_mid",
-      "light": "cream"
+      "light": "border_muted"
     },
     "error": {
       "dark": "error",
-      "light": "error"
+      "light": "error_light"
     },
     "warning": {
       "dark": "amber",
@@ -72,7 +76,7 @@
     },
     "success": {
       "dark": "success",
-      "light": "success"
+      "light": "success_light"
     },
     "info": {
       "dark": "cyan",
@@ -80,11 +84,11 @@
     },
     "diffAdded": {
       "dark": "success",
-      "light": "success"
+      "light": "success_light"
     },
     "diffRemoved": {
       "dark": "error",
-      "light": "error"
+      "light": "error_light"
     },
     "diffContext": {
       "dark": "cream",
