@@ -28,6 +28,7 @@ const VALID_OMO_PROVIDERS = [
   'openai',
   'opencode-zen',
   'zai-coding-plan',
+  'kimi-for-coding',
 ] as const
 
 function parseOmoProviders(input: string): OmoInstallOptions {
@@ -42,6 +43,7 @@ function parseOmoProviders(input: string): OmoInstallOptions {
   let openai: 'no' | 'yes' = 'no'
   let opencodeZen: 'no' | 'yes' = 'no'
   let zaiCodingPlan: 'no' | 'yes' = 'no'
+  let kimiForCoding: 'no' | 'yes' = 'no'
 
   for (const provider of providers) {
     if (!VALID_OMO_PROVIDERS.includes(provider as (typeof VALID_OMO_PROVIDERS)[number])) {
@@ -70,10 +72,13 @@ function parseOmoProviders(input: string): OmoInstallOptions {
       case 'zai-coding-plan':
         zaiCodingPlan = 'yes'
         break
+      case 'kimi-for-coding':
+        kimiForCoding = 'yes'
+        break
     }
   }
 
-  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan}
+  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan, kimiForCoding}
 }
 
 /**
