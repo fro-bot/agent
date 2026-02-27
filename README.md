@@ -355,6 +355,7 @@ concurrency:
 | `s3-bucket`         | No       | —          | S3 bucket name (required if `s3-backup` is true)   |
 | `aws-region`        | No       | —          | AWS region for S3 bucket                           |
 | `skip-cache`        | No       | `false`    | Skip cache restore (useful for debugging)          |
+| `omo-config`        | No       | —          | Custom oMo configuration JSON (deep-merged)        |
 
 ### Action Outputs
 

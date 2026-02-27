@@ -56,6 +56,11 @@ inputs:
       copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: empty
       (uses free OpenCode models)
     required: false
+  omo-config:
+    description: >-
+      Custom oMo configuration JSON. Written before installer runs.
+      Deep-merged with existing config.
+    required: false
 
 outputs:
   session-id:

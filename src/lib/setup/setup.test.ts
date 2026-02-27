@@ -589,5 +589,80 @@ describe('setup', () => {
         expect(result?.omoInstalled).toBe(true)
       })
     })
+
+    describe('omo-config input', () => {
+      beforeEach(() => {
+        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+        vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+        vi.mocked(exec.exec).mockResolvedValue(0)
+        vi.mocked(fs.writeFile).mockResolvedValue()
+        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+        vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
+      })
+
+      it('writes omo-config JSON to oh-my-opencode.json before installer runs', async () => {
+        // #given
+        const customConfig = JSON.stringify({theme: 'dark', model: 'claude-opus-4-5'})
+        vi.mocked(core.getInput).mockImplementation((name: string) => {
+          const inputs: Record<string, string> = {
+            'github-token': 'ghs_test_token',
+            'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
+            'opencode-version': 'latest',
+            'omo-config': customConfig,
+          }
+          return inputs[name] ?? ''
+        })
+
+        // #when
+        const result = await runSetup()
+
+        // #then - writeFile called for oh-my-opencode.json
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const omoConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+        )
+        expect(omoConfigCall).toBeDefined()
+        const written = JSON.parse(omoConfigCall?.[1] as string) as Record<string, unknown>
+        expect(written).toMatchObject({theme: 'dark', model: 'claude-opus-4-5'})
+      })
+
+      it('does not write oh-my-opencode.json when omo-config is not provided', async () => {
+        // #given - no omo-config input (default mock returns empty string)
+
+        // #when
+        const result = await runSetup()
+
+        // #then - oh-my-opencode.json is not written
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const omoConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+        )
+        expect(omoConfigCall).toBeUndefined()
+      })
+
+      it('continues setup and warns when omo-config JSON is invalid', async () => {
+        // #given - invalid JSON in omo-config
+        vi.mocked(core.getInput).mockImplementation((name: string) => {
+          const inputs: Record<string, string> = {
+            'github-token': 'ghs_test_token',
+            'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
+            'opencode-version': 'latest',
+            'omo-config': '{invalid json}',
+          }
+          return inputs[name] ?? ''
+        })
+
+        // #when
+        const result = await runSetup()
+
+        // #then - setup continues despite bad omo-config
+        expect(result).not.toBeNull()
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('omo-config'))
+      })
+    })
   })
 })

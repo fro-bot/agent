@@ -16,6 +16,7 @@ import {createLogger} from '../logger.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
+import {writeOmoConfig} from './omo-config.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
@@ -109,6 +110,7 @@ function parseSetupInputs(): SetupInputs {
     appId: core.getInput('app-id') || null,
     privateKey: core.getInput('private-key') || null,
     opencodeConfig: core.getInput('opencode-config') || null,
+    omoConfig: core.getInput('omo-config') || null,
   }
 }
 
@@ -220,6 +222,17 @@ export async function runSetup(): Promise<SetupResult | null> {
     // Run oMo installer to ensure config values (e.g. provider settings) are current.
     // Skip if Bun install failed — bunx won't be available.
     if (bunInstalled) {
+      // Write omo-config before installer runs so it can observe any custom settings
+      if (inputs.omoConfig != null) {
+        try {
+          await writeOmoConfig(inputs.omoConfig, omoConfigPath, logger)
+        } catch (error) {
+          logger.warning('Failed to write omo-config, continuing without custom config', {
+            error: toErrorMessage(error),
+          })
+        }
+      }
+
       const omoProvidersRaw = core.getInput('omo-providers').trim()
       const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
       const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
