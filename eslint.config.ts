@@ -5,6 +5,7 @@ export default defineConfig(
     name: '@bfra.me/github-action',
     ignores: [
       '.ai/',
+      '.github/copilot-*.md',
       '**/AGENTS.md',
       'FEATURES.md',
       'PRD.md',

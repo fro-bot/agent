@@ -1,65 +1,107 @@
 # Copilot Instructions
 
-## Role & Scope
+## Before You Start
 
-- Project-scoped coding agent for all fro-bot/agent tasks
-- Read AGENTS.md, RULES.md, and relevant RFCs before implementing
-- Check PRD.md and FEATURES.md for requirements on new features
-- Documentation hierarchy: PRD > RFCs > FEATURES.md > RULES.md > AGENTS.md
-- Match existing patterns; don't introduce patterns not already in the codebase
-- Keep changes minimal and reversible; minimize blast radius
+Read these files before implementing anything:
 
-## TypeScript Conventions (Mandatory)
+- **AGENTS.md** — Code map, execution flow, complexity hotspots, and project commands
+- **RULES.md** — Focus on these sections:
+  - _Code Style & Conventions_ (module system, booleans, function style)
+  - _Architecture Patterns_ (adapters, dependency injection, NormalizedEvent)
+  - _SDK Execution Patterns_ (server lifecycle, sessions, events)
+  - _Security Requirements_ (credential handling, log redaction, authorization)
+  - _Testing Standards_ (TDD workflow, SDK mocking, BDD comments)
+  - _Anti-Patterns (Forbidden)_ (comprehensive list of what NOT to do)
+- **RFCs/** — Check relevant RFCs for feature-specific architecture decisions
+- **PRD.md / FEATURES.md** — Check for requirements on new features
 
-- ESM-only: `"type": "module"`, `.js` extensions in imports
-- Function-based only: no ES6 classes
-- Strict booleans: use `!= null` or `Boolean()` for non-boolean values; `!` is allowed only for `boolean` types
-- No `as any`, `@ts-ignore`, `@ts-expect-error`
-- Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
-- Inject `logger: Logger` into all functions as a parameter
-- Readonly properties on all interfaces
-- Discriminated unions over optional properties
-- `as const` for fixed value arrays; infer union types from them
+Documentation hierarchy: PRD > RFCs > FEATURES.md > RULES.md > AGENTS.md
 
-## Naming Conventions
+## Critical Patterns (AI Failure Modes)
 
-- Files: kebab-case (`cache-manager.ts`)
-- Functions/variables: camelCase
-- Types/interfaces: PascalCase
-- Constants: SCREAMING_SNAKE or camelCase
+These patterns differ from common AI training data. Get them wrong and the build breaks.
 
-## Architecture Patterns
+### 1. ESM imports MUST use `.js` extensions
 
-- Dependencies as function parameters (not global imports)
-- Adapter pattern for testable I/O (`CacheAdapter`, `ExecAdapter`, `ToolCacheAdapter`)
-- NormalizedEvent layer: always use `normalizeEvent()` before routing; never check raw event strings
-- Event routing lives in `triggers/router.ts`; never bypass it
+```typescript
+// ✅ CORRECT
+import {createLogger} from "../lib/logger.js"
+import {restoreCache} from "./cache.js"
 
-## SDK Execution (@opencode-ai/sdk)
+// ❌ WRONG — build fails without extension
+import {createLogger} from "../lib/logger"
+import {restoreCache} from "./cache"
+```
 
-- Use `createOpencode({ port, timeout })` for server + client lifecycle
-- Always `server.close()` in a `finally` block — never leak the server
-- Create sessions with `client.session.create({ body: { title } })`
-- Only set `agent` on the prompt body for non-default agents; omit it for `DEFAULT_AGENT` (`'sisyphus'`) so the server uses its properly-resolved default. Model override is optional.
-- Subscribe to events with `client.event.subscribe()` and process `session.idle` for completion
-- Cancel subscription with `events.controller.abort()` after completion
+### 2. Strict boolean expressions — no implicit falsy checks
 
-## Delegated Work Plugin
+```typescript
+// ✅ CORRECT
+if (value != null) { ... }
+if (array.length > 0) { ... }
+if (str !== '') { ... }
 
-- Plugin source: `src/plugin/fro-bot-agent.ts` → bundled to `dist/plugin/fro-bot-agent.js`
-- Install globally to `~/.config/opencode/plugin/` — NEVER to `.opencode/plugin/` (workspace pollution)
-- Available tools: `create_branch`, `commit_files`, `create_pull_request`, `update_pull_request`
-- Context via env vars: `GITHUB_TOKEN` and `GITHUB_REPOSITORY` — fail fast if missing
+// ❌ WRONG — violates strict-boolean-expressions
+if (!value) { ... }
+if (array.length) { ... }
+if (str) { ... }
+```
 
-## Security
+`!` is ONLY allowed for actual `boolean` types.
 
-- Never log or commit secrets; never cache `auth.json`, `.env`, `*.key`, `*.pem`
-- Log redaction: auto-redacts `token`, `password`, `secret`, `key`, `auth`
-- Attachment URLs: only `github.com/user-attachments/` (5MB/file, 5 files max)
-- Authorization gating: only `OWNER`, `MEMBER`, `COLLABORATOR`; bots and forks blocked
-- Anti-loop protection: check author login against bot identity before processing
-- Telemetry: opt-in only; no external aggregation; never log code, comments, or prompts
-- Post-action hook (`post.ts`): must never call `core.setFailed()` — it's best-effort only
+### 3. Functions only — no ES6 classes
+
+```typescript
+// ✅ CORRECT
+export async function restoreCache(options: CacheOptions, logger: Logger): Promise<CacheResult> {
+  // ...
+}
+
+// ❌ WRONG — classes are forbidden
+class CacheManager {
+  constructor(private options: CacheOptions) {}
+  async restore(): Promise<CacheResult> { ... }
+}
+```
+
+### 4. Vitest, not Jest
+
+```typescript
+// ✅ CORRECT
+import {describe, expect, it, vi} from "vitest"
+vi.mock("@actions/core", () => ({getInput: vi.fn()}))
+
+// ❌ WRONG
+import {jest} from "@jest/globals"
+jest.mock("@actions/core")
+```
+
+### 5. Logger injection in every function
+
+```typescript
+// ✅ CORRECT — logger as parameter
+export function parseInputs(raw: Record<string, string>, logger: Logger): Result<ActionInputs> {
+  logger.info("Parsing action inputs")
+  // ...
+}
+
+// ❌ WRONG — no logger parameter
+export function parseInputs(raw: Record<string, string>): Result<ActionInputs> {
+  console.log("Parsing action inputs")
+  // ...
+}
+```
+
+## Core Conventions
+
+- **ESM-only**: `"type": "module"`, `.js` extensions in all relative imports
+- **No type suppression**: Never use `as any`, `@ts-ignore`, `@ts-expect-error`
+- **Result types**: Use `Result<T, E>` from `@bfra.me/es` for recoverable errors
+- **Readonly interfaces**: All interface properties use `readonly`
+- **Discriminated unions** over optional properties
+- **`as const`** for fixed value arrays; infer union types from them
+- **Dependency injection**: Dependencies as function parameters, not global imports
+- **Adapter pattern**: `CacheAdapter`, `ExecAdapter`, `ToolCacheAdapter` for testable I/O
 
 ## Testing (TDD — Mandatory)
 
@@ -71,11 +113,34 @@
 
 ## Build & Verification
 
-- `pnpm test` — all tests must pass
-- `pnpm check-types` — no type errors
-- `pnpm lint` — no lint errors
-- `pnpm build` — bundle to `dist/`; dist/ is committed and CI validates sync
+```bash
+pnpm test          # All tests must pass
+pnpm lint          # No lint errors
+pnpm build         # Bundle to dist/ (includes type-check); dist/ is committed
+```
+
 - Never manually edit `dist/`; it is always overwritten by build
+- CI validates `dist/` is in sync — always run `pnpm build` after source changes
+
+## Security
+
+- Never log or commit secrets; never cache `auth.json`, `.env`, `*.key`, `*.pem`
+- Authorization gating: only `OWNER`, `MEMBER`, `COLLABORATOR`; bots and forks blocked
+- Post-action hook (`post.ts`): must never call `core.setFailed()` — best-effort only
+
+## Naming
+
+- Files: kebab-case (`cache-manager.ts`)
+- Functions/variables: camelCase
+- Types/interfaces: PascalCase
+- Constants: SCREAMING_SNAKE or camelCase
+
+## Architecture
+
+- NormalizedEvent layer: always use `normalizeEvent()` before routing; never check raw event strings
+- Event routing lives in `triggers/router.ts`; never bypass it
+- SDK: Use `createOpencode({ port, timeout })` for server + client lifecycle
+- Always `server.close()` in a `finally` block — never leak the server
 
 ## Commit Format
 
@@ -86,4 +151,4 @@
 
 - Produce PR-ready changes
 - Update tests and `README.md` when inputs or public behavior changes
-- Include run summary in every comment (see RULES.md format)
+- Keep changes minimal and reversible; minimize blast radius
