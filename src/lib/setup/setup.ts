@@ -234,6 +234,15 @@ export async function runSetup(): Promise<SetupResult | null> {
       omoError = omoResult.error
     }
 
+    // Export CI-safe OpenCode config. OPENCODE_CONFIG_CONTENT has highest precedence over all
+    // other OpenCode config sources (project, global, etc.). User-supplied opencode-config input
+    // is merged on top of the baseline, so user values override the defaults.
+    const ciConfig: Record<string, unknown> = {
+      autoupdate: false,
+      ...(inputs.opencodeConfig == null ? {} : (JSON.parse(inputs.opencodeConfig) as Record<string, unknown>)),
+    }
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfig))
+
     if (!toolsCacheResult.hit) {
       await saveToolsCache({
         logger,
