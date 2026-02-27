@@ -26,6 +26,3 @@ jobs:
 
       - name: Build project
         run: pnpm build
-
-      - name: Configure git hooks
-        run: git config core.hooksPath .github/git-hooks
