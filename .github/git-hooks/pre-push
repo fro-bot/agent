@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Pre-push hook for Copilot coding agent (and local dev).
+# Ensures code passes all checks and dist/ stays in sync before pushing.
+
+set -euo pipefail
+
+echo "▶ Running pre-push verification..."
+
+echo "  ✦ Tests"
+pnpm test
+
+echo "  ✦ Lint"
+pnpm lint
+
+# pnpm build already runs check-types via: "build": "pnpm check-types && tsdown"
+echo "  ✦ Build (includes type-check)"
+pnpm build
+
+echo "  ✦ Checking dist/ is in sync"
+if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
+  echo "ERROR: dist/ is out of sync after build. Stage and commit the changes."
+  git diff --stat dist/
+  exit 1
+fi
+
+echo "✔ All checks passed."
