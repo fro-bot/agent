@@ -26,7 +26,8 @@
     "test": "vitest run"
   },
   "simple-git-hooks": {
-    "pre-commit": "pnpm exec lint-staged"
+    "pre-commit": "pnpm exec lint-staged",
+    "pre-push": "pnpm test && pnpm lint && pnpm build && git diff --exit-code dist/"
   },
   "lint-staged": {
     "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
