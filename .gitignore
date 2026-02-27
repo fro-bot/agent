@@ -103,5 +103,11 @@ docs/brainstorms/
 # eslint-typegen (https://github.com/antfu/eslint-typegen)
 eslint-typegen.d.ts
 
+# Opencode
+!.opencode/
+.opencode/*
+!.opencode/themes/
+!.opencode/tui.json
+
 # Oh My OpenCode
 .sisyphus/
