@@ -31,7 +31,7 @@ These are already documented in AGENTS.md for reference:
 | GitHub Actions Cache   | /actions/cache     |
 | Vitest                 | /vitest-dev/vitest |
 | tsdown                 | /rolldown/tsdown   |
-| OpenCode SDK           | /sst/claude-sdk-js |
+| OpenCode SDK           | /sst/opencode-sdk-js |
 
 ## Step 2: Firewall Allowlist
 
@@ -41,10 +41,10 @@ Context7 MCP makes outbound HTTP requests to fetch documentation. Add these to t
 
 ```text
 registry.npmjs.org:443
-api.context7.com:443
+context7.com:443
 ```
 
-> **Note:** `registry.npmjs.org` is likely already allowed by the default Copilot firewall for dependency installation. Verify `api.context7.com` (or whatever endpoint Context7 uses) is reachable by checking Copilot session logs after configuration.
+> **Note:** `registry.npmjs.org` is likely already allowed by the default Copilot firewall for dependency installation. The Context7 API endpoint is `context7.com` ([source](https://github.com/upstash/context7/blob/main/packages/mcp/src/lib/constants.ts)).
 
 ## Step 3: Copilot Environment (if needed)
 

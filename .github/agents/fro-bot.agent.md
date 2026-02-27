@@ -23,7 +23,7 @@ You are implementing changes in a GitHub Action with persistent session state. T
 These files are large and interconnected. Grep for existing patterns before modifying:
 
 - `triggers/router.ts` (887 lines) — all 7 `NormalizedEvent` variants must be handled; adding a trigger means updating the discriminated union in `github/types.ts`, the normalizer in `github/context.ts`, AND the router
-- `agent/claude.ts` (634 lines) — SDK server lifecycle; every code path must reach `server.close()` in a `finally` block
+- `agent/opencode.ts` (634 lines) — SDK server lifecycle; every code path must reach `server.close()` in a `finally` block
 - `main.ts` (524 lines) — 12-step orchestration; new steps must maintain the existing error-handling chain
 - `agent/prompt.ts` (420 lines) — prompt sections use `TriggerDirective` with `appendMode`; understand the builder pattern before editing
 
