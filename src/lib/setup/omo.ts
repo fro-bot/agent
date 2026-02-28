@@ -60,6 +60,7 @@ export async function installOmo(
     `oh-my-opencode@${version}`,
     'install',
     '--no-tui',
+    '--skip-auth',
     `--claude=${claude}`,
     `--copilot=${copilot}`,
     `--gemini=${gemini}`,
