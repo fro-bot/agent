@@ -11,10 +11,6 @@ on:
     - cron: '31 7 * * 3' # Every Wednesday at 7:31am UTC
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
