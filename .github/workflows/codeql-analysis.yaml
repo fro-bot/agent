@@ -3,11 +3,13 @@ name: CodeQL
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [main, 'renovate/**']
+    branches: [main]
   schedule:
     - cron: '31 7 * * 3' # Every Wednesday at 7:31am UTC
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
@@ -18,11 +20,10 @@ permissions:
 
 jobs:
   analyze:
-    env:
-      language: javascript
     name: Analyze
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       security-events: write
 
     steps:
@@ -32,7 +33,8 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
-          languages: ${{ env.language }}
+          languages: javascript
+          queries: +security-and-quality
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
@@ -40,4 +42,4 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
-          category: '/language:${{ env.language }}'
+          category: '/language:javascript'
