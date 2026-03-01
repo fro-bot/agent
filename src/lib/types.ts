@@ -72,6 +72,7 @@ export interface OmoProviders {
   readonly openai: 'no' | 'yes'
   readonly opencodeZen: 'no' | 'yes'
   readonly zaiCodingPlan: 'no' | 'yes'
+  readonly kimiForCoding: 'no' | 'yes'
 }
 
 // Action outputs
