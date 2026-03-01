@@ -179,6 +179,14 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoProviders = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
 
+    const opencodeConfigRaw = core.getInput('opencode-config').trim()
+    const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
+
+    // Validate opencode-config is valid JSON if provided
+    if (opencodeConfig != null) {
+      validateJsonString(opencodeConfig, 'opencode-config')
+    }
+
     return ok({
       githubToken,
       authJson,
@@ -194,6 +202,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       skipCache,
       omoVersion,
       omoProviders,
+      opencodeConfig,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))

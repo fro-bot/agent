@@ -56,6 +56,11 @@ inputs:
       copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: empty
       (uses free OpenCode models)
     required: false
+  opencode-config:
+    description: >-
+      JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).
+      Values are merged on top of the autoupdate:false baseline; user values win on conflicts.
+    required: false
 
 outputs:
   session-id:

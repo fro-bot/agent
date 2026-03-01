@@ -60,6 +60,8 @@ export interface ActionInputs {
   readonly omoVersion: string
   // oMo provider configuration
   readonly omoProviders: OmoProviders
+  // OpenCode config to merge with baseline
+  readonly opencodeConfig: string | null
 }
 
 // oMo provider configuration for installer
