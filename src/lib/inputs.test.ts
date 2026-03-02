@@ -356,6 +356,120 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('Invalid model format')
     })
+
+    it('returns error for invalid opencode-config (not valid JSON)', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': 'not-valid-json',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('opencode-config')
+      expect(!result.success && result.error.message).toContain('valid JSON')
+    })
+
+    it('returns error when opencode-config is JSON null literal', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': 'null',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('opencode-config')
+      expect(!result.success && result.error.message).toContain('JSON object')
+    })
+
+    it('returns error when opencode-config is a JSON array', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': '[1,2,3]',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('opencode-config')
+      expect(!result.success && result.error.message).toContain('JSON object')
+    })
+
+    it('returns error when opencode-config is a JSON string literal', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': '"literal"',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('opencode-config')
+      expect(!result.success && result.error.message).toContain('JSON object')
+    })
+  })
+
+  describe('with valid opencode-config', () => {
+    it('parses valid JSON object in opencode-config', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': '{"model": "claude-opus-4", "temperature": 0.7}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.opencodeConfig).toBe('{"model": "claude-opus-4", "temperature": 0.7}')
+    })
+
+    it('sets opencodeConfig to null when empty string', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'opencode-config': '',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.opencodeConfig).toBe(null)
+    })
   })
 })
 

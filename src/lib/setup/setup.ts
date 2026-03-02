@@ -16,6 +16,7 @@ import {createLogger} from '../logger.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
+import {writeOmoConfig} from './omo-config.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
@@ -28,6 +29,7 @@ const VALID_OMO_PROVIDERS = [
   'openai',
   'opencode-zen',
   'zai-coding-plan',
+  'kimi-for-coding',
 ] as const
 
 function parseOmoProviders(input: string): OmoInstallOptions {
@@ -42,6 +44,7 @@ function parseOmoProviders(input: string): OmoInstallOptions {
   let openai: 'no' | 'yes' = 'no'
   let opencodeZen: 'no' | 'yes' = 'no'
   let zaiCodingPlan: 'no' | 'yes' = 'no'
+  let kimiForCoding: 'no' | 'yes' = 'no'
 
   for (const provider of providers) {
     if (!VALID_OMO_PROVIDERS.includes(provider as (typeof VALID_OMO_PROVIDERS)[number])) {
@@ -70,10 +73,13 @@ function parseOmoProviders(input: string): OmoInstallOptions {
       case 'zai-coding-plan':
         zaiCodingPlan = 'yes'
         break
+      case 'kimi-for-coding':
+        kimiForCoding = 'yes'
+        break
     }
   }
 
-  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan}
+  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan, kimiForCoding}
 }
 
 /**
@@ -103,12 +109,18 @@ function createExecAdapter(): ExecAdapter {
  * Parse setup action inputs from environment.
  */
 function parseSetupInputs(): SetupInputs {
+  const appIdRaw = core.getInput('app-id').trim()
+  const privateKeyRaw = core.getInput('private-key').trim()
+  const opencodeConfigRaw = core.getInput('opencode-config').trim()
+  const omoConfigRaw = core.getInput('omo-config').trim()
+
   return {
     opencodeVersion: core.getInput('opencode-version') || 'latest',
     authJson: core.getInput('auth-json', {required: true}),
-    appId: core.getInput('app-id') || null,
-    privateKey: core.getInput('private-key') || null,
-    opencodeConfig: core.getInput('opencode-config') || null,
+    appId: appIdRaw.length > 0 ? appIdRaw : null,
+    privateKey: privateKeyRaw.length > 0 ? privateKeyRaw : null,
+    opencodeConfig: opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null,
+    omoConfig: omoConfigRaw.length > 0 ? omoConfigRaw : null,
   }
 }
 
@@ -220,6 +232,17 @@ export async function runSetup(): Promise<SetupResult | null> {
     // Run oMo installer to ensure config values (e.g. provider settings) are current.
     // Skip if Bun install failed — bunx won't be available.
     if (bunInstalled) {
+      // Write omo-config before installer runs so it can observe any custom settings
+      if (inputs.omoConfig != null) {
+        try {
+          await writeOmoConfig(inputs.omoConfig, omoConfigPath, logger)
+        } catch (error) {
+          logger.warning('Failed to write omo-config, continuing without custom config', {
+            error: toErrorMessage(error),
+          })
+        }
+      }
+
       const omoProvidersRaw = core.getInput('omo-providers').trim()
       const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
       const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
@@ -233,6 +256,30 @@ export async function runSetup(): Promise<SetupResult | null> {
       }
       omoError = omoResult.error
     }
+
+    // Export CI-safe OpenCode config. OPENCODE_CONFIG_CONTENT has highest precedence over all
+    // other OpenCode config sources (project, global, etc.). User-supplied opencode-config input
+    // is merged on top of the baseline, so user values override the defaults.
+    const ciConfig: Record<string, unknown> = {autoupdate: false}
+
+    if (inputs.opencodeConfig != null) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(inputs.opencodeConfig)
+      } catch {
+        core.setFailed('opencode-config must be valid JSON')
+        return null
+      }
+
+      // Validate that the parsed result is a plain object (not null, array, or primitive)
+      if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        core.setFailed('opencode-config must be a JSON object')
+        return null
+      }
+      Object.assign(ciConfig, parsed)
+    }
+
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfig))
 
     if (!toolsCacheResult.hit) {
       await saveToolsCache({
