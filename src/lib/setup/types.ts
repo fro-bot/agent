@@ -14,6 +14,7 @@ export interface SetupInputs {
   readonly appId: string | null
   readonly privateKey: string | null
   readonly opencodeConfig: string | null
+  readonly omoConfig: string | null
 }
 
 /**

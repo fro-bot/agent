@@ -60,6 +60,8 @@ export interface ActionInputs {
   readonly omoVersion: string
   // oMo provider configuration
   readonly omoProviders: OmoProviders
+  // OpenCode config to merge with baseline
+  readonly opencodeConfig: string | null
 }
 
 // oMo provider configuration for installer
@@ -70,6 +72,7 @@ export interface OmoProviders {
   readonly openai: 'no' | 'yes'
   readonly opencodeZen: 'no' | 'yes'
   readonly zaiCodingPlan: 'no' | 'yes'
+  readonly kimiForCoding: 'no' | 'yes'
 }
 
 // Action outputs

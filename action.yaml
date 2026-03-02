@@ -53,8 +53,18 @@ inputs:
   omo-providers:
     description: >-
       Comma-separated list of oMo providers to enable. Values: claude, claude-max20,
-      copilot, gemini, openai, opencode-zen, zai-coding-plan. Default: empty
-      (uses free OpenCode models)
+      copilot, gemini, openai, opencode-zen, zai-coding-plan, kimi-for-coding.
+      Default: empty (uses free OpenCode models)
+    required: false
+  opencode-config:
+    description: >-
+      JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).
+      Values are merged on top of the autoupdate:false baseline; user values win on conflicts.
+    required: false
+  omo-config:
+    description: >-
+      Custom oMo configuration JSON. Written before installer runs.
+      Deep-merged with existing config.
     required: false
 
 outputs:

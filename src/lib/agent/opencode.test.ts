@@ -235,7 +235,15 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
-      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
@@ -267,7 +275,15 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
@@ -295,7 +311,15 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {claude: 'yes', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'yes',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
@@ -320,7 +344,15 @@ describe('executeOpenCode', () => {
       agent: 'sisyphus',
       model: {providerID: 'openai', modelID: 'gpt-5'},
       timeoutMs: 1800000,
-      omoProviders: {claude: 'yes', copilot: 'no', gemini: 'no', openai: 'yes', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'yes',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'yes',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
@@ -345,7 +377,15 @@ describe('executeOpenCode', () => {
       agent: 'CustomAgent',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
@@ -371,7 +411,15 @@ describe('executeOpenCode', () => {
       agent: 'oracle',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {claude: 'no', copilot: 'no', gemini: 'no', openai: 'no', opencodeZen: 'no', zaiCodingPlan: 'no'},
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
     }
 
     // #when
