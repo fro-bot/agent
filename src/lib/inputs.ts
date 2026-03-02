@@ -190,6 +190,15 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     // Validate opencode-config is valid JSON if provided
     if (opencodeConfig != null) {
       validateJsonString(opencodeConfig, 'opencode-config')
+
+      const parsedOpencodeConfig: unknown = JSON.parse(opencodeConfig)
+      const isObject = typeof parsedOpencodeConfig === 'object'
+      const isNull = parsedOpencodeConfig == null
+      const isArray = Array.isArray(parsedOpencodeConfig)
+
+      if (!isObject || isNull || isArray) {
+        throw new Error("Input 'opencode-config' must be a JSON object")
+      }
     }
 
     return ok({

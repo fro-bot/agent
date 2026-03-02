@@ -43,7 +43,7 @@ describe('deepMerge', () => {
     expect(result).toEqual({arr: [4, 5]})
   })
 
-  it('handles null source gracefully', () => {
+  it('returns target unchanged when source is empty object', () => {
     // #given
     const target = {a: 1}
 
@@ -52,6 +52,23 @@ describe('deepMerge', () => {
 
     // #then
     expect(result).toEqual({a: 1})
+  })
+
+  it('ignores prototype pollution keys during merge', () => {
+    // #given
+    const source = JSON.parse('{"__proto__":{"polluted":true},"constructor":{"prototype":{"oops":true}},"safe":1}') as {
+      __proto__?: unknown
+      constructor?: unknown
+      safe: number
+    }
+
+    // #when
+    const result = deepMerge({}, source)
+
+    // #then
+    expect(result.safe).toBe(1)
+    expect(Object.prototype).not.toHaveProperty('polluted')
+    expect(Object.prototype).not.toHaveProperty('oops')
   })
 
   it('does not mutate target or source objects', () => {
@@ -174,6 +191,24 @@ describe('writeOmoConfig', () => {
 
     // #when / #then
     await expect(writeOmoConfig(invalidJson, tmpDir, logger)).rejects.toThrow()
+  })
+
+  it('throws when input JSON is not an object', async () => {
+    // #given
+    const jsonNull = 'null'
+    const jsonArray = '[1,2,3]'
+    const jsonNumber = '42'
+
+    // #when / #then
+    await expect(writeOmoConfig(jsonNull, tmpDir, logger)).rejects.toThrow(
+      'omo-config must be a JSON object (non-null, non-array)',
+    )
+    await expect(writeOmoConfig(jsonArray, tmpDir, logger)).rejects.toThrow(
+      'omo-config must be a JSON object (non-null, non-array)',
+    )
+    await expect(writeOmoConfig(jsonNumber, tmpDir, logger)).rejects.toThrow(
+      'omo-config must be a JSON object (non-null, non-array)',
+    )
   })
 
   it('logs info after writing config', async () => {

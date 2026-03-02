@@ -109,13 +109,18 @@ function createExecAdapter(): ExecAdapter {
  * Parse setup action inputs from environment.
  */
 function parseSetupInputs(): SetupInputs {
+  const appIdRaw = core.getInput('app-id').trim()
+  const privateKeyRaw = core.getInput('private-key').trim()
+  const opencodeConfigRaw = core.getInput('opencode-config').trim()
+  const omoConfigRaw = core.getInput('omo-config').trim()
+
   return {
     opencodeVersion: core.getInput('opencode-version') || 'latest',
     authJson: core.getInput('auth-json', {required: true}),
-    appId: core.getInput('app-id') || null,
-    privateKey: core.getInput('private-key') || null,
-    opencodeConfig: core.getInput('opencode-config') || null,
-    omoConfig: core.getInput('omo-config') || null,
+    appId: appIdRaw.length > 0 ? appIdRaw : null,
+    privateKey: privateKeyRaw.length > 0 ? privateKeyRaw : null,
+    opencodeConfig: opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null,
+    omoConfig: omoConfigRaw.length > 0 ? omoConfigRaw : null,
   }
 }
 
@@ -258,7 +263,14 @@ export async function runSetup(): Promise<SetupResult | null> {
     const ciConfig: Record<string, unknown> = {autoupdate: false}
 
     if (inputs.opencodeConfig != null) {
-      const parsed = JSON.parse(inputs.opencodeConfig) as unknown
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(inputs.opencodeConfig)
+      } catch {
+        core.setFailed('opencode-config must be valid JSON')
+        return null
+      }
+
       // Validate that the parsed result is a plain object (not null, array, or primitive)
       if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
         core.setFailed('opencode-config must be a JSON object')
