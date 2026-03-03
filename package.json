@@ -72,14 +72,25 @@
   "packageManager": "pnpm@10.30.2",
   "pnpm": {
     "overrides": {
+      "@actions/glob>minimatch": "3.1.5",
       "@eslint/config-array>minimatch": "10.2.3",
       "@isaacs/brace-expansion": "5.0.1",
+      "@npmcli/arborist>minimatch": "10.2.3",
+      "@npmcli/map-workspaces>minimatch": "10.2.3",
+      "@tufjs/models>minimatch": "10.2.3",
+      "@typescript-eslint/typescript-estree>minimatch": "9.0.9",
+      "eslint-plugin-import-x>minimatch": "10.2.3",
       "eslint-plugin-json-schema-validator>ajv": "8.18.0",
+      "eslint-plugin-json-schema-validator>minimatch": "10.2.3",
       "eslint>ajv": "6.14.0",
+      "eslint>minimatch": "10.2.3",
       "fast-xml-parser": "5.3.8",
+      "glob>minimatch": "10.2.3",
+      "ignore-walk>minimatch": "10.2.3",
       "lodash": "4.17.23",
       "lodash-es": "4.17.23",
-      "tar": "7.5.9"
+      "tar": "7.5.9",
+      "vite>rollup": "4.59.0"
     }
   }
 }
