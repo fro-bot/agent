@@ -6,7 +6,7 @@
  */
 
 // Re-export shared types from github module
-export {BOT_COMMENT_MARKER, type CommentTarget} from '../github/types.js'
+export {BOT_COMMENT_MARKER, type CommentTarget} from '../../services/github/types.js'
 
 /**
  * A comment within a thread (issue, PR, or discussion).

@@ -1,6 +1,6 @@
 import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import {describe, expect, it} from 'vitest'
-import {BOT_COMMENT_MARKER} from '../github/types.js'
+import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
 import {
   appendSummaryToComment,
   extractSummaryFromComment,

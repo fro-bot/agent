@@ -1,5 +1,5 @@
 import type {AttachmentUrl} from './types.js'
-import {isValidAttachmentUrl} from '../github/urls.js'
+import {isValidAttachmentUrl} from '../../services/github/urls.js'
 
 const ATTACHMENT_PATTERNS = {
   markdownImage: /!\[([^\]]*)\]\((https:\/\/github\.com\/user-attachments\/assets\/[^)]+)\)/gi,

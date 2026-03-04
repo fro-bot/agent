@@ -5,7 +5,7 @@
  * Works alongside github/context.ts utilities, not replacing them.
  */
 
-import type {EventType, GitHubContext} from '../github/types.js'
+import type {EventType, GitHubContext} from '../../services/github/types.js'
 import {ALLOWED_ASSOCIATIONS} from '../../shared/types.js'
 
 export {ALLOWED_ASSOCIATIONS}

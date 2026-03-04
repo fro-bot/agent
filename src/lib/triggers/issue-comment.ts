@@ -1,9 +1,9 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {Thread} from '../comments/types.js'
-import type {Octokit} from '../github/types.js'
 import type {TriggerContext} from './types.js'
+import {getCommentTarget} from '../../services/github/context.js'
 import {readThread} from '../comments/reader.js'
-import {getCommentTarget} from '../github/context.js'
 
 export interface IssueCommentResult {
   readonly handled: boolean

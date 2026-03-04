@@ -4,8 +4,8 @@
  * Uses GitHub Git Data API for branch creation, existence checking, and deletion.
  */
 
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {BranchResult, CreateBranchOptions} from './types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 

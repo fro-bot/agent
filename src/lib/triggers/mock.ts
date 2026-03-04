@@ -1,8 +1,8 @@
+import type {GitHubContext} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {GitHubContext} from '../github/types.js'
 import process from 'node:process'
+import {classifyEventType, normalizeEvent} from '../../services/github/context.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {classifyEventType, normalizeEvent} from '../github/context.js'
 
 export interface MockEventConfig {
   readonly enabled: boolean

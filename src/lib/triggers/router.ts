@@ -1,5 +1,5 @@
+import type {GitHubContext} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {GitHubContext} from '../github/types.js'
 import type {
   AuthorInfo,
   ParsedCommand,

@@ -1,5 +1,5 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {ContextBudget, IssueContext, PullRequestContext} from './types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {truncateBody} from './budget.js'

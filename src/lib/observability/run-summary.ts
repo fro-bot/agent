@@ -1,6 +1,6 @@
 import type {TokenUsage} from '../../shared/types.js'
 import type {CommentSummaryOptions} from './types.js'
-import {BOT_COMMENT_MARKER} from '../github/types.js'
+import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
 
 /**
  * Format cache status with visual indicators for run summaries.

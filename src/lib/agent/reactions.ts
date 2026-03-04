@@ -1,7 +1,6 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {ReactionContext} from './types.js'
-import {toErrorMessage} from '../../shared/errors.js'
 import {
   addLabelsToIssue,
   createCommentReaction,
@@ -9,7 +8,8 @@ import {
   ensureLabelExists,
   listCommentReactions,
   removeLabelFromIssue,
-} from '../github/api.js'
+} from '../../services/github/api.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from './types.js'
 
 export async function addEyesReaction(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<boolean> {

@@ -1,5 +1,5 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {TriggerContext, TriggerTarget} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'

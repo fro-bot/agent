@@ -1,4 +1,4 @@
-import type {Octokit} from '../lib/github/types.js'
+import type {Octokit} from '../services/github/types.js'
 import type {Logger} from './logger.js'
 import {Buffer} from 'node:buffer'
 import {vi, type Mock} from 'vitest'

@@ -1,5 +1,5 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {fallbackIssueContext, fallbackPullRequestContext} from './fallback.js'
 import {createMockLogger} from './test-helpers.js'

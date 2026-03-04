@@ -1,8 +1,8 @@
-import type {Octokit} from '../github/types.js'
+import type {Octokit} from '../../services/github/types.js'
 import type {ExecAdapter, GhAuthResult, Logger} from './types.js'
 import process from 'node:process'
-import {getUserByUsername} from '../github/api.js'
-import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
+import {getUserByUsername} from '../../services/github/api.js'
+import {getBotLogin as getAuthenticatedUser} from '../../services/github/client.js'
 
 export async function configureGhAuth(
   client: Octokit | null,

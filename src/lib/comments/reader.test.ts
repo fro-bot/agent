@@ -1,9 +1,9 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {Thread} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
 import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
-import {BOT_COMMENT_MARKER} from '../github/types.js'
 import {findBotComment, readThread} from './reader.js'
 
 describe('comments/reader', () => {

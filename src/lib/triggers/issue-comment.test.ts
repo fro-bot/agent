@@ -1,9 +1,9 @@
+import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {Octokit} from '../github/types.js'
 import type {TriggerContext} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {normalizeEvent} from '../../services/github/context.js'
 import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
-import {normalizeEvent} from '../github/context.js'
 import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {handleIssueComment} from './issue-comment.js'
 
