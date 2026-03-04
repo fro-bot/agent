@@ -12,7 +12,7 @@ import {
   type CacheAdapter,
   type RestoreCacheOptions,
   type SaveCacheOptions,
-} from './cache.js'
+} from './index.js'
 
 // Test fixtures
 const testComponents: CacheKeyComponents = {
