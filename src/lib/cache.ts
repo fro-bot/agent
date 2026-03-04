@@ -4,10 +4,10 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as cache from '@actions/cache'
+import {isSqliteBackend} from '../services/session/version.js'
 import {STORAGE_VERSION} from '../shared/constants.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey, type CacheKeyComponents} from './cache-key.js'
-import {isSqliteBackend} from './session/version.js'
 
 /**
  * Adapter interface for cache operations.

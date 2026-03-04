@@ -8,10 +8,10 @@
 
 import type {Result} from '@bfra.me/es/result'
 import type {Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+import type {SessionClient} from '../../services/session/backend.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
 import type {ErrorInfo} from '../comments/types.js'
-import type {SessionClient} from '../session/backend.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
