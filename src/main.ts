@@ -47,9 +47,9 @@ import {
 import {formatErrorComment, postComment} from './features/comments/index.js'
 import {createMetricsCollector, writeJobSummary} from './features/observability/index.js'
 import {routeEvent} from './features/triggers/index.js'
-import {parseActionInputs} from './lib/inputs.js'
-import {setActionOutputs} from './lib/outputs.js'
-import {STATE_KEYS} from './lib/state-keys.js'
+import {parseActionInputs} from './harness/config/inputs.js'
+import {setActionOutputs} from './harness/config/outputs.js'
+import {STATE_KEYS} from './harness/config/state-keys.js'
 import {restoreCache, saveCache} from './services/cache/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './services/github/index.js'
 import {

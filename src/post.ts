@@ -12,7 +12,7 @@
  */
 import type {Logger} from './shared/logger.js'
 import * as core from '@actions/core'
-import {STATE_KEYS} from './lib/state-keys.js'
+import {STATE_KEYS} from './harness/config/state-keys.js'
 import {saveCache} from './services/cache/index.js'
 import {
   getGitHubRefName,

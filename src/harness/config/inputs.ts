@@ -1,5 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
-import type {ActionInputs, ModelConfig, OmoProviders} from '../shared/types.js'
+import type {ActionInputs, ModelConfig, OmoProviders} from '../../shared/types.js'
 import * as core from '@actions/core'
 import {
   DEFAULT_AGENT,
@@ -8,9 +8,9 @@ import {
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_TIMEOUT_MS,
-} from '../shared/constants.js'
-import {err, ok} from '../shared/types.js'
-import {validateJsonString, validatePositiveInteger} from '../shared/validation.js'
+} from '../../shared/constants.js'
+import {err, ok} from '../../shared/types.js'
+import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
 
 /**
  * Parse model input string in "provider/model" format.

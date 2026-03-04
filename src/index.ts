@@ -1,6 +1,6 @@
-export {parseActionInputs} from './lib/inputs.js'
+export {parseActionInputs} from './harness/config/inputs.js'
 
-export {setActionOutputs} from './lib/outputs.js'
+export {setActionOutputs} from './harness/config/outputs.js'
 
 // Public API - lib exports
 export {
