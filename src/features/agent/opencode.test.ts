@@ -1,6 +1,6 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {OpenCodeServerHandle} from './opencode.js'
+import type {OpenCodeServerHandle} from './server.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
@@ -9,19 +9,13 @@ import process from 'node:process'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import * as setup from '../../services/setup/setup.js'
 import * as envUtils from '../../shared/env.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {
-  bootstrapOpenCodeServer,
-  ensureOpenCodeAvailable,
-  executeOpenCode,
-  INITIAL_ACTIVITY_TIMEOUT_MS,
-  logServerEvent,
-  pollForSessionCompletion,
-  processEventStream,
-  verifyOpenCodeAvailable,
-  waitForEventProcessorShutdown,
-} from './opencode.js'
+import {executeOpenCode} from './execution.js'
+import {bootstrapOpenCodeServer, ensureOpenCodeAvailable, verifyOpenCodeAvailable} from './server.js'
+import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
+import {logServerEvent, processEventStream} from './streaming.js'
 
 // Mock node:fs/promises
 vi.mock('node:fs/promises', () => ({
@@ -802,7 +796,10 @@ describe('executeOpenCode retry behavior', () => {
     expect(promptCallCount).toBe(3)
     expect(result.success).toBe(false)
     expect(result.llmError).not.toBeNull()
-    expect(mockLogger.warning).toHaveBeenCalledWith('LLM fetch error: max retries exhausted', expect.any(Object))
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'LLM fetch error detected, retrying with continuation prompt',
+      expect.any(Object),
+    )
   })
 
   it('does not retry on non-LLM errors', async () => {
@@ -842,7 +839,6 @@ describe('executeOpenCode retry behavior', () => {
     // #given
     const mockServer = createMockServer()
     let promptCallCount = 0
-    let subscribeCallCount = 0
 
     const mockClient = {
       session: {
@@ -858,29 +854,25 @@ describe('executeOpenCode retry behavior', () => {
       },
       event: {
         subscribe: vi.fn().mockImplementation(async () => {
-          subscribeCallCount++
-          const events: Event[] =
-            subscribeCallCount === 1
-              ? []
-              : [
-                  {
-                    type: 'message.updated',
-                    properties: {
-                      info: {
-                        id: 'msg_123',
-                        sessionID: 'ses_123',
-                        parentID: '',
-                        role: 'assistant',
-                        tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
-                        modelID: 'claude-sonnet-4-20250514',
-                        cost: 0.001,
-                        time: {created: 0},
-                        system: '',
-                        parts: [],
-                      },
-                    },
-                  } as unknown as Event,
-                ]
+          const events: Event[] = [
+            {
+              type: 'message.updated',
+              properties: {
+                info: {
+                  id: 'msg_123',
+                  sessionID: 'ses_123',
+                  parentID: '',
+                  role: 'assistant',
+                  tokens: {input: 100, output: 50, reasoning: 0, cache: {read: 0, write: 0}},
+                  modelID: 'claude-sonnet-4-20250514',
+                  cost: 0.001,
+                  time: {created: 0},
+                  system: '',
+                  parts: [],
+                },
+              },
+            } as unknown as Event,
+          ]
           return Promise.resolve(createMockEventStream(events))
         }),
       },
@@ -983,6 +975,19 @@ describe('ensureOpenCodeAvailable', () => {
     const result = await ensureOpenCodeAvailable({
       logger: mockLogger,
       opencodeVersion: 'latest',
+      githubToken: 'ghs_test_token',
+      authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+      omoVersion: '3.7.4',
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
+      opencodeConfig: null,
     })
 
     // #then
@@ -995,12 +1000,26 @@ describe('ensureOpenCodeAvailable', () => {
   it('logs message when OpenCode not available and setup needed', async () => {
     // #given
     vi.mocked(exec.exec).mockRejectedValue(new Error('Command not found'))
+    vi.spyOn(setup, 'runSetup').mockResolvedValue(null)
 
     // #when
     try {
       await ensureOpenCodeAvailable({
         logger: mockLogger,
         opencodeVersion: 'latest',
+        githubToken: 'ghs_test_token',
+        authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+        omoVersion: '3.7.4',
+        omoProviders: {
+          claude: 'no',
+          copilot: 'no',
+          gemini: 'no',
+          openai: 'no',
+          opencodeZen: 'no',
+          zaiCodingPlan: 'no',
+          kimiForCoding: 'no',
+        },
+        opencodeConfig: null,
       })
     } catch {
       // Expected to fail since runSetup will fail in test environment

@@ -15,13 +15,9 @@ export type {CollectAgentContextOptions} from './context.js'
 // Diff context collection (RFC-009) - used internally by collectAgentContext
 export {collectDiffContext} from './diff-context.js'
 
-// OpenCode execution (RFC-013: SDK mode)
-export {bootstrapOpenCodeServer, ensureOpenCodeAvailable, executeOpenCode, verifyOpenCodeAvailable} from './opencode.js'
-export type {OpenCodeServerHandle} from './opencode.js'
-
+export {executeOpenCode} from './execution.js'
 // Prompt construction
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
-
 export type {TriggerDirective} from './prompt.js'
 
 // Reactions & labels
@@ -34,6 +30,11 @@ export {
   updateReactionOnFailure,
   updateReactionOnSuccess,
 } from './reactions.js'
+
+// OpenCode execution (RFC-013: SDK mode)
+export {bootstrapOpenCodeServer, ensureOpenCodeAvailable, verifyOpenCodeAvailable} from './server.js'
+
+export type {OpenCodeServerHandle} from './server.js'
 
 // Types
 export type {

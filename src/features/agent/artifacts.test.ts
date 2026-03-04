@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-import {detectArtifacts} from './opencode.js'
+import {detectArtifacts} from './streaming.js'
 
 describe('detectArtifacts', () => {
   it('detects PR creation from output', () => {
