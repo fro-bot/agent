@@ -4,9 +4,9 @@ import type {Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {getSessionInfo, listSessions, searchSessions} from './search.js'
-import {getSession, getSessionMessages, getSessionTodos, listSessionsForProject} from './storage.js'
+import {getSession, getSessionMessages, getSessionTodos, listSessionsForProject} from './session-storage.js'
 
-vi.mock('./storage.js', () => ({
+vi.mock('./session-storage.js', () => ({
   listSessionsForProject: vi.fn(),
   getSession: vi.fn(),
   getSessionMessages: vi.fn(),

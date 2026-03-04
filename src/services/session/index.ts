@@ -17,7 +17,7 @@ export {
   getSessionTodos,
   listProjectsViaSDK,
   listSessionsForProject,
-} from './storage.js'
+} from './session-storage.js'
 
 // Types
 export type {

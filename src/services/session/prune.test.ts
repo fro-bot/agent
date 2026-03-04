@@ -5,7 +5,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
 
-vi.mock('./storage.js')
+vi.mock('./session-storage.js')
 
 const mockLogger: Logger = {
   debug: vi.fn(),
@@ -62,7 +62,7 @@ describe('pruneSessions', () => {
 
   it('returns zeros when no project found', async () => {
     // #given
-    const {findProjectByWorkspace} = await import('./storage.js')
+    const {findProjectByWorkspace} = await import('./session-storage.js')
     vi.mocked(findProjectByWorkspace).mockResolvedValue(null)
     const client = createMockSdkClient()
 
@@ -78,7 +78,7 @@ describe('pruneSessions', () => {
 
   it('returns zeros when no sessions exist', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject} = await import('./session-storage.js')
     vi.mocked(findProjectByWorkspace).mockResolvedValue({
       id: 'proj1',
       worktree: '/repo',
@@ -99,7 +99,7 @@ describe('pruneSessions', () => {
 
   it('prunes oldest sessions when count exceeds maxSessions', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./session-storage.js')
     const now = Date.now()
     const oldTime = now - 60 * 24 * 60 * 60 * 1000 // 60 days ago
 
@@ -133,7 +133,7 @@ describe('pruneSessions', () => {
 
   it('keeps recent sessions even if count exceeds maxSessions', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject} = await import('./session-storage.js')
     const now = Date.now()
 
     const sessions = [
@@ -163,7 +163,7 @@ describe('pruneSessions', () => {
 
   it('prunes child sessions when parent is pruned', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./session-storage.js')
     const now = Date.now()
     const oldTime = now - 60 * 24 * 60 * 60 * 1000
 
@@ -195,7 +195,7 @@ describe('pruneSessions', () => {
 
   it('handles SDK delete failure gracefully', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./session-storage.js')
     const now = Date.now()
     const oldTime = now - 60 * 24 * 60 * 60 * 1000
 
@@ -224,7 +224,7 @@ describe('pruneSessions', () => {
 
   it('returns zero freedBytes from SDK deletes', async () => {
     // #given
-    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./storage.js')
+    const {findProjectByWorkspace, listSessionsForProject, deleteSession} = await import('./session-storage.js')
     const now = Date.now()
     const oldTime = now - 60 * 24 * 60 * 60 * 1000
 

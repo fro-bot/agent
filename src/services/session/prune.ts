@@ -2,7 +2,7 @@ import type {SessionClient} from './backend.js'
 import type {Logger, PruneResult, PruningConfig} from './types.js'
 
 import {toErrorMessage} from '../../shared/errors.js'
-import {deleteSession, findProjectByWorkspace, listSessionsForProject} from './storage.js'
+import {deleteSession, findProjectByWorkspace, listSessionsForProject} from './session-storage.js'
 
 /**
  * Default pruning configuration.

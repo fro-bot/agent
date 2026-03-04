@@ -12,7 +12,7 @@ import {
   getSessionTodos,
   listProjectsViaSDK,
   listSessionsForProject,
-} from './storage.js'
+} from './session-storage.js'
 
 const mockLogger: Logger = {
   debug: vi.fn(),
