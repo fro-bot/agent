@@ -4,13 +4,12 @@
 
 ## WHERE TO LOOK
 
-| Component        | File              | Purpose                                               |
-| ---------------- | ----------------- | ----------------------------------------------------- |
-| **Types**        | `types.ts`        | ThreadComment, Thread, ErrorInfo, PostCommentResult   |
-| **Reader**       | `reader.ts`       | `readThread()`, `findBotComment()`, pagination (257L) |
-| **Writer**       | `writer.ts`       | `postComment()`, `isBotComment()`, GraphQL mutations  |
-| **Error Format** | `error-format.ts` | `formatErrorComment()`, error creation helpers        |
-| **Exports**      | `index.ts`        | Public API surface                                    |
+| Component        | File              | Responsibility                                               |
+| ---------------- | ----------------- | ------------------------------------------------------------ |
+| **Reader**       | `reader.ts`       | `readThread()`, `findBotComment()`, pagination (257 L)       |
+| **Writer**       | `writer.ts`       | `postComment()`, `isBotComment()`, GraphQL mutations (214 L) |
+| **Error Format** | `error-format.ts` | `formatErrorComment()`, error creation helpers (187 L)       |
+| **Types**        | `types.ts`        | ThreadComment, Thread, ErrorInfo, PostCommentResult (141 L)  |
 
 ## KEY EXPORTS
 
@@ -64,6 +63,6 @@ postComment(client, target, options, logger)
 
 ## INTEGRATION NOTES
 
-- **Reactions**: Use `src/lib/agent/reactions.ts` for emoji/label operations.
-- **Run Summary**: Use `src/lib/observability/run-summary.ts` for comment summaries.
+- **Reactions**: Use `src/features/agent/reactions.ts` for emoji/label operations.
+- **Run Summary**: Use `src/features/observability/run-summary.ts` for comment summaries.
 - **Permissions**: Discussions require `discussions: write` in workflow.

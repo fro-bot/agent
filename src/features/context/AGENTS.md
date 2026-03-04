@@ -22,7 +22,14 @@ hydrateIssueContext() / hydratePullRequestContext()
 
 ## WHERE TO LOOK
 
-| File              | Purpose                                             |
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Types** | `types.ts` | Type definitions, budget constraints (279 L) |
+| **GraphQL** | `graphql.ts` | GraphQL queries and execution (batched) (186 L) |
+| **Issue** | `issue.ts` | Issue context hydration logic (66 L) |
+| **Pull Request**| `pull-request.ts`| PR context hydration (requested reviewers) (142 L) |
+| **Fallback** | `fallback.ts` | REST API fallback (188 L) |
+| **Budget** | `budget.ts` | Truncation, size estimation, prompt format (195 L) |],op:
 | ----------------- | --------------------------------------------------- |
 | `types.ts`        | Type definitions, budget constraints (279 L)        |
 | `graphql.ts`      | GraphQL queries and execution (batched)             |

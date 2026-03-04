@@ -2,6 +2,29 @@
 
 **Context**: Centralized event routing and skip-logic gating (RFC-005). Consumes `NormalizedEvent` from `github/context.ts` to determine IF an action should run. Pure logic; no side effects.
 
+## WHERE TO LOOK
+
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Router** | `router.ts` | Core `routeEvent()` dispatch (39 L) |
+| **Skip (Main)** | `skip-conditions.ts` | Main skip condition orchestrator (41 L) |
+| **Skip (Comments)** | `skip-conditions-comment.ts` | Comment-specific skip conditions (68 L) |
+| **Skip (PR)** | `skip-conditions-pr.ts` | PR-specific skip conditions (91 L) |
+| **Skip (Issues)** | `skip-conditions-issues.ts` | Issue-specific skip conditions (50 L) |
+| **Skip (Manual)** | `skip-conditions-manual.ts` | Manual/schedule skip conditions (28 L) |
+| **Skip (Types)** | `skip-conditions-types.ts` | Shared skip condition types (10 L) |
+| **Context (Main)** | `context-builders.ts` | Main context builder orchestrator (74 L) |
+| **Context (Comm)** | `context-builders-comments.ts` | Comment context builders (106 L) |
+| **Context (PR/Iss)**| `context-builders-pr-issues.ts`| PR/issue context builders (71 L) |
+| **Context (Man)** | `context-builders-manual.ts` | Manual/schedule context builders (67 L) |
+| **Context (Types)**| `context-builders-types.ts`| Shared context builder types (11 L) |
+| **Utils** | `author-utils.ts` | Author validation utilities (9 L) |
+| **Parsing** | `mention-command.ts` | Mention/command parsing (63 L) |
+| **Mocking** | `mock.ts` | Synthetic event generation for testing (99 L) |
+| **Types** | `types.ts` | `TriggerResult`, `TriggerConfig`, `TriggerContext` (193 L) |],op:
+
+**Context**: Centralized event routing and skip-logic gating (RFC-005). Consumes `NormalizedEvent` from `github/context.ts` to determine IF an action should run. Pure logic; no side effects.
+
 ## FILES
 
 - `router.ts`: Core logic (887 lines). Contains `routeEvent`, `checkSkipConditions`, and context builders. Operates on `NormalizedEvent` discriminated union.

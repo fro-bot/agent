@@ -4,6 +4,23 @@ OpenCode session persistence layer — storage, search, pruning, and run summary
 
 ## WHERE TO LOOK
 
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Read** | `storage-read.ts` | Session, message, and part read operations (96 L) |
+| **Write** | `storage-write.ts` | Session, message, and part write operations (16 L) |
+| **Discovery** | `discovery.ts` | Project directory and session discovery (49 L) |
+| **Storage** | `session-storage.ts` | Main storage orchestrator and path resolution (9 L) |
+| **Search** | `search.ts` | `listSessions()`, `searchSessions()`, `getSessionInfo()` (220 L) |
+| **Pruning** | `prune.ts` | Dual-condition retention (Age OR Count) (138 L) |
+| **Writeback** | `writeback.ts` | Synthetic run summary messages for agent discovery (78 L) |
+| **Mappers** | `storage-*-mapper.ts` | Data transformation between storage and memory |
+| **Types** | `types.ts` | SessionInfo, Message, Part, TodoItem (291 L) |
+| **Version** | `version.ts` | Storage format versioning and migrations (34 L) |],op:
+
+OpenCode session persistence layer — storage, search, pruning, and run summary writeback.
+
+## WHERE TO LOOK
+
 | Component     | File           | Responsibility                                           |
 | ------------- | -------------- | -------------------------------------------------------- |
 | **Storage**   | `storage.ts`   | JSON file I/O, project/session discovery, deletion       |

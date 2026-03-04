@@ -4,7 +4,11 @@
 
 ## WHERE TO LOOK
 
-| Component    | File          | Purpose                                      |
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Diff** | `diff.ts` | Fetch PR diff, parse hunks, get file content (168 L) |
+| **Reviewer** | `reviewer.ts` | Submit reviews, post/get/reply to comments (213 L) |
+| **Types** | `types.ts` | PRDiff, ReviewComment, SubmitReviewOptions (168 L) |],op:
 | ------------ | ------------- | -------------------------------------------- |
 | **Types**    | `types.ts`    | PRDiff, ReviewComment, SubmitReviewOptions   |
 | **Diff**     | `diff.ts`     | Fetch PR diff, parse hunks, get file content |

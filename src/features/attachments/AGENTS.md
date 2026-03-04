@@ -19,7 +19,13 @@ Comment body → parseAttachmentUrls() → downloadAttachments() → validateAtt
 
 ## WHERE TO LOOK
 
-| File            | Purpose                                                |
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Downloader** | `downloader.ts` | Secure download with redirect validation (185 L) |
+| **Parser** | `parser.ts` | Extract attachment URLs from markdown/HTML (112 L) |
+| **Validator** | `validator.ts` | MIME type and size limit enforcement (114 L) |
+| **Injector** | `injector.ts` | Build SDK `FilePartInput[]` from attachments (81 L) |
+| **Types** | `types.ts` | Type definitions, limits (92 L) |],op:
 | --------------- | ------------------------------------------------------ |
 | `types.ts`      | Type definitions, limits, SDK type re-exports          |
 | `parser.ts`     | Extract attachment URLs from markdown/HTML             |

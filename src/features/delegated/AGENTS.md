@@ -5,7 +5,12 @@
 
 ## WHERE TO LOOK
 
-| File              | Purpose                                       |
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Branch** | `branch.ts` | Branch creation, existence checks (134 L) |
+| **Commit** | `commit.ts` | Atomic multi-file commits via Git Data API (218 L) |
+| **Pull Request**| `pull-request.ts`| PR creation, updates, labels (183 L) |
+| **Types** | `types.ts` | Type definitions for delegated ops (143 L) |],op:
 | ----------------- | --------------------------------------------- |
 | `index.ts`        | Public API entry point                        |
 | `types.ts`        | Type definitions for all delegated operations |

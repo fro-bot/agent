@@ -4,7 +4,12 @@
 
 ## WHERE TO LOOK
 
-| Component       | File             | Purpose                                              |
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Metrics** | `metrics.ts` | `createMetricsCollector()` factory (115 L) |
+| **Run Summary** | `run-summary.ts` | Comment summary generation (182 L) |
+| **Job Summary** | `job-summary.ts` | GitHub Actions UI job summary (99 L) |
+| **Types** | `types.ts` | `RunMetrics`, `ErrorRecord` (34 L) |],op:
 | --------------- | ---------------- | ---------------------------------------------------- |
 | **Types**       | `types.ts`       | `RunMetrics`, `ErrorRecord`, `CommentSummaryOptions` |
 | **Metrics**     | `metrics.ts`     | `createMetricsCollector()` factory                   |
