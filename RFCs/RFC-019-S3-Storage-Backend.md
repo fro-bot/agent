@@ -44,7 +44,7 @@ Implement S3 write-through backup for OpenCode storage, enabling cross-runner pe
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── storage/
 │   ├── AGENTS.md           # Module documentation
 │   ├── types.ts            # Storage types
@@ -57,7 +57,7 @@ src/lib/
 └── types.ts                # Updated: S3Config type
 ```
 
-### 2. Types (`src/lib/storage/types.ts`)
+### 2. Types (`src/services/session/storage/types.ts`)
 
 ```typescript
 export interface S3Config {
@@ -109,7 +109,7 @@ S3 objects use prefix isolation by agent identity and repository:
 opencode-storage/{github|discord}/{owner-repo}/storage/...
 ```
 
-### 4. S3 Client Operations (`src/lib/storage/s3.ts`)
+### 4. S3 Client Operations (`src/services/session/storage/s3.ts`)
 
 ```typescript
 import {
@@ -278,7 +278,7 @@ function chunkArray<T>(arr: readonly T[], size: number): T[][] {
 }
 ```
 
-### 5. Sync Orchestration (`src/lib/storage/sync.ts`)
+### 5. Sync Orchestration (`src/services/session/storage/sync.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -429,7 +429,7 @@ async function walkDirectory(dirPath: string): Promise<string[]> {
 }
 ```
 
-### 6. Cache Integration (`src/lib/cache.ts` updates)
+### 6. Cache Integration (`src/services/cache/restore.ts` updates)
 
 Add S3 fallback to `restoreCache`:
 
@@ -532,7 +532,7 @@ inputs:
     default: "opencode-storage"
 ```
 
-### 8. Input Parsing (`src/lib/inputs.ts` updates)
+### 8. Input Parsing (`src/harness/config/inputs.ts` updates)
 
 ```typescript
 import type {S3Config} from "./storage/types.js"
@@ -643,7 +643,7 @@ opencode-storage/discord/owner-repo/storage/...
 
 ## Test Cases
 
-### S3 Client Tests (`src/lib/storage/s3.test.ts`)
+### S3 Client Tests (`src/services/session/storage/s3.test.ts`)
 
 ```typescript
 import {describe, expect, it, vi} from "vitest"
@@ -694,7 +694,7 @@ describe("createS3Client", () => {
 })
 ```
 
-### Sync Tests (`src/lib/storage/sync.test.ts`)
+### Sync Tests (`src/services/session/storage/sync.test.ts`)
 
 ```typescript
 import {describe, expect, it, vi} from "vitest"

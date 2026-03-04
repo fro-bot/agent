@@ -25,11 +25,13 @@ These patterns differ from common AI training data. Get them wrong and the build
 
 ```typescript
 // ✅ CORRECT
-import {createLogger} from "../lib/logger.js"
+import {createLogger} from "../shared/logger.js"
+import {restoreCache} from "../services/cache/restore.js"
 import {restoreCache} from "./cache.js"
 
 // ❌ WRONG — build fails without extension
-import {createLogger} from "../lib/logger"
+import {createLogger} from "../shared/logger"
+import {restoreCache} from "../services/cache/restore"
 import {restoreCache} from "./cache"
 ```
 
@@ -138,7 +140,7 @@ pnpm build         # Bundle to dist/ (includes type-check); dist/ is committed
 ## Architecture
 
 - NormalizedEvent layer: always use `normalizeEvent()` before routing; never check raw event strings
-- Event routing lives in `triggers/router.ts`; never bypass it
+- Event routing lives in `src/features/triggers/router.ts`; never bypass it
 - SDK: Use `createOpencode({ port, timeout })` for server + client lifecycle
 - Always `server.close()` in a `finally` block — never leak the server
 

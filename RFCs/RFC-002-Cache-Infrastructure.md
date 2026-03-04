@@ -45,13 +45,13 @@ Add to `package.json`:
 ### 2. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── cache.ts              # Core cache operations
 ├── cache-key.ts          # Cache key generation
 └── cache.test.ts         # Cache unit tests
 ```
 
-### 3. Cache Key Generation (`src/lib/cache-key.ts`)
+### 3. Cache Key Generation (`src/services/cache/cache-key.ts`)
 
 ```typescript
 import type {AgentIdentity} from "./types.js"
@@ -99,7 +99,7 @@ export function buildSaveCacheKey(components: CacheKeyComponents, runId: number)
 }
 ```
 
-### 4. Core Cache Operations (`src/lib/cache.ts`)
+### 4. Core Cache Operations (`src/services/cache/restore.ts`)
 
 ```typescript
 import * as cache from "@actions/cache"

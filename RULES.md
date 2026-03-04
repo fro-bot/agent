@@ -107,7 +107,7 @@ const core = require("@actions/core") // Never use
 | Element          | Convention                   | Example                              |
 | ---------------- | ---------------------------- | ------------------------------------ |
 | Files            | kebab-case                   | `cache-manager.ts`, `run-summary.ts` |
-| Folders          | lowercase                    | `src/`, `lib/`                       |
+Folders          | lowercase                    | `src/`, `shared/`                   |
 | Functions        | camelCase                    | `restoreCache()`, `postComment()`    |
 | Variables        | camelCase                    | `sessionId`, `cacheKey`              |
 | Constants        | SCREAMING_SNAKE or camelCase | `MAX_RETRIES`, `defaultTimeout`      |
@@ -196,28 +196,26 @@ function parseConfig(input: string): Result<Config, ParseError> {
 
 ```
 src/
-├── main.ts              # Action entry point (top-level await)
-├── setup.ts             # Setup action entry point
-├── lib/
-│   ├── agent/           # Agent execution
-│   │   ├── opencode.ts  # SDK executor (executeOpenCode)
-│   │   ├── context.ts   # GitHub context collection
-│   │   ├── prompt.ts    # Prompt construction
-│   │   ├── reactions.ts # Reactions and labels
-│   │   └── types.ts     # Agent-specific types
-│   ├── github/          # GitHub API
-│   │   ├── client.ts    # Octokit client creation
-│   │   └── context.ts   # Event parsing
-│   ├── setup/           # Setup action modules
-│   ├── cache.ts         # Cache restore/save logic
-│   ├── logger.ts        # JSON logging with redaction
-│   ├── types.ts         # Shared type definitions
-│   └── constants.ts     # Shared constants
-├── utils/
-│   ├── env.ts           # Environment variable getters
-│   └── validation.ts    # Input validation
-└── constants.ts         # Shared constants
-```
+├── main.ts              # Action entry point
+├── post.ts              # Post-action entry point
+├── shared/              # Layer 0: Pure types, utils, constants
+│   ├── logger.ts        # Redaction-aware logger
+│   ├── types.ts         # Core interfaces
+│   └── constants.ts     # Shared values
+├── services/            # Layer 1: External adapters (Octokit, OpenCode SDK)
+│   ├── github/          # Octokit client & context parsing
+│   ├── session/         # Storage & search (RFC-004)
+│   ├── setup/           # Bun/oMo/OpenCode installation
+│   └── cache/           # GitHub Actions cache (restore/save)
+├── features/            # Layer 2: Business logic & domain features
+│   ├── agent/           # Execution, prompt construction, retries
+│   ├── triggers/        # Event routing & skip conditions (router.ts)
+│   ├── comments/        # GitHub comment read/write
+│   └── reviews/         # PR diff parsing & review submission
+└── harness/             # Layer 3: Workflow composition & configuration
+    ├── run.ts           # 12-step orchestration logic
+    ├── phases/          # Individual run phase implementations
+    └── config/          # Input parsing & validation (inputs.ts)
 
 ### Entry Point Pattern
 
@@ -635,7 +633,7 @@ export default defineConfig({
 
 ### Testing Requirements
 
-- **Unit tests**: Each tool function in `src/lib/delegated/`
+// src/lib/delegated/ (moved to services/github/delegated/)
 - **Integration test**: Verify bundled `dist/plugin/fro-bot-agent.js` loads correctly
 - **TDD workflow**: Write failing test first, then implement
 
@@ -826,7 +824,7 @@ The action supports multiple GitHub event triggers with specific handling:
 Each trigger injects a default task directive via `getTriggerDirective()`:
 
 ```typescript
-// src/lib/agent/prompt.ts
+// src/features/agent/prompt.ts
 function getTriggerDirective(context: TriggerContext, inputs: ActionInputs): string {
   switch (context.eventName) {
     case "issue_comment":
@@ -1118,6 +1116,7 @@ pnpm test         # Run tests
 | File                        | Purpose                  |
 | --------------------------- | ------------------------ |
 | `src/main.ts`               | Action entry point       |
+| `src/features/agent/execution.ts` | SDK executor             |
 | `src/lib/agent/opencode.ts` | SDK executor             |
 | `action.yaml`               | GitHub Action definition |
 | `tsdown.config.ts`          | Build configuration      |

@@ -16,13 +16,13 @@
 
 **Files Modified:**
 
-- `src/lib/triggers/types.ts` - Extended trigger types, skip reasons, TriggerTarget, TriggerConfig
-- `src/lib/triggers/router.ts` - Added context builders and skip checkers for all new triggers
-- `src/lib/triggers/router.test.ts` - Added 24 new tests for all new trigger types
-- `src/lib/agent/prompt.ts` - Added `getTriggerDirective()`, `buildTaskSection()`, `TriggerDirective` interface
-- `src/lib/agent/prompt.test.ts` - Added 16 new tests for directive and task section logic
-- `src/lib/agent/types.ts` - Extended `PromptOptions` with `triggerContext`
-- `src/lib/agent/index.ts` - Exported new functions and types
+- `src/features/triggers/types.ts` - Extended trigger types, skip reasons, TriggerTarget, TriggerConfig
+- `src/features/triggers/router.ts` - Added context builders and skip checkers for all new triggers
+- `src/features/triggers/router.test.ts` - Added 24 new tests for all new trigger types
+- `src/features/agent/prompt.ts` - Added `getTriggerDirective()`, `buildTaskSection()`, `TriggerDirective` interface
+- `src/features/agent/prompt.test.ts` - Added 16 new tests for directive and task section logic
+- `src/features/agent/types.ts` - Extended `PromptOptions` with `triggerContext`
+- `src/features/agent/index.ts` - Exported new functions and types
 
 **Test Coverage:** 443 tests pass (27 test files)
 
@@ -53,7 +53,7 @@ Extend GitHub event handling to support additional triggers (`issues`, `pull_req
 
 ## Technical Specification
 
-### 1. Extended Trigger Types (`src/lib/triggers/types.ts`)
+### 1. Extended Trigger Types (`src/features/triggers/types.ts`)
 
 ```typescript
 /**
@@ -133,7 +133,7 @@ export const DEFAULT_TRIGGER_CONFIG: TriggerConfig = {
 } as const
 ```
 
-### 2. Extended Event Router (`src/lib/triggers/router.ts`)
+### 2. Extended Event Router (`src/features/triggers/router.ts`)
 
 ```typescript
 /**
@@ -440,7 +440,7 @@ export function checkSkipConditions(context: TriggerContext, config: TriggerConf
 }
 ```
 
-### 4. Trigger Directives (`src/lib/agent/prompt.ts`)
+### 4. Trigger Directives (`src/features/agent/prompt.ts`)
 
 ````typescript
 import type {TriggerContext} from "../triggers/types.js"
@@ -631,7 +631,7 @@ Respond to the trigger comment above. Follow all instructions and requirements l
 
 ### 6. Payload Type Definitions
 
-Add to `src/lib/github/types.ts`:
+Add to `src/services/github/types.ts`:
 
 ```typescript
 /**
@@ -868,7 +868,7 @@ describe("getTriggerDirective", () => {
 2. **Payload Typing**: GitHub payloads are complex; types cover common fields but may need runtime validation
 3. **Mention Matching**: Reuse existing `hasBotMention()` function from RFC-005
 4. **Context Builder Pattern**: Follow existing pattern of separate context builders per event type
-5. **Type Alignment**: Update `EventType` in `src/lib/github/types.ts` to include new event names
+5. **Type Alignment**: Update `EventType` in `src/services/github/types.ts` to include new event names
 
 ## Compatibility with Dependencies
 

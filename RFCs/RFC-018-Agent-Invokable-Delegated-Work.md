@@ -9,7 +9,7 @@
 
 ## Summary
 
-Expose RFC-010's delegated work library (`src/lib/delegated/`) as OpenCode custom tools the agent can invoke during execution. This enables the agent to create branches, commit files, and open PRs programmatically via the GitHub API instead of shelling out to `git` and `gh` CLI.
+Expose RFC-010's delegated work library (`src/features/delegated/`) as OpenCode custom tools the agent can invoke during execution. This enables the agent to create branches, commit files, and open PRs programmatically via the GitHub API instead of shelling out to `git` and `gh` CLI.
 
 ## Dependencies
 
@@ -395,7 +395,7 @@ export const FroBotAgentPlugin: Plugin = async ({project, directory}) => {
 export default FroBotAgentPlugin
 ```
 
-### 4. Plugin Installation (`src/lib/setup/plugin.ts`)
+### 4. Plugin Installation (`src/services/setup/plugin.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -449,7 +449,7 @@ export default defineConfig({
 - [ ] Plugin defined with all four tools (create_branch, commit_files, create_pull_request, update_pull_request)
 - [ ] Plugin bundled to `dist/plugin/fro-bot-agent.js`
 - [ ] Plugin installed to `~/.config/opencode/plugin/` during setup
-- [ ] Tools reuse `createClient()` from `src/lib/github/client.ts`
+- [ ] Tools reuse `createClient()` from `src/services/github/client.ts`
 - [ ] Tools reuse `getGitHubRepository()` from `src/utils/env.ts`
 - [ ] Authorization validated at tool invocation (write/admin permission required)
 - [ ] Tools return structured success/error responses

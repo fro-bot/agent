@@ -25,7 +25,7 @@ Implement delegated work capabilities: pushing commits to branches and opening p
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── delegated/
 │   ├── types.ts          # Delegated work types
 │   ├── branch.ts         # Branch operations
@@ -34,7 +34,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Delegated Work Types (`src/lib/delegated/types.ts`)
+### 2. Delegated Work Types (`src/features/delegated/types.ts`)
 
 ```typescript
 export interface FileChange {
@@ -98,7 +98,7 @@ export interface DelegatedWorkSummary {
 }
 ```
 
-### 3. Branch Operations (`src/lib/delegated/branch.ts`)
+### 3. Branch Operations (`src/features/delegated/branch.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -215,7 +215,7 @@ export function generateBranchName(prefix: string, suffix?: string): string {
 }
 ```
 
-### 4. Commit Operations (`src/lib/delegated/commit.ts`)
+### 4. Commit Operations (`src/features/delegated/commit.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -363,7 +363,7 @@ export function formatCommitMessage(type: string, scope: string | null, descript
 }
 ```
 
-### 5. Pull Request Operations (`src/lib/delegated/pull-request.ts`)
+### 5. Pull Request Operations (`src/features/delegated/pull-request.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -534,7 +534,7 @@ export function generatePRBody(options: {
 }
 ```
 
-### 6. Public Exports (`src/lib/delegated/index.ts`)
+### 6. Public Exports (`src/features/delegated/index.ts`)
 
 ```typescript
 export {createBranch, branchExists, deleteBranch, generateBranchName} from "./branch.js"
@@ -783,12 +783,12 @@ RFC-010 was implemented as a **library-only** solution. The delegated work funct
 
 | File                                | Purpose                                                 | Tests |
 | ----------------------------------- | ------------------------------------------------------- | ----- |
-| `src/lib/delegated/types.ts`        | Type definitions, security constants                    | -     |
-| `src/lib/delegated/branch.ts`       | Branch operations (create, exists, delete, generate)    | 10    |
-| `src/lib/delegated/commit.ts`       | Git Data API atomic commits with security validation    | 17    |
-| `src/lib/delegated/pull-request.ts` | PR operations (create, find, update, labels, reviewers) | 14    |
-| `src/lib/delegated/index.ts`        | Public exports                                          | -     |
-| `src/lib/delegated/AGENTS.md`       | Module documentation                                    | -     |
+| `src/features/delegated/types.ts`        | Type definitions, security constants                    | -     |
+| `src/features/delegated/branch.ts`       | Branch operations (create, exists, delete, generate)    | 10    |
+| `src/features/delegated/commit.ts`       | Git Data API atomic commits with security validation    | 17    |
+| `src/features/delegated/pull-request.ts` | PR operations (create, find, update, labels, reviewers) | 14    |
+| `src/features/delegated/index.ts`        | Public exports                                          | -     |
+| `src/features/delegated/AGENTS.md`       | Module documentation                                    | -     |
 
 **Total: 41 new tests** (all passing)
 

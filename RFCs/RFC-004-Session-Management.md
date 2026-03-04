@@ -36,7 +36,7 @@ The action-side utilities must work with the exact OpenCode storage format to en
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── session/
 │   ├── types.ts          # Session-related types (matching OpenCode)
 │   ├── storage.ts        # OpenCode storage access utilities
@@ -71,7 +71,7 @@ OpenCode uses **JSON files on disk** (NOT SQLite) stored under `$XDG_DATA_HOME/o
     └── {sessionID}.json              # Session diffs (optional)
 ```
 
-### 3. Session Types (`src/lib/session/types.ts`)
+### 3. Session Types (`src/services/session/types.ts`)
 
 Types aligned with OpenCode's actual Zod schemas from `packages/opencode/src/session/index.ts`:
 
@@ -353,7 +353,7 @@ export interface MessageError {
 }
 ```
 
-### 4. Storage Utilities (`src/lib/session/storage.ts`)
+### 4. Storage Utilities (`src/services/session/storage.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -568,7 +568,7 @@ async function deleteFile(filePath: string, logger: Logger): Promise<number> {
 }
 ```
 
-### 5. Session Search (`src/lib/session/search.ts`)
+### 5. Session Search (`src/services/session/search.ts`)
 
 ```typescript
 import type {SessionInfo, SessionSummary, SessionSearchResult, SessionMatch, Message, Part, Logger} from "./types.js"
@@ -803,7 +803,7 @@ export async function getSessionInfo(
 }
 ```
 
-### 6. Session Pruning (`src/lib/session/prune.ts`)
+### 6. Session Pruning (`src/services/session/prune.ts`)
 
 ```typescript
 import type {PruneResult, PruningConfig, Logger} from "./types.js"
@@ -941,7 +941,7 @@ export async function pruneSessions(directory: string, config: PruningConfig, lo
 }
 ```
 
-### 7. Session Writeback (`src/lib/session/writeback.ts`)
+### 7. Session Writeback (`src/services/session/writeback.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -1068,7 +1068,7 @@ function generateRandomBase62(length: number): string {
 }
 ```
 
-### 8. Public Exports (`src/lib/session/index.ts`)
+### 8. Public Exports (`src/services/session/index.ts`)
 
 ```typescript
 // Storage utilities
@@ -1463,12 +1463,12 @@ describe("OpenCode storage format compatibility", () => {
 
 **Summary:** Implemented session management utilities for the Fro Bot agent harness:
 
-- `src/lib/session/types.ts` - OpenCode-compatible types (SessionInfo, Message, Part, etc.)
-- `src/lib/session/storage.ts` - Storage access utilities (list, read, delete operations)
-- `src/lib/session/search.ts` - Session list and search operations
-- `src/lib/session/prune.ts` - Session pruning with retention policy
-- `src/lib/session/writeback.ts` - Run summary writeback to session storage
-- `src/lib/session/index.ts` - Public exports
+- `src/services/session/types.ts` - OpenCode-compatible types (SessionInfo, Message, Part, etc.)
+- `src/services/session/storage.ts` - Storage access utilities (list, read, delete operations)
+- `src/services/session/search.ts` - Session list and search operations
+- `src/services/session/prune.ts` - Session pruning with retention policy
+- `src/services/session/writeback.ts` - Run summary writeback to session storage
+- `src/services/session/index.ts` - Public exports
 
 **Tests:** 48 new tests covering all acceptance criteria
 

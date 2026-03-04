@@ -44,7 +44,7 @@ src/
 └── index.ts                # Public API exports
 ```
 
-### 2. Type Definitions (`src/lib/types.ts`)
+### 2. Type Definitions (`src/shared/types.ts`)
 
 ```typescript
 // Agent identity for cache scoping
@@ -112,7 +112,7 @@ export interface TokenUsage {
 export type Result<T, E = Error> = {readonly ok: true; readonly value: T} | {readonly ok: false; readonly error: E}
 ```
 
-### 3. Constants (`src/lib/constants.ts`)
+### 3. Constants (`src/shared/constants.ts`)
 
 ```typescript
 // Storage paths
@@ -137,7 +137,7 @@ export const CACHE_PREFIX = "opencode-storage" as const
 export const STORAGE_VERSION = 1
 ```
 
-### 4. Input Parsing (`src/lib/inputs.ts`)
+### 4. Input Parsing (`src/harness/config/inputs.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -205,7 +205,7 @@ export function validateNonEmptyString(value: unknown, fieldName: string): strin
 }
 ```
 
-### 6. Structured Logger (`src/lib/logger.ts`)
+### 6. Structured Logger (`src/shared/logger.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -372,7 +372,7 @@ runs:
 ## Acceptance Criteria
 
 - [ ] Project structure reorganized with `lib/` and `utils/` directories
-- [ ] All type definitions exported from `src/lib/types.ts`
+- [ ] All type definitions exported from `src/shared/types.ts`
 - [ ] Constants defined with `as const` assertions
 - [ ] Input parsing validates all action inputs
 - [ ] Validation utilities cover JSON, integers, and non-empty strings
