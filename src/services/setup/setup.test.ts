@@ -1,6 +1,6 @@
-import * as fs from 'node:fs/promises'
+import type {SetupInputs} from './types.js'
 
-import * as cache from '@actions/cache'
+import * as fs from 'node:fs/promises'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
@@ -8,6 +8,28 @@ import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runSetup} from './setup.js'
 import * as toolsCache from './tools-cache.js'
+
+function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
+  return {
+    opencodeVersion: 'latest',
+    authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+    appId: null,
+    privateKey: null,
+    opencodeConfig: null,
+    omoConfig: null,
+    omoVersion: '3.7.4',
+    omoProviders: {
+      claude: 'no',
+      copilot: 'no',
+      gemini: 'no',
+      openai: 'no',
+      opencodeZen: 'no',
+      zaiCodingPlan: 'no',
+      kimiForCoding: 'no',
+    },
+    ...overrides,
+  }
+}
 
 // Mock @actions/core before importing setup
 vi.mock('@actions/core', () => ({
@@ -39,12 +61,6 @@ vi.mock('@actions/tool-cache', () => ({
 vi.mock('@actions/exec', () => ({
   exec: vi.fn(),
   getExecOutput: vi.fn(),
-}))
-
-// Mock @actions/cache
-vi.mock('@actions/cache', () => ({
-  restoreCache: vi.fn(),
-  saveCache: vi.fn(),
 }))
 
 vi.mock('@actions/github', () => ({
@@ -158,7 +174,7 @@ describe('setup', () => {
       )
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(core.setFailed).not.toHaveBeenCalled()
@@ -181,7 +197,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(tc.downloadTool).not.toHaveBeenCalled()
@@ -202,7 +218,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(fs.writeFile).toHaveBeenCalledWith(expect.stringContaining('auth.json'), expect.any(String), {mode: 0o600})
@@ -222,7 +238,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
@@ -238,7 +254,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
@@ -246,15 +262,6 @@ describe('setup', () => {
 
     it('merges user opencode-config input on top of OPENCODE_CONFIG_CONTENT baseline', async () => {
       // #given - user supplies opencode-config with custom settings
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '{"model": "claude-opus-4-5", "autoupdate": true}',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -263,7 +270,10 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(
+        createSetupInputs({opencodeConfig: '{"model": "claude-opus-4-5", "autoupdate": true}'}),
+        'ghs_test_token',
+      )
 
       // #then - user config wins on conflicting keys (autoupdate:true overrides false baseline)
       expect(core.exportVariable).toHaveBeenCalledWith(
@@ -274,15 +284,6 @@ describe('setup', () => {
 
     it('fails when opencode-config parses to JSON null', async () => {
       // #given - user supplies JSON null literal as opencode-config
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{\"anthropic\": {\"api_key\": \"sk-ant-test\"}}',
-          'opencode-version': 'latest',
-          'opencode-config': 'null',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -291,7 +292,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs({opencodeConfig: 'null'}), 'ghs_test_token')
 
       // #then
       expect(result).toBe(null)
@@ -300,15 +301,6 @@ describe('setup', () => {
 
     it('fails with explicit message when opencode-config is invalid JSON', async () => {
       // #given - malformed JSON
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '{invalid-json}',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -317,7 +309,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs({opencodeConfig: '{invalid-json}'}), 'ghs_test_token')
 
       // #then
       expect(result).toBe(null)
@@ -326,15 +318,6 @@ describe('setup', () => {
 
     it('treats whitespace-only opencode-config as not provided', async () => {
       // #given
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '   ',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -343,7 +326,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(result).not.toBeNull()
@@ -353,15 +336,6 @@ describe('setup', () => {
 
     it('fails when opencode-config is an array', async () => {
       // #given - user supplies array as opencode-config
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{\"anthropic\": {\"api_key\": \"sk-ant-test\"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '[\"model\", \"claude-opus-4\"]',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -370,7 +344,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs({opencodeConfig: '["model", "claude-opus-4"]'}), 'ghs_test_token')
 
       // #then
       expect(result).toBe(null)
@@ -379,15 +353,6 @@ describe('setup', () => {
 
     it('fails when opencode-config is a number', async () => {
       // #given - user supplies number as opencode-config
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{\"anthropic\": {\"api_key\": \"sk-ant-test\"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '42',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -396,7 +361,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs({opencodeConfig: '42'}), 'ghs_test_token')
 
       // #then
       expect(result).toBe(null)
@@ -405,15 +370,6 @@ describe('setup', () => {
 
     it('fails when opencode-config is a string', async () => {
       // #given - user supplies string as opencode-config
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghs_test_token',
-          'auth-json': '{\"anthropic\": {\"api_key\": \"sk-ant-test\"}}',
-          'opencode-version': 'latest',
-          'opencode-config': '\"just-a-string\"',
-        }
-        return inputs[name] ?? ''
-      })
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -422,7 +378,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs({opencodeConfig: '"just-a-string"'}), 'ghs_test_token')
 
       // #then
       expect(result).toBe(null)
@@ -443,7 +399,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(core.setOutput).toHaveBeenCalledWith('opencode-path', expect.any(String))
@@ -469,7 +425,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then - should warn but continue (RFC-011 graceful degradation)
       expect(result).not.toBeNull()
@@ -495,7 +451,7 @@ describe('setup', () => {
       vi.mocked(bunModule.installBun).mockRejectedValueOnce(new Error('download failed'))
 
       // #when
-      const result = await runSetup()
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then - setup continues but oMo is not attempted
       expect(result).not.toBeNull()
@@ -505,58 +461,10 @@ describe('setup', () => {
       expect(exec.exec).not.toHaveBeenCalledWith('bunx', expect.anything(), expect.anything())
     })
 
-    it('restores cache when available', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({
-        exitCode: 0,
-        stdout: '{"tag_name": "v1.0.300"}',
-        stderr: '',
-      })
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(cache.restoreCache).mockResolvedValue('cache-key-hit')
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup()
-
-      // #then
-      expect(cache.restoreCache).toHaveBeenCalled()
-      expect(core.setOutput).toHaveBeenCalledWith('cache-status', 'hit')
-    })
-
-    it('reports cache miss when no cache found', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({
-        exitCode: 0,
-        stdout: '{"tag_name": "v1.0.300"}',
-        stderr: '',
-      })
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(cache.restoreCache).mockResolvedValue(undefined)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup()
-
-      // #then
-      expect(core.setOutput).toHaveBeenCalledWith('cache-status', 'miss')
-    })
-
     it('calls setFailed on unrecoverable error', async () => {
       // #given
-      vi.mocked(core.getInput).mockImplementation((name: string) => {
-        if (name === 'auth-json') return 'invalid json {'
-        return ''
-      })
-
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs({authJson: 'invalid json {'}), 'ghs_test_token')
 
       // #then
       expect(core.setFailed).toHaveBeenCalled()
@@ -572,7 +480,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'fro-bot[bot]'], undefined)
@@ -601,7 +509,7 @@ describe('setup', () => {
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
       // #when
-      await runSetup()
+      await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.name']), expect.anything())
@@ -633,7 +541,7 @@ describe('setup', () => {
         // #given tools cache miss (default in beforeEach)
 
         // #when
-        await runSetup()
+        await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(toolsCache.restoreToolsCache).toHaveBeenCalledTimes(1)
@@ -647,7 +555,7 @@ describe('setup', () => {
         // #given tools cache miss
 
         // #when
-        await runSetup()
+        await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
@@ -665,7 +573,7 @@ describe('setup', () => {
         vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(tc.downloadTool).not.toHaveBeenCalled()
@@ -704,7 +612,7 @@ describe('setup', () => {
         })
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(tc.downloadTool).toHaveBeenCalled()
@@ -742,7 +650,7 @@ describe('setup', () => {
         })
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(core.setFailed).not.toHaveBeenCalled()
@@ -754,7 +662,7 @@ describe('setup', () => {
         // #given tools cache miss (default)
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(result).not.toBeNull()
@@ -769,7 +677,7 @@ describe('setup', () => {
         })
 
         // #when
-        await runSetup()
+        await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
@@ -783,7 +691,7 @@ describe('setup', () => {
         })
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then - oMo always runs to ensure config is current
         expect(result).not.toBeNull()
@@ -805,18 +713,9 @@ describe('setup', () => {
       it('writes omo-config JSON to oh-my-opencode.json before installer runs', async () => {
         // #given
         const customConfig = JSON.stringify({theme: 'dark', model: 'claude-opus-4-5'})
-        vi.mocked(core.getInput).mockImplementation((name: string) => {
-          const inputs: Record<string, string> = {
-            'github-token': 'ghs_test_token',
-            'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-            'opencode-version': 'latest',
-            'omo-config': customConfig,
-          }
-          return inputs[name] ?? ''
-        })
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs({omoConfig: customConfig}), 'ghs_test_token')
 
         // #then - writeFile called for oh-my-opencode.json
         expect(result).not.toBeNull()
@@ -833,7 +732,7 @@ describe('setup', () => {
         // #given - no omo-config input (default mock returns empty string)
 
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then - oh-my-opencode.json is not written
         expect(result).not.toBeNull()
@@ -846,18 +745,8 @@ describe('setup', () => {
 
       it('treats whitespace-only omo-config as not provided', async () => {
         // #given
-        vi.mocked(core.getInput).mockImplementation((name: string) => {
-          const inputs: Record<string, string> = {
-            'github-token': 'ghs_test_token',
-            'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-            'opencode-version': 'latest',
-            'omo-config': '   ',
-          }
-          return inputs[name] ?? ''
-        })
-
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(result).not.toBeNull()
@@ -871,18 +760,8 @@ describe('setup', () => {
 
       it('continues setup and warns when omo-config JSON is invalid', async () => {
         // #given - invalid JSON in omo-config
-        vi.mocked(core.getInput).mockImplementation((name: string) => {
-          const inputs: Record<string, string> = {
-            'github-token': 'ghs_test_token',
-            'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-            'opencode-version': 'latest',
-            'omo-config': '{invalid json}',
-          }
-          return inputs[name] ?? ''
-        })
-
         // #when
-        const result = await runSetup()
+        const result = await runSetup(createSetupInputs({omoConfig: '{invalid json}'}), 'ghs_test_token')
 
         // #then - setup continues despite bad omo-config
         expect(result).not.toBeNull()

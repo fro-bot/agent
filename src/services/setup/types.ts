@@ -1,6 +1,7 @@
 import type {Buffer} from 'node:buffer'
 
 import type {Logger} from '../../shared/logger.js'
+import type {OmoProviders} from '../../shared/types.js'
 
 // Re-export Logger for convenience in setup modules
 export type {Logger}
@@ -15,6 +16,8 @@ export interface SetupInputs {
   readonly privateKey: string | null
   readonly opencodeConfig: string | null
   readonly omoConfig: string | null
+  readonly omoVersion: string
+  readonly omoProviders: OmoProviders
 }
 
 /**
@@ -26,7 +29,6 @@ export interface SetupResult {
   readonly ghAuthenticated: boolean
   readonly omoInstalled: boolean
   readonly omoError: string | null
-  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly toolsCacheStatus: 'hit' | 'miss'
   readonly duration: number
 }

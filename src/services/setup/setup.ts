@@ -1,18 +1,15 @@
-import type {OmoInstallOptions} from './omo.js'
 import type {ExecAdapter, OpenCodeInstallResult, SetupInputs, SetupResult, ToolCacheAdapter} from './types.js'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
-import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {getOctokit} from '@actions/github'
 import * as tc from '@actions/tool-cache'
-import {DEFAULT_BUN_VERSION, DEFAULT_OMO_PROVIDERS, DEFAULT_OMO_VERSION} from '../../shared/constants.js'
+import {DEFAULT_BUN_VERSION} from '../../shared/constants.js'
 import {getRunnerOS, getXdgDataHome} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
-import {buildPrimaryCacheKey, buildRestoreKeys} from '../cache/cache-key.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
@@ -20,67 +17,6 @@ import {writeOmoConfig} from './omo-config.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
-
-const VALID_OMO_PROVIDERS = [
-  'claude',
-  'claude-max20',
-  'copilot',
-  'gemini',
-  'openai',
-  'opencode-zen',
-  'zai-coding-plan',
-  'kimi-for-coding',
-] as const
-
-function parseOmoProviders(input: string): OmoInstallOptions {
-  const providers = input
-    .split(',')
-    .map(p => p.trim().toLowerCase())
-    .filter(p => p.length > 0)
-
-  let claude: 'no' | 'yes' | 'max20' = 'no'
-  let copilot: 'no' | 'yes' = 'no'
-  let gemini: 'no' | 'yes' = 'no'
-  let openai: 'no' | 'yes' = 'no'
-  let opencodeZen: 'no' | 'yes' = 'no'
-  let zaiCodingPlan: 'no' | 'yes' = 'no'
-  let kimiForCoding: 'no' | 'yes' = 'no'
-
-  for (const provider of providers) {
-    if (!VALID_OMO_PROVIDERS.includes(provider as (typeof VALID_OMO_PROVIDERS)[number])) {
-      continue
-    }
-
-    switch (provider) {
-      case 'claude':
-        claude = 'yes'
-        break
-      case 'claude-max20':
-        claude = 'max20'
-        break
-      case 'copilot':
-        copilot = 'yes'
-        break
-      case 'gemini':
-        gemini = 'yes'
-        break
-      case 'openai':
-        openai = 'yes'
-        break
-      case 'opencode-zen':
-        opencodeZen = 'yes'
-        break
-      case 'zai-coding-plan':
-        zaiCodingPlan = 'yes'
-        break
-      case 'kimi-for-coding':
-        kimiForCoding = 'yes'
-        break
-    }
-  }
-
-  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan, kimiForCoding}
-}
 
 /**
  * Create tool cache adapter from @actions/tool-cache
@@ -106,25 +42,6 @@ function createExecAdapter(): ExecAdapter {
 }
 
 /**
- * Parse setup action inputs from environment.
- */
-function parseSetupInputs(): SetupInputs {
-  const appIdRaw = core.getInput('app-id').trim()
-  const privateKeyRaw = core.getInput('private-key').trim()
-  const opencodeConfigRaw = core.getInput('opencode-config').trim()
-  const omoConfigRaw = core.getInput('omo-config').trim()
-
-  return {
-    opencodeVersion: core.getInput('opencode-version') || 'latest',
-    authJson: core.getInput('auth-json', {required: true}),
-    appId: appIdRaw.length > 0 ? appIdRaw : null,
-    privateKey: privateKeyRaw.length > 0 ? privateKeyRaw : null,
-    opencodeConfig: opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null,
-    omoConfig: omoConfigRaw.length > 0 ? omoConfigRaw : null,
-  }
-}
-
-/**
  * Run the setup action.
  *
  * This function orchestrates:
@@ -133,18 +50,14 @@ function parseSetupInputs(): SetupInputs {
  * 3. Configuring gh CLI authentication
  * 4. Configuring git identity
  * 5. Populating auth.json
- * 6. Restoring session cache
  */
-export async function runSetup(): Promise<SetupResult | null> {
+export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
   const startTime = Date.now()
   const logger = createLogger({component: 'setup'})
   const toolCache = createToolCacheAdapter()
   const execAdapter = createExecAdapter()
 
   try {
-    // Parse inputs
-    const inputs = parseSetupInputs()
-    const githubToken = core.getInput('github-token', {required: true})
     logger.info('Starting setup', {version: inputs.opencodeVersion})
 
     // Parse auth.json early to fail fast
@@ -169,9 +82,7 @@ export async function runSetup(): Promise<SetupResult | null> {
       }
     }
 
-    // Determine oMo version
-    const omoVersionRaw = core.getInput('omo-version').trim()
-    const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
+    const omoVersion = inputs.omoVersion
 
     // Restore tools cache before installs
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
@@ -243,9 +154,7 @@ export async function runSetup(): Promise<SetupResult | null> {
         }
       }
 
-      const omoProvidersRaw = core.getInput('omo-providers').trim()
-      const omoOptions = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-      const omoResult = await installOmo(omoVersion, {logger, execAdapter}, omoOptions)
+      const omoResult = await installOmo(omoVersion, {logger, execAdapter}, inputs.omoProviders)
       if (omoResult.installed) {
         logger.info('oMo installed', {version: omoResult.version})
         omoInstalled = true
@@ -315,33 +224,6 @@ export async function runSetup(): Promise<SetupResult | null> {
     core.setOutput('auth-json-path', authJsonPath)
     logger.info('auth.json populated', {path: authJsonPath})
 
-    // Restore session cache
-    const repo = process.env.GITHUB_REPOSITORY ?? 'unknown/unknown'
-    const ref = process.env.GITHUB_REF_NAME ?? 'main'
-    const os = getRunnerOS()
-
-    const cacheKey = buildPrimaryCacheKey({agentIdentity: 'github', repo, ref, os})
-    const restoreKeys = buildRestoreKeys({agentIdentity: 'github', repo, ref, os})
-
-    let cacheStatus: 'hit' | 'miss' | 'corrupted' = 'miss'
-    try {
-      const restoredKey = await cache.restoreCache([storagePath], cacheKey, [...restoreKeys])
-      if (restoredKey == null) {
-        logger.info('No cache found')
-      } else {
-        cacheStatus = 'hit'
-        logger.info('Cache restored', {key: restoredKey})
-      }
-    } catch (error) {
-      cacheStatus = 'corrupted'
-      logger.warning('Cache restore failed', {
-        error: toErrorMessage(error),
-      })
-    }
-
-    core.setOutput('cache-status', cacheStatus)
-    core.setOutput('storage-path', storagePath)
-
     const duration = Date.now() - startTime
 
     const result: SetupResult = {
@@ -350,7 +232,6 @@ export async function runSetup(): Promise<SetupResult | null> {
       ghAuthenticated: ghResult.authenticated,
       omoInstalled,
       omoError,
-      cacheStatus,
       toolsCacheStatus,
       duration,
     }

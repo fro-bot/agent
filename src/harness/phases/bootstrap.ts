@@ -37,6 +37,11 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   const opencodeResult = await ensureOpenCodeAvailable({
     logger,
     opencodeVersion: inputs.opencodeVersion,
+    githubToken: inputs.githubToken,
+    authJson: inputs.authJson,
+    omoVersion: inputs.omoVersion,
+    omoProviders: inputs.omoProviders,
+    opencodeConfig: inputs.opencodeConfig,
   })
 
   if (opencodeResult.didSetup) {
