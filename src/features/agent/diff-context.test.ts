@@ -1,4 +1,4 @@
-import type {TriggerContext} from '../../lib/triggers/types.js'
+import type {TriggerContext} from '../triggers/types.js'
 import {describe, expect, it, vi} from 'vitest'
 import {getPRDiff} from '../../lib/reviews/index.js'
 import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'

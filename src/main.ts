@@ -36,6 +36,7 @@ import {
   ensureOpenCodeAvailable,
   executeOpenCode,
 } from './features/agent/index.js'
+import {routeEvent} from './features/triggers/index.js'
 import {
   buildAttachmentResult,
   cleanupTempFiles,
@@ -49,7 +50,6 @@ import {parseActionInputs} from './lib/inputs.js'
 import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
 import {STATE_KEYS} from './lib/state-keys.js'
-import {routeEvent} from './lib/triggers/index.js'
 import {restoreCache, saveCache} from './services/cache/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './services/github/index.js'
 import {

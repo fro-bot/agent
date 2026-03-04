@@ -6,9 +6,9 @@
  */
 
 import type {HydratedContext} from '../../lib/context/types.js'
-import type {TriggerContext} from '../../lib/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext} from './types.js'
 import {
   DEFAULT_CONTEXT_BUDGET,

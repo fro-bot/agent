@@ -1,6 +1,6 @@
-import type {TriggerContext} from '../../lib/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {DiffContext} from './types.js'
 import {getPRDiff} from '../../lib/reviews/index.js'
 import {toErrorMessage} from '../../shared/errors.js'

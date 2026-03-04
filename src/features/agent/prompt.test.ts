@@ -1,6 +1,6 @@
-import type {TriggerContext} from '../../lib/triggers/types.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, PromptOptions, SessionContext} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
