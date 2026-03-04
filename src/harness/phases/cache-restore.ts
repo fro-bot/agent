@@ -1,20 +1,12 @@
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
-import type {CacheKeyComponents} from '../../services/cache/index.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
-import {restoreCache} from '../../services/cache/index.js'
+import {buildCacheKeyComponents, restoreCache} from '../../services/cache/index.js'
 import {ensureProjectId} from '../../services/setup/project-id.js'
-import {
-  getGitHubRefName,
-  getGitHubRepository,
-  getGitHubWorkspace,
-  getOpenCodeAuthPath,
-  getOpenCodeStoragePath,
-  getRunnerOS,
-} from '../../shared/env.js'
+import {getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 
 export interface CacheRestorePhaseResult {
@@ -24,12 +16,7 @@ export interface CacheRestorePhaseResult {
 }
 
 export async function runCacheRestore(bootstrap: BootstrapPhaseResult): Promise<CacheRestorePhaseResult | null> {
-  const cacheComponents: CacheKeyComponents = {
-    agentIdentity: 'github',
-    repo: getGitHubRepository(),
-    ref: getGitHubRefName(),
-    os: getRunnerOS(),
-  }
+  const cacheComponents = buildCacheKeyComponents()
 
   const cacheLogger = createLogger({phase: 'cache'})
   const workspacePath = getGitHubWorkspace()

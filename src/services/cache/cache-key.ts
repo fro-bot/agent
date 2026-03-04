@@ -1,5 +1,6 @@
 import type {AgentIdentity} from '../../shared/types.js'
 import {CACHE_PREFIX} from '../../shared/constants.js'
+import {getGitHubRefName, getGitHubRepository, getRunnerOS} from '../../shared/env.js'
 
 export interface CacheKeyComponents {
   readonly agentIdentity: AgentIdentity
@@ -48,4 +49,13 @@ export function buildRestoreKeys(components: CacheKeyComponents): readonly strin
  */
 export function buildSaveCacheKey(components: CacheKeyComponents, runId: number): string {
   return `${buildPrimaryCacheKey(components)}-${runId}`
+}
+
+export function buildCacheKeyComponents(): CacheKeyComponents {
+  return {
+    agentIdentity: 'github',
+    repo: getGitHubRepository(),
+    ref: getGitHubRefName(),
+    os: getRunnerOS(),
+  }
 }

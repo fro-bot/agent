@@ -1,5 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from './shared/test-helpers.js'
+import {createMockLogger} from '../shared/test-helpers.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
@@ -8,8 +8,8 @@ vi.mock('@actions/core', () => ({
   debug: vi.fn(),
 }))
 
-vi.mock('./services/cache/index.js', async importOriginal => {
-  const original = await importOriginal<typeof import('./services/cache/index.js')>()
+vi.mock('../services/cache/index.js', async importOriginal => {
+  const original = await importOriginal<typeof import('../services/cache/index.js')>()
   return {
     ...original,
     saveCache: vi.fn(),
@@ -47,7 +47,7 @@ describe('post action', () => {
 
       await runPost({logger})
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       expect(saveCache).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith('Skipping post-action: event was not processed', expect.any(Object))
     })
@@ -65,7 +65,7 @@ describe('post action', () => {
 
       await runPost({logger})
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       expect(saveCache).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith(
         'Skipping post-action: cache already saved by main action',
@@ -82,7 +82,7 @@ describe('post action', () => {
         return ''
       })
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       vi.mocked(saveCache).mockResolvedValue(true)
 
       const {runPost} = await import('./post.js')
@@ -103,7 +103,7 @@ describe('post action', () => {
         return ''
       })
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       vi.mocked(saveCache).mockResolvedValue(false)
 
       const {runPost} = await import('./post.js')
@@ -126,7 +126,7 @@ describe('post action', () => {
         return ''
       })
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       vi.mocked(saveCache).mockRejectedValue(new Error('Cache save failed'))
 
       const {runPost} = await import('./post.js')
@@ -149,7 +149,7 @@ describe('post action', () => {
         return ''
       })
 
-      const {saveCache} = await import('./services/cache/index.js')
+      const {saveCache} = await import('../services/cache/index.js')
       vi.mocked(saveCache).mockResolvedValue(true)
 
       const {runPost} = await import('./post.js')
