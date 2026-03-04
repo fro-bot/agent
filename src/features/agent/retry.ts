@@ -1,4 +1,4 @@
-import type {Event, type createOpencode} from '@opencode-ai/sdk'
+import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult} from './streaming.js'

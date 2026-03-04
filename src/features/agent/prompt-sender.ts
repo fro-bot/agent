@@ -1,4 +1,4 @@
-import type {FilePartInput, TextPartInput, type createOpencode} from '@opencode-ai/sdk'
+import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {ErrorInfo} from '../comments/types.js'
 import type {EventStreamResult} from './streaming.js'
