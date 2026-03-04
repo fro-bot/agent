@@ -21,6 +21,7 @@ import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
+import {runSetup} from '../../services/setup/setup.js'
 import {sleep} from '../../shared/async.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
@@ -28,7 +29,6 @@ import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled}
 import {toErrorMessage} from '../../shared/errors.js'
 import {err, ok} from '../../shared/types.js'
 import {createAgentError, createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
-import {runSetup} from '../setup/setup.js'
 import {buildAgentPrompt} from './prompt.js'
 
 export interface OpenCodeServerHandle {

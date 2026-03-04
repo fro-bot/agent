@@ -49,7 +49,6 @@ import {formatErrorComment, postComment} from './lib/comments/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
-import {ensureProjectId} from './lib/setup/project-id.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {routeEvent} from './lib/triggers/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './services/github/index.js'
@@ -61,6 +60,7 @@ import {
   searchSessions,
   writeSessionSummary,
 } from './services/session/index.js'
+import {ensureProjectId} from './services/setup/project-id.js'
 import {
   getGitHubRefName,
   getGitHubRepository,
