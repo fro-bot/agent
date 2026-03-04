@@ -19,8 +19,8 @@
  * 12. Save cache (always, in finally block)
  */
 
-import type {OpenCodeServerHandle} from './lib/agent/index.js'
-import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
+import type {OpenCodeServerHandle} from './features/agent/index.js'
+import type {ExecutionConfig, PromptOptions, ReactionContext} from './features/agent/types.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
 import type {CacheKeyComponents} from './services/cache/index.js'
 import type {CommentTarget, Octokit} from './services/github/types.js'
@@ -35,7 +35,7 @@ import {
   completeAcknowledgment,
   ensureOpenCodeAvailable,
   executeOpenCode,
-} from './lib/agent/index.js'
+} from './features/agent/index.js'
 import {
   buildAttachmentResult,
   cleanupTempFiles,

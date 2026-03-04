@@ -1,13 +1,13 @@
+import type {TriggerContext, TriggerTarget} from '../../lib/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {TriggerContext, TriggerTarget} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {collectAgentContext} from './context.js'
 
-vi.mock('../github/api.js', () => ({
+vi.mock('../../services/github/api.js', () => ({
   getDefaultBranch: vi.fn().mockResolvedValue('main'),
 }))
 
