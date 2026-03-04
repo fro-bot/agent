@@ -5,19 +5,19 @@
  * comment data, author info, and target info. Avoids duplicating parsing.
  */
 
-import type {HydratedContext} from '../../lib/context/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {HydratedContext} from '../context/types.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext} from './types.js'
+import {getDefaultBranch} from '../../services/github/api.js'
 import {
   DEFAULT_CONTEXT_BUDGET,
   fallbackIssueContext,
   fallbackPullRequestContext,
   hydrateIssueContext,
   hydratePullRequestContext,
-} from '../../lib/context/index.js'
-import {getDefaultBranch} from '../../services/github/api.js'
+} from '../context/index.js'
 import {collectDiffContext} from './diff-context.js'
 
 export interface CollectAgentContextOptions {

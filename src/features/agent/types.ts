@@ -6,10 +6,10 @@
  */
 
 import type {FilePartInput} from '@opencode-ai/sdk'
-import type {ErrorInfo} from '../../lib/comments/types.js'
-import type {HydratedContext} from '../../lib/context/types.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {ModelConfig, OmoProviders, TokenUsage} from '../../shared/types.js'
+import type {ErrorInfo} from '../comments/types.js'
+import type {HydratedContext} from '../context/types.js'
 import type {TriggerContext} from '../triggers/types.js'
 
 /**

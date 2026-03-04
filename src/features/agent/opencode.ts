@@ -8,10 +8,10 @@
 
 import type {Result} from '@bfra.me/es/result'
 import type {Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
-import type {ErrorInfo} from '../../lib/comments/types.js'
 import type {SessionClient} from '../../services/session/backend.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
+import type {ErrorInfo} from '../comments/types.js'
 import type {AgentResult, EnsureOpenCodeResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
@@ -20,7 +20,6 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
-import {createAgentError, createLLMFetchError, isLlmFetchError} from '../../lib/comments/error-format.js'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {runSetup} from '../../services/setup/setup.js'
 import {sleep} from '../../shared/async.js'
@@ -29,6 +28,7 @@ import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/con
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {err, ok} from '../../shared/types.js'
+import {createAgentError, createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {buildAgentPrompt} from './prompt.js'
 
 export interface OpenCodeServerHandle {

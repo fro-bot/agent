@@ -2,8 +2,8 @@ import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {DiffContext} from './types.js'
-import {getPRDiff} from '../../lib/reviews/index.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {getPRDiff} from '../reviews/index.js'
 
 const MAX_FILES_IN_CONTEXT = 50
 const MAX_FILES_IN_PROMPT = 20

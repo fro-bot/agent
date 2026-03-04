@@ -21,7 +21,7 @@
 
 import type {OpenCodeServerHandle} from './features/agent/index.js'
 import type {ExecutionConfig, PromptOptions, ReactionContext} from './features/agent/types.js'
-import type {CommentSummaryOptions} from './lib/observability/types.js'
+import type {CommentSummaryOptions} from './features/observability/types.js'
 import type {CacheKeyComponents} from './services/cache/index.js'
 import type {CommentTarget, Octokit} from './services/github/types.js'
 import type {CacheResult, RunSummary} from './shared/types.js'
@@ -36,7 +36,6 @@ import {
   ensureOpenCodeAvailable,
   executeOpenCode,
 } from './features/agent/index.js'
-import {routeEvent} from './features/triggers/index.js'
 import {
   buildAttachmentResult,
   cleanupTempFiles,
@@ -44,10 +43,11 @@ import {
   parseAttachmentUrls,
   validateAttachments,
   type AttachmentResult,
-} from './lib/attachments/index.js'
-import {formatErrorComment, postComment} from './lib/comments/index.js'
+} from './features/attachments/index.js'
+import {formatErrorComment, postComment} from './features/comments/index.js'
+import {createMetricsCollector, writeJobSummary} from './features/observability/index.js'
+import {routeEvent} from './features/triggers/index.js'
 import {parseActionInputs} from './lib/inputs.js'
-import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {restoreCache, saveCache} from './services/cache/index.js'
@@ -316,7 +316,7 @@ async function run(): Promise<number> {
       prsCreated: readonly string[]
       commitsCreated: readonly string[]
       commentsPosted: number
-      llmError: import('./lib/comments/types.js').ErrorInfo | null
+      llmError: import('./features/comments/types.js').ErrorInfo | null
     }
     const executionStartTime = Date.now()
 
