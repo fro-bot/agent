@@ -21,8 +21,8 @@
 
 import type {OpenCodeServerHandle} from './lib/agent/index.js'
 import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/types.js'
-import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
+import type {CacheKeyComponents} from './services/cache/index.js'
 import type {CommentTarget, Octokit} from './services/github/types.js'
 import type {CacheResult, RunSummary} from './shared/types.js'
 import * as path from 'node:path'
@@ -44,13 +44,13 @@ import {
   validateAttachments,
   type AttachmentResult,
 } from './lib/attachments/index.js'
-import {restoreCache, saveCache} from './lib/cache.js'
 import {formatErrorComment, postComment} from './lib/comments/index.js'
 import {parseActionInputs} from './lib/inputs.js'
 import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {routeEvent} from './lib/triggers/index.js'
+import {restoreCache, saveCache} from './services/cache/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './services/github/index.js'
 import {
   DEFAULT_PRUNING_CONFIG,

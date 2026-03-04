@@ -1,5 +1,5 @@
-import type {AgentIdentity} from '../shared/types.js'
-import {CACHE_PREFIX} from '../shared/constants.js'
+import type {AgentIdentity} from '../../shared/types.js'
+import {CACHE_PREFIX} from '../../shared/constants.js'
 
 export interface CacheKeyComponents {
   readonly agentIdentity: AgentIdentity
