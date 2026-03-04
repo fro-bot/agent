@@ -3,8 +3,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 
-import {toErrorMessage} from '../../utils/errors.js'
-import {DEFAULT_BUN_VERSION} from '../constants.js'
+import {DEFAULT_BUN_VERSION} from '../../shared/constants.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'bun'
 const DOWNLOAD_BASE_URL = 'https://github.com/oven-sh/bun/releases/download'

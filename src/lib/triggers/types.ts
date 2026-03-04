@@ -6,7 +6,7 @@
  */
 
 import type {EventType, GitHubContext} from '../github/types.js'
-import {ALLOWED_ASSOCIATIONS} from '../types.js'
+import {ALLOWED_ASSOCIATIONS} from '../../shared/types.js'
 
 export {ALLOWED_ASSOCIATIONS}
 

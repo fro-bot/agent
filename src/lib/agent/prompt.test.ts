@@ -1,9 +1,9 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, PromptOptions, SessionContext} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 
 function createMockContext(overrides: Partial<AgentContext> = {}): AgentContext {

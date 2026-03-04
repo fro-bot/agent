@@ -1,6 +1,6 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger, createMockOctokit} from '../test-helpers.js'
+import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
 
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {

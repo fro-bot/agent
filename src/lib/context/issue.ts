@@ -1,5 +1,5 @@
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {ContextBudget, IssueContext} from './types.js'
 import {truncateBody} from './budget.js'
 import {executeIssueQuery} from './graphql.js'

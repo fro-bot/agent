@@ -1,7 +1,7 @@
 import type {TriggerContext} from '../triggers/types.js'
 import {describe, expect, it, vi} from 'vitest'
+import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {getPRDiff} from '../reviews/index.js'
-import {createMockLogger, createMockOctokit} from '../test-helpers.js'
 import {collectDiffContext, MAX_FILES_IN_CONTEXT} from './diff-context.js'
 
 vi.mock('../reviews/index.js', () => ({

@@ -5,7 +5,7 @@
  * instructions, gh CLI examples, and run summary requirements.
  */
 
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
 import {formatContextForPrompt} from '../context/index.js'

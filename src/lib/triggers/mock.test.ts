@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {normalizeEvent} from '../github/context.js'
-import {createMockLogger} from '../test-helpers.js'
 import {createIssueCommentCreatedEvent} from './__fixtures__/payloads.js'
 import {getMockEventConfig, getMockToken, isInCI, isMockEventEnabled, parseMockEvent} from './mock.js'
 

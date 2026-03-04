@@ -1,6 +1,6 @@
 import type {Octokit} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {createAppClient, createClient, getBotLogin} from './client.js'
 
 describe('createClient', () => {

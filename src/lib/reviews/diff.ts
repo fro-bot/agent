@@ -1,5 +1,5 @@
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {DiffFile, DiffHunk, PRDiff} from './types.js'
 import {Buffer} from 'node:buffer'
 import {PAGINATION_CONFIG} from './types.js'

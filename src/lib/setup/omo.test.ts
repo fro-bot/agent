@@ -2,7 +2,7 @@ import type {OmoInstallDeps} from './omo.js'
 import type {ExecAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {installOmo, verifyOmoInstallation} from './omo.js'
 
 // Mock exec adapter

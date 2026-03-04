@@ -1,6 +1,6 @@
 import type {Buffer} from 'node:buffer'
 
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 
 // Re-export Logger for convenience in setup modules
 export type {Logger}

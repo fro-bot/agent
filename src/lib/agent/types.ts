@@ -6,11 +6,11 @@
  */
 
 import type {FilePartInput} from '@opencode-ai/sdk'
+import type {ModelConfig, OmoProviders, TokenUsage} from '../../shared/types.js'
 import type {ErrorInfo} from '../comments/types.js'
 import type {HydratedContext} from '../context/types.js'
 import type {SessionSearchResult, SessionSummary} from '../session/types.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {ModelConfig, OmoProviders, TokenUsage} from '../types.js'
 
 /**
  * Context collected from GitHub Actions for agent prompt construction.

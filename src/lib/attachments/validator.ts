@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {AttachmentLimits, DownloadedAttachment, SkippedAttachment, ValidatedAttachment} from './types.js'
 
-import {formatBytes} from '../../utils/format.js'
+import {formatBytes} from '../../shared/format.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 
 interface ValidationResult {

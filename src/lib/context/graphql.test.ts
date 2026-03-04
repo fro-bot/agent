@@ -1,4 +1,4 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {executeIssueQuery, executePullRequestQuery, ISSUE_QUERY, PULL_REQUEST_QUERY} from './graphql.js'
 import {createFailingMockOctokit, createMockLogger, createMockOctokit} from './test-helpers.js'

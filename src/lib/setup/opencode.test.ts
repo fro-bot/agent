@@ -1,6 +1,6 @@
 import type {ExecAdapter, Logger, PlatformInfo, ToolCacheAdapter} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildDownloadUrl, FALLBACK_VERSION, getPlatformInfo, installOpenCode} from './opencode.js'
 
 // Mock tool-cache adapter

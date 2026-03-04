@@ -6,7 +6,7 @@ import type {
   PullRequestReviewCommentEvent,
   WorkflowDispatchEvent,
 } from '@octokit/webhooks-types'
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {CommentTarget, EventType, GitHubContext, NormalizedEvent} from './types.js'
 import * as github from '@actions/github'
 

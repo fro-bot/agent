@@ -1,5 +1,5 @@
 import type {Event} from '@opencode-ai/sdk'
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {OpenCodeServerHandle} from './opencode.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import {Buffer} from 'node:buffer'
@@ -9,8 +9,8 @@ import process from 'node:process'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import * as envUtils from '../../utils/env.js'
-import {createMockLogger} from '../test-helpers.js'
+import * as envUtils from '../../shared/env.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   bootstrapOpenCodeServer,
   ensureOpenCodeAvailable,

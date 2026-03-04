@@ -1,12 +1,12 @@
-import type {Logger} from './logger.js'
-import type {CacheResult} from './types.js'
+import type {Logger} from '../shared/logger.js'
+import type {CacheResult} from '../shared/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as cache from '@actions/cache'
-import {toErrorMessage} from '../utils/errors.js'
+import {STORAGE_VERSION} from '../shared/constants.js'
+import {toErrorMessage} from '../shared/errors.js'
 import {buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey, type CacheKeyComponents} from './cache-key.js'
-import {STORAGE_VERSION} from './constants.js'
 import {isSqliteBackend} from './session/version.js'
 
 /**

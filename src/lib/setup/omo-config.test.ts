@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {deepMerge, writeOmoConfig} from './omo-config.js'
 
 describe('deepMerge', () => {

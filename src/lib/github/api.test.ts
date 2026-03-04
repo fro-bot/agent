@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger, createMockOctokit} from '../test-helpers.js'
+import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {
   addLabelsToIssue,
   createCommentReaction,

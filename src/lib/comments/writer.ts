@@ -1,5 +1,5 @@
+import type {Logger} from '../../shared/logger.js'
 import type {CommentTarget, Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {
   AddDiscussionCommentResponse,
   DiscussionQueryResponse,
@@ -7,7 +7,7 @@ import type {
   PostCommentResult,
   UpdateDiscussionCommentResponse,
 } from './types.js'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
 import {findBotComment, readThread} from './reader.js'
 

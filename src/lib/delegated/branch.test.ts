@@ -1,6 +1,6 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger, createMockOctokit} from '../test-helpers.js'
+import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {branchExists, createBranch, deleteBranch, generateBranchName} from './branch.js'
 
 describe('createBranch', () => {

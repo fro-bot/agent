@@ -1,4 +1,4 @@
-import type {ActionOutputs} from './types.js'
+import type {ActionOutputs} from '../shared/types.js'
 import * as core from '@actions/core'
 
 /**

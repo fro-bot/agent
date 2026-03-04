@@ -10,10 +10,9 @@
  * - Skip if main already saved cache (cacheSaved=true)
  * - NEVER call core.setFailed() - best-effort only
  */
-import type {Logger} from './lib/logger.js'
+import type {Logger} from './shared/logger.js'
 import * as core from '@actions/core'
 import {saveCache} from './lib/cache.js'
-import {createLogger} from './lib/logger.js'
 import {STATE_KEYS} from './lib/state-keys.js'
 import {
   getGitHubRefName,
@@ -22,8 +21,9 @@ import {
   getOpenCodeAuthPath,
   getOpenCodeStoragePath,
   getRunnerOS,
-} from './utils/env.js'
-import {toErrorMessage} from './utils/errors.js'
+} from './shared/env.js'
+import {toErrorMessage} from './shared/errors.js'
+import {createLogger} from './shared/logger.js'
 
 export interface PostOptions {
   logger?: Logger

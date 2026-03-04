@@ -1,4 +1,4 @@
-import type {TokenUsage} from '../types.js'
+import type {TokenUsage} from '../../shared/types.js'
 
 export interface ErrorRecord {
   readonly timestamp: string

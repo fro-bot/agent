@@ -2,7 +2,7 @@ import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCache
 import os from 'node:os'
 import process from 'node:process'
 
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'

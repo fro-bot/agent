@@ -1,4 +1,4 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {ContextBudget} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {hydrateIssueContext} from './issue.js'

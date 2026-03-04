@@ -3,7 +3,7 @@ import type {CommentSummaryOptions, RunMetrics} from './types.js'
 import * as core from '@actions/core'
 import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {createLogger} from '../logger.js'
+import {createLogger} from '../../shared/logger.js'
 import {writeJobSummary} from './job-summary.js'
 
 vi.mock('@actions/core', () => {
@@ -20,7 +20,7 @@ vi.mock('@actions/core', () => {
   }
 })
 
-vi.mock('../logger.js', () => ({
+vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({
     debug: vi.fn(),
     info: vi.fn(),

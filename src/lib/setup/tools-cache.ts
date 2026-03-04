@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import * as cache from '@actions/cache'
-import {toErrorMessage} from '../../utils/errors.js'
-import {TOOLS_CACHE_PREFIX} from '../constants.js'
+import {TOOLS_CACHE_PREFIX} from '../../shared/constants.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 export interface ToolsCacheKeyComponents {
   readonly os: string

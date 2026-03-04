@@ -1,7 +1,7 @@
 import type {Dirent} from 'node:fs'
 import type {ExecAdapter, Logger, ToolCacheAdapter} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildBunDownloadUrl, DEFAULT_BUN_VERSION, getBunPlatformInfo, installBun, isBunAvailable} from './bun.js'
 
 // Mock fs/promises module

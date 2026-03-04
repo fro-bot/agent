@@ -1,4 +1,4 @@
-import type {RunSummary} from '../types.js'
+import type {RunSummary} from '../../shared/types.js'
 import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
 

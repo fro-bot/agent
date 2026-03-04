@@ -1,10 +1,10 @@
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {TriggerContext, TriggerTarget} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {createMockLogger, createMockOctokit} from '../test-helpers.js'
+import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
 import {collectAgentContext} from './context.js'
 
 vi.mock('../github/api.js', () => ({

@@ -1,6 +1,6 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from './types.js'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 type ReactionContent = '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket' | 'eyes'
 

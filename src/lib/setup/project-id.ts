@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as exec from '@actions/exec'
 
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 export type ProjectIdSource = 'cached' | 'generated' | 'error'
 

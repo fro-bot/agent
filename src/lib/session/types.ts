@@ -4,7 +4,7 @@
  * @see https://github.com/anomalyco/opencode/blob/main/packages/opencode/src/session/index.ts
  */
 
-export type {Logger} from '../logger.js'
+export type {Logger} from '../../shared/logger.js'
 
 /**
  * OpenCode Session.Info - matches the actual schema from OpenCode source.

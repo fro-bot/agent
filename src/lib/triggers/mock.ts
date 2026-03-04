@@ -1,7 +1,7 @@
+import type {Logger} from '../../shared/logger.js'
 import type {GitHubContext} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import process from 'node:process'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {classifyEventType, normalizeEvent} from '../github/context.js'
 
 export interface MockEventConfig {

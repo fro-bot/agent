@@ -1,4 +1,4 @@
-import type {TokenUsage} from '../types.js'
+import type {TokenUsage} from '../../shared/types.js'
 import type {CommentSummaryOptions} from './types.js'
 import {BOT_COMMENT_MARKER} from '../github/types.js'
 

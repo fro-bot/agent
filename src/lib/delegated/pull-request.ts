@@ -4,8 +4,8 @@
  * Uses GitHub REST API for PR creation, updates, and management.
  */
 
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {CreatePROptions, GeneratePRBodyOptions, PRResult, UpdatePROptions} from './types.js'
 
 /**

@@ -2,7 +2,7 @@ import type {Buffer} from 'node:buffer'
 
 import type {ExecAdapter, Logger, OmoInstallResult} from './types.js'
 
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 export interface OmoInstallOptions {
   claude?: 'no' | 'yes' | 'max20'

@@ -1,6 +1,6 @@
 import type {GitHubContext} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {createIssueCommentCreatedEvent} from '../triggers/__fixtures__/payloads.js'
 import {classifyEventType, getCommentTarget, isPullRequest, normalizeEvent, parseGitHubContext} from './context.js'
 

@@ -1,10 +1,10 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {AttachmentLimits, AttachmentUrl, DownloadedAttachment} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {extractFilename} from './parser.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 

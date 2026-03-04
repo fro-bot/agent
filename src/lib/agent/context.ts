@@ -5,9 +5,9 @@
  * comment data, author info, and target info. Avoids duplicating parsing.
  */
 
+import type {Logger} from '../../shared/logger.js'
 import type {HydratedContext} from '../context/types.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext} from './types.js'
 import {

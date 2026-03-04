@@ -24,7 +24,7 @@ import type {ExecutionConfig, PromptOptions, ReactionContext} from './lib/agent/
 import type {CacheKeyComponents} from './lib/cache-key.js'
 import type {CommentTarget, Octokit} from './lib/github/types.js'
 import type {CommentSummaryOptions} from './lib/observability/types.js'
-import type {CacheResult, RunSummary} from './lib/types.js'
+import type {CacheResult, RunSummary} from './shared/types.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
@@ -48,7 +48,6 @@ import {restoreCache, saveCache} from './lib/cache.js'
 import {formatErrorComment, postComment} from './lib/comments/index.js'
 import {createClient, getBotLogin, parseGitHubContext} from './lib/github/index.js'
 import {parseActionInputs} from './lib/inputs.js'
-import {createLogger} from './lib/logger.js'
 import {createMetricsCollector, writeJobSummary} from './lib/observability/index.js'
 import {setActionOutputs} from './lib/outputs.js'
 import {
@@ -70,8 +69,9 @@ import {
   getOpenCodeAuthPath,
   getOpenCodeStoragePath,
   getRunnerOS,
-} from './utils/env.js'
-import {normalizeWorkspacePath} from './utils/paths.js'
+} from './shared/env.js'
+import {createLogger} from './shared/logger.js'
+import {normalizeWorkspacePath} from './shared/paths.js'
 
 /**
  * Main action entry point.
@@ -310,7 +310,7 @@ async function run(): Promise<number> {
       exitCode: number
       sessionId: string | null
       error: string | null
-      tokenUsage: import('./lib/types.js').TokenUsage | null
+      tokenUsage: import('./shared/types.js').TokenUsage | null
       model: string | null
       cost: number | null
       prsCreated: readonly string[]

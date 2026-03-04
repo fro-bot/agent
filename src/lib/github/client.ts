@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from './types.js'
 import * as github from '@actions/github'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 export interface ClientOptions {
   readonly token: string

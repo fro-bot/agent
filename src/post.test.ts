@@ -1,5 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from './lib/test-helpers.js'
+import {createMockLogger} from './shared/test-helpers.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),

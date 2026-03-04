@@ -1,6 +1,6 @@
 import type {AttachmentLimits, DownloadedAttachment} from './types.js'
 import {describe, expect, it} from 'vitest'
-import {createMockLogger} from '../test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {DEFAULT_ATTACHMENT_LIMITS} from './types.js'
 import {validateAttachments} from './validator.js'
 

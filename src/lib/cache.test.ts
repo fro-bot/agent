@@ -1,5 +1,5 @@
+import type {Logger} from '../shared/logger.js'
 import type {CacheKeyComponents} from './cache-key.js'
-import type {Logger} from './logger.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'

@@ -1,7 +1,7 @@
-import type {Logger} from '../logger.js'
+import type {Logger} from '../../shared/logger.js'
 import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
 
 /**

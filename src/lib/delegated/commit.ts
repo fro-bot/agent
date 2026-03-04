@@ -5,8 +5,8 @@
  * Flow: createBlob → createTree → createCommit → updateRef
  */
 
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {CommitOptions, CommitResult, FileChange} from './types.js'
 
 import {Buffer} from 'node:buffer'

@@ -1,7 +1,7 @@
+import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from '../github/types.js'
-import type {Logger} from '../logger.js'
 import type {IssueGraphQLResponse, PullRequestGraphQLResponse} from './types.js'
-import {toErrorMessage} from '../../utils/errors.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 export const ISSUE_QUERY = `
   query GetIssue($owner: String!, $repo: String!, $number: Int!, $maxComments: Int!) {

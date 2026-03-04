@@ -1,6 +1,6 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, Message, Part, ProjectInfo, SessionInfo, TodoItem, ToolState} from './types.js'
-import {normalizeWorkspacePath} from '../../utils/paths.js'
+import {normalizeWorkspacePath} from '../../shared/paths.js'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value != null
