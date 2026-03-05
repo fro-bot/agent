@@ -1,7 +1,7 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, Message, Part, SessionInfo, SessionMatch, SessionSearchResult, SessionSummary} from './types.js'
 
-import {getSession, getSessionMessages, getSessionTodos, listSessionsForProject} from './session-storage.js'
+import {getSession, getSessionMessages, getSessionTodos, listSessionsForProject} from './storage-read.js'
 
 /**
  * List all main sessions (excluding child/branched sessions) for a directory.

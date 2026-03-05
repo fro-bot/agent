@@ -1,23 +1,22 @@
 // Backend types (SDK-only)
 export type {SessionClient} from './backend.js'
 
+export {findProjectByWorkspace, listProjectsViaSDK} from './discovery.js'
+
 // Pruning
 export {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
 
 // Search operations
 export {getSessionInfo, listSessions, searchSessions} from './search.js'
-
 // Storage utilities
 export {
-  deleteSession,
   findLatestSession,
-  findProjectByWorkspace,
   getSession,
   getSessionMessages,
   getSessionTodos,
-  listProjectsViaSDK,
   listSessionsForProject,
-} from './session-storage.js'
+} from './storage-read.js'
+export {deleteSession} from './storage-write.js'
 
 // Types
 export type {

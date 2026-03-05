@@ -2,14 +2,7 @@ import type {SessionClient} from './backend.js'
 import type {Logger, ProjectInfo} from './types.js'
 
 import {normalizeWorkspacePath} from '../../shared/paths.js'
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value != null
-}
-
-function readString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
+import {isRecord, readString} from './storage-mappers.js'
 
 export async function listProjectsViaSDK(client: SessionClient, logger: Logger): Promise<readonly ProjectInfo[]> {
   const response = await client.project.list()
