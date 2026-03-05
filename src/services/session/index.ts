@@ -10,13 +10,13 @@ export {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
 export {getSessionInfo, listSessions, searchSessions} from './search.js'
 // Storage utilities
 export {
+  deleteSession,
   findLatestSession,
   getSession,
   getSessionMessages,
   getSessionTodos,
   listSessionsForProject,
-} from './storage-read.js'
-export {deleteSession} from './storage-write.js'
+} from './storage.js'
 
 // Types
 export type {

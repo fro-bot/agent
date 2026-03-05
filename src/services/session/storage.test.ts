@@ -5,13 +5,13 @@ import {describe, expect, it, vi} from 'vitest'
 
 import {findProjectByWorkspace, listProjectsViaSDK} from './discovery.js'
 import {
+  deleteSession,
   findLatestSession,
   getSession,
   getSessionMessages,
   getSessionTodos,
   listSessionsForProject,
-} from './storage-read.js'
-import {deleteSession} from './storage-write.js'
+} from './storage.js'
 
 const mockLogger: Logger = {
   debug: vi.fn(),

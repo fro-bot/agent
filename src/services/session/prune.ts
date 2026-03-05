@@ -3,8 +3,7 @@ import type {Logger, PruneResult, PruningConfig} from './types.js'
 
 import {toErrorMessage} from '../../shared/errors.js'
 import {findProjectByWorkspace} from './discovery.js'
-import {listSessionsForProject} from './storage-read.js'
-import {deleteSession} from './storage-write.js'
+import {deleteSession, listSessionsForProject} from './storage.js'
 
 /**
  * Default pruning configuration.
