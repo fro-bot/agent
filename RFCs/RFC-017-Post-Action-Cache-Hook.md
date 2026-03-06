@@ -271,7 +271,7 @@ export default defineConfig({
 
 ### 5. State Keys Module (Optional Extraction)
 
-Create `src/lib/state-keys.ts` for shared state key constants:
+Create `src/harness/config/state-keys.ts` for shared state key constants:
 
 ```typescript
 /**

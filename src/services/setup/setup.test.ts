@@ -1,0 +1,773 @@
+import type {SetupInputs} from './types.js'
+
+import * as fs from 'node:fs/promises'
+import * as core from '@actions/core'
+import * as exec from '@actions/exec'
+import * as github from '@actions/github'
+import * as tc from '@actions/tool-cache'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {runSetup} from './setup.js'
+import * as toolsCache from './tools-cache.js'
+
+function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
+  return {
+    opencodeVersion: 'latest',
+    authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+    appId: null,
+    privateKey: null,
+    opencodeConfig: null,
+    omoConfig: null,
+    omoVersion: '3.7.4',
+    omoProviders: {
+      claude: 'no',
+      copilot: 'no',
+      gemini: 'no',
+      openai: 'no',
+      opencodeZen: 'no',
+      zaiCodingPlan: 'no',
+      kimiForCoding: 'no',
+    },
+    ...overrides,
+  }
+}
+
+// Mock @actions/core before importing setup
+vi.mock('@actions/core', () => ({
+  getInput: vi.fn(),
+  getBooleanInput: vi.fn(),
+  setOutput: vi.fn(),
+  exportVariable: vi.fn(),
+  addPath: vi.fn(),
+  setFailed: vi.fn(),
+  info: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+  isDebug: vi.fn(() => false),
+  startGroup: vi.fn(),
+  endGroup: vi.fn(),
+}))
+
+// Mock @actions/tool-cache
+vi.mock('@actions/tool-cache', () => ({
+  find: vi.fn(),
+  downloadTool: vi.fn(),
+  extractTar: vi.fn(),
+  extractZip: vi.fn(),
+  cacheDir: vi.fn(),
+}))
+
+// Mock @actions/exec
+vi.mock('@actions/exec', () => ({
+  exec: vi.fn(),
+  getExecOutput: vi.fn(),
+}))
+
+vi.mock('@actions/github', () => ({
+  getOctokit: vi.fn(),
+}))
+
+// Mock @octokit/auth-app
+vi.mock('@octokit/auth-app', () => ({
+  createAppAuth: vi.fn(),
+}))
+
+// Mock node:fs/promises
+vi.mock('node:fs/promises', () => ({
+  writeFile: vi.fn(),
+  mkdir: vi.fn(),
+  access: vi.fn(),
+  stat: vi.fn(),
+  readFile: vi.fn(),
+}))
+
+// Mock tools-cache module
+vi.mock('./tools-cache.js', () => ({
+  restoreToolsCache: vi.fn(),
+  saveToolsCache: vi.fn(),
+}))
+
+// Mock bun module
+vi.mock('./bun.js', () => ({
+  installBun: vi.fn().mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true}),
+  DEFAULT_BUN_VERSION: '1.3.5',
+}))
+
+describe('setup', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    process.env = {...originalEnv}
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    process.env.GITHUB_REF_NAME = 'main'
+    process.env.RUNNER_OS = 'Linux'
+    process.env.RUNNER_ARCH = 'X64'
+    process.env.XDG_DATA_HOME = '/tmp/test-data'
+    process.env.RUNNER_TOOL_CACHE = '/opt/hostedtoolcache'
+
+    // Default mock implementations
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      const inputs: Record<string, string> = {
+        'github-token': 'ghs_test_token',
+        'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
+        'opencode-version': 'latest',
+      }
+      return inputs[name] ?? ''
+    })
+    vi.mocked(core.getBooleanInput).mockReturnValue(false)
+
+    vi.mocked(github.getOctokit).mockReturnValue({
+      rest: {
+        users: {
+          getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
+          getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
+        },
+      },
+    } as never)
+
+    // Default tools cache: miss (so existing tests run normal install path)
+    vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+    vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+
+    // Default exec.getExecOutput mock
+    vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  describe('runSetup', () => {
+    it('installs OpenCode when not cached', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('')
+      vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.zip')
+      vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
+      vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
+      vi.mocked(tc.cacheDir).mockResolvedValue('/cached/opencode')
+      vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+        // Mock bot login
+        if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+          return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+        }
+        // Mock file validation - return appropriate type based on actual platform
+        if (cmd === 'file') {
+          const isZipPlatform = process.platform === 'darwin' || process.platform === 'win32'
+          const output = isZipPlatform ? 'Zip archive data' : 'gzip compressed data'
+          return {exitCode: 0, stdout: output, stderr: ''}
+        }
+        return {exitCode: 0, stdout: '', stderr: ''}
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // Mock fetch for getLatestVersion
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => Promise.resolve({tag_name: 'v1.0.300'}),
+        }),
+      )
+
+      // #when
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(result).not.toBeNull()
+      expect(tc.downloadTool).toHaveBeenCalled()
+      expect(core.addPath).toHaveBeenCalled()
+    })
+
+    it('uses cached OpenCode when available', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(tc.downloadTool).not.toHaveBeenCalled()
+      expect(core.addPath).toHaveBeenCalledWith('/cached/opencode/1.0.300')
+    })
+
+    it('writes auth.json with correct permissions', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(fs.writeFile).toHaveBeenCalledWith(expect.stringContaining('auth.json'), expect.any(String), {mode: 0o600})
+    })
+
+    it('exports GH_TOKEN environment variable', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
+    })
+
+    it('exports OPENCODE_CONFIG_CONTENT with autoupdate:false baseline', async () => {
+      // #given - no opencode-config input
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
+    })
+
+    it('merges user opencode-config input on top of OPENCODE_CONFIG_CONTENT baseline', async () => {
+      // #given - user supplies opencode-config with custom settings
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(
+        createSetupInputs({opencodeConfig: '{"model": "claude-opus-4-5", "autoupdate": true}'}),
+        'ghs_test_token',
+      )
+
+      // #then - user config wins on conflicting keys (autoupdate:true overrides false baseline)
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'OPENCODE_CONFIG_CONTENT',
+        JSON.stringify({autoupdate: true, model: 'claude-opus-4-5'}),
+      )
+    })
+
+    it('fails when opencode-config parses to JSON null', async () => {
+      // #given - user supplies JSON null literal as opencode-config
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs({opencodeConfig: 'null'}), 'ghs_test_token')
+
+      // #then
+      expect(result).toBe(null)
+      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
+    })
+
+    it('fails with explicit message when opencode-config is invalid JSON', async () => {
+      // #given - malformed JSON
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs({opencodeConfig: '{invalid-json}'}), 'ghs_test_token')
+
+      // #then
+      expect(result).toBe(null)
+      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be valid JSON')
+    })
+
+    it('treats whitespace-only opencode-config as not provided', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(result).not.toBeNull()
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
+    })
+
+    it('fails when opencode-config is an array', async () => {
+      // #given - user supplies array as opencode-config
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs({opencodeConfig: '["model", "claude-opus-4"]'}), 'ghs_test_token')
+
+      // #then
+      expect(result).toBe(null)
+      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
+    })
+
+    it('fails when opencode-config is a number', async () => {
+      // #given - user supplies number as opencode-config
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs({opencodeConfig: '42'}), 'ghs_test_token')
+
+      // #then
+      expect(result).toBe(null)
+      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
+    })
+
+    it('fails when opencode-config is a string', async () => {
+      // #given - user supplies string as opencode-config
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs({opencodeConfig: '"just-a-string"'}), 'ghs_test_token')
+
+      // #then
+      expect(result).toBe(null)
+      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
+    })
+
+    it('sets outputs for opencode-path and auth-json-path', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(core.setOutput).toHaveBeenCalledWith('opencode-path', expect.any(String))
+      expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
+    })
+
+    it('warns when oMo installation fails but continues setup', async () => {
+      // #given - bunx oMo fails, other exec calls succeed
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockImplementation(async (cmd: string) => {
+        if (cmd === 'bunx') {
+          throw new Error('bunx failed')
+        }
+        return 0
+      })
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then - should warn but continue (RFC-011 graceful degradation)
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('oMo installation failed'))
+    })
+
+    it('skips oMo install when Bun installation fails', async () => {
+      // #given - Bun install throws
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({
+        exitCode: 0,
+        stdout: '{"tag_name": "v1.0.300"}',
+        stderr: '',
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      const bunModule = await import('./bun.js')
+      vi.mocked(bunModule.installBun).mockRejectedValueOnce(new Error('download failed'))
+
+      // #when
+      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then - setup continues but oMo is not attempted
+      expect(result).not.toBeNull()
+      expect(result?.omoInstalled).toBe(false)
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Bun installation failed'))
+      expect(exec.exec).not.toHaveBeenCalledWith('bunx', expect.anything(), expect.anything())
+    })
+
+    it('calls setFailed on unrecoverable error', async () => {
+      // #given
+      // #when
+      await runSetup(createSetupInputs({authJson: 'invalid json {'}), 'ghs_test_token')
+
+      // #then
+      expect(core.setFailed).toHaveBeenCalled()
+    })
+
+    it('configures git identity from GitHub token user', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(exec.exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.name', 'fro-bot[bot]'], undefined)
+      expect(exec.exec).toHaveBeenCalledWith(
+        'git',
+        ['config', '--global', 'user.email', '123456+fro-bot[bot]@users.noreply.github.com'],
+        undefined,
+      )
+    })
+
+    it('skips git identity when already configured', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+        if (cmd === 'git' && args?.[0] === 'config' && args?.[1] === 'user.name') {
+          return {exitCode: 0, stdout: 'Existing User\n', stderr: ''}
+        }
+        if (cmd === 'git' && args?.[0] === 'config' && args?.[1] === 'user.email') {
+          return {exitCode: 0, stdout: 'existing@example.com\n', stderr: ''}
+        }
+        return {exitCode: 0, stdout: '', stderr: ''}
+      })
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.name']), expect.anything())
+      expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.email']), expect.anything())
+    })
+
+    describe('tools cache integration', () => {
+      beforeEach(() => {
+        process.env.RUNNER_TOOL_CACHE = '/opt/hostedtoolcache'
+
+        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
+        })
+        vi.mocked(exec.exec).mockResolvedValue(0)
+        vi.mocked(fs.writeFile).mockResolvedValue()
+        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+        // Default: tools cache miss
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+      })
+
+      it('calls restoreToolsCache before install functions', async () => {
+        // #given tools cache miss (default in beforeEach)
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(toolsCache.restoreToolsCache).toHaveBeenCalledTimes(1)
+        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(callArgs).toBeDefined()
+        expect(callArgs?.toolCachePath).toContain('opencode')
+        expect(callArgs?.omoConfigPath).toContain('opencode')
+      })
+
+      it('calls saveToolsCache after successful installs on cache miss', async () => {
+        // #given tools cache miss
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
+        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
+        expect(saveArgs).toBeDefined()
+        expect(saveArgs?.toolCachePath).toContain('opencode')
+      })
+
+      it('skips installs and save on tools cache hit when binary is findable', async () => {
+        // #given tools cache hit and tc.find returns a valid path
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        expect(result).not.toBeNull()
+        expect(result?.toolsCacheStatus).toBe('hit')
+      })
+
+      it('falls through to install when tools cache hits but binary not findable', async () => {
+        // #given tools cache hit but tc.find returns empty (version mismatch)
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('')
+        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
+        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({tag_name: 'v1.0.300'}),
+          }),
+        )
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          if (cmd === 'file') {
+            const isZip = process.platform === 'darwin' || process.platform === 'win32'
+            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
+        })
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(tc.downloadTool).toHaveBeenCalled()
+        expect(result).not.toBeNull()
+        expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/1.0.300/x64')
+      })
+
+      it('never adds raw toolCachePath directory to PATH', async () => {
+        // #given tools cache hit but tc.find returns empty
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
+        })
+        vi.mocked(tc.find).mockReturnValue('')
+        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
+        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
+        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({tag_name: 'v1.0.300'}),
+          }),
+        )
+        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
+          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
+            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
+          }
+          if (cmd === 'file') {
+            const isZip = process.platform === 'darwin' || process.platform === 'win32'
+            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
+          }
+          return {exitCode: 0, stdout: '', stderr: ''}
+        })
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode')
+        expect(result).not.toBeNull()
+      })
+
+      it('includes toolsCacheStatus in SetupResult on cache miss', async () => {
+        // #given tools cache miss (default)
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(result?.toolsCacheStatus).toBe('miss')
+      })
+
+      it('does not call saveToolsCache on tools cache hit', async () => {
+        // #given tools cache hit
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+        })
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+      })
+
+      it('always runs oMo installer even on cache hit', async () => {
+        // #given tools cache hit
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+          hit: true,
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+        })
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then - oMo always runs to ensure config is current
+        expect(result).not.toBeNull()
+        expect(result?.omoInstalled).toBe(true)
+      })
+    })
+
+    describe('omo-config input', () => {
+      beforeEach(() => {
+        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+        vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+        vi.mocked(exec.exec).mockResolvedValue(0)
+        vi.mocked(fs.writeFile).mockResolvedValue()
+        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+        vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
+      })
+
+      it('writes omo-config JSON to oh-my-opencode.json before installer runs', async () => {
+        // #given
+        const customConfig = JSON.stringify({theme: 'dark', model: 'claude-opus-4-5'})
+
+        // #when
+        const result = await runSetup(createSetupInputs({omoConfig: customConfig}), 'ghs_test_token')
+
+        // #then - writeFile called for oh-my-opencode.json
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const omoConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+        )
+        expect(omoConfigCall).toBeDefined()
+        const written = JSON.parse(omoConfigCall?.[1] as string) as Record<string, unknown>
+        expect(written).toMatchObject({theme: 'dark', model: 'claude-opus-4-5'})
+      })
+
+      it('does not write oh-my-opencode.json when omo-config is not provided', async () => {
+        // #given - no omo-config input (default mock returns empty string)
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then - oh-my-opencode.json is not written
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const omoConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+        )
+        expect(omoConfigCall).toBeUndefined()
+      })
+
+      it('treats whitespace-only omo-config as not provided', async () => {
+        // #given
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('omo-config'))
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const omoConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+        )
+        expect(omoConfigCall).toBeUndefined()
+      })
+
+      it('continues setup and warns when omo-config JSON is invalid', async () => {
+        // #given - invalid JSON in omo-config
+        // #when
+        const result = await runSetup(createSetupInputs({omoConfig: '{invalid json}'}), 'ghs_test_token')
+
+        // #then - setup continues despite bad omo-config
+        expect(result).not.toBeNull()
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('omo-config'))
+      })
+    })
+  })
+})

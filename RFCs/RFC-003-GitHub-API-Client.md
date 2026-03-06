@@ -42,7 +42,7 @@ Add to `package.json`:
 ### 2. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── github/
 │   ├── client.ts         # Octokit client factory
 │   ├── context.ts        # GitHub context parsing
@@ -50,7 +50,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 3. GitHub Types (`src/lib/github/types.ts`)
+### 3. GitHub Types (`src/services/github/types.ts`)
 
 ```typescript
 import type {GitHub} from "@actions/github/lib/utils"
@@ -138,7 +138,7 @@ export interface Comment {
 export const BOT_COMMENT_MARKER = "<!-- fro-bot-agent -->" as const
 ```
 
-### 4. Client Factory (`src/lib/github/client.ts`)
+### 4. Client Factory (`src/services/github/client.ts`)
 
 ```typescript
 import * as github from "@actions/github"
@@ -241,7 +241,7 @@ export function getClientForOperation(standardClient: Octokit, appClient: Octoki
 }
 ```
 
-### 5. Context Parsing (`src/lib/github/context.ts`)
+### 5. Context Parsing (`src/services/github/context.ts`)
 
 ```typescript
 import * as github from "@actions/github"
@@ -345,7 +345,7 @@ export function isIssueLocked(payload: IssueCommentPayload): boolean {
 }
 ```
 
-### 6. Public Exports (`src/lib/github/index.ts`)
+### 6. Public Exports (`src/services/github/index.ts`)
 
 ```typescript
 export {createClient, createAppClient, getBotLogin, getClientForOperation} from "./client.js"

@@ -1,3 +1,7 @@
+export {parseActionInputs} from './harness/config/inputs.js'
+
+export {setActionOutputs} from './harness/config/outputs.js'
+
 // Public API - lib exports
 export {
   CACHE_EXCLUSIONS,
@@ -9,16 +13,15 @@ export {
   OPENCODE_STORAGE_PATH,
   RETRY_DELAYS_MS,
   STORAGE_VERSION,
-} from './lib/constants.js'
+} from './shared/constants.js'
+// Public API - utils exports
+export {getOpenCodeAuthPath, getOpenCodeStoragePath, getRunnerOS, getXdgDataHome} from './shared/env.js'
 
-export {parseActionInputs} from './lib/inputs.js'
+export {createLogger} from './shared/logger.js'
 
-export {createLogger} from './lib/logger.js'
-export type {LogContext, Logger} from './lib/logger.js'
+export type {LogContext, Logger} from './shared/logger.js'
+export {ALLOWED_ASSOCIATIONS, err, isErr, isOk, ok} from './shared/types.js'
 
-export {setActionOutputs} from './lib/outputs.js'
-
-export {ALLOWED_ASSOCIATIONS, err, isErr, isOk, ok} from './lib/types.js'
 export type {
   ActionInputs,
   ActionOutputs,
@@ -34,9 +37,6 @@ export type {
   RunSummary,
   TokenUsage,
   ValidationResult,
-} from './lib/types.js'
+} from './shared/types.js'
 
-// Public API - utils exports
-export {getOpenCodeAuthPath, getOpenCodeStoragePath, getRunnerOS, getXdgDataHome} from './utils/env.js'
-
-export {validateJsonString, validateNonEmptyString, validatePositiveInteger} from './utils/validation.js'
+export {validateJsonString, validateNonEmptyString, validatePositiveInteger} from './shared/validation.js'

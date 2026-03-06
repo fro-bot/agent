@@ -53,10 +53,10 @@ RFC-012 specified CLI execution via `opencode run "$PROMPT"`. PRD v1.1 (2026-01-
 
 ### 1. File Structure
 
-SDK implementation is a **drop-in replacement** for RFC-012's CLI executor. No subdirectory—all code lives directly in `src/lib/agent/`.
+SDK implementation is a **drop-in replacement** for RFC-012's CLI executor. No subdirectory—all code lives directly in `src/features/agent/`.
 
 ```
-src/lib/agent/
+src/features/agent/
 ├── context.ts            # UNCHANGED: GitHub context collection
 ├── prompt.ts             # UNCHANGED: Prompt construction
 ├── reactions.ts          # UNCHANGED: GitHub reactions/labels
@@ -68,7 +68,7 @@ src/lib/agent/
 
 **Explicitly NOT created:**
 
-- `src/lib/agent/sdk/` subdirectory does NOT exist
+- `src/features/agent/sdk/` subdirectory does NOT exist
 - `executeWithSDK()` function does NOT exist
 
 ### 2. Removed CLI Code
@@ -84,7 +84,7 @@ The following CLI-specific code from RFC-012 is **removed**:
 | Exit code parsing from CLI              | SDK `prompt()` is synchronous, returns response directly |
 | Stdout/stderr log parsing               | SDK provides typed event stream via `/event` SSE         |
 
-### 3. Type Additions (`src/lib/agent/types.ts`)
+### 3. Type Additions (`src/features/agent/types.ts`)
 
 SDK types are **merged into the existing `types.ts`**, not a separate file:
 
@@ -125,7 +125,7 @@ export interface AgentResult {
 - `CompletionResult`
 - SDK client type aliases
 
-### 4. SDK Executor (`src/lib/agent/opencode.ts`)
+### 4. SDK Executor (`src/features/agent/opencode.ts`)
 
 The entire SDK implementation is consolidated into a single file, replacing the CLI executor. The public API signature remains unchanged for backward compatibility.
 
@@ -413,7 +413,7 @@ async function assertOpenCodeConnected(client: SDKClient, logger: Logger): Promi
   throw new Error("Failed to connect to OpenCode server after 30 retries")
 }
 
-// NOTE: Model/agent/timeout configuration is now parsed in src/lib/inputs.ts
+// NOTE: Model/agent/timeout configuration is now parsed in src/harness/config/inputs.ts
 // and passed via the ExecutionConfig parameter. The helper functions
 // getModelConfig(), getAgentName(), getTimeoutMs() are REMOVED.
 // This follows the repo pattern of parsing inputs centrally.
@@ -535,12 +535,12 @@ function sleep(ms: number): Promise<void> {
 }
 ```
 
-### 5. Updated Exports (`src/lib/agent/index.ts`)
+### 5. Updated Exports (`src/features/agent/index.ts`)
 
 Exports remain stable—no new paths introduced:
 
 ```typescript
-// src/lib/agent/index.ts
+// src/features/agent/index.ts
 export {collectAgentContext} from "./context.js"
 export {buildAgentPrompt} from "./prompt.js"
 export {acknowledgeReceipt, completeAcknowledgment} from "./reactions.js"
@@ -811,7 +811,7 @@ inputs:
 
 ## Test Cases
 
-Tests are colocated in `src/lib/agent/opencode.test.ts`, rewritten to mock `@opencode-ai/sdk` and `child_process`.
+Tests are colocated in `src/features/agent/opencode.test.ts`, rewritten to mock `@opencode-ai/sdk` and `child_process`.
 
 ### executeOpenCode
 
@@ -1133,13 +1133,13 @@ RFC-012's CLI execution is replaced **in-place** by this RFC. The exported API (
 
 | File | Status | Notes |
 | --- | --- | --- |
-| `src/lib/agent/context.ts` | UNCHANGED | Context collection remains the same |
-| `src/lib/agent/prompt.ts` | UNCHANGED | Prompt construction remains the same |
-| `src/lib/agent/reactions.ts` | UNCHANGED | Reactions/labels remain the same |
-| `src/lib/agent/types.ts` | UPDATED | SDK types merged (ModelConfig, PromptPart, AgentResult.sessionId) |
-| `src/lib/agent/opencode.ts` | REPLACED | CLI internals replaced with SDK; API signature unchanged |
-| `src/lib/agent/index.ts` | UPDATED | Exports parseModelInput; no new paths |
-| `src/lib/agent/opencode.test.ts` | REWRITTEN | Tests mock `@opencode-ai/sdk` instead of `@actions/exec` |
+| `src/features/agent/context.ts` | UNCHANGED | Context collection remains the same |
+| `src/features/agent/prompt.ts` | UNCHANGED | Prompt construction remains the same |
+| `src/features/agent/reactions.ts` | UNCHANGED | Reactions/labels remain the same |
+| `src/features/agent/types.ts` | UPDATED | SDK types merged (ModelConfig, PromptPart, AgentResult.sessionId) |
+| `src/features/agent/opencode.ts` | REPLACED | CLI internals replaced with SDK; API signature unchanged |
+| `src/features/agent/index.ts` | UPDATED | Exports parseModelInput; no new paths |
+| `src/features/agent/opencode.test.ts` | REWRITTEN | Tests mock `@opencode-ai/sdk` instead of `@actions/exec` |
 | `src/main.ts` | MINIMAL CHANGE | Continues calling executeOpenCode(); no SDK imports |
 
 ### Backward Compatibility
@@ -1243,7 +1243,7 @@ Rules:
 
 ### Prompt Builder Implementation
 
-Update `src/lib/agent/prompt.ts`:
+Update `src/features/agent/prompt.ts`:
 
 ```typescript
 export interface PromptOptions {
@@ -1395,14 +1395,14 @@ RFC-013 SDK Execution Mode has been fully implemented, replacing CLI-based execu
 | `package.json`                   | Added `@opencode-ai/sdk` dependency             |
 | `tsdown.config.ts`               | Added SDK to bundled dependencies               |
 | `action.yaml`                    | Added `agent`, `model`, `timeout` inputs        |
-| `src/lib/inputs.ts`              | Added `parseModelInput()` + new field parsing   |
-| `src/lib/types.ts`               | Added `ModelConfig` interface                   |
-| `src/lib/agent/types.ts`         | Added `ExecutionConfig`, `PromptPart`           |
-| `src/lib/agent/opencode.ts`      | Replaced CLI spawning with SDK client           |
-| `src/lib/agent/index.ts`         | Updated exports                                 |
+| `src/harness/config/inputs.ts`              | Added `parseModelInput()` + new field parsing   |
+| `src/shared/types.ts`               | Added `ModelConfig` interface                   |
+| `src/features/agent/types.ts`         | Added `ExecutionConfig`, `PromptPart`           |
+| `src/features/agent/opencode.ts`      | Replaced CLI spawning with SDK client           |
+| `src/features/agent/index.ts`         | Updated exports                                 |
 | `src/main.ts`                    | Passes `ExecutionConfig` to `executeOpenCode()` |
-| `src/lib/agent/opencode.test.ts` | Rewrote 19 tests for SDK mode                   |
-| `src/lib/inputs.test.ts`         | Added 6 tests for `parseModelInput()`           |
+| `src/features/agent/opencode.test.ts` | Rewrote 19 tests for SDK mode                   |
+| `src/harness/config/inputs.test.ts`         | Added 6 tests for `parseModelInput()`           |
 
 ### Verification
 

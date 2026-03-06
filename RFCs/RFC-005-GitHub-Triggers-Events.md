@@ -29,7 +29,7 @@ Implement comprehensive event handling for GitHub Actions triggers: `issue_comme
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── triggers/
 │   ├── types.ts          # Trigger-related types
 │   ├── router.ts         # Event routing logic
@@ -39,7 +39,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Trigger Types (`src/lib/triggers/types.ts`)
+### 2. Trigger Types (`src/features/triggers/types.ts`)
 
 ```typescript
 import type {GitHubContext, Octokit} from "../github/types.js"
@@ -87,7 +87,7 @@ export interface TriggerOutput {
 }
 ```
 
-### 3. Event Router (`src/lib/triggers/router.ts`)
+### 3. Event Router (`src/features/triggers/router.ts`)
 
 ```typescript
 import type {GitHubContext, Octokit, IssueCommentPayload} from "../github/types.js"
@@ -316,7 +316,7 @@ export function extractCommand(body: string, botLogin: string): string | null {
 }
 ```
 
-### 4. Issue Comment Handler (`src/lib/triggers/issue-comment.ts`)
+### 4. Issue Comment Handler (`src/features/triggers/issue-comment.ts`)
 
 ```typescript
 import type {TriggerContext, TriggerResult, TriggerOutput} from "./types.js"
@@ -375,7 +375,7 @@ export async function handleIssueComment(
 }
 ```
 
-### 5. Public Exports (`src/lib/triggers/index.ts`)
+### 5. Public Exports (`src/features/triggers/index.ts`)
 
 ```typescript
 export {routeEvent, hasBotMention, extractCommand} from "./router.js"
@@ -513,7 +513,7 @@ interface MockEventConfig {
 }
 ```
 
-### Implementation (`src/lib/triggers/mock.ts`)
+### Implementation (`src/features/triggers/mock.ts`)
 
 ```typescript
 import type {GitHubContext} from "../github/types.js"

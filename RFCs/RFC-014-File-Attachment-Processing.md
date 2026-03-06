@@ -11,13 +11,13 @@ Implementation completed with the following components:
 
 | Component            | File                                | Tests |
 | -------------------- | ----------------------------------- | ----- |
-| Types & limits       | `src/lib/attachments/types.ts`      | N/A   |
-| URL parsing          | `src/lib/attachments/parser.ts`     | 22    |
-| Secure download      | `src/lib/attachments/downloader.ts` | 7     |
-| MIME/size validation | `src/lib/attachments/validator.ts`  | 10    |
-| SDK file parts       | `src/lib/attachments/injector.ts`   | 5     |
-| Public API           | `src/lib/attachments/index.ts`      | N/A   |
-| Module docs          | `src/lib/attachments/AGENTS.md`     | N/A   |
+| Types & limits       | `src/features/attachments/types.ts`      | N/A   |
+| URL parsing          | `src/features/attachments/parser.ts`     | 22    |
+| Secure download      | `src/features/attachments/downloader.ts` | 7     |
+| MIME/size validation | `src/features/attachments/validator.ts`  | 10    |
+| SDK file parts       | `src/features/attachments/injector.ts`   | 5     |
+| Public API           | `src/features/attachments/index.ts`      | N/A   |
+| Module docs          | `src/features/attachments/AGENTS.md`     | N/A   |
 
 **Key implementation details:**
 
@@ -52,7 +52,7 @@ Implement file attachment processing for GitHub comment triggers. This RFC defin
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── attachments/
 │   ├── types.ts          # Attachment-related types
 │   ├── parser.ts         # URL detection from comment body
@@ -62,7 +62,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Attachment Types (`src/lib/attachments/types.ts`)
+### 2. Attachment Types (`src/features/attachments/types.ts`)
 
 > **SDK Schema Verification (2026-01-18):** Types aligned with `@opencode-ai/sdk` v1.1.x `FilePartInput` from SDK: `{ type: 'file', mime: string, url: string, filename?: string }` `TextPartInput` from SDK: `{ type: 'text', text: string }` The SDK expects `url` (file:// URL), NOT base64 `content`.
 >
@@ -152,7 +152,7 @@ export const DEFAULT_ATTACHMENT_LIMITS: AttachmentLimits = {
 }
 ```
 
-### 3. URL Parser (`src/lib/attachments/parser.ts`)
+### 3. URL Parser (`src/features/attachments/parser.ts`)
 
 ```typescript
 import type {AttachmentUrl} from "./types.js"
@@ -286,7 +286,7 @@ export function extractFilename(url: string, altText: string, index: number): st
 }
 ```
 
-### 4. Downloader (`src/lib/attachments/downloader.ts`)
+### 4. Downloader (`src/features/attachments/downloader.ts`)
 
 > **Security Note (2026-01-18):** Downloads use `redirect: "manual"` to prevent token leakage to non-GitHub hosts. Content-Length checked before buffering to prevent memory exhaustion.
 
@@ -458,7 +458,7 @@ export async function cleanupTempFiles(tempPaths: readonly string[], logger: Log
 }
 ```
 
-### 5. Validator (`src/lib/attachments/validator.ts`)
+### 5. Validator (`src/features/attachments/validator.ts`)
 
 ```typescript
 import type {DownloadedAttachment, ValidatedAttachment, SkippedAttachment, AttachmentLimits} from "./types.js"
@@ -588,7 +588,7 @@ function formatBytes(bytes: number): string {
 }
 ```
 
-### 6. Prompt Injector (`src/lib/attachments/injector.ts`)
+### 6. Prompt Injector (`src/features/attachments/injector.ts`)
 
 > **Note:** Uses `FilePartInput` from `@opencode-ai/sdk` - do NOT duplicate the type.
 
@@ -664,7 +664,7 @@ export function buildAttachmentResult(
 }
 ```
 
-### 7. Public Exports (`src/lib/attachments/index.ts`)
+### 7. Public Exports (`src/features/attachments/index.ts`)
 
 ```typescript
 export {parseAttachmentUrls, isValidAttachmentUrl, extractFilename} from "./parser.js"
