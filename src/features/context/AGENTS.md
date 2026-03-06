@@ -1,0 +1,81 @@
+# CONTEXT MODULE
+
+**RFC:** RFC-015 GraphQL Context Hydration **Status:** Completed
+
+## OVERVIEW
+
+Provides rich issue and pull request context to the agent via GraphQL API with REST fallback and budget constraints to prevent prompt bloat.
+
+## ARCHITECTURE
+
+```
+hydrateIssueContext() / hydratePullRequestContext()
+          ↓                         ↓
+ executeIssueQuery()      executePullRequestQuery()
+          ↓                         ↓
+   IssueContext             PullRequestContext
+          ↓                         ↓
+ fallbackIssueContext()   fallbackPullRequestContext()
+          ↓                         ↓
+ formatContextForPrompt() → Markdown string
+```
+
+## WHERE TO LOOK
+
+| Component | File | Responsibility |
+| --- | --- | --- |
+| **Types** | `types.ts` | Type definitions, budget constraints (279 L) |
+| **GraphQL** | `graphql.ts` | GraphQL queries and execution (batched) (186 L) |
+| **Issue** | `issue.ts` | Issue context hydration logic (66 L) |
+| **Pull Request**| `pull-request.ts`| PR context hydration (requested reviewers) (142 L) |
+| **Fallback** | `fallback.ts` | REST API fallback (188 L) |
+| **Budget** | `budget.ts` | Truncation, size estimation, prompt format (195 L) |],op:
+| ----------------- | --------------------------------------------------- |
+| `types.ts`        | Type definitions, budget constraints (279 L)        |
+| `graphql.ts`      | GraphQL queries and execution (batched)             |
+| `issue.ts`        | Issue context hydration logic                       |
+| `pull-request.ts` | PR context hydration (includes requested reviewers) |
+| `fallback.ts`     | REST API fallback (189 L, full PR context support)  |
+| `budget.ts`       | Truncation, size estimation, prompt format          |
+| `index.ts`        | Public exports                                      |
+| `test-helpers.ts` | Shared mock utilities for tests                     |
+
+## KEY EXPORTS
+
+- `hydrateIssueContext(...)`: Primary entry for issues (GraphQL)
+- `hydratePullRequestContext(...)`: Primary entry for PRs (GraphQL, includes requested reviewers)
+- `fallbackIssueContext(...)`: REST fallback for issues
+- `fallbackPullRequestContext(...)`: REST fallback for PRs (full parity with GraphQL)
+- `formatContextForPrompt(context)`: Converts hydrated context to Markdown
+- `truncateBody(text, maxBytes)`: UTF-8 safe byte-level truncation
+- `DEFAULT_CONTEXT_BUDGET`: Budget limits per RFC-015
+
+## BUDGET CONSTRAINTS
+
+| Limit         | Value  | Description                      |
+| ------------- | ------ | -------------------------------- |
+| maxComments   | 50     | Max comments to fetch            |
+| maxCommits    | 100    | Max commits (PR only)            |
+| maxFiles      | 100    | Max files (PR only)              |
+| maxReviews    | 100    | Max reviews (PR only)            |
+| maxBodyBytes  | 10 KB  | Individual body truncation limit |
+| maxTotalBytes | 100 KB | Overall prompt context limit     |
+
+## GRACEFUL DEGRADATION
+
+1. **Primary:** GraphQL API for efficient batched queries.
+2. **Fallback:** REST API (via Octokit) when GraphQL fails or is unavailable.
+3. **Null-Safe:** Returns `null` on terminal failures rather than throwing.
+4. **Partial Failure:** Requested reviewers fetch is isolated from main PR context (insufficient permissions degrade gracefully).
+
+## FORK DETECTION
+
+PRs from forks are detected by comparing `baseRepository.owner` vs `headRepository.owner`. Fork PRs are flagged with `isFork: true` for security awareness in the prompt.
+
+## PR REVIEWER CONTEXT
+
+`PullRequestContext` includes `requestedReviewers` (user logins) and `requestedReviewerTeams` (team names). The agent uses `isRequestedReviewer` to determine whether it should approve/request-changes or comment-only.
+
+## UTF-8 SAFETY
+
+Body truncation uses byte-level slicing with `TextEncoder`/`TextDecoder`. Invalid UTF-8 sequences (0xFFFD) at truncation boundaries are stripped to ensure the resulting Markdown is valid and safe for LLM consumption.

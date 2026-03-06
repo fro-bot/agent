@@ -68,7 +68,7 @@ src/
 │   │   └── index.ts           # Public exports
 ```
 
-### 2. Agent Types (`src/lib/agent/types.ts`)
+### 2. Agent Types (`src/features/agent/types.ts`)
 
 ```typescript
 export interface AgentContext {
@@ -111,9 +111,9 @@ export interface PromptOptions {
 export type AcknowledgmentState = "pending" | "acknowledged" | "completed" | "failed"
 ```
 
-### 3. GitHub Context Collection (`src/lib/agent/context.ts`)
+### 3. GitHub Context Collection (`src/features/agent/context.ts`)
 
-**Note:** This module leverages RFC-003's `parseGitHubContext()` and related utilities from `src/lib/github/context.ts` to extract all context from the GitHub Actions event payload. No workflow-level environment variables are needed for comment/issue data.
+**Note:** This module leverages RFC-003's `parseGitHubContext()` and related utilities from `src/services/github/context.ts` to extract all context from the GitHub Actions event payload. No workflow-level environment variables are needed for comment/issue data.
 
 ```typescript
 import type {Logger} from "../logger.js"
@@ -193,7 +193,7 @@ export async function fetchDefaultBranch(repo: string, logger: Logger): Promise<
 }
 ```
 
-### 4. Prompt Construction (`src/lib/agent/prompt.ts`)
+### 4. Prompt Construction (`src/features/agent/prompt.ts`)
 
 ```typescript
 import type {PromptOptions, Logger} from "./types.js"
@@ -347,7 +347,7 @@ Execute the requested operation for repository ${context.repo}. Follow all instr
 }
 ```
 
-### 5. Reactions & Labels (`src/lib/agent/reactions.ts`)
+### 5. Reactions & Labels (`src/features/agent/reactions.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
@@ -587,7 +587,7 @@ export async function completeAcknowledgment(ctx: ReactionContext, success: bool
 }
 ```
 
-### 6. OpenCode CLI Execution (`src/lib/agent/opencode.ts`)
+### 6. OpenCode CLI Execution (`src/features/agent/opencode.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
@@ -893,7 +893,7 @@ async function run(): Promise<void> {
 await run()
 ```
 
-### 8. Index Exports (`src/lib/agent/index.ts`)
+### 8. Index Exports (`src/features/agent/index.ts`)
 
 ```typescript
 // Types

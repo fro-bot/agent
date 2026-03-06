@@ -29,19 +29,19 @@ Implement security controls for safe operation: permission gating for fork PRs, 
 
 ### Implementation Location
 
-Security functionality is distributed across modules by concern rather than consolidated into a separate `src/lib/security/` module. This keeps logic close to where it's contextually used.
+Security functionality is distributed across modules by concern rather than consolidated into a separate `src/features/security/` module. This keeps logic close to where it's contextually used.
 
 | Concern           | Module                       | Key Functions                                                   |
 | ----------------- | ---------------------------- | --------------------------------------------------------------- |
-| Permission Gating | `src/lib/triggers/router.ts` | `isAuthorizedAssociation()`, skip conditions                    |
-| Author Types      | `src/lib/triggers/types.ts`  | `AuthorInfo`, `ALLOWED_ASSOCIATIONS`, `ALL_AUTHOR_ASSOCIATIONS` |
-| auth.json Write   | `src/lib/setup/auth-json.ts` | `populateAuthJson()`, `verifyAuthJson()`                        |
-| auth.json Delete  | `src/lib/cache.ts`           | `deleteAuthJson()`, `isAuthPathSafe()`                          |
-| Log Redaction     | `src/lib/logger.ts`          | `redactSensitiveFields()`                                       |
-| GitHub Client     | `src/lib/github/client.ts`   | `createAppClient()`, `getBotLogin()`                            |
-| Base Types        | `src/lib/types.ts`           | `ALLOWED_ASSOCIATIONS` (canonical)                              |
+| Permission Gating | `src/features/triggers/router.ts` | `isAuthorizedAssociation()`, skip conditions                    |
+| Author Types      | `src/features/triggers/types.ts`  | `AuthorInfo`, `ALLOWED_ASSOCIATIONS`, `ALL_AUTHOR_ASSOCIATIONS` |
+| auth.json Write   | `src/services/setup/auth-json.ts` | `populateAuthJson()`, `verifyAuthJson()`                        |
+| auth.json Delete  | `src/services/cache/restore.ts`           | `deleteAuthJson()`, `isAuthPathSafe()`                          |
+| Log Redaction     | `src/shared/logger.ts`          | `redactSensitiveFields()`                                       |
+| GitHub Client     | `src/services/github/client.ts`   | `createAppClient()`, `getBotLogin()`                            |
+| Base Types        | `src/shared/types.ts`           | `ALLOWED_ASSOCIATIONS` (canonical)                              |
 
-### 1. Permission Gating (`src/lib/triggers/router.ts`)
+### 1. Permission Gating (`src/features/triggers/router.ts`)
 
 Permission gating is integrated into the event routing logic. When an event is routed, the author's association is checked against allowed associations.
 
@@ -58,7 +58,7 @@ function isBotUser(login: string): boolean {
 
 The `checkSkipConditions()` function applies these checks for each event type, returning `unauthorized_author` skip reason when denied.
 
-### 2. Author Association Types (`src/lib/triggers/types.ts`)
+### 2. Author Association Types (`src/features/triggers/types.ts`)
 
 ```typescript
 /**
@@ -90,12 +90,12 @@ export type AuthorAssociation = (typeof ALL_AUTHOR_ASSOCIATIONS)[number]
 /**
  * Associations allowed to trigger the agent.
  * Only trusted users (OWNER, MEMBER, COLLABORATOR) can invoke agent actions.
- * Re-exported from src/lib/types.ts (canonical source).
+ * Re-exported from src/shared/types.ts (canonical source).
  */
 export {ALLOWED_ASSOCIATIONS} from "../types.js"
 ```
 
-### 3. auth.json Handling (`src/lib/setup/auth-json.ts`)
+### 3. auth.json Handling (`src/services/setup/auth-json.ts`)
 
 ```typescript
 /**
@@ -114,7 +114,7 @@ export async function verifyAuthJson(authPath: string, logger: Logger): Promise<
 }
 ```
 
-### 4. Cache Security (`src/lib/cache.ts`)
+### 4. Cache Security (`src/services/cache/restore.ts`)
 
 ```typescript
 /**
@@ -136,7 +136,7 @@ export function isAuthPathSafe(authPath: string, storagePath: string): boolean {
 }
 ```
 
-### 5. Log Redaction (`src/lib/logger.ts`)
+### 5. Log Redaction (`src/shared/logger.ts`)
 
 Already implemented with comprehensive sensitive field detection:
 
@@ -177,7 +177,7 @@ export function redactSensitiveFields<T>(value: T, sensitivePatterns: readonly s
 
 ## Test Cases
 
-### Permission Tests (`src/lib/triggers/router.test.ts`)
+### Permission Tests (`src/features/triggers/router.test.ts`)
 
 Tests for permission gating are integrated into the router tests:
 
@@ -218,7 +218,7 @@ describe("checkSkipConditions - unauthorized_author", () => {
 })
 ```
 
-### auth.json Tests (`src/lib/setup/auth-json.test.ts`)
+### auth.json Tests (`src/services/setup/auth-json.test.ts`)
 
 ```typescript
 describe("verifyAuthJson", () => {
@@ -242,7 +242,7 @@ describe("populateAuthJson", () => {
 })
 ```
 
-### Cache Security Tests (`src/lib/cache.test.ts`)
+### Cache Security Tests (`src/services/cache/cache.test.ts`)
 
 ```typescript
 describe("isAuthPathSafe", () => {
@@ -269,7 +269,7 @@ describe("isAuthPathSafe", () => {
 
 ### Architectural Decision
 
-RFC-006 originally proposed a consolidated `src/lib/security/` module. During implementation analysis, we found that security functionality was already implemented across existing modules in a contextually-appropriate way:
+RFC-006 originally proposed a consolidated `src/features/security/` module. During implementation analysis, we found that security functionality was already implemented across existing modules in a contextually-appropriate way:
 
 1. **Permission gating** is handled in `triggers/router.ts` where event routing decisions are made
 2. **Credential management** is split between setup (write) and cache (delete) modules
@@ -285,10 +285,10 @@ Creating a separate security module would have:
 
 The following utilities were added to fill gaps in the existing implementation:
 
-- `verifyAuthJson()` in `src/lib/setup/auth-json.ts` - verification check before execution
-- `isAuthPathSafe()` in `src/lib/cache.ts` - exported for explicit safety validation
-- `ALL_AUTHOR_ASSOCIATIONS` in `src/lib/triggers/types.ts` - documents all GitHub values
-- Deduplicated `ALLOWED_ASSOCIATIONS` - canonical source in `src/lib/types.ts`, re-exported elsewhere
+- `verifyAuthJson()` in `src/services/setup/auth-json.ts` - verification check before execution
+- `isAuthPathSafe()` in `src/services/cache/restore.ts` - exported for explicit safety validation
+- `ALL_AUTHOR_ASSOCIATIONS` in `src/features/triggers/types.ts` - documents all GitHub values
+- Deduplicated `ALLOWED_ASSOCIATIONS` - canonical source in `src/shared/types.ts`, re-exported elsewhere
 
 ## Estimated Effort
 

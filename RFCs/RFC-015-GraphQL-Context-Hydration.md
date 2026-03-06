@@ -32,7 +32,7 @@ Implement enhanced GitHub context hydration using GraphQL API to provide the age
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── context/
 │   ├── types.ts          # Context-related types
 │   ├── graphql.ts        # GraphQL queries and client
@@ -43,7 +43,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Context Types (`src/lib/context/types.ts`)
+### 2. Context Types (`src/features/context/types.ts`)
 
 ```typescript
 import type {Logger} from "../types.js"
@@ -207,7 +207,7 @@ export interface HydrationOptions {
 }
 ```
 
-### 3. GraphQL Queries (`src/lib/context/graphql.ts`)
+### 3. GraphQL Queries (`src/features/context/graphql.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -400,7 +400,7 @@ export async function executeGraphQL<T>(
 }
 ```
 
-### 4. Issue Context Hydration (`src/lib/context/issue.ts`)
+### 4. Issue Context Hydration (`src/features/context/issue.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -501,7 +501,7 @@ export async function hydrateIssueContext(
 }
 ```
 
-### 5. Pull Request Context Hydration (`src/lib/context/pull-request.ts`)
+### 5. Pull Request Context Hydration (`src/features/context/pull-request.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -702,7 +702,7 @@ export async function hydratePullRequestContext(
 }
 ```
 
-### 6. Context Budgeting (`src/lib/context/budget.ts`)
+### 6. Context Budgeting (`src/features/context/budget.ts`)
 
 ```typescript
 import type {HydratedContext, ContextBudget} from "./types.js"
@@ -852,7 +852,7 @@ export function formatContextForPrompt(context: HydratedContext): string {
 }
 ```
 
-### 7. REST API Fallback (`src/lib/context/fallback.ts`)
+### 7. REST API Fallback (`src/features/context/fallback.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -1013,7 +1013,7 @@ function mapRestStatus(status: string): "ADDED" | "DELETED" | "MODIFIED" | "RENA
 }
 ```
 
-### 8. Public Exports (`src/lib/context/index.ts`)
+### 8. Public Exports (`src/features/context/index.ts`)
 
 ```typescript
 export {hydrateIssueContext} from "./issue.js"

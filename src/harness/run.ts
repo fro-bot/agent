@@ -1,0 +1,97 @@
+import type {OpenCodeServerHandle} from '../features/agent/index.js'
+import type {ReactionContext} from '../features/agent/types.js'
+import type {AttachmentResult} from '../features/attachments/index.js'
+import type {Octokit} from '../services/github/types.js'
+import * as core from '@actions/core'
+import {createMetricsCollector} from '../features/observability/index.js'
+import {createLogger} from '../shared/logger.js'
+import {setActionOutputs} from './config/outputs.js'
+import {STATE_KEYS} from './config/state-keys.js'
+import {runAcknowledge} from './phases/acknowledge.js'
+import {runBootstrap} from './phases/bootstrap.js'
+import {runCacheRestore} from './phases/cache-restore.js'
+import {runCleanup} from './phases/cleanup.js'
+import {runExecute} from './phases/execute.js'
+import {runFinalize} from './phases/finalize.js'
+import {runRouting} from './phases/routing.js'
+import {runSessionPrep} from './phases/session-prep.js'
+
+export async function run(): Promise<number> {
+  const startTime = Date.now()
+  const bootstrapLogger = createLogger({phase: 'bootstrap'})
+  const metrics = createMetricsCollector()
+  metrics.start()
+
+  let reactionCtx: ReactionContext | null = null
+  let agentSuccess = false
+  let exitCode = 0
+  let githubClient: Octokit | null = null
+  let attachmentResult: AttachmentResult | null = null
+  let detectedOpencodeVersion: string | null = null
+  let serverHandle: OpenCodeServerHandle | null = null
+
+  core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+  core.saveState(STATE_KEYS.CACHE_SAVED, 'false')
+
+  try {
+    bootstrapLogger.info('Starting Fro Bot Agent')
+
+    const bootstrap = await runBootstrap(bootstrapLogger)
+    if (bootstrap == null) return 1
+    detectedOpencodeVersion = bootstrap.opencodeResult.version
+
+    const routing = await runRouting(bootstrap, startTime)
+    if (routing == null) return 0
+    githubClient = routing.githubClient
+
+    reactionCtx = await runAcknowledge(routing, bootstrap.logger)
+
+    const cacheRestore = await runCacheRestore(bootstrap)
+    if (cacheRestore == null) return 1
+    serverHandle = cacheRestore.serverHandle
+    metrics.setCacheStatus(cacheRestore.cacheStatus)
+
+    const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
+    attachmentResult = sessionPrep.attachmentResult
+
+    const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
+    agentSuccess = execution.success
+
+    metrics.end()
+    exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger)
+  } catch (error) {
+    exitCode = 1
+    const duration = Date.now() - startTime
+    const errorName = error instanceof Error ? error.name : 'UnknownError'
+    const errorMessage = error instanceof Error ? error.message : String(error)
+
+    metrics.recordError(errorName, errorMessage, false)
+    metrics.end()
+
+    setActionOutputs({
+      sessionId: null,
+      cacheStatus: 'miss',
+      duration,
+    })
+
+    if (error instanceof Error) {
+      bootstrapLogger.error('Agent failed', {error: error.message})
+      core.setFailed(error.message)
+    } else {
+      bootstrapLogger.error('Agent failed with unknown error')
+      core.setFailed('An unknown error occurred')
+    }
+  } finally {
+    await runCleanup({
+      bootstrapLogger,
+      reactionCtx,
+      githubClient,
+      agentSuccess,
+      attachmentResult,
+      serverHandle,
+      detectedOpencodeVersion,
+    })
+  }
+
+  return exitCode
+}

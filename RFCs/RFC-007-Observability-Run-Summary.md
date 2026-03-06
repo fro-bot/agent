@@ -12,7 +12,7 @@
 
 RFC-007 was successfully implemented with the following components:
 
-1. **New observability module** (`src/lib/observability/`)
+1. **New observability module** (`src/features/observability/`)
    - `types.ts`: `RunMetrics`, `ErrorRecord`, `CommentSummaryOptions`
    - `metrics.ts`: Closure-based `MetricsCollector` factory
    - `run-summary.ts`: Comment summary generation and manipulation
@@ -20,10 +20,10 @@ RFC-007 was successfully implemented with the following components:
    - `index.ts`: Public exports
    - `AGENTS.md`: Module documentation
 
-2. **Updated core types** (`src/lib/types.ts`)
+2. **Updated core types** (`src/shared/types.ts`)
    - Expanded `TokenUsage` to full SDK structure (input, output, reasoning, cache)
 
-3. **Updated agent execution** (`src/lib/agent/opencode.ts`)
+3. **Updated agent execution** (`src/features/agent/opencode.ts`)
    - Token extraction from `message.updated` events
    - Artifact detection from bash tool outputs (PRs, commits, comments)
 
@@ -60,7 +60,7 @@ Implement comprehensive observability: structured run summaries in GitHub commen
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── observability/
 │   ├── AGENTS.md           # Module documentation
 │   ├── types.ts            # Observability types
@@ -78,7 +78,7 @@ src/lib/
 └── main.ts                 # Updated: MetricsCollector integration
 ```
 
-### 2. Updated Core Types (`src/lib/types.ts`)
+### 2. Updated Core Types (`src/shared/types.ts`)
 
 Update `TokenUsage` to match the full OpenCode SDK structure:
 
@@ -97,7 +97,7 @@ export interface TokenUsage {
 // Remove old RunSummary interface - replaced by observability module
 ```
 
-### 3. Observability Types (`src/lib/observability/types.ts`)
+### 3. Observability Types (`src/features/observability/types.ts`)
 
 ```typescript
 import type {TokenUsage} from "../types.js"
@@ -136,7 +136,7 @@ export interface CommentSummaryOptions {
 }
 ```
 
-### 4. Metrics Collection (`src/lib/observability/metrics.ts`)
+### 4. Metrics Collection (`src/features/observability/metrics.ts`)
 
 Closure-based implementation (no ES6 classes per project rules):
 
@@ -251,7 +251,7 @@ export function createMetricsCollector(): MetricsCollector {
 }
 ```
 
-### 5. Run Summary Generation (`src/lib/observability/run-summary.ts`)
+### 5. Run Summary Generation (`src/features/observability/run-summary.ts`)
 
 ```typescript
 import {BOT_COMMENT_MARKER} from "../github/types.js"
@@ -407,7 +407,7 @@ export function formatTokenUsage(usage: TokenUsage, model: string | null): strin
 }
 ```
 
-### 6. GitHub Actions Job Summary (`src/lib/observability/job-summary.ts`)
+### 6. GitHub Actions Job Summary (`src/features/observability/job-summary.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -511,7 +511,7 @@ export async function writeJobSummary(options: CommentSummaryOptions, logger: Lo
 }
 ```
 
-### 7. Public Exports (`src/lib/observability/index.ts`)
+### 7. Public Exports (`src/features/observability/index.ts`)
 
 ```typescript
 export {
@@ -532,7 +532,7 @@ export type {MetricsCollector} from "./metrics.js"
 export type {CommentSummaryOptions, ErrorRecord, RunMetrics} from "./types.js"
 ```
 
-### 8. Updated Agent Types (`src/lib/agent/types.ts`)
+### 8. Updated Agent Types (`src/features/agent/types.ts`)
 
 Add metrics fields to `AgentResult`:
 
@@ -555,7 +555,7 @@ export interface AgentResult {
 }
 ```
 
-### 9. Updated OpenCode Execution (`src/lib/agent/opencode.ts`)
+### 9. Updated OpenCode Execution (`src/features/agent/opencode.ts`)
 
 Modify `processEventStream()` to extract tokens and detect artifacts:
 
@@ -769,7 +769,7 @@ async function run(): Promise<number> {
 
 ## Test Cases
 
-### Metrics Tests (`src/lib/observability/metrics.test.ts`)
+### Metrics Tests (`src/features/observability/metrics.test.ts`)
 
 ```typescript
 import {describe, expect, it} from "vitest"
@@ -875,7 +875,7 @@ describe("createMetricsCollector", () => {
 })
 ```
 
-### Run Summary Tests (`src/lib/observability/run-summary.test.ts`)
+### Run Summary Tests (`src/features/observability/run-summary.test.ts`)
 
 ```typescript
 import {describe, expect, it} from "vitest"
@@ -1037,7 +1037,7 @@ describe("replaceSummaryInComment", () => {
 })
 ```
 
-### Job Summary Tests (`src/lib/observability/job-summary.test.ts`)
+### Job Summary Tests (`src/features/observability/job-summary.test.ts`)
 
 ```typescript
 import {beforeEach, describe, expect, it, vi} from "vitest"
@@ -1167,7 +1167,7 @@ Per PRD v1.4, the telemetry policy mandates:
 
 ### Implementation
 
-#### 1. Telemetry Configuration (`src/lib/observability/types.ts`)
+#### 1. Telemetry Configuration (`src/features/observability/types.ts`)
 
 ```typescript
 export interface TelemetryConfig {

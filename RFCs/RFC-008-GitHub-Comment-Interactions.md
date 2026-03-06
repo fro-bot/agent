@@ -14,22 +14,22 @@ RFC-008 has been fully implemented with the following components:
 
 ### Files Created
 
-- `src/lib/comments/types.ts` - ThreadComment, Thread, ErrorInfo, PostCommentResult types
-- `src/lib/comments/reader.ts` - `readThread()`, `findBotComment()`, pagination for Issues/PRs/Discussions
-- `src/lib/comments/writer.ts` - `postComment()`, `isBotComment()`, idempotent updates, GraphQL mutations
-- `src/lib/comments/error-format.ts` - `formatErrorComment()`, error creation helpers
-- `src/lib/comments/index.ts` - Public API exports
-- `src/lib/comments/AGENTS.md` - Module documentation
+- `src/features/comments/types.ts` - ThreadComment, Thread, ErrorInfo, PostCommentResult types
+- `src/features/comments/reader.ts` - `readThread()`, `findBotComment()`, pagination for Issues/PRs/Discussions
+- `src/features/comments/writer.ts` - `postComment()`, `isBotComment()`, idempotent updates, GraphQL mutations
+- `src/features/comments/error-format.ts` - `formatErrorComment()`, error creation helpers
+- `src/features/comments/index.ts` - Public API exports
+- `src/features/comments/AGENTS.md` - Module documentation
 - Test files: 37 tests total for the comments module
 
 ### Integration Points
 
-- `src/lib/github/context.ts` - `getCommentTarget()` now handles `discussion_comment` events
-- `src/lib/triggers/issue-comment.ts` - `handleIssueComment()` implemented using comments module
+- `src/services/github/context.ts` - `getCommentTarget()` now handles `discussion_comment` events
+- `src/features/triggers/issue-comment.ts` - `handleIssueComment()` implemented using comments module
 
 ### Deviations from Spec
 
-1. **Reactions module not created** - `src/lib/comments/reactions.ts` was NOT implemented because `src/lib/agent/reactions.ts` already satisfies F43 (Reactions & Labels). No duplication needed.
+1. **Reactions module not created** - `src/features/comments/reactions.ts` was NOT implemented because `src/features/agent/reactions.ts` already satisfies F43 (Reactions & Labels). No duplication needed.
 2. **Thread type simplified** - `Thread` interface uses `type: 'discussion' | 'issue' | 'pr'` instead of `target: CommentTarget` and omits `state`/`locked` fields (not needed for current use cases).
 3. **Error types adjusted** - Simplified to: `api_error`, `configuration`, `internal`, `llm_timeout`, `permission`, `rate_limit`, `validation`
 4. **Bot detection enhanced** - `findBotComment()` checks BOTH author AND marker (security against marker copying by users)
@@ -61,7 +61,7 @@ Implement core comment interactions for Issues, PRs, and Discussions. This inclu
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── comments/
 │   ├── types.ts          # Comment-related types
 │   ├── reader.ts         # Read issue/PR/discussion threads
@@ -71,7 +71,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Comment Types (`src/lib/comments/types.ts`)
+### 2. Comment Types (`src/features/comments/types.ts`)
 
 ```typescript
 import type {CommentTarget} from "../github/types.js"
@@ -129,7 +129,7 @@ export type ErrorType =
   | "internal_error"
 ```
 
-### 3. Thread Reader (`src/lib/comments/reader.ts`)
+### 3. Thread Reader (`src/features/comments/reader.ts`)
 
 ```typescript
 import type {Octokit, CommentTarget} from "../github/types.js"
@@ -314,7 +314,7 @@ export function findBotComment(thread: Thread, botLogin: string): ThreadComment 
 }
 ```
 
-### 4. Comment Writer (`src/lib/comments/writer.ts`)
+### 4. Comment Writer (`src/features/comments/writer.ts`)
 
 ```typescript
 import type {Octokit, CommentTarget} from "../github/types.js"
@@ -445,7 +445,7 @@ export function isBotComment(body: string): boolean {
 }
 ```
 
-### 5. Error Formatting (`src/lib/comments/error-format.ts`)
+### 5. Error Formatting (`src/features/comments/error-format.ts`)
 
 ```typescript
 import type {ErrorInfo, ErrorType} from "./types.js"
@@ -568,7 +568,7 @@ export function createLLMTimeoutError(timeoutMs: number): ErrorInfo {
 }
 ```
 
-### 6. Reactions & Labels (`src/lib/comments/reactions.ts`)
+### 6. Reactions & Labels (`src/features/comments/reactions.ts`)
 
 ```typescript
 import type {Octokit, CommentTarget} from "../github/types.js"
@@ -818,7 +818,7 @@ export async function acknowledgeWorkComplete(
 }
 ```
 
-### 7. Public Exports (`src/lib/comments/index.ts`)
+### 7. Public Exports (`src/features/comments/index.ts`)
 
 ```typescript
 export {readThread, findBotComment} from "./reader.js"
@@ -856,18 +856,18 @@ export type {ReactionType, ReactionResult, LabelResult} from "./reactions.js"
 
 ### Reactions & Labels (F43)
 
-- [x] Agent adds 👀 (eyes) reaction to triggering comment on receipt _(implemented in src/lib/agent/reactions.ts)_
-- [x] Agent adds "agent: working" label to issue/PR when starting work _(implemented in src/lib/agent/reactions.ts)_
-- [x] "agent: working" label is created automatically if it doesn't exist _(implemented in src/lib/agent/reactions.ts)_
-- [x] Agent removes 👀 reaction on completion _(implemented in src/lib/agent/reactions.ts)_
-- [x] Agent removes "agent: working" label on completion (success or failure) _(implemented in src/lib/agent/reactions.ts)_
+- [x] Agent adds 👀 (eyes) reaction to triggering comment on receipt _(implemented in src/features/agent/reactions.ts)_
+- [x] Agent adds "agent: working" label to issue/PR when starting work _(implemented in src/features/agent/reactions.ts)_
+- [x] "agent: working" label is created automatically if it doesn't exist _(implemented in src/features/agent/reactions.ts)_
+- [x] Agent removes 👀 reaction on completion _(implemented in src/features/agent/reactions.ts)_
+- [x] Agent removes "agent: working" label on completion (success or failure) _(implemented in src/features/agent/reactions.ts)_
 - [x] All reaction/label operations are non-fatal (warn on failure, don't fail run)
 - [x] Bot can find and clean up its own reactions
 
 ### Integration Points
 
-- [x] `getCommentTarget()` in `src/lib/github/context.ts` handles `discussion_comment` events
-- [x] `handleIssueComment()` in `src/lib/triggers/issue-comment.ts` uses comments module
+- [x] `getCommentTarget()` in `src/services/github/context.ts` handles `discussion_comment` events
+- [x] `handleIssueComment()` in `src/features/triggers/issue-comment.ts` uses comments module
 
 ## Test Cases
 

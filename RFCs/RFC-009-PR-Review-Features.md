@@ -27,7 +27,7 @@ Implement PR-specific features: reading diffs, posting line-level review comment
 ### 1. File Structure
 
 ```
-src/lib/
+src/services/cache/
 ├── reviews/
 │   ├── types.ts          # Review-related types
 │   ├── diff.ts           # Diff parsing and analysis
@@ -35,7 +35,7 @@ src/lib/
 │   └── index.ts          # Public exports
 ```
 
-### 2. Review Types (`src/lib/reviews/types.ts`)
+### 2. Review Types (`src/features/reviews/types.ts`)
 
 ```typescript
 export interface PRDiff {
@@ -90,7 +90,7 @@ export interface ReviewResult {
 }
 ```
 
-### 3. Diff Parsing (`src/lib/reviews/diff.ts`)
+### 3. Diff Parsing (`src/features/reviews/diff.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -258,7 +258,7 @@ export async function getFileContent(
 }
 ```
 
-### 4. Review Operations (`src/lib/reviews/reviewer.ts`)
+### 4. Review Operations (`src/features/reviews/reviewer.ts`)
 
 ```typescript
 import type {Octokit} from "../github/types.js"
@@ -476,7 +476,7 @@ export async function replyToReviewComment(
 }
 ```
 
-### 5. Public Exports (`src/lib/reviews/index.ts`)
+### 5. Public Exports (`src/features/reviews/index.ts`)
 
 ```typescript
 export {getPRDiff, parseHunks, calculateDiffPosition, getFileContent} from "./diff.js"
@@ -667,13 +667,13 @@ RFC-009 was implemented with the following modifications based on Oracle archite
 
 | File | Purpose |
 | --- | --- |
-| `src/lib/reviews/types.ts` | Type definitions with pagination config and skip reasons |
-| `src/lib/reviews/diff.ts` | `getPRDiff()`, `parseHunks()`, `getFileContent()` |
-| `src/lib/reviews/reviewer.ts` | `submitReview()`, `postReviewComment()`, `getReviewComments()`, `replyToReviewComment()`, `prepareReviewComments()` |
-| `src/lib/reviews/index.ts` | Public API exports |
-| `src/lib/reviews/AGENTS.md` | Module documentation |
-| `src/lib/reviews/diff.test.ts` | 13 tests |
-| `src/lib/reviews/reviewer.test.ts` | 11 tests |
+| `src/features/reviews/types.ts` | Type definitions with pagination config and skip reasons |
+| `src/features/reviews/diff.ts` | `getPRDiff()`, `parseHunks()`, `getFileContent()` |
+| `src/features/reviews/reviewer.ts` | `submitReview()`, `postReviewComment()`, `getReviewComments()`, `replyToReviewComment()`, `prepareReviewComments()` |
+| `src/features/reviews/index.ts` | Public API exports |
+| `src/features/reviews/AGENTS.md` | Module documentation |
+| `src/features/reviews/diff.test.ts` | 13 tests |
+| `src/features/reviews/reviewer.test.ts` | 11 tests |
 
 ### Acceptance Criteria
 
@@ -698,7 +698,7 @@ RFC-009 was implemented with the following modifications based on Oracle archite
 
 The reviews module integrates into the main action through a clean abstraction layer:
 
-1. **`src/lib/agent/diff-context.ts`**: Exports `collectDiffContext()` function that:
+1. **`src/features/agent/diff-context.ts`**: Exports `collectDiffContext()` function that:
    - Checks if event is `pull_request` type
    - Validates PR number and repo format
    - Calls `getPRDiff()` from reviews module
@@ -715,11 +715,11 @@ The reviews module integrates into the main action through a clean abstraction l
    })
    ```
 
-3. **`src/lib/agent/prompt.ts`**: Includes `buildDiffContextSection()` that adds a "Pull Request Diff Summary" section to the agent prompt with:
+3. **`src/features/agent/prompt.ts`**: Includes `buildDiffContextSection()` that adds a "Pull Request Diff Summary" section to the agent prompt with:
    - Changed file count, additions, deletions
    - Truncation warning if applicable
    - Table of changed files (up to 20 shown)
 
-4. **`src/lib/agent/types.ts`**: Added `DiffContext` and `DiffFileSummary` types, extended `PromptOptions` with optional `diffContext` field
+4. **`src/features/agent/types.ts`**: Added `DiffContext` and `DiffFileSummary` types, extended `PromptOptions` with optional `diffContext` field
 
 This integration ensures the agent receives structured diff context when reviewing PRs, enabling informed code review feedback.

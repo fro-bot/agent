@@ -15,7 +15,7 @@
 
 ~~Implement a dedicated `setup` action (`uses: fro-bot/agent/setup@v0`) that bootstraps the complete agent environment~~
 
-**Current Implementation:** The main action (`uses: fro-bot/agent@v0`) now automatically handles environment setup via the `ensureOpenCodeAvailable()` function in `src/lib/agent/opencode.ts`. This includes installing OpenCode CLI, Oh My OpenCode (oMo) plugin, and configuring the workspace for agent execution.
+**Current Implementation:** The main action (`uses: fro-bot/agent@v0`) now automatically handles environment setup via the `ensureOpenCodeAvailable()` function in `src/features/agent/opencode.ts`. This includes installing OpenCode CLI, Oh My OpenCode (oMo) plugin, and configuring the workspace for agent execution.
 
 ## Dependencies
 
@@ -120,7 +120,7 @@ runs:
   main: "../dist/setup.js"
 ```
 
-### 3. Setup Types (`src/lib/setup/types.ts`)
+### 3. Setup Types (`src/services/setup/types.ts`)
 
 ```typescript
 export interface SetupInputs {
@@ -187,7 +187,7 @@ export type AuthInfo = OAuthAuth | ApiAuth | WellKnownAuth
 export type AuthConfig = Record<string, AuthInfo>
 ```
 
-### 4. OpenCode Installation (`src/lib/setup/opencode.ts`)
+### 4. OpenCode Installation (`src/services/setup/opencode.ts`)
 
 ```typescript
 import * as tc from "@actions/tool-cache"
@@ -367,7 +367,7 @@ export async function getLatestVersion(logger: Logger): Promise<string> {
 }
 ```
 
-### 5. Bun Runtime Installation (`src/lib/setup/bun.ts`)
+### 5. Bun Runtime Installation (`src/services/setup/bun.ts`)
 
 ```typescript
 import * as core from "@actions/core"
@@ -501,7 +501,7 @@ export async function isBunAvailable(execAdapter: {
 }
 ```
 
-### 7. oMo Plugin Installation (`src/lib/setup/omo.ts`)
+### 7. oMo Plugin Installation (`src/services/setup/omo.ts`)
 
 ```typescript
 import type {Logger} from "../logger.js"
@@ -598,7 +598,7 @@ export async function installOmo(
 }
 ```
 
-### 8. GitHub CLI Authentication (`src/lib/setup/gh-auth.ts`)
+### 8. GitHub CLI Authentication (`src/services/setup/gh-auth.ts`)
 
 ```typescript
 import * as exec from "@actions/exec"
@@ -706,7 +706,7 @@ export async function getBotUserId(appSlug: string, token: string, logger: Logge
 }
 ```
 
-### 9. auth.json Population (`src/lib/setup/auth-json.ts`)
+### 9. auth.json Population (`src/services/setup/auth-json.ts`)
 
 ```typescript
 import * as fs from "node:fs/promises"
@@ -1049,7 +1049,7 @@ If alternate runners (macOS/Windows or self-hosted) are supported later, the set
 4. **Graceful degradation**: oMo install failure should warn, not fail the run
 5. **Version fallback**: OpenCode installation tries latest, falls back to pinned version (1.0.204)
 6. **Download validation**: Archives validated with `file` command on Linux before extraction
-7. **App token via RFC-003**: Uses `createAppClient()` from `src/lib/github/client.ts` for GitHub App authentication
+7. **App token via RFC-003**: Uses `createAppClient()` from `src/services/github/client.ts` for GitHub App authentication
 8. **GITHUB_TOKEN fallback**: When App credentials missing or auth fails, falls back to `GITHUB_TOKEN` for basic operations
 
 ---
@@ -1102,7 +1102,7 @@ The main action (not setup) handles reactions and labels to provide visual feedb
 ### Acknowledgment Flow
 
 ```typescript
-// src/lib/reactions.ts
+// src/features/agent/reactions.ts
 import * as exec from "@actions/exec"
 import type {Logger} from "./types.js"
 
@@ -1208,7 +1208,7 @@ export async function removeWorkingLabel(ctx: ReactionContext, logger: Logger): 
 ### Context Collection
 
 ```typescript
-// src/lib/context.ts
+// src/features/context/context.ts
 import * as exec from "@actions/exec"
 import type {Logger} from "./types.js"
 
