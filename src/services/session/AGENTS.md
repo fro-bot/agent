@@ -4,30 +4,18 @@ OpenCode session persistence layer — storage, search, pruning, and run summary
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Read** | `storage-read.ts` | Session, message, and part read operations (96 L) |
-| **Write** | `storage-write.ts` | Session, message, and part write operations (16 L) |
-| **Discovery** | `discovery.ts` | Project directory and session discovery (49 L) |
-| **Storage** | `session-storage.ts` | Main storage orchestrator and path resolution (9 L) |
-| **Search** | `search.ts` | `listSessions()`, `searchSessions()`, `getSessionInfo()` (220 L) |
-| **Pruning** | `prune.ts` | Dual-condition retention (Age OR Count) (138 L) |
-| **Writeback** | `writeback.ts` | Synthetic run summary messages for agent discovery (78 L) |
-| **Mappers** | `storage-*-mapper.ts` | Data transformation between storage and memory |
-| **Types** | `types.ts` | SessionInfo, Message, Part, TodoItem (291 L) |
-| **Version** | `version.ts` | Storage format versioning and migrations (34 L) |],op:
-
-OpenCode session persistence layer — storage, search, pruning, and run summary writeback.
-
-## WHERE TO LOOK
-
-| Component     | File           | Responsibility                                           |
-| ------------- | -------------- | -------------------------------------------------------- |
-| **Storage**   | `storage.ts`   | JSON file I/O, project/session discovery, deletion       |
-| **Search**    | `search.ts`    | `listSessions()`, `searchSessions()`, `getSessionInfo()` |
-| **Pruning**   | `prune.ts`     | Dual-condition retention (Age OR Count)                  |
-| **Writeback** | `writeback.ts` | Synthetic run summary messages for agent discovery       |
-| **Types**     | `types.ts`     | SessionInfo, Message, Part, TodoItem                     |
+| Component       | File                         | Responsibility                                            |
+| --------------- | ---------------------------- | --------------------------------------------------------- |
+| **Storage**     | `storage.ts`                 | SDK session list/get/messages/todos/delete operations     |
+| **Mappers**     | `storage-mappers.ts`         | Session and todo mappers (SDK → local types)              |
+| **Msg Mappers** | `storage-message-mappers.ts` | Message, part, and tool state mappers (SDK → local types) |
+| **Discovery**   | `discovery.ts`               | Project directory and session discovery via SDK           |
+| **Search**      | `search.ts`                  | `listSessions()`, `searchSessions()`, `getSessionInfo()`  |
+| **Pruning**     | `prune.ts`                   | Dual-condition retention (Age OR Count)                   |
+| **Writeback**   | `writeback.ts`               | Synthetic run summary messages for agent discovery        |
+| **Types**       | `types.ts`                   | SessionInfo, Message, Part, TodoItem (authoritative)      |
+| **Version**     | `version.ts`                 | Storage format versioning and migrations                  |
+| **Backend**     | `backend.ts`                 | SDK client type alias                                     |
 
 ## KEY EXPORTS
 
@@ -37,36 +25,32 @@ OpenCode session persistence layer — storage, search, pruning, and run summary
 - `writeSessionSummary(summary, logger)` — Injects `role: 'user'` summary into session history.
 - `getSession(projectID, sessionId, logger)` — Retrieve single session metadata.
 - `getSessionMessages(sessionId, logger)` — Chronological message list sorted by `time.created`.
-- `deleteSession(projectID, sessionID, logger)` — Cascade delete parts, messages, and todos.
+- `deleteSession(projectID, sessionID, logger)` — Delete session via SDK.
 - `findLatestSession(afterTimestamp, logger)` — Inference logic to find newly created sessions.
 
-## STORAGE STRUCTURE
+## MAPPER ARCHITECTURE
 
-```
-$XDG_DATA_HOME/opencode/storage/
-├── project/{projectID}.json           # Git worktree → project mapping
-├── session/{projectID}/{sessionID}.json  # Session metadata (timestamps, title)
-├── message/{sessionID}/{messageID}.json  # Message headers (role, agent, model)
-├── part/{messageID}/{partID}.json       # Content (text, tool outputs, reasoning)
-├── todo/{sessionID}.json                # Session-level todo items
-└── session_diff/{sessionID}.json         # Local state changes tracking
-```
+Mappers convert SDK types to local types. Typed endpoints use SDK types as input; untyped endpoints use `unknown`:
+
+- **Typed mappers**: `mapSdkSessionToSessionInfo(SdkSessionExtended)`, `mapSdkMessageToMessage(SdkMessageExtended)`, `mapSdkPartToPart(SdkPart)`, `mapSdkToolState(SdkToolState)`
+- **Untyped mapper**: `mapSdkTodos(unknown)` — `session.todos()` endpoint is not typed in SDK
+- **Extension types**: `SdkSessionExtended` and `SdkMessageExtended` add fields the server returns but SDK omits (`permission`, `time.archived`, `agent` on AssistantMessage, `variant` on UserMessage)
 
 ## PATTERNS
 
-- **XDG Storage**: Path `~/.local/share/opencode/storage/` via `getOpenCodeStoragePath()`.
-- **Null-Safe I/O**: `readJson()` returns `null` on error; absence is normal (lazy creation).
-- **Chronological Sort**: Messages sorted by `time.created` (unsorted on disk).
+- **SDK-First**: All storage operations go through `@opencode-ai/sdk` client, never direct file I/O.
+- **Null-Safe Returns**: Functions return empty arrays or `null` on SDK errors; never throw.
+- **Chronological Sort**: Messages sorted by `time.created` (unsorted from SDK).
 - **Dual-Condition Pruning**: Keep if `(age < cutoff OR index < maxSessions)` to prevent bloat.
 - **Child Tracking**: Sessions with `parentID` represent branches; filtered from main lists.
-- **ID Packing**: Monotonic IDs with `hex-timestamp` + `base62-random` (e.g., `ses_123`).
+- **Local Types Authoritative**: `types.ts` defines the canonical types; SDK types are inputs only.
 
 ## ANTI-PATTERNS
 
-| Forbidden                     | Reason                                                 |
-| ----------------------------- | ------------------------------------------------------ |
-| Throwing on file-not-found    | OpenCode creates files lazily; absence is expected     |
-| Hardcoding `~/.local/share`   | Respect `XDG_DATA_HOME` via `getOpenCodeStoragePath()` |
-| Unsorted message access       | Messages unordered on disk; always sort by time        |
-| Ignoring child sessions       | Must cascade-delete children when parent is pruned     |
-| Time-only OR count-only prune | Dual-condition needed for balanced retention           |
+| Forbidden                     | Reason                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| Extending SDK types directly  | `readonly` mismatch, field name differences, structural incompatibilities |
+| Throwing on SDK errors        | SDK errors are expected; return empty/null instead                        |
+| Unsorted message access       | Messages unordered from SDK; always sort by time                          |
+| Ignoring child sessions       | Must cascade-delete children when parent is pruned                        |
+| Time-only OR count-only prune | Dual-condition needed for balanced retention                              |
