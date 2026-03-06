@@ -1,4 +1,11 @@
+import type {Session as SdkSession} from '@opencode-ai/sdk'
+
 import type {SessionInfo, TodoItem} from './types.js'
+
+type SdkSessionExtended = SdkSession & {
+  readonly permission?: {rules: readonly unknown[]}
+  readonly time: SdkSession['time'] & {archived?: number}
+}
 
 export const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v != null
 export const readString = (v: unknown): string | null => (typeof v === 'string' ? v : null)
@@ -16,44 +23,40 @@ export function mapSdkFileDiffs(
   }))
 }
 
-export function mapSdkSessionToSessionInfo(s: unknown): SessionInfo {
-  if (!isRecord(s))
-    return {id: '', version: '', projectID: '', directory: '', title: '', time: {created: 0, updated: 0}}
+export function mapSdkSessionToSessionInfo(s: SdkSessionExtended): SessionInfo {
   return {
-    id: readString(s.id) ?? '',
-    version: readString(s.version) ?? '',
-    projectID: readString(s.projectID) ?? readString(s.projectId) ?? '',
-    directory: readString(s.directory) ?? '',
-    parentID: readString(s.parentID) ?? readString(s.parentId) ?? undefined,
-    title: readString(s.title) ?? '',
-    time: isRecord(s.time)
-      ? {
-          created: readNumber(s.time.created) ?? 0,
-          updated: readNumber(s.time.updated) ?? 0,
-          compacting: readNumber(s.time.compacting) ?? undefined,
-          archived: readNumber(s.time.archived) ?? undefined,
-        }
-      : {created: 0, updated: 0},
-    summary: isRecord(s.summary)
-      ? {
-          additions: readNumber(s.summary.additions) ?? 0,
-          deletions: readNumber(s.summary.deletions) ?? 0,
-          files: readNumber(s.summary.files) ?? 0,
-          diffs: mapSdkFileDiffs(s.summary.diffs),
-        }
-      : undefined,
-    share: isRecord(s.share) && readString(s.share.url) != null ? {url: readString(s.share.url) ?? ''} : undefined,
-    permission: isRecord(s.permission)
-      ? {rules: Array.isArray(s.permission.rules) ? s.permission.rules : []}
-      : undefined,
-    revert: isRecord(s.revert)
-      ? {
-          messageID: readString(s.revert.messageID) ?? readString(s.revert.messageId) ?? '',
-          partID: readString(s.revert.partID) ?? readString(s.revert.partId) ?? undefined,
-          snapshot: readString(s.revert.snapshot) ?? undefined,
-          diff: readString(s.revert.diff) ?? undefined,
-        }
-      : undefined,
+    id: s.id,
+    version: s.version,
+    projectID: s.projectID,
+    directory: s.directory,
+    parentID: s.parentID,
+    title: s.title,
+    time: {
+      created: s.time.created,
+      updated: s.time.updated,
+      compacting: s.time.compacting,
+      archived: s.time.archived,
+    },
+    summary:
+      s.summary == null
+        ? undefined
+        : {
+            additions: s.summary.additions,
+            deletions: s.summary.deletions,
+            files: s.summary.files,
+            diffs: mapSdkFileDiffs(s.summary.diffs),
+          },
+    share: s.share?.url == null ? undefined : {url: s.share.url},
+    permission: s.permission == null ? undefined : {rules: s.permission.rules},
+    revert:
+      s.revert == null
+        ? undefined
+        : {
+            messageID: s.revert.messageID,
+            partID: s.revert.partID,
+            snapshot: s.revert.snapshot,
+            diff: s.revert.diff,
+          },
   }
 }
 

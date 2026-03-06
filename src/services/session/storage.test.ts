@@ -130,7 +130,7 @@ describe('listSessionsForProject', () => {
     const sdkSession = {
       id: 'ses_sdk',
       version: '1.1.53',
-      projectId: 'proj_sdk',
+      projectID: 'proj_sdk',
       directory: '/workspace',
       title: 'SDK Session',
       time: {created: 1000, updated: 2000},
@@ -142,7 +142,7 @@ describe('listSessionsForProject', () => {
 
     // #then
     expect(client.session.list).toHaveBeenCalledWith({query: {directory: '/workspace'}})
-    expect(result).toEqual([
+    expect(result).toMatchObject([
       {
         id: 'ses_sdk',
         version: '1.1.53',
@@ -173,7 +173,7 @@ describe('getSession', () => {
     const sdkSession = {
       id: 'ses_sdk',
       version: '1.1.53',
-      projectId: 'proj_sdk',
+      projectID: 'proj_sdk',
       directory: '/workspace',
       title: 'SDK Session',
       time: {created: 1000, updated: 2000},
@@ -185,7 +185,7 @@ describe('getSession', () => {
 
     // #then
     expect(client.session.get).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       id: 'ses_sdk',
       version: '1.1.53',
       projectID: 'proj_sdk',

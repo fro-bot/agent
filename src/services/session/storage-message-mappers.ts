@@ -1,172 +1,162 @@
+import type {
+  AssistantMessage as SdkAssistantMessage,
+  Message as SdkMessage,
+  Part as SdkPart,
+  ToolState as SdkToolState,
+  UserMessage as SdkUserMessage,
+} from '@opencode-ai/sdk'
+
 import type {Message, Part, ToolState} from './types.js'
 
-import {isRecord, mapSdkFileDiffs, readBoolean, readNumber, readString} from './storage-mappers.js'
+import {mapSdkFileDiffs, readString} from './storage-mappers.js'
 
-function mapSdkToolState(s: Record<string, unknown>): ToolState {
-  const status = readString(s.status) ?? 'pending'
-  if (status === 'running')
+type SdkMessageExtended = (SdkAssistantMessage & {agent?: string}) | (SdkUserMessage & {variant?: string})
+interface SdkMessageWithParts {
+  info: SdkMessage
+  parts: readonly SdkPart[]
+}
+
+function mapSdkToolState(s: SdkToolState): ToolState {
+  if (s.status === 'running')
     return {
       status: 'running',
-      input: isRecord(s.input) ? s.input : {},
-      time: {start: readNumber(isRecord(s.time) ? s.time.start : null) ?? 0},
+      input: s.input,
+      time: {start: s.time.start},
     }
-  if (status === 'error')
+  if (s.status === 'error')
     return {
       status: 'error',
-      input: isRecord(s.input) ? s.input : {},
-      error: readString(s.error) ?? '',
+      input: s.input,
+      error: s.error,
       time: {
-        start: readNumber(isRecord(s.time) ? s.time.start : null) ?? 0,
-        end: readNumber(isRecord(s.time) ? s.time.end : null) ?? 0,
+        start: s.time.start,
+        end: s.time.end,
       },
     }
-  if (status !== 'completed') return {status: 'pending'}
-  const t = isRecord(s.time) ? s.time : null
+  if (s.status === 'pending') return {status: 'pending'}
   return {
     status: 'completed',
-    input: isRecord(s.input) ? s.input : {},
-    output: readString(s.output) ?? '',
-    title: readString(s.title) ?? '',
-    metadata: isRecord(s.metadata) ? s.metadata : {},
+    input: s.input,
+    output: s.output,
+    title: s.title,
+    metadata: s.metadata,
     time: {
-      start: readNumber(t?.start) ?? 0,
-      end: readNumber(t?.end) ?? 0,
-      compacted: readNumber(t?.compacted) ?? undefined,
+      start: s.time.start,
+      end: s.time.end,
+      compacted: s.time.compacted,
     },
     attachments: undefined,
   }
 }
 
-export function mapSdkPartToPart(p: unknown): Part {
-  if (!isRecord(p)) return {id: '', sessionID: '', messageID: '', type: 'text', text: ''}
+export function mapSdkPartToPart(p: SdkPart): Part {
   const base = {
-    id: readString(p.id) ?? '',
-    sessionID: readString(p.sessionID) ?? readString(p.sessionId) ?? '',
-    messageID: readString(p.messageID) ?? readString(p.messageId) ?? '',
+    id: p.id,
+    sessionID: p.sessionID,
+    messageID: p.messageID,
   }
-  const type = readString(p.type)
-  if (type === 'text')
+  if (p.type === 'text')
     return {
       ...base,
       type: 'text',
-      text: readString(p.text) ?? '',
-      synthetic: readBoolean(p.synthetic) ?? undefined,
-      ignored: readBoolean(p.ignored) ?? undefined,
-      time: isRecord(p.time)
-        ? {start: readNumber(p.time.start) ?? 0, end: readNumber(p.time.end) ?? undefined}
-        : undefined,
-      metadata: isRecord(p.metadata) ? p.metadata : undefined,
+      text: p.text,
+      synthetic: p.synthetic,
+      ignored: p.ignored,
+      time: p.time,
+      metadata: p.metadata,
     }
-  if (type === 'reasoning')
+  if (p.type === 'reasoning')
     return {
       ...base,
       type: 'reasoning',
-      reasoning: readString(p.reasoning) ?? '',
-      time: isRecord(p.time)
-        ? {start: readNumber(p.time.start) ?? 0, end: readNumber(p.time.end) ?? undefined}
-        : undefined,
+      reasoning: (p as unknown as {reasoning?: string}).reasoning ?? p.text,
+      time: p.time,
     }
-  if (type === 'tool')
+  if (p.type === 'tool')
     return {
       ...base,
       type: 'tool',
-      callID: readString(p.callID) ?? readString(p.callId) ?? '',
-      tool: readString(p.tool) ?? '',
-      state: mapSdkToolState(isRecord(p.state) ? p.state : {status: 'pending'}),
-      metadata: isRecord(p.metadata) ? p.metadata : undefined,
+      callID: p.callID,
+      tool: p.tool,
+      state: mapSdkToolState(p.state),
+      metadata: p.metadata,
     }
-  if (type !== 'step-finish') return {...base, type: 'text', text: readString(p.text) ?? ''}
-  const tokens = isRecord(p.tokens) ? p.tokens : null
-  const cache = isRecord(tokens?.cache) ? tokens.cache : null
+  if (p.type !== 'step-finish') return {...base, type: 'text', text: 'text' in p ? (p as {text: string}).text : ''}
+  const stepFinish = p
   return {
     ...base,
     type: 'step-finish',
-    reason: readString(p.reason) ?? '',
-    snapshot: readString(p.snapshot) ?? undefined,
-    cost: readNumber(p.cost) ?? 0,
+    reason: stepFinish.reason,
+    snapshot: stepFinish.snapshot,
+    cost: stepFinish.cost,
     tokens: {
-      input: readNumber(tokens?.input) ?? 0,
-      output: readNumber(tokens?.output) ?? 0,
-      reasoning: readNumber(tokens?.reasoning) ?? 0,
-      cache: {read: readNumber(cache?.read) ?? 0, write: readNumber(cache?.write) ?? 0},
+      input: stepFinish.tokens.input,
+      output: stepFinish.tokens.output,
+      reasoning: stepFinish.tokens.reasoning,
+      cache: {read: stepFinish.tokens.cache.read, write: stepFinish.tokens.cache.write},
     },
   }
 }
 
-export function mapSdkMessageToMessage(m: unknown): Message {
-  if (!isRecord(m))
-    return {id: '', sessionID: '', role: 'user', time: {created: 0}, agent: '', model: {providerID: '', modelID: ''}}
-  if (readString(m.role) !== 'assistant') {
-    const model = isRecord(m.model) ? m.model : null
+export function mapSdkMessageToMessage(m: SdkMessageExtended): Message {
+  if (m.role === 'user') {
+    const user = m as SdkUserMessage & {variant?: string}
     return {
-      id: readString(m.id) ?? '',
-      sessionID: readString(m.sessionID) ?? readString(m.sessionId) ?? '',
+      id: user.id,
+      sessionID: user.sessionID,
       role: 'user',
-      time: {created: readNumber(isRecord(m.time) ? m.time.created : null) ?? 0},
-      summary: isRecord(m.summary)
-        ? {
-            title: readString(m.summary.title) ?? undefined,
-            body: readString(m.summary.body) ?? undefined,
-            diffs: mapSdkFileDiffs(m.summary.diffs) ?? [],
-          }
-        : undefined,
-      agent: readString(m.agent) ?? '',
+      time: {created: user.time.created},
+      summary:
+        user.summary == null
+          ? undefined
+          : {
+              title: user.summary.title,
+              body: user.summary.body,
+              diffs: mapSdkFileDiffs(user.summary.diffs) ?? [],
+            },
+      agent: user.agent,
       model: {
-        providerID:
-          readString(model?.providerID) ??
-          readString(model?.providerId) ??
-          readString(m.providerID) ??
-          readString(m.providerId) ??
-          '',
-        modelID:
-          readString(model?.modelID) ??
-          readString(model?.modelId) ??
-          readString(m.modelID) ??
-          readString(m.modelId) ??
-          '',
+        providerID: user.model.providerID,
+        modelID: user.model.modelID,
       },
-      system: readString(m.system) ?? undefined,
-      tools: isRecord(m.tools) ? (m.tools as Record<string, boolean>) : undefined,
-      variant: readString(m.variant) ?? undefined,
+      system: user.system,
+      tools: user.tools,
+      variant: user.variant,
     }
   }
-  const t = isRecord(m.time) ? m.time : null
-  const tokens = isRecord(m.tokens) ? m.tokens : null
-  const cache = isRecord(tokens?.cache) ? tokens.cache : null
-  const path = isRecord(m.path) ? m.path : null
+  const assistant = m as SdkAssistantMessage & {agent?: string}
   return {
-    id: readString(m.id) ?? '',
-    sessionID: readString(m.sessionID) ?? readString(m.sessionId) ?? '',
+    id: assistant.id,
+    sessionID: assistant.sessionID,
     role: 'assistant',
-    time: {created: readNumber(t?.created) ?? 0, completed: readNumber(t?.completed) ?? undefined},
-    parentID: readString(m.parentID) ?? readString(m.parentId) ?? '',
-    modelID: readString(m.modelID) ?? readString(m.modelId) ?? '',
-    providerID: readString(m.providerID) ?? readString(m.providerId) ?? '',
-    mode: readString(m.mode) ?? '',
-    agent: readString(m.agent) ?? '',
-    path: {cwd: readString(path?.cwd) ?? '', root: readString(path?.root) ?? ''},
-    summary: readBoolean(m.summary) ?? undefined,
-    cost: readNumber(m.cost) ?? 0,
+    time: {created: assistant.time.created, completed: assistant.time.completed},
+    parentID: assistant.parentID,
+    modelID: assistant.modelID,
+    providerID: assistant.providerID,
+    mode: assistant.mode,
+    agent: assistant.agent ?? '',
+    path: {cwd: assistant.path.cwd, root: assistant.path.root},
+    summary: assistant.summary,
+    cost: assistant.cost,
     tokens: {
-      input: readNumber(tokens?.input) ?? 0,
-      output: readNumber(tokens?.output) ?? 0,
-      reasoning: readNumber(tokens?.reasoning) ?? 0,
-      cache: {read: readNumber(cache?.read) ?? 0, write: readNumber(cache?.write) ?? 0},
+      input: assistant.tokens.input,
+      output: assistant.tokens.output,
+      reasoning: assistant.tokens.reasoning,
+      cache: {read: assistant.tokens.cache.read, write: assistant.tokens.cache.write},
     },
-    finish: readString(m.finish) ?? undefined,
-    error: isRecord(m.error)
-      ? {name: readString(m.error.name) ?? '', message: readString(m.error.message) ?? ''}
+    finish: assistant.finish,
+    error: assistant.error
+      ? {name: assistant.error.name, message: readString(assistant.error.data.message) ?? ''}
       : undefined,
   }
 }
 
-export function mapSdkMessages(v: unknown): readonly Message[] {
-  if (!Array.isArray(v)) return []
+export function mapSdkMessages(messages: readonly (SdkMessage | SdkMessageWithParts)[]): readonly Message[] {
   return [
-    ...v.map(item => {
-      const message = mapSdkMessageToMessage(item)
-      if (!isRecord(item)) return message
-      const parts = Array.isArray(item.parts) ? item.parts.map(mapSdkPartToPart) : undefined
+    ...messages.map(item => {
+      const sdkMessage = 'info' in item ? item.info : item
+      const message = mapSdkMessageToMessage(sdkMessage as SdkMessageExtended)
+      const parts = 'parts' in item ? item.parts.map(mapSdkPartToPart) : undefined
       return parts == null || parts.length === 0 ? message : ({...message, parts} as unknown as Message)
     }),
   ].sort((a, b) => a.time.created - b.time.created)
