@@ -60,8 +60,8 @@ describe('listProjectsViaSDK', () => {
     // #then
     expect(client.project.list).toHaveBeenCalledWith()
     expect(result).toEqual([
-      {id: 'proj_1', worktree: '/repo', path: '/repo'},
-      {id: 'proj_2', worktree: '/repo-two', path: '/repo-two'},
+      {id: 'proj_1', worktree: '/repo', path: '/repo', vcs: 'git', time: {created: 0, updated: 0}},
+      {id: 'proj_2', worktree: '/repo-two', path: '/repo-two', vcs: 'git', time: {created: 0, updated: 0}},
     ])
   })
 
@@ -107,7 +107,7 @@ describe('findProjectByWorkspace', () => {
     const result = await findProjectByWorkspace(client as unknown as SessionClient, '/repo/', mockLogger)
 
     // #then
-    expect(result).toEqual({id: 'proj_1', worktree: '/repo', path: '/repo'})
+    expect(result).toEqual({id: 'proj_1', worktree: '/repo', path: '/repo', vcs: 'git', time: {created: 0, updated: 0}})
   })
 
   it('returns null when no project matches', async () => {
@@ -323,11 +323,10 @@ describe('deleteSession', () => {
     const client = createMockSdkClient({sessionDeleteResponse: {data: null}})
 
     // #when
-    const result = await deleteSession(client as unknown as SessionClient, 'ses_sdk', mockLogger)
+    await expect(deleteSession(client as unknown as SessionClient, 'ses_sdk', mockLogger)).resolves.toBeUndefined()
 
     // #then
     expect(client.session.delete).toHaveBeenCalledWith({path: {id: 'ses_sdk'}})
-    expect(result).toBe(0)
     expect(mockLogger.debug).toHaveBeenCalledWith(
       'Deleted session via SDK',
       expect.objectContaining({sessionID: 'ses_sdk'}),
@@ -339,10 +338,9 @@ describe('deleteSession', () => {
     const client = createMockSdkClient({sessionDeleteResponse: {error: 'Not found'}})
 
     // #when
-    const result = await deleteSession(client as unknown as SessionClient, 'ses_missing', mockLogger)
+    await expect(deleteSession(client as unknown as SessionClient, 'ses_missing', mockLogger)).resolves.toBeUndefined()
 
     // #then
-    expect(result).toBe(0)
     expect(mockLogger.warning).toHaveBeenCalledWith(
       'SDK session delete failed',
       expect.objectContaining({sessionID: 'ses_missing'}),

@@ -19,7 +19,7 @@ export async function listProjectsViaSDK(client: SessionClient, logger: Logger):
     const worktree = readString(project.worktree)
     const projectPath = readString(project.path)
     if (id == null || worktree == null || projectPath == null) continue
-    projects.push({id, worktree, path: projectPath} as unknown as ProjectInfo)
+    projects.push({id, worktree, path: projectPath, vcs: 'git', time: {created: 0, updated: 0}})
   }
   return projects
 }
@@ -34,7 +34,7 @@ export async function findProjectByWorkspace(
 
   for (const project of projects) {
     if (normalizeWorkspacePath(project.worktree) === normalizedWorkspace) return project
-    const projectPath = readString((project as unknown as Record<string, unknown>).path)
+    const projectPath = readString(project.path)
     if (projectPath != null && normalizeWorkspacePath(projectPath) === normalizedWorkspace) return project
   }
 

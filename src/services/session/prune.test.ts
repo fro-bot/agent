@@ -122,7 +122,7 @@ describe('pruneSessions', () => {
       time: {created: 1000, updated: 2000},
     })
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
-    vi.mocked(deleteSession).mockResolvedValue(0)
+    vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()
 
     // #when — maxSessions=3, all sessions older than 30 days
@@ -187,7 +187,7 @@ describe('pruneSessions', () => {
       time: {created: 1000, updated: 2000},
     })
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
-    vi.mocked(deleteSession).mockResolvedValue(0)
+    vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()
 
     // #when — maxSessions=1, only ses_recent kept
@@ -248,7 +248,7 @@ describe('pruneSessions', () => {
       time: {created: 1000, updated: 2000},
     })
     vi.mocked(listSessionsForProject).mockResolvedValue(sessions)
-    vi.mocked(deleteSession).mockResolvedValue(0)
+    vi.mocked(deleteSession).mockResolvedValue(undefined)
     const client = createMockSdkClient()
 
     // #when

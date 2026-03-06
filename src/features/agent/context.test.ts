@@ -4,7 +4,8 @@ import type {TriggerContext, TriggerTarget} from '../triggers/types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
+import {createMockOctokit} from '../../services/github/test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {collectAgentContext} from './context.js'
 
 vi.mock('../../services/github/api.js', () => ({

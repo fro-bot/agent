@@ -1,7 +1,7 @@
 import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   addLabelsToIssue,
   createCommentReaction,
@@ -13,6 +13,7 @@ import {
   parseRepoString,
   removeLabelFromIssue,
 } from './api.js'
+import {createMockOctokit} from './test-helpers.js'
 
 describe('parseRepoString', () => {
   it('parses valid owner/repo string', () => {

@@ -20,11 +20,11 @@ const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: s
 }
 
 export interface AttemptResult {
-  success: boolean
-  error: string | null
-  llmError: ErrorInfo | null
-  shouldRetry: boolean
-  eventStreamResult: EventStreamResult
+  readonly success: boolean
+  readonly error: string | null
+  readonly llmError: ErrorInfo | null
+  readonly shouldRetry: boolean
+  readonly eventStreamResult: EventStreamResult
 }
 
 export async function sendPromptToSession(

@@ -197,7 +197,8 @@ export type Part = TextPart | ToolPart | ReasoningPart | StepFinishPart
 export interface ProjectInfo {
   readonly id: string
   readonly worktree: string
-  readonly vcs: 'git' | string
+  readonly path?: string
+  readonly vcs: string
   readonly time: {
     readonly created: number
     readonly updated: number

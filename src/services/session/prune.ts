@@ -105,15 +105,13 @@ export async function pruneSessions(
     }
   }
 
-  let freedBytes = 0
   const prunedIds: string[] = []
 
   for (const sessionId of allSessionsToPrune) {
     try {
-      const bytes = await deleteSession(client, sessionId, logger)
-      freedBytes += bytes
+      await deleteSession(client, sessionId, logger)
       prunedIds.push(sessionId)
-      logger.debug('Pruned session', {sessionId, bytes})
+      logger.debug('Pruned session', {sessionId})
     } catch (error) {
       logger.warning('Failed to prune session', {
         sessionId,
@@ -127,13 +125,12 @@ export async function pruneSessions(
   logger.info('Session pruning complete', {
     prunedCount: prunedIds.length,
     remainingCount,
-    freedBytes,
   })
 
   return {
     prunedCount: prunedIds.length,
     prunedSessionIds: prunedIds,
     remainingCount,
-    freedBytes,
+    freedBytes: 0,
   }
 }

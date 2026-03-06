@@ -1,8 +1,9 @@
 import type {CommentTarget, Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {createMockOctokit} from '../../services/github/test-helpers.js'
 import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
-import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {isBotComment, postComment} from './writer.js'
 
 describe('comments/writer', () => {

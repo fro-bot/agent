@@ -90,13 +90,12 @@ export async function findLatestSession(
   return {projectID: latest.projectID, session: latest}
 }
 
-export async function deleteSession(client: SessionClient, sessionID: string, logger: Logger): Promise<number> {
+export async function deleteSession(client: SessionClient, sessionID: string, logger: Logger): Promise<void> {
   const response = await client.session.delete({path: {id: sessionID}})
   if (response.error != null) {
     logger.warning('SDK session delete failed', {sessionID, error: String(response.error)})
-    return 0
+    return
   }
 
   logger.debug('Deleted session via SDK', {sessionID})
-  return 0
 }

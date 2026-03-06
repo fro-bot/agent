@@ -2,7 +2,8 @@ import type {Logger} from '../../shared/logger.js'
 
 import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger, createMockOctokit} from '../../shared/test-helpers.js'
+import {createMockOctokit} from '../../services/github/test-helpers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   createCommit,
   formatCommitMessage,

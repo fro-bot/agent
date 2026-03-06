@@ -7,15 +7,16 @@ import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {createAgentError, createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 
 export interface EventStreamResult {
-  tokens: TokenUsage | null
-  model: string | null
-  cost: number | null
-  prsCreated: string[]
-  commitsCreated: string[]
-  commentsPosted: number
-  llmError: ErrorInfo | null
+  readonly tokens: TokenUsage | null
+  readonly model: string | null
+  readonly cost: number | null
+  readonly prsCreated: string[]
+  readonly commitsCreated: string[]
+  readonly commentsPosted: number
+  readonly llmError: ErrorInfo | null
 }
 
+/** Mutable by design — updated in-place during stream processing. */
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
   sessionIdle: boolean
