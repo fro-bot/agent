@@ -4,22 +4,14 @@
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Types** | `types.ts` | `NormalizedEvent` (8 variants), `GitHubContext` (175 L) |
-| **Client** | `client.ts` | `createClient` (PAT) vs `createAppClient` (94 L) |
-| **Context** | `context.ts` | `normalizeEvent()`, `parseGitHubContext()` (226 L) |
-| **API** | `api.ts` | Reactions, labels, branch discovery (255 L) |
-| **URLs** | `urls.ts` | Secure URL validation (attachments) (66 L) |
-| **Utils** | `utils.ts` | HTTP error handling (ignoreNotFound) (26 L) |],op:
-| ----------- | ------------ | ---------------------------------------------------------------- |
-| **Types**   | `types.ts`   | `NormalizedEvent` (8 variants), `GitHubContext`, `CommentTarget` |
-| **Client**  | `client.ts`  | `createClient` (PAT) vs `createAppClient` (App auth)             |
-| **Context** | `context.ts` | `normalizeEvent()`, `parseGitHubContext()`, target extraction    |
-| **API**     | `api.ts`     | Reactions, labels, branch discovery, user lookups (255 L)        |
-| **URLs**    | `urls.ts`    | Secure URL validation (attachments), SHA extraction              |
-| **Utils**   | `utils.ts`   | HTTP error handling (ignoreNotFound)                             |
-| **Exports** | `index.ts`   | Public API surface                                               |
+| Component   | File         | Responsibility                                          |
+| ----------- | ------------ | ------------------------------------------------------- |
+| **Types**   | `types.ts`   | `NormalizedEvent` (8 variants), `GitHubContext` (175 L) |
+| **Client**  | `client.ts`  | `createClient` (PAT) vs `createAppClient` (94 L)        |
+| **Context** | `context.ts` | `normalizeEvent()`, `parseGitHubContext()` (226 L)      |
+| **API**     | `api.ts`     | Reactions, labels, branch discovery (255 L)             |
+| **URLs**    | `urls.ts`    | Secure URL validation (attachments) (66 L)              |
+| **Utils**   | `utils.ts`   | HTTP error handling (ignoreNotFound) (26 L)             |
 
 ## KEY EXPORTS
 

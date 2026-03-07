@@ -4,42 +4,25 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Execution** | `execution.ts` | SDK session creation, prompt retry loop, result collection (178 L) |
-| **Prompting** | `prompt-sender.ts` | Prompt body construction, model resolution (73 L) |
-| **Retry** | `retry.ts` | Retry constants, `runPromptAttempt` with event stream (94 L) |
-| **Server** | `server.ts` | SDK server bootstrap, health check (106 L) |
-| **Polling** | `session-poll.ts` | Poll for session completion, event processor shutdown (110 L) |
-| **Streaming** | `streaming.ts` | Event stream processing, artifact detection (137 L) |
-| **Context** | `context.ts` | Gathers event data from NormalizedEvent, diff, hydrated context |
-| **UX** | `reactions.ts` | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L) |
-| **Prompting (Old)** | `prompt.ts` | Multi-section prompt with response protocol and output contract (420 L) |
-| **Budgeting** | `diff-context.ts` | Context limits (50 files in context, 20 in prompt) (75 L) |
-| **Types** | `types.ts` | `AgentContext`, `AgentResult`, `PromptOptions`, `DiffContext` (138 L) |],op:
-
-OpenCode SDK execution with GitHub context injection, multi-section prompt construction, and UX feedback loops.
-
-## WHERE TO LOOK
-
-| Component     | File              | Responsibility                                                         |
-| ------------- | ----------------- | ---------------------------------------------------------------------- |
-| **Execution** | `opencode.ts`     | SDK server spawn, session events, prompt sending, streaming (634 L)    |
-| **Context**   | `context.ts`      | Gathers event data from NormalizedEvent, diff, hydrated context        |
-| **UX**        | `reactions.ts`    | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L)        |
-| **Prompting** | `prompt.ts`       | Multi-section prompt with response protocol and output contract (420L) |
-| **Budgeting** | `diff-context.ts` | Context limits (50 files in context, 20 in prompt) (75 L)              |
-| **Types**     | `types.ts`        | `AgentContext`, `AgentResult`, `PromptOptions`, `DiffContext` (138 L)  |
+| Component     | File               | Responsibility                                                          |
+| ------------- | ------------------ | ----------------------------------------------------------------------- |
+| **Execution** | `execution.ts`     | SDK session creation, prompt retry loop, result collection (178 L)      |
+| **Prompting** | `prompt-sender.ts` | Prompt body construction, model resolution (73 L)                       |
+| **Retry**     | `retry.ts`         | Retry constants, `runPromptAttempt` with event stream (94 L)            |
+| **Server**    | `server.ts`        | SDK server bootstrap, health check (106 L)                              |
+| **Polling**   | `session-poll.ts`  | Poll for session completion, event processor shutdown (110 L)           |
+| **Streaming** | `streaming.ts`     | Event stream processing, artifact detection (137 L)                     |
+| **Context**   | `context.ts`       | Gathers event data from NormalizedEvent, diff, hydrated context         |
+| **UX**        | `reactions.ts`     | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L)         |
+| **Prompt**    | `prompt.ts`        | Multi-section prompt with response protocol and output contract (420 L) |
+| **Budgeting** | `diff-context.ts`  | Context limits (50 files in context, 20 in prompt) (75 L)               |
+| **Types**     | `types.ts`         | `AgentContext`, `AgentResult`, `PromptOptions`, `DiffContext` (138 L)   |
 
 ## KEY EXPORTS
 
-- `executeOpenCode(prompt, config, logger)`: Main SDK execution entry point (`execution.ts`)
-- `ensureOpenCodeAvailable(options)`: Automated binary installation if missing (`../services/setup/opencode.ts`)
-- `collectAgentContext(logger)`: Hydrates event metadata from NormalizedEvent (`context.ts`)
-- `buildAgentPrompt(options, logger)`: Compiles multi-section prompt (`prompt.ts`)
-- `ensureOpenCodeAvailable(options)`: Automated binary installation if missing
+- `executeOpenCode(prompt, config, logger)`: Main SDK execution entry point
 - `collectAgentContext(logger)`: Hydrates event metadata from NormalizedEvent
-- `buildAgentPrompt(options, logger)`: Compiles multi-section prompt (see Prompt Architecture)
+- `buildAgentPrompt(options, logger)`: Compiles multi-section prompt
 - `buildTaskSection(context, promptInput)`: Task directive with append-mode support
 - `getTriggerDirective(context, promptInput)`: Per-event directive selection
 - `buildResponseProtocolSection(...)`: CI output rules (single comment, Run Summary)

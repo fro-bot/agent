@@ -4,15 +4,11 @@
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Diff** | `diff.ts` | Fetch PR diff, parse hunks, get file content (168 L) |
-| **Reviewer** | `reviewer.ts` | Submit reviews, post/get/reply to comments (213 L) |
-| **Types** | `types.ts` | PRDiff, ReviewComment, SubmitReviewOptions (168 L) |],op:
-| ------------ | ------------- | -------------------------------------------- |
-| **Types**    | `types.ts`    | PRDiff, ReviewComment, SubmitReviewOptions   |
-| **Diff**     | `diff.ts`     | Fetch PR diff, parse hunks, get file content |
-| **Reviewer** | `reviewer.ts` | Submit reviews, post/get/reply to comments   |
+| Component    | File          | Responsibility                                       |
+| ------------ | ------------- | ---------------------------------------------------- |
+| **Diff**     | `diff.ts`     | Fetch PR diff, parse hunks, get file content (168 L) |
+| **Reviewer** | `reviewer.ts` | Submit reviews, post/get/reply to comments (213 L)   |
+| **Types**    | `types.ts`    | PRDiff, ReviewComment, SubmitReviewOptions (168 L)   |
 
 ## KEY EXPORTS
 
@@ -28,13 +24,6 @@ postReviewComment(octokit, owner, repo, prNumber, commitSha, comment, logger)
 getReviewComments(octokit, owner, repo, prNumber, logger)
 replyToReviewComment(octokit, owner, repo, prNumber, commentId, body, logger)
 prepareReviewComments(comments, diff, logger)
-
-// Types & Constants
-;(PRDiff, DiffFile, DiffHunk)
-;(ReviewComment, ReviewEvent, ReviewResult)
-;(SubmitReviewOptions, PreparedReviewComments)
-;(ExistingReviewComment, SkippedReviewComment, SkipReason)
-;(PAGINATION_CONFIG, REVIEW_EVENTS, SKIP_REASONS)
 ```
 
 ## PATTERNS
