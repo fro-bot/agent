@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-02-14
-**Commit:** 34240c9
+**Generated:** 2026-03-06
+**Commit:** 3985e1a
 **Branch:** main
 
 ## OVERVIEW
@@ -12,141 +12,178 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 
 ```
 ./
-15: ├── src/                  # TypeScript source (88 source files, 13k lines)
-16: │   ├── main.ts           # Thin entry point → harness/run.ts
-17: │   ├── post.ts           # Thin entry point → harness/run.ts
-18: │   ├── index.ts          # Public API re-exports
-19: │   ├── shared/           # Layer 0: Pure types, utils, constants (no external deps)
-20: │   │   ├── types.ts      # Core interfaces (ActionInputs, TokenUsage, etc.)
-21: │   │   ├── constants.ts  # Shared configuration constants
-22: │   │   ├── logger.ts     # JSON logging with auto-redaction
-23: │   │   ├── env.ts        # Environment variable readers
-24: │   │   ├── errors.ts     # Error conversion utilities
-25: │   │   ├── validation.ts # Input validation
-26: │   │   ├── format.ts     # String formatting
-27: │   │   ├── async.ts      # Async utilities (sleep)
-28: │   │   ├── console.ts    # Console output helpers
-29: │   │   └── paths.ts      # Path utilities
-30: │   ├── services/         # Layer 1: External adapters (GitHub, cache, session, setup)
-31: │   │   ├── github/       # Octokit client, context parsing, NormalizedEvent
-32: │   │   ├── session/      # Persistence layer (search, prune, storage, writeback)
-33: │   │   ├── setup/        # Bun, oMo, OpenCode installation
-34: │   │   └── cache/        # Cache restore/save with corruption detection
-35: │   ├── features/         # Layer 2: Business logic (agent, triggers, reviews, etc.)
-36: │   │   ├── agent/        # SDK execution, prompts, reactions, streaming
-37: │   │   ├── triggers/     # Event routing, skip conditions, context builders
-38: │   │   ├── comments/     # GitHub comment read/write, error formatting
-39: │   │   ├── context/      # GraphQL hydration for issues/PRs
-40: │   │   ├── reviews/      # PR diff parsing, review comments
-41: │   │   ├── attachments/  # File attachment processing
-42: │   │   ├── delegated/    # Branch/commit/PR operations
-43: │   │   └── observability/# Metrics collection, run summaries
-44: │   └── harness/          # Layer 3: Workflow composition (entry points, phases)
-45: │       ├── run.ts        # Main orchestration (delegates to phases)
-46: │       ├── post.ts       # Post-action hook (durable cache save)
-47: │       ├── config/       # Input parsing, outputs, state keys, omo-providers
-48: │       └── phases/       # Bootstrap, routing, execute, finalize, cleanup, etc.
-49: ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
-50: ├── RFCs/                 # 19 RFC documents (architecture specs)
-51: ├── docs/plans/           # Architecture plans and design docs
-52: ├── action.yaml           # GitHub Action definition (node24)
-53: └── tsdown.config.ts      # esbuild bundler config (dual entry points)
+├── src/                  # TypeScript source (132 source files, 13.6k lines)
+│   ├── main.ts           # Thin entry point → harness/run.ts
+│   ├── post.ts           # Thin entry point → harness/post.ts
+│   ├── index.ts          # Public API re-exports
+│   ├── shared/           # Layer 0: Pure types, utils, constants (no external deps)
+│   │   ├── types.ts      # Core interfaces (ActionInputs, TokenUsage, etc.)
+│   │   ├── constants.ts  # Shared configuration constants
+│   │   ├── logger.ts     # JSON logging with auto-redaction
+│   │   ├── env.ts        # Environment variable readers
+│   │   ├── errors.ts     # Error conversion utilities
+│   │   ├── validation.ts # Input validation
+│   │   ├── format.ts     # String formatting
+│   │   ├── async.ts      # Async utilities (sleep)
+│   │   ├── console.ts    # Console output helpers
+│   │   └── paths.ts      # Path utilities
+│   ├── services/         # Layer 1: External adapters (GitHub, cache, session, setup)
+│   │   ├── github/       # Octokit client, context parsing, NormalizedEvent
+│   │   ├── session/      # Persistence layer (search, prune, storage, writeback)
+│   │   ├── setup/        # Bun, oMo, OpenCode installation
+│   │   └── cache/        # Cache restore/save with corruption detection
+│   ├── features/         # Layer 2: Business logic (agent, triggers, reviews, etc.)
+│   │   ├── agent/        # SDK execution, prompts, reactions, streaming
+│   │   ├── triggers/     # Event routing, skip conditions, context builders
+│   │   ├── comments/     # GitHub comment read/write, error formatting
+│   │   ├── context/      # GraphQL hydration for issues/PRs
+│   │   ├── reviews/      # PR diff parsing, review comments
+│   │   ├── attachments/  # File attachment processing
+│   │   ├── delegated/    # Branch/commit/PR operations
+│   │   └── observability/# Metrics collection, run summaries
+│   └── harness/          # Layer 3: Workflow composition (entry points, phases)
+│       ├── run.ts        # Main orchestration (delegates to phases)
+│       ├── post.ts       # Post-action hook (durable cache save)
+│       ├── config/       # Input parsing, outputs, state keys, omo-providers
+│       └── phases/       # Bootstrap, routing, execute, finalize, cleanup, etc.
+├── dist/                 # Bundled output (COMMITTED, must stay in sync)
+├── RFCs/                 # 19 RFC documents (architecture specs)
+├── docs/plans/           # Architecture plans and design docs
+├── action.yaml           # GitHub Action definition (node24)
+└── tsdown.config.ts      # esbuild bundler config (dual entry points)
 ```
 
 ## WHERE TO LOOK
 
-| Task             | Location                      | Notes                                              |
-| ---------------- | ----------------------------- | -------------------------------------------------- |
-47: | Add action logic | `src/harness/run.ts`          | Main orchestration via phases                      |
-48: | Post-action hook | `src/harness/post.ts`         | Durable cache save (RFC-017)                       |
-49: | Setup library    | `src/services/setup/`         | Bun/oMo/OpenCode installation (auto-setup)         |
-50: | Cache operations | `src/services/cache/`         | `restore.ts`, `save.ts`                            |
-51: | GitHub API       | `src/services/github/client.ts` | `createClient()`, `createAppClient()`              |
-52: | Event parsing    | `src/services/github/context.ts` | `parseGitHubContext()`, `normalizeEvent()`         |
-53: | Event types      | `src/services/github/types.ts` | `NormalizedEvent` discriminated union (7 variants) |
-54: | Agent execution  | `src/features/agent/execution.ts` | `executeOpenCode()` logic                          |
-55: | Prompt building  | `src/features/agent/prompt.ts` | `buildAgentPrompt()`, response protocol sections   |
-56: | Session storage  | `src/services/session/`       | `storage-read.ts`, `storage-write.ts`              |
-57: | Session search   | `src/services/session/search.ts` | `listSessions()`, `searchSessions()`               |
-58: | Event routing    | `src/features/triggers/router.ts` | `routeEvent()` orchestration                       |
-59: | Context hydrate  | `src/features/context/`       | GraphQL/REST issue/PR data (RFC-015)               |
-60: | Comment posting  | `src/features/comments/writer.ts` | `postComment()`, GraphQL mutations                 |
-61: | PR reviews       | `src/features/reviews/reviewer.ts` | `submitReview()`, line comments                    |
-62: | Input parsing    | `src/harness/config/inputs.ts` | `parseActionInputs()` returns Result               |
-63: | Logging          | `src/shared/logger.ts`        | `createLogger()` with redaction                    |
-64: | Core types       | `src/shared/types.ts`         | `ActionInputs`, `CacheResult`, `RunContext`        |
-65: | Build config     | `tsdown.config.ts`            | ESM shim, bundled deps, license extraction         |
-80: 
-81: ## CODE MAP
-82: 
-83: | Symbol | Type | Location | Role |
-84: | --- | --- | --- | --- |
-85: | `run` | Function | `src/harness/run.ts` | Main entry, phase orchestration |
-86: | `runPost` | Function | `src/harness/post.ts` | Post-action cache save |
-87: | `runSetup` | Function | `src/services/setup/setup.ts` | Setup orchestration |
-88: | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
-89: | `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
-90: | `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
-91: | `buildAgentPrompt` | Function | `src/features/agent/prompt.ts` | Multi-section prompt with directives |
-92: | `sendPromptToSession` | Function | `src/features/agent/prompt-sender.ts` | Send prompt to SDK session |
-93: | `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
-94: | `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
-95: | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
-96: | `bootstrapOpenCodeServer` | Function | `src/features/agent/server.ts` | Initialize SDK server lifecycle |
-97: | `normalizeEvent` | Function | `src/services/github/context.ts` | Raw payload → typed NormalizedEvent |
-98: | `parseGitHubContext` | Function | `src/services/github/context.ts` | Global context → typed GitHubContext |
-99: | `routeEvent` | Function | `src/features/triggers/router.ts` | Event routing orchestration |
-100: | `postComment` | Function | `src/features/comments/writer.ts` | Create or update comment |
-101: | `submitReview` | Function | `src/features/reviews/reviewer.ts` | Submit PR review |
-102: | `parseActionInputs` | Function | `src/harness/config/inputs.ts` | Parse/validate inputs |
-103: | `createLogger` | Function | `src/shared/logger.ts` | Logger with redaction |
-104: | `ActionInputs` | Interface | `src/shared/types.ts` | Input schema |
-105: | `NormalizedEvent` | Union | `src/services/github/types.ts` | 7-variant discriminated event union |
-106: | `TriggerDirective` | Interface | `src/features/agent/prompt.ts` | Directive + appendMode for triggers |
-107: | `TriggerResult` | Interface | `src/features/triggers/types.ts` | Routing decision |
-108: 
-109: ## EXECUTION FLOW
-110: 
-111: ```
-112: main.ts → harness/run.ts
-113:   │
-114:   ├─→ bootstrap phase (parseActionInputs, ensureOpenCodeAvailable, restoreCache)
-115:   ├─→ routing phase (parseGitHubContext, normalizeEvent, routeEvent)
-116:   ├─→ acknowledge phase (acknowledgeReceipt)
-117:   ├─→ session-prep phase (processAttachments, buildAgentPrompt)
-118:   ├─→ execute phase (executeOpenCode via SDK)
-119:   ├─→ finalize phase (writeSessionSummary, pruneSessions)
-120:   └─→ cleanup phase (saveCache)
-121: 
-122: post.ts → harness/post.ts
-123:   └─→ saveCache (durable persistence)
-124: ```
-125: 
-126: ## COMPLEXITY HOTSPOTS
-127: 
-128: | File                 | Lines | Reason                                                   |
-129: | -------------------- | ----- | -------------------------------------------------------- |
-130: | `features/triggers/router.ts` | 39    | Routing logic (skip/context extracted)          |
-131: | `features/agent/execution.ts` | 178   | SDK execution orchestration                    |
-132: | `harness/run.ts`              | 97    | 12-step orchestration, phase delegation        |
-133: | `features/agent/prompt.ts`    | 420   | Prompt templates, trigger directives           |
-134: | `services/cache/restore.ts`   | 187   | Corruption detection, version checking          |
-135: | `services/session/types.ts`   | 291   | Session/message/part type hierarchy             |
-136: | `features/context/types.ts`   | 279   | GraphQL context types, budget constraints       |
-137: | `services/github/context.ts`  | 226   | normalizeEvent() 7-variant union builder        |
-138: | `features/agent/streaming.ts` | 137   | SDK event stream processing                    |
-139: | `features/agent/session-poll.ts` | 110 | SDK session completion polling                |
-140: 
-141: ## NOTES
-142: 
-143: - **Four-layer architecture**: shared/ → services/ → features/ → harness/
-144: - **Layer dependency rules**: Each layer may only import from layers below it.
-145: - **dist/ committed**: CI fails if `git diff dist/` shows changes after build
-146: - **Node 24 required**: Matches `action.yaml` runtime
-147: - **19 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook, plugin, S3 backend
-148: - **SDK-based execution**: Uses `@opencode-ai/sdk` for server lifecycle + event streaming
-149: - **Persistent memory**: Sessions survive across CI runs via GitHub Actions cache
-150: - **NormalizedEvent**: All webhook payloads pass through `normalizeEvent()` before routing; router never touches raw payloads
+| Task             | Location                           | Notes                                              |
+| ---------------- | ---------------------------------- | -------------------------------------------------- |
+| Add action logic | `src/harness/run.ts`               | Main orchestration via phases                      |
+| Post-action hook | `src/harness/post.ts`              | Durable cache save (RFC-017)                       |
+| Setup library    | `src/services/setup/`              | Bun/oMo/OpenCode installation (auto-setup)         |
+| Cache operations | `src/services/cache/`              | `restore.ts`, `save.ts`                            |
+| GitHub API       | `src/services/github/client.ts`    | `createClient()`, `createAppClient()`              |
+| Event parsing    | `src/services/github/context.ts`   | `parseGitHubContext()`, `normalizeEvent()`         |
+| Event types      | `src/services/github/types.ts`     | `NormalizedEvent` discriminated union (8 variants) |
+| Agent execution  | `src/features/agent/execution.ts`  | `executeOpenCode()` logic                          |
+| Prompt building  | `src/features/agent/prompt.ts`     | `buildAgentPrompt()`, response protocol sections   |
+| Session storage  | `src/services/session/`            | `storage.ts`, `storage-mappers.ts`                 |
+| Session search   | `src/services/session/search.ts`   | `listSessions()`, `searchSessions()`               |
+| Event routing    | `src/features/triggers/router.ts`  | `routeEvent()` orchestration                       |
+| Context hydrate  | `src/features/context/`            | GraphQL/REST issue/PR data (RFC-015)               |
+| Comment posting  | `src/features/comments/writer.ts`  | `postComment()`, GraphQL mutations                 |
+| PR reviews       | `src/features/reviews/reviewer.ts` | `submitReview()`, line comments                    |
+| Input parsing    | `src/harness/config/inputs.ts`     | `parseActionInputs()` returns Result               |
+| Logging          | `src/shared/logger.ts`             | `createLogger()` with redaction                    |
+| Core types       | `src/shared/types.ts`              | `ActionInputs`, `CacheResult`, `RunContext`        |
+| Build config     | `tsdown.config.ts`                 | ESM shim, bundled deps, license extraction         |
+
+## CODE MAP
+
+| Symbol | Type | Location | Role |
+| --- | --- | --- | --- |
+| `run` | Function | `src/harness/run.ts` | Main entry, phase orchestration |
+| `runPost` | Function | `src/harness/post.ts` | Post-action cache save |
+| `runSetup` | Function | `src/services/setup/setup.ts` | Setup orchestration |
+| `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
+| `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
+| `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
+| `buildAgentPrompt` | Function | `src/features/agent/prompt.ts` | Multi-section prompt with directives |
+| `sendPromptToSession` | Function | `src/features/agent/prompt-sender.ts` | Send prompt to SDK session |
+| `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
+| `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
+| `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
+| `bootstrapOpenCodeServer` | Function | `src/features/agent/server.ts` | Initialize SDK server lifecycle |
+| `normalizeEvent` | Function | `src/services/github/context.ts` | Raw payload → typed NormalizedEvent |
+| `parseGitHubContext` | Function | `src/services/github/context.ts` | Global context → typed GitHubContext |
+| `routeEvent` | Function | `src/features/triggers/router.ts` | Event routing orchestration |
+| `postComment` | Function | `src/features/comments/writer.ts` | Create or update comment |
+| `submitReview` | Function | `src/features/reviews/reviewer.ts` | Submit PR review |
+| `parseActionInputs` | Function | `src/harness/config/inputs.ts` | Parse/validate inputs |
+| `createLogger` | Function | `src/shared/logger.ts` | Logger with redaction |
+| `ActionInputs` | Interface | `src/shared/types.ts` | Input schema |
+| `NormalizedEvent` | Union | `src/services/github/types.ts` | 8-variant discriminated event union |
+| `TriggerDirective` | Interface | `src/features/agent/prompt.ts` | Directive + appendMode for triggers |
+| `TriggerResult` | Interface | `src/features/triggers/types.ts` | Routing decision |
+
+## EXECUTION FLOW
+
+```
+main.ts → harness/run.ts
+  │
+  ├─→ bootstrap phase (parseActionInputs, ensureOpenCodeAvailable, restoreCache)
+  ├─→ routing phase (parseGitHubContext, normalizeEvent, routeEvent)
+  ├─→ acknowledge phase (acknowledgeReceipt)
+  ├─→ cache-restore phase (dedicated session state restore)
+  ├─→ session-prep phase (processAttachments, buildAgentPrompt)
+  ├─→ execute phase (executeOpenCode via SDK)
+  ├─→ finalize phase (writeSessionSummary, pruneSessions)
+  └─→ cleanup phase (saveCache, writeJobSummary)
+
+post.ts → harness/post.ts
+  └─→ saveCache (durable persistence)
+```
+
+## COMPLEXITY HOTSPOTS
+
+| File                              | Lines | Reason                                    |
+| --------------------------------- | ----- | ----------------------------------------- |
+| `features/triggers/__fixtures__/` | 627   | Factory-style payload generation          |
+| `features/agent/prompt.ts`        | 420   | Prompt templates, trigger directives      |
+| `services/session/types.ts`       | 292   | Session/message/part type hierarchy       |
+| `features/context/types.ts`       | 279   | GraphQL context types, budget constraints |
+| `features/comments/reader.ts`     | 257   | Thread reading, pagination                |
+| `services/github/api.ts`          | 255   | Reactions, labels, branch discovery       |
+| `services/setup/setup.ts`         | 247   | Setup orchestration                       |
+| `services/github/context.ts`      | 226   | normalizeEvent() 8-variant union builder  |
+| `harness/config/inputs.ts`        | 224   | Input parsing and validation              |
+| `services/session/search.ts`      | 220   | Session listing and cross-session search  |
+
+## CONVENTIONS
+
+- **ESM-only**: `.js` extensions required in all relative imports
+- **Functions only**: No ES6 classes; closures for stateful patterns
+- **Logger injection**: Every function takes `logger` parameter
+- **Result types**: `Result<T, E>` from `@bfra.me/es` for recoverable errors
+- **Readonly interfaces**: All properties use `readonly`
+- **Strict booleans**: No implicit falsy checks (`!value`); use explicit comparisons
+- **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
+- **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`
+- **Vitest**: Colocated `.test.ts` files; BDD comments (`// #given`, `// #when`, `// #then`)
+
+## ANTI-PATTERNS (THIS PROJECT)
+
+- **Type suppression**: Never use `as any`, `@ts-ignore`, `@ts-expect-error`
+- **Raw event access**: Always use `NormalizedEvent`; never read `context.payload`
+- **Global context**: Never use `github.context` directly; use `parseGitHubContext()`
+- **Classes**: Functions only; project-wide functional pattern
+- **Console.log**: Use injected logger with redaction
+- **Force push**: Always `force: false` on ref updates
+- **Blocking on UX**: Reactions are secondary; API failures must not halt execution
+- **Multiple comments**: Response Protocol: exactly ONE comment/review per invocation
+
+## COMMANDS
+
+```bash
+pnpm bootstrap      # Install dependencies
+pnpm test           # Run all tests (vitest)
+pnpm lint           # ESLint check
+pnpm fix            # ESLint auto-fix
+pnpm check-types    # TypeScript type check (tsc --noEmit)
+pnpm build          # Type check + bundle to dist/ (must stay in sync)
+```
+
+## NOTES
+
+- **Four-layer architecture**: shared/ → services/ → features/ → harness/
+- **Layer dependency rules**: Each layer may only import from layers below it
+- **dist/ committed**: CI fails if `git diff dist/` shows changes after build
+- **Node 24 required**: Matches `action.yaml` runtime
+- **19 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook, plugin, S3 backend
+- **SDK-based execution**: Uses `@opencode-ai/sdk` for server lifecycle + event streaming
+- **Persistent memory**: Sessions survive across CI runs via GitHub Actions cache
+- **NormalizedEvent**: All webhook payloads pass through `normalizeEvent()` before routing; router never touches raw payloads
+- **Dual action entry points**: `main.ts` (execution) and `post.ts` (durable cache save)
+- **Pre-push hook**: Runs test + lint + build + dist diff check
 
 ## EXTERNAL RESOURCES
 
