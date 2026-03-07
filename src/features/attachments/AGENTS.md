@@ -19,19 +19,13 @@ Comment body → parseAttachmentUrls() → downloadAttachments() → validateAtt
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Downloader** | `downloader.ts` | Secure download with redirect validation (185 L) |
-| **Parser** | `parser.ts` | Extract attachment URLs from markdown/HTML (112 L) |
-| **Validator** | `validator.ts` | MIME type and size limit enforcement (114 L) |
-| **Injector** | `injector.ts` | Build SDK `FilePartInput[]` from attachments (81 L) |
-| **Types** | `types.ts` | Type definitions, limits (92 L) |],op:
-| --------------- | ------------------------------------------------------ |
-| `types.ts`      | Type definitions, limits, SDK type re-exports          |
-| `parser.ts`     | Extract attachment URLs from markdown/HTML             |
-| `downloader.ts` | Secure download with redirect validation (via `fetch`) |
-| `validator.ts`  | MIME type and size limit enforcement                   |
-| `injector.ts`   | Build SDK `FilePartInput[]` from validated attachments |
+| Component      | File            | Responsibility                                      |
+| -------------- | --------------- | --------------------------------------------------- |
+| **Downloader** | `downloader.ts` | Secure download with redirect validation (185 L)    |
+| **Parser**     | `parser.ts`     | Extract attachment URLs from markdown/HTML (112 L)  |
+| **Validator**  | `validator.ts`  | MIME type and size limit enforcement (114 L)        |
+| **Injector**   | `injector.ts`   | Build SDK `FilePartInput[]` from attachments (81 L) |
+| **Types**      | `types.ts`      | Type definitions, limits (92 L)                     |
 
 ## KEY EXPORTS
 
@@ -53,18 +47,18 @@ cleanupTempFiles(tempFiles, logger) // ALWAYS call in finally block
 
 ## LIMITS
 
-| Limit | Value |
-| --- | --- |
-| Max files | 5 |
-| Max file size | 5 MB |
-| Max total size | 15 MB |
-| Allowed MIME types | image/*, text/plain, text/markdown, text/csv, application/json, application/pdf |
+| Limit              | Value                                                                            |
+| ------------------ | -------------------------------------------------------------------------------- |
+| Max files          | 5                                                                                |
+| Max file size      | 5 MB                                                                             |
+| Max total size     | 15 MB                                                                            |
+| Allowed MIME types | image/\*, text/plain, text/markdown, text/csv, application/json, application/pdf |
 
 ## ANTI-PATTERNS
 
-| Forbidden               | Reason                                          |
-| ----------------------- | ----------------------------------------------- |
-| Following redirects     | Risk of leaking `GITHUB_TOKEN` to external hosts|
-| Skipping cleanup        | Leaks temporary files on CI runner disk         |
-| Trusting MIME headers   | Content must be validated against allowlist     |
-| Permissive URL patterns | Prevents SSRF/exfiltration via untrusted hosts |
+| Forbidden               | Reason                                           |
+| ----------------------- | ------------------------------------------------ |
+| Following redirects     | Risk of leaking `GITHUB_TOKEN` to external hosts |
+| Skipping cleanup        | Leaks temporary files on CI runner disk          |
+| Trusting MIME headers   | Content must be validated against allowlist      |
+| Permissive URL patterns | Prevents SSRF/exfiltration via untrusted hosts   |

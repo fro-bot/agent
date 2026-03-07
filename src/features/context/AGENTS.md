@@ -22,23 +22,14 @@ hydrateIssueContext() / hydratePullRequestContext()
 
 ## WHERE TO LOOK
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| **Types** | `types.ts` | Type definitions, budget constraints (279 L) |
-| **GraphQL** | `graphql.ts` | GraphQL queries and execution (batched) (186 L) |
-| **Issue** | `issue.ts` | Issue context hydration logic (66 L) |
-| **Pull Request**| `pull-request.ts`| PR context hydration (requested reviewers) (142 L) |
-| **Fallback** | `fallback.ts` | REST API fallback (188 L) |
-| **Budget** | `budget.ts` | Truncation, size estimation, prompt format (195 L) |],op:
-| ----------------- | --------------------------------------------------- |
-| `types.ts`        | Type definitions, budget constraints (279 L)        |
-| `graphql.ts`      | GraphQL queries and execution (batched)             |
-| `issue.ts`        | Issue context hydration logic                       |
-| `pull-request.ts` | PR context hydration (includes requested reviewers) |
-| `fallback.ts`     | REST API fallback (189 L, full PR context support)  |
-| `budget.ts`       | Truncation, size estimation, prompt format          |
-| `index.ts`        | Public exports                                      |
-| `test-helpers.ts` | Shared mock utilities for tests                     |
+| Component        | File              | Responsibility                                     |
+| ---------------- | ----------------- | -------------------------------------------------- |
+| **Types**        | `types.ts`        | Type definitions, budget constraints (279 L)       |
+| **GraphQL**      | `graphql.ts`      | GraphQL queries and execution (batched) (186 L)    |
+| **Issue**        | `issue.ts`        | Issue context hydration logic (66 L)               |
+| **Pull Request** | `pull-request.ts` | PR context hydration (requested reviewers) (142 L) |
+| **Fallback**     | `fallback.ts`     | REST API fallback (188 L)                          |
+| **Budget**       | `budget.ts`       | Truncation, size estimation, prompt format (195 L) |
 
 ## KEY EXPORTS
 
