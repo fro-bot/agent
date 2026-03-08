@@ -37,7 +37,7 @@
 | :---------------------------- | :---------------------------------- | :----------------------------------- |
 | `issue_comment`               | `created`                           | Optional (uses comment body)         |
 | `discussion_comment`          | `created`                           | Optional (uses comment body)         |
-| `pull_request`                | `opened`, `reopened`, `synchronize` | Optional (reviews code)              |
+| `pull_request`                | `opened`, `reopened`, `synchronize`, `ready_for_review` | Optional (reviews code)              |
 | `issues`                      | `opened`, `edited`                  | `edited` requires `@fro-bot` mention |
 | `schedule`                    | N/A                                 | **Required** (hard fail if empty)    |
 | `workflow_dispatch`           | N/A                                 | **Required** (hard fail if empty)    |

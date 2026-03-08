@@ -2,7 +2,7 @@ import type {SkipCheckResult} from './skip-conditions-types.js'
 import type {TriggerConfig, TriggerContext} from './types.js'
 import {isAuthorizedAssociation} from './author-utils.js'
 
-const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened'] as const
+const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review'] as const
 
 function isPRSupportedAction(action: string): action is (typeof PR_SUPPORTED_ACTIONS)[number] {
   return (PR_SUPPORTED_ACTIONS as readonly string[]).includes(action)
