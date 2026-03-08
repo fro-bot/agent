@@ -228,6 +228,7 @@ describe('checkSkipConditions', () => {
       commentId: null,
       hasMention: false,
       command: null,
+      isBotReviewRequested: false,
       action: null,
       raw: ghContext,
     }
@@ -258,6 +259,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: true,
       command: null,
+      isBotReviewRequested: false,
       action: 'edited',
       raw: ghContext,
     }
@@ -288,6 +290,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: true,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -318,6 +321,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: true,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -348,6 +352,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: false,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -378,6 +383,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: true,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -408,6 +414,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: false,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -439,6 +446,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: false,
       command: null,
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }
@@ -471,6 +479,7 @@ describe('checkSkipConditions', () => {
       commentId: 456,
       hasMention: true,
       command: {raw: 'help', action: 'help', args: ''},
+      isBotReviewRequested: false,
       action: 'created',
       raw: ghContext,
     }

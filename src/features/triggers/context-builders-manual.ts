@@ -33,6 +33,7 @@ export function buildWorkflowDispatchContextData(
     commentId: null,
     hasMention: false,
     command: null,
+    isBotReviewRequested: false,
   }
 }
 
@@ -63,5 +64,6 @@ export function buildScheduleContextData(
     commentId: null,
     hasMention: false,
     command: null,
+    isBotReviewRequested: false,
   }
 }
