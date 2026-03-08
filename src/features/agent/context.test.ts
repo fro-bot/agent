@@ -43,6 +43,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
     commentId: null,
     hasMention: false,
     command: null,
+    isBotReviewRequested: false,
     raw: {} as TriggerContext['raw'],
     ...overrides,
   }

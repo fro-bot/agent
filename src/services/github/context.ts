@@ -98,9 +98,36 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
 
     case 'pull_request': {
       const p = payload as PullRequestEvent
+      const rawRequestedReviewers = p.pull_request.requested_reviewers ?? []
+      const requestedReviewer =
+        'requested_reviewer' in p && p.requested_reviewer != null
+          ? {
+              login: p.requested_reviewer.login,
+              type: p.requested_reviewer.type,
+            }
+          : null
+      const requestedTeam =
+        'requested_team' in p && p.requested_team != null
+          ? {
+              name: p.requested_team.name,
+              slug: p.requested_team.slug,
+            }
+          : null
+      const requestedReviewers = rawRequestedReviewers.flatMap(reviewer =>
+        'login' in reviewer && 'type' in reviewer
+          ? [
+              {
+                login: reviewer.login,
+                type: reviewer.type,
+              },
+            ]
+          : [],
+      )
       return {
         type: 'pull_request',
         action: p.action,
+        requestedReviewer,
+        requestedTeam,
         pullRequest: {
           number: p.pull_request.number,
           title: p.pull_request.title,
@@ -108,6 +135,7 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
           locked: p.pull_request.locked ?? false,
           draft: p.pull_request.draft ?? false,
           authorAssociation: p.pull_request.author_association ?? 'NONE',
+          requestedReviewers,
         },
         sender: {
           login: p.sender.login,

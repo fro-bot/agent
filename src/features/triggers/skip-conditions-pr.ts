@@ -2,7 +2,7 @@ import type {SkipCheckResult} from './skip-conditions-types.js'
 import type {TriggerConfig, TriggerContext} from './types.js'
 import {isAuthorizedAssociation} from './author-utils.js'
 
-const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened'] as const
+const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review', 'review_requested'] as const
 
 function isPRSupportedAction(action: string): action is (typeof PR_SUPPORTED_ACTIONS)[number] {
   return (PR_SUPPORTED_ACTIONS as readonly string[]).includes(action)
@@ -43,6 +43,18 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       shouldSkip: true,
       reason: 'issue_locked',
       message: 'Pull request is locked',
+    }
+  }
+  if (
+    config.botLogin != null &&
+    config.botLogin !== '' &&
+    (context.action === 'ready_for_review' || context.action === 'review_requested') &&
+    context.isBotReviewRequested !== true
+  ) {
+    return {
+      shouldSkip: true,
+      reason: 'bot_not_requested',
+      message: `Pull request action '${context.action}' did not request review from the bot`,
     }
   }
 

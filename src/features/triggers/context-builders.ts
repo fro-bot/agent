@@ -22,6 +22,7 @@ function mergeContext(
     commentId: data.commentId,
     hasMention: data.hasMention,
     command: data.command,
+    isBotReviewRequested: data.isBotReviewRequested,
   }
 }
 
@@ -69,6 +70,7 @@ export function buildTriggerContext(
         commentId: null,
         hasMention: false,
         command: null,
+        isBotReviewRequested: false,
       }
   }
 }

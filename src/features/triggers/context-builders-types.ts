@@ -7,5 +7,6 @@ export interface TriggerContextData {
   readonly commentId: number | null
   readonly hasMention: boolean
   readonly command: ParsedCommand | null
+  readonly isBotReviewRequested: boolean
   readonly action: string | null
 }

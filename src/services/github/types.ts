@@ -10,7 +10,7 @@ export type Octokit = InstanceType<typeof GitHub>
  * - 'issue_comment': Comment on issue or PR (via issue_comment event)
  * - 'discussion_comment': Comment on discussion (via discussion or discussion_comment event)
  * - 'issues': Issue opened or edited
- * - 'pull_request': PR opened, synchronized, or reopened
+ * - 'pull_request': PR opened, synchronized, reopened, or marked ready for review
  * - 'pull_request_review_comment': Review comment on PR
  * - 'schedule': Cron-triggered workflow run
  * - 'workflow_dispatch': Manual workflow trigger
@@ -93,6 +93,8 @@ export interface NormalizedIssuesEvent {
 export interface NormalizedPullRequestEvent {
   readonly type: 'pull_request'
   readonly action: string
+  readonly requestedReviewer: {readonly login: string; readonly type: string} | null
+  readonly requestedTeam: {readonly name: string; readonly slug: string} | null
   readonly pullRequest: {
     readonly number: number
     readonly title: string
@@ -100,6 +102,7 @@ export interface NormalizedPullRequestEvent {
     readonly locked: boolean
     readonly draft: boolean
     readonly authorAssociation: string
+    readonly requestedReviewers: readonly {readonly login: string; readonly type: string}[]
   }
   readonly sender: {
     readonly login: string

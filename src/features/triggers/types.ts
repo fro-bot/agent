@@ -64,6 +64,12 @@ export interface TriggerTarget {
   readonly locked: boolean
   /** Whether the PR is a draft (pull_request only) */
   readonly isDraft?: boolean
+  /** Reviewer assigned in this event (pull_request.review_requested only) */
+  readonly requestedReviewerLogin?: string
+  /** Team assigned in this event (pull_request.review_requested team path) */
+  readonly requestedTeamSlug?: string
+  /** Current PR requested reviewers (for ready_for_review fallback) */
+  readonly requestedReviewerLogins?: readonly string[]
   /** File path for review comments (pull_request_review_comment only) */
   readonly path?: string
   /** Line number for review comments (pull_request_review_comment only) */
@@ -119,6 +125,8 @@ export interface TriggerContext {
   readonly hasMention: boolean
   /** Parsed command from the mention (if any) */
   readonly command: ParsedCommand | null
+  /** Whether pull_request event targets this bot as requested reviewer */
+  readonly isBotReviewRequested: boolean
   /** Original GitHub context for advanced use */
   readonly raw: GitHubContext
 }
@@ -129,6 +137,7 @@ export interface TriggerContext {
 export const SKIP_REASONS = [
   'action_not_created',
   'action_not_supported',
+  'bot_not_requested',
   'draft_pr',
   'issue_locked',
   'no_mention',
