@@ -89,7 +89,7 @@
       "ignore-walk>minimatch": "10.2.3",
       "lodash": "4.17.23",
       "lodash-es": "4.17.23",
-      "tar": "7.5.9",
+      "tar": "7.5.10",
       "vite>rollup": "4.59.0"
     }
   }
