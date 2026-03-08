@@ -33,20 +33,21 @@
 
 ## SUPPORTED EVENTS
 
-| Event                         | Supported Actions                   | Prompt Requirement                   |
-| :---------------------------- | :---------------------------------- | :----------------------------------- |
-| `issue_comment`               | `created`                           | Optional (uses comment body)         |
-| `discussion_comment`          | `created`                           | Optional (uses comment body)         |
-| `pull_request`                | `opened`, `reopened`, `synchronize` | Optional (reviews code)              |
-| `issues`                      | `opened`, `edited`                  | `edited` requires `@fro-bot` mention |
-| `schedule`                    | N/A                                 | **Required** (hard fail if empty)    |
-| `workflow_dispatch`           | N/A                                 | **Required** (hard fail if empty)    |
-| `pull_request_review_comment` | `created`                           | Optional (uses comment body)         |
+| Event | Supported Actions | Prompt Requirement |
+| :-- | :-- | :-- |
+| `issue_comment` | `created` | Optional (uses comment body) |
+| `discussion_comment` | `created` | Optional (uses comment body) |
+| `pull_request` | `opened`, `reopened`, `synchronize`, `ready_for_review`, `review_requested` | Optional (reviews code) |
+| `issues` | `opened`, `edited` | `edited` requires `@fro-bot` mention |
+| `schedule` | N/A | **Required** (hard fail if empty) |
+| `workflow_dispatch` | N/A | **Required** (hard fail if empty) |
+| `pull_request_review_comment` | `created` | Optional (uses comment body) |
 
 ## SKIP REASONS
 
 - `action_not_created`: Trigger action != `created` (for comments).
 - `action_not_supported`: Event action (e.g., `labeled`) is not in the allowlist.
+- `bot_not_requested`: PR review was not requested from the configured bot for gated actions.
 - `draft_pr`: PR is in draft mode (skipped by default).
 - `issue_locked`: Target issue or pull request is locked.
 - `no_mention`: Missing `@fro-bot` mention in `issues.edited` or required comment events.

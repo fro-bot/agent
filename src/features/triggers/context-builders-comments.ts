@@ -34,6 +34,7 @@ export function buildIssueCommentContextData(
     commentId: event.comment.id,
     hasMention,
     command,
+    isBotReviewRequested: false,
   }
 }
 
@@ -65,6 +66,7 @@ export function buildDiscussionContextData(event: GitHubContext['event'], botLog
     commentId: event.comment.id,
     hasMention,
     command,
+    isBotReviewRequested: false,
   }
 }
 
@@ -102,5 +104,6 @@ export function buildPRReviewCommentContextData(
     commentId: event.comment.id,
     hasMention,
     command,
+    isBotReviewRequested: false,
   }
 }

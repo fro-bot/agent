@@ -4,6 +4,34 @@ import type {AuthorInfo, TriggerTarget} from './types.js'
 import {isBotUser} from './author-utils.js'
 import {parseBotMentionAndCommand} from './mention-command.js'
 
+function normalizeReviewerLogin(login: string): string {
+  return login.toLowerCase().replace(/\[bot\]$/i, '')
+}
+
+function isReviewRequestedForBot(event: GitHubContext['event'], botLogin: string | null): boolean {
+  if (event.type !== 'pull_request' || botLogin == null || botLogin === '') {
+    return false
+  }
+
+  const normalizedBotLogin = normalizeReviewerLogin(botLogin)
+  if (normalizedBotLogin === '') {
+    return false
+  }
+
+  if (event.action === 'review_requested') {
+    const requestedReviewerLogin = event.requestedReviewer?.login
+    return requestedReviewerLogin != null && normalizeReviewerLogin(requestedReviewerLogin) === normalizedBotLogin
+  }
+
+  if (event.action === 'ready_for_review') {
+    return event.pullRequest.requestedReviewers.some(
+      reviewer => normalizeReviewerLogin(reviewer.login) === normalizedBotLogin,
+    )
+  }
+
+  return false
+}
+
 export function buildIssuesContextData(event: GitHubContext['event'], botLogin: string | null): TriggerContextData {
   if (event.type !== 'issues') {
     throw new Error('Event type must be issues')
@@ -32,6 +60,7 @@ export function buildIssuesContextData(event: GitHubContext['event'], botLogin: 
     commentId: null,
     hasMention,
     command,
+    isBotReviewRequested: false,
   }
 }
 
@@ -55,6 +84,9 @@ export function buildPullRequestContextData(
     body: event.pullRequest.body,
     locked: event.pullRequest.locked,
     isDraft: event.pullRequest.draft,
+    requestedReviewerLogin: event.requestedReviewer?.login,
+    requestedTeamSlug: event.requestedTeam?.slug,
+    requestedReviewerLogins: event.pullRequest.requestedReviewers.map(reviewer => reviewer.login),
   }
   const prBody = event.pullRequest.body ?? ''
   const {hasMention, command} = parseBotMentionAndCommand(prBody, botLogin)
@@ -67,5 +99,6 @@ export function buildPullRequestContextData(
     commentId: null,
     hasMention,
     command,
+    isBotReviewRequested: isReviewRequestedForBot(event, botLogin),
   }
 }

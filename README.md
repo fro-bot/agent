@@ -192,14 +192,14 @@ The agent responds when mentioned in comments on issues, pull requests, or PR re
 
 ### Supported Events
 
-| Event                         | Trigger                     | Default Behavior                               |
-| ----------------------------- | --------------------------- | ---------------------------------------------- |
-| `issue_comment`               | `@fro-bot` mention          | Respond to comment                             |
-| `issues` (opened/edited)      | `@fro-bot` in issue body    | Triage issue and propose next steps            |
-| `pull_request`                | PR opened/synced/reopened   | Review code for quality and potential bugs     |
-| `pull_request_review_comment` | `@fro-bot` in review thread | Respond to specific code review comment        |
-| `workflow_dispatch`           | Manual workflow trigger     | Execute custom prompt (required input)         |
-| `schedule`                    | Cron schedule               | Execute periodic task (requires prompt config) |
+| Event | Trigger | Default Behavior |
+| --- | --- | --- |
+| `issue_comment` | `@fro-bot` mention | Respond to comment |
+| `issues` (opened/edited) | `@fro-bot` in issue body | Triage issue and propose next steps |
+| `pull_request` | PR opened/synced/reopened/ready_for_review/review_requested | Review code for quality and potential bugs |
+| `pull_request_review_comment` | `@fro-bot` in review thread | Respond to specific code review comment |
+| `workflow_dispatch` | Manual workflow trigger | Execute custom prompt (required input) |
+| `schedule` | Cron schedule | Execute periodic task (requires prompt config) |
 
 ### Access Control
 
@@ -221,7 +221,7 @@ The action supports seven event types. Use this section to wire triggers correct
 | `pull_request_review_comment` | `created` | Yes | Comment body | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
 | `discussion_comment` | `created` | Yes | Comment body | `contents: read`, `discussions: write` | `discussion.number` or `run_id` |
 | `issues` | `opened`, `edited` | No (opened), Yes (edited) | Built-in directives | `contents: read`, `issues: write` | `issue.number` or `run_id` |
-| `pull_request` | `opened`, `synchronize`, `reopened` | No | `prompt` input (review prompt) | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
+| `pull_request` | `opened`, `synchronize`, `reopened`, `ready_for_review`, `review_requested` | No | `prompt` input (review prompt) | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
 | `schedule` | Cron | No | `prompt` input (schedule prompt) | `contents: read`, `issues: write` | `run_id` |
 | `workflow_dispatch` | Manual | No | `prompt` input (required) | Varies by task | `run_id` |
 
@@ -281,7 +281,9 @@ The action supports seven event types. Use this section to wire triggers correct
 <details>
 <summary><strong>pull_request</strong> — AI code review (not CI)</summary>
 
-- **Behavior:** Runs an AI review on `opened`, `synchronize`, `reopened`.
+- **Behavior:** Runs an AI review on `opened`, `synchronize`, `reopened`, `ready_for_review`, and `review_requested`.
+- **Reviewer-assignment gating:** For `review_requested` and `ready_for_review`, processing continues only when the configured bot login is requested as reviewer (or when `bot-login` is not set).
+- **Team requests:** `review_requested` events targeting teams are normalized and exposed in context, but current gating only auto-triggers for explicit reviewer logins, not team membership expansion.
 - **Skip conditions:** Draft PRs, fork PRs, or untrusted author association.
 - **Guard example:**
   ```yaml
@@ -344,6 +346,7 @@ concurrency:
       github.event.discussion.number ||
       github.run_id
     }}
+
 
   cancel-in-progress: false
 ```

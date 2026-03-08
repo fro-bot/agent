@@ -142,6 +142,70 @@ describe('parseGitHubContext', () => {
   })
 })
 
+describe('normalizeEvent for pull_request reviewer fields', () => {
+  it('normalizes requested reviewer and requested reviewers for review_requested action', () => {
+    // #given a pull_request.review_requested payload with requested reviewer fields
+    const payload = {
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        number: 123,
+        title: 'feat: add reviewer trigger',
+        body: 'Please review this PR',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then it should map singular and plural reviewer fields
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.requestedReviewer).toEqual({login: 'fro-bot[bot]', type: 'Bot'})
+    expect(event.pullRequest.requestedReviewers).toEqual([{login: 'fro-bot[bot]', type: 'Bot'}])
+  })
+
+  it('normalizes requested team and filters non-user entries from requested reviewers', () => {
+    // #given a pull_request.review_requested payload for a team
+    const payload = {
+      action: 'review_requested',
+      requested_team: {name: 'Platform Team', slug: 'platform-team'},
+      pull_request: {
+        number: 124,
+        title: 'feat: team review request',
+        body: 'Team review requested',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [
+          {name: 'Platform Team', slug: 'platform-team'},
+          {login: 'alice', type: 'User'},
+        ],
+      },
+      sender: {login: 'contributor'},
+    }
+
+    // #when normalizing the event
+    const event = normalizeEvent('pull_request', payload)
+
+    // #then it should map requested team and keep only reviewer logins
+    expect(event.type).toBe('pull_request')
+    if (event.type !== 'pull_request') {
+      throw new Error('Expected pull_request event')
+    }
+    expect(event.requestedTeam).toEqual({name: 'Platform Team', slug: 'platform-team'})
+    expect(event.requestedReviewer).toBeNull()
+    expect(event.pullRequest.requestedReviewers).toEqual([{login: 'alice', type: 'User'}])
+  })
+})
+
 describe('isPullRequest', () => {
   it('returns true when pull_request field exists', () => {
     const event: GitHubContext['event'] = {
