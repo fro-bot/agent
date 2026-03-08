@@ -1,24 +1,8 @@
-import type {GitHubContext} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it} from 'vitest'
-import {classifyEventType, normalizeEvent} from '../../services/github/context.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {routeEvent} from './router.js'
-
-function createMockGitHubContext(eventName: string, payload: unknown = {}): GitHubContext {
-  const eventType = classifyEventType(eventName)
-  return {
-    eventName,
-    eventType,
-    repo: {owner: 'owner', repo: 'repo'},
-    ref: 'refs/heads/main',
-    sha: 'abc123',
-    runId: 12345,
-    actor: 'actor',
-    payload,
-    event: normalizeEvent(eventType, payload),
-  }
-}
+import {createMockGitHubContext} from './test-helpers.js'
 
 describe('pull_request ready_for_review routing', () => {
   let logger: Logger
@@ -160,5 +144,32 @@ describe('pull_request ready_for_review routing', () => {
 
     // #then it should process (assignment gating disabled)
     expect(result.shouldProcess).toBe(true)
+  })
+
+  it('skips pull_request.review_requested event when a team is requested (not an individual)', () => {
+    // #given a pull_request.review_requested event where a team (not individual) is the reviewer
+    const payload = {
+      action: 'review_requested',
+      requested_team: {name: 'Platform Team', slug: 'platform-team'},
+      pull_request: {
+        number: 105,
+        title: 'feat: team review',
+        body: 'Please review',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        requested_teams: [{name: 'Platform Team', slug: 'platform-team'}],
+      },
+      sender: {login: 'contributor'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should skip because a team was requested, not the bot individually
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('bot_not_requested')
   })
 })
