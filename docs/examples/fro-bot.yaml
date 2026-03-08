@@ -11,7 +11,7 @@
 #   pull_request_review_comment — respond in PR review threads
 #   discussion_comment         — respond in Discussions (requires Discussions enabled)
 #   issues                     — auto-triage new issues; edits require @mention
-#   pull_request               — AI code review on PR open/sync/reopen
+#   pull_request               — AI code review on PR open/sync/reopen/ready/review-requested
 #   schedule                   — periodic maintenance (daily by default)
 #   workflow_dispatch          — manual prompt execution via "Run workflow" button
 #
@@ -257,7 +257,7 @@ on:
   issues:
     types: [opened, edited]
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review, review_requested]
   schedule:
     - cron: '30 15 * * *'
   workflow_dispatch:
