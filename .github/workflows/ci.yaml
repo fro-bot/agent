@@ -184,19 +184,19 @@ jobs:
           echo "Installed versions:"
           which bun && bun --version || true
           which opencode && opencode --version || true
-          bunx oh-my-opencode get-local-version || true
+          bunx oh-my-openagent get-local-version || true
 
           echo "OpenCode config files:"
           find ~/.config/opencode -maxdepth 2 -type f | sort
           [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
-          [ -f ~/.config/opencode/oh-my-opencode.json ] && cat ~/.config/opencode/oh-my-opencode.json || true
+          [ -f ~/.config/opencode/oh-my-openagent.json ] && cat ~/.config/opencode/oh-my-openagent.json || true
 
           echo "OpenCode shared files:"
           ls -lA ~/.local/share/opencode || true
           ls -lA ~/.local/share/opencode/log || true
 
-          echo "Check oh-my-opencode installation:"
-          bunx oh-my-opencode doctor --verbose || true
+          echo "Check oh-my-openagent installation:"
+          bunx oh-my-openagent doctor --verbose || true
 
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true
