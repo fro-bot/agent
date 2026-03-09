@@ -133,12 +133,12 @@ describe('writeOmoConfig', () => {
     await writeOmoConfig(configJson, configDir, logger)
 
     // #then - directory created and file written
-    const filePath = path.join(configDir, 'oh-my-openagent.json')
+    const filePath = path.join(configDir, 'oh-my-opencode.json')
     const content = await fs.readFile(filePath, 'utf8')
     expect(JSON.parse(content)).toEqual({theme: 'dark'})
   })
 
-  it('writes config to oh-my-openagent.json in configDir', async () => {
+  it('writes config to oh-my-opencode.json in configDir', async () => {
     // #given
     const configJson = JSON.stringify({model: 'claude-opus-4-5', theme: 'light'})
 
@@ -146,7 +146,7 @@ describe('writeOmoConfig', () => {
     await writeOmoConfig(configJson, tmpDir, logger)
 
     // #then
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     const content = await fs.readFile(filePath, 'utf8')
     expect(JSON.parse(content)).toEqual({model: 'claude-opus-4-5', theme: 'light'})
   })
@@ -154,7 +154,7 @@ describe('writeOmoConfig', () => {
   it('deep-merges with existing config, user values win', async () => {
     // #given - existing config has some keys
     const existingConfig = {theme: 'dark', keybindings: 'vim', plugins: ['a', 'b']}
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     await fs.writeFile(filePath, JSON.stringify(existingConfig))
 
     const userConfig = JSON.stringify({theme: 'light', model: 'gpt-4o'})
@@ -180,7 +180,7 @@ describe('writeOmoConfig', () => {
     await writeOmoConfig(configJson, tmpDir, logger)
 
     // #then
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     const content = await fs.readFile(filePath, 'utf8')
     expect(JSON.parse(content)).toEqual({hooks: {before: 'echo start'}})
   })
@@ -230,7 +230,7 @@ describe('writeOmoConfig', () => {
         openai: {model: 'gpt-4o'},
       },
     }
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     await fs.writeFile(filePath, JSON.stringify(existingConfig))
 
     // user overrides anthropic model only
@@ -251,7 +251,7 @@ describe('writeOmoConfig', () => {
 
   it('overwrites existing file when existing config is not valid JSON', async () => {
     // #given - corrupt existing file
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     await fs.writeFile(filePath, 'not valid json {{{')
 
     const userConfig = JSON.stringify({theme: 'dark'})
@@ -272,7 +272,7 @@ describe('writeOmoConfig', () => {
     await writeOmoConfig(configJson, tmpDir, logger)
 
     // #then - output is pretty-printed (contains newlines)
-    const filePath = path.join(tmpDir, 'oh-my-openagent.json')
+    const filePath = path.join(tmpDir, 'oh-my-opencode.json')
     const raw = await fs.readFile(filePath, 'utf8')
     expect(raw).toContain('\n')
     expect(JSON.parse(raw)).toEqual({a: 1, b: {c: 2}})

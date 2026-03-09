@@ -90,7 +90,7 @@ export async function installOmo(
       logger.error(errorMsg, {output: output.slice(0, 1000)})
       return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
-    const versionMatch = /oh-my-openagent@(\d+\.\d+\.\d+)/i.exec(output)
+    const versionMatch = /oh-my-opencode@(\d+\.\d+\.\d+)/i.exec(output)
     const detectedVersion = versionMatch != null && versionMatch[1] != null ? versionMatch[1] : version
     logger.info('oMo plugin installed', {version: detectedVersion})
     return {installed: true, version: detectedVersion, error: null}
@@ -105,7 +105,7 @@ export async function installOmo(
 export async function verifyOmoInstallation(logger: Logger, execAdapter: ExecAdapter): Promise<boolean> {
   try {
     // bunx runs ephemerally so the binary won't be in PATH — verify config file only
-    const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-openagent.json'], {
+    const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-opencode.json'], {
       silent: true,
       ignoreReturnCode: true,
     })

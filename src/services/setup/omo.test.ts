@@ -39,7 +39,7 @@ describe('omo', () => {
         .mockImplementation(
           async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
             if (options?.listeners?.stdout != null) {
-              options.listeners.stdout(Buffer.from('Installing oh-my-openagent@1.2.3\n'))
+              options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
             }
             return 0
           },
@@ -331,7 +331,7 @@ describe('omo', () => {
       const mockExec = createMockExecAdapter({
         getExecOutput: vi.fn().mockResolvedValue({
           exitCode: 0,
-          stdout: '-rw-r--r-- 1 user user 123 Jan 1 00:00 oh-my-openagent.json',
+          stdout: '-rw-r--r-- 1 user user 123 Jan 1 00:00 oh-my-opencode.json',
           stderr: '',
         }),
       })
@@ -344,7 +344,7 @@ describe('omo', () => {
       expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1)
       expect(mockExec.getExecOutput).toHaveBeenCalledWith(
         'ls',
-        ['-la', '~/.config/opencode/oh-my-openagent.json'],
+        ['-la', '~/.config/opencode/oh-my-opencode.json'],
         expect.any(Object),
       )
     })

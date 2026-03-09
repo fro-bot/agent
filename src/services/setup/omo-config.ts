@@ -2,7 +2,7 @@ import type {Logger} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 
-const OMO_CONFIG_FILENAME = 'oh-my-openagent.json'
+const OMO_CONFIG_FILENAME = 'oh-my-opencode.json'
 const UNSAFE_MERGE_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
@@ -54,12 +54,12 @@ export function deepMerge(target: Record<string, unknown>, source: Record<string
  * Write oMo configuration JSON to the oMo config file, deep-merging with any
  * existing configuration so that user-provided values take priority.
  *
- * The config file is written to `<configDir>/oh-my-openagent.json`.
+ * The config file is written to `<configDir>/oh-my-opencode.json`.
  * If the directory does not exist it is created. If the existing file
  * contains invalid JSON, it is silently replaced with the user config.
  *
  * @param configJson  - Raw JSON string from the `omo-config` action input
- * @param configDir   - Directory containing `oh-my-openagent.json`
+ * @param configDir   - Directory containing `oh-my-opencode.json`
  *                      (typically `~/.config/opencode`)
  * @param logger      - Logger instance
  */
