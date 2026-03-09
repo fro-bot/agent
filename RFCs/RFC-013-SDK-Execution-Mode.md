@@ -1,10 +1,6 @@
 # RFC-013: SDK Execution Mode
 
-**Status:** Completed
-**Priority:** MUST
-**Complexity:** High
-**Phase:** 1
-**Completed:** 2026-01-10
+**Status:** Completed **Priority:** MUST **Complexity:** High **Phase:** 1 **Completed:** 2026-01-10
 
 ---
 
@@ -750,7 +746,7 @@ inputs:
 
 - `agent` input with default `"Sisyphus"` (oMo's default agent)
 - `model` input is now **optional** — if not provided, uses the agent's configured model
-- Follows the pattern from [oh-my-opencode runner.ts](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/src/cli/run/runner.ts)
+- Follows the pattern from [oh-my-openagent runner.ts](https://github.com/code-yeongyu/oh-my-openagent/blob/dev/src/cli/run/runner.ts)
 
 ---
 
@@ -1390,19 +1386,19 @@ RFC-013 SDK Execution Mode has been fully implemented, replacing CLI-based execu
 
 ### Files Changed
 
-| File                             | Change                                          |
-| -------------------------------- | ----------------------------------------------- |
-| `package.json`                   | Added `@opencode-ai/sdk` dependency             |
-| `tsdown.config.ts`               | Added SDK to bundled dependencies               |
-| `action.yaml`                    | Added `agent`, `model`, `timeout` inputs        |
-| `src/harness/config/inputs.ts`              | Added `parseModelInput()` + new field parsing   |
-| `src/shared/types.ts`               | Added `ModelConfig` interface                   |
+| File                                  | Change                                          |
+| ------------------------------------- | ----------------------------------------------- |
+| `package.json`                        | Added `@opencode-ai/sdk` dependency             |
+| `tsdown.config.ts`                    | Added SDK to bundled dependencies               |
+| `action.yaml`                         | Added `agent`, `model`, `timeout` inputs        |
+| `src/harness/config/inputs.ts`        | Added `parseModelInput()` + new field parsing   |
+| `src/shared/types.ts`                 | Added `ModelConfig` interface                   |
 | `src/features/agent/types.ts`         | Added `ExecutionConfig`, `PromptPart`           |
 | `src/features/agent/opencode.ts`      | Replaced CLI spawning with SDK client           |
 | `src/features/agent/index.ts`         | Updated exports                                 |
-| `src/main.ts`                    | Passes `ExecutionConfig` to `executeOpenCode()` |
+| `src/main.ts`                         | Passes `ExecutionConfig` to `executeOpenCode()` |
 | `src/features/agent/opencode.test.ts` | Rewrote 19 tests for SDK mode                   |
-| `src/harness/config/inputs.test.ts`         | Added 6 tests for `parseModelInput()`           |
+| `src/harness/config/inputs.test.ts`   | Added 6 tests for `parseModelInput()`           |
 
 ### Verification
 

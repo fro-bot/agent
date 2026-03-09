@@ -55,7 +55,7 @@ export function buildBunDownloadUrl(version: string, info: BunPlatformInfo): str
 }
 
 /**
- * Install Bun runtime for running oh-my-opencode via bunx.
+ * Install Bun runtime for running oh-my-openagent via bunx.
  *
  * Downloads Bun binary, extracts it, caches it in the runner tool-cache,
  * and adds to PATH so bunx is available for oMo installation.

@@ -16,7 +16,7 @@
 
 ## Overview
 
-Fro Bot Agent is a GitHub Action that brings AI automation to your repository using [OpenCode](https://opencode.ai/) with [Oh My OpenCode (oMo)](https://github.com/code-yeongyu/oh-my-opencode) agent workflows. It can respond to issues, review pull requests, participate in discussions, and execute scheduled tasks—all while **remembering previous interactions**.
+Fro Bot Agent is a GitHub Action that brings AI automation to your repository using [OpenCode](https://opencode.ai/) with [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) agent workflows. It can respond to issues, review pull requests, participate in discussions, and execute scheduled tasks—all while **remembering previous interactions**.
 
 ### Why Fro Bot?
 
@@ -607,7 +607,7 @@ See `AGENTS.md` for detailed development guidelines and architecture overview.
 ## References
 
 - [OpenCode Documentation](https://opencode.ai/docs/) — Official OpenCode platform docs
-- [Oh My OpenCode (oMo)](https://github.com/code-yeongyu/oh-my-opencode) — Agent workflow framework
+- [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) — Agent workflow framework
 - [GitHub Actions Documentation](https://docs.github.com/en/actions) — GitHub Actions reference
 - [Action Source Code](https://github.com/fro-bot/agent) — View the implementation
 

@@ -11,7 +11,7 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 | **Setup**      | `setup.ts`       | Orchestration entry point (runSetup) (247 L)   |
 | **OpenCode**   | `opencode.ts`    | CLI resolution & installation (168 L)          |
 | **Bun**        | `bun.ts`         | Bun runtime setup (required for oMo) (170 L)   |
-| **oMo**        | `omo.ts`         | oh-my-opencode install (graceful fail) (120 L) |
+| **oMo**        | `omo.ts`         | oh-my-openagent install (graceful fail) (120 L) |
 | **oMo Config** | `omo-config.ts`  | Plugin configuration (97 L)                    |
 | **GH Auth**    | `gh-auth.ts`     | gh CLI auth & Git user identity (101 L)        |
 | **Auth JSON**  | `auth-json.ts`   | Temporary auth.json generation (70 L)          |

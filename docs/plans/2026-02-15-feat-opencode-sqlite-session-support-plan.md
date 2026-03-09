@@ -483,7 +483,7 @@ Phase ordering is correct for TDD with one clarification:
 - [OpenCode ≥1.1.53 session.sql.ts](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/session.sql.ts) — Drizzle schema (SessionTable, MessageTable, PartTable, TodoTable)
 - [OpenCode ≥1.1.53 db.ts](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/storage/db.ts) — Bun SQLite + Drizzle setup
 - [OpenCode ≥1.1.53 server/routes/session.ts](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/server/routes/session.ts) — HTTP API routes
-- [oMo PR #1837](https://github.com/code-yeongyu/oh-my-opencode/pull/1837) — SQLite migration compatibility (reference implementation)
+- [oMo PR #1837](https://github.com/code-yeongyu/oh-my-openagent/pull/1837) — SQLite migration compatibility (reference implementation)
 
 ### Related Work
 
