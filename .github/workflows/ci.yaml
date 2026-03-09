@@ -14,6 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
   cancel-in-progress: true
 
+# Restrict default token permissions; each job grants only what it needs.
+permissions: {}
+
 defaults:
   run:
     shell: 'bash -Eeuxo pipefail {0}'
@@ -25,6 +28,7 @@ jobs:
       should-build: ${{ contains(steps.filter.outputs.changes, 'should-build') }}
       should-lint: ${{ contains(steps.filter.outputs.changes, 'should-lint') }}
     permissions:
+      contents: read
       pull-requests: read
     runs-on: ubuntu-latest
     steps:
@@ -61,6 +65,8 @@ jobs:
     if: ${{ needs.setup.outputs.should-lint == 'true' }}
     name: Lint
     needs: [setup]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -72,6 +78,8 @@ jobs:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
     name: Build
     needs: [setup]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -97,6 +105,8 @@ jobs:
   test:
     name: Test
     needs: [setup, build]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -117,6 +127,8 @@ jobs:
       )
     name: Test GitHub Action
     needs: build
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -205,6 +217,9 @@ jobs:
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
     name: Dependency Review
+    permissions:
+      contents: read
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -224,6 +239,8 @@ jobs:
     outputs:
       commit: ${{ steps.merge.outputs.commit }}
       version: ${{ steps.semantic-release.outputs.version }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - id: get-app-token

@@ -26,6 +26,9 @@ on:
     branches: [main]
     types: [completed]
 
+# Restrict default token permissions; the renovate reusable workflow uses an app token.
+permissions: {}
+
 jobs:
   renovate:
     if: >-
