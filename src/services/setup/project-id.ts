@@ -92,12 +92,22 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
     const firstRootCommit = rootCommits[0] as string
 
     try {
-      await fs.writeFile(projectIdFile, firstRootCommit, 'utf8')
+      // Use O_CREAT | O_EXCL (wx flag) for an atomic create-only write, eliminating the TOCTOU
+      // window between the earlier readFile check and this write. If another process races to
+      // create the same file, we receive EEXIST and continue safely — the value is deterministic.
+      await fs.writeFile(projectIdFile, firstRootCommit, {encoding: 'utf8', flag: 'wx'})
       logger.info('Project ID generated and cached', {projectId: firstRootCommit, source: 'generated'})
     } catch (writeError) {
-      logger.warning('Failed to cache project ID (continuing)', {
-        error: toErrorMessage(writeError),
-      })
+      const errnoCode = typeof writeError === 'object' ? (writeError as NodeJS.ErrnoException).code : undefined
+      if (errnoCode === 'EEXIST') {
+        logger.debug('Project ID file already written by concurrent process, skipping', {
+          projectId: firstRootCommit,
+        })
+      } else {
+        logger.warning('Failed to cache project ID (continuing)', {
+          error: toErrorMessage(writeError),
+        })
+      }
     }
 
     return {projectId: firstRootCommit, source: 'generated'}
