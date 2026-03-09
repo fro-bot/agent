@@ -39,9 +39,8 @@ inputs:
     required: false
     default: '1800000'
   opencode-version:
-    description: 'OpenCode CLI version to install if auto-setup is needed (default: latest)'
+    description: OpenCode CLI version to install if auto-setup is needed. Defaults to version pinned in source code if not set.
     required: false
-    default: latest
   omo-version:
     description: oMo (Oh My OpenAgent) version to install if auto-setup is needed. Defaults to version pinned in source code if not set.
     required: false
