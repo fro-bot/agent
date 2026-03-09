@@ -24,7 +24,11 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       message: `Pull requests from bots (${context.author.login}) are not processed`,
     }
   }
-  if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {
+  if (
+    context.action !== 'review_requested' &&
+    context.author != null &&
+    !isAuthorizedAssociation(context.author.association, config.allowedAssociations)
+  ) {
     return {
       shouldSkip: true,
       reason: 'unauthorized_author',
