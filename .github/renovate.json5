@@ -4,21 +4,15 @@
   customManagers: [
     {
       customType: 'regex',
-      fileMatch: ['src/shared/constants\\.ts'],
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
       matchStrings: ["DEFAULT_OMO_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
       depNameTemplate: 'oh-my-openagent',
       datasourceTemplate: 'npm',
     },
   ],
   packageRules: [
-    {
-      matchFileNames: ['.github/workflows/**'],
-      semanticCommitType: 'ci',
-    },
-    {
-      matchDatasources: ['docker'],
-      semanticCommitType: 'build',
-    },
+    {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
+    {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
       matchPackageNames: [
         '@bfra.me/tsconfig',
@@ -40,10 +34,7 @@
       groupName: 'semantic-release and conventionalcommits',
       semanticCommitType: 'feat',
     },
-    {
-      matchPackageNames: ['oh-my-openagent'],
-      semanticCommitType: 'build',
-    },
+    {matchPackageNames: ['oh-my-openagent'], semanticCommitType: 'build'},
   ],
   postUpgradeTasks: {
     commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],
