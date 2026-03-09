@@ -13,4 +13,4 @@ shamefullyHoist: true
 
 shellEmulator: true
 
-strictPeerDependencies: true
+strictPeerDependencies: false
