@@ -1,6 +1,15 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
+  customManagers: [
+    {
+      customType: 'regex',
+      fileMatch: ['src/shared/constants\\.ts'],
+      matchStrings: ["DEFAULT_OMO_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: 'oh-my-openagent',
+      datasourceTemplate: 'npm',
+    },
+  ],
   packageRules: [
     {
       matchFileNames: ['.github/workflows/**'],
@@ -30,6 +39,10 @@
       matchUpdateTypes: ['major'],
       groupName: 'semantic-release and conventionalcommits',
       semanticCommitType: 'feat',
+    },
+    {
+      matchPackageNames: ['oh-my-openagent'],
+      semanticCommitType: 'build',
     },
   ],
   postUpgradeTasks: {
