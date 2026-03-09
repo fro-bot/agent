@@ -303,6 +303,31 @@ describe('ensureProjectId', () => {
     expect(result.source).toBe('generated')
   })
 
+  it('handles concurrent write (EEXIST from wx flag) gracefully and still returns generated ID', async () => {
+    // #given .git/opencode already exists with invalid content (initial readFile falls through)
+    // This simulates a race where another process writes the file between our check and write:
+    // the wx flag will throw EEXIST when writeFile runs, which must be handled without error.
+    await fs.mkdir(gitDir, {recursive: true})
+    await fs.writeFile(projectIdFile, 'not-a-valid-sha', 'utf8')
+
+    const rootCommitSha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'
+    const execAdapter = createMockExecAdapter({stdout: `${rootCommitSha}\n`})
+
+    const options: ProjectIdOptions = {
+      workspacePath,
+      logger: createTestLogger(),
+      execAdapter,
+    }
+
+    // #when ensureProjectId is called (writeFile with wx will throw EEXIST since file exists)
+    const result = await ensureProjectId(options)
+
+    // #then it still returns the generated ID without propagating the EEXIST error
+    expect(result.projectId).toBe(rootCommitSha)
+    expect(result.source).toBe('generated')
+    expect(result.error).toBeUndefined()
+  })
+
   it('accepts valid SHA-1 format from cache', async () => {
     // #given workspace with .git/opencode containing valid SHA
     const validSha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'
