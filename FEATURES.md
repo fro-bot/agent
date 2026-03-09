@@ -600,7 +600,7 @@ Install OpenCode binary via `@actions/tool-cache` for cross-run caching.
 
 **Acceptance Criteria:**
 - [ ] Installs OpenCode CLI via `@actions/tool-cache` with cross-run caching
-- [ ] Supports `opencode-version` input (default: `latest`)
+- [ ] Supports `opencode-version` input (default: `1.2.24`)
 - [ ] Add OpenCode to PATH for subsequent steps
 
 ---

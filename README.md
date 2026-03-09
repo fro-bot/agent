@@ -370,7 +370,7 @@ concurrency:
 | `agent`             | No       | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
 | `model`             | No       | —          | Model override in `provider/model` format          |
 | `timeout`           | No       | `1800000`  | Execution timeout in milliseconds (0 = no limit)   |
-| `opencode-version`  | No       | `latest`   | OpenCode CLI version for installation              |
+| `opencode-version`  | No       | `1.2.24`   | OpenCode CLI version for installation              |
 | `session-retention` | No       | `50`       | Number of sessions to retain before pruning        |
 | `s3-backup`         | No       | `false`    | Enable S3 write-through backup                     |
 | `s3-bucket`         | No       | —          | S3 bucket name (required if `s3-backup` is true)   |
