@@ -4,14 +4,14 @@
   customManagers: [
     {
       customType: 'regex',
-      fileMatch: ['src/shared/constants\\.ts'],
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
       matchStrings: ["DEFAULT_OMO_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
       depNameTemplate: 'oh-my-openagent',
       datasourceTemplate: 'npm',
     },
     {
       customType: 'regex',
-      fileMatch: ['src/shared/constants\\.ts'],
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
       matchStrings: ["DEFAULT_OPENCODE_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
@@ -19,14 +19,8 @@
     },
   ],
   packageRules: [
-    {
-      matchFileNames: ['.github/workflows/**'],
-      semanticCommitType: 'ci',
-    },
-    {
-      matchDatasources: ['docker'],
-      semanticCommitType: 'build',
-    },
+    {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
+    {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
       matchPackageNames: [
         '@bfra.me/tsconfig',
