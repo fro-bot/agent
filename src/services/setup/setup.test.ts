@@ -710,35 +710,35 @@ describe('setup', () => {
         vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
       })
 
-      it('writes omo-config JSON to oh-my-opencode.json before installer runs', async () => {
+      it('writes omo-config JSON to oh-my-openagent.json before installer runs', async () => {
         // #given
         const customConfig = JSON.stringify({theme: 'dark', model: 'claude-opus-4-5'})
 
         // #when
         const result = await runSetup(createSetupInputs({omoConfig: customConfig}), 'ghs_test_token')
 
-        // #then - writeFile called for oh-my-opencode.json
+        // #then - writeFile called for oh-my-openagent.json
         expect(result).not.toBeNull()
         const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
         const omoConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-openagent.json'),
         )
         expect(omoConfigCall).toBeDefined()
         const written = JSON.parse(omoConfigCall?.[1] as string) as Record<string, unknown>
         expect(written).toMatchObject({theme: 'dark', model: 'claude-opus-4-5'})
       })
 
-      it('does not write oh-my-opencode.json when omo-config is not provided', async () => {
+      it('does not write oh-my-openagent.json when omo-config is not provided', async () => {
         // #given - no omo-config input (default mock returns empty string)
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-        // #then - oh-my-opencode.json is not written
+        // #then - oh-my-openagent.json is not written
         expect(result).not.toBeNull()
         const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
         const omoConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-openagent.json'),
         )
         expect(omoConfigCall).toBeUndefined()
       })
@@ -753,7 +753,7 @@ describe('setup', () => {
         expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('omo-config'))
         const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
         const omoConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-opencode.json'),
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-openagent.json'),
         )
         expect(omoConfigCall).toBeUndefined()
       })

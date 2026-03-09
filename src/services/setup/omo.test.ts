@@ -33,13 +33,13 @@ describe('omo', () => {
 
   describe('installOmo', () => {
     it('returns success on successful installation', async () => {
-      // #given - bunx oh-my-opencode install succeeds
+      // #given - bunx oh-my-openagent install succeeds
       const execMock = vi
         .fn()
         .mockImplementation(
           async (_cmd, _args, options: {listeners?: {stdout?: (chunk: Buffer) => void}}): Promise<number> => {
             if (options?.listeners?.stdout != null) {
-              options.listeners.stdout(Buffer.from('Installing oh-my-opencode@1.2.3\n'))
+              options.listeners.stdout(Buffer.from('Installing oh-my-openagent@1.2.3\n'))
             }
             return 0
           },
@@ -59,7 +59,7 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
         [
-          'oh-my-opencode@1.2.3',
+          'oh-my-openagent@1.2.3',
           'install',
           '--no-tui',
           '--skip-auth',
@@ -101,7 +101,7 @@ describe('omo', () => {
       expect(result.error).toBeNull()
     })
 
-    it('returns failure when bunx oh-my-opencode install fails', async () => {
+    it('returns failure when bunx oh-my-openagent install fails', async () => {
       // #given - bunx command fails
       const execMock = vi.fn().mockResolvedValue(1)
       const mockDeps = createMockDeps({
@@ -146,7 +146,7 @@ describe('omo', () => {
       await installOmo('3.5.5', mockDeps)
 
       // #then
-      expect(mockLogger.info).toHaveBeenCalledWith('Installing Oh My OpenCode plugin', expect.any(Object))
+      expect(mockLogger.info).toHaveBeenCalledWith('Installing Oh My OpenAgent plugin', expect.any(Object))
       expect(mockLogger.info).toHaveBeenCalledWith('oMo plugin installed', expect.any(Object))
     })
 
@@ -163,7 +163,7 @@ describe('omo', () => {
       // #then - bunx call should use version parameter
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
-        expect.arrayContaining(['oh-my-opencode@3.5.5']),
+        expect.arrayContaining(['oh-my-openagent@3.5.5']),
         expect.any(Object),
       )
     })
@@ -182,7 +182,7 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
         [
-          'oh-my-opencode@3.5.5',
+          'oh-my-openagent@3.5.5',
           'install',
           '--no-tui',
           '--skip-auth',
@@ -219,7 +219,7 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
         [
-          'oh-my-opencode@3.5.5',
+          'oh-my-openagent@3.5.5',
           'install',
           '--no-tui',
           '--skip-auth',
@@ -249,7 +249,7 @@ describe('omo', () => {
       expect(execMock).toHaveBeenCalledWith(
         'bunx',
         [
-          'oh-my-opencode@3.5.5',
+          'oh-my-openagent@3.5.5',
           'install',
           '--no-tui',
           '--skip-auth',
@@ -331,7 +331,7 @@ describe('omo', () => {
       const mockExec = createMockExecAdapter({
         getExecOutput: vi.fn().mockResolvedValue({
           exitCode: 0,
-          stdout: '-rw-r--r-- 1 user user 123 Jan 1 00:00 oh-my-opencode.json',
+          stdout: '-rw-r--r-- 1 user user 123 Jan 1 00:00 oh-my-openagent.json',
           stderr: '',
         }),
       })
@@ -344,7 +344,7 @@ describe('omo', () => {
       expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1)
       expect(mockExec.getExecOutput).toHaveBeenCalledWith(
         'ls',
-        ['-la', '~/.config/opencode/oh-my-opencode.json'],
+        ['-la', '~/.config/opencode/oh-my-openagent.json'],
         expect.any(Object),
       )
     })
