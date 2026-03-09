@@ -27,7 +27,8 @@ on:
     types: [completed]
 
 # Restrict default token permissions; the renovate reusable workflow uses an app token.
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   renovate:
