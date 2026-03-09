@@ -1,7 +1,6 @@
 # Product Requirements Document (PRD): Fro Bot Agent Harness
 
-**Version:** 1.4
-**Last Updated:** 2026-01-17
+**Version:** 1.4 **Last Updated:** 2026-01-17
 
 ### Version History
 
@@ -35,7 +34,7 @@
 
 ## Overview
 
-Fro Bot Agent is a **multi-modality agent harness** that runs OpenCode with Oh My OpenCode (oMo) capabilities to act as an autonomous collaborator across multiple platforms:
+Fro Bot Agent is a **multi-modality agent harness** that runs OpenCode with Oh My OpenAgent (oMo) capabilities to act as an autonomous collaborator across multiple platforms:
 
 - **GitHub Action** (MVP): Issues, Discussions, and Pull Requests via GitHub Actions triggers
 - **Discord Bot** (MVP): Long-running daemon with channel=repo, thread=session UX

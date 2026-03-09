@@ -1129,7 +1129,7 @@ pnpm test         # Run tests
 
 **Two layers of session management exist:**
 
-1. **oMo Session Tools (Agent-side)** - LLM tools provided by Oh My OpenCode plugin to AI agents during runtime:
+1. **oMo Session Tools (Agent-side)** - LLM tools provided by Oh My OpenAgent plugin to AI agents during runtime:
    - `session_search` - Full-text search across sessions
    - `session_read` - Read session messages and history
    - `session_info` - Get session metadata and statistics

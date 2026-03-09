@@ -28,7 +28,7 @@
 
 ## Product Overview
 
-Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenCode (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
+Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenAgent (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
 
 **Core Differentiator:** Durable memory across runs - OpenCode session/application state is restored at start and saved at end, enabling the agent to pick up work without repeating expensive investigation.
 
@@ -616,7 +616,7 @@ Automatically install Bun runtime and oMo plugins.
 
 **Acceptance Criteria:**
 - [ ] Automatically installs Bun runtime via `@actions/tool-cache`
-- [ ] Installs oMo plugin via `bunx oh-my-opencode install`
+- [ ] Installs oMo plugin via `bunx oh-my-openagent install`
 - [ ] Users do NOT need `oven-sh/setup-bun`
 - [ ] Graceful degradation: warn on failure, do not fail the run
 

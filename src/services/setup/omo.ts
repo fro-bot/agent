@@ -20,7 +20,7 @@ export interface OmoInstallDeps {
 }
 
 /**
- * Install Oh My OpenCode (oMo) plugin in headless mode.
+ * Install Oh My OpenAgent (oMo) plugin in headless mode.
  *
  * Adds Sisyphus agent capabilities to OpenCode with configurable model providers.
  * Uses bunx to download and run the installer ephemerally. Platform-specific
@@ -47,7 +47,7 @@ export async function installOmo(
     kimiForCoding = 'no',
   } = options
 
-  logger.info('Installing Oh My OpenCode plugin', {
+  logger.info('Installing Oh My OpenAgent plugin', {
     version,
     claude,
     copilot,
@@ -60,7 +60,7 @@ export async function installOmo(
 
   let output = ''
   const args = [
-    `oh-my-opencode@${version}`,
+    `oh-my-openagent@${version}`,
     'install',
     '--no-tui',
     '--skip-auth',
@@ -86,7 +86,7 @@ export async function installOmo(
       ignoreReturnCode: true,
     })
     if (exitCode !== 0) {
-      const errorMsg = `bunx oh-my-opencode install returned exit code ${exitCode}`
+      const errorMsg = `bunx oh-my-openagent install returned exit code ${exitCode}`
       logger.error(errorMsg, {output: output.slice(0, 1000)})
       return {installed: false, version: null, error: `${errorMsg}\n${output.slice(0, 500)}`}
     }
@@ -98,7 +98,7 @@ export async function installOmo(
     const errorMsg = toErrorMessage(error)
     const fullError = output.length > 0 ? `${errorMsg}\nOutput: ${output.slice(0, 500)}` : errorMsg
     logger.error('Failed to run oMo installer', {error: errorMsg, output: output.slice(0, 500)})
-    return {installed: false, version: null, error: `bunx oh-my-opencode install failed: ${fullError}`}
+    return {installed: false, version: null, error: `bunx oh-my-openagent install failed: ${fullError}`}
   }
 }
 
