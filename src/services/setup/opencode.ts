@@ -2,13 +2,14 @@ import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCache
 import os from 'node:os'
 import process from 'node:process'
 
+import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 
 /** Known stable version for fallback when latest fails */
-export const FALLBACK_VERSION = '1.2.9'
+export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
 
 /**
  * Get platform information for binary downloads.

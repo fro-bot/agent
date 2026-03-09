@@ -81,9 +81,9 @@ author: "Fro Bot <agent@fro.bot>"
 
 inputs:
   opencode-version:
-    description: "OpenCode version to install (default: latest)"
+    description: "OpenCode version to install (default: 1.2.24)"
     required: false
-    default: "latest"
+    default: "1.2.24"
   auth-json:
     description: |
       JSON object mapping provider IDs to auth configs.
@@ -859,7 +859,7 @@ async function run(): Promise<void> {
 
 function parseInputs(): SetupInputs {
   return {
-    opencodeVersion: core.getInput("opencode-version") || "latest",
+    opencodeVersion: core.getInput("opencode-version") || "1.2.24",
     authJson: core.getInput("auth-json", {required: true}),
     appId: core.getInput("app-id") || null,
     privateKey: core.getInput("private-key") || null,

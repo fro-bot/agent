@@ -11,7 +11,7 @@ import * as toolsCache from './tools-cache.js'
 
 function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
   return {
-    opencodeVersion: 'latest',
+    opencodeVersion: '1.2.24',
     authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
     appId: null,
     privateKey: null,
@@ -111,7 +111,7 @@ describe('setup', () => {
       const inputs: Record<string, string> = {
         'github-token': 'ghs_test_token',
         'auth-json': '{"anthropic": {"api_key": "sk-ant-test"}}',
-        'opencode-version': 'latest',
+        'opencode-version': '1.2.24',
       }
       return inputs[name] ?? ''
     })

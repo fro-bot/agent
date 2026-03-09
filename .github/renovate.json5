@@ -9,6 +9,14 @@
       depNameTemplate: 'oh-my-openagent',
       datasourceTemplate: 'npm',
     },
+    {
+      customType: 'regex',
+      fileMatch: ['src/shared/constants\\.ts'],
+      matchStrings: ["DEFAULT_OPENCODE_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: 'anomalyco/opencode',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^v?(?<version>.*)$',
+    },
   ],
   packageRules: [
     {
@@ -42,6 +50,10 @@
     },
     {
       matchPackageNames: ['oh-my-openagent'],
+      semanticCommitType: 'build',
+    },
+    {
+      matchPackageNames: ['anomalyco/opencode'],
       semanticCommitType: 'build',
     },
   ],
