@@ -17,6 +17,14 @@
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',
     },
+    {
+      customType: 'regex',
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
+      matchStrings: ["DEFAULT_BUN_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
   ],
   packageRules: [
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
@@ -48,6 +56,10 @@
     },
     {
       matchPackageNames: ['anomalyco/opencode'],
+      semanticCommitType: 'build',
+    },
+    {
+      matchPackageNames: ['oven-sh/bun'],
       semanticCommitType: 'build',
     },
   ],
