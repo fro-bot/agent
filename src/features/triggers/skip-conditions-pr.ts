@@ -24,6 +24,10 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       message: `Pull requests from bots (${context.author.login}) are not processed`,
     }
   }
+  // For review_requested, skip association gating on the PR author. GitHub restricts
+  // reviewer assignment to users with write or triage access, and the webhook payload
+  // does not carry the requester's (sender's) association — only the PR author's.
+  // Trust is: non-bot sender + GitHub access control + explicit bot reviewer assignment.
   if (
     context.action !== 'review_requested' &&
     context.author != null &&
