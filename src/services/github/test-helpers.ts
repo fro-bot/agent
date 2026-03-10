@@ -36,6 +36,7 @@ export interface MockOctokitOverrides {
   readonly listReviewComments?: Mock | unknown[]
   readonly createReplyForReviewComment?: Mock | unknown
   readonly getPullRequest?: Mock | unknown
+  readonly getCollaboratorPermissionLevel?: Mock | unknown
 }
 
 export function createMockOctokit(overrides: MockOctokitOverrides = {}): Octokit {
@@ -167,6 +168,12 @@ export function createMockOctokit(overrides: MockOctokitOverrides = {}): Octokit
           typeof overrides.getRepo === 'function'
             ? overrides.getRepo
             : vi.fn().mockResolvedValue({data: overrides.getRepo ?? {default_branch: 'main'}}),
+        getCollaboratorPermissionLevel:
+          typeof overrides.getCollaboratorPermissionLevel === 'function'
+            ? overrides.getCollaboratorPermissionLevel
+            : vi.fn().mockResolvedValue({
+                data: overrides.getCollaboratorPermissionLevel ?? {permission: 'write', user: {login: 'test-user'}},
+              }),
       },
       users: {
         getByUsername:
