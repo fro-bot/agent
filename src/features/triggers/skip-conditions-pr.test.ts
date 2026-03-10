@@ -259,4 +259,61 @@ describe('pull_request ready_for_review routing', () => {
     expect(result.shouldProcess).toBe(true)
     expect(result.context.action).toBe('review_requested')
   })
+
+  it('blocks ready_for_review on bot-authored PR when senderAssociation is not resolved', () => {
+    // #given a ready_for_review event on a Copilot-authored PR (CONTRIBUTOR)
+    // without sender association resolution (API failure scenario)
+    const payload = {
+      action: 'ready_for_review',
+      pull_request: {
+        number: 22,
+        title: 'fix: SPA routing on GitHub Pages',
+        body: 'Automated fix',
+        locked: false,
+        draft: false,
+        author_association: 'CONTRIBUTOR',
+        requested_reviewers: [{login: 'fro-bot', type: 'User'}],
+        requested_teams: [],
+      },
+      sender: {login: 'marcusrbrown'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing without sender association (API failed)
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should block — ready_for_review requires successful API resolution
+    // unlike review_requested which has a permissive fallback
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
+  })
+
+  it('processes ready_for_review on bot-authored PR with senderAssociation override', () => {
+    // #given a ready_for_review event where the sender's association was resolved via API
+    const payload = {
+      action: 'ready_for_review',
+      pull_request: {
+        number: 22,
+        title: 'fix: SPA routing on GitHub Pages',
+        body: 'Automated fix',
+        locked: false,
+        draft: false,
+        author_association: 'CONTRIBUTOR',
+        requested_reviewers: [{login: 'fro-bot', type: 'User'}],
+        requested_teams: [],
+      },
+      sender: {login: 'marcusrbrown'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing with resolved sender association
+    const result = routeEvent(ghContext, logger, {
+      botLogin: 'fro-bot',
+      senderAssociation: 'OWNER',
+    })
+
+    // #then it should process and the author association should be overridden
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.author?.association).toBe('OWNER')
+  })
 })

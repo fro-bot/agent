@@ -1219,8 +1219,8 @@ describe('routeEvent', () => {
     })
   })
 
-  describe('senderAssociation override for review_requested', () => {
-    it('overrides author association when senderAssociation is provided', () => {
+  describe('senderAssociation override', () => {
+    it('overrides author association for review_requested', () => {
       // #given a review_requested event where the PR author has CONTRIBUTOR association
       // but the sender (requester) has been resolved as COLLABORATOR via API
       const payload = {
@@ -1230,28 +1230,55 @@ describe('routeEvent', () => {
           title: 'feat: bot-authored PR',
           body: 'Automated changes',
           state: 'open',
-          user: {login: 'some-bot'},
+          user: {login: 'Copilot'},
           draft: false,
           locked: false,
           author_association: 'CONTRIBUTOR',
           requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
         },
         requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
-        repository: {
-          owner: {login: 'owner'},
-          name: 'repo',
-        },
+        repository: {owner: {login: 'owner'}, name: 'repo'},
         sender: {login: 'marcusrbrown'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
-      const config = {botLogin: 'fro-bot', senderAssociation: 'COLLABORATOR'}
+      const config = {botLogin: 'fro-bot', senderAssociation: 'OWNER'}
 
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
 
-      // #then the author association should be overridden to COLLABORATOR
+      // #then the author association should be overridden to OWNER
       expect(result.shouldProcess).toBe(true)
-      expect(result.context.author?.association).toBe('COLLABORATOR')
+      expect(result.context.author?.association).toBe('OWNER')
+    })
+
+    it('overrides author association for ready_for_review', () => {
+      // #given a ready_for_review event on a bot-authored PR
+      // where the sender (who marked it ready) is the repo owner
+      const payload = {
+        action: 'ready_for_review',
+        pull_request: {
+          number: 22,
+          title: 'fix: SPA routing on GitHub Pages',
+          body: 'Automated fix',
+          state: 'open',
+          user: {login: 'Copilot'},
+          draft: false,
+          locked: false,
+          author_association: 'CONTRIBUTOR',
+          requested_reviewers: [{login: 'fro-bot', type: 'User'}],
+        },
+        repository: {owner: {login: 'marcusrbrown'}, name: 'mrbro.dev'},
+        sender: {login: 'marcusrbrown'},
+      }
+      const ghContext = createMockGitHubContext('pull_request', payload)
+      const config = {botLogin: 'fro-bot', senderAssociation: 'OWNER'}
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, config)
+
+      // #then the author association should be overridden to OWNER
+      expect(result.shouldProcess).toBe(true)
+      expect(result.context.author?.association).toBe('OWNER')
     })
 
     it('does not override when senderAssociation is null', () => {
@@ -1263,17 +1290,14 @@ describe('routeEvent', () => {
           title: 'feat: bot-authored PR',
           body: 'Automated changes',
           state: 'open',
-          user: {login: 'some-bot'},
+          user: {login: 'Copilot'},
           draft: false,
           locked: false,
           author_association: 'CONTRIBUTOR',
           requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
         },
         requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
-        repository: {
-          owner: {login: 'owner'},
-          name: 'repo',
-        },
+        repository: {owner: {login: 'owner'}, name: 'repo'},
         sender: {login: 'marcusrbrown'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
@@ -1282,13 +1306,13 @@ describe('routeEvent', () => {
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
 
-      // #then the author association should remain the PR author's (CONTRIBUTOR)
-      // and review_requested still processes because association gating is skipped for it
+      // #then association remains the PR author's (CONTRIBUTOR)
+      // and still processes because association gating is skipped for review_requested
       expect(result.shouldProcess).toBe(true)
       expect(result.context.author?.association).toBe('CONTRIBUTOR')
     })
 
-    it('does not override for non-review_requested actions even with senderAssociation', () => {
+    it('does not override for non-sender-triggered actions', () => {
       // #given an opened PR with senderAssociation provided (should be ignored)
       const payload = {
         action: 'opened',
@@ -1302,10 +1326,7 @@ describe('routeEvent', () => {
           locked: false,
           author_association: 'CONTRIBUTOR',
         },
-        repository: {
-          owner: {login: 'owner'},
-          name: 'repo',
-        },
+        repository: {owner: {login: 'owner'}, name: 'repo'},
         sender: {login: 'contributor'},
       }
       const ghContext = createMockGitHubContext('pull_request', payload)
