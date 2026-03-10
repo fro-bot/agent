@@ -5,6 +5,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as core from '@actions/core'
 import {collectAgentContext} from '../../features/agent/index.js'
 import {routeEvent} from '../../features/triggers/index.js'
+import {getRepositoryPermission} from '../../services/github/api.js'
 import {createClient, getBotLogin, parseGitHubContext} from '../../services/github/index.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
@@ -26,11 +27,28 @@ export async function runRouting(
   const githubClient = createClient({token: bootstrap.inputs.githubToken, logger: contextLogger})
   const botLogin = await getBotLogin(githubClient, contextLogger)
 
+  let senderAssociation: string | null = null
+  if (
+    githubContext.eventType === 'pull_request' &&
+    githubContext.event.type === 'pull_request' &&
+    githubContext.event.action === 'review_requested'
+  ) {
+    const {owner, repo} = githubContext.repo
+    senderAssociation = await getRepositoryPermission(
+      githubClient,
+      owner,
+      repo,
+      githubContext.event.sender.login,
+      contextLogger,
+    )
+  }
+
   const triggerLogger = createLogger({phase: 'trigger'})
   const triggerResult = routeEvent(githubContext, triggerLogger, {
     botLogin,
     requireMention: true,
     promptInput: bootstrap.inputs.prompt,
+    senderAssociation,
   })
 
   if (!triggerResult.shouldProcess) {
