@@ -245,7 +245,8 @@ const PERMISSION_TO_ASSOCIATION: Readonly<Record<string, string>> = {
 
 /**
  * Resolve a user's repository permission level as an author_association equivalent.
- * Used for review_requested events where the webhook payload omits the sender's association.
+ * Used for review_requested and ready_for_review events where the webhook payload
+ * carries the PR author's association instead of the sender's.
  * Returns null for read/none permissions or on API error.
  */
 export async function getRepositoryPermission(
