@@ -28,7 +28,10 @@ export async function runRouting(
   const botLogin = await getBotLogin(githubClient, contextLogger)
 
   let senderAssociation: string | null = null
-  if (githubContext.event.type === 'pull_request' && githubContext.event.action === 'review_requested') {
+  if (
+    githubContext.event.type === 'pull_request' &&
+    (githubContext.event.action === 'review_requested' || githubContext.event.action === 'ready_for_review')
+  ) {
     const {owner, repo} = githubContext.repo
     senderAssociation = await getRepositoryPermission(
       githubClient,

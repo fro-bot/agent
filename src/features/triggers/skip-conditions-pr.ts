@@ -25,9 +25,15 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
     }
   }
   // For review_requested, skip association gating on the PR author. GitHub restricts
-  // reviewer assignment to users with write or triage access, and the webhook payload
-  // does not carry the requester's (sender's) association — only the PR author's.
-  // Trust is: non-bot sender + GitHub access control + explicit bot reviewer assignment.
+  // reviewer assignment to users with write or triage access, providing a strong
+  // platform-level permission gate. The webhook payload only carries the PR author's
+  // association (not the sender's), and when the API lookup succeeds the router has
+  // already overridden author.association. This fallback handles API failure.
+  //
+  // For ready_for_review, no fallback bypass — GitHub gates it to PR authors + write
+  // access users, which is weaker than review_requested. The sender's association
+  // MUST be resolved via API (Layer 1) for ready_for_review to pass this check on
+  // bot-authored PRs. If the API call fails, this correctly blocks.
   if (
     context.action !== 'review_requested' &&
     context.author != null &&

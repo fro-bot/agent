@@ -16,7 +16,11 @@ export function routeEvent(
   const fullConfig: TriggerConfig = {...DEFAULT_TRIGGER_CONFIG, ...config}
   let context = buildTriggerContext(githubContext, fullConfig.botLogin, fullConfig.promptInput)
 
-  if (fullConfig.senderAssociation != null && context.action === 'review_requested' && context.author != null) {
+  if (
+    fullConfig.senderAssociation != null &&
+    (context.action === 'review_requested' || context.action === 'ready_for_review') &&
+    context.author != null
+  ) {
     context = {...context, author: {...context.author, association: fullConfig.senderAssociation}}
   }
 
