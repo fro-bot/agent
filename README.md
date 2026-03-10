@@ -284,7 +284,7 @@ The action supports seven event types. Use this section to wire triggers correct
 - **Behavior:** Runs an AI review on `opened`, `synchronize`, `reopened`, `ready_for_review`, and `review_requested`.
 - **Reviewer-assignment gating:** For `review_requested` and `ready_for_review`, processing continues only when the configured bot login is requested as reviewer (or when `bot-login` is not set).
 - **Team requests:** `review_requested` events targeting teams are normalized and exposed in context, but current gating only auto-triggers for explicit reviewer logins, not team membership expansion.
-- **Skip conditions:** Draft PRs, fork PRs, or untrusted author association.
+- **Skip conditions:** Draft PRs and fork PRs. For `opened`/`synchronize`/`reopened`/`ready_for_review`, untrusted author association is skipped. For `review_requested`, processing is gated by requester bot-check and explicit bot reviewer assignment.
 - **Guard example:**
   ```yaml
   if: >-

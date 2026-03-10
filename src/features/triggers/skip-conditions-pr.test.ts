@@ -172,4 +172,91 @@ describe('pull_request ready_for_review routing', () => {
     expect(result.shouldProcess).toBe(false)
     expect(result.shouldProcess === false && result.skipReason).toBe('bot_not_requested')
   })
+
+  it('routes pull_request.review_requested when requester triggers review for bot-authored PR', () => {
+    // #given a review request from a maintainer for a bot-authored PR
+    // sender has no author_association (realistic webhook shape)
+    const payload = {
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        number: 106,
+        title: 'chore: renovate dependency updates',
+        body: 'Automated dependency update',
+        locked: false,
+        draft: false,
+        author_association: 'NONE',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+        requested_teams: [],
+      },
+      sender: {login: 'repo-maintainer'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should process because requester initiated the review request
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.action).toBe('review_requested')
+    expect(result.context.isBotReviewRequested).toBe(true)
+  })
+
+  it('skips pull_request.review_requested when requester is a bot', () => {
+    // #given a review request triggered by a bot requester
+    const payload = {
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        number: 107,
+        title: 'feat: request from bot account',
+        body: 'Please review',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+        requested_teams: [],
+      },
+      sender: {login: 'dependabot[bot]'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should skip because requester is a bot
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
+  })
+
+  it('processes review_requested with realistic sender (no author_association) even when PR author has low association', () => {
+    // #given a review_requested event with minimal sender (matching real webhook shape)
+    // and a PR authored by someone with NONE association
+    const payload = {
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        number: 108,
+        title: 'chore: dependency update',
+        body: 'Automated update',
+        locked: false,
+        draft: false,
+        author_association: 'NONE',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+        requested_teams: [],
+      },
+      sender: {login: 'trusted-maintainer'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {
+      botLogin: 'fro-bot',
+      allowedAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
+    })
+
+    // #then it should process because review_requested skips association gating
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.action).toBe('review_requested')
+  })
 })
