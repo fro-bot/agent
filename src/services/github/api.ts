@@ -243,6 +243,11 @@ const PERMISSION_TO_ASSOCIATION: Readonly<Record<string, string>> = {
   triage: 'COLLABORATOR',
 }
 
+/**
+ * Resolve a user's repository permission level as an author_association equivalent.
+ * Used for review_requested events where the webhook payload omits the sender's association.
+ * Returns null for read/none permissions or on API error.
+ */
 export async function getRepositoryPermission(
   client: Octokit,
   owner: string,
