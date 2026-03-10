@@ -188,6 +188,8 @@ export interface TriggerConfig {
   readonly skipDraftPRs: boolean
   /** Prompt input for schedule/workflow_dispatch triggers */
   readonly promptInput: string | null
+  /** Resolved sender association from API (for review_requested where webhook lacks it) */
+  readonly senderAssociation: string | null
 }
 
 /**
@@ -199,4 +201,5 @@ export const DEFAULT_TRIGGER_CONFIG: TriggerConfig = {
   allowedAssociations: ALLOWED_ASSOCIATIONS,
   skipDraftPRs: true,
   promptInput: null,
+  senderAssociation: null,
 } as const

@@ -233,6 +233,39 @@ export async function getDefaultBranch(client: Octokit, repoString: string, logg
   }
 }
 
+// Maps GitHub repository permission levels to author_association equivalents.
+// Used when the webhook payload doesn't include the sender's association
+// (e.g., pull_request events where sender != PR author).
+const PERMISSION_TO_ASSOCIATION: Readonly<Record<string, string>> = {
+  admin: 'OWNER',
+  maintain: 'MEMBER',
+  write: 'COLLABORATOR',
+  triage: 'COLLABORATOR',
+}
+
+/**
+ * Resolve a user's repository permission level as an author_association equivalent.
+ * Used for review_requested events where the webhook payload omits the sender's association.
+ * Returns null for read/none permissions or on API error.
+ */
+export async function getRepositoryPermission(
+  client: Octokit,
+  owner: string,
+  repo: string,
+  username: string,
+  logger: Logger,
+): Promise<string | null> {
+  try {
+    const {data} = await client.rest.repos.getCollaboratorPermissionLevel({owner, repo, username})
+    const association = PERMISSION_TO_ASSOCIATION[data.permission] ?? null
+    logger.debug('Resolved sender permission', {username, permission: data.permission, association})
+    return association
+  } catch (error) {
+    logger.warning('Failed to resolve sender permission', {username, error: toErrorMessage(error)})
+    return null
+  }
+}
+
 /**
  * Get user information by username.
  * Used to get bot user ID for commit attribution.

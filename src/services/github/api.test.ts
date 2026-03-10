@@ -8,6 +8,7 @@ import {
   deleteCommentReaction,
   ensureLabelExists,
   getDefaultBranch,
+  getRepositoryPermission,
   getUserByUsername,
   listCommentReactions,
   parseRepoString,
@@ -344,6 +345,133 @@ describe('getDefaultBranch', () => {
     // #then
     expect(result).toBe('main')
     expect(mockLogger.warning).toHaveBeenCalled()
+  })
+})
+
+describe('getRepositoryPermission', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  it('maps admin permission to OWNER', async () => {
+    // #given a user with admin permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'admin', user: {login: 'admin-user'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'admin-user', mockLogger)
+
+    // #then it should return OWNER
+    expect(result).toBe('OWNER')
+  })
+
+  it('maps maintain permission to MEMBER', async () => {
+    // #given a user with maintain permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'maintain', user: {login: 'maintainer'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'maintainer', mockLogger)
+
+    // #then it should return MEMBER
+    expect(result).toBe('MEMBER')
+  })
+
+  it('maps write permission to COLLABORATOR', async () => {
+    // #given a user with write permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'write', user: {login: 'writer'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'writer', mockLogger)
+
+    // #then it should return COLLABORATOR
+    expect(result).toBe('COLLABORATOR')
+  })
+
+  it('maps triage permission to COLLABORATOR', async () => {
+    // #given a user with triage permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'triage', user: {login: 'triager'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'triager', mockLogger)
+
+    // #then it should return COLLABORATOR
+    expect(result).toBe('COLLABORATOR')
+  })
+
+  it('returns null for read permission', async () => {
+    // #given a user with read-only permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'read', user: {login: 'reader'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'reader', mockLogger)
+
+    // #then it should return null (not an authorized association)
+    expect(result).toBeNull()
+  })
+
+  it('returns null for none permission', async () => {
+    // #given a user with no permission
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'none', user: {login: 'outsider'}},
+    } as never)
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'outsider', mockLogger)
+
+    // #then it should return null
+    expect(result).toBeNull()
+  })
+
+  it('returns null on API error', async () => {
+    // #given an API failure
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockRejectedValue(new Error('Not found'))
+
+    // #when resolving their repository permission
+    const result = await getRepositoryPermission(mockClient, 'owner', 'repo', 'unknown', mockLogger)
+
+    // #then it should return null and log a warning
+    expect(result).toBeNull()
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      'Failed to resolve sender permission',
+      expect.objectContaining({username: 'unknown'}),
+    )
+  })
+
+  it('logs resolved permission details', async () => {
+    // #given a successful permission resolution
+    const mockClient = createMockOctokit()
+    vi.mocked(mockClient.rest.repos.getCollaboratorPermissionLevel).mockResolvedValue({
+      data: {permission: 'write', user: {login: 'marcus'}},
+    } as never)
+
+    // #when resolving their repository permission
+    await getRepositoryPermission(mockClient, 'owner', 'repo', 'marcus', mockLogger)
+
+    // #then it should log the resolution
+    expect(mockLogger.debug).toHaveBeenCalledWith('Resolved sender permission', {
+      username: 'marcus',
+      permission: 'write',
+      association: 'COLLABORATOR',
+    })
   })
 })
 
