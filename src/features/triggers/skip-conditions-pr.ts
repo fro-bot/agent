@@ -17,28 +17,31 @@ export function checkPullRequestSkipConditions(context: TriggerContext, config: 
       message: `Pull request action '${action}' is not supported`,
     }
   }
-  if (context.author != null && context.author.isBot) {
+  // For review_requested/ready_for_review the webhook sender is the user or bot
+  // that triggered the action, not the PR author. A bot auto-assigning reviews
+  // (e.g., bfra-me[bot]) is a legitimate workflow — not a self-loop. Loop
+  // prevention for these actions comes from bot_not_requested below.
+  if (
+    context.action !== 'review_requested' &&
+    context.action !== 'ready_for_review' &&
+    context.author != null &&
+    context.author.isBot
+  ) {
     return {
       shouldSkip: true,
       reason: 'self_comment',
       message: `Pull requests from bots (${context.author.login}) are not processed`,
     }
   }
-  // For review_requested, skip association gating on the PR author. GitHub restricts
-  // reviewer assignment to users with write or triage access, providing a strong
-  // platform-level permission gate. The webhook payload only carries the PR author's
-  // association (not the sender's), and when the API lookup succeeds the router has
-  // already overridden author.association. This fallback handles API failure.
-  //
-  // For ready_for_review, no fallback bypass — GitHub gates it to PR authors + write
-  // access users, which is weaker than review_requested. The sender's association
-  // MUST be resolved via API (Layer 1) for ready_for_review to pass this check on
-  // bot-authored PRs. If the API call fails, this correctly blocks.
-  if (
-    context.action !== 'review_requested' &&
-    context.author != null &&
-    !isAuthorizedAssociation(context.author.association, config.allowedAssociations)
-  ) {
+  // For review_requested and ready_for_review, the router resolves the sender's
+  // association via API and overrides author.association before this check runs.
+  // No permissive fallback for any action — if the API lookup fails and the PR
+  // author is unauthorized, the event is correctly blocked. The three authorization
+  // rules fall out naturally:
+  //   Rule 1: Authorized PR author → author.association passes this check
+  //   Rule 2: Unauthorized PR author + authorized sender → router overrode author.association
+  //   Rule 3: Unauthorized PR author + no resolution → blocks here
+  if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {
     return {
       shouldSkip: true,
       reason: 'unauthorized_author',

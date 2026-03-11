@@ -173,9 +173,8 @@ describe('pull_request ready_for_review routing', () => {
     expect(result.shouldProcess === false && result.skipReason).toBe('bot_not_requested')
   })
 
-  it('routes pull_request.review_requested when requester triggers review for bot-authored PR', () => {
-    // #given a review request from a maintainer for a bot-authored PR
-    // sender has no author_association (realistic webhook shape)
+  it('routes pull_request.review_requested when authorized sender triggers review for bot-authored PR', () => {
+    // #given a review request from a maintainer (resolved via API) for a bot-authored PR
     const payload = {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
@@ -193,17 +192,18 @@ describe('pull_request ready_for_review routing', () => {
     }
     const ghContext = createMockGitHubContext('pull_request', payload)
 
-    // #when routing the event
-    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+    // #when routing with resolved sender association (Rule 2)
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', senderAssociation: 'MEMBER'})
 
-    // #then it should process because requester initiated the review request
+    // #then it should process — sender's MEMBER association overrides PR author's NONE
     expect(result.shouldProcess).toBe(true)
     expect(result.context.action).toBe('review_requested')
     expect(result.context.isBotReviewRequested).toBe(true)
   })
 
-  it('skips pull_request.review_requested when requester is a bot', () => {
-    // #given a review request triggered by a bot requester
+  it('processes review_requested from bot sender when PR author is authorized', () => {
+    // #given a review request triggered by a bot (auto-assign action)
+    // on a PR authored by an authorized user (MEMBER)
     const payload = {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
@@ -217,6 +217,61 @@ describe('pull_request ready_for_review routing', () => {
         requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
         requested_teams: [],
       },
+      sender: {login: 'bfra-me[bot]'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should process — bot sender check is skipped for review_requested
+    // and the PR author's MEMBER association is authorized
+    expect(result.shouldProcess).toBe(true)
+    expect(result.context.action).toBe('review_requested')
+  })
+
+  it('blocks review_requested from bot sender when PR author is unauthorized and no senderAssociation', () => {
+    // #given a review request triggered by a bot on a PR with unauthorized author
+    // and no sender association resolved (API failure or bot sender)
+    const payload = {
+      action: 'review_requested',
+      requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
+      pull_request: {
+        number: 108,
+        title: 'chore: automated update',
+        body: 'Bot-created PR',
+        locked: false,
+        draft: false,
+        author_association: 'NONE',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+        requested_teams: [],
+      },
+      sender: {login: 'some-bot[bot]'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should block — no permissive fallback, unauthorized author blocks
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
+  })
+
+  it('still blocks bot sender for non-review actions (opened)', () => {
+    // #given a PR opened by a bot
+    const payload = {
+      action: 'opened',
+      pull_request: {
+        number: 109,
+        title: 'chore: automated PR',
+        body: 'Bot-created',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [],
+        requested_teams: [],
+      },
       sender: {login: 'dependabot[bot]'},
     }
     const ghContext = createMockGitHubContext('pull_request', payload)
@@ -224,14 +279,14 @@ describe('pull_request ready_for_review routing', () => {
     // #when routing the event
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
 
-    // #then it should skip because requester is a bot
+    // #then it should skip — bot sender check still applies for opened
     expect(result.shouldProcess).toBe(false)
     expect(result.shouldProcess === false && result.skipReason).toBe('self_comment')
   })
 
-  it('processes review_requested with realistic sender (no author_association) even when PR author has low association', () => {
-    // #given a review_requested event with minimal sender (matching real webhook shape)
-    // and a PR authored by someone with NONE association
+  it('blocks review_requested when PR author is unauthorized and no senderAssociation override', () => {
+    // #given a review_requested event where the PR author has NONE association
+    // and no senderAssociation was resolved (API failure)
     const payload = {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
@@ -249,15 +304,43 @@ describe('pull_request ready_for_review routing', () => {
     }
     const ghContext = createMockGitHubContext('pull_request', payload)
 
-    // #when routing the event
+    // #when routing without senderAssociation (API lookup failed)
     const result = routeEvent(ghContext, logger, {
       botLogin: 'fro-bot',
       allowedAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
     })
 
-    // #then it should process because review_requested skips association gating
+    // #then it should block — association gating applies to all actions
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
+  })
+
+  it('processes ready_for_review from bot sender when PR author is authorized', () => {
+    // #given a ready_for_review event triggered by a bot (auto-assign action)
+    // on a PR authored by an authorized user (MEMBER)
+    const payload = {
+      action: 'ready_for_review',
+      pull_request: {
+        number: 110,
+        title: 'feat: bot marks PR ready',
+        body: 'Ready for review',
+        locked: false,
+        draft: false,
+        author_association: 'MEMBER',
+        requested_reviewers: [{login: 'fro-bot[bot]', type: 'Bot'}],
+        requested_teams: [],
+      },
+      sender: {login: 'bfra-me[bot]'},
+    }
+    const ghContext = createMockGitHubContext('pull_request', payload)
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it should process — bot sender check skipped for ready_for_review
+    // and the PR author's MEMBER association is authorized (Rule 1)
     expect(result.shouldProcess).toBe(true)
-    expect(result.context.action).toBe('review_requested')
+    expect(result.context.action).toBe('ready_for_review')
   })
 
   it('blocks ready_for_review on bot-authored PR when senderAssociation is not resolved', () => {
@@ -282,8 +365,8 @@ describe('pull_request ready_for_review routing', () => {
     // #when routing without sender association (API failed)
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
 
-    // #then it should block — ready_for_review requires successful API resolution
-    // unlike review_requested which has a permissive fallback
+    // #then it should block — association gating applies to all actions,
+    // no permissive fallback for any action
     expect(result.shouldProcess).toBe(false)
     expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
   })
