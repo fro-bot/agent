@@ -54,18 +54,21 @@ export async function ensureProjectId(options: ProjectIdOptions): Promise<Projec
   }
 
   try {
-    const stat = await fs.stat(gitDir)
-    if (stat.isDirectory() === false) {
-      const gitFileContent = await fs.readFile(gitDir, 'utf8')
-      const gitdirMatch = /^gitdir: (.+)$/m.exec(gitFileContent)
-      if (gitdirMatch == null) {
-        return {projectId: null, source: 'error', error: 'Invalid .git file format'}
-      }
-      gitDir = path.resolve(workspacePath, gitdirMatch[1] as string)
-      projectIdFile = path.join(gitDir, 'opencode')
+    const gitFileContent = await fs.readFile(gitDir, 'utf8')
+    // .git is a regular file (worktree link) — parse gitdir
+    const gitdirMatch = /^gitdir: (.+)$/m.exec(gitFileContent)
+    if (gitdirMatch == null) {
+      return {projectId: null, source: 'error', error: 'Invalid .git file format'}
     }
-  } catch {
-    return {projectId: null, source: 'error', error: 'Not a git repository'}
+    gitDir = path.resolve(workspacePath, gitdirMatch[1] as string)
+    projectIdFile = path.join(gitDir, 'opencode')
+  } catch (error) {
+    const code = typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined
+    if (code !== 'EISDIR') {
+      // Any error other than EISDIR means .git doesn't exist or isn't accessible
+      return {projectId: null, source: 'error', error: 'Not a git repository'}
+    }
+    // EISDIR: .git is a directory — normal git repository, proceed with gitDir as-is
   }
 
   try {
