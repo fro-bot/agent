@@ -1,11 +1,6 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
-  // Explicitly disable automerge for all packages — every dependency update PR
-  // must receive at least one human approving review before merge.
-  // This overrides any `automerge: true` inherited from the base preset and
-  // ensures the OpenSSF Scorecard Code-Review check is satisfied.
-  automerge: false,
   customManagers: [
     {
       customType: 'regex',
