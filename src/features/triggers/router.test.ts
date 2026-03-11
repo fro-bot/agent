@@ -1283,6 +1283,7 @@ describe('routeEvent', () => {
 
     it('does not override when senderAssociation is null', () => {
       // #given a review_requested event without resolved sender association
+      // and the PR author has an unauthorized association (CONTRIBUTOR)
       const payload = {
         action: 'review_requested',
         pull_request: {
@@ -1306,10 +1307,9 @@ describe('routeEvent', () => {
       // #when routing the event
       const result = routeEvent(ghContext, logger, config)
 
-      // #then association remains the PR author's (CONTRIBUTOR)
-      // and still processes because association gating is skipped for review_requested
-      expect(result.shouldProcess).toBe(true)
-      expect(result.context.author?.association).toBe('CONTRIBUTOR')
+      // #then association remains the PR author's (CONTRIBUTOR) — unauthorized, so blocked
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('unauthorized_author')
     })
 
     it('does not override for non-sender-triggered actions', () => {
