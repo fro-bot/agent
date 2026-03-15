@@ -714,7 +714,7 @@ function createMockClient(options: {sessionIdle?: boolean; sessionError?: boolea
 
 ```bash
 # Development
-pnpm bootstrap     # Install dependencies
+pnpm install       # Install dependencies
 pnpm build         # Bundle to dist/
 pnpm check-types   # TypeScript validation
 pnpm lint          # ESLint check
@@ -1103,7 +1103,7 @@ docs(readme): add SDK execution configuration
 ### Commands
 
 ```bash
-pnpm bootstrap    # Install deps
+pnpm install      # Install deps
 pnpm build        # Bundle
 pnpm check-types  # Type check
 pnpm lint         # Lint

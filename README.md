@@ -544,7 +544,7 @@ If the agent times out before completing:
 
 ```bash
 # Install dependencies
-pnpm bootstrap
+pnpm install
 
 # Run tests
 pnpm test

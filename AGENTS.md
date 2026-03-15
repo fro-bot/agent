@@ -164,7 +164,7 @@ post.ts → harness/post.ts
 ## COMMANDS
 
 ```bash
-pnpm bootstrap      # Install dependencies
+pnpm install        # Install dependencies
 pnpm test           # Run all tests (vitest)
 pnpm lint           # ESLint check
 pnpm fix            # ESLint auto-fix
