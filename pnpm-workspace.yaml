@@ -7,6 +7,10 @@ onlyBuiltDependencies:
   - simple-git-hooks
   - unrs-resolver
 
+overrides:
+  tar@^7: '>=7.5.11'
+  undici@^7: '>=7.24.0'
+
 savePrefix: ''
 
 shamefullyHoist: true
