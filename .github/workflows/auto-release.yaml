@@ -87,6 +87,9 @@ jobs:
       - id: merge-staging
         if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Merge `release/next` into `release`
+        # -Xtheirs is required: the release branch contains semantic-release
+        # git-plugin commits (dist/ + package.json) that conflict with main's
+        # versions of those files. This matches the CI merge strategy.
         run: |
           git merge --no-ff -Xtheirs -m 'skip: merge release/next [skip release]' origin/release/next
 
@@ -112,28 +115,10 @@ jobs:
         if: steps.check-release-pr.outputs.should-release == 'true'
         name: Semantic Release
         run: |
-          before_tag=$(python - <<'PY'
-          import subprocess
-
-          tags = subprocess.check_output(
-              ['git', 'tag', '--list', 'v*', '--sort=-version:refname'],
-              text=True,
-          ).splitlines()
-          print(tags[0] if tags else '')
-          PY
-          )
+          before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD)
           pnpm semantic-release --ci true
-          after_tag=$(python - <<'PY'
-          import subprocess
-
-          tags = subprocess.check_output(
-              ['git', 'tag', '--list', 'v*', '--sort=-version:refname'],
-              text=True,
-          ).splitlines()
-          print(tags[0] if tags else '')
-          PY
-          )
+          after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
             echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
           fi
