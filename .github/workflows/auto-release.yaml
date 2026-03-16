@@ -1,0 +1,156 @@
+---
+name: Auto Release
+
+on:
+  schedule:
+    - cron: '0 20 * * 0,3'
+  workflow_dispatch:
+    inputs:
+      force-release:
+        description: Force a release even when no open release PR exists
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  perform-release:
+    name: Perform Release
+    runs-on: ubuntu-latest
+    steps:
+      - id: get-app-token
+        name: Get GitHub App Installation Token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner}}
+
+      - id: get-user-id
+        name: Get GitHub App User ID and Setup Git user
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        run: |
+          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          user_id=$(gh api "/users/${name}" --jq .id)
+          email="${user_id}+${name}@users.noreply.github.com"
+          echo "user-email=${email}" >> "$GITHUB_OUTPUT"
+          echo "user-name=${name}" >> "$GITHUB_OUTPUT"
+          git config --global user.email "${email}"
+          git config --global user.name "${name}"
+
+      - id: check-release-pr
+        name: Check for release PR
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        run: |
+          PR_NUMBER=$(gh pr list --head release/next --base release --state open --json number --jq '.[0].number')
+          echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR_NUMBER" ] || [ "${{ github.event.inputs.force-release == 'true' }}" = 'true' ]; then
+            echo 'should-release=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'should-release=false' >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Checkout `release` branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          ref: release
+          show-progress: false
+          token: ${{ steps.get-app-token.outputs.token }}
+
+      - id: check-staging
+        if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Check if staging branch exists
+        run: |
+          if git ls-remote --exit-code origin release/next &>/dev/null; then
+            echo 'has-staging=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has-staging=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
+        name: Fetch staging branch
+        run: git fetch origin release/next
+
+      - id: merge-staging
+        if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
+        name: Merge `release/next` into `release`
+        # -Xtheirs is required: the release branch contains semantic-release
+        # git-plugin commits (dist/ + package.json) that conflict with main's
+        # versions of those files. This matches the CI merge strategy.
+        run: |
+          git merge --no-ff -Xtheirs -m 'skip: merge release/next [skip release]' origin/release/next
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Push `release` branch
+        run: git push origin release:release
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Build release
+        run: pnpm build
+
+      - env:
+          GIT_AUTHOR_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
+          GIT_AUTHOR_NAME: ${{ steps.get-user-id.outputs.user-name }}
+          GIT_COMMITTER_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
+          GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
+          GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        id: semantic-release
+        if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Semantic Release
+        run: |
+          before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD)
+          pnpm semantic-release --ci true
+          after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
+            echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Update major version branch
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        run: |
+          version=${{ steps.semantic-release.outputs.new-release-version }}
+          if [ -n "$version" ]; then
+            sha=$(git rev-parse HEAD)
+            branch_name=v$(echo ${version} | cut -d . -f 1)
+            ref=refs/heads/${branch_name}
+            if gh api "repos/{owner}/{repo}/git/ref/heads/${branch_name}" &>/dev/null 2>&1; then
+              gh api -X PATCH "repos/{owner}/{repo}/git/${ref}" -f sha=$sha -F force=true
+            else
+              gh api -X POST "repos/{owner}/{repo}/git/refs" -f ref=${ref} -f sha=$sha
+            fi
+          fi
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Delete staging branch
+        run: git push origin --delete release/next || true
+
+      - if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Close release PR
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.check-release-pr.outputs.pr-number }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr close "$PR_NUMBER" --comment "Released via auto-release workflow"
+          fi
