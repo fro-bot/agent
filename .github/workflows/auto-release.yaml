@@ -27,7 +27,7 @@ jobs:
     steps:
       - id: get-app-token
         name: Get GitHub App Installation Token
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
         with:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
@@ -62,7 +62,7 @@ jobs:
 
       - if: steps.check-release-pr.outputs.should-release == 'true'
         name: Checkout `release` branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           filter: blob:none
@@ -70,12 +70,22 @@ jobs:
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - id: check-staging
+        if: steps.check-release-pr.outputs.should-release == 'true'
+        name: Check if staging branch exists
+        run: |
+          if git ls-remote --exit-code origin release/next &>/dev/null; then
+            echo 'has-staging=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has-staging=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Fetch staging branch
         run: git fetch origin release/next
 
       - id: merge-staging
-        if: steps.check-release-pr.outputs.should-release == 'true'
+        if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Merge `release/next` into `release`
         run: |
           git merge --no-ff -Xtheirs -m 'skip: merge release/next [skip release]' origin/release/next
