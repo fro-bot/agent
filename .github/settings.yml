@@ -59,3 +59,11 @@ branches:
         require_last_push_approval: true
       required_status_checks: null
       restrictions: null
+
+  - name: release
+    protection:
+      enforce_admins: true
+      required_linear_history: false
+      required_pull_request_reviews: null
+      required_status_checks: null
+      restrictions: null
