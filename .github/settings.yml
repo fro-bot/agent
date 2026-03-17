@@ -78,7 +78,7 @@ branches:
       required_pull_request_reviews: null
       required_status_checks: null
       # Only the GitHub App can push to release. This prevents humans from
-      # bypassing the release/next PR path and pushing directly to release.
+      # bypassing the next PR path and pushing directly to release.
       restrictions:
         apps:
           - fro-bot
