@@ -301,7 +301,7 @@ jobs:
         name: Generate PR Body
         run: |
           VERSION="${{ steps.semantic-release.outputs.version }}"
-          COMMIT_LIST=$(git log origin/${{ env.RELEASE_BRANCH }}..HEAD --format='* %s (%h)' --no-merges | head -50)
+          COMMIT_LIST=$(git log origin/${{ env.RELEASE_BRANCH }}..HEAD --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
           if [ -n "$VERSION" ]; then
             TITLE_SUFFIX=": v$VERSION"
