@@ -51,7 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
-          PR_NUMBER=$(gh pr list --head release/next --base release --state open --json number --jq '.[0].number')
+          PR_NUMBER=$(gh pr list --head next --base release --state open --json number --jq '.[0].number')
           echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           if [ -n "$PR_NUMBER" ] || [ "${{ github.event.inputs.force-release == 'true' }}" = 'true' ]; then
             echo 'should-release=true' >> "$GITHUB_OUTPUT"
@@ -74,7 +74,7 @@ jobs:
         if: steps.check-release-pr.outputs.should-release == 'true'
         name: Check if staging branch exists
         run: |
-          if git ls-remote --exit-code origin release/next &>/dev/null; then
+          if git ls-remote --exit-code origin next &>/dev/null; then
             echo 'has-staging=true' >> "$GITHUB_OUTPUT"
           else
             echo 'has-staging=false' >> "$GITHUB_OUTPUT"
@@ -82,16 +82,16 @@ jobs:
 
       - if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Fetch staging branch
-        run: git fetch origin release/next
+        run: git fetch origin next
 
       - id: merge-staging
         if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
-        name: Merge `release/next` into `release`
+        name: Merge `next` into `release`
         # -Xtheirs is required: the release branch contains semantic-release
         # git-plugin commits (dist/ + package.json) that conflict with main's
         # versions of those files. This matches the CI merge strategy.
         run: |
-          git merge --no-ff -Xtheirs -m 'skip: merge release/next [skip release]' origin/release/next
+          git merge --no-ff -Xtheirs -m 'skip: merge next [skip release]' origin/next
 
       - if: steps.check-release-pr.outputs.should-release == 'true'
         name: Push `release` branch
@@ -143,7 +143,7 @@ jobs:
 
       - if: steps.check-release-pr.outputs.should-release == 'true'
         name: Delete staging branch
-        run: git push origin --delete release/next || true
+        run: git push origin --delete next || true
 
       - if: steps.check-release-pr.outputs.should-release == 'true'
         name: Close release PR

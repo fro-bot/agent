@@ -280,7 +280,7 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
       - if: env.DRY_RUN != 'true'
         name: Push `${{ env.RELEASE_BRANCH }}` release branch
-        run: git push --force-with-lease origin HEAD:release/next
+        run: git push --force-with-lease origin HEAD:next
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
       - if: env.DRY_RUN != 'true'
@@ -326,14 +326,14 @@ jobs:
         if: env.DRY_RUN != 'true'
         name: Create or Update Release PR
         run: |
-          PR_NUMBER=$(gh pr list --head release/next --base ${{ env.RELEASE_BRANCH }} --state open --json number --jq '.[0].number')
+          PR_NUMBER=$(gh pr list --head next --base ${{ env.RELEASE_BRANCH }} --state open --json number --jq '.[0].number')
           VERSION="${{ steps.semantic-release.outputs.version }}"
           TITLE="chore(release): pending release${VERSION:+ v${VERSION}}"
           if [ -n "$PR_NUMBER" ]; then
             gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file /tmp/pr-body.md
           elif [ -n "$VERSION" ]; then
             gh pr create \
-              --head release/next \
+              --head next \
               --base ${{ env.RELEASE_BRANCH }} \
               --title "$TITLE" \
               --body-file /tmp/pr-body.md
