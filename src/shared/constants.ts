@@ -20,7 +20,7 @@ export const DEFAULT_MODEL = {
 } as const
 
 // Setup consolidation defaults
-export const DEFAULT_OPENCODE_VERSION = '1.2.24'
+export const DEFAULT_OPENCODE_VERSION = '1.2.27'
 export const DEFAULT_BUN_VERSION = '1.3.10'
 export const DEFAULT_OMO_VERSION = '3.11.2'
 export const DEFAULT_OMO_PROVIDERS = ''
