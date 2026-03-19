@@ -51,11 +51,36 @@ branches:
   - name: v?
     protection:
       enforce_admins: true
+      allow_force_pushes: true
       required_linear_history: false
       required_pull_request_reviews:
         required_approving_review_count: 1
         dismiss_stale_reviews: true
         require_code_owner_reviews: true
         require_last_push_approval: true
+        # Allow the GitHub App to bypass PR reviews when updating the major
+        # version branch ref (e.g. v0) after each release. Human PRs still
+        # require review. This is needed because v? branches are pointer
+        # branches maintained by the auto-release workflow, not development
+        # branches.
+        bypass_pull_request_allowances:
+          apps:
+            - fro-bot
+          users: []
+          teams: []
       required_status_checks: null
       restrictions: null
+
+  - name: release
+    protection:
+      enforce_admins: true
+      required_linear_history: false
+      required_pull_request_reviews: null
+      required_status_checks: null
+      # Only the GitHub App can push to release. This prevents humans from
+      # bypassing the next PR path and pushing directly to release.
+      restrictions:
+        apps:
+          - fro-bot
+        users: []
+        teams: []

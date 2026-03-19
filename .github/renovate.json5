@@ -32,8 +32,12 @@
     {
       matchPackageNames: [
         '@bfra.me/tsconfig',
+        '@opencode-ai/sdk',
         '@semantic-release/git',
+        'anomalyco/opencode',
         'conventional-changelog-conventionalcommits',
+        'oh-my-openagent',
+        'oven-sh/bun',
         'semantic-release',
         'tsdown',
         'typescript',
@@ -49,18 +53,6 @@
       matchUpdateTypes: ['major'],
       groupName: 'semantic-release and conventionalcommits',
       semanticCommitType: 'feat',
-    },
-    {
-      matchPackageNames: ['oh-my-openagent'],
-      semanticCommitType: 'build',
-    },
-    {
-      matchPackageNames: ['anomalyco/opencode'],
-      semanticCommitType: 'build',
-    },
-    {
-      matchPackageNames: ['oven-sh/bun'],
-      semanticCommitType: 'build',
     },
   ],
   postUpgradeTasks: {
