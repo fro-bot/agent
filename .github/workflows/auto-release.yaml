@@ -49,9 +49,10 @@ jobs:
       - id: check-release-pr
         name: Check for release PR
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
-          PR_NUMBER=$(gh pr list --head next --base release --state open --json number --jq '.[0].number')
+          PR_NUMBER=$(gh pr list --head next --base release --state open --json number --jq '.[0].number // empty')
           echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           if [ -n "$PR_NUMBER" ] || [ "${{ github.event.inputs.force-release == 'true' }}" = 'true' ]; then
             echo 'should-release=true' >> "$GITHUB_OUTPUT"
@@ -148,6 +149,7 @@ jobs:
       - if: steps.check-release-pr.outputs.should-release == 'true'
         name: Close release PR
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
           PR_NUMBER: ${{ steps.check-release-pr.outputs.pr-number }}
         run: |
