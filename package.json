@@ -43,18 +43,19 @@
     "@actions/tool-cache": "4.0.0",
     "@bfra.me/es": "0.1.0",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.2.20"
+    "@opencode-ai/sdk": "1.2.26"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.50.1",
     "@bfra.me/prettier-config": "0.16.7",
     "@bfra.me/tsconfig": "0.12.2",
     "@octokit/webhooks-types": "7.6.1",
+    "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.10.13",
-    "@vitest/eslint-plugin": "1.6.9",
-    "conventional-changelog-conventionalcommits": "9.1.0",
-    "eslint": "10.0.2",
+    "@vitest/eslint-plugin": "1.6.12",
+    "conventional-changelog-conventionalcommits": "9.3.0",
+    "eslint": "10.0.3",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
     "generate-license-file": "4.1.1",
@@ -65,9 +66,9 @@
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.3",
     "simple-git-hooks": "2.13.1",
-    "tsdown": "0.20.3",
+    "tsdown": "0.21.2",
     "typescript": "5.9.3",
-    "vitest": "4.0.18"
+    "vitest": "4.1.0"
   },
-  "packageManager": "pnpm@10.30.2"
+  "packageManager": "pnpm@10.32.1"
 }
