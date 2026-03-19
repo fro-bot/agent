@@ -30,8 +30,6 @@ branches:
         # OpenSSF Scorecard Code-Review check.
         bypass_pull_request_allowances:
           apps: []
-          users: []
-          teams: []
       required_status_checks:
         strict: true
         contexts:
@@ -66,8 +64,6 @@ branches:
         bypass_pull_request_allowances:
           apps:
             - fro-bot
-          users: []
-          teams: []
       required_status_checks: null
       restrictions: null
 
@@ -83,7 +79,5 @@ branches:
         bypass_pull_request_allowances:
           apps:
             - fro-bot
-          users: []
-          teams: []
       required_status_checks: null
       restrictions: null
