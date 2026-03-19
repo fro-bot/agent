@@ -94,7 +94,7 @@ jobs:
             echo 'has-staging=false' >> "$GITHUB_OUTPUT"
           fi
 
-      - if: (env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true') && steps.check-staging.outputs.has-staging == 'true'
+      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Fetch staging branch
         run: git fetch origin next
 
@@ -107,7 +107,7 @@ jobs:
         run: |
           git merge --no-ff -Xtheirs -m 'skip: merge next [skip release]' origin/next
 
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true'
         name: Push `release` branch
         run: git push origin release:release
 
