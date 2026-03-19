@@ -313,7 +313,7 @@ jobs:
 
           This PR tracks changes pending release. Released on the next auto-release cycle (Sunday/Wednesday) or via manual dispatch.
 
-          **Do not merge this PR via the GitHub UI.** The auto-release workflow handles the merge programmatically.
+          **Merge this PR to trigger a release.** Releases also run automatically on Sunday/Wednesday at 20:00 UTC, or via manual workflow dispatch.
 
           ### Commits Since Last Release
           EOF
