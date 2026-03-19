@@ -130,7 +130,7 @@ jobs:
         name: Semantic Release
         run: |
           before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
-          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD)
+          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD) GITHUB_EVENT_NAME=push
           pnpm semantic-release --ci true
           after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
