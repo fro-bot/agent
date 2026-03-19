@@ -2,6 +2,9 @@
 name: Auto Release
 
 on:
+  pull_request:
+    types: [closed]
+    branches: [release]
   schedule:
     - cron: '0 20 * * 0,3'
   workflow_dispatch:
@@ -24,6 +27,15 @@ jobs:
   perform-release:
     name: Perform Release
     runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.ref == 'next' &&
+        !github.event.pull_request.head.repo.fork) ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    env:
+      IS_PR_MERGE: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true }}
     steps:
       - id: get-app-token
         name: Get GitHub App Installation Token
@@ -47,6 +59,7 @@ jobs:
           git config --global user.name "${name}"
 
       - id: check-release-pr
+        if: env.IS_PR_MERGE != 'true'
         name: Check for release PR
         env:
           GH_REPO: ${{ github.repository }}
@@ -61,7 +74,7 @@ jobs:
           echo 'should-release=false' >> "$GITHUB_OUTPUT"
           exit 0
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Checkout `release` branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -72,7 +85,7 @@ jobs:
           token: ${{ steps.get-app-token.outputs.token }}
 
       - id: check-staging
-        if: steps.check-release-pr.outputs.should-release == 'true'
+        if: env.IS_PR_MERGE != 'true'
         name: Check if staging branch exists
         run: |
           if git ls-remote --exit-code origin next &>/dev/null; then
@@ -81,12 +94,12 @@ jobs:
             echo 'has-staging=false' >> "$GITHUB_OUTPUT"
           fi
 
-      - if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
+      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
         name: Fetch staging branch
         run: git fetch origin next
 
       - id: merge-staging
-        if: steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
+        if: env.IS_PR_MERGE != 'true'
         name: Merge `next` into `release`
         # -Xtheirs is required: the release branch contains semantic-release
         # git-plugin commits (dist/ + package.json) that conflict with main's
@@ -94,15 +107,15 @@ jobs:
         run: |
           git merge --no-ff -Xtheirs -m 'skip: merge next [skip release]' origin/next
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true'
         name: Push `release` branch
         run: git push origin release:release
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Build release
         run: pnpm build
 
@@ -113,7 +126,7 @@ jobs:
           GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
           GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
         id: semantic-release
-        if: steps.check-release-pr.outputs.should-release == 'true'
+        if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Semantic Release
         run: |
           before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
@@ -124,7 +137,7 @@ jobs:
             echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Update major version branch
         env:
           GH_REPO: ${{ github.repository }}
@@ -142,11 +155,11 @@ jobs:
             fi
           fi
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Delete staging branch
         run: git push origin --delete next || true
 
-      - if: steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE != 'true'
         name: Close release PR
         env:
           GH_REPO: ${{ github.repository }}
