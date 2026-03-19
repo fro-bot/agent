@@ -58,6 +58,7 @@ jobs:
           git config --global user.email "${email}"
           git config --global user.name "${name}"
 
+      # For schedule/dispatch: check if there's a pending release or force flag
       - id: check-release-pr
         if: env.IS_PR_MERGE != 'true'
         name: Check for release PR
@@ -84,32 +85,29 @@ jobs:
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
 
-      - id: check-staging
-        if: env.IS_PR_MERGE != 'true'
-        name: Check if staging branch exists
+      # Reset release to the last tag so semantic-release sees all new commits
+      # from main since that tag. This makes the workflow independent of how
+      # GitHub merged the PR (squash, rebase, or merge commit).
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
+        name: Reset `release` to last release tag
         run: |
-          if git ls-remote --exit-code origin next &>/dev/null; then
-            echo 'has-staging=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'has-staging=false' >> "$GITHUB_OUTPUT"
-          fi
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "Resetting release to ${last_tag}"
+          git reset --hard "${last_tag}"
 
-      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true' && steps.check-staging.outputs.has-staging == 'true'
-        name: Fetch staging branch
-        run: git fetch origin next
-
-      - id: merge-staging
-        if: env.IS_PR_MERGE != 'true'
-        name: Merge `next` into `release`
-        # -Xtheirs is required: the release branch contains semantic-release
-        # git-plugin commits (dist/ + package.json) that conflict with main's
-        # versions of those files. This matches the CI merge strategy.
+      # Merge main into release — this is the canonical merge for ALL paths.
+      # -Xtheirs is required: the release branch contains semantic-release
+      # git-plugin commits (dist/ + package.json) that conflict with main's
+      # versions of those files.
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
+        name: Merge `main` into `release`
         run: |
-          git merge --no-ff -Xtheirs -m 'skip: merge next [skip release]' origin/next
+          git fetch origin main
+          git merge --no-ff -Xtheirs -m 'skip: merge main [skip release]' origin/main
 
-      - if: env.IS_PR_MERGE != 'true' && steps.check-release-pr.outputs.should-release == 'true'
+      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Push `release` branch
-        run: git push origin release:release
+        run: git push --force-with-lease origin release:release
 
       - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Setup Node.js and pnpm
@@ -130,7 +128,7 @@ jobs:
         name: Semantic Release
         run: |
           before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
-          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD)
+          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD) GITHUB_EVENT_NAME=push
           pnpm semantic-release --ci true
           after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
@@ -159,6 +157,7 @@ jobs:
         name: Delete staging branch
         run: git push origin --delete next || true
 
+      # Only close PR on schedule/dispatch — on PR merge path it's already closed
       - if: env.IS_PR_MERGE != 'true'
         name: Close release PR
         env:
