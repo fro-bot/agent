@@ -39,7 +39,7 @@ branches:
 
       restrictions: null
 
-  - name: v?
+  - name: v0
     protection:
       enforce_admins: true
       allow_force_pushes: true
