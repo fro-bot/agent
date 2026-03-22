@@ -270,6 +270,14 @@ jobs:
           filter: blob:none
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
+      # Reset release to the last tag so the merge base is clean.
+      # Without this, semantic-release's dist/ commits on the release branch
+      # cause rename/rename conflicts that -Xtheirs cannot resolve.
+      - name: Reset `${{ env.RELEASE_BRANCH }}` to last release tag
+        run: |
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "Resetting ${{ env.RELEASE_BRANCH }} to ${last_tag}"
+          git reset --hard "${last_tag}"
       - if: ${{ github.event_name == 'pull_request' }}
         name: Fetch PR
         run: git fetch origin +${{ github.sha }}:${{ github.ref }}
