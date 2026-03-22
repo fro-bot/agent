@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 
-import {execSync} from 'node:child_process'
+import {execFileSync} from 'node:child_process'
 import {appendFileSync} from 'node:fs'
 import process from 'node:process'
 
+// This file uses .ts import because it runs directly under Node's
+// --experimental-strip-types / --experimental-transform-types.
+// The test file (preview.test.ts) uses .js because it runs under
+// Vitest with bundler module resolution. Both are correct for their runtime.
 import {analyzeReleaseType, computeNextVersion} from './preview.ts'
 
 const COMMIT_SEPARATOR = '---COMMIT_SEPARATOR---'
@@ -48,8 +52,8 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
   return parsed
 }
 
-function runGit(command: string): string {
-  return execSync(command, {
+function runGit(...args: string[]): string {
+  return execFileSync('git', args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim()
@@ -60,7 +64,7 @@ function resolveFromTag(overrideTag: string | null): string {
     return overrideTag
   }
 
-  const tagsOutput = runGit("git tag --list 'v*' --sort=-version:refname")
+  const tagsOutput = runGit('tag', '--list', 'v*', '--sort=-version:refname')
   const latestTag = tagsOutput
     .split('\n')
     .map(tag => tag.trim())
@@ -73,8 +77,7 @@ function resolveFromTag(overrideTag: string | null): string {
 }
 
 function readCommitMessages(fromTag: string, toRef: string): readonly string[] {
-  const escapedSeparator = COMMIT_SEPARATOR.replaceAll("'", String.raw`'\''`)
-  const output = runGit(`git log ${fromTag}..${toRef} --format='%B%n${escapedSeparator}'`)
+  const output = runGit('log', `${fromTag}..${toRef}`, `--format=%B%n${COMMIT_SEPARATOR}`)
   return output
     .split(COMMIT_SEPARATOR)
     .map(message => message.trim())

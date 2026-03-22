@@ -14,7 +14,7 @@
 
 **Files:**
 
-- Create: `src/features/release/preview.test.ts`
+- Create: `scripts/release/preview.test.ts`
 - Modify: `package.json`
 
 **Step 1: Write the failing test**
@@ -28,7 +28,7 @@ Add tests that describe the preview contract:
 
 **Step 2: Run test to verify it fails**
 
-Run: `pnpm test src/features/release/preview.test.ts` Expected: FAIL because preview module does not exist yet
+Run: `pnpm test scripts/release/preview.test.ts` Expected: FAIL because preview module does not exist yet
 
 **Step 3: Commit**
 
@@ -38,8 +38,8 @@ Do not commit yet.
 
 **Files:**
 
-- Create: `src/features/release/preview.ts`
-- Test: `src/features/release/preview.test.ts`
+- Create: `scripts/release/preview.ts`
+- Test: `scripts/release/preview.test.ts`
 
 **Step 1: Write minimal implementation**
 
@@ -60,12 +60,12 @@ export function computeNextVersion(currentVersion: string, releaseType: ReleaseT
 
 **Step 2: Run test to verify it passes**
 
-Run: `pnpm test src/features/release/preview.test.ts` Expected: PASS
+Run: `pnpm test scripts/release/preview.test.ts` Expected: PASS
 
 **Step 3: Commit**
 
 ```bash
-git add src/features/release/preview.ts src/features/release/preview.test.ts
+git add scripts/release/preview.ts scripts/release/preview.test.ts
 git commit -m "feat(ci): add release preview analyzer"
 ```
 
@@ -73,9 +73,9 @@ git commit -m "feat(ci): add release preview analyzer"
 
 **Files:**
 
-- Create: `scripts/release/preview-next-release.mjs`
+- Create: `scripts/release/preview-next-release.ts`
 - Modify: `package.json`
-- Modify: `src/features/release/preview.ts`
+- Modify: `scripts/release/preview.ts`
 
 **Step 1: Write the failing test**
 
@@ -83,7 +83,7 @@ Add a focused test for any parsing/helper logic that the CLI wrapper depends on.
 
 **Step 2: Run test to verify it fails**
 
-Run: `pnpm test src/features/release/preview.test.ts` Expected: FAIL for the new helper behavior
+Run: `pnpm test scripts/release/preview.test.ts` Expected: FAIL for the new helper behavior
 
 **Step 3: Write minimal implementation**
 
@@ -97,14 +97,14 @@ Build a script that:
 
 **Step 4: Run tests and a manual script invocation**
 
-Run: `pnpm test src/features/release/preview.test.ts` Expected: PASS
+Run: `pnpm test scripts/release/preview.test.ts` Expected: PASS
 
-Run: `node scripts/release/preview-next-release.mjs --from v0.30.10 --to HEAD` Expected: structured preview output
+Run: `node --experimental-strip-types --experimental-transform-types scripts/release/preview-next-release.ts --from v0.30.10 --to HEAD` Expected: structured preview output
 
 **Step 5: Commit**
 
 ```bash
-git add scripts/release/preview-next-release.mjs src/features/release/preview.ts src/features/release/preview.test.ts package.json
+git add scripts/release/preview-next-release.ts scripts/release/preview.ts scripts/release/preview.test.ts package.json
 git commit -m "feat(ci): add next release preview script"
 ```
 
@@ -180,7 +180,7 @@ git commit -m "refactor(ci): remove synthetic next branch hacks"
 
 **Step 1: Run focused tests**
 
-Run: `pnpm test src/features/release/preview.test.ts` Expected: PASS
+Run: `pnpm test scripts/release/preview.test.ts` Expected: PASS
 
 **Step 2: Run typecheck**
 
