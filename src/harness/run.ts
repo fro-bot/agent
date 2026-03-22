@@ -11,6 +11,7 @@ import {runAcknowledge} from './phases/acknowledge.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
+import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {runExecute} from './phases/execute.js'
 import {runFinalize} from './phases/finalize.js'
 import {runRouting} from './phases/routing.js'
@@ -44,6 +45,10 @@ export async function run(): Promise<number> {
     if (routing == null) return 0
     githubClient = routing.githubClient
 
+    const repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
+    const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
+    if (!dedup.shouldProceed) return 0
+
     reactionCtx = await runAcknowledge(routing, bootstrap.logger)
 
     const cacheRestore = await runCacheRestore(bootstrap)
@@ -56,6 +61,10 @@ export async function run(): Promise<number> {
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
     agentSuccess = execution.success
+
+    if (agentSuccess && dedup.entity != null) {
+      await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)
+    }
 
     metrics.end()
     exitCode = await runFinalize(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger)

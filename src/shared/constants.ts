@@ -33,5 +33,10 @@ export const LLM_RETRY_DELAY_MS = 10_000
 export const CACHE_PREFIX = 'opencode-storage' as const
 export const TOOLS_CACHE_PREFIX = 'opencode-tools' as const
 
+// Dedup execution defaults
+export const DEFAULT_DEDUP_WINDOW_MS = 600_000 // 10 minutes
+export const DEDUP_CACHE_PREFIX = 'fro-bot-dedup-v1' as const
+export const DEDUP_SENTINEL_DIR = '/tmp/fro-bot-dedup' as const
+
 // Storage version (increment on breaking changes)
 export const STORAGE_VERSION = 1

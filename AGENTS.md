@@ -1,8 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-03-06
-**Commit:** 3985e1a
-**Branch:** main
+**Generated:** 2026-03-06 **Commit:** 3985e1a **Branch:** main
 
 ## OVERVIEW
 
@@ -112,6 +110,7 @@ main.ts → harness/run.ts
   │
   ├─→ bootstrap phase (parseActionInputs, ensureOpenCodeAvailable, restoreCache)
   ├─→ routing phase (parseGitHubContext, normalizeEvent, routeEvent)
+  ├─→ dedup phase (skip if agent already ran for this PR/issue recently)
   ├─→ acknowledge phase (acknowledgeReceipt)
   ├─→ cache-restore phase (dedicated session state restore)
   ├─→ session-prep phase (processAttachments, buildAgentPrompt)

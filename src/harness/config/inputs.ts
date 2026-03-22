@@ -3,6 +3,7 @@ import type {ActionInputs, ModelConfig, OmoProviders} from '../../shared/types.j
 import * as core from '@actions/core'
 import {
   DEFAULT_AGENT,
+  DEFAULT_DEDUP_WINDOW_MS,
   DEFAULT_OMO_PROVIDERS,
   DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
@@ -43,15 +44,15 @@ export function parseModelInput(input: string): ModelConfig {
   return {providerID, modelID}
 }
 
-function parseTimeoutMs(value: string): number {
+function parseTimeoutMs(value: string, inputName = 'timeout'): number {
   const trimmed = value.trim()
   if (!/^\d+$/.test(trimmed)) {
-    throw new Error(`timeout must be a non-negative integer, received: ${value}`)
+    throw new Error(`${inputName} must be a non-negative integer, received: ${value}`)
   }
 
   const parsed = Number.parseInt(trimmed, 10)
   if (Number.isNaN(parsed) || parsed < 0) {
-    throw new Error(`timeout must be a non-negative integer, received: ${value}`)
+    throw new Error(`${inputName} must be a non-negative integer, received: ${value}`)
   }
 
   return parsed
@@ -117,7 +118,15 @@ function parseOmoProviders(input: string): OmoProviders {
     }
   }
 
-  return {claude, copilot, gemini, openai, opencodeZen, zaiCodingPlan, kimiForCoding}
+  return {
+    claude,
+    copilot,
+    gemini,
+    openai,
+    opencodeZen,
+    zaiCodingPlan,
+    kimiForCoding,
+  }
 }
 
 /**
@@ -187,6 +196,10 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const opencodeConfigRaw = core.getInput('opencode-config').trim()
     const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
 
+    const dedupWindowRaw = core.getInput('dedup-window').trim()
+    const dedupWindow =
+      dedupWindowRaw.length > 0 ? parseTimeoutMs(dedupWindowRaw, 'dedup-window') : DEFAULT_DEDUP_WINDOW_MS
+
     // Validate opencode-config is valid JSON if provided
     if (opencodeConfig != null) {
       validateJsonString(opencodeConfig, 'opencode-config')
@@ -217,6 +230,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       omoVersion,
       omoProviders,
       opencodeConfig,
+      dedupWindow,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
