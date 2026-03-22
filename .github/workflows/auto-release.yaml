@@ -5,15 +5,6 @@ on:
   pull_request:
     types: [closed]
     branches: [release]
-  schedule:
-    - cron: '0 20 * * 0,3'
-  workflow_dispatch:
-    inputs:
-      force-release:
-        description: Force a release even when no open release PR exists
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -28,14 +19,10 @@ jobs:
     name: Perform Release
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'pull_request' &&
-        github.event.pull_request.merged == true &&
-        github.event.pull_request.head.ref == 'next' &&
-        !github.event.pull_request.head.repo.fork) ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
-    env:
-      IS_PR_MERGE: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true }}
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'next' &&
+      github.event.pull_request.base.ref == 'release' &&
+      !github.event.pull_request.head.repo.fork
     steps:
       - id: get-app-token
         name: Get GitHub App Installation Token
@@ -58,25 +45,7 @@ jobs:
           git config --global user.email "${email}"
           git config --global user.name "${name}"
 
-      # For schedule/dispatch: check if there's a pending release or force flag
-      - id: check-release-pr
-        if: env.IS_PR_MERGE != 'true'
-        name: Check for release PR
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
-        run: |
-          PR_NUMBER=$(gh pr list --head next --base release --state open --json number --jq '.[0].number // empty')
-          echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          if [ -n "$PR_NUMBER" ] || [ "${{ github.event.inputs.force-release == 'true' }}" = 'true' ]; then
-            echo 'should-release=true' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo 'should-release=false' >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Checkout `release` branch
+      - name: Checkout `release` branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
@@ -85,36 +54,29 @@ jobs:
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
 
-      # Reset release to the last tag so semantic-release sees all new commits
-      # from main since that tag. This makes the workflow independent of how
-      # GitHub merged the PR (squash, rebase, or merge commit).
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Reset `release` to last release tag
+      - name: Verify merged release PR context
+        env:
+          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
-          echo "Resetting release to ${last_tag}"
-          git reset --hard "${last_tag}"
+          if [ -z "$MERGE_COMMIT_SHA" ]; then
+            echo 'Missing merge_commit_sha for merged release PR'
+            exit 1
+          fi
+          release_head=$(git rev-parse HEAD)
+          if [ "$release_head" != "$MERGE_COMMIT_SHA" ]; then
+            echo 'Release branch head does not match merged release PR commit'
+            exit 1
+          fi
+          parent_count=$(git rev-list --parents -n 1 "$MERGE_COMMIT_SHA" | wc -w | tr -d ' ')
+          if [ "$parent_count" -lt 3 ]; then
+            echo 'Release PR must be merged with a merge commit'
+            exit 1
+          fi
 
-      # Merge main into release — this is the canonical merge for ALL paths.
-      # -Xtheirs is required: the release branch contains semantic-release
-      # git-plugin commits (dist/ + package.json) that conflict with main's
-      # versions of those files.
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Merge `main` into `release`
-        run: |
-          git fetch origin main
-          git merge --no-ff -Xtheirs -m 'skip: merge main [skip release]' origin/main
-
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Push `release` branch
-        run: git push --force-with-lease origin release:release
-
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Setup Node.js and pnpm
+      - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
 
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Build release
+      - name: Build release
         run: pnpm build
 
       - env:
@@ -124,7 +86,6 @@ jobs:
           GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
           GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
         id: semantic-release
-        if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
         name: Semantic Release
         run: |
           before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
@@ -135,36 +96,22 @@ jobs:
             echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Update major version branch
+      - name: Update major version branch
+        if: steps.semantic-release.outputs.new-release-version != ''
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
           version=${{ steps.semantic-release.outputs.new-release-version }}
-          if [ -n "$version" ]; then
-            sha=$(git rev-parse HEAD)
-            branch_name=v$(echo ${version} | cut -d . -f 1)
-            ref=refs/heads/${branch_name}
-            if gh api "repos/{owner}/{repo}/git/ref/heads/${branch_name}" &>/dev/null 2>&1; then
-              gh api -X PATCH "repos/{owner}/{repo}/git/${ref}" -f sha=$sha -F force=true
-            else
-              gh api -X POST "repos/{owner}/{repo}/git/refs" -f ref=${ref} -f sha=$sha
-            fi
+          sha=$(git rev-parse HEAD)
+          branch_name=v$(echo ${version} | cut -d . -f 1)
+          ref=refs/heads/${branch_name}
+          if gh api "repos/{owner}/{repo}/git/ref/heads/${branch_name}" &>/dev/null 2>&1; then
+            gh api -X PATCH "repos/{owner}/{repo}/git/${ref}" -f sha=$sha -F force=true
+          else
+            gh api -X POST "repos/{owner}/{repo}/git/refs" -f ref=${ref} -f sha=$sha
           fi
 
-      - if: env.IS_PR_MERGE == 'true' || steps.check-release-pr.outputs.should-release == 'true'
-        name: Delete staging branch
+      - name: Delete staging branch
+        if: steps.semantic-release.outputs.new-release-version != ''
         run: git push origin --delete next || true
-
-      # Only close PR on schedule/dispatch — on PR merge path it's already closed
-      - if: env.IS_PR_MERGE != 'true'
-        name: Close release PR
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
-          PR_NUMBER: ${{ steps.check-release-pr.outputs.pr-number }}
-        run: |
-          if [ -n "$PR_NUMBER" ]; then
-            gh pr close "$PR_NUMBER" --comment "Released via auto-release workflow"
-          fi
