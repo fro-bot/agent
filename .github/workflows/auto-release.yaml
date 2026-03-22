@@ -54,14 +54,6 @@ jobs:
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
 
-      - name: Reset `release` to last tag and merge `next`
-        run: |
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
-          echo "Resetting release to ${last_tag}"
-          git reset --hard "${last_tag}"
-          echo "Merging origin/next into release"
-          git merge --no-ff -Xtheirs -m 'skip: merge next into release [skip release]' origin/next
-
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
 
@@ -102,5 +94,5 @@ jobs:
           fi
 
       - name: Delete staging branch
-        if: steps.semantic-release.outputs.new-release-version != ''
+        if: always()
         run: git push --no-verify origin --delete next || true
