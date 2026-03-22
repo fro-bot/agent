@@ -64,6 +64,15 @@ inputs:
       Custom oMo configuration JSON. Written before installer runs.
       Deep-merged with existing config.
     required: false
+  dedup-window:
+    description: >-
+      Deduplication window in milliseconds. Skip execution if the agent already
+      ran for the same PR or issue within this window. 0 = disabled.
+      Default: 600000 (10 minutes). Note: dedup is best-effort suppression
+      via cache sentinels, not an in-flight lock. Use workflow-level
+      concurrency groups to prevent overlapping same-entity runs.
+    required: false
+    default: '600000'
 
 outputs:
   session-id:

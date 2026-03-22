@@ -339,6 +339,77 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.timeoutMs).toBe(0)
     })
 
+    it('parses dedup-window with default value', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.dedupWindow).toBe(600000)
+    })
+
+    it('parses custom dedup-window', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'dedup-window': '300000',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.dedupWindow).toBe(300000)
+    })
+
+    it('accepts zero dedup-window to disable dedup', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'dedup-window': '0',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.dedupWindow).toBe(0)
+    })
+
+    it('returns error for invalid dedup-window value', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'dedup-window': 'not-a-number',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('dedup-window')
+    })
+
     it('returns error for invalid model format (no slash)', () => {
       const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
 
