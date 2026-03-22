@@ -238,7 +238,7 @@ jobs:
     needs: [setup, lint, test, build]
     outputs:
       commit: ${{ steps.merge.outputs.commit }}
-      version: ${{ steps.semantic-release.outputs.version }}
+      version: ${{ steps.semantic-release.outputs.version || steps.release-preview.outputs.next_version }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -270,6 +270,14 @@ jobs:
           filter: blob:none
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
+      # Reset release to the last tag so the merge base is clean.
+      # Without this, semantic-release's dist/ commits on the release branch
+      # cause rename/rename conflicts that -Xtheirs cannot resolve.
+      - name: Reset `${{ env.RELEASE_BRANCH }}` to last release tag
+        run: |
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "Resetting ${{ env.RELEASE_BRANCH }} to ${last_tag}"
+          git reset --hard "${last_tag}"
       - if: ${{ github.event_name == 'pull_request' }}
         name: Fetch PR
         run: git fetch origin +${{ github.sha }}:${{ github.ref }}
@@ -279,14 +287,21 @@ jobs:
           git merge --no-ff -Xtheirs -m 'skip: merge (${{ github.sha }}) [skip release]' ${{ github.sha }}
           echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
       - if: env.DRY_RUN != 'true'
-        name: Push `${{ env.RELEASE_BRANCH }}` release branch
-        run: git push --force-with-lease origin HEAD:next
+        name: Push `next` branch
+        run: |
+          git branch -f next HEAD
+          git push --force-with-lease origin HEAD:next
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
       - if: env.DRY_RUN != 'true'
         name: Build release
         run: pnpm build
-      - env:
+      - if: env.DRY_RUN == 'true'
+        id: release-preview
+        name: Release Preview
+        run: node --experimental-strip-types --experimental-transform-types scripts/release/preview-next-release.ts --to ${{ steps.merge.outputs.commit }}
+      - if: env.DRY_RUN != 'true'
+        env:
           GIT_AUTHOR_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
           GIT_AUTHOR_NAME: ${{ steps.get-user-id.outputs.user-name }}
           GIT_COMMITTER_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
@@ -295,19 +310,8 @@ jobs:
         id: semantic-release
         name: Semantic Release
         run: |
-          export GITHUB_REF=refs/heads/${{ env.RELEASE_BRANCH }} GITHUB_SHA=${{ steps.merge.outputs.commit }}
-          pnpm semantic-release --dry-run true --ci false
-      - if: env.DRY_RUN != 'true'
-        name: Generate PR Body
-        run: |
-          VERSION="${{ steps.semantic-release.outputs.version }}"
-          COMMIT_LIST=$(git log origin/${{ env.RELEASE_BRANCH }}..HEAD --format='* %s (%h)' --no-merges --max-count=50)
-          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-          if [ -n "$VERSION" ]; then
-            TITLE_SUFFIX=": v$VERSION"
-          else
-            TITLE_SUFFIX=""
-          fi
+          export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
+          pnpm semantic-release --branches next --ci false
           cat > /tmp/pr-body.md <<EOF
           ## Pending Release${TITLE_SUFFIX}
 

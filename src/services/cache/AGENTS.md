@@ -12,12 +12,15 @@ OpenCode state persistence via GitHub Actions cache with corruption detection an
 | **Save**    | `save.ts`      | Cache save with S3 backup support (114 L)         |
 | **Key**     | `cache-key.ts` | Deterministic cache key generation (61 L)         |
 | **Types**   | `types.ts`     | `CacheResult`, `CacheOptions`, `S3Options` (38 L) |
+| **Dedup**   | `dedup.ts`     | Execution dedup sentinel restore/save (98 L)      |
 
 ## KEY EXPORTS
 
 - `restoreCache(options, logger)`: Restores storage from GitHub/S3 cache
 - `saveCache(options, logger)`: Persists storage to GitHub/S3 cache
 - `generateCacheKey(repo, branch, os)`: Builds the storage cache key
+- `restoreDeduplicationMarker(repo, entity, logger)`: Restores recent dedup sentinel
+- `saveDeduplicationMarker(repo, entity, marker, logger)`: Saves dedup sentinel after execution
 
 ## PATTERNS
 

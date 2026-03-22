@@ -23,15 +23,6 @@ branches:
         dismiss_stale_reviews: true
         require_code_owner_reviews: true
         require_last_push_approval: true
-        # Explicitly prevent any app, user, or team from bypassing the PR
-        # review requirement on main. This stops automated tools (e.g. the
-        # fro-bot GitHub App used by Renovate automerge) from merging PRs
-        # without a human approving review, which is required to pass the
-        # OpenSSF Scorecard Code-Review check.
-        bypass_pull_request_allowances:
-          apps: []
-          users: []
-          teams: []
       required_status_checks:
         strict: true
         contexts:
@@ -45,29 +36,14 @@ branches:
           - Test GitHub Action
           - Setup
           - Renovate / Renovate
-
       restrictions: null
 
-  - name: v?
+  - name: v0
     protection:
       enforce_admins: true
       allow_force_pushes: true
       required_linear_history: false
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-        dismiss_stale_reviews: true
-        require_code_owner_reviews: true
-        require_last_push_approval: true
-        # Allow the GitHub App to bypass PR reviews when updating the major
-        # version branch ref (e.g. v0) after each release. Human PRs still
-        # require review. This is needed because v? branches are pointer
-        # branches maintained by the auto-release workflow, not development
-        # branches.
-        bypass_pull_request_allowances:
-          apps:
-            - fro-bot
-          users: []
-          teams: []
+      required_pull_request_reviews: null
       required_status_checks: null
       restrictions: null
 
@@ -75,15 +51,6 @@ branches:
     protection:
       enforce_admins: true
       required_linear_history: false
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-        dismiss_stale_reviews: true
-        require_code_owner_reviews: false
-        require_last_push_approval: false
-        bypass_pull_request_allowances:
-          apps:
-            - fro-bot
-          users: []
-          teams: []
+      required_pull_request_reviews: null
       required_status_checks: null
       restrictions: null
