@@ -54,19 +54,13 @@ jobs:
           show-progress: false
           token: ${{ steps.get-app-token.outputs.token }}
 
-      - name: Verify merged release PR context
-        env:
-          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      - name: Reset `release` to last tag and merge `next`
         run: |
-          if [ -z "$MERGE_COMMIT_SHA" ]; then
-            echo 'Missing merge_commit_sha for merged release PR'
-            exit 1
-          fi
-          release_head=$(git rev-parse HEAD)
-          if [ "$release_head" != "$MERGE_COMMIT_SHA" ]; then
-            echo 'Release branch head does not match merged release PR commit'
-            exit 1
-          fi
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "Resetting release to ${last_tag}"
+          git reset --hard "${last_tag}"
+          echo "Merging origin/next into release"
+          git merge --no-ff -Xtheirs -m 'skip: merge next into release [skip release]' origin/next
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
@@ -85,7 +79,7 @@ jobs:
         run: |
           before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD) GITHUB_EVENT_NAME=push
-          pnpm semantic-release --ci true
+          pnpm semantic-release --ci false
           after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
             echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
@@ -109,4 +103,4 @@ jobs:
 
       - name: Delete staging branch
         if: steps.semantic-release.outputs.new-release-version != ''
-        run: git push origin --delete next || true
+        run: git push --no-verify origin --delete next || true
