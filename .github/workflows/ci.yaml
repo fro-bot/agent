@@ -304,8 +304,20 @@ jobs:
         name: Semantic Release
         run: |
           git branch -f next ${{ steps.merge.outputs.commit }}
-          export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
-          pnpm semantic-release --branches next --repository-url . --dry-run true --ci false
+          if [ "${DRY_RUN}" = 'true' ]; then
+            export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
+            pnpm semantic-release \
+              --branches next \
+              --repository-url . \
+              --plugins @semantic-release/commit-analyzer \
+              --plugins @semantic-release/release-notes-generator \
+              --plugins @semantic-release/exec \
+              --dry-run true \
+              --ci false
+          else
+            export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
+            pnpm semantic-release --branches next --ci false
+          fi
       - if: env.DRY_RUN != 'true'
         name: Generate PR Body
         run: |
