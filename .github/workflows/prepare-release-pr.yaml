@@ -83,6 +83,9 @@ jobs:
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
 
+      - name: Push synthetic release candidate to `next`
+        run: git push --force-with-lease origin HEAD:next
+
       - env:
           GIT_AUTHOR_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
           GIT_AUTHOR_NAME: ${{ steps.get-user-id.outputs.user-name }}
@@ -92,12 +95,8 @@ jobs:
         id: semantic-release
         name: Dry-run semantic release
         run: |
-          export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD)
-          pnpm semantic-release --dry-run true --ci false
-
-      - if: steps.semantic-release.outputs.version != ''
-        name: Push `next` branch
-        run: git push --force-with-lease origin HEAD:next
+          export GITHUB_REF=refs/heads/next GITHUB_SHA=$(git rev-parse HEAD) GITHUB_EVENT_NAME=push
+          pnpm semantic-release --branches next --dry-run true --ci false
 
       - if: steps.semantic-release.outputs.version != ''
         name: Generate PR body

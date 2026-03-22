@@ -303,8 +303,8 @@ jobs:
         id: semantic-release
         name: Semantic Release
         run: |
-          export GITHUB_REF=refs/heads/${{ env.RELEASE_BRANCH }} GITHUB_SHA=${{ steps.merge.outputs.commit }}
-          pnpm semantic-release --dry-run true --ci false
+          export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
+          pnpm semantic-release --branches next --dry-run true --ci false
       - if: env.DRY_RUN != 'true'
         name: Generate PR Body
         run: |
