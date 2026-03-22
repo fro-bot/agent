@@ -292,10 +292,13 @@ jobs:
         name: Release Preview
         run: node --experimental-strip-types --experimental-transform-types scripts/release/preview-next-release.ts --to ${{ steps.merge.outputs.commit }}
       - if: env.DRY_RUN != 'true'
-        name: Push `next` branch
+        name: Push `next` and reset `release` to latest tag
         run: |
           git branch -f next HEAD
           git push --force-with-lease origin HEAD:next
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "Resetting remote release to ${last_tag}"
+          git push --force-with-lease origin "${last_tag}^{}:refs/heads/release"
       - if: env.DRY_RUN != 'true' && steps.release-preview.outputs.next_version != ''
         name: Generate PR Body
         run: |

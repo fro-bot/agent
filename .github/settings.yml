@@ -50,6 +50,7 @@ branches:
   - name: release
     protection:
       enforce_admins: true
+      allow_force_pushes: true
       required_linear_history: false
       required_pull_request_reviews: null
       required_status_checks: null
