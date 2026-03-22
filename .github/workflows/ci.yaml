@@ -287,8 +287,10 @@ jobs:
           git merge --no-ff -Xtheirs -m 'skip: merge (${{ github.sha }}) [skip release]' ${{ github.sha }}
           echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
       - if: env.DRY_RUN != 'true'
-        name: Push `${{ env.RELEASE_BRANCH }}` release branch
-        run: git push --force-with-lease origin HEAD:next
+        name: Push `next` branch
+        run: |
+          git branch -f next HEAD
+          git push --force-with-lease origin HEAD:next
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
       - if: env.DRY_RUN != 'true'
