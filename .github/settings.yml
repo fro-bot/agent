@@ -23,8 +23,6 @@ branches:
         dismiss_stale_reviews: true
         require_code_owner_reviews: true
         require_last_push_approval: true
-        bypass_pull_request_allowances:
-          apps: []
       required_status_checks:
         strict: true
         contexts:
@@ -51,9 +49,6 @@ branches:
         dismiss_stale_reviews: true
         require_code_owner_reviews: true
         require_last_push_approval: true
-        bypass_pull_request_allowances:
-          apps:
-            - fro-bot
       required_status_checks: null
       restrictions: null
 
@@ -66,8 +61,5 @@ branches:
         dismiss_stale_reviews: true
         require_code_owner_reviews: false
         require_last_push_approval: false
-        bypass_pull_request_allowances:
-          apps:
-            - fro-bot
       required_status_checks: null
       restrictions: null
