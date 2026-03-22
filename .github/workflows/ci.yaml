@@ -312,6 +312,17 @@ jobs:
         run: |
           export GITHUB_REF=refs/heads/next GITHUB_SHA=${{ steps.merge.outputs.commit }} GITHUB_EVENT_NAME=push
           pnpm semantic-release --branches next --ci false
+      - if: env.DRY_RUN != 'true'
+        name: Generate PR Body
+        run: |
+          VERSION="${{ steps.semantic-release.outputs.version }}"
+          COMMIT_LIST=$(git log origin/${{ env.RELEASE_BRANCH }}..HEAD --format='* %s (%h)' --no-merges --max-count=50)
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          if [ -n "$VERSION" ]; then
+            TITLE_SUFFIX=": v$VERSION"
+          else
+            TITLE_SUFFIX=""
+          fi
           cat > /tmp/pr-body.md <<EOF
           ## Pending Release${TITLE_SUFFIX}
 
