@@ -12,6 +12,10 @@ repository:
     - github-actions
     - github-app
     - bot
+  allow_merge_commit: true
+  allow_squash_merge: true
+  allow_rebase_merge: false
+  delete_branch_on_merge: false
 
 branches:
   - name: main

@@ -292,18 +292,16 @@ jobs:
         name: Release Preview
         run: node --experimental-strip-types --experimental-transform-types scripts/release/preview-next-release.ts --to ${{ steps.merge.outputs.commit }}
       - if: env.DRY_RUN != 'true'
-        name: Push `next` and reset `release` to latest tag
+        name: Push `next` branch
         run: |
           git branch -f next HEAD
           git push --no-verify --force-with-lease origin HEAD:next
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
-          echo "Resetting remote release to ${last_tag}"
-          git push --no-verify --force-with-lease origin "${last_tag}^{}:refs/heads/release"
       - if: env.DRY_RUN != 'true' && steps.release-preview.outputs.next_version != ''
         name: Generate PR Body
         run: |
           VERSION="${{ steps.release-preview.outputs.next_version }}"
-          COMMIT_LIST=$(git log origin/${{ env.RELEASE_BRANCH }}..HEAD --format='* %s (%h)' --no-merges --max-count=50)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          COMMIT_LIST=$(git log "${last_tag}..HEAD" --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
           TITLE_SUFFIX=": v${VERSION}"
           cat > /tmp/pr-body.md <<EOF
