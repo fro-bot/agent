@@ -295,10 +295,10 @@ jobs:
         name: Push `next` and reset `release` to latest tag
         run: |
           git branch -f next HEAD
-          git push --force-with-lease origin HEAD:next
+          git push --no-verify --force-with-lease origin HEAD:next
           last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           echo "Resetting remote release to ${last_tag}"
-          git push --force-with-lease origin "${last_tag}^{}:refs/heads/release"
+          git push --no-verify --force-with-lease origin "${last_tag}^{}:refs/heads/release"
       - if: env.DRY_RUN != 'true' && steps.release-preview.outputs.next_version != ''
         name: Generate PR Body
         run: |
