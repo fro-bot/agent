@@ -1,9 +1,12 @@
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
+import os from 'node:os'
 import * as path from 'node:path'
-import {DEDUP_CACHE_PREFIX, DEDUP_SENTINEL_DIR} from '../../shared/constants.js'
+import {DEDUP_CACHE_PREFIX} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {defaultCacheAdapter, type CacheAdapter} from './types.js'
+
+export const DEDUP_BASE_DIR = path.join(os.homedir(), '.cache', 'fro-bot-dedup')
 
 export type DedupEntityType = 'issue' | 'pr'
 
@@ -27,7 +30,7 @@ function sanitizeRepoName(repo: string): string {
 
 function buildEntitySentinelDir(repo: string, entity: DeduplicationEntity): string {
   const sanitizedRepo = sanitizeRepoName(repo)
-  return path.join(DEDUP_SENTINEL_DIR, `${sanitizedRepo}-${entity.entityType}-${entity.entityNumber}`)
+  return path.join(DEDUP_BASE_DIR, `${sanitizedRepo}-${entity.entityType}-${entity.entityNumber}`)
 }
 
 function buildDedupRestorePrefix(repo: string, entity: DeduplicationEntity): string {

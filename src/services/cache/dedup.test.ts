@@ -2,10 +2,11 @@ import type {CacheAdapter} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-import {DEDUP_CACHE_PREFIX, DEDUP_SENTINEL_DIR} from '../../shared/constants.js'
+import {DEDUP_CACHE_PREFIX} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   buildDedupSaveKey,
+  DEDUP_BASE_DIR,
   restoreDeduplicationMarker,
   saveDeduplicationMarker,
   type DeduplicationEntity,
@@ -17,7 +18,7 @@ const testEntity: DeduplicationEntity = {
   entityType: 'pr',
   entityNumber: 42,
 }
-const testEntityDir = path.join(DEDUP_SENTINEL_DIR, 'owner-repo-pr-42')
+const testEntityDir = path.join(DEDUP_BASE_DIR, 'owner-repo-pr-42')
 
 function createMarker(runId: number): DeduplicationMarker {
   return {
@@ -45,7 +46,7 @@ describe('buildDedupSaveKey', () => {
 
 describe('restoreDeduplicationMarker', () => {
   afterEach(async () => {
-    await fs.rm(DEDUP_SENTINEL_DIR, {recursive: true, force: true})
+    await fs.rm(DEDUP_BASE_DIR, {recursive: true, force: true})
   })
 
   it('returns null when no sentinel exists', async () => {
@@ -116,7 +117,7 @@ describe('restoreDeduplicationMarker', () => {
 
 describe('saveDeduplicationMarker', () => {
   afterEach(async () => {
-    await fs.rm(DEDUP_SENTINEL_DIR, {recursive: true, force: true})
+    await fs.rm(DEDUP_BASE_DIR, {recursive: true, force: true})
   })
 
   it('saves with correct cache key including run id', async () => {
