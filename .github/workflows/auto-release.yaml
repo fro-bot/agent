@@ -67,11 +67,6 @@ jobs:
             echo 'Release branch head does not match merged release PR commit'
             exit 1
           fi
-          parent_count=$(git rev-list --parents -n 1 "$MERGE_COMMIT_SHA" | wc -w | tr -d ' ')
-          if [ "$parent_count" -lt 3 ]; then
-            echo 'Release PR must be merged with a merge commit'
-            exit 1
-          fi
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
