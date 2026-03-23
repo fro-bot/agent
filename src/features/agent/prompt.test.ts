@@ -1,3 +1,4 @@
+import type {LogicalSessionKey} from '../../services/session/logical-key.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
@@ -54,6 +55,15 @@ function createMockSearchResult(overrides: Partial<SessionSearchResult> = {}): S
   }
 }
 
+function createMockLogicalKey(overrides: Partial<LogicalSessionKey> = {}): LogicalSessionKey {
+  return {
+    key: 'pr-42',
+    entityType: 'pr',
+    entityId: '42',
+    ...overrides,
+  }
+}
+
 describe('buildAgentPrompt', () => {
   let mockLogger: Logger
 
@@ -80,6 +90,95 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Actor:** test-user')
     expect(prompt).toContain('**Run ID:** 12345')
     expect(prompt).toContain('**Cache Status:** hit')
+  })
+
+  it('includes non-negotiable rules at top and constraint reminder at end', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Critical Rules (NON-NEGOTIABLE)')
+    expect(prompt).toContain('## Reminder: Critical Rules')
+
+    const criticalRulesIndex = prompt.indexOf('## Critical Rules (NON-NEGOTIABLE)')
+    const taskIndex = prompt.indexOf('## Task')
+    const reminderIndex = prompt.indexOf('## Reminder: Critical Rules')
+    const ghOpsIndex = prompt.indexOf('## GitHub Operations (Use gh CLI)')
+
+    expect(criticalRulesIndex).toBe(0)
+    expect(taskIndex).toBeGreaterThan(criticalRulesIndex)
+    expect(reminderIndex).toBeGreaterThan(ghOpsIndex)
+  })
+
+  it('includes thread identity section when logical key is provided', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      logicalKey: createMockLogicalKey(),
+      isContinuation: true,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Thread Identity')
+    expect(prompt).toContain('**Logical Thread**: `pr-42` (pr #42)')
+    expect(prompt).toContain('**Status**: Continuing previous conversation thread.')
+  })
+
+  it('places current thread context above environment and historical context for continuation runs', () => {
+    // #given
+    const sessionContext: SessionContext = {
+      recentSessions: [createMockSessionSummary()],
+      priorWorkContext: [
+        createMockSearchResult({
+          sessionId: 'ses_current',
+          matches: [{messageId: 'msg_1', partId: 'part_1', role: 'assistant', excerpt: 'Current thread prior work'}],
+        }),
+        createMockSearchResult({
+          sessionId: 'ses_other',
+          matches: [{messageId: 'msg_2', partId: 'part_2', role: 'assistant', excerpt: 'Other thread context'}],
+        }),
+      ],
+    }
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      sessionContext,
+      logicalKey: createMockLogicalKey(),
+      isContinuation: true,
+      currentThreadSessionId: 'ses_current',
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Current Thread Context')
+    expect(prompt).toContain('Current thread prior work')
+    expect(prompt).toContain('## Related Historical Context')
+    expect(prompt).toContain('Other thread context')
+
+    const currentThreadIndex = prompt.indexOf('## Current Thread Context')
+    const environmentIndex = prompt.indexOf('## Environment')
+    const relatedHistoryIndex = prompt.indexOf('## Related Historical Context')
+    const agentContextIndex = prompt.indexOf('# Agent Context')
+
+    expect(currentThreadIndex).toBeGreaterThan(-1)
+    expect(currentThreadIndex).toBeLessThan(environmentIndex)
+    expect(relatedHistoryIndex).toBeGreaterThan(environmentIndex)
+    expect(agentContextIndex).toBeGreaterThan(relatedHistoryIndex)
   })
 
   it('includes CI environment awareness with operating environment section', () => {
