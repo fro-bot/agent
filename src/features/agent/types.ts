@@ -6,6 +6,7 @@
  */
 
 import type {FilePartInput} from '@opencode-ai/sdk'
+import type {LogicalSessionKey} from '../../services/session/logical-key.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {ModelConfig, OmoProviders, TokenUsage} from '../../shared/types.js'
 import type {ErrorInfo} from '../comments/types.js'
@@ -81,6 +82,9 @@ export interface PromptOptions {
   readonly customPrompt: string | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly sessionContext?: SessionContext
+  readonly logicalKey?: LogicalSessionKey | null
+  readonly isContinuation?: boolean
+  readonly currentThreadSessionId?: string | null
   readonly sessionId?: string
   readonly triggerContext?: TriggerContext
   readonly fileParts?: readonly FilePartInput[]
@@ -129,6 +133,8 @@ export interface ExecutionConfig {
   readonly model: ModelConfig | null
   readonly timeoutMs: number
   readonly omoProviders: OmoProviders
+  readonly continueSessionId?: string
+  readonly sessionTitle?: string
 }
 
 export interface EnsureOpenCodeResult {

@@ -5,11 +5,18 @@
  * instructions, gh CLI examples, and run summary requirements.
  */
 
+import type {SessionSearchResult} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
 import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
+import {
+  buildConstraintReminderSection,
+  buildCurrentThreadContextSection,
+  buildNonNegotiableRulesSection,
+  buildThreadIdentitySection,
+} from './prompt-thread.js'
 
 export interface TriggerDirective {
   readonly directive: string
@@ -118,30 +125,23 @@ export function buildTaskSection(context: TriggerContext, promptInput: string | 
  * - Custom prompt if provided
  */
 export function buildAgentPrompt(options: PromptOptions, logger: Logger): string {
-  const {context, customPrompt, cacheStatus, sessionContext} = options
+  const {context, customPrompt, cacheStatus, sessionContext, logicalKey, isContinuation, currentThreadSessionId} =
+    options
   const parts: string[] = []
+  const continuationEnabled = isContinuation === true
 
-  // System context header
-  parts.push(`# Agent Context
+  parts.push(buildNonNegotiableRulesSection())
 
-You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
-
-## Operating Environment
-
-- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
-- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
-- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
-- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.
-`)
-
-  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(`
-${customPrompt.trim()}
-
-`)
+  const threadIdentitySection = buildThreadIdentitySection(logicalKey ?? null, continuationEnabled, null)
+  if (threadIdentitySection.length > 0) {
+    parts.push(threadIdentitySection)
   }
 
-  // Task section
+  const currentThreadContextText =
+    sessionContext != null && continuationEnabled && currentThreadSessionId != null
+      ? buildCurrentThreadPriorWorkText(sessionContext.priorWorkContext, currentThreadSessionId)
+      : null
+
   if (options.triggerContext != null) {
     parts.push(buildTaskSection(options.triggerContext, customPrompt))
   } else if (context.commentBody == null) {
@@ -156,36 +156,6 @@ Respond to the trigger comment above. Follow all instructions and requirements l
 `)
   }
 
-  // Output Contract section (PR triggers only)
-  if (options.triggerContext != null) {
-    const eventType = options.triggerContext.eventType
-    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
-      parts.push(buildOutputContractSection(context))
-    }
-  }
-
-  // Environment context
-  parts.push(`
-## Environment
-- **Repository:** ${context.repo}
-- **Branch/Ref:** ${context.ref}
-- **Event:** ${context.eventName}
-- **Actor:** ${context.actor}
-- **Run ID:** ${context.runId}
-- **Cache Status:** ${cacheStatus}
-`)
-
-  // Issue/PR context
-  if (context.issueNumber != null) {
-    const typeLabel = context.issueType === 'pr' ? 'Pull Request' : 'Issue'
-    parts.push(`## ${typeLabel} Context
-- **Number:** #${context.issueNumber}
-- **Title:** ${context.issueTitle ?? 'N/A'}
-- **Type:** ${context.issueType ?? 'unknown'}
-`)
-  }
-
-  // Triggering comment
   if (context.commentBody != null) {
     parts.push(`## Trigger Comment
 **Author:** ${context.commentAuthor ?? 'unknown'}
@@ -196,20 +166,75 @@ ${context.commentBody}
 `)
   }
 
-  // Prior session context (RFC-004 integration)
-  if (sessionContext != null) {
-    parts.push(buildSessionContextSection(sessionContext))
+  const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
+  if (currentThreadSection.length > 0) {
+    parts.push(currentThreadSection)
   }
 
-  // PR diff context (RFC-009 integration)
+  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
+    parts.push(`
+${customPrompt.trim()}
+
+`)
+  }
+
+  if (options.triggerContext != null) {
+    const eventType = options.triggerContext.eventType
+    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
+      parts.push(buildOutputContractSection(context))
+    }
+  }
+
+  parts.push(`
+## Environment
+- **Repository:** ${context.repo}
+- **Branch/Ref:** ${context.ref}
+- **Event:** ${context.eventName}
+- **Actor:** ${context.actor}
+- **Run ID:** ${context.runId}
+- **Cache Status:** ${cacheStatus}
+`)
+
+  if (context.issueNumber != null) {
+    const typeLabel = context.issueType === 'pr' ? 'Pull Request' : 'Issue'
+    parts.push(`## ${typeLabel} Context
+- **Number:** #${context.issueNumber}
+- **Title:** ${context.issueTitle ?? 'N/A'}
+- **Type:** ${context.issueType ?? 'unknown'}
+`)
+  }
+
   if (context.diffContext != null) {
     parts.push(buildDiffContextSection(context.diffContext))
   }
 
-  // Hydrated issue/PR context (RFC-015 integration)
   if (context.hydratedContext != null) {
     parts.push(formatContextForPrompt(context.hydratedContext))
   }
+
+  if (sessionContext != null) {
+    const historicalSection = buildHistoricalSessionContext(
+      sessionContext,
+      continuationEnabled,
+      currentThreadSessionId,
+      currentThreadContextText != null,
+    )
+    if (historicalSection != null) {
+      parts.push(historicalSection)
+    }
+  }
+
+  parts.push(`# Agent Context
+
+You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
+
+## Operating Environment
+
+- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
+- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
+- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
+- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.
+`)
 
   // Session management instructions (REQUIRED)
   parts.push(`## Session Management (REQUIRED)
@@ -274,6 +299,8 @@ gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
 \`\`\`
 `)
 
+  parts.push(buildConstraintReminderSection())
+
   const prompt = parts.join('\n')
   logger.debug('Built agent prompt', {
     length: prompt.length,
@@ -332,8 +359,12 @@ Every response you post — regardless of channel (issue, PR, discussion, review
  * Build the session context section for the prompt.
  * Provides lightweight metadata and search excerpts to avoid prompt bloat.
  */
-function buildSessionContextSection(sessionContext: SessionContext): string {
-  const lines: string[] = ['## Prior Session Context']
+function buildSessionContextSection(
+  sessionContext: SessionContext,
+  sectionTitle: string,
+  priorWorkContext: readonly SessionSearchResult[],
+): string {
+  const lines: string[] = [sectionTitle]
 
   // Recent sessions (lightweight metadata only)
   if (sessionContext.recentSessions.length > 0) {
@@ -354,14 +385,14 @@ function buildSessionContextSection(sessionContext: SessionContext): string {
   }
 
   // Prior work context (search results)
-  if (sessionContext.priorWorkContext.length > 0) {
+  if (priorWorkContext.length > 0) {
     lines.push('')
     lines.push('### Relevant Prior Work')
     lines.push('')
     lines.push('The following sessions contain content related to this issue:')
     lines.push('')
 
-    for (const result of sessionContext.priorWorkContext.slice(0, 3)) {
+    for (const result of priorWorkContext.slice(0, 3)) {
       lines.push(`**Session ${result.sessionId}:**`)
       lines.push('```markdown')
       for (const match of result.matches.slice(0, 2)) {
@@ -376,6 +407,58 @@ function buildSessionContextSection(sessionContext: SessionContext): string {
 
   lines.push('')
   return lines.join('\n')
+}
+
+function buildCurrentThreadPriorWorkText(
+  priorWorkContext: readonly SessionSearchResult[],
+  currentThreadSessionId: string,
+): string | null {
+  const currentThreadResults = priorWorkContext.filter(result => result.sessionId === currentThreadSessionId)
+
+  if (currentThreadResults.length === 0) {
+    return null
+  }
+
+  const lines: string[] = []
+  for (const result of currentThreadResults.slice(0, 1)) {
+    lines.push(`**Session ${result.sessionId}:**`)
+    lines.push('```markdown')
+    for (const match of result.matches.slice(0, 3)) {
+      lines.push(`- ${match.excerpt}`)
+    }
+    lines.push('```')
+  }
+
+  return lines.join('\n')
+}
+
+function buildHistoricalSessionContext(
+  sessionContext: SessionContext,
+  isContinuation: boolean,
+  currentThreadSessionId: string | null | undefined,
+  hasCurrentThreadContext: boolean,
+): string | null {
+  if (isContinuation && currentThreadSessionId != null) {
+    const relatedPriorWork = sessionContext.priorWorkContext.filter(
+      result => result.sessionId !== currentThreadSessionId,
+    )
+
+    if (sessionContext.recentSessions.length === 0 && relatedPriorWork.length === 0) {
+      return null
+    }
+
+    return buildSessionContextSection(sessionContext, '## Related Historical Context', relatedPriorWork)
+  }
+
+  if (
+    sessionContext.recentSessions.length === 0 &&
+    sessionContext.priorWorkContext.length === 0 &&
+    hasCurrentThreadContext
+  ) {
+    return null
+  }
+
+  return buildSessionContextSection(sessionContext, '## Prior Session Context', sessionContext.priorWorkContext)
 }
 
 function buildDiffContextSection(diffContext: DiffContext): string {
