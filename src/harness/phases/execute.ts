@@ -68,11 +68,18 @@ export async function runExecute(
     }
   } else {
     const execLogger = createLogger({phase: 'execution'})
+    execLogger.info('Starting OpenCode execution', {
+      logicalKey: sessionPrep.logicalKey?.key ?? null,
+      continueSessionId: sessionPrep.continueSessionId,
+    })
+
     const executionConfig: ExecutionConfig = {
       agent: bootstrap.inputs.agent,
       model: bootstrap.inputs.model,
       timeoutMs: bootstrap.inputs.timeoutMs,
       omoProviders: bootstrap.inputs.omoProviders,
+      continueSessionId: sessionPrep.continueSessionId ?? undefined,
+      sessionTitle: sessionPrep.sessionTitle ?? undefined,
     }
 
     const execResult = await executeOpenCode(promptOptions, execLogger, executionConfig, cacheRestore.serverHandle)
@@ -96,6 +103,12 @@ export async function runExecute(
       ...execResult,
       sessionId,
     }
+
+    execLogger.info('Completed OpenCode execution', {
+      success: result.success,
+      sessionId: result.sessionId,
+      logicalKey: sessionPrep.logicalKey?.key ?? null,
+    })
   }
 
   if (result.sessionId != null) {
@@ -126,6 +139,7 @@ export async function runExecute(
         runId: Number(routing.agentContext.runId),
         cacheStatus: cacheRestore.cacheStatus,
         sessionIds: [result.sessionId],
+        logicalKey: sessionPrep.logicalKey?.key,
         createdPRs: [...result.prsCreated],
         createdCommits: [...result.commitsCreated],
         duration: Math.round((Date.now() - startTime) / 1000),

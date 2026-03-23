@@ -1,5 +1,6 @@
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {LogicalSessionKey} from '../../services/session/logical-key.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
@@ -11,6 +12,7 @@ import {
   validateAttachments,
 } from '../../features/attachments/index.js'
 import {listSessions, searchSessions} from '../../services/session/index.js'
+import {buildLogicalKey, buildSessionTitle, resolveSessionForLogicalKey} from '../../services/session/logical-key.js'
 import {getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
@@ -20,6 +22,10 @@ export interface SessionPrepPhaseResult {
   readonly priorWorkContext: readonly SessionSearchResult[]
   readonly attachmentResult: AttachmentResult | null
   readonly normalizedWorkspace: string
+  readonly logicalKey: LogicalSessionKey | null
+  readonly continueSessionId: string | null
+  readonly isContinuation: boolean
+  readonly sessionTitle: string | null
 }
 
 export async function runSessionPrep(
@@ -39,7 +45,39 @@ export async function runSessionPrep(
   )
   sessionLogger.debug('Listed recent sessions', {count: recentSessions.length})
 
-  const searchQuery = routing.agentContext.issueTitle ?? routing.agentContext.repo
+  const logicalKey = buildLogicalKey(routing.triggerResult.context)
+  const sessionTitle = logicalKey == null ? null : buildSessionTitle(logicalKey)
+  let continueSessionId: string | null = null
+  let isContinuation = false
+
+  if (logicalKey != null) {
+    const resolution = await resolveSessionForLogicalKey(
+      cacheRestore.serverHandle.client,
+      normalizedWorkspace,
+      logicalKey,
+      sessionLogger,
+    )
+
+    if (resolution.status === 'found') {
+      continueSessionId = resolution.session.id
+      isContinuation = true
+      sessionLogger.info('Session continuity: found existing session', {
+        logicalKey: logicalKey.key,
+        sessionId: continueSessionId,
+      })
+    } else if (resolution.status === 'error') {
+      sessionLogger.warning('Session continuity: lookup error, will create new', {
+        logicalKey: logicalKey.key,
+        error: resolution.error,
+      })
+    } else {
+      sessionLogger.info('Session continuity: no existing session found', {
+        logicalKey: logicalKey.key,
+      })
+    }
+  }
+
+  const searchQuery = logicalKey?.key ?? routing.agentContext.issueTitle ?? routing.agentContext.repo
   const priorWorkContext = await searchSessions(
     searchQuery,
     cacheRestore.serverHandle.client,
@@ -80,5 +118,9 @@ export async function runSessionPrep(
     priorWorkContext,
     attachmentResult,
     normalizedWorkspace,
+    logicalKey,
+    continueSessionId,
+    isContinuation,
+    sessionTitle,
   }
 }

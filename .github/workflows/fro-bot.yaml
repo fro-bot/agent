@@ -123,3 +123,13 @@ jobs:
           model: ${{ vars.FRO_BOT_MODEL }}
           omo-providers: ${{ secrets.OMO_PROVIDERS }}
           prompt: ${{ env.PROMPT }}
+
+      - if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: opencode-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/.local/share/opencode/log
+          retention-days: 7
+          compression-level: 9
+          include-hidden-files: true
+          if-no-files-found: warn

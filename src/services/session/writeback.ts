@@ -22,6 +22,10 @@ function formatSummaryForSession(summary: RunSummary): string {
     lines.push(`Sessions used: ${summary.sessionIds.join(', ')}`)
   }
 
+  if (summary.logicalKey != null) {
+    lines.push(`Logical Thread: ${summary.logicalKey}`)
+  }
+
   if (summary.createdPRs.length > 0) {
     lines.push(`PRs created: ${summary.createdPRs.join(', ')}`)
   }

@@ -50,12 +50,22 @@ export async function executeOpenCode(
       server = opencode.server
     } else client = serverHandle.client
 
-    const sessionResponse = await client.session.create()
-    if (sessionResponse.data == null || sessionResponse.error != null)
-      throw new Error(
-        `Failed to create session: ${sessionResponse.error == null ? 'No data returned' : String(sessionResponse.error)}`,
-      )
-    const sessionId = sessionResponse.data.id
+    let sessionId: string
+    if (config?.continueSessionId == null) {
+      const createPayload =
+        config?.sessionTitle == null ? undefined : ({body: {title: config.sessionTitle}} as Record<string, unknown>)
+      const sessionResponse =
+        createPayload == null ? await client.session.create() : await client.session.create(createPayload)
+      if (sessionResponse.data == null || sessionResponse.error != null)
+        throw new Error(
+          `Failed to create session: ${sessionResponse.error == null ? 'No data returned' : String(sessionResponse.error)}`,
+        )
+      sessionId = sessionResponse.data.id
+      logger.info('Created new OpenCode session', {sessionId, sessionTitle: config?.sessionTitle ?? null})
+    } else {
+      sessionId = config.continueSessionId
+      logger.info('Continuing existing OpenCode session', {sessionId})
+    }
     const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
     const directory = getGitHubWorkspace()
 
@@ -109,6 +119,20 @@ export async function executeOpenCode(
       const result = await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger)
       if (result.success) {
         final = result.eventStreamResult
+
+        // Best-effort title re-assertion: OpenCode may auto-overwrite session titles
+        // based on first message content. Re-set to preserve deterministic lookup.
+        if (config?.sessionTitle != null) {
+          try {
+            await (client.session as unknown as {update: (args: Record<string, unknown>) => Promise<unknown>}).update({
+              sessionID: sessionId,
+              title: config.sessionTitle,
+            })
+          } catch {
+            logger.debug('Best-effort session title re-assertion failed', {sessionId})
+          }
+        }
+
         return {
           success: true,
           exitCode: 0,

@@ -103,6 +103,7 @@ export interface RunSummary {
   readonly runId: number
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly sessionIds: readonly string[]
+  readonly logicalKey?: string
   readonly createdPRs: readonly string[]
   readonly createdCommits: readonly string[]
   readonly duration: number
