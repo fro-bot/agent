@@ -7,6 +7,7 @@ import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {createOpencode} from '@opencode-ai/sdk'
+import {reassertSessionTitle} from '../../services/session/title-reassert.js'
 import {sleep} from '../../shared/async.js'
 import {DEFAULT_AGENT, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
@@ -116,22 +117,16 @@ export async function executeOpenCode(
 
       const prompt = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
       const files = attempt === 1 ? promptOptions.fileParts : undefined
-      const result = await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger)
+      const result = await (async () => {
+        try {
+          return await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger)
+        } finally {
+          await reassertSessionTitle(client, sessionId, config?.sessionTitle, logger)
+        }
+      })()
+
       if (result.success) {
         final = result.eventStreamResult
-
-        // Best-effort title re-assertion: OpenCode may auto-overwrite session titles
-        // based on first message content. Re-set to preserve deterministic lookup.
-        if (config?.sessionTitle != null) {
-          try {
-            await (client.session as unknown as {update: (args: Record<string, unknown>) => Promise<unknown>}).update({
-              sessionID: sessionId,
-              title: config.sessionTitle,
-            })
-          } catch {
-            logger.debug('Best-effort session title re-assertion failed', {sessionId})
-          }
-        }
 
         return {
           success: true,

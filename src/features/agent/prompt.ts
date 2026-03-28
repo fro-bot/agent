@@ -156,7 +156,16 @@ Respond to the trigger comment above. Follow all instructions and requirements l
 `)
   }
 
-  if (context.commentBody != null) {
+  const trimmedCustomPrompt = customPrompt?.trim() ?? null
+  const trimmedCommentBody = context.commentBody?.trim() ?? null
+  const triggerCommentDuplicatesTask =
+    trimmedCustomPrompt != null &&
+    trimmedCustomPrompt.length > 0 &&
+    trimmedCommentBody != null &&
+    trimmedCommentBody.length > 0 &&
+    trimmedCustomPrompt === trimmedCommentBody
+
+  if (context.commentBody != null && !triggerCommentDuplicatesTask) {
     parts.push(`## Trigger Comment
 **Author:** ${context.commentAuthor ?? 'unknown'}
 
