@@ -43,6 +43,9 @@ export async function runExecute(
       recentSessions: sessionPrep.recentSessions,
       priorWorkContext: sessionPrep.priorWorkContext,
     },
+    logicalKey: sessionPrep.logicalKey ?? null,
+    isContinuation: sessionPrep.isContinuation,
+    currentThreadSessionId: sessionPrep.continueSessionId ?? null,
     triggerContext: routing.triggerResult.context,
     fileParts: sessionPrep.attachmentResult?.fileParts,
   }
