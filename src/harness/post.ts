@@ -1,7 +1,15 @@
 import type {Logger} from '../shared/logger.js'
 import * as core from '@actions/core'
+import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
-import {getGitHubRunId, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../shared/env.js'
+import {
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getOpenCodeAuthPath,
+  getOpenCodeLogPath,
+  getOpenCodeStoragePath,
+  isOpenCodePromptArtifactEnabled,
+} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -27,29 +35,47 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
 
   if (cacheSaved === 'true') {
     logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
-    return
+  } else {
+    try {
+      const components = buildCacheKeyComponents()
+
+      const saved = await saveCache({
+        components,
+        runId: getGitHubRunId(),
+        logger,
+        storagePath: getOpenCodeStoragePath(),
+        authPath: getOpenCodeAuthPath(),
+        opencodeVersion,
+      })
+
+      if (saved) {
+        logger.info('Post-action cache saved', {sessionId})
+      } else {
+        logger.info('Post-action: no cache content to save', {sessionId})
+      }
+    } catch (error) {
+      logger.warning('Post-action cache save failed (non-fatal)', {
+        error: toErrorMessage(error),
+      })
+    }
   }
 
-  try {
-    const components = buildCacheKeyComponents()
-
-    const saved = await saveCache({
-      components,
-      runId: getGitHubRunId(),
-      logger,
-      storagePath: getOpenCodeStoragePath(),
-      authPath: getOpenCodeAuthPath(),
-      opencodeVersion,
-    })
-
-    if (saved) {
-      logger.info('Post-action cache saved', {sessionId})
-    } else {
-      logger.info('Post-action: no cache content to save', {sessionId})
+  if (isOpenCodePromptArtifactEnabled()) {
+    const artifactUploaded = core.getState(STATE_KEYS.ARTIFACT_UPLOADED)
+    if (artifactUploaded !== 'true') {
+      try {
+        const artifactLogger = createLogger({phase: 'post-artifact-upload'})
+        await uploadLogArtifact({
+          logPath: getOpenCodeLogPath(),
+          runId: getGitHubRunId(),
+          runAttempt: getGitHubRunAttempt(),
+          logger: artifactLogger,
+        })
+      } catch (error) {
+        logger.warning('Post-action artifact upload failed (non-fatal)', {
+          error: toErrorMessage(error),
+        })
+      }
     }
-  } catch (error) {
-    logger.warning('Post-action cache save failed (non-fatal)', {
-      error: toErrorMessage(error),
-    })
   }
 }

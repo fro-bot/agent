@@ -76,6 +76,17 @@ export function getGitHubRunId(): number {
   return 0
 }
 
+export function getGitHubRunAttempt(): number {
+  const attempt = process.env.GITHUB_RUN_ATTEMPT
+  if (attempt != null && attempt.trim().length > 0) {
+    const parsedAttempt = Number(attempt)
+    if (Number.isFinite(parsedAttempt) && parsedAttempt > 0) {
+      return parsedAttempt
+    }
+  }
+  return 1
+}
+
 export function getGitHubWorkspace(): string {
   const workspace = process.env.GITHUB_WORKSPACE
   if (workspace != null && workspace.trim().length > 0) {
