@@ -110,6 +110,7 @@ function createMockClient(options: {
       create: options.throwOnCreate
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
+      update: vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
       promptAsync: options.throwOnPrompt
         ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
         : vi.fn().mockResolvedValue({data: options.promptResponse}),
@@ -442,6 +443,70 @@ describe('executeOpenCode', () => {
     expect(result.exitCode).toBe(0)
     expect(result.error).toBeNull()
     expect(result.duration).toBeGreaterThanOrEqual(0)
+  })
+
+  it('re-asserts session title with SDK update payload after prompt attempts', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Agent response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+    const config: ExecutionConfig = {
+      agent: 'sisyphus',
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
+      sessionTitle: 'fro-bot: schedule-c757a308',
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    expect(mockClient.session.update).toHaveBeenCalledWith({
+      path: {id: 'ses_123'},
+      body: {title: 'fro-bot: schedule-c757a308'},
+    })
+  })
+
+  it('re-asserts session title even when prompt attempt fails', async () => {
+    // #given
+    const mockClient = createMockClient({throwOnPrompt: true})
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+    const config: ExecutionConfig = {
+      agent: 'sisyphus',
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: {
+        claude: 'no',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
+      sessionTitle: 'fro-bot: schedule-c757a308',
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    expect(mockClient.session.update).toHaveBeenCalledWith({
+      path: {id: 'ses_123'},
+      body: {title: 'fro-bot: schedule-c757a308'},
+    })
   })
 
   it('returns failure result when prompt fails', async () => {
