@@ -16,6 +16,10 @@ vi.mock('../services/cache/index.js', async importOriginal => {
   }
 })
 
+vi.mock('../services/artifact/index.js', () => ({
+  uploadLogArtifact: vi.fn(),
+}))
+
 describe('post action', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -160,6 +164,102 @@ describe('post action', () => {
       expect(logger.info).toHaveBeenCalledWith(
         'Post-action cache saved',
         expect.objectContaining({sessionId: 'ses_abc123'}),
+      )
+    })
+
+    it('should upload artifact when OPENCODE_PROMPT_ARTIFACT is enabled and not yet uploaded', async () => {
+      // #given artifact upload is enabled and not yet done
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'true'
+        if (key === 'artifactUploaded') return ''
+        return ''
+      })
+
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      vi.mocked(uploadLogArtifact).mockResolvedValue(true)
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      // #when runPost executes
+      await runPost({logger})
+
+      // #then artifact upload is called
+      expect(uploadLogArtifact).toHaveBeenCalledWith(expect.objectContaining({runId: 12345, runAttempt: 1}))
+    })
+
+    it('should skip artifact upload when already uploaded by main action', async () => {
+      // #given artifact was already uploaded
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'true'
+        if (key === 'artifactUploaded') return 'true'
+        return ''
+      })
+
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      // #when runPost executes
+      await runPost({logger})
+
+      // #then artifact upload is not called
+      expect(uploadLogArtifact).not.toHaveBeenCalled()
+    })
+
+    it('should skip artifact upload when OPENCODE_PROMPT_ARTIFACT is not set', async () => {
+      // #given artifact upload is disabled
+      delete process.env.OPENCODE_PROMPT_ARTIFACT
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'true'
+        return ''
+      })
+
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      // #when runPost executes
+      await runPost({logger})
+
+      // #then artifact upload is not called
+      expect(uploadLogArtifact).not.toHaveBeenCalled()
+    })
+
+    it('should not fail when artifact upload throws in post action', async () => {
+      // #given artifact upload throws
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'true'
+        if (key === 'artifactUploaded') return ''
+        return ''
+      })
+
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      vi.mocked(uploadLogArtifact).mockRejectedValue(new Error('Network timeout'))
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      // #when runPost executes
+      await expect(runPost({logger})).resolves.not.toThrow()
+
+      // #then it logs a warning but doesn't fail
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Post-action artifact upload failed (non-fatal)',
+        expect.objectContaining({error: 'Network timeout'}),
       )
     })
   })

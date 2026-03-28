@@ -207,13 +207,6 @@ jobs:
           echo "OpenCode state files:"
           ls -lA ~/.local/state/opencode || true
 
-      - if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: opencode-logs
-          path: ~/.local/share/opencode/log
-          if-no-files-found: warn
-
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
     name: Dependency Review
