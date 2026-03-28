@@ -136,6 +136,25 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Status**: Continuing previous conversation thread.')
   })
 
+  it('shows fresh thread identity status when logical key exists without continuation', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      logicalKey: createMockLogicalKey(),
+      isContinuation: false,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Thread Identity')
+    expect(prompt).toContain('**Logical Thread**: `pr-42` (pr #42)')
+    expect(prompt).toContain('**Status**: Fresh conversation — no prior thread found for this entity.')
+  })
+
   it('places current thread context above environment and historical context for continuation runs', () => {
     // #given
     const sessionContext: SessionContext = {
@@ -568,6 +587,37 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('See **Response Protocol** above')
     expect(prompt).toContain('## Session Management (REQUIRED)')
     expect(prompt).toContain('## GitHub Operations (Use gh CLI)')
+  })
+
+  it('skips Trigger Comment section when schedule prompt text matches trigger comment', () => {
+    // #given
+    const duplicatedTask = 'Run daily maintenance tasks and update the report issue.'
+    const context = createMockContext({
+      eventName: 'schedule',
+      issueNumber: null,
+      issueTitle: null,
+      issueType: null,
+      commentBody: duplicatedTask,
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'schedule',
+      commentBody: duplicatedTask,
+      target: undefined,
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: `  ${duplicatedTask}  `,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('## Task')
+    expect(prompt).toContain(duplicatedTask)
+    expect(prompt).not.toContain('## Trigger Comment')
   })
 
   describe('session context', () => {
