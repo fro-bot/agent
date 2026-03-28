@@ -7,9 +7,18 @@ import * as path from 'node:path'
 import * as core from '@actions/core'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
+import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
 import {DEFAULT_PRUNING_CONFIG, pruneSessions} from '../../services/session/index.js'
-import {getGitHubRunId, getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
+import {
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getGitHubWorkspace,
+  getOpenCodeAuthPath,
+  getOpenCodeLogPath,
+  getOpenCodeStoragePath,
+  isOpenCodePromptArtifactEnabled,
+} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -80,6 +89,19 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
 
     if (cacheSaved) {
       core.saveState(STATE_KEYS.CACHE_SAVED, 'true')
+    }
+
+    if (isOpenCodePromptArtifactEnabled()) {
+      const artifactLogger = createLogger({phase: 'artifact-upload'})
+      const artifactUploaded = await uploadLogArtifact({
+        logPath: getOpenCodeLogPath(),
+        runId: getGitHubRunId(),
+        runAttempt: getGitHubRunAttempt(),
+        logger: artifactLogger,
+      })
+      if (artifactUploaded) {
+        core.saveState(STATE_KEYS.ARTIFACT_UPLOADED, 'true')
+      }
     }
   } catch (cleanupError) {
     bootstrapLogger.warning('Cleanup failed (non-fatal)', {

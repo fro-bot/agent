@@ -3,6 +3,7 @@ import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {
   getGitHubRefName,
   getGitHubRepository,
+  getGitHubRunAttempt,
   getGitHubRunId,
   getGitHubWorkspace,
   getOpenCodeAuthPath,
@@ -204,6 +205,48 @@ describe('getGitHubRunId', () => {
   it('returns 0 when GITHUB_RUN_ID is empty', () => {
     process.env.GITHUB_RUN_ID = ''
     expect(getGitHubRunId()).toBe(0)
+  })
+})
+
+describe('getGitHubRunAttempt', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_RUN_ATTEMPT as number when set', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '3'
+    expect(getGitHubRunAttempt()).toBe(3)
+  })
+
+  it('returns 1 when GITHUB_RUN_ATTEMPT not set', () => {
+    delete process.env.GITHUB_RUN_ATTEMPT
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 when GITHUB_RUN_ATTEMPT is empty', () => {
+    process.env.GITHUB_RUN_ATTEMPT = ''
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for non-numeric values', () => {
+    process.env.GITHUB_RUN_ATTEMPT = 'abc'
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for zero', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '0'
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for negative values', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '-1'
+    expect(getGitHubRunAttempt()).toBe(1)
   })
 })
 
