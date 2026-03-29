@@ -12,6 +12,8 @@ import {setActionOutputs} from '../config/outputs.js'
 
 const DEDUP_EVENT_TYPES = new Set(['pull_request', 'issues'])
 
+const DEDUP_BYPASS_ACTIONS = new Set(['synchronize', 'reopened'])
+
 export interface DedupCheckResult {
   readonly shouldProceed: boolean
   readonly entity: DeduplicationEntity | null
@@ -53,6 +55,11 @@ export async function runDedup(
 
   if (entity == null) {
     return {shouldProceed: true, entity: null}
+  }
+
+  if (triggerContext.action != null && DEDUP_BYPASS_ACTIONS.has(triggerContext.action)) {
+    logger.debug('Dedup bypassed for action', {action: triggerContext.action})
+    return {shouldProceed: true, entity}
   }
 
   const marker = await restoreDeduplicationMarker(repo, entity, logger, cacheAdapter)

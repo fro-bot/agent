@@ -178,6 +178,38 @@ describe('runDedup', () => {
     expect(vi.mocked(restoreDeduplicationMarker)).not.toHaveBeenCalled()
   })
 
+  it('bypasses dedup for synchronize action', async () => {
+    // #given synchronize action on a PR (fires first, needed for required status checks)
+    const context = createTriggerContext({
+      eventType: 'pull_request',
+      action: 'synchronize',
+      target: createTarget('pr', 42),
+    })
+
+    // #when running dedup phase
+    const result = await runDedup(600_000, context, 'fro-bot/agent', 1, createMockLogger())
+
+    // #then dedup is bypassed — no cache lookup occurs
+    expect(result).toEqual({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+    expect(vi.mocked(restoreDeduplicationMarker)).not.toHaveBeenCalled()
+  })
+
+  it('bypasses dedup for reopened action', async () => {
+    // #given reopened PR (meaningful state change, breaks dedup lock)
+    const context = createTriggerContext({
+      eventType: 'pull_request',
+      action: 'reopened',
+      target: createTarget('pr', 42),
+    })
+
+    // #when running dedup phase
+    const result = await runDedup(600_000, context, 'fro-bot/agent', 1, createMockLogger())
+
+    // #then dedup is bypassed
+    expect(result).toEqual({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+    expect(vi.mocked(restoreDeduplicationMarker)).not.toHaveBeenCalled()
+  })
+
   it('returns shouldProceed true when no sentinel is found', async () => {
     // #given cache miss for dedup marker
     vi.mocked(restoreDeduplicationMarker).mockResolvedValueOnce(null)
