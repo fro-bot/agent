@@ -39,8 +39,8 @@ importers:
         specifier: 8.2.0
         version: 8.2.0
       '@opencode-ai/sdk':
-        specifier: 1.3.2
-        version: 1.3.2
+        specifier: 1.3.5
+        version: 1.3.5
     devDependencies:
       '@bfra.me/eslint-config':
         specifier: 0.50.1
@@ -724,8 +724,8 @@ packages:
   '@octokit/webhooks-types@7.6.1':
     resolution: {integrity: sha512-S8u2cJzklBC0FgTwWVLaM8tMrDuDMVE4xiTK4EYXM9GntyvrdbSoxqDQa+Fh57CCNApyIpyeqPhhFEmHPfrXgw==}
 
-  '@opencode-ai/sdk@1.3.2':
-    resolution: {integrity: sha512-u7sXVKn0kyAA5vVVHuHQfq3+3UGWOU1Sh6d/e+aS4zO8AwriTSWNQ9r8Qy5yxBH+PoeOGl5WIVdp+s2Ea2zuAg==}
+  '@opencode-ai/sdk@1.3.5':
+    resolution: {integrity: sha512-ckKedqONnigSejAm/UVlBuQP0U1Ozn9uC54zLxz/EqQZPWE8y7V+8PT048zC7q6gqI+puj2jns65/+enJSkTEQ==}
 
   '@ota-meshi/ast-token-store@0.3.0':
     resolution: {integrity: sha512-XRO0zi2NIUKq2lUk3T1ecFSld1fMWRKE6naRFGkgkdeosx7IslyUKNv5Dcb5PJTja9tHJoFu0v/7yEpAkrkrTg==}
@@ -5147,7 +5147,7 @@ snapshots:
 
   '@octokit/webhooks-types@7.6.1': {}
 
-  '@opencode-ai/sdk@1.3.2': {}
+  '@opencode-ai/sdk@1.3.5': {}
 
   '@ota-meshi/ast-token-store@0.3.0': {}
 
