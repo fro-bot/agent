@@ -1,11 +1,29 @@
 import type {TriggerContext, TriggerTarget} from '../../features/triggers/types.js'
 import type {DeduplicationMarker} from '../../services/cache/dedup.js'
 import type {EventType, GitHubContext} from '../../services/github/types.js'
+import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {restoreDeduplicationMarker, saveDeduplicationMarker} from '../../services/cache/dedup.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {setActionOutputs} from '../config/outputs.js'
 import {extractDedupEntity, runDedup, saveDedupMarker} from './dedup.js'
+
+vi.mock('@actions/core', () => ({
+  summary: {
+    addHeading: vi.fn().mockReturnThis(),
+    addTable: vi.fn().mockReturnThis(),
+    addRaw: vi.fn().mockReturnThis(),
+    write: vi.fn().mockResolvedValue(undefined),
+  },
+  warning: vi.fn(),
+  info: vi.fn(),
+  debug: vi.fn(),
+  setOutput: vi.fn(),
+  getInput: vi.fn().mockReturnValue(''),
+  saveState: vi.fn(),
+  getState: vi.fn().mockReturnValue(''),
+  setFailed: vi.fn(),
+}))
 
 vi.mock('../../services/cache/dedup.js', () => ({
   restoreDeduplicationMarker: vi.fn(),
@@ -324,7 +342,7 @@ describe('runDedup', () => {
     // #when running dedup phase
     const result = await runDedup(10_000, context, 'fro-bot/agent', 5_000, createMockLogger())
 
-    // #then processing is skipped and outputs are set
+    // #then processing is skipped, outputs set, and job summary written
     expect(result).toEqual({
       shouldProceed: false,
       entity: {entityType: 'pr', entityNumber: 42},
@@ -334,6 +352,8 @@ describe('runDedup', () => {
       cacheStatus: 'miss',
       duration: 25_000,
     })
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(core.summary.write).toHaveBeenCalled()
   })
 })
 
