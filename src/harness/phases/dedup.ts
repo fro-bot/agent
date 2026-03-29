@@ -1,16 +1,16 @@
 import type {TriggerContext} from '../../features/triggers/types.js'
+import type {DeduplicationEntity, DeduplicationMarker} from '../../services/cache/dedup.js'
 import type {CacheAdapter} from '../../services/cache/types.js'
 import type {Logger} from '../../shared/logger.js'
-import {
-  restoreDeduplicationMarker,
-  saveDeduplicationMarker,
-  type DeduplicationEntity,
-  type DeduplicationMarker,
-} from '../../services/cache/dedup.js'
+import * as core from '@actions/core'
+import {restoreDeduplicationMarker, saveDeduplicationMarker} from '../../services/cache/dedup.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {setActionOutputs} from '../config/outputs.js'
 
 const DEDUP_EVENT_TYPES = new Set(['pull_request', 'issues'])
+
+const DEDUP_BYPASS_ACTIONS = new Set(['synchronize', 'reopened'])
 
 export interface DedupCheckResult {
   readonly shouldProceed: boolean
@@ -53,6 +53,11 @@ export async function runDedup(
 
   if (entity == null) {
     return {shouldProceed: true, entity: null}
+  }
+
+  if (triggerContext.action != null && DEDUP_BYPASS_ACTIONS.has(triggerContext.action)) {
+    logger.debug('Dedup bypassed for action', {action: triggerContext.action})
+    return {shouldProceed: true, entity}
   }
 
   const marker = await restoreDeduplicationMarker(repo, entity, logger, cacheAdapter)
@@ -104,6 +109,8 @@ export async function runDedup(
     duration: Date.now() - startTime,
   })
 
+  await writeDedupSkipSummary(triggerContext, entity, marker, effectiveAge, dedupWindow, logger)
+
   return {shouldProceed: false, entity}
 }
 
@@ -124,4 +131,40 @@ export async function saveDedupMarker(
   }
 
   await saveDeduplicationMarker(repo, entity, marker, logger, cacheAdapter)
+}
+
+async function writeDedupSkipSummary(
+  triggerContext: TriggerContext,
+  entity: DeduplicationEntity,
+  marker: DeduplicationMarker,
+  ageMs: number,
+  dedupWindow: number,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const ageSeconds = Math.round(ageMs / 1000)
+    const windowSeconds = Math.round(dedupWindow / 1000)
+    const entityLabel = `${entity.entityType} #${entity.entityNumber}`
+    const priorRunUrl = `https://github.com/${triggerContext.repo.owner}/${triggerContext.repo.repo}/actions/runs/${marker.runId}`
+
+    core.summary
+      .addHeading('Fro Bot Agent Run — Skipped (Dedup)', 2)
+      .addRaw(`Execution skipped because the agent already ran for **${entityLabel}** recently.\n\n`)
+      .addTable([
+        [
+          {data: 'Detail', header: true},
+          {data: 'Value', header: true},
+        ],
+        ['Current action', `\`${triggerContext.eventType}.${triggerContext.action ?? 'unknown'}\``],
+        ['Prior run', `[${marker.runId}](${priorRunUrl})`],
+        ['Prior action', `\`${marker.eventType}.${marker.action}\``],
+        ['Time since prior run', `${ageSeconds}s`],
+        ['Dedup window', `${windowSeconds}s`],
+      ])
+      .addRaw('\n> Dedup is best-effort suppression. Use workflow concurrency groups to prevent overlapping runs.\n')
+
+    await core.summary.write()
+  } catch (error) {
+    logger.warning('Failed to write dedup skip summary', {error: toErrorMessage(error)})
+  }
 }
