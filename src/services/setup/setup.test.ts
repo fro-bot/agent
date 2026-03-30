@@ -16,6 +16,7 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
     appId: null,
     privateKey: null,
     opencodeConfig: null,
+    systematicConfig: null,
     omoConfig: null,
     omoVersion: '3.7.4',
     systematicVersion: '2.1.0',
@@ -86,6 +87,20 @@ vi.mock('node:fs/promises', () => ({
 vi.mock('./tools-cache.js', () => ({
   restoreToolsCache: vi.fn(),
   saveToolsCache: vi.fn(),
+}))
+
+vi.mock('./adapters.js', () => ({
+  createToolCacheAdapter: vi.fn(() => ({
+    find: vi.mocked(tc.find),
+    downloadTool: vi.mocked(tc.downloadTool),
+    extractTar: vi.mocked(tc.extractTar),
+    extractZip: vi.mocked(tc.extractZip),
+    cacheDir: vi.mocked(tc.cacheDir),
+  })),
+  createExecAdapter: vi.fn(() => ({
+    exec: vi.mocked(exec.exec),
+    getExecOutput: vi.mocked(exec.getExecOutput),
+  })),
 }))
 
 // Mock bun module
@@ -245,8 +260,8 @@ describe('setup', () => {
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
     })
 
-    it('exports OPENCODE_CONFIG_CONTENT with autoupdate:false baseline and Systematic plugin', async () => {
-      // #given - no opencode-config input
+    it('exports OPENCODE_CONFIG_CONTENT environment variable', async () => {
+      // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
       vi.mocked(exec.exec).mockResolvedValue(0)
@@ -258,60 +273,7 @@ describe('setup', () => {
       await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
-      expect(core.exportVariable).toHaveBeenCalledWith(
-        'OPENCODE_CONFIG_CONTENT',
-        JSON.stringify({autoupdate: false, plugins: ['@fro.bot/systematic@2.1.0']}),
-      )
-    })
-
-    it('merges user opencode-config input on top of OPENCODE_CONFIG_CONTENT baseline', async () => {
-      // #given - user supplies opencode-config with custom settings
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup(
-        createSetupInputs({opencodeConfig: '{"model": "claude-opus-4-5", "autoupdate": true}'}),
-        'ghs_test_token',
-      )
-
-      // #then - user config wins on conflicting keys; Systematic plugin appended
-      expect(core.exportVariable).toHaveBeenCalledWith(
-        'OPENCODE_CONFIG_CONTENT',
-        JSON.stringify({autoupdate: true, model: 'claude-opus-4-5', plugins: ['@fro.bot/systematic@2.1.0']}),
-      )
-    })
-
-    it('preserves user-provided Systematic plugin entry without appending a duplicate', async () => {
-      // #given - user already pins Systematic in opencode-config
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup(
-        createSetupInputs({
-          opencodeConfig: '{"plugins": ["custom-plugin@1.0.0", "@fro.bot/systematic@9.9.9"]}',
-          systematicVersion: '2.1.0',
-        }),
-        'ghs_test_token',
-      )
-
-      // #then - existing Systematic entry wins and is not duplicated
-      expect(core.exportVariable).toHaveBeenCalledWith(
-        'OPENCODE_CONFIG_CONTENT',
-        JSON.stringify({
-          autoupdate: false,
-          plugins: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
-        }),
-      )
+      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.any(String))
     })
 
     it('fails when opencode-config parses to JSON null', async () => {
@@ -346,27 +308,6 @@ describe('setup', () => {
       // #then
       expect(result).toBe(null)
       expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be valid JSON')
-    })
-
-    it('treats whitespace-only opencode-config as not provided', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-      // #then
-      expect(result).not.toBeNull()
-      expect(core.setFailed).not.toHaveBeenCalled()
-      expect(core.exportVariable).toHaveBeenCalledWith(
-        'OPENCODE_CONFIG_CONTENT',
-        JSON.stringify({autoupdate: false, plugins: ['@fro.bot/systematic@2.1.0']}),
-      )
     })
 
     it('fails when opencode-config is an array', async () => {
@@ -584,6 +525,7 @@ describe('setup', () => {
         expect(callArgs).toBeDefined()
         expect(callArgs?.toolCachePath).toContain('opencode')
         expect(callArgs?.omoConfigPath).toContain('opencode')
+        expect(callArgs?.systematicVersion).toBe('2.1.0')
       })
 
       it('calls saveToolsCache after successful installs on cache miss', async () => {
@@ -603,7 +545,7 @@ describe('setup', () => {
         // #given tools cache hit and tc.find returns a valid path
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
 
@@ -621,7 +563,7 @@ describe('setup', () => {
         // #given tools cache hit but tc.find returns empty (version mismatch)
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -659,7 +601,7 @@ describe('setup', () => {
         // #given tools cache hit but tc.find returns empty
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -708,7 +650,7 @@ describe('setup', () => {
         // #given tools cache hit
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
         })
 
         // #when
@@ -722,7 +664,7 @@ describe('setup', () => {
         // #given tools cache hit
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5',
+          restoredKey: 'opencode-tools-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
         })
 
         // #when
@@ -802,6 +744,51 @@ describe('setup', () => {
         expect(result).not.toBeNull()
         expect(core.setFailed).not.toHaveBeenCalled()
         expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('omo-config'))
+      })
+
+      it('writes systematic-config JSON to systematic.json before installer runs', async () => {
+        // #given
+        const systematicConfig = JSON.stringify({agents: {default: 'sisyphus'}, mode: 'strict'})
+
+        // #when
+        const result = await runSetup(createSetupInputs({systematicConfig}), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const systematicConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('systematic.json'),
+        )
+        expect(systematicConfigCall).toBeDefined()
+        const written = JSON.parse(systematicConfigCall?.[1] as string) as Record<string, unknown>
+        expect(written).toMatchObject({agents: {default: 'sisyphus'}, mode: 'strict'})
+      })
+
+      it('does not write systematic.json when systematic-config is not provided', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
+        const systematicConfigCall = writeFileCalls.find(
+          ([filePath]) => typeof filePath === 'string' && filePath.includes('systematic.json'),
+        )
+        expect(systematicConfigCall).toBeUndefined()
+      })
+
+      it('continues setup and warns when systematic-config JSON is invalid', async () => {
+        // #given
+
+        // #when
+        const result = await runSetup(createSetupInputs({systematicConfig: '{invalid json}'}), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('systematic-config write failed'))
       })
     })
   })

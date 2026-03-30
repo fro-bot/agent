@@ -64,14 +64,15 @@ export async function verifyOpenCodeAvailable(
 }
 
 export interface EnsureOpenCodeOptions {
-  logger: Logger
-  opencodeVersion: string
-  githubToken: string
-  authJson: string
-  omoVersion: string
-  systematicVersion: string
-  omoProviders: SetupInputs['omoProviders']
-  opencodeConfig: string | null
+  readonly logger: Logger
+  readonly opencodeVersion: string
+  readonly githubToken: string
+  readonly authJson: string
+  readonly omoVersion: string
+  readonly systematicVersion: string
+  readonly omoProviders: SetupInputs['omoProviders']
+  readonly opencodeConfig: string | null
+  readonly systematicConfig: string | null
 }
 
 export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): Promise<EnsureOpenCodeResult> {
@@ -91,6 +92,7 @@ export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): P
     appId: null,
     privateKey: null,
     opencodeConfig: options.opencodeConfig,
+    systematicConfig: options.systematicConfig,
     omoConfig: null,
     omoVersion: options.omoVersion,
     systematicVersion: options.systematicVersion,

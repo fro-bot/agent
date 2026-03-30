@@ -16,6 +16,7 @@ This project manages external CLI tools through a **single-source-of-truth versi
 | OpenCode | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | `github-releases` (`anomalyco/opencode`) |
 | oMo | `DEFAULT_OMO_VERSION` | `omo-version` | `npm` (`oh-my-openagent`) |
 | Bun | `DEFAULT_BUN_VERSION` | _(internal only)_ | `github-releases` (`oven-sh/bun`, extract `bun-v` prefix) |
+| Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 
 ## Quick Start
 

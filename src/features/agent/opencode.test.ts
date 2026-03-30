@@ -1054,6 +1054,7 @@ describe('ensureOpenCodeAvailable', () => {
         kimiForCoding: 'no',
       },
       opencodeConfig: null,
+      systematicConfig: null,
     })
 
     // #then
@@ -1087,6 +1088,7 @@ describe('ensureOpenCodeAvailable', () => {
           kimiForCoding: 'no',
         },
         opencodeConfig: null,
+        systematicConfig: null,
       })
     } catch {
       // Expected to fail since runSetup will fail in test environment
