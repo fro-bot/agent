@@ -316,9 +316,43 @@ describe('parseActionInputs', () => {
       })
 
       const result = parseActionInputs()
-
       expect(result.success).toBe(true)
       expect(result.success && result.data.timeoutMs).toBe(300000)
+    })
+
+    it('parses systematic-version input with default value', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.systematicVersion).toBe('2.1.0')
+    })
+
+    it('parses custom systematic-version input', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'systematic-version': '2.2.0',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.systematicVersion).toBe('2.2.0')
     })
 
     it('accepts zero timeout for no limit', () => {

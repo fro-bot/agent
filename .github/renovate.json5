@@ -25,6 +25,13 @@
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^bun-v(?<version>.*)$',
     },
+    {
+      customType: 'regex',
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
+      matchStrings: ["DEFAULT_SYSTEMATIC_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: '@fro.bot/systematic',
+      datasourceTemplate: 'npm',
+    },
   ],
   packageRules: [
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
@@ -32,6 +39,7 @@
     {
       matchPackageNames: [
         '@bfra.me/tsconfig',
+        '@fro.bot/systematic',
         '@opencode-ai/sdk',
         '@semantic-release/git',
         'anomalyco/opencode',
