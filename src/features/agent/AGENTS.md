@@ -9,7 +9,7 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 | **Execution** | `execution.ts`     | SDK session creation, prompt retry loop, result collection (178 L)      |
 | **Prompting** | `prompt-sender.ts` | Prompt body construction, model resolution (73 L)                       |
 | **Retry**     | `retry.ts`         | Retry constants, `runPromptAttempt` with event stream (94 L)            |
-| **Server**    | `server.ts`        | SDK server bootstrap, health check (106 L)                              |
+| **Server**    | `server.ts`        | SDK server bootstrap, health check, setup option wiring (110 L)         |
 | **Polling**   | `session-poll.ts`  | Poll for session completion, event processor shutdown (110 L)           |
 | **Streaming** | `streaming.ts`     | Event stream processing, artifact detection (137 L)                     |
 | **Context**   | `context.ts`       | Gathers event data from NormalizedEvent, diff, hydrated context         |
@@ -83,6 +83,7 @@ gh CLI Reference (always)
 - **Reaction-based UX**: Non-fatal state machine (Eyes → Hooray/Confused); failures never crash execution
 - **Context Budgeting**: Two-tier enforcement (50 files fetched, 20 files injected into prompt)
 - **NormalizedEvent Intake**: `collectAgentContext` reads from `NormalizedEvent` (not raw payloads)
+- **Setup Option Pass-through**: `EnsureOpenCodeOptions` includes `systematicVersion` and `systematicConfig` for setup handoff
 
 ## ANTI-PATTERNS
 
