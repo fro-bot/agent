@@ -67,6 +67,9 @@ inputs:
       Custom oMo configuration JSON. Written before installer runs.
       Deep-merged with existing config.
     required: false
+  systematic-config:
+    description: Custom Systematic plugin configuration JSON (deep-merged with existing config).
+    required: false
   dedup-window:
     description: >-
       Deduplication window in milliseconds. Skip execution if the agent already

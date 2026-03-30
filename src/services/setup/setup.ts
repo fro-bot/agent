@@ -1,56 +1,24 @@
-import type {ExecAdapter, OpenCodeInstallResult, SetupInputs, SetupResult, ToolCacheAdapter} from './types.js'
+import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
-import * as exec from '@actions/exec'
 import {getOctokit} from '@actions/github'
-import * as tc from '@actions/tool-cache'
 import {DEFAULT_BUN_VERSION} from '../../shared/constants.js'
 import {getRunnerOS, getXdgDataHome} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
+import {createExecAdapter, createToolCacheAdapter} from './adapters.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
+import {buildCIConfig} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {writeOmoConfig} from './omo-config.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
+import {writeSystematicConfig} from './systematic-config.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
-/**
- * Create tool cache adapter from @actions/tool-cache
- */
-function createToolCacheAdapter(): ToolCacheAdapter {
-  return {
-    find: tc.find,
-    downloadTool: tc.downloadTool,
-    extractTar: tc.extractTar,
-    extractZip: tc.extractZip,
-    cacheDir: tc.cacheDir,
-  }
-}
-
-/**
- * Create exec adapter from @actions/exec
- */
-function createExecAdapter(): ExecAdapter {
-  return {
-    exec: exec.exec,
-    getExecOutput: exec.getExecOutput,
-  }
-}
-
-/**
- * Run the setup action.
- *
- * This function orchestrates:
- * 1. Installing OpenCode CLI
- * 2. Installing oMo plugin (graceful failure)
- * 3. Configuring gh CLI authentication
- * 4. Configuring git identity
- * 5. Populating auth.json
- */
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
   const startTime = Date.now()
   const logger = createLogger({component: 'setup'})
@@ -83,6 +51,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     }
 
     const omoVersion = inputs.omoVersion
+    const systematicVersion = inputs.systematicVersion
 
     // Restore tools cache before installs
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
@@ -96,6 +65,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       os: runnerOS,
       opencodeVersion: version,
       omoVersion,
+      systematicVersion,
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -154,6 +124,14 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         }
       }
 
+      if (inputs.systematicConfig != null) {
+        try {
+          await writeSystematicConfig(inputs.systematicConfig, omoConfigPath, logger)
+        } catch (error) {
+          logger.warning(`systematic-config write failed: ${toErrorMessage(error)}`)
+        }
+      }
+
       const omoResult = await installOmo(omoVersion, {logger, execAdapter}, inputs.omoProviders)
       if (omoResult.installed) {
         logger.info('oMo installed', {version: omoResult.version})
@@ -166,39 +144,12 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       omoError = omoResult.error
     }
 
-    // Export CI-safe OpenCode config. OPENCODE_CONFIG_CONTENT has highest precedence over all
-    // other OpenCode config sources (project, global, etc.). User-supplied opencode-config input
-    // is merged on top of the baseline, so user values override the defaults.
-    const ciConfig: Record<string, unknown> = {autoupdate: false}
-
-    if (inputs.opencodeConfig != null) {
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(inputs.opencodeConfig)
-      } catch {
-        core.setFailed('opencode-config must be valid JSON')
-        return null
-      }
-
-      // Validate that the parsed result is a plain object (not null, array, or primitive)
-      if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        core.setFailed('opencode-config must be a JSON object')
-        return null
-      }
-      Object.assign(ciConfig, parsed)
+    const ciConfigResult = buildCIConfig({opencodeConfig: inputs.opencodeConfig, systematicVersion}, logger)
+    if (ciConfigResult.error != null) {
+      core.setFailed(ciConfigResult.error)
+      return null
     }
-
-    // Ensure the Systematic plugin is always registered in the plugins array.
-    // User-provided plugins via opencode-config are preserved; Systematic is appended
-    // only when no @fro.bot/systematic entry already exists (so user version pins win).
-    const systematicPlugin = `@fro.bot/systematic@${inputs.systematicVersion}`
-    const rawPlugins: unknown[] = Array.isArray(ciConfig.plugins) ? (ciConfig.plugins as unknown[]) : []
-    const hasSystematic = rawPlugins.some((p: unknown) => typeof p === 'string' && p.startsWith('@fro.bot/systematic'))
-    if (!hasSystematic) {
-      ciConfig.plugins = [...rawPlugins, systematicPlugin]
-    }
-
-    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfig))
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfigResult.config))
 
     if (!toolsCacheResult.hit) {
       await saveToolsCache({
@@ -206,6 +157,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         os: runnerOS,
         opencodeVersion: version,
         omoVersion,
+        systematicVersion,
         toolCachePath,
         bunCachePath,
         omoConfigPath,
