@@ -188,6 +188,16 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       Object.assign(ciConfig, parsed)
     }
 
+    // Ensure the Systematic plugin is always registered in the plugins array.
+    // User-provided plugins via opencode-config are preserved; Systematic is appended
+    // only when no @fro.bot/systematic entry already exists (so user version pins win).
+    const systematicPlugin = `@fro.bot/systematic@${inputs.systematicVersion}`
+    const rawPlugins: unknown[] = Array.isArray(ciConfig.plugins) ? (ciConfig.plugins as unknown[]) : []
+    const hasSystematic = rawPlugins.some((p: unknown) => typeof p === 'string' && p.startsWith('@fro.bot/systematic'))
+    if (!hasSystematic) {
+      ciConfig.plugins = [...rawPlugins, systematicPlugin]
+    }
+
     core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfig))
 
     if (!toolsCacheResult.hit) {
