@@ -18,6 +18,7 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
     opencodeConfig: null,
     omoConfig: null,
     omoVersion: '3.7.4',
+    systematicVersion: '2.1.0',
     omoProviders: {
       claude: 'no',
       copilot: 'no',
@@ -244,7 +245,7 @@ describe('setup', () => {
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
     })
 
-    it('exports OPENCODE_CONFIG_CONTENT with autoupdate:false baseline', async () => {
+    it('exports OPENCODE_CONFIG_CONTENT with autoupdate:false baseline and Systematic plugin', async () => {
       // #given - no opencode-config input
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
@@ -257,7 +258,10 @@ describe('setup', () => {
       await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
-      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'OPENCODE_CONFIG_CONTENT',
+        JSON.stringify({autoupdate: false, plugins: ['@fro.bot/systematic@2.1.0']}),
+      )
     })
 
     it('merges user opencode-config input on top of OPENCODE_CONFIG_CONTENT baseline', async () => {
@@ -275,10 +279,38 @@ describe('setup', () => {
         'ghs_test_token',
       )
 
-      // #then - user config wins on conflicting keys (autoupdate:true overrides false baseline)
+      // #then - user config wins on conflicting keys; Systematic plugin appended
       expect(core.exportVariable).toHaveBeenCalledWith(
         'OPENCODE_CONFIG_CONTENT',
-        JSON.stringify({autoupdate: true, model: 'claude-opus-4-5'}),
+        JSON.stringify({autoupdate: true, model: 'claude-opus-4-5', plugins: ['@fro.bot/systematic@2.1.0']}),
+      )
+    })
+
+    it('preserves user-provided Systematic plugin entry without appending a duplicate', async () => {
+      // #given - user already pins Systematic in opencode-config
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(
+        createSetupInputs({
+          opencodeConfig: '{"plugins": ["custom-plugin@1.0.0", "@fro.bot/systematic@9.9.9"]}',
+          systematicVersion: '2.1.0',
+        }),
+        'ghs_test_token',
+      )
+
+      // #then - existing Systematic entry wins and is not duplicated
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'OPENCODE_CONFIG_CONTENT',
+        JSON.stringify({
+          autoupdate: false,
+          plugins: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
+        }),
       )
     })
 
@@ -331,7 +363,10 @@ describe('setup', () => {
       // #then
       expect(result).not.toBeNull()
       expect(core.setFailed).not.toHaveBeenCalled()
-      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', JSON.stringify({autoupdate: false}))
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'OPENCODE_CONFIG_CONTENT',
+        JSON.stringify({autoupdate: false, plugins: ['@fro.bot/systematic@2.1.0']}),
+      )
     })
 
     it('fails when opencode-config is an array', async () => {

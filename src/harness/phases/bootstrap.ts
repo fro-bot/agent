@@ -40,6 +40,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     githubToken: inputs.githubToken,
     authJson: inputs.authJson,
     omoVersion: inputs.omoVersion,
+    systematicVersion: inputs.systematicVersion,
     omoProviders: inputs.omoProviders,
     opencodeConfig: inputs.opencodeConfig,
   })

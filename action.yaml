@@ -44,6 +44,9 @@ inputs:
   omo-version:
     description: oMo (Oh My OpenAgent) version to install if auto-setup is needed. Defaults to version pinned in source code if not set.
     required: false
+  systematic-version:
+    description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.
+    required: false
   skip-cache:
     description: Skip session cache restore (default false)
     required: false

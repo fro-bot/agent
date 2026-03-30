@@ -69,6 +69,7 @@ export interface EnsureOpenCodeOptions {
   githubToken: string
   authJson: string
   omoVersion: string
+  systematicVersion: string
   omoProviders: SetupInputs['omoProviders']
   opencodeConfig: string | null
 }
@@ -92,6 +93,7 @@ export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): P
     opencodeConfig: options.opencodeConfig,
     omoConfig: null,
     omoVersion: options.omoVersion,
+    systematicVersion: options.systematicVersion,
     omoProviders: options.omoProviders,
   }
   const setupResult = await runSetup(setupInputs, options.githubToken)

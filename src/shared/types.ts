@@ -58,6 +58,7 @@ export interface ActionInputs {
   readonly opencodeVersion: string
   readonly skipCache: boolean
   readonly omoVersion: string
+  readonly systematicVersion: string
   // oMo provider configuration
   readonly omoProviders: OmoProviders
   // OpenCode config to merge with baseline
