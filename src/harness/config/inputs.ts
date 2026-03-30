@@ -8,6 +8,7 @@ import {
   DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_SESSION_RETENTION,
+  DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
 } from '../../shared/constants.js'
 import {err, ok} from '../../shared/types.js'
@@ -190,6 +191,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const omoVersionRaw = core.getInput('omo-version').trim()
     const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
 
+    const systematicVersionRaw = core.getInput('systematic-version').trim()
+    const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
+
     const omoProvidersRaw = core.getInput('omo-providers').trim()
     const omoProviders = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
 
@@ -228,6 +232,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       opencodeVersion,
       skipCache,
       omoVersion,
+      systematicVersion,
       omoProviders,
       opencodeConfig,
       dedupWindow,

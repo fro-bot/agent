@@ -362,22 +362,23 @@ concurrency:
 
 ### Action Inputs
 
-| Input               | Required | Default    | Description                                        |
-| ------------------- | -------- | ---------- | -------------------------------------------------- |
-| `github-token`      | Yes      | —          | GitHub token with write permissions                |
-| `auth-json`         | Yes      | —          | JSON object mapping LLM providers to credentials   |
-| `prompt`            | No       | —          | Custom prompt for the agent                        |
-| `agent`             | No       | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
-| `model`             | No       | —          | Model override in `provider/model` format          |
-| `timeout`           | No       | `1800000`  | Execution timeout in milliseconds (0 = no limit)   |
-| `opencode-version`  | No       | `1.2.24`   | OpenCode CLI version for installation              |
-| `session-retention` | No       | `50`       | Number of sessions to retain before pruning        |
-| `s3-backup`         | No       | `false`    | Enable S3 write-through backup                     |
-| `s3-bucket`         | No       | —          | S3 bucket name (required if `s3-backup` is true)   |
-| `aws-region`        | No       | —          | AWS region for S3 bucket                           |
-| `skip-cache`        | No       | `false`    | Skip cache restore (useful for debugging)          |
-| `omo-config`        | No       | —          | Custom oMo configuration JSON (deep-merged)        |
-| `opencode-config`   | No       | —          | Custom OpenCode configuration JSON (deep-merged)   |
+| Input                | Required | Default    | Description                                        |
+| -------------------- | -------- | ---------- | -------------------------------------------------- |
+| `github-token`       | Yes      | —          | GitHub token with write permissions                |
+| `auth-json`          | Yes      | —          | JSON object mapping LLM providers to credentials   |
+| `prompt`             | No       | —          | Custom prompt for the agent                        |
+| `agent`              | No       | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
+| `model`              | No       | —          | Model override in `provider/model` format          |
+| `timeout`            | No       | `1800000`  | Execution timeout in milliseconds (0 = no limit)   |
+| `opencode-version`   | No       | `1.2.24`   | OpenCode CLI version for installation              |
+| `systematic-version` | No       | `2.1.0`    | Systematic plugin version for OpenCode             |
+| `session-retention`  | No       | `50`       | Number of sessions to retain before pruning        |
+| `s3-backup`          | No       | `false`    | Enable S3 write-through backup                     |
+| `s3-bucket`          | No       | —          | S3 bucket name (required if `s3-backup` is true)   |
+| `aws-region`         | No       | —          | AWS region for S3 bucket                           |
+| `skip-cache`         | No       | `false`    | Skip cache restore (useful for debugging)          |
+| `omo-config`         | No       | —          | Custom oMo configuration JSON (deep-merged)        |
+| `opencode-config`    | No       | —          | Custom OpenCode configuration JSON (deep-merged)   |
 
 ### Action Outputs
 

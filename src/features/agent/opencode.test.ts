@@ -1043,6 +1043,7 @@ describe('ensureOpenCodeAvailable', () => {
       githubToken: 'ghs_test_token',
       authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
       omoVersion: '3.7.4',
+      systematicVersion: '2.1.0',
       omoProviders: {
         claude: 'no',
         copilot: 'no',
@@ -1075,6 +1076,7 @@ describe('ensureOpenCodeAvailable', () => {
         githubToken: 'ghs_test_token',
         authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
         omoVersion: '3.7.4',
+        systematicVersion: '2.1.0',
         omoProviders: {
           claude: 'no',
           copilot: 'no',
