@@ -27,6 +27,7 @@ describe('post action', () => {
     process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
     process.env.GITHUB_REF_NAME = 'main'
     process.env.GITHUB_RUN_ID = '12345'
+    process.env.GITHUB_RUN_ATTEMPT = '1'
     process.env.RUNNER_OS = 'Linux'
   })
 
@@ -35,6 +36,7 @@ describe('post action', () => {
     delete process.env.GITHUB_REPOSITORY
     delete process.env.GITHUB_REF_NAME
     delete process.env.GITHUB_RUN_ID
+    delete process.env.GITHUB_RUN_ATTEMPT
     delete process.env.RUNNER_OS
   })
 
