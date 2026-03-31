@@ -200,6 +200,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const opencodeConfigRaw = core.getInput('opencode-config').trim()
     const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
 
+    const systematicConfigRaw = core.getInput('systematic-config').trim()
+    const systematicConfig = systematicConfigRaw.length > 0 ? systematicConfigRaw : null
+
     const dedupWindowRaw = core.getInput('dedup-window').trim()
     const dedupWindow =
       dedupWindowRaw.length > 0 ? parseTimeoutMs(dedupWindowRaw, 'dedup-window') : DEFAULT_DEDUP_WINDOW_MS
@@ -235,6 +238,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       systematicVersion,
       omoProviders,
       opencodeConfig,
+      systematicConfig,
       dedupWindow,
     })
   } catch (error) {

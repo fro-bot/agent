@@ -62,6 +62,14 @@
       groupName: 'semantic-release and conventionalcommits',
       semanticCommitType: 'feat',
     },
+    {
+      description: ['Automerge unstable minor updates of some packages.'],
+      matchCurrentVersion: '/^v?0/',
+      matchPackageNames: ['tsdown'],
+      matchUpdateTypes: ['minor', 'patch'],
+      extends: ['github>bfra-me/renovate-config:automerge.json5#5.2.0'],
+      dependencyDashboardApproval: false,
+    },
   ],
   postUpgradeTasks: {
     commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],

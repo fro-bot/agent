@@ -575,6 +575,42 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(true)
       expect(result.success && result.data.opencodeConfig).toBe(null)
     })
+
+    it('parses systematic-config when provided', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'systematic-config': '{"mode":"strict"}',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.systematicConfig).toBe('{"mode":"strict"}')
+    })
+
+    it('sets systematicConfig to null when empty string', () => {
+      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
+
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'github-token': 'ghp_test123',
+          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+          'systematic-config': '',
+        }
+        return inputs[name] ?? ''
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.systematicConfig).toBe(null)
+    })
   })
 })
 

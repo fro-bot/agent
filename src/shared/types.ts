@@ -63,6 +63,7 @@ export interface ActionInputs {
   readonly omoProviders: OmoProviders
   // OpenCode config to merge with baseline
   readonly opencodeConfig: string | null
+  readonly systematicConfig: string | null
   // Dedup execution: skip if agent already ran for this entity recently (0 = disabled)
   readonly dedupWindow: number
 }
