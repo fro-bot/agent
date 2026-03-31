@@ -44,12 +44,13 @@ describe('buildToolsCacheKey', () => {
     const os = 'Linux'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion})
+    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion})
 
     // #then key uses opencode-tools prefix
-    expect(key).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5')
+    expect(key).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5-sys-2.1.0')
     expect(key).toMatch(/^opencode-tools-/)
   })
 
@@ -58,12 +59,13 @@ describe('buildToolsCacheKey', () => {
     const os = 'Linux'
     const opencodeVersion = 'latest'
     const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion})
+    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion})
 
     // #then key includes latest
-    expect(key).toBe('opencode-tools-Linux-oc-latest-omo-3.5.5')
+    expect(key).toBe('opencode-tools-Linux-oc-latest-omo-3.5.5-sys-2.1.0')
   })
 })
 
@@ -73,12 +75,13 @@ describe('buildToolsRestoreKeys', () => {
     const os = 'Linux'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
+    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion})
 
     // #then only version-specific prefix key is returned (no broad OS-only fallback)
-    expect(keys).toEqual(['opencode-tools-Linux-oc-1.0.0-omo-3.5.5-'])
+    expect(keys).toEqual(['opencode-tools-Linux-oc-1.0.0-omo-3.5.5-sys-2.1.0-'])
   })
 
   it('does not include broad OS-only fallback key', () => {
@@ -86,9 +89,10 @@ describe('buildToolsRestoreKeys', () => {
     const os = 'Linux'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
+    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion})
 
     // #then no OS-only key that could match stale versions
     const broadKeys = [...keys].filter(k => k === `opencode-tools-${os}-`)
@@ -100,12 +104,13 @@ describe('buildToolsRestoreKeys', () => {
     const os = 'macOS'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion})
+    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion})
 
     // #then keys include macOS prefix
-    expect(keys[0]).toBe('opencode-tools-macOS-oc-1.0.0-omo-3.5.5-')
+    expect(keys[0]).toBe('opencode-tools-macOS-oc-1.0.0-omo-3.5.5-sys-2.1.0-')
   })
 })
 
@@ -136,6 +141,7 @@ describe('restoreToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -149,7 +155,7 @@ describe('restoreToolsCache', () => {
 
   it('returns hit: true with key on cache hit', async () => {
     // #given a cache adapter that returns a key (hit)
-    const restoredKey = 'opencode-tools-Linux-oc-1.0.0-omo-3.5.5'
+    const restoredKey = 'opencode-tools-Linux-oc-1.0.0-omo-3.5.5-sys-2.1.0'
     const adapter = createMockToolsCacheAdapter({restoreResult: restoredKey})
 
     // #when restoring cache
@@ -158,6 +164,7 @@ describe('restoreToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -186,6 +193,7 @@ describe('restoreToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -211,6 +219,7 @@ describe('restoreToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -250,6 +259,7 @@ describe('saveToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -277,6 +287,7 @@ describe('saveToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -304,6 +315,7 @@ describe('saveToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -311,7 +323,7 @@ describe('saveToolsCache', () => {
     })
 
     // #then uses correct key
-    expect(capturedKey).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5')
+    expect(capturedKey).toBe('opencode-tools-Linux-oc-1.0.0-omo-3.5.5-sys-2.1.0')
   })
 
   it('handles cache already exists error', async () => {
@@ -326,6 +338,7 @@ describe('saveToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,
@@ -348,6 +361,7 @@ describe('saveToolsCache', () => {
       os: 'Linux',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
       toolCachePath,
       bunCachePath,
       omoConfigPath,

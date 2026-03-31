@@ -43,6 +43,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     systematicVersion: inputs.systematicVersion,
     omoProviders: inputs.omoProviders,
     opencodeConfig: inputs.opencodeConfig,
+    systematicConfig: inputs.systematicConfig,
   })
 
   if (opencodeResult.didSetup) {

@@ -378,6 +378,7 @@ concurrency:
 | `aws-region`         | No       | —          | AWS region for S3 bucket                           |
 | `skip-cache`         | No       | `false`    | Skip cache restore (useful for debugging)          |
 | `omo-config`         | No       | —          | Custom oMo configuration JSON (deep-merged)        |
+| `systematic-config`  | No       | —          | Custom Systematic configuration JSON (deep-merged) |
 | `opencode-config`    | No       | —          | Custom OpenCode configuration JSON (deep-merged)   |
 
 ### Action Outputs
