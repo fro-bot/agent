@@ -24,7 +24,7 @@ export const DEFAULT_OPENCODE_VERSION = '1.3.13'
 export const DEFAULT_BUN_VERSION = '1.3.11'
 export const DEFAULT_OMO_VERSION = '3.14.0'
 export const DEFAULT_OMO_PROVIDERS = ''
-export const DEFAULT_SYSTEMATIC_VERSION = '2.2.1'
+export const DEFAULT_SYSTEMATIC_VERSION = '2.3.0'
 
 // Retry configuration
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const
