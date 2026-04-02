@@ -1,6 +1,7 @@
 import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
 import {parseActionInputs, parseModelInput} from './inputs.js'
 
 // Mock @actions/core
@@ -334,7 +335,7 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(true)
-      expect(result.success && result.data.systematicVersion).toBe('2.1.0')
+      expect(result.success && result.data.systematicVersion).toBe(DEFAULT_SYSTEMATIC_VERSION)
     })
 
     it('parses custom systematic-version input', () => {
