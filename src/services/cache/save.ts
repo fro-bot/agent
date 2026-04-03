@@ -20,6 +20,18 @@ async function buildCachePaths(
   if (await isSqliteBackend(opencodeVersion ?? null)) {
     const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
     paths.push(dbPath)
+    // Include WAL and SHM files if they exist — SQLite WAL mode stores
+    // recent writes in these files until checkpointed to the main DB.
+    // Without them, sessions created during the current run are lost.
+    for (const suffix of ['-wal', '-shm']) {
+      try {
+        await fs.access(`${dbPath}${suffix}`)
+        paths.push(`${dbPath}${suffix}`)
+      } catch {
+        // File doesn't exist — server may not be using WAL mode or
+        // WAL was already checkpointed. Safe to skip.
+      }
+    }
   }
   return paths
 }

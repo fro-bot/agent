@@ -20,6 +20,10 @@ async function buildCachePaths(
   if (await isSqliteBackend(opencodeVersion ?? null)) {
     const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
     paths.push(dbPath)
+    // Include WAL and SHM files for restore — they may exist in the archive
+    // if the server was running (WAL mode) when the cache was saved.
+    paths.push(`${dbPath}-wal`)
+    paths.push(`${dbPath}-shm`)
   }
   return paths
 }
