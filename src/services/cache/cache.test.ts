@@ -455,6 +455,78 @@ describe('saveCache', () => {
     await expect(fs.access(authPath)).resolves.toBeUndefined()
   })
 
+  it('includes SQLite WAL and SHM files when they exist', async () => {
+    // #given storage with content, a SQLite db, WAL, and SHM files
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const dbDir = path.dirname(storagePath)
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+
+    let capturedPaths: string[] = []
+    const adapter: CacheAdapter = {
+      restoreCache: async () => undefined,
+      saveCache: async paths => {
+        capturedPaths = paths
+        return 1
+      },
+    }
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.3.13',
+      cacheAdapter: adapter,
+    }
+
+    // #when saving cache
+    await saveCache(options)
+
+    // #then WAL and SHM files are included in cache paths
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-wal'))
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-shm'))
+  })
+
+  it('omits WAL and SHM files when they do not exist', async () => {
+    // #given storage with content and only the main db file (no WAL/SHM)
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const dbDir = path.dirname(storagePath)
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
+
+    let capturedPaths: string[] = []
+    const adapter: CacheAdapter = {
+      restoreCache: async () => undefined,
+      saveCache: async paths => {
+        capturedPaths = paths
+        return 1
+      },
+    }
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.3.13',
+      cacheAdapter: adapter,
+    }
+
+    // #when saving cache
+    await saveCache(options)
+
+    // #then only the main db file is included (no WAL/SHM)
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
+    expect(capturedPaths).not.toContain(path.join(dbDir, 'opencode.db-wal'))
+    expect(capturedPaths).not.toContain(path.join(dbDir, 'opencode.db-shm'))
+  })
+
   it('writes version marker before save', async () => {
     // #given storage with content
     await fs.mkdir(storagePath, {recursive: true})
