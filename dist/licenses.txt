@@ -4645,7 +4645,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 
 
-lodash@4.17.23
+lodash@4.18.1
 MIT
 Copyright OpenJS Foundation and other contributors <https://openjsf.org/>
 
