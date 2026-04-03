@@ -73,6 +73,21 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       }
     }
 
+    // Shut down the OpenCode server BEFORE saving the cache.
+    // A clean shutdown triggers a SQLite WAL checkpoint, merging all
+    // session data written during this run into the main database file.
+    // Without this, sessions in the WAL are lost when only the .db file
+    // is restored from cache on the next run.
+    if (serverHandle != null) {
+      try {
+        serverHandle.shutdown()
+      } catch (shutdownError) {
+        bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
+          error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+        })
+      }
+    }
+
     const cacheComponents = buildCacheKeyComponents()
 
     const cacheLogger = createLogger({phase: 'cache-save'})
@@ -107,15 +122,5 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     bootstrapLogger.warning('Cleanup failed (non-fatal)', {
       error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
     })
-  } finally {
-    if (serverHandle != null) {
-      try {
-        serverHandle.shutdown()
-      } catch (shutdownError) {
-        bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
-          error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
-        })
-      }
-    }
   }
 }
