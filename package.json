@@ -17,7 +17,7 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "bootstrap": "SIMPLE_GIT_HOOKS=0 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
+    "bootstrap": "SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
     "build": "pnpm check-types && tsdown",
     "check-types": "tsc --noEmit",
     "fix": "eslint --fix",
@@ -44,10 +44,10 @@
     "@actions/tool-cache": "4.0.0",
     "@bfra.me/es": "0.1.0",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.3.10"
+    "@opencode-ai/sdk": "1.3.15"
   },
   "devDependencies": {
-    "@bfra.me/eslint-config": "0.50.1",
+    "@bfra.me/eslint-config": "0.50.2",
     "@bfra.me/prettier-config": "0.16.7",
     "@bfra.me/tsconfig": "0.12.2",
     "@octokit/webhooks-types": "7.6.1",
@@ -68,7 +68,7 @@
     "semantic-release": "25.0.3",
     "simple-git-hooks": "2.13.1",
     "tsdown": "0.21.7",
-    "typescript": "5.9.3",
+    "typescript": "6.0.2",
     "vitest": "4.1.2"
   },
   "packageManager": "pnpm@10.33.0"
