@@ -35,4 +35,4 @@ runs:
     - name: Install dependencies
       if: inputs.install-dependencies == 'true'
       shell: bash
-      run: pnpm bootstrap
+      run: pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn
