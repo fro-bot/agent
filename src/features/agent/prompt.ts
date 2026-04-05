@@ -150,8 +150,7 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
       ? buildCurrentThreadPriorWorkText(sessionContext.priorWorkContext, currentThreadSessionId)
       : null
 
-  parts.push(`
-## Environment
+  parts.push(`## Environment
 - **Repository:** ${context.repo}
 - **Branch/Ref:** ${context.ref}
 - **Event:** ${context.eventName}
@@ -228,10 +227,7 @@ Respond to the trigger comment above. Follow all instructions and requirements l
   }
 
   if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(`
-${customPrompt.trim()}
-
-`)
+    parts.push(customPrompt.trim())
   }
 
   if (options.triggerContext != null) {
@@ -241,11 +237,11 @@ ${customPrompt.trim()}
     }
   }
 
-  parts.push(`# Agent Context
+  parts.push(`## Agent Context
 
 You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
 
-## Operating Environment
+### Operating Environment
 
 - **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
 - Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
@@ -254,7 +250,7 @@ You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Ac
 `)
 
   // Session management instructions (REQUIRED)
-  parts.push(`## Session Management (REQUIRED)
+  parts.push(`### Session Management (REQUIRED)
 
 Before investigating any issue:
 1. Use \`session_search\` to find relevant prior sessions for this repository
@@ -274,13 +270,13 @@ Before completing:
   // GitHub CLI instructions
   const issueNum = context.issueNumber ?? '<number>'
   const hasResponseProtocol = context.issueNumber != null
-  parts.push(`## GitHub Operations (Use gh CLI)
+  parts.push(`### GitHub Operations (Use gh CLI)
 
 The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
 ${
   hasResponseProtocol
     ? `
-### Posting Your Response
+#### Posting Your Response
 
 See **Response Protocol** above. Post exactly one comment or review per run.
 
@@ -297,13 +293,13 @@ gh issue comment ${issueNum} --body "Your response with Run Summary"
     : ''
 }
 
-### API Calls
+#### API Calls
 Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'\`.
 `)
 
   parts.push(buildConstraintReminderSection())
 
-  const prompt = parts.join('\n')
+  const prompt = parts.map(p => p.trim()).join('\n\n')
   logger.debug('Built agent prompt', {
     length: prompt.length,
     hasCustom: customPrompt != null,
@@ -318,11 +314,11 @@ function buildResponseProtocolSection(
   sessionId: string | undefined,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
-  return `## Response Protocol (REQUIRED)
+  return `### Response Protocol (REQUIRED)
 
 You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
 
-### Rules
+#### Rules
 
 1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
@@ -331,7 +327,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 5. **For PR reviews:** When using \`gh pr review --approve\` or \`gh pr review --request-changes\`, put your full response (analysis + Run Summary) in the \`--body\` argument. Do not post a separate PR comment afterward.
 6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
 
-### Unified Response Format
+#### Unified Response Format
 
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
 

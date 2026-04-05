@@ -132,8 +132,7 @@ import{$ as e,A as t,B as n,C as r,D as i,E as a,F as o,G as s,H as c,I as l,J a
 `)}function cr(e,t){switch(e.eventType){case`issue_comment`:return{directive:`Respond to the comment above. Post your response as a single comment on this thread.`,appendMode:!0};case`discussion_comment`:return{directive:`Respond to the discussion comment above. Post your response as a single comment.`,appendMode:!0};case`issues`:return e.action===`opened`?{directive:`Triage this issue: summarize, reproduce if possible, propose next steps. Post your response as a single comment.`,appendMode:!0}:{directive:`Respond to the mention in this issue. Post your response as a single comment.`,appendMode:!0};case`pull_request`:return{directive:[`Review this pull request for code quality, potential bugs, and improvements.`,"If you are a requested reviewer, submit a review via `gh pr review` with your full response (including Run Summary) in the --body.",`Include the Run Summary in the review body. Do not post a separate comment.`,`If the author is a collaborator, prioritize actionable feedback over style nits.`].join(`
 `),appendMode:!0};case`pull_request_review_comment`:return{directive:lr(e),appendMode:!0};case`schedule`:case`workflow_dispatch`:return{directive:t??``,appendMode:!1};default:return{directive:`Execute the requested operation.`,appendMode:!0}}}function lr(e){let t=e.target,n=[`Respond to the review comment.`,``];return t?.path!=null&&n.push(`**File:** \`${t.path}\``),t?.line!=null&&n.push(`**Line:** ${t.line}`),t?.commitId!=null&&n.push(`**Commit:** \`${t.commitId}\``),t?.diffHunk!=null&&t.diffHunk.length>0&&n.push(``,`**Diff Context:**`,"```diff",t.diffHunk,"```"),n.join(`
 `)}function ur(e,t){let{directive:n,appendMode:r}=cr(e,t),i=[`## Task`,``];return r?(i.push(n),t!=null&&t.trim().length>0&&i.push(``,`**Additional Instructions:**`,t.trim())):i.push(n),i.push(``),i.join(`
-`)}function dr(e,t){let{context:n,customPrompt:r,cacheStatus:i,sessionContext:a,logicalKey:o,isContinuation:s,currentThreadSessionId:c}=e,l=[],u=s===!0,d=n.commentBody==null?null:Ye(n.commentBody),f=e.triggerContext?.eventType??n.eventName,p=d!=null&&(f===`issue_comment`||f===`discussion_comment`||f===`pull_request_review_comment`);l.push(ir());let m=ar(o??null,u,null);m.length>0&&l.push(m);let h=a!=null&&u&&c!=null?mr(a.priorWorkContext,c):null;if(l.push(`
-## Environment
+`)}function dr(e,t){let{context:n,customPrompt:r,cacheStatus:i,sessionContext:a,logicalKey:o,isContinuation:s,currentThreadSessionId:c}=e,l=[],u=s===!0,d=n.commentBody==null?null:Ye(n.commentBody),f=e.triggerContext?.eventType??n.eventName,p=d!=null&&(f===`issue_comment`||f===`discussion_comment`||f===`pull_request_review_comment`);l.push(ir());let m=ar(o??null,u,null);m.length>0&&l.push(m);let h=a!=null&&u&&c!=null?mr(a.priorWorkContext,c):null;if(l.push(`## Environment
 - **Repository:** ${n.repo}
 - **Branch/Ref:** ${n.ref}
 - **Event:** ${n.eventName}
@@ -156,20 +155,17 @@ Execute the requested operation for repository ${n.repo}. Follow all instruction
 `):l.push(`## Task
 
 Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
-`):l.push(ur(e.triggerContext,r));let y=or(h);if(y.length>0&&l.push(y),r!=null&&r.trim().length>0&&e.triggerContext==null&&l.push(`
-${r.trim()}
-
-`),e.triggerContext!=null){let t=e.triggerContext.eventType;(t===`pull_request`||t===`pull_request_review_comment`)&&l.push(_r(n))}l.push(`# Agent Context
+`):l.push(ur(e.triggerContext,r));let y=or(h);if(y.length>0&&l.push(y),r!=null&&r.trim().length>0&&e.triggerContext==null&&l.push(r.trim()),e.triggerContext!=null){let t=e.triggerContext.eventType;(t===`pull_request`||t===`pull_request_review_comment`)&&l.push(_r(n))}l.push(`## Agent Context
 
 You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
 
-## Operating Environment
+### Operating Environment
 
 - **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
 - Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
 - The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
 - You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.
-`),l.push(`## Session Management (REQUIRED)
+`),l.push(`### Session Management (REQUIRED)
 
 Before investigating any issue:
 1. Use \`session_search\` to find relevant prior sessions for this repository
@@ -180,11 +176,11 @@ Before completing:
 1. Ensure your session contains a summary of work done
 2. Include key decisions, findings, and outcomes
 3. This summary will be searchable in future agent runs
-`),n.issueNumber!=null&&l.push(fr(n,i,e.sessionId));let b=n.issueNumber??`<number>`,x=n.issueNumber!=null;l.push(`## GitHub Operations (Use gh CLI)
+`),n.issueNumber!=null&&l.push(fr(n,i,e.sessionId));let b=n.issueNumber??`<number>`,x=n.issueNumber!=null;l.push(`### GitHub Operations (Use gh CLI)
 
 The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
 ${x?`
-### Posting Your Response
+#### Posting Your Response
 
 See **Response Protocol** above. Post exactly one comment or review per run.
 
@@ -199,14 +195,15 @@ gh pr review ${b} --approve --body "Your review with Run Summary"
 gh issue comment ${b} --body "Your response with Run Summary"
 \`\`\``:``}
 
-### API Calls
+#### API Calls
 Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/${n.repo}/pulls/${b}/files --jq '.[].filename'\`.
-`),l.push(sr());let S=l.join(`
-`);return t.debug(`Built agent prompt`,{length:S.length,hasCustom:r!=null,hasSessionContext:a!=null}),S}function fr(e,t,n){let r=e.issueNumber??`<number>`;return`## Response Protocol (REQUIRED)
+`),l.push(sr());let S=l.map(e=>e.trim()).join(`
+
+`);return t.debug(`Built agent prompt`,{length:S.length,hasCustom:r!=null,hasSessionContext:a!=null}),S}function fr(e,t,n){let r=e.issueNumber??`<number>`;return`### Response Protocol (REQUIRED)
 
 You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
 
-### Rules
+#### Rules
 
 1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
@@ -215,7 +212,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 5. **For PR reviews:** When using \`gh pr review --approve\` or \`gh pr review --request-changes\`, put your full response (analysis + Run Summary) in the \`--body\` argument. Do not post a separate PR comment afterward.
 6. **For issue/PR comments:** Post a single \`gh issue comment ${r}\` or \`gh pr comment ${r}\` with your full response including Run Summary.
 
-### Unified Response Format
+#### Unified Response Format
 
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
 
