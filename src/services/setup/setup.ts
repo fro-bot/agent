@@ -167,8 +167,21 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // Strip legacy "plugins" (plural) key — OpenCode only accepts "plugin" (singular)
     delete existingConfig.plugins
 
+    // Normalize oMo plugin specifiers: the oMo installer hardcodes "@latest" or bare name
+    // regardless of the actual installed version. Rewrite to the pinned version.
+    const normalizePlugins = (plugins: unknown[]): unknown[] =>
+      plugins.map(p => {
+        if (typeof p !== 'string') return p
+        if (p === 'oh-my-openagent' || p === 'oh-my-openagent@latest') {
+          return `oh-my-openagent@${omoVersion}`
+        }
+        return p
+      })
+
     // Merge plugin arrays: existing plugins + CI plugins, deduplicated by package name prefix
-    const existingPlugins: unknown[] = Array.isArray(existingConfig.plugin) ? (existingConfig.plugin as unknown[]) : []
+    const existingPlugins: unknown[] = normalizePlugins(
+      Array.isArray(existingConfig.plugin) ? (existingConfig.plugin as unknown[]) : [],
+    )
     const ciPlugins: unknown[] = Array.isArray(ciConfigResult.config.plugin)
       ? (ciConfigResult.config.plugin as unknown[])
       : []
