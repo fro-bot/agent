@@ -164,6 +164,9 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       // File doesn't exist yet or is invalid — start fresh
     }
 
+    // Strip legacy "plugins" (plural) key — OpenCode only accepts "plugin" (singular)
+    delete existingConfig.plugins
+
     // Merge plugin arrays: existing plugins + CI plugins, deduplicated by package name prefix
     const existingPlugins: unknown[] = Array.isArray(existingConfig.plugin) ? (existingConfig.plugin as unknown[]) : []
     const ciPlugins: unknown[] = Array.isArray(ciConfigResult.config.plugin)
