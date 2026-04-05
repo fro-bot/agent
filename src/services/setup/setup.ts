@@ -1,5 +1,4 @@
 import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
-import {writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -150,12 +149,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       core.setFailed(ciConfigResult.error)
       return null
     }
-    const ciConfigJson = JSON.stringify(ciConfigResult.config, null, 2)
-    core.exportVariable('OPENCODE_CONFIG_CONTENT', ciConfigJson)
-
-    const opencodeConfigPath = join(omoConfigPath, 'opencode.json')
-    await writeFile(opencodeConfigPath, ciConfigJson)
-    logger.info('Wrote OpenCode config', {path: opencodeConfigPath, plugins: ciConfigResult.config.plugins})
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfigResult.config))
 
     if (!toolsCacheResult.hit) {
       await saveToolsCache({
