@@ -9,6 +9,7 @@ import type {SessionSearchResult} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
+import {cleanMarkdownBody} from '../../shared/format.js'
 import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 import {
@@ -129,6 +130,13 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
     options
   const parts: string[] = []
   const continuationEnabled = isContinuation === true
+  const cleanedCommentBody = context.commentBody == null ? null : cleanMarkdownBody(context.commentBody)
+  const triggerCommentEvent = options.triggerContext?.eventType ?? context.eventName
+  const renderTriggerComment =
+    cleanedCommentBody != null &&
+    (triggerCommentEvent === 'issue_comment' ||
+      triggerCommentEvent === 'discussion_comment' ||
+      triggerCommentEvent === 'pull_request_review_comment')
 
   parts.push(buildNonNegotiableRulesSection())
 
@@ -141,58 +149,6 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
     sessionContext != null && continuationEnabled && currentThreadSessionId != null
       ? buildCurrentThreadPriorWorkText(sessionContext.priorWorkContext, currentThreadSessionId)
       : null
-
-  if (options.triggerContext != null) {
-    parts.push(buildTaskSection(options.triggerContext, customPrompt))
-  } else if (context.commentBody == null) {
-    parts.push(`## Task
-
-Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
-`)
-  } else {
-    parts.push(`## Task
-
-Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
-`)
-  }
-
-  const trimmedCustomPrompt = customPrompt?.trim() ?? null
-  const trimmedCommentBody = context.commentBody?.trim() ?? null
-  const triggerCommentDuplicatesTask =
-    trimmedCustomPrompt != null &&
-    trimmedCustomPrompt.length > 0 &&
-    trimmedCommentBody != null &&
-    trimmedCommentBody.length > 0 &&
-    trimmedCustomPrompt === trimmedCommentBody
-
-  if (context.commentBody != null && !triggerCommentDuplicatesTask) {
-    parts.push(`## Trigger Comment
-**Author:** ${context.commentAuthor ?? 'unknown'}
-
-\`\`\`
-${context.commentBody}
-\`\`\`
-`)
-  }
-
-  const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
-  if (currentThreadSection.length > 0) {
-    parts.push(currentThreadSection)
-  }
-
-  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(`
-${customPrompt.trim()}
-
-`)
-  }
-
-  if (options.triggerContext != null) {
-    const eventType = options.triggerContext.eventType
-    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
-      parts.push(buildOutputContractSection(context))
-    }
-  }
 
   parts.push(`
 ## Environment
@@ -230,6 +186,58 @@ ${customPrompt.trim()}
     )
     if (historicalSection != null) {
       parts.push(historicalSection)
+    }
+  }
+
+  const trimmedCustomPrompt = customPrompt?.trim() ?? null
+  const trimmedCommentBody = cleanedCommentBody?.trim() ?? null
+  const triggerCommentDuplicatesTask =
+    trimmedCustomPrompt != null &&
+    trimmedCustomPrompt.length > 0 &&
+    trimmedCommentBody != null &&
+    trimmedCommentBody.length > 0 &&
+    trimmedCustomPrompt === trimmedCommentBody
+
+  if (renderTriggerComment && !triggerCommentDuplicatesTask) {
+    parts.push(`## Trigger Comment
+**Author:** ${context.commentAuthor ?? 'unknown'}
+
+\`\`\`
+${cleanedCommentBody}
+\`\`\`
+`)
+  }
+
+  if (options.triggerContext != null) {
+    parts.push(buildTaskSection(options.triggerContext, customPrompt))
+  } else if (context.commentBody == null) {
+    parts.push(`## Task
+
+Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
+`)
+  } else {
+    parts.push(`## Task
+
+Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
+`)
+  }
+
+  const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
+  if (currentThreadSection.length > 0) {
+    parts.push(currentThreadSection)
+  }
+
+  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
+    parts.push(`
+${customPrompt.trim()}
+
+`)
+  }
+
+  if (options.triggerContext != null) {
+    const eventType = options.triggerContext.eventType
+    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
+      parts.push(buildOutputContractSection(context))
     }
   }
 
@@ -289,23 +297,8 @@ gh issue comment ${issueNum} --body "Your response with Run Summary"
     : ''
 }
 
-### Creating PRs
-\`\`\`bash
-gh pr create --title "feat(scope): description" --body "Details..." --base ${context.defaultBranch} --head feature-branch
-\`\`\`
-
-### Pushing Commits
-\`\`\`bash
-git add .
-git commit -m "type(scope): description"
-git push origin HEAD
-\`\`\`
-
 ### API Calls
-\`\`\`bash
-gh api repos/${context.repo}/issues --jq '.[].title'
-gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
-\`\`\`
+Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'\`.
 `)
 
   parts.push(buildConstraintReminderSection())

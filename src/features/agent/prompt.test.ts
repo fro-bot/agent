@@ -195,8 +195,8 @@ describe('buildAgentPrompt', () => {
     const agentContextIndex = prompt.indexOf('# Agent Context')
 
     expect(currentThreadIndex).toBeGreaterThan(-1)
-    expect(currentThreadIndex).toBeLessThan(environmentIndex)
-    expect(relatedHistoryIndex).toBeGreaterThan(environmentIndex)
+    expect(currentThreadIndex).toBeGreaterThan(environmentIndex)
+    expect(relatedHistoryIndex).toBeLessThan(currentThreadIndex)
     expect(agentContextIndex).toBeGreaterThan(relatedHistoryIndex)
   })
 
@@ -261,7 +261,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Type:** pr')
   })
 
-  it('includes trigger comment when present', () => {
+  it('includes trigger comment when present for actual comment events', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext({
@@ -270,6 +270,7 @@ describe('buildAgentPrompt', () => {
       }),
       customPrompt: null,
       cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
     }
 
     // #when
@@ -279,6 +280,91 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('## Trigger Comment')
     expect(prompt).toContain('**Author:** reporter')
     expect(prompt).toContain('Please fix the bug in auth.ts')
+  })
+
+  it('cleans escaped markdown in trigger comments before injection', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        commentBody: 'Please use \`code\` and \| tables',
+        commentAuthor: 'reporter',
+      }),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).toContain('Please use `code` and | tables')
+    expect(prompt).not.toContain('\\`code\\`')
+    expect(prompt).not.toContain(String.raw`\| tables`)
+  })
+
+  it('omits trigger comment section for pull request events to avoid duplicate body content', () => {
+    // #given
+    const context = createMockContext({
+      eventName: 'pull_request',
+      issueType: 'pr',
+      issueNumber: 99,
+      commentBody: 'PR body duplicated here',
+      hydratedContext: {
+        type: 'pull_request',
+        number: 99,
+        title: 'feat: add feature',
+        body: 'PR body duplicated here',
+        bodyTruncated: false,
+        state: 'open',
+        author: 'contributor',
+        createdAt: '2024-02-01T09:00:00Z',
+        baseBranch: 'main',
+        headBranch: 'feature/cool-thing',
+        isFork: false,
+        labels: [],
+        assignees: [],
+        comments: [],
+        commentsTruncated: false,
+        totalComments: 0,
+        commits: [],
+        commitsTruncated: false,
+        totalCommits: 0,
+        files: [],
+        filesTruncated: false,
+        totalFiles: 0,
+        reviews: [],
+        reviewsTruncated: false,
+        totalReviews: 0,
+        authorAssociation: 'MEMBER',
+        requestedReviewers: [],
+        requestedReviewerTeams: [],
+      },
+    })
+    const triggerContext = createMockTriggerContext({
+      eventType: 'pull_request',
+      target: {
+        kind: 'pr',
+        number: 99,
+        title: 'feat: add feature',
+        body: 'PR body duplicated here',
+        locked: false,
+        isDraft: false,
+      },
+    })
+    const options: PromptOptions = {
+      context,
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext,
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    expect(prompt).not.toContain('## Trigger Comment')
+    expect(prompt).toContain('### Description')
   })
 
   it('includes session management instructions', () => {
@@ -370,9 +456,10 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('## GitHub Operations (Use gh CLI)')
     expect(prompt).toContain('gh issue comment 42')
     expect(prompt).toContain('gh pr comment 42')
-    expect(prompt).toContain('gh pr create')
-    expect(prompt).toContain('--base develop')
+    expect(prompt).toContain('gh api repos/owner/repo/pulls/42/files')
     expect(prompt).toContain('See **Response Protocol** above')
+    expect(prompt).not.toContain('gh pr create')
+    expect(prompt).not.toContain('git push origin HEAD')
     expect(prompt).not.toContain('# Comment on issue')
   })
 
@@ -618,6 +705,49 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('## Task')
     expect(prompt).toContain(duplicatedTask)
     expect(prompt).not.toContain('## Trigger Comment')
+  })
+
+  it('orders reference material before trigger comment and task before response protocol', () => {
+    // #given
+    const sessionContext: SessionContext = {
+      recentSessions: [createMockSessionSummary()],
+      priorWorkContext: [createMockSearchResult()],
+    }
+    const options: PromptOptions = {
+      context: createMockContext({
+        diffContext: {
+          changedFiles: 1,
+          additions: 5,
+          deletions: 2,
+          truncated: false,
+          files: [{filename: 'src/test.ts', status: 'modified', additions: 5, deletions: 2}],
+        },
+      }),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      sessionContext,
+      triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger)
+
+    // #then
+    const environmentIndex = prompt.indexOf('## Environment')
+    const issueContextIndex = prompt.indexOf('## Issue Context')
+    const diffIndex = prompt.indexOf('## Pull Request Diff Summary')
+    const sessionIndex = prompt.indexOf('## Prior Session Context')
+    const triggerCommentIndex = prompt.indexOf('## Trigger Comment')
+    const taskIndex = prompt.indexOf('## Task')
+    const responseProtocolIndex = prompt.indexOf('## Response Protocol (REQUIRED)')
+
+    expect(environmentIndex).toBeGreaterThan(-1)
+    expect(issueContextIndex).toBeGreaterThan(environmentIndex)
+    expect(diffIndex).toBeGreaterThan(issueContextIndex)
+    expect(sessionIndex).toBeGreaterThan(diffIndex)
+    expect(triggerCommentIndex).toBeGreaterThan(sessionIndex)
+    expect(taskIndex).toBeGreaterThan(triggerCommentIndex)
+    expect(responseProtocolIndex).toBeGreaterThan(taskIndex)
   })
 
   describe('session context', () => {
@@ -1227,7 +1357,7 @@ describe('output contract', () => {
     expect(prompt).toContain('Author association: CONTRIBUTOR')
   })
 
-  it('places output contract immediately after task section for PR events', () => {
+  it('places output contract after task section and before agent context for PR events', () => {
     // #given
     const context = createMockContext({
       eventName: 'pull_request',
@@ -1254,13 +1384,13 @@ describe('output contract', () => {
     // #then
     const taskIndex = prompt.indexOf('## Task')
     const contractIndex = prompt.indexOf('## Output Contract')
-    const environmentIndex = prompt.indexOf('## Environment')
+    const agentContextIndex = prompt.indexOf('# Agent Context')
 
     expect(taskIndex).toBeGreaterThan(-1)
     expect(contractIndex).toBeGreaterThan(-1)
-    expect(environmentIndex).toBeGreaterThan(-1)
+    expect(agentContextIndex).toBeGreaterThan(-1)
     expect(contractIndex).toBeGreaterThan(taskIndex)
-    expect(contractIndex).toBeLessThan(environmentIndex)
+    expect(contractIndex).toBeLessThan(agentContextIndex)
   })
 
   it('does not include output contract for non-PR triggers', () => {
