@@ -53,6 +53,7 @@ jobs:
               - src/**
               - action.yaml
               - package.json
+              - tsconfig.json
             should-lint:
               - added|modified: *config
               - added|modified: *src-changed
