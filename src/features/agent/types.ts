@@ -90,6 +90,16 @@ export interface PromptOptions {
   readonly fileParts?: readonly FilePartInput[]
 }
 
+export interface ReferenceFile {
+  readonly filename: string
+  readonly content: string
+}
+
+export interface PromptResult {
+  readonly text: string
+  readonly referenceFiles: readonly ReferenceFile[]
+}
+
 /**
  * PR diff context for review (RFC-009 integration).
  * Provides summarized diff information for the agent prompt.

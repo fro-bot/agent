@@ -7,11 +7,10 @@
 
 import type {SessionSearchResult} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
+import type {HydratedContext} from '../context/types.js'
 import type {TriggerContext} from '../triggers/types.js'
-import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
+import type {AgentContext, DiffContext, PromptOptions, PromptResult, ReferenceFile, SessionContext} from './types.js'
 import {cleanMarkdownBody} from '../../shared/format.js'
-import {formatContextForPrompt} from '../context/index.js'
-import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 import {
   buildConstraintReminderSection,
   buildCurrentThreadContextSection,
@@ -97,7 +96,7 @@ function buildReviewCommentDirective(context: TriggerContext): string {
 
 export function buildTaskSection(context: TriggerContext, promptInput: string | null): string {
   const {directive, appendMode} = getTriggerDirective(context, promptInput)
-  const lines: string[] = ['## Task', '']
+  const lines: string[] = ['## Task']
 
   if (appendMode) {
     lines.push(directive)
@@ -125,10 +124,11 @@ export function buildTaskSection(context: TriggerContext, promptInput: string | 
  * - Run summary requirement
  * - Custom prompt if provided
  */
-export function buildAgentPrompt(options: PromptOptions, logger: Logger): string {
+export function buildAgentPrompt(options: PromptOptions, logger: Logger): PromptResult {
   const {context, customPrompt, cacheStatus, sessionContext, logicalKey, isContinuation, currentThreadSessionId} =
     options
   const parts: string[] = []
+  const referenceFiles: ReferenceFile[] = []
   const continuationEnabled = isContinuation === true
   const cleanedCommentBody = context.commentBody == null ? null : cleanMarkdownBody(context.commentBody)
   const triggerCommentEvent = options.triggerContext?.eventType ?? context.eventName
@@ -159,21 +159,20 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
 - **Cache Status:** ${cacheStatus}
 `)
 
-  if (context.issueNumber != null) {
+  if (context.hydratedContext != null) {
+    const extracted = extractExternalContent(context.hydratedContext)
+    for (const file of extracted) {
+      referenceFiles.push(file)
+    }
+    parts.push(buildHydratedContextSection(context.hydratedContext, extracted, context.diffContext))
+  } else if (context.diffContext != null && context.issueType === 'pr' && context.issueNumber != null) {
+    parts.push(buildDiffOnlyPullRequestSection(context.issueNumber, context.issueTitle, context.diffContext))
+  } else if (context.issueNumber != null) {
     const typeLabel = context.issueType === 'pr' ? 'Pull Request' : 'Issue'
-    parts.push(`## ${typeLabel} Context
-- **Number:** #${context.issueNumber}
+    parts.push(`## ${typeLabel} #${context.issueNumber}
 - **Title:** ${context.issueTitle ?? 'N/A'}
 - **Type:** ${context.issueType ?? 'unknown'}
 `)
-  }
-
-  if (context.diffContext != null) {
-    parts.push(buildDiffContextSection(context.diffContext))
-  }
-
-  if (context.hydratedContext != null) {
-    parts.push(formatContextForPrompt(context.hydratedContext))
   }
 
   if (sessionContext != null) {
@@ -183,8 +182,8 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
       currentThreadSessionId,
       currentThreadContextText != null,
     )
-    if (historicalSection != null) {
-      parts.push(historicalSection)
+    if (historicalSection != null && historicalSection.content.trim().length > 0) {
+      parts.push(historicalSection.content)
     }
   }
 
@@ -198,12 +197,12 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
     trimmedCustomPrompt === trimmedCommentBody
 
   if (renderTriggerComment && !triggerCommentDuplicatesTask) {
+    const filename = 'trigger-comment.txt'
+    referenceFiles.push({filename, content: cleanedCommentBody?.trim() ?? ''})
     parts.push(`## Trigger Comment
-**Author:** ${context.commentAuthor ?? 'unknown'}
+- **Author:** ${context.commentAuthor ?? 'unknown'}
 
-\`\`\`
-${cleanedCommentBody}
-\`\`\`
+- Full trigger comment attached as @${filename}
 `)
   }
 
@@ -211,12 +210,10 @@ ${cleanedCommentBody}
     parts.push(buildTaskSection(options.triggerContext, customPrompt))
   } else if (context.commentBody == null) {
     parts.push(`## Task
-
 Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
 `)
   } else {
     parts.push(`## Task
-
 Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
 `)
   }
@@ -238,11 +235,9 @@ Respond to the trigger comment above. Follow all instructions and requirements l
   }
 
   parts.push(`## Agent Context
-
 You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
 
 ### Operating Environment
-
 - **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
 - Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
 - The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
@@ -251,7 +246,6 @@ You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Ac
 
   // Session management instructions (REQUIRED)
   parts.push(`### Session Management (REQUIRED)
-
 Before investigating any issue:
 1. Use \`session_search\` to find relevant prior sessions for this repository
 2. Use \`session_read\` to review prior work if found
@@ -267,34 +261,21 @@ Before completing:
     parts.push(buildResponseProtocolSection(context, cacheStatus, options.sessionId))
   }
 
-  // GitHub CLI instructions
   const issueNum = context.issueNumber ?? '<number>'
   const hasResponseProtocol = context.issueNumber != null
-  parts.push(`### GitHub Operations (Use gh CLI)
-
-The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
-${
-  hasResponseProtocol
-    ? `
-#### Posting Your Response
-
-See **Response Protocol** above. Post exactly one comment or review per run.
+  parts.push(`### GitHub Operations
+The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.${
+    hasResponseProtocol
+      ? ` Post exactly one comment or review per run (see Response Protocol).
 
 \`\`\`bash
-# Post response as PR comment (use --body-file for long responses)
 gh pr comment ${issueNum} --body "Your response with Run Summary"
-
-# Submit PR review with response in body
 gh pr review ${issueNum} --approve --body "Your review with Run Summary"
-
-# Post response as issue comment
 gh issue comment ${issueNum} --body "Your response with Run Summary"
+gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
 \`\`\``
-    : ''
-}
-
-#### API Calls
-Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'\`.
+      : ''
+  }
 `)
 
   parts.push(buildConstraintReminderSection())
@@ -305,7 +286,263 @@ Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/$
     hasCustom: customPrompt != null,
     hasSessionContext: sessionContext != null,
   })
-  return prompt
+
+  return {
+    text: prompt,
+    referenceFiles,
+  }
+}
+
+/**
+ * Extract all external (user-authored) content from hydrated context into reference files.
+ * Returns only non-empty files.
+ */
+function extractExternalContent(context: HydratedContext): ReferenceFile[] {
+  const files: ReferenceFile[] = []
+  const body = cleanMarkdownBody(context.body).trim()
+
+  if (body.length > 0) {
+    const filename = context.type === 'pull_request' ? 'pr-description.txt' : 'issue-description.txt'
+    files.push({filename, content: body})
+  }
+
+  if (context.type === 'pull_request' && context.reviews.length > 0) {
+    for (const [index, review] of context.reviews.entries()) {
+      const reviewBody = cleanMarkdownBody(review.body).trim()
+      if (reviewBody.length === 0) {
+        continue
+      }
+
+      files.push({
+        filename: buildAttachmentFilename('pr-review', index + 1, review.author),
+        content: reviewBody,
+      })
+    }
+  }
+
+  if (context.comments.length > 0) {
+    const prefix = context.type === 'pull_request' ? 'pr-comment' : 'issue-comment'
+    for (const [index, comment] of context.comments.entries()) {
+      files.push({
+        filename: buildAttachmentFilename(prefix, index + 1, comment.author),
+        content: cleanMarkdownBody(comment.body).trim(),
+      })
+    }
+  }
+
+  return files
+}
+
+/**
+ * Build the hydrated context section with inline metadata/structure and @file references
+ * for external content (description, reviews, comments).
+ */
+function buildHydratedContextSection(
+  context: HydratedContext,
+  externalFiles: readonly ReferenceFile[],
+  diffContext?: DiffContext | null,
+): string {
+  const lines: string[] = []
+  const fileMap = new Map(externalFiles.map(f => [f.filename, f]))
+
+  if (context.type === 'pull_request') {
+    lines.push(`## Pull Request #${context.number}`)
+    lines.push(`- **Title:** ${context.title}`)
+    lines.push(`- **State:** ${context.state}`)
+    lines.push(`- **Author:** ${context.author ?? 'unknown'}`)
+    lines.push(`- **Created:** ${context.createdAt}`)
+    lines.push(`- **Base:** ${context.baseBranch} ← **Head:** ${context.headBranch}`)
+    if (context.isFork) {
+      lines.push('- **Fork:** Yes (external contributor)')
+    }
+    if (context.labels.length > 0) {
+      lines.push(`- **Labels:** ${context.labels.map(l => l.name).join(', ')}`)
+    }
+    if (context.assignees.length > 0) {
+      lines.push(`- **Assignees:** ${context.assignees.map(a => a.login).join(', ')}`)
+    }
+
+    const descFile = fileMap.get('pr-description.txt')
+    if (descFile != null) {
+      lines.push(`- **Description:** @pr-description.txt`)
+    }
+    if (diffContext != null) {
+      lines.push(`- **Changed Files:** ${diffContext.changedFiles}`)
+      lines.push(`- **Additions:** +${diffContext.additions}`)
+      lines.push(`- **Deletions:** -${diffContext.deletions}`)
+    }
+    if (context.bodyTruncated) {
+      lines.push('*Note: Description was truncated due to size limits.*')
+    }
+
+    if (context.files.length > 0) {
+      const mergedStatuses = mergeDiffStatuses(context, diffContext)
+      lines.push('')
+      lines.push(
+        `### Files Changed (${context.files.length}${context.filesTruncated ? ` of ${context.totalFiles}` : ''})`,
+      )
+      if (mergedStatuses == null) {
+        lines.push('| File | +/- |')
+        lines.push('|------|-----|')
+        for (const file of context.files) {
+          lines.push(`| \`${file.path}\` | +${file.additions}/-${file.deletions} |`)
+        }
+      } else {
+        lines.push('| File | Status | +/- |')
+        lines.push('|------|--------|-----|')
+        for (const file of context.files) {
+          lines.push(
+            `| \`${file.path}\` | ${mergedStatuses.get(file.path) ?? 'unknown'} | +${file.additions}/-${file.deletions} |`,
+          )
+        }
+      }
+    }
+
+    if (context.commits.length > 0) {
+      lines.push('')
+      lines.push(
+        `### Commits (${context.commits.length}${context.commitsTruncated ? ` of ${context.totalCommits}` : ''})`,
+      )
+      for (const commit of context.commits) {
+        const shortOid = commit.oid.slice(0, 7)
+        lines.push(`- \`${shortOid}\` ${commit.message.split('\n')[0]}`)
+      }
+    }
+
+    lines.push('')
+    lines.push(
+      `### Reviews (${context.reviews.length}${context.reviewsTruncated ? ` of ${context.totalReviews}` : ''})`,
+    )
+    if (context.reviews.length === 0) {
+      lines.push('[none]')
+    } else {
+      for (const [index, review] of context.reviews.entries()) {
+        if (index > 0) {
+          lines.push('')
+        }
+
+        lines.push(`- **Author:** ${review.author ?? 'unknown'}`)
+        lines.push(`- **Status:** ${review.state}`)
+
+        const reviewFilename = buildAttachmentFilename('pr-review', index + 1, review.author)
+        if (fileMap.has(reviewFilename)) {
+          lines.push(`- **Body:** @${reviewFilename}`)
+        }
+      }
+    }
+
+    lines.push('')
+    lines.push(
+      `### Comments (${context.comments.length}${context.commentsTruncated ? ` of ${context.totalComments}` : ''})`,
+    )
+    if (context.comments.length === 0) {
+      lines.push('[none]')
+    } else {
+      for (const [index, comment] of context.comments.entries()) {
+        if (index > 0) {
+          lines.push('')
+        }
+
+        const commentFilename = buildAttachmentFilename('pr-comment', index + 1, comment.author)
+        lines.push(`- **Author:** ${comment.author ?? 'unknown'}`)
+        lines.push(`- **Date:** ${comment.createdAt}`)
+        lines.push(`- **Body:** @${commentFilename}`)
+      }
+    }
+  } else {
+    lines.push(`## Issue #${context.number}`)
+    lines.push(`- **Title:** ${context.title}`)
+    lines.push(`- **State:** ${context.state}`)
+    lines.push(`- **Author:** ${context.author ?? 'unknown'}`)
+    lines.push(`- **Created:** ${context.createdAt}`)
+    if (context.labels.length > 0) {
+      lines.push(`- **Labels:** ${context.labels.map(l => l.name).join(', ')}`)
+    }
+    if (context.assignees.length > 0) {
+      lines.push(`- **Assignees:** ${context.assignees.map(a => a.login).join(', ')}`)
+    }
+
+    const bodyFile = fileMap.get('issue-description.txt')
+    if (bodyFile != null) {
+      lines.push(`- **Body:** @issue-description.txt`)
+    }
+    if (context.bodyTruncated) {
+      lines.push('*Note: Body was truncated due to size limits.*')
+    }
+
+    lines.push('')
+    lines.push(
+      `### Comments (${context.comments.length}${context.commentsTruncated ? ` of ${context.totalComments}` : ''})`,
+    )
+    if (context.comments.length === 0) {
+      lines.push('[none]')
+    } else {
+      for (const [index, comment] of context.comments.entries()) {
+        if (index > 0) {
+          lines.push('')
+        }
+
+        const commentFilename = buildAttachmentFilename('issue-comment', index + 1, comment.author)
+        lines.push(`- **Author:** ${comment.author ?? 'unknown'}`)
+        lines.push(`- **Date:** ${comment.createdAt}`)
+        lines.push(`- **Body:** @${commentFilename}`)
+      }
+    }
+  }
+
+  return lines.join('\n')
+}
+
+function buildAttachmentFilename(prefix: string, index: number, author: string | null): string {
+  const slug = (author ?? 'unknown')
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, '-')
+    .replaceAll(/^-|-$/g, '')
+
+  return `${prefix}-${String(index).padStart(3, '0')}-${slug.length > 0 ? slug : 'unknown'}.txt`
+}
+
+function mergeDiffStatuses(
+  context: Extract<HydratedContext, {readonly type: 'pull_request'}>,
+  diffContext: DiffContext | null | undefined,
+): ReadonlyMap<string, string> | null {
+  if (diffContext == null || context.files.length === 0 || diffContext.files.length !== context.files.length) {
+    return null
+  }
+
+  const statusMap = new Map(diffContext.files.map(file => [file.filename, file.status]))
+
+  for (const file of context.files) {
+    if (!statusMap.has(file.path)) {
+      return null
+    }
+  }
+
+  return statusMap
+}
+
+function buildDiffOnlyPullRequestSection(issueNumber: number, title: string | null, diffContext: DiffContext): string {
+  const lines: string[] = [`## Pull Request #${issueNumber}`]
+  lines.push(`- **Title:** ${title ?? 'N/A'}`)
+  lines.push(`- **Changed Files:** ${diffContext.changedFiles}`)
+  lines.push(`- **Additions:** +${diffContext.additions}`)
+  lines.push(`- **Deletions:** -${diffContext.deletions}`)
+
+  if (diffContext.truncated) {
+    lines.push('- **Note:** Diff was truncated due to size limits')
+  }
+
+  if (diffContext.files.length > 0) {
+    lines.push('')
+    lines.push('### Files Changed')
+    lines.push('| File | Status | +/- |')
+    lines.push('|------|--------|-----|')
+    for (const file of diffContext.files) {
+      lines.push(`| \`${file.filename}\` | ${file.status} | +${file.additions}/-${file.deletions} |`)
+    }
+  }
+
+  return lines.join('\n')
 }
 
 function buildResponseProtocolSection(
@@ -315,11 +552,8 @@ function buildResponseProtocolSection(
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
   return `### Response Protocol (REQUIRED)
-
 You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
-
-#### Rules
-
+**Rules:**
 1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
 3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
@@ -327,10 +561,8 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 5. **For PR reviews:** When using \`gh pr review --approve\` or \`gh pr review --request-changes\`, put your full response (analysis + Run Summary) in the \`--body\` argument. Do not post a separate PR comment afterward.
 6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
 
-#### Unified Response Format
-
+**Response Format:**
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
-
 \`\`\`markdown
 [Your response content here]
 
@@ -364,7 +596,6 @@ function buildSessionContextSection(
 ): string {
   const lines: string[] = [sectionTitle]
 
-  // Recent sessions (lightweight metadata only)
   if (sessionContext.recentSessions.length > 0) {
     lines.push('')
     lines.push('### Recent Sessions')
@@ -382,11 +613,9 @@ function buildSessionContextSection(
     lines.push('Use `session_read` to review any of these sessions in detail.')
   }
 
-  // Prior work context (search results)
   if (priorWorkContext.length > 0) {
     lines.push('')
     lines.push('### Relevant Prior Work')
-    lines.push('')
     lines.push('The following sessions contain content related to this issue:')
     lines.push('')
 
@@ -435,7 +664,7 @@ function buildHistoricalSessionContext(
   isContinuation: boolean,
   currentThreadSessionId: string | null | undefined,
   hasCurrentThreadContext: boolean,
-): string | null {
+): {readonly title: string; readonly content: string} | null {
   if (isContinuation && currentThreadSessionId != null) {
     const relatedPriorWork = sessionContext.priorWorkContext.filter(
       result => result.sessionId !== currentThreadSessionId,
@@ -445,7 +674,10 @@ function buildHistoricalSessionContext(
       return null
     }
 
-    return buildSessionContextSection(sessionContext, '## Related Historical Context', relatedPriorWork)
+    return {
+      title: '## Related Historical Context',
+      content: buildSessionContextSection(sessionContext, '## Related Historical Context', relatedPriorWork),
+    }
   }
 
   if (
@@ -456,46 +688,22 @@ function buildHistoricalSessionContext(
     return null
   }
 
-  return buildSessionContextSection(sessionContext, '## Prior Session Context', sessionContext.priorWorkContext)
-}
-
-function buildDiffContextSection(diffContext: DiffContext): string {
-  const lines: string[] = ['## Pull Request Diff Summary']
-  lines.push('')
-  lines.push(`- **Changed Files:** ${diffContext.changedFiles}`)
-  lines.push(`- **Additions:** +${diffContext.additions}`)
-  lines.push(`- **Deletions:** -${diffContext.deletions}`)
-
-  if (diffContext.truncated) {
-    lines.push('- **Note:** Diff was truncated due to size limits')
+  if (sessionContext.recentSessions.length === 0 && sessionContext.priorWorkContext.length === 0) {
+    return null
   }
 
-  if (diffContext.files.length > 0) {
-    lines.push('')
-    lines.push('### Changed Files')
-    lines.push('| File | Status | +/- |')
-    lines.push('|------|--------|-----|')
-
-    for (const file of diffContext.files.slice(0, MAX_FILES_IN_PROMPT)) {
-      lines.push(`| \`${file.filename}\` | ${file.status} | +${file.additions}/-${file.deletions} |`)
-    }
-
-    if (diffContext.files.length > MAX_FILES_IN_PROMPT) {
-      lines.push(`| ... | | +${diffContext.files.length - MAX_FILES_IN_PROMPT} more files |`)
-    }
+  return {
+    title: '## Prior Session Context',
+    content: buildSessionContextSection(sessionContext, '## Prior Session Context', sessionContext.priorWorkContext),
   }
-
-  lines.push('')
-  return lines.join('\n')
 }
 
 function buildOutputContractSection(context: AgentContext): string {
-  const lines: string[] = ['## Output Contract', '']
+  const lines: string[] = ['## Output Contract']
   lines.push(`- Review action: approve/request-changes if confident; otherwise comment-only`)
   lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)
   if (context.authorAssociation != null) {
     lines.push(`- Author association: ${context.authorAssociation}`)
   }
-  lines.push('')
   return lines.join('\n')
 }
