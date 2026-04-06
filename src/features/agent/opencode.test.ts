@@ -44,7 +44,11 @@ vi.mock('@opencode-ai/sdk', () => ({
 
 // Mock buildAgentPrompt
 vi.mock('./prompt.js', () => ({
-  buildAgentPrompt: vi.fn().mockReturnValue('Built prompt with sessionId'),
+  buildAgentPrompt: vi.fn().mockReturnValue({text: 'Built prompt with sessionId', referenceFiles: []}),
+}))
+
+vi.mock('./reference-files.js', () => ({
+  materializeReferenceFiles: vi.fn().mockResolvedValue([]),
 }))
 
 function createMockPromptOptions(overrides: Partial<PromptOptions> = {}): PromptOptions {
@@ -675,6 +679,49 @@ describe('executeOpenCode', () => {
     )
   })
 
+  it('materializes reference files into the log directory and merges file parts', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+    vi.spyOn(envUtils, 'getOpenCodeLogPath').mockReturnValue('/tmp/opencode/log')
+    const {buildAgentPrompt} = await import('./prompt.js')
+    vi.mocked(buildAgentPrompt).mockReturnValue({
+      text: 'Built prompt with sessionId',
+      referenceFiles: [{filename: 'pr-context.txt', content: 'context'}],
+    })
+    const {materializeReferenceFiles} = await import('./reference-files.js')
+    vi.mocked(materializeReferenceFiles).mockResolvedValue([
+      {type: 'file', mime: 'text/plain', url: 'file:///tmp/opencode/log/pr-context.txt', filename: 'pr-context.txt'},
+    ])
+    const imageFilePart = {
+      type: 'file' as const,
+      mime: 'image/png',
+      url: 'file:///tmp/image.png',
+      filename: 'image.png',
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions({fileParts: [imageFilePart]}), mockLogger)
+
+    // #then
+    expect(materializeReferenceFiles).toHaveBeenCalledWith(
+      [{filename: 'pr-context.txt', content: 'context'}],
+      '/tmp/opencode/log',
+      mockLogger,
+    )
+    const promptCall = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {parts?: {type: string; filename?: string}[]}
+    }
+    expect(promptCall.body?.parts).toEqual([
+      {type: 'text', text: 'Built prompt with sessionId'},
+      imageFilePart,
+      {type: 'file', mime: 'text/plain', url: 'file:///tmp/opencode/log/pr-context.txt', filename: 'pr-context.txt'},
+    ])
+  })
+
   it('does not write prompt artifact when OPENCODE_PROMPT_ARTIFACT is disabled', async () => {
     // #given
     const mockClient = createMockClient({
@@ -1009,6 +1056,57 @@ describe('executeOpenCode retry behavior', () => {
     expect(secondPart).toBeDefined()
     expect(firstPart?.text).toBe('Built prompt with sessionId')
     expect(secondPart?.text).toContain('interrupted by a network error')
+  })
+
+  it('keeps all file parts on retry attempts', async () => {
+    // #given
+    const mockServer = createMockServer()
+    const promptBodies: {parts: {type: string; text?: string; filename?: string}[]}[] = []
+    const attachedFile = {
+      type: 'file' as const,
+      mime: 'text/plain',
+      url: 'file:///tmp/opencode/log/pr-context.txt',
+      filename: 'pr-context.txt',
+    }
+
+    const {materializeReferenceFiles} = await import('./reference-files.js')
+    vi.mocked(materializeReferenceFiles).mockResolvedValue([attachedFile])
+
+    const mockClient = {
+      session: {
+        create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+        promptAsync: vi
+          .fn()
+          .mockImplementation(async (args: {body: {parts: {type: string; text?: string; filename?: string}[]}}) => {
+            promptBodies.push(args.body)
+            if (promptBodies.length === 1) {
+              return Promise.resolve({error: 'fetch failed'})
+            }
+            return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+          }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      event: {
+        subscribe: vi.fn().mockResolvedValue(createMockEventStream([])),
+      },
+    }
+
+    vi.mocked(createOpencode).mockResolvedValue({
+      client: mockClient,
+      server: mockServer,
+    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.advanceTimersByTimeAsync(2000)
+    await resultPromise
+
+    // #then
+    expect(promptBodies).toHaveLength(2)
+    expect(promptBodies[0]?.parts[1]).toEqual(attachedFile)
+    expect(promptBodies[1]?.parts[1]).toEqual(attachedFile)
+    expect(promptBodies[1]?.parts[0]?.text).toContain('interrupted by a network error')
   })
 })
 
