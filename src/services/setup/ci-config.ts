@@ -26,17 +26,17 @@ export function buildCIConfig(
   }
 
   const systematicPlugin = `@fro.bot/systematic@${inputs.systematicVersion}`
-  const rawPlugins: unknown[] = Array.isArray(ciConfig.plugins) ? (ciConfig.plugins as unknown[]) : []
+  const rawPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
   const hasSystematic = rawPlugins.some(
-    (plugin): plugin is string => typeof plugin === 'string' && plugin.startsWith('@fro.bot/systematic'),
+    (p): p is string => typeof p === 'string' && p.startsWith('@fro.bot/systematic'),
   )
   if (!hasSystematic) {
-    ciConfig.plugins = [...rawPlugins, systematicPlugin]
+    ciConfig.plugin = [...rawPlugins, systematicPlugin]
   }
 
   logger.debug('Built CI OpenCode config', {
     hasUserConfig: inputs.opencodeConfig != null,
-    pluginCount: Array.isArray(ciConfig.plugins) ? ciConfig.plugins.length : 0,
+    pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
   })
 
   return {config: ciConfig, error: null}

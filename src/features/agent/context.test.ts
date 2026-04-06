@@ -146,6 +146,28 @@ describe('collectAgentContext', () => {
     expect(ctx.issueType).toBe('pr')
   })
 
+  it('returns null issueNumber for manual targets (schedule/dispatch)', async () => {
+    // #given — manual targets have kind='manual' and number=0
+    const triggerContext = createMockTriggerContext({
+      eventName: 'schedule',
+      eventType: 'schedule',
+      target: createMockTarget({kind: 'manual', number: 0, title: 'Scheduled workflow'}),
+    })
+
+    // #when
+    const ctx = await collectAgentContext({
+      logger: mockLogger,
+      octokit: mockOctokit,
+      triggerContext,
+      botLogin: null,
+    })
+
+    // #then — number=0 sentinel should become null
+    expect(ctx.issueNumber).toBeNull()
+    expect(ctx.issueType).toBeNull()
+    expect(ctx.issueTitle).toBe('Scheduled workflow')
+  })
+
   it('returns null for comment fields when TriggerContext has nulls', async () => {
     // #given
     const triggerContext = createMockTriggerContext({

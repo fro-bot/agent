@@ -1,4 +1,5 @@
 import type {ContextBudget, HydratedContext, IssueContext, PullRequestContext, TruncateResult} from './types.js'
+import {cleanMarkdownBody} from '../../shared/format.js'
 
 export {DEFAULT_CONTEXT_BUDGET} from './types.js'
 
@@ -57,6 +58,7 @@ function formatAssignees(assignees: readonly {readonly login: string}[]): string
 
 function formatIssueContext(context: IssueContext): string {
   const lines: string[] = []
+  const body = cleanMarkdownBody(context.body)
 
   lines.push(`## Issue #${context.number}`)
   lines.push('')
@@ -74,7 +76,7 @@ function formatIssueContext(context: IssueContext): string {
   lines.push('')
   lines.push('### Body')
   lines.push('')
-  lines.push(context.body)
+  lines.push(body)
   if (context.bodyTruncated) {
     lines.push('')
     lines.push('*Note: Body was truncated due to size limits.*')
@@ -103,6 +105,7 @@ function formatIssueContext(context: IssueContext): string {
 
 function formatPullRequestContext(context: PullRequestContext): string {
   const lines: string[] = []
+  const body = cleanMarkdownBody(context.body)
 
   lines.push(`## Pull Request #${context.number}`)
   lines.push('')
@@ -125,7 +128,7 @@ function formatPullRequestContext(context: PullRequestContext): string {
   lines.push('')
   lines.push('### Description')
   lines.push('')
-  lines.push(context.body)
+  lines.push(body)
   if (context.bodyTruncated) {
     lines.push('')
     lines.push('*Note: Description was truncated due to size limits.*')

@@ -105,7 +105,7 @@ export async function installOmo(
 export async function verifyOmoInstallation(logger: Logger, execAdapter: ExecAdapter): Promise<boolean> {
   try {
     // bunx runs ephemerally so the binary won't be in PATH — verify config file only
-    const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-opencode.json'], {
+    const configResult = await execAdapter.getExecOutput('ls', ['-la', '~/.config/opencode/oh-my-openagent.json'], {
       silent: true,
       ignoreReturnCode: true,
     })

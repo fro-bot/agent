@@ -1,5 +1,29 @@
 import {describe, expect, it} from 'vitest'
-import {formatBytes} from './format.js'
+import {cleanMarkdownBody, formatBytes} from './format.js'
+
+describe('cleanMarkdownBody', () => {
+  it('removes unnecessary markdown escapes for backticks and pipes', () => {
+    // #given
+    const text = 'Use \`code\` in table \| col'
+
+    // #when
+    const result = cleanMarkdownBody(text)
+
+    // #then
+    expect(result).toBe('Use `code` in table | col')
+  })
+
+  it('leaves unrelated content unchanged', () => {
+    // #given
+    const text = 'Plain markdown body'
+
+    // #when
+    const result = cleanMarkdownBody(text)
+
+    // #then
+    expect(result).toBe('Plain markdown body')
+  })
+})
 
 describe('formatBytes', () => {
   it('formats bytes under 1KB', () => {

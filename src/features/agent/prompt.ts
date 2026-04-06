@@ -9,6 +9,7 @@ import type {SessionSearchResult} from '../../services/session/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, DiffContext, PromptOptions, SessionContext} from './types.js'
+import {cleanMarkdownBody} from '../../shared/format.js'
 import {formatContextForPrompt} from '../context/index.js'
 import {MAX_FILES_IN_PROMPT} from './diff-context.js'
 import {
@@ -129,6 +130,13 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
     options
   const parts: string[] = []
   const continuationEnabled = isContinuation === true
+  const cleanedCommentBody = context.commentBody == null ? null : cleanMarkdownBody(context.commentBody)
+  const triggerCommentEvent = options.triggerContext?.eventType ?? context.eventName
+  const renderTriggerComment =
+    cleanedCommentBody != null &&
+    (triggerCommentEvent === 'issue_comment' ||
+      triggerCommentEvent === 'discussion_comment' ||
+      triggerCommentEvent === 'pull_request_review_comment')
 
   parts.push(buildNonNegotiableRulesSection())
 
@@ -142,60 +150,7 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): string
       ? buildCurrentThreadPriorWorkText(sessionContext.priorWorkContext, currentThreadSessionId)
       : null
 
-  if (options.triggerContext != null) {
-    parts.push(buildTaskSection(options.triggerContext, customPrompt))
-  } else if (context.commentBody == null) {
-    parts.push(`## Task
-
-Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
-`)
-  } else {
-    parts.push(`## Task
-
-Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
-`)
-  }
-
-  const trimmedCustomPrompt = customPrompt?.trim() ?? null
-  const trimmedCommentBody = context.commentBody?.trim() ?? null
-  const triggerCommentDuplicatesTask =
-    trimmedCustomPrompt != null &&
-    trimmedCustomPrompt.length > 0 &&
-    trimmedCommentBody != null &&
-    trimmedCommentBody.length > 0 &&
-    trimmedCustomPrompt === trimmedCommentBody
-
-  if (context.commentBody != null && !triggerCommentDuplicatesTask) {
-    parts.push(`## Trigger Comment
-**Author:** ${context.commentAuthor ?? 'unknown'}
-
-\`\`\`
-${context.commentBody}
-\`\`\`
-`)
-  }
-
-  const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
-  if (currentThreadSection.length > 0) {
-    parts.push(currentThreadSection)
-  }
-
-  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(`
-${customPrompt.trim()}
-
-`)
-  }
-
-  if (options.triggerContext != null) {
-    const eventType = options.triggerContext.eventType
-    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
-      parts.push(buildOutputContractSection(context))
-    }
-  }
-
-  parts.push(`
-## Environment
+  parts.push(`## Environment
 - **Repository:** ${context.repo}
 - **Branch/Ref:** ${context.ref}
 - **Event:** ${context.eventName}
@@ -233,11 +188,60 @@ ${customPrompt.trim()}
     }
   }
 
-  parts.push(`# Agent Context
+  const trimmedCustomPrompt = customPrompt?.trim() ?? null
+  const trimmedCommentBody = cleanedCommentBody?.trim() ?? null
+  const triggerCommentDuplicatesTask =
+    trimmedCustomPrompt != null &&
+    trimmedCustomPrompt.length > 0 &&
+    trimmedCommentBody != null &&
+    trimmedCommentBody.length > 0 &&
+    trimmedCustomPrompt === trimmedCommentBody
+
+  if (renderTriggerComment && !triggerCommentDuplicatesTask) {
+    parts.push(`## Trigger Comment
+**Author:** ${context.commentAuthor ?? 'unknown'}
+
+\`\`\`
+${cleanedCommentBody}
+\`\`\`
+`)
+  }
+
+  if (options.triggerContext != null) {
+    parts.push(buildTaskSection(options.triggerContext, customPrompt))
+  } else if (context.commentBody == null) {
+    parts.push(`## Task
+
+Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
+`)
+  } else {
+    parts.push(`## Task
+
+Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
+`)
+  }
+
+  const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
+  if (currentThreadSection.length > 0) {
+    parts.push(currentThreadSection)
+  }
+
+  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
+    parts.push(customPrompt.trim())
+  }
+
+  if (options.triggerContext != null) {
+    const eventType = options.triggerContext.eventType
+    if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
+      parts.push(buildOutputContractSection(context))
+    }
+  }
+
+  parts.push(`## Agent Context
 
 You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
 
-## Operating Environment
+### Operating Environment
 
 - **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
 - Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
@@ -246,7 +250,7 @@ You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Ac
 `)
 
   // Session management instructions (REQUIRED)
-  parts.push(`## Session Management (REQUIRED)
+  parts.push(`### Session Management (REQUIRED)
 
 Before investigating any issue:
 1. Use \`session_search\` to find relevant prior sessions for this repository
@@ -266,13 +270,13 @@ Before completing:
   // GitHub CLI instructions
   const issueNum = context.issueNumber ?? '<number>'
   const hasResponseProtocol = context.issueNumber != null
-  parts.push(`## GitHub Operations (Use gh CLI)
+  parts.push(`### GitHub Operations (Use gh CLI)
 
 The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.
 ${
   hasResponseProtocol
     ? `
-### Posting Your Response
+#### Posting Your Response
 
 See **Response Protocol** above. Post exactly one comment or review per run.
 
@@ -289,28 +293,13 @@ gh issue comment ${issueNum} --body "Your response with Run Summary"
     : ''
 }
 
-### Creating PRs
-\`\`\`bash
-gh pr create --title "feat(scope): description" --body "Details..." --base ${context.defaultBranch} --head feature-branch
-\`\`\`
-
-### Pushing Commits
-\`\`\`bash
-git add .
-git commit -m "type(scope): description"
-git push origin HEAD
-\`\`\`
-
-### API Calls
-\`\`\`bash
-gh api repos/${context.repo}/issues --jq '.[].title'
-gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
-\`\`\`
+#### API Calls
+Use \`gh api\` for direct REST/GraphQL access when needed, e.g. \`gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'\`.
 `)
 
   parts.push(buildConstraintReminderSection())
 
-  const prompt = parts.join('\n')
+  const prompt = parts.map(p => p.trim()).join('\n\n')
   logger.debug('Built agent prompt', {
     length: prompt.length,
     hasCustom: customPrompt != null,
@@ -325,11 +314,11 @@ function buildResponseProtocolSection(
   sessionId: string | undefined,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
-  return `## Response Protocol (REQUIRED)
+  return `### Response Protocol (REQUIRED)
 
 You MUST post exactly ONE comment or review per invocation. All of your output — your response content AND the Run Summary — goes into that single artifact.
 
-### Rules
+#### Rules
 
 1. **One output per run.** Post exactly ONE comment (via \`gh issue comment\` or \`gh pr comment\`) or ONE review (via \`gh pr review\`). Never both. Never multiple comments.
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
@@ -338,7 +327,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 5. **For PR reviews:** When using \`gh pr review --approve\` or \`gh pr review --request-changes\`, put your full response (analysis + Run Summary) in the \`--body\` argument. Do not post a separate PR comment afterward.
 6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
 
-### Unified Response Format
+#### Unified Response Format
 
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:
 

@@ -15,3 +15,7 @@ export function formatBytes(bytes: number): string {
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
 }
+
+export function cleanMarkdownBody(text: string): string {
+  return text.replaceAll('\\`', '`').replaceAll(String.raw`\|`, '|')
+}

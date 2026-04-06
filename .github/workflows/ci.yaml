@@ -187,10 +187,14 @@ jobs:
           which opencode && opencode --version || true
           bunx oh-my-openagent get-local-version || true
 
+          echo "OPENCODE_CONFIG_CONTENT (should include @fro.bot/systematic):"
+          echo "$OPENCODE_CONFIG_CONTENT" | jq . 2>/dev/null || echo "$OPENCODE_CONFIG_CONTENT"
+
           echo "OpenCode config files:"
           find ~/.config/opencode -maxdepth 2 -type f | sort
           [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
-          [ -f ~/.config/opencode/oh-my-opencode.json ] && cat ~/.config/opencode/oh-my-opencode.json || true
+          [ -f ~/.config/opencode/oh-my-openagent.json ] && cat ~/.config/opencode/oh-my-openagent.json || true
+          [ -f ~/.config/opencode/oh-my-opencode.json ] && echo "Legacy oMo config:" && cat ~/.config/opencode/oh-my-opencode.json || true
 
           echo "OpenCode shared files:"
           ls -lA ~/.local/share/opencode || true
