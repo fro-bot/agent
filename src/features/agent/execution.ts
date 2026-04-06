@@ -15,6 +15,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
+import {materializeReferenceFiles} from './reference-files.js'
 import {MAX_LLM_RETRIES, RETRY_DELAY_MS} from './retry.js'
 
 export async function executeOpenCode(
@@ -67,15 +68,15 @@ export async function executeOpenCode(
       sessionId = config.continueSessionId
       logger.info('Continuing existing OpenCode session', {sessionId})
     }
-    const initialPrompt = buildAgentPrompt({...promptOptions, sessionId}, logger)
+    const {text: initialPrompt, referenceFiles} = buildAgentPrompt({...promptOptions, sessionId}, logger)
     const directory = getGitHubWorkspace()
+    const logPath = getOpenCodeLogPath()
+    await fs.mkdir(logPath, {recursive: true})
 
     if (isOpenCodePromptArtifactEnabled()) {
-      const logPath = getOpenCodeLogPath()
       const hash = crypto.createHash('sha256').update(initialPrompt).digest('hex')
       const artifactPath = path.join(logPath, `prompt-${sessionId}-${hash.slice(0, 8)}.txt`)
       try {
-        await fs.mkdir(logPath, {recursive: true})
         await fs.writeFile(artifactPath, initialPrompt, 'utf8')
         logger.info('Prompt artifact written', {hash, path: artifactPath})
       } catch (error) {
@@ -85,6 +86,9 @@ export async function executeOpenCode(
         })
       }
     }
+
+    const referenceFileParts = await materializeReferenceFiles(referenceFiles, logPath, logger)
+    const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
 
     let final: EventStreamResult = {
       tokens: null,
@@ -116,7 +120,7 @@ export async function executeOpenCode(
       if (timeoutMs > 0 && timeoutMs - (Date.now() - startTime) <= RETRY_DELAY_MS && attempt > 1) break
 
       const prompt = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
-      const files = attempt === 1 ? promptOptions.fileParts : undefined
+      const files = allFileParts.length > 0 ? allFileParts : undefined
       const result = await (async () => {
         try {
           return await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger)
