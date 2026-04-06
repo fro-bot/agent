@@ -6,7 +6,6 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {getPRDiff} from '../reviews/index.js'
 
 const MAX_FILES_IN_CONTEXT = 50
-const MAX_FILES_IN_PROMPT = 20
 
 /**
  * Collects PR diff context for agent prompts (RFC-009 integration).
@@ -72,4 +71,4 @@ export async function collectDiffContext(
   }
 }
 
-export {MAX_FILES_IN_CONTEXT, MAX_FILES_IN_PROMPT}
+export {MAX_FILES_IN_CONTEXT}

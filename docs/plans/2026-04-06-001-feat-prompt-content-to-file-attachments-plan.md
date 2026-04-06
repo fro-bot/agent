@@ -1,7 +1,7 @@
 ---
 title: "feat: Move external prompt content to file attachments"
 type: feat
-status: active
+status: completed
 date: 2026-04-06
 deepened: 2026-04-06
 ---
