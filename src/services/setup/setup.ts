@@ -1,4 +1,5 @@
 import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
+import {readFile, writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -149,7 +150,63 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       core.setFailed(ciConfigResult.error)
       return null
     }
-    core.exportVariable('OPENCODE_CONFIG_CONTENT', JSON.stringify(ciConfigResult.config))
+
+    // Merge CI config on top of any existing opencode.json (e.g. oMo plugin registration)
+    const opencodeConfigPath = join(omoConfigPath, 'opencode.json')
+    let existingConfig: Record<string, unknown> = {}
+    try {
+      const raw = await readFile(opencodeConfigPath, 'utf8')
+      const parsed: unknown = JSON.parse(raw)
+      if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        existingConfig = parsed as Record<string, unknown>
+      }
+    } catch {
+      // File doesn't exist yet or is invalid — start fresh
+    }
+
+    // Strip legacy "plugins" (plural) key — OpenCode only accepts "plugin" (singular)
+    delete existingConfig.plugins
+
+    // Normalize oMo plugin specifiers: the oMo installer hardcodes "@latest" or bare name
+    // regardless of the actual installed version. Rewrite to the pinned version.
+    const normalizePlugins = (plugins: unknown[]): unknown[] =>
+      plugins.map(p => {
+        if (typeof p !== 'string') return p
+        if (p === 'oh-my-openagent' || p === 'oh-my-openagent@latest') {
+          return `oh-my-openagent@${omoVersion}`
+        }
+        return p
+      })
+
+    // Merge plugin arrays: existing plugins + CI plugins, deduplicated by package name prefix
+    const existingPlugins: unknown[] = normalizePlugins(
+      Array.isArray(existingConfig.plugin) ? (existingConfig.plugin as unknown[]) : [],
+    )
+    const ciPlugins: unknown[] = Array.isArray(ciConfigResult.config.plugin)
+      ? (ciConfigResult.config.plugin as unknown[])
+      : []
+    const mergedPlugins = [...existingPlugins]
+    for (const ciPlugin of ciPlugins) {
+      if (typeof ciPlugin !== 'string') continue
+      const prefix = ciPlugin
+        .split('@')
+        .slice(0, ciPlugin.startsWith('@') ? 2 : 1)
+        .join('@')
+      const alreadyPresent = mergedPlugins.some(p => typeof p === 'string' && p.startsWith(prefix))
+      if (!alreadyPresent) {
+        mergedPlugins.push(ciPlugin)
+      }
+    }
+
+    const mergedConfig = {...existingConfig, ...ciConfigResult.config, plugin: mergedPlugins}
+    const mergedConfigJson = JSON.stringify(mergedConfig, null, 2)
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', mergedConfigJson)
+    await writeFile(opencodeConfigPath, mergedConfigJson)
+    logger.info('Wrote merged OpenCode config', {
+      path: opencodeConfigPath,
+      pluginCount: mergedPlugins.length,
+      plugins: mergedPlugins,
+    })
 
     if (!toolsCacheResult.hit) {
       await saveToolsCache({

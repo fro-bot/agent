@@ -44,7 +44,9 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
   const repo = `${repoInfo.owner}/${repoInfo.repo}`
 
   const issueType = target?.kind === 'issue' || target?.kind === 'pr' ? target.kind : null
-  const issueNumber = target?.number ?? null
+  // Manual targets (schedule/workflow_dispatch) use number=0 as a sentinel;
+  // treat 0 as null so prompts don't render misleading "Issue #0" context.
+  const issueNumber = target != null && target.kind !== 'manual' ? target.number : null
   const issueTitle = target?.title ?? null
   const commentAuthor = author?.login ?? null
 

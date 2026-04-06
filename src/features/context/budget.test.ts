@@ -237,6 +237,33 @@ describe('formatContextForPrompt', () => {
     expect(markdown).toContain('Have you tried restarting?')
   })
 
+  it('cleans escaped markdown in issue body', () => {
+    // #given
+    const context: IssueContext = {
+      type: 'issue',
+      number: 42,
+      title: 'Escaped markdown',
+      body: 'Use \`code\` and table \| separator',
+      bodyTruncated: false,
+      state: 'open',
+      author: 'reporter',
+      createdAt: '2024-01-15T10:00:00Z',
+      labels: [],
+      assignees: [],
+      comments: [],
+      commentsTruncated: false,
+      totalComments: 0,
+    }
+
+    // #when
+    const markdown = formatContextForPrompt(context)
+
+    // #then
+    expect(markdown).toContain('Use `code` and table | separator')
+    expect(markdown).not.toContain('\\`code\\`')
+    expect(markdown).not.toContain(String.raw`\|`)
+  })
+
   it('formats pull request context as markdown', () => {
     // #given
     const context: PullRequestContext = {
@@ -289,6 +316,48 @@ describe('formatContextForPrompt', () => {
     expect(markdown).toContain('contributor')
     expect(markdown).toContain('src/cool.ts')
     expect(markdown).toContain('APPROVED')
+  })
+
+  it('cleans escaped markdown in pull request description', () => {
+    // #given
+    const context: PullRequestContext = {
+      type: 'pull_request',
+      number: 100,
+      title: 'Add new feature',
+      body: 'This PR adds \`code\` samples \| table rows',
+      bodyTruncated: false,
+      state: 'open',
+      author: 'contributor',
+      createdAt: '2024-02-01T09:00:00Z',
+      baseBranch: 'main',
+      headBranch: 'feature/cool-thing',
+      isFork: false,
+      labels: [],
+      assignees: [],
+      comments: [],
+      commentsTruncated: false,
+      totalComments: 0,
+      commits: [],
+      commitsTruncated: false,
+      totalCommits: 0,
+      files: [],
+      filesTruncated: false,
+      totalFiles: 0,
+      reviews: [],
+      reviewsTruncated: false,
+      totalReviews: 0,
+      authorAssociation: 'MEMBER',
+      requestedReviewers: [],
+      requestedReviewerTeams: [],
+    }
+
+    // #when
+    const markdown = formatContextForPrompt(context)
+
+    // #then
+    expect(markdown).toContain('This PR adds `code` samples | table rows')
+    expect(markdown).not.toContain('\\`code\\`')
+    expect(markdown).not.toContain(String.raw`\|`)
   })
 
   it('includes truncation notes when content was truncated', () => {
