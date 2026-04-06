@@ -17,7 +17,7 @@ describe('buildCIConfig', () => {
 
     // #then
     expect(result.error).toBeNull()
-    expect(result.config).toEqual({autoupdate: false, plugins: ['@fro.bot/systematic@2.1.0']})
+    expect(result.config).toEqual({autoupdate: false, plugin: ['@fro.bot/systematic@2.1.0']})
   })
 
   it('merges user config keys and appends systematic plugin', () => {
@@ -35,17 +35,17 @@ describe('buildCIConfig', () => {
     expect(result.config).toEqual({
       autoupdate: true,
       model: 'claude-opus-4-5',
-      plugins: ['@fro.bot/systematic@2.1.0'],
+      plugin: ['@fro.bot/systematic@2.1.0'],
     })
   })
 
-  it('appends systematic plugin to existing plugins array', () => {
+  it('appends systematic plugin to existing plugin array', () => {
     // #given
     const logger = createLogger()
 
     // #when
     const result = buildCIConfig(
-      {opencodeConfig: '{"plugins":["custom-plugin@1.0.0"]}', systematicVersion: '2.1.0'},
+      {opencodeConfig: '{"plugin":["custom-plugin@1.0.0"]}', systematicVersion: '2.1.0'},
       logger,
     )
 
@@ -53,7 +53,7 @@ describe('buildCIConfig', () => {
     expect(result.error).toBeNull()
     expect(result.config).toEqual({
       autoupdate: false,
-      plugins: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'],
+      plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'],
     })
   })
 
@@ -64,7 +64,7 @@ describe('buildCIConfig', () => {
     // #when
     const result = buildCIConfig(
       {
-        opencodeConfig: '{"plugins":["custom-plugin@1.0.0","@fro.bot/systematic@9.9.9"]}',
+        opencodeConfig: '{"plugin":["custom-plugin@1.0.0","@fro.bot/systematic@9.9.9"]}',
         systematicVersion: '2.1.0',
       },
       logger,
@@ -74,7 +74,7 @@ describe('buildCIConfig', () => {
     expect(result.error).toBeNull()
     expect(result.config).toEqual({
       autoupdate: false,
-      plugins: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
+      plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
     })
   })
 
