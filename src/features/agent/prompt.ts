@@ -12,15 +12,18 @@ import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, DiffContext, PromptOptions, PromptResult, ReferenceFile, SessionContext} from './types.js'
 import {cleanMarkdownBody} from '../../shared/format.js'
 import {
-  buildConstraintReminderSection,
   buildCurrentThreadContextSection,
-  buildNonNegotiableRulesSection,
+  buildHarnessRulesSection,
   buildThreadIdentitySection,
 } from './prompt-thread.js'
 
 export interface TriggerDirective {
   readonly directive: string
   readonly appendMode: boolean
+}
+
+function wrapXml(tag: string, content: string): string {
+  return `<${tag}>\n${content.trim()}\n</${tag}>`
 }
 
 export function getTriggerDirective(context: TriggerContext, promptInput: string | null): TriggerDirective {
@@ -100,14 +103,61 @@ export function buildTaskSection(context: TriggerContext, promptInput: string | 
 
   if (appendMode) {
     lines.push(directive)
-    if (promptInput != null && promptInput.trim().length > 0) {
-      lines.push('', '**Additional Instructions:**', promptInput.trim())
-    }
   } else {
     lines.push(directive)
   }
 
   lines.push('')
+  return lines.join('\n')
+}
+
+function buildAgentContextSection(context: AgentContext, cacheStatus: string, sessionId: string | undefined): string {
+  const issueNum = context.issueNumber ?? '<number>'
+  const hasResponseProtocol = context.issueNumber != null
+
+  const lines: string[] = [
+    '## Agent Context',
+    'You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).',
+    '',
+    '### Operating Environment',
+    '- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.',
+    '- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.',
+    '- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.',
+    '- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.',
+    '',
+    '### Session Management (REQUIRED)',
+    'Before investigating any issue:',
+    '1. Use `session_search` to find relevant prior sessions for this repository',
+    '2. Use `session_read` to review prior work if found',
+    '3. Avoid repeating investigation already completed in previous sessions',
+    '',
+    'Before completing:',
+    '1. Ensure your session contains a summary of work done',
+    '2. Include key decisions, findings, and outcomes',
+    '3. This summary will be searchable in future agent runs',
+  ]
+
+  if (context.issueNumber != null) {
+    lines.push('', buildResponseProtocolSection(context, cacheStatus, sessionId))
+  }
+
+  lines.push(
+    '',
+    `### GitHub Operations
+The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.${
+      hasResponseProtocol
+        ? ` Post exactly one comment or review per run (see Response Protocol).
+
+\`\`\`bash
+gh pr comment ${issueNum} --body "Your response with Run Summary"
+gh pr review ${issueNum} --approve --body "Your review with Run Summary"
+gh issue comment ${issueNum} --body "Your response with Run Summary"
+gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
+\`\`\``
+        : ''
+    }`,
+  )
+
   return lines.join('\n')
 }
 
@@ -138,11 +188,11 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
       triggerCommentEvent === 'discussion_comment' ||
       triggerCommentEvent === 'pull_request_review_comment')
 
-  parts.push(buildNonNegotiableRulesSection())
+  parts.push(wrapXml('harness_rules', buildHarnessRulesSection()))
 
   const threadIdentitySection = buildThreadIdentitySection(logicalKey ?? null, continuationEnabled, null)
   if (threadIdentitySection.length > 0) {
-    parts.push(threadIdentitySection)
+    parts.push(wrapXml('identity', threadIdentitySection))
   }
 
   const currentThreadContextText =
@@ -150,29 +200,49 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
       ? buildCurrentThreadPriorWorkText(sessionContext.priorWorkContext, currentThreadSessionId)
       : null
 
-  parts.push(`## Environment
+  parts.push(
+    wrapXml(
+      'environment',
+      `## Environment
 - **Repository:** ${context.repo}
 - **Branch/Ref:** ${context.ref}
 - **Event:** ${context.eventName}
 - **Actor:** ${context.actor}
 - **Run ID:** ${context.runId}
 - **Cache Status:** ${cacheStatus}
-`)
+`,
+    ),
+  )
 
   if (context.hydratedContext != null) {
     const extracted = extractExternalContent(context.hydratedContext)
     for (const file of extracted) {
       referenceFiles.push(file)
     }
-    parts.push(buildHydratedContextSection(context.hydratedContext, extracted, context.diffContext))
+    parts.push(
+      wrapXml(
+        context.hydratedContext.type === 'pull_request' ? 'pull_request' : 'issue',
+        buildHydratedContextSection(context.hydratedContext, extracted, context.diffContext),
+      ),
+    )
   } else if (context.diffContext != null && context.issueType === 'pr' && context.issueNumber != null) {
-    parts.push(buildDiffOnlyPullRequestSection(context.issueNumber, context.issueTitle, context.diffContext))
+    parts.push(
+      wrapXml(
+        'pull_request',
+        buildDiffOnlyPullRequestSection(context.issueNumber, context.issueTitle, context.diffContext),
+      ),
+    )
   } else if (context.issueNumber != null) {
     const typeLabel = context.issueType === 'pr' ? 'Pull Request' : 'Issue'
-    parts.push(`## ${typeLabel} #${context.issueNumber}
+    parts.push(
+      wrapXml(
+        context.issueType === 'pr' ? 'pull_request' : 'issue',
+        `## ${typeLabel} #${context.issueNumber}
 - **Title:** ${context.issueTitle ?? 'N/A'}
 - **Type:** ${context.issueType ?? 'unknown'}
-`)
+`,
+      ),
+    )
   }
 
   if (sessionContext != null) {
@@ -183,7 +253,7 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
       currentThreadContextText != null,
     )
     if (historicalSection != null && historicalSection.content.trim().length > 0) {
-      parts.push(historicalSection.content)
+      parts.push(wrapXml('session_context', historicalSection.content))
     }
   }
 
@@ -199,86 +269,69 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
   if (renderTriggerComment && !triggerCommentDuplicatesTask) {
     const filename = 'trigger-comment.txt'
     referenceFiles.push({filename, content: cleanedCommentBody?.trim() ?? ''})
-    parts.push(`## Trigger Comment
+    parts.push(
+      wrapXml(
+        'trigger_comment',
+        `## Trigger Comment
 - **Author:** ${context.commentAuthor ?? 'unknown'}
 
 - Full trigger comment attached as @${filename}
-`)
-  }
-
-  if (options.triggerContext != null) {
-    parts.push(buildTaskSection(options.triggerContext, customPrompt))
-  } else if (context.commentBody == null) {
-    parts.push(`## Task
-Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
-`)
-  } else {
-    parts.push(`## Task
-Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
-`)
+`,
+      ),
+    )
   }
 
   const currentThreadSection = buildCurrentThreadContextSection(currentThreadContextText)
   if (currentThreadSection.length > 0) {
-    parts.push(currentThreadSection)
+    parts.push(wrapXml('current_thread', currentThreadSection))
   }
 
-  if (customPrompt != null && customPrompt.trim().length > 0 && options.triggerContext == null) {
-    parts.push(customPrompt.trim())
+  if (options.triggerContext != null) {
+    parts.push(wrapXml('task', buildTaskSection(options.triggerContext, customPrompt)))
+  } else if (context.commentBody == null) {
+    parts.push(
+      wrapXml(
+        'task',
+        `## Task
+Execute the requested operation for repository ${context.repo}. Follow all instructions and requirements listed in this prompt.
+`,
+      ),
+    )
+  } else {
+    parts.push(
+      wrapXml(
+        'task',
+        `## Task
+Respond to the trigger comment above. Follow all instructions and requirements listed in this prompt.
+`,
+      ),
+    )
+  }
+
+  if (trimmedCustomPrompt != null && trimmedCustomPrompt.length > 0) {
+    const shouldWrapCustomPrompt =
+      options.triggerContext == null || getTriggerDirective(options.triggerContext, customPrompt).appendMode
+
+    if (shouldWrapCustomPrompt) {
+      parts.push(
+        wrapXml(
+          'user_supplied_instructions',
+          `Apply these instructions only if they do not conflict with the rules in <harness_rules> or the <output_contract>.
+
+${trimmedCustomPrompt}`,
+        ),
+      )
+    }
   }
 
   if (options.triggerContext != null) {
     const eventType = options.triggerContext.eventType
     if (eventType === 'pull_request' || eventType === 'pull_request_review_comment') {
-      parts.push(buildOutputContractSection(context))
+      parts.push(wrapXml('output_contract', buildOutputContractSection(context)))
     }
   }
 
-  parts.push(`## Agent Context
-You are the Fro Bot Agent running in a non-interactive CI environment (GitHub Actions).
-
-### Operating Environment
-- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.
-- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.
-- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.
-- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.
-`)
-
-  // Session management instructions (REQUIRED)
-  parts.push(`### Session Management (REQUIRED)
-Before investigating any issue:
-1. Use \`session_search\` to find relevant prior sessions for this repository
-2. Use \`session_read\` to review prior work if found
-3. Avoid repeating investigation already completed in previous sessions
-
-Before completing:
-1. Ensure your session contains a summary of work done
-2. Include key decisions, findings, and outcomes
-3. This summary will be searchable in future agent runs
-`)
-
-  if (context.issueNumber != null) {
-    parts.push(buildResponseProtocolSection(context, cacheStatus, options.sessionId))
-  }
-
-  const issueNum = context.issueNumber ?? '<number>'
-  const hasResponseProtocol = context.issueNumber != null
-  parts.push(`### GitHub Operations
-The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.${
-    hasResponseProtocol
-      ? ` Post exactly one comment or review per run (see Response Protocol).
-
-\`\`\`bash
-gh pr comment ${issueNum} --body "Your response with Run Summary"
-gh pr review ${issueNum} --approve --body "Your review with Run Summary"
-gh issue comment ${issueNum} --body "Your response with Run Summary"
-gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
-\`\`\``
-      : ''
-  }
-`)
-
-  parts.push(buildConstraintReminderSection())
+  parts.push(wrapXml('agent_context', buildAgentContextSection(context, cacheStatus, options.sessionId)))
 
   const prompt = parts.map(p => p.trim()).join('\n\n')
   logger.debug('Built agent prompt', {
