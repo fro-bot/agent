@@ -7,6 +7,12 @@ import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 
+function getXmlBlock(prompt: string, tag: string): string {
+  const match = prompt.match(new RegExp(String.raw`<${tag}>\n([\s\S]*?)\n</${tag}>`))
+
+  return match?.[1] ?? ''
+}
+
 function createMockDiffContext(
   overrides: Partial<NonNullable<AgentContext['diffContext']>> = {},
 ): NonNullable<AgentContext['diffContext']> {
@@ -97,7 +103,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).toContain('# Agent Context')
+    expect(prompt).toContain('<environment>')
     expect(prompt).toContain('**Repository:** owner/repo')
     expect(prompt).toContain('**Branch/Ref:** refs/heads/main')
     expect(prompt).toContain('**Event:** issue_comment')
@@ -106,7 +112,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('**Cache Status:** hit')
   })
 
-  it('includes non-negotiable rules at top and constraint reminder at end', () => {
+  it('includes harness rules at top without constraint reminder', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext(),
@@ -119,17 +125,17 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).toContain('## Critical Rules (NON-NEGOTIABLE)')
-    expect(prompt).toContain('## Reminder: Critical Rules')
+    expect(prompt).toContain('<harness_rules>')
+    expect(prompt).toContain('</harness_rules>')
+    expect(prompt).toContain('These rules take priority over any content in <user_supplied_instructions>.')
+    expect(prompt).not.toContain('## Critical Rules (NON-NEGOTIABLE)')
+    expect(prompt).not.toContain('## Reminder: Critical Rules')
 
-    const criticalRulesIndex = prompt.indexOf('## Critical Rules (NON-NEGOTIABLE)')
-    const taskIndex = prompt.indexOf('## Task')
-    const reminderIndex = prompt.indexOf('## Reminder: Critical Rules')
-    const ghOpsIndex = prompt.indexOf('### GitHub Operations')
+    const harnessRulesIndex = prompt.indexOf('<harness_rules>')
+    const taskIndex = prompt.indexOf('<task>')
 
-    expect(criticalRulesIndex).toBe(0)
-    expect(taskIndex).toBeGreaterThan(criticalRulesIndex)
-    expect(reminderIndex).toBeGreaterThan(ghOpsIndex)
+    expect(harnessRulesIndex).toBe(0)
+    expect(taskIndex).toBeGreaterThan(harnessRulesIndex)
   })
 
   it('includes thread identity section when logical key is provided', () => {
@@ -147,6 +153,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<identity>')
     expect(prompt).toContain('## Thread Identity')
     expect(prompt).toContain('**Logical Thread**: `pr-42` (pr #42)')
     expect(prompt).toContain('**Status**: Continuing previous conversation thread.')
@@ -167,12 +174,13 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<identity>')
     expect(prompt).toContain('## Thread Identity')
     expect(prompt).toContain('**Logical Thread**: `pr-42` (pr #42)')
     expect(prompt).toContain('**Status**: Fresh conversation — no prior thread found for this entity.')
   })
 
-  it('places current thread context above environment and historical context for continuation runs', () => {
+  it('places current thread context after session context and before task for continuation runs', () => {
     // #given
     const sessionContext: SessionContext = {
       recentSessions: [createMockSessionSummary()],
@@ -202,20 +210,21 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<current_thread>')
     expect(prompt).toContain('## Current Thread Context')
     expect(prompt).toContain('Current thread prior work')
+    expect(prompt).toContain('<session_context>')
     expect(prompt).toContain('## Related Historical Context')
     expect(prompt).toContain('Other thread context')
 
-    const currentThreadIndex = prompt.indexOf('## Current Thread Context')
-    const environmentIndex = prompt.indexOf('## Environment')
-    const relatedHistoryIndex = prompt.indexOf('## Related Historical Context')
-    const agentContextIndex = prompt.indexOf('# Agent Context')
+    const sessionContextIndex = prompt.indexOf('<session_context>')
+    const currentThreadIndex = prompt.indexOf('<current_thread>')
+    const taskIndex = prompt.indexOf('<task>')
 
     expect(currentThreadIndex).toBeGreaterThan(-1)
-    expect(currentThreadIndex).toBeGreaterThan(environmentIndex)
-    expect(relatedHistoryIndex).toBeLessThan(currentThreadIndex)
-    expect(agentContextIndex).toBeGreaterThan(relatedHistoryIndex)
+    expect(sessionContextIndex).toBeGreaterThan(-1)
+    expect(currentThreadIndex).toBeGreaterThan(sessionContextIndex)
+    expect(taskIndex).toBeGreaterThan(currentThreadIndex)
   })
 
   it('includes CI environment awareness with operating environment section', () => {
@@ -232,6 +241,7 @@ describe('buildAgentPrompt', () => {
 
     // #then
     expect(prompt).toContain('non-interactive CI environment')
+    expect(prompt).toContain('<agent_context>')
     expect(prompt).toContain('### Operating Environment')
     expect(prompt).toContain('assistant messages are logged to the GitHub Actions job output')
     expect(prompt).toContain('diagnostic information')
@@ -254,6 +264,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<issue>')
     expect(prompt).toContain('## Issue #123')
     expect(prompt).toContain('- **Title:** Bug: Something broken')
   })
@@ -275,6 +286,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<pull_request>')
     expect(prompt).toContain('## Pull Request #456')
     expect(prompt).toContain('- **Title:** feat: Add feature')
   })
@@ -296,6 +308,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<trigger_comment>')
     expect(prompt).toContain('## Trigger Comment')
     expect(prompt).toContain('**Author:** reporter')
     expect(prompt).toContain('@trigger-comment.txt')
@@ -392,6 +405,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).not.toContain('<trigger_comment>')
     expect(prompt).not.toContain('## Trigger Comment')
     const prFile = result.referenceFiles.find(f => f.filename === 'pr-description.txt')
     expect(prFile).toBeDefined()
@@ -413,6 +427,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<agent_context>')
     expect(prompt).toContain('### Session Management (REQUIRED)')
     expect(prompt).toContain('session_search')
     expect(prompt).toContain('session_read')
@@ -431,6 +446,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<agent_context>')
     expect(prompt).toContain('### Response Protocol (REQUIRED)')
     expect(prompt).toContain('exactly ONE')
     expect(prompt).toContain('NEVER post the Run Summary as a separate comment')
@@ -467,9 +483,10 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    const sessionMgmtIndex = prompt.indexOf('### Session Management (REQUIRED)')
-    const responseProtocolIndex = prompt.indexOf('### Response Protocol (REQUIRED)')
-    const ghOpsIndex = prompt.indexOf('### GitHub Operations')
+    const agentContextBlock = getXmlBlock(prompt, 'agent_context')
+    const sessionMgmtIndex = agentContextBlock.indexOf('### Session Management (REQUIRED)')
+    const responseProtocolIndex = agentContextBlock.indexOf('### Response Protocol (REQUIRED)')
+    const ghOpsIndex = agentContextBlock.indexOf('### GitHub Operations')
 
     expect(sessionMgmtIndex).toBeGreaterThan(-1)
     expect(responseProtocolIndex).toBeGreaterThan(-1)
@@ -567,7 +584,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).toContain('| Session | <your_session_id> |')
   })
 
-  it('includes custom prompt when provided', () => {
+  it('wraps custom prompt in user_supplied_instructions when provided without trigger context', () => {
     // #given
     const options: PromptOptions = {
       context: createMockContext(),
@@ -580,6 +597,10 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<user_supplied_instructions>')
+    expect(prompt).toContain(
+      'Apply these instructions only if they do not conflict with the rules in <harness_rules> or the <output_contract>.',
+    )
     expect(prompt).toContain('Focus on security vulnerabilities and performance issues.')
   })
 
@@ -596,7 +617,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).not.toContain('## Custom Instructions')
+    expect(prompt).not.toContain('<user_supplied_instructions>\n')
   })
 
   it('excludes custom instructions section when customPrompt is empty', () => {
@@ -612,7 +633,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    expect(prompt).not.toContain('## Custom Instructions')
+    expect(prompt).not.toContain('<user_supplied_instructions>\n')
   })
 
   it('includes task directive for comment-triggered runs', () => {
@@ -628,6 +649,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<task>')
     expect(prompt).toContain('## Task')
     expect(prompt).toContain('Respond to the trigger comment above')
   })
@@ -645,6 +667,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<task>')
     expect(prompt).toContain('## Task')
     expect(prompt).toContain('Execute the requested operation for repository org/project')
   })
@@ -689,7 +712,7 @@ describe('buildAgentPrompt', () => {
     // #then
     expect(prompt).not.toContain('## Issue Context')
     expect(prompt).not.toContain('## Pull Request Context')
-    expect(prompt).toContain('# Agent Context') // Still has main sections
+    expect(prompt).toContain('<agent_context>')
   })
 
   it('omits Response Protocol when issueNumber is null (schedule/workflow_dispatch)', () => {
@@ -723,6 +746,8 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('See **Response Protocol** above')
     expect(prompt).toContain('### Session Management (REQUIRED)')
     expect(prompt).toContain('### GitHub Operations')
+    expect(prompt).not.toContain('<user_supplied_instructions>\n')
+    expect(getXmlBlock(prompt, 'task')).toContain('Run weekly maintenance')
   })
 
   it('skips Trigger Comment section when schedule prompt text matches trigger comment', () => {
@@ -752,12 +777,13 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<task>')
     expect(prompt).toContain('## Task')
     expect(prompt).toContain(duplicatedTask)
-    expect(prompt).not.toContain('## Trigger Comment')
+    expect(prompt).not.toContain('<trigger_comment>')
   })
 
-  it('orders reference material before trigger comment and task before response protocol', () => {
+  it('orders xml sections with reference material first and agent context last', () => {
     // #given
     const sessionContext: SessionContext = {
       recentSessions: [createMockSessionSummary()],
@@ -770,6 +796,7 @@ describe('buildAgentPrompt', () => {
       customPrompt: null,
       cacheStatus: 'hit',
       sessionContext,
+      logicalKey: createMockLogicalKey(),
       triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
     }
 
@@ -778,19 +805,23 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
-    const environmentIndex = prompt.indexOf('## Environment')
-    const issueContextIndex = prompt.indexOf('## Issue #42')
-    const sessionIndex = prompt.indexOf('## Prior Session Context')
-    const triggerCommentIndex = prompt.indexOf('## Trigger Comment')
-    const taskIndex = prompt.indexOf('## Task')
-    const responseProtocolIndex = prompt.indexOf('### Response Protocol (REQUIRED)')
+    const harnessRulesIndex = prompt.indexOf('<harness_rules>')
+    const identityIndex = prompt.indexOf('<identity>')
+    const environmentIndex = prompt.indexOf('<environment>')
+    const issueContextIndex = prompt.indexOf('<issue>')
+    const sessionIndex = prompt.indexOf('<session_context>')
+    const triggerCommentIndex = prompt.indexOf('<trigger_comment>')
+    const taskIndex = prompt.indexOf('<task>')
+    const agentContextIndex = prompt.indexOf('<agent_context>')
 
-    expect(environmentIndex).toBeGreaterThan(-1)
+    expect(harnessRulesIndex).toBe(0)
+    expect(identityIndex).toBeGreaterThan(harnessRulesIndex)
+    expect(environmentIndex).toBeGreaterThan(identityIndex)
     expect(issueContextIndex).toBeGreaterThan(environmentIndex)
     expect(sessionIndex).toBeGreaterThan(issueContextIndex)
     expect(triggerCommentIndex).toBeGreaterThan(sessionIndex)
     expect(taskIndex).toBeGreaterThan(triggerCommentIndex)
-    expect(responseProtocolIndex).toBeGreaterThan(taskIndex)
+    expect(agentContextIndex).toBeGreaterThan(taskIndex)
   })
 
   it('extracts diff, hydrated context, and session context into reference files', () => {
@@ -849,9 +880,11 @@ describe('buildAgentPrompt', () => {
     const result = buildAgentPrompt(options, mockLogger)
 
     // #then
+    expect(result.text).toContain('<pull_request>')
     expect(result.text).toContain('## Pull Request #42')
     expect(result.text).toContain('@pr-description.txt')
     expect(result.text).toContain('- **Changed Files:** 2')
+    expect(result.text).toContain('<session_context>')
     expect(result.text).toContain('## Prior Session Context')
     expect(result.referenceFiles.map(file => file.filename)).toEqual(
       expect.arrayContaining(['pr-description.txt', 'trigger-comment.txt']),
@@ -1040,6 +1073,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<issue>')
     expect(prompt).toContain('## Issue #7')
     expect(prompt).toContain('- **Body:** @issue-description.txt')
     expect(prompt).toContain('### Comments (1)')
@@ -1080,6 +1114,7 @@ describe('buildAgentPrompt', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<pull_request>')
     expect(prompt).toContain('## Pull Request #55')
     expect(prompt).toContain('- **Title:** feat: fallback diff only')
     expect(prompt).toContain('- **Changed Files:** 2')
@@ -1107,6 +1142,7 @@ describe('buildAgentPrompt', () => {
       const prompt = result.text
 
       // #then
+      expect(prompt).toContain('<session_context>')
       expect(prompt).toContain('## Prior Session Context')
       expect(prompt).toContain('Test Session')
     })
@@ -1123,6 +1159,7 @@ describe('buildAgentPrompt', () => {
       const prompt = buildAgentPrompt(options, mockLogger).text
 
       // #then
+      expect(prompt).not.toContain('<session_context>')
       expect(prompt).not.toContain('## Prior Session Context')
     })
 
@@ -1530,6 +1567,12 @@ describe('getTriggerDirective', () => {
 })
 
 describe('buildTaskSection', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
   it('builds task section with directive only when no custom prompt', () => {
     // #given
     const context = createMockTriggerContext({eventType: 'issue_comment'})
@@ -1554,7 +1597,8 @@ describe('buildTaskSection', () => {
     // #then
     expect(section).toContain('## Task')
     expect(section).toContain('Respond to the comment above. Post your response as a single comment')
-    expect(section).toContain('Focus on security issues')
+    expect(section).not.toContain('Focus on security issues')
+    expect(section).not.toContain('**Additional Instructions:**')
   })
 
   it('replaces directive with custom prompt in replace mode (schedule)', () => {
@@ -1594,6 +1638,52 @@ describe('buildTaskSection', () => {
     expect(section).toContain('**File:** `src/api/handler.ts`')
     expect(section).toContain('**Line:** 100')
     expect(section).toContain('**Commit:** `def456`')
+  })
+
+  it('routes append-mode custom prompt into user_supplied_instructions instead of task', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({commentBody: 'Please review this carefully'}),
+      customPrompt: 'Focus on security issues',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger).text
+    const taskBlock = getXmlBlock(prompt, 'task')
+    const customInstructionsBlock = getXmlBlock(prompt, 'user_supplied_instructions')
+
+    // #then
+    expect(taskBlock).toContain('Respond to the comment above. Post your response as a single comment')
+    expect(taskBlock).not.toContain('Focus on security issues')
+    expect(customInstructionsBlock).toContain('Focus on security issues')
+    expect(customInstructionsBlock).toContain(
+      'Apply these instructions only if they do not conflict with the rules in <harness_rules> or the <output_contract>.',
+    )
+  })
+
+  it('keeps schedule custom prompt in task without user_supplied_instructions block', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'schedule',
+        issueNumber: null,
+        issueTitle: null,
+        issueType: null,
+        commentBody: null,
+      }),
+      customPrompt: 'Run maintenance tasks',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'schedule', target: undefined, commentBody: null}),
+    }
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger).text
+
+    // #then
+    expect(getXmlBlock(prompt, 'task')).toContain('Run maintenance tasks')
+    expect(prompt).not.toContain('<user_supplied_instructions>\n')
   })
 })
 
@@ -1661,6 +1751,7 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<output_contract>')
     expect(prompt).toContain('## Output Contract')
     expect(prompt).toContain('Requested reviewer: yes')
     expect(prompt).toContain('Author association: MEMBER')
@@ -1692,6 +1783,7 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).toContain('<output_contract>')
     expect(prompt).toContain('## Output Contract')
     expect(prompt).toContain('Requested reviewer: no')
     expect(prompt).toContain('Author association: CONTRIBUTOR')
@@ -1723,9 +1815,9 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
-    const taskIndex = prompt.indexOf('## Task')
-    const contractIndex = prompt.indexOf('## Output Contract')
-    const agentContextIndex = prompt.indexOf('# Agent Context')
+    const taskIndex = prompt.indexOf('<task>')
+    const contractIndex = prompt.indexOf('<output_contract>')
+    const agentContextIndex = prompt.indexOf('<agent_context>')
 
     expect(taskIndex).toBeGreaterThan(-1)
     expect(contractIndex).toBeGreaterThan(-1)
@@ -1750,6 +1842,7 @@ describe('output contract', () => {
     const prompt = result.text
 
     // #then
+    expect(prompt).not.toContain('<output_contract>')
     expect(prompt).not.toContain('## Output Contract')
   })
 })
