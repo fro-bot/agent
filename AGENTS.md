@@ -70,7 +70,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | Event parsing | `src/services/github/context.ts` | `parseGitHubContext()`, `normalizeEvent()` |
 | Event types | `src/services/github/types.ts` | `NormalizedEvent` discriminated union (8 variants) |
 | Agent execution | `src/features/agent/execution.ts` | `executeOpenCode()` logic |
-| Prompt building | `src/features/agent/prompt.ts` | `buildAgentPrompt()`, response protocol sections |
+| Prompt building | `src/features/agent/prompt.ts` | `buildAgentPrompt()`, XML-tagged prompt architecture |
 | Session storage | `src/services/session/` | `storage.ts`, `storage-mappers.ts` |
 | Session search | `src/services/session/search.ts` | `listSessions()`, `searchSessions()` |
 | Event routing | `src/features/triggers/router.ts` | `routeEvent()` orchestration |
@@ -94,7 +94,9 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
 | `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache |
 | `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
-| `buildAgentPrompt` | Function | `src/features/agent/prompt.ts` | Multi-section prompt with directives |
+| `buildAgentPrompt` | Function | `src/features/agent/prompt.ts` | XML-tagged prompt with authority hierarchy |
+| `buildAgentContextSection` | Function | `src/features/agent/prompt.ts` | Consolidated agent operations block |
+| `buildHarnessRulesSection` | Function | `src/features/agent/prompt-thread.ts` | Non-negotiable rules with precedence declaration |
 | `sendPromptToSession` | Function | `src/features/agent/prompt-sender.ts` | Send prompt to SDK session |
 | `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
 | `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
@@ -137,7 +139,7 @@ post.ts → harness/post.ts
 | File                              | Lines | Reason                                                 |
 | --------------------------------- | ----- | ------------------------------------------------------ |
 | `features/triggers/__fixtures__/` | 627   | Factory-style payload generation                       |
-| `features/agent/prompt.ts`        | 512   | Prompt templates, trigger directives                   |
+| `features/agent/prompt.ts`        | 762   | XML-tagged prompt architecture, trigger directives     |
 | `services/session/types.ts`       | 292   | Session/message/part type hierarchy                    |
 | `services/github/api.ts`          | 289   | Reactions, labels, branch discovery                    |
 | `features/context/types.ts`       | 279   | GraphQL context types, budget constraints              |
@@ -194,6 +196,7 @@ pnpm build          # Type check + bundle to dist/ (must stay in sync)
 - **NormalizedEvent**: All webhook payloads pass through `normalizeEvent()` before routing; router never touches raw payloads
 - **Dual action entry points**: `main.ts` (execution) and `post.ts` (durable cache save)
 - **Pre-push hook**: Runs test + lint + build + dist diff check
+- **XML-tagged prompt**: Prompt sections wrapped in XML tags (`<harness_rules>`, `<task>`, `<user_supplied_instructions>`, `<agent_context>`, etc.) with explicit authority hierarchy and Anthropic-recommended section ordering (reference data first, task/instructions last)
 
 ## EXTERNAL RESOURCES
 
