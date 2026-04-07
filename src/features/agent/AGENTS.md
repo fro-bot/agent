@@ -27,7 +27,7 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 - `getTriggerDirective(context, promptInput)`: Per-event directive selection
 - `buildResponseProtocolSection(...)`: CI output rules (single comment, Run Summary)
 - `buildOutputContractSection(context)`: PR review action guidance
-- `buildDiffContextSection(diffContext)`: PR diff summary injection
+- Diff summary is merged inline into `buildHydratedContextSection()` PR metadata
 - `buildSessionContextSection(sessionContext)`: Prior work metadata injection
 - `acknowledgeReceipt(client, ctx, logger)`: Posts 👀 reaction and "working" label
 - `completeAcknowledgment(client, ctx, success, logger)`: Finalizes UX state on completion
