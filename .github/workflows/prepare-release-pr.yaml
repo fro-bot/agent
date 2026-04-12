@@ -46,6 +46,19 @@ jobs:
             echo 'has-open-pr=false' >> "$GITHUB_OUTPUT"
           fi
 
+      - id: git-user
+        name: Get GitHub App User ID and Setup Git user
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        run: |
+          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          user_id=$(gh api "/users/${name}" --jq .id)
+          email="${user_id}+${name}@users.noreply.github.com"
+          echo "user-email=${email}" >> "$GITHUB_OUTPUT"
+          echo "user-name=${name}" >> "$GITHUB_OUTPUT"
+          git config --global user.email "${email}"
+          git config --global user.name "${name}"
+
       - name: Checkout `release` branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
