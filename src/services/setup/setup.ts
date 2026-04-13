@@ -111,6 +111,11 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       })
     }
 
+    // Disable oMo telemetry before any oMo code runs (including the installer).
+    // Both variables are checked independently in oMo's PostHog client.
+    core.exportVariable('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
+    core.exportVariable('OMO_DISABLE_POSTHOG', '1')
+
     // Run oMo installer to ensure config values (e.g. provider settings) are current.
     // Skip if Bun install failed — bunx won't be available.
     if (bunInstalled) {
