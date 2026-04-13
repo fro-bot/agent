@@ -1,0 +1,25 @@
+{
+  "colorGroups": [
+    {
+      "query": "[type:architecture]",
+      "color": {
+        "a": 1,
+        "rgb": 4468453
+      }
+    },
+    {
+      "query": "[type:subsystem]",
+      "color": {
+        "a": 1,
+        "rgb": 14684176
+      }
+    },
+    {
+      "query": "[type:convention]",
+      "color": {
+        "a": 1,
+        "rgb": 16185856
+      }
+    }
+  ]
+}

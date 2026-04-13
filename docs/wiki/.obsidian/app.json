@@ -1,0 +1,7 @@
+{
+  "useMarkdownLinks": false,
+  "showFrontmatter": true,
+  "readableLineLength": true,
+  "strictLineBreaks": true,
+  "attachmentFolderPath": "attachments"
+}
