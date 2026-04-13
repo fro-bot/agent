@@ -260,6 +260,23 @@ describe('setup', () => {
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
     })
 
+    it('disables oMo telemetry via environment variables', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+
+      // #when
+      await runSetup(createSetupInputs(), 'ghs_test_token')
+
+      // #then
+      expect(core.exportVariable).toHaveBeenCalledWith('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
+      expect(core.exportVariable).toHaveBeenCalledWith('OMO_DISABLE_POSTHOG', '1')
+    })
+
     it('exports OPENCODE_CONFIG_CONTENT environment variable', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
