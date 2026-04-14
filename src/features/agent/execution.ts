@@ -16,7 +16,7 @@ import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {MAX_LLM_RETRIES, RETRY_DELAY_MS} from './retry.js'
+import {MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
 
 export async function executeOpenCode(
   promptOptions: PromptOptions,
@@ -117,7 +117,8 @@ export async function executeOpenCode(
           commentsPosted: final.commentsPosted,
           llmError: lastLlmError,
         }
-      if (timeoutMs > 0 && timeoutMs - (Date.now() - startTime) <= RETRY_DELAY_MS && attempt > 1) break
+      const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
+      if (timeoutMs > 0 && timeoutMs - (Date.now() - startTime) <= retryDelay && attempt > 1) break
 
       const prompt = attempt === 1 ? initialPrompt : CONTINUATION_PROMPT
       const files = allFileParts.length > 0 ? allFileParts : undefined
@@ -155,10 +156,10 @@ export async function executeOpenCode(
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
         error: result.error,
-        delayMs: RETRY_DELAY_MS,
+        delayMs: retryDelay,
         sessionId,
       })
-      await sleep(RETRY_DELAY_MS)
+      await sleep(retryDelay)
     }
 
     return {
