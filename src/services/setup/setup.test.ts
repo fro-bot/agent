@@ -542,6 +542,7 @@ describe('setup', () => {
         expect(callArgs).toBeDefined()
         expect(callArgs?.toolCachePath).toContain('opencode')
         expect(callArgs?.omoConfigPath).toContain('opencode')
+        expect(callArgs?.opencodeCachePath).toContain('opencode')
         expect(callArgs?.systematicVersion).toBe('2.1.0')
       })
 
