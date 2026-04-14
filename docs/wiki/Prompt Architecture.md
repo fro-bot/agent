@@ -14,8 +14,6 @@ sources:
 summary: "How the multi-section XML-tagged prompt is assembled and why each section exists"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Prompt Architecture
 
 The prompt sent to the AI agent is the most complex artifact Fro Bot constructs. It is a multi-section XML-tagged document assembled conditionally based on the trigger event, available context, and session history. The assembly logic lives in `src/features/agent/prompt.ts` (762 lines — one of the project's complexity hotspots).

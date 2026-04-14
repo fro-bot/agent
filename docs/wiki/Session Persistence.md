@@ -20,8 +20,6 @@ sources:
 summary: "How agent memory survives across CI runs via cache, SDK sessions, and pruning"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Session Persistence
 
 The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI agents that start fresh every run, Fro Bot preserves its session history across workflow invocations. This means the agent can reference prior investigations, avoid repeating work, and build institutional knowledge of a codebase over time.
