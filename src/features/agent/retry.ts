@@ -5,8 +5,8 @@ import type {ActivityTracker, EventStreamResult} from './streaming.js'
 import {pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
 import {processEventStream} from './streaming.js'
 
-export const MAX_LLM_RETRIES = 3
-export const RETRY_DELAY_MS = 5000
+export const MAX_LLM_RETRIES = 4
+export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
 export async function runPromptAttempt(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],

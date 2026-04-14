@@ -898,14 +898,14 @@ describe('executeOpenCode retry behavior', () => {
 
     // #when
     const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
-    for (let i = 0; i < 3; i++) {
-      await vi.advanceTimersByTimeAsync(5000)
+    for (const delay of [5_000, 15_000, 30_000, 60_000]) {
+      await vi.advanceTimersByTimeAsync(delay)
       await vi.advanceTimersByTimeAsync(2000)
     }
     const result = await resultPromise
 
     // #then
-    expect(promptCallCount).toBe(3)
+    expect(promptCallCount).toBe(4)
     expect(result.success).toBe(false)
     expect(result.llmError).not.toBeNull()
     expect(mockLogger.warning).toHaveBeenCalledWith(
