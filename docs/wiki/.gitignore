@@ -5,3 +5,6 @@
 .obsidian/core-plugins*.json
 .obsidian/bookmarks.json
 .obsidian/backlink.json
+
+# Obsidian community plugin binaries (installed locally per user)
+.obsidian/plugins/

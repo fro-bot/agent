@@ -12,8 +12,6 @@ sources:
 summary: "Four-layer architecture, dependency rules, and high-level module map"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Architecture Overview
 
 Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode + oMo) inside GitHub Actions workflows and preserves the agent's session state across runs. The codebase is TypeScript, ESM-only, targeting Node 24.

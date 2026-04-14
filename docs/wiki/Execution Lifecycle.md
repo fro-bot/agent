@@ -22,8 +22,6 @@ sources:
 summary: "Phase-by-phase walkthrough of a single action run from trigger to cache save"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Execution Lifecycle
 
 Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/run.ts`. Each phase is a standalone module under `src/harness/phases/` — a deliberate design that keeps the orchestrator thin and each phase independently testable.

@@ -18,8 +18,6 @@ sources:
 summary: "Tool installation, configuration assembly, credential management, and cache strategy"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Setup and Configuration
 
 The setup module (`src/services/setup/`) bootstraps the CI environment before agent execution can begin. It installs runtime dependencies, configures authentication, assembles the OpenCode configuration, and manages a tools cache to speed up subsequent runs.

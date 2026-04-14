@@ -13,8 +13,6 @@ sources:
 summary: "Coding conventions, architectural patterns, and anti-patterns enforced across the project"
 ---
 
-<!-- eslint-disable markdown/no-missing-label-refs -->
-
 # Conventions and Patterns
 
 This page documents the recurring patterns and conventions in the Fro Bot Agent codebase. Understanding these is essential for contributors — the project enforces them strictly, and deviations will fail CI.
