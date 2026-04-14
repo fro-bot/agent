@@ -11,12 +11,21 @@ on:
   issues:
     types: [opened, edited]
   schedule:
-    - cron: '30 15 * * *'
+    - cron: '30 15 * * *' # Daily DMR
+    - cron: '0 20 * * 0' # Weekly wiki update (must match PROMPT expression below)
   workflow_dispatch:
     inputs:
       prompt:
-        description: Custom prompt for the Fro Bot agent
-        required: true
+        description: Custom prompt for the Fro Bot agent (takes precedence over use-schedule-prompt and use-wiki-prompt)
+        required: false
+      use-schedule-prompt:
+        description: Run with the built-in Daily Maintenance Report prompt
+        type: boolean
+        default: false
+      use-wiki-prompt:
+        description: Run with the built-in Wiki update prompt
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -61,6 +70,72 @@ env:
 
     Do NOT comment on or modify individual issues/PRs. Do NOT apply labels.
     Do NOT open PRs. This run must update ONE issue only.
+
+  WIKI_PROMPT: |
+    You are maintaining a project wiki as an Obsidian vault in `docs/wiki/`.
+    This wiki provides human-readable documentation for the fro-bot/agent project.
+
+    == BRANCH WORKFLOW ==
+    1. Check for an existing open wiki PR: `gh pr list --head fro-bot/wiki-update --state open --json number --jq '.[0].number // empty'`
+    2. If branch `fro-bot/wiki-update` exists but has NO open PR, delete it: `git push origin --delete fro-bot/wiki-update || true`
+    3. Create or checkout branch `fro-bot/wiki-update` from `main`
+    4. After all changes, commit with message: `docs(wiki): update project wiki`
+    5. Push branch and create or update PR targeting `main`
+    6. Enable auto-merge: `gh pr merge <number> --auto --squash`
+       If auto-merge fails, leave the PR open and note the failure in the PR body.
+
+    == LINT PASS (run before writing) ==
+    Check existing `docs/wiki/` pages for:
+    - Broken wikilinks: verify each `[[Page Name]]` reference has a corresponding `Page Name.md` file
+    - Orphan pages: verify each page (except index.md) has at least one inbound `[[wikilink]]` from another page
+    - Stale pages: compare each page's `sources` frontmatter list against `git log` — if any listed source file changed since the page's `last-updated` date, mark it for update
+    Fix any issues found inline during the update pass.
+
+    == UPDATE STRATEGY ==
+    Run `git log --oneline` to find commits since the last wiki update commit (look for `docs(wiki):` prefix).
+    Identify which wiki pages' `sources` files were touched by those commits.
+    Update ONLY those pages. Do not regenerate unchanged pages.
+
+    If NO wiki pages exist yet (seed run), generate ALL canonical pages:
+    - Architecture Overview (type: architecture)
+    - Execution Lifecycle (type: architecture)
+    - Session Persistence (type: subsystem)
+    - Prompt Architecture (type: subsystem)
+    - Setup and Configuration (type: subsystem)
+    - Conventions and Patterns (type: convention)
+
+    == PAGE SCHEMA ==
+    Every wiki page MUST have this YAML frontmatter:
+    ```yaml
+    ---
+    type: architecture | subsystem | convention
+    last-updated: "YYYY-MM-DD"
+    updated-by: "<commit SHA or session ID>"
+    sources:
+      - src/path/to/relevant/file.ts
+      - RFCs/RFC-NNN-Name.md
+    summary: "One-line description of what this page covers"
+    ---
+    ```
+
+    == CONTENT GUIDANCE ==
+    - Write for human developers, not agents. Clear prose, not bullet dumps.
+    - DESCRIPTIVE (how the system works, why decisions were made), NOT prescriptive (what to do).
+    - Use Obsidian wikilinks `[[Page Name]]` to cross-reference other wiki pages.
+    - Cite source files by path. Reference RFCs by number.
+    - Do NOT copy source code verbatim. Describe architecture and data flow.
+    - Do NOT duplicate AGENTS.md prescriptive content.
+
+    == INDEX UPDATE ==
+    After page changes, update `docs/wiki/index.md`:
+    - List each page with standard markdown links for GitHub: `[Page Name](Page%20Name.md)`
+    - Include the page's `type` and `summary` from frontmatter
+    - Organize by topic area
+
+    == CONSTRAINTS ==
+    - Do NOT modify AGENTS.md or any source code files.
+    - Do NOT create issues or post comments.
+    - This run must ONLY update files in `docs/wiki/` and create ONE PR.
 
 jobs:
   fro-bot:
@@ -113,7 +188,10 @@ jobs:
           OPENCODE_PROMPT_ARTIFACT: 'true'
           PROMPT: >-
             ${{
-              (github.event_name == 'workflow_dispatch' && (github.event.inputs.prompt || ''))
+              (github.event_name == 'workflow_dispatch' && github.event.inputs.prompt != '' && github.event.inputs.prompt)
+              || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && env.WIKI_PROMPT)
+              || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-schedule-prompt == 'true' && env.SCHEDULE_PROMPT)
+              || (github.event_name == 'schedule' && github.event.schedule == '0 20 * * 0' && env.WIKI_PROMPT)
               || (github.event_name == 'schedule' && env.SCHEDULE_PROMPT)
               || ''
             }}
