@@ -12,11 +12,26 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 ## Pages
 
-_Pages are generated and maintained by Fro Bot during weekly scheduled runs. This section will be populated after the first wiki seed run._
+### Architecture
 
-| Page | Type | Summary            |
-| ---- | ---- | ------------------ |
-| —    | —    | _Seed run pending_ |
+| Page | Type | Summary |
+| --- | --- | --- |
+| [Architecture Overview](Architecture%20Overview.md) | architecture | Four-layer architecture, dependency rules, and high-level module map |
+| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run from trigger to cache save |
+
+### Subsystems
+
+| Page | Type | Summary |
+| --- | --- | --- |
+| [Session Persistence](Session%20Persistence.md) | subsystem | How agent memory survives across CI runs via cache, SDK sessions, and pruning |
+| [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
+| [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, and cache strategy |
+
+### Conventions
+
+| Page | Type | Summary |
+| --- | --- | --- |
+| [Conventions and Patterns](Conventions%20and%20Patterns.md) | convention | Coding conventions, architectural patterns, and anti-patterns enforced across the project |
 
 ## About This Wiki
 
