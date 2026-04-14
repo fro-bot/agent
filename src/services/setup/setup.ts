@@ -59,6 +59,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const toolCachePath = join(runnerToolCache, 'opencode')
     const bunCachePath = join(runnerToolCache, 'bun')
     const omoConfigPath = join(homedir(), '.config', 'opencode')
+    const opencodeCachePath = join(homedir(), '.cache', 'opencode')
     const runnerOS = getRunnerOS()
 
     const toolsCacheResult = await restoreToolsCache({
@@ -70,6 +71,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       toolCachePath,
       bunCachePath,
       omoConfigPath,
+      opencodeCachePath,
     })
 
     const toolsCacheStatus: 'hit' | 'miss' = toolsCacheResult.hit ? 'hit' : 'miss'
@@ -223,6 +225,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         toolCachePath,
         bunCachePath,
         omoConfigPath,
+        opencodeCachePath,
       })
     }
 
