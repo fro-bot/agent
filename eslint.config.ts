@@ -8,6 +8,7 @@ export default defineConfig(
       '.ai/',
       '.github/copilot-*.md',
       '**/AGENTS.md',
+      '**/.obsidian/',
       'FEATURES.md',
       'PRD.md',
       'RFCs/',
@@ -21,6 +22,13 @@ export default defineConfig(
       tsconfigPath: './tsconfig.json',
     },
     vitest: true,
+  },
+  {
+    name: 'wiki markdown overrides',
+    files: ['docs/wiki/**/*.md'],
+    rules: {
+      'markdown/no-missing-label-refs': 'off',
+    },
   },
   {
     name: 'vitest overrides',
