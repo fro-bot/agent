@@ -31,6 +31,8 @@ export async function run(): Promise<number> {
   let attachmentResult: AttachmentResult | null = null
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
+  let repo = ''
+  let runId = ''
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -53,7 +55,8 @@ export async function run(): Promise<number> {
     if (routing == null) return 0
     githubClient = routing.githubClient
 
-    const repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
+    repo = `${routing.triggerResult.context.repo.owner}/${routing.triggerResult.context.repo.repo}`
+    runId = routing.agentContext.runId
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
     if (!dedup.shouldProceed) return 0
 
@@ -107,6 +110,10 @@ export async function run(): Promise<number> {
       serverHandle,
       detectedOpencodeVersion,
       storeConfig,
+      metrics,
+      agentIdentity: 'github',
+      repo,
+      runId,
     })
   }
 

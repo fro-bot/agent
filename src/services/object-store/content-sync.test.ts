@@ -5,7 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {err, ok} from '../../shared/types.js'
-import {syncSessionsFromStore, syncSessionsToStore} from './index.js'
+import {syncArtifactsToStore, syncMetadataToStore, syncSessionsFromStore, syncSessionsToStore} from './index.js'
 
 function createLogger(): Logger {
   return {
@@ -99,6 +99,129 @@ describe('content sync', () => {
       'Failed to upload session database file to object store',
       expect.any(Object),
     )
+  })
+
+  it('uploads all files in log directory under artifacts run prefix', async () => {
+    const logPath = path.join(tempDir, 'logs')
+    await fs.mkdir(path.join(logPath, 'nested'), {recursive: true})
+    await fs.writeFile(path.join(logPath, 'prompt-main.txt'), 'prompt')
+    await fs.writeFile(path.join(logPath, 'pr-description.txt'), 'pr')
+    await fs.writeFile(path.join(logPath, 'nested', 'issue-description.txt'), 'issue')
+
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+    const adapter = createAdapter({upload})
+
+    const result = await syncArtifactsToStore(
+      adapter,
+      config,
+      'github',
+      'owner/repo',
+      'run-123',
+      logPath,
+      createLogger(),
+    )
+
+    expect(result).toEqual({uploaded: 3, failed: 0})
+    expect(upload).toHaveBeenCalledTimes(3)
+    expect(upload.mock.calls).toEqual([
+      [
+        'fro-bot-state/github/owner-repo/artifacts/run-123/nested/issue-description.txt',
+        path.join(logPath, 'nested', 'issue-description.txt'),
+      ],
+      [
+        'fro-bot-state/github/owner-repo/artifacts/run-123/pr-description.txt',
+        path.join(logPath, 'pr-description.txt'),
+      ],
+      ['fro-bot-state/github/owner-repo/artifacts/run-123/prompt-main.txt', path.join(logPath, 'prompt-main.txt')],
+    ])
+  })
+
+  it('returns zero counts when log path does not exist', async () => {
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+    const adapter = createAdapter({upload})
+
+    const result = await syncArtifactsToStore(
+      adapter,
+      config,
+      'github',
+      'owner/repo',
+      'run-123',
+      path.join(tempDir, 'missing-logs'),
+      createLogger(),
+    )
+
+    expect(result).toEqual({uploaded: 0, failed: 0})
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  it('continues artifact uploads when one upload fails', async () => {
+    const logPath = path.join(tempDir, 'logs')
+    await fs.mkdir(logPath, {recursive: true})
+    await fs.writeFile(path.join(logPath, 'prompt-main.txt'), 'prompt')
+    await fs.writeFile(path.join(logPath, 'issue-description.txt'), 'issue')
+
+    const logger = createLogger()
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async (key: string) => {
+      if (key.endsWith('prompt-main.txt')) {
+        return err(new Error('upload failed'))
+      }
+      return ok(undefined)
+    })
+    const adapter = createAdapter({upload})
+
+    const result = await syncArtifactsToStore(adapter, config, 'github', 'owner/repo', 'run-123', logPath, logger)
+
+    expect(result).toEqual({uploaded: 1, failed: 1})
+    expect(logger.warning).toHaveBeenCalledWith('Failed to upload artifact file to object store', expect.any(Object))
+  })
+
+  it('serializes metadata and uploads it under metadata run key', async () => {
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async (_key: string, localPath: string) => {
+      const payload: unknown = JSON.parse(await fs.readFile(localPath, 'utf8'))
+      expect(payload).toEqual({runId: 'run-123', cacheStatus: 'hit'})
+      return ok(undefined)
+    })
+    const adapter = createAdapter({upload})
+
+    const result = await syncMetadataToStore(
+      adapter,
+      config,
+      'github',
+      'owner/repo',
+      'run-123',
+      {runId: 'run-123', cacheStatus: 'hit'},
+      createLogger(),
+    )
+
+    expect(result).toEqual({success: true})
+    expect(upload).toHaveBeenCalledTimes(1)
+    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner-repo/metadata/run-123.json')
+  })
+
+  it('cleans up metadata temp file after upload', async () => {
+    let tempFilePath = ''
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async (_key: string, localPath: string) => {
+      tempFilePath = localPath
+      await expect(fs.access(localPath)).resolves.toBeUndefined()
+      return ok(undefined)
+    })
+    const adapter = createAdapter({upload})
+
+    await syncMetadataToStore(adapter, config, 'github', 'owner/repo', 'run-123', {ok: true}, createLogger())
+
+    await expect(fs.access(tempFilePath)).rejects.toThrow()
+  })
+
+  it('returns success false when metadata upload fails', async () => {
+    const logger = createLogger()
+    const adapter = createAdapter({
+      upload: async () => err(new Error('upload failed')),
+    })
+
+    const result = await syncMetadataToStore(adapter, config, 'github', 'owner/repo', 'run-123', {ok: true}, logger)
+
+    expect(result).toEqual({success: false})
+    expect(logger.warning).toHaveBeenCalledWith('Failed to upload run metadata to object store', expect.any(Object))
   })
 
   it('downloads all keys returned by list', async () => {

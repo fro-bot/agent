@@ -3,7 +3,9 @@ import type {Logger} from '../shared/logger.js'
 import * as core from '@actions/core'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
+import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '../services/object-store/index.js'
 import {
+  getGitHubRepository,
   getGitHubRunAttempt,
   getGitHubRunId,
   getOpenCodeAuthPath,
@@ -78,6 +80,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   if (cacheSaved === 'true') {
     logger.info('Skipping post-action: cache already saved by main action', {cacheSaved})
   } else {
+    const runId = String(getGitHubRunId())
     try {
       const components = buildCacheKeyComponents()
       const cacheSaveOptions = {
@@ -101,6 +104,34 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
       logger.warning('Post-action cache save failed (non-fatal)', {
         error: toErrorMessage(error),
       })
+    }
+
+    if (storeConfig?.enabled === true) {
+      try {
+        const objectStoreLogger = createLogger({phase: 'post-object-store'})
+        const adapter = createS3Adapter(storeConfig, objectStoreLogger)
+        const repo = getGitHubRepository()
+        const runAttempt = getGitHubRunAttempt()
+        await syncMetadataToStore(
+          adapter,
+          storeConfig,
+          'github',
+          repo,
+          runId,
+          {
+            runId,
+            timestamp: new Date().toISOString(),
+            cleanupSkipped: true,
+            runAttempt,
+          },
+          objectStoreLogger,
+        )
+        await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, getOpenCodeLogPath(), objectStoreLogger)
+      } catch (error) {
+        logger.warning('Post-action object store sync failed (non-fatal)', {
+          error: toErrorMessage(error),
+        })
+      }
     }
   }
 

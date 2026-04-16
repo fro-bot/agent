@@ -1,15 +1,18 @@
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
+import type {MetricsCollector} from '../../features/observability/metrics.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {ObjectStoreConfig} from '../../services/object-store/index.js'
 import type {Logger} from '../../shared/logger.js'
+import type {AgentIdentity} from '../../shared/types.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
+import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '../../services/object-store/index.js'
 import {DEFAULT_PRUNING_CONFIG, pruneSessions} from '../../services/session/index.js'
 import {
   getGitHubRunAttempt,
@@ -33,6 +36,10 @@ export interface CleanupPhaseOptions {
   readonly serverHandle: OpenCodeServerHandle | null
   readonly detectedOpencodeVersion: string | null
   readonly storeConfig: ObjectStoreConfig
+  readonly metrics: MetricsCollector
+  readonly agentIdentity: AgentIdentity
+  readonly repo: string
+  readonly runId: string
 }
 
 export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
@@ -45,6 +52,10 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     serverHandle,
     detectedOpencodeVersion,
     storeConfig,
+    metrics,
+    agentIdentity,
+    repo,
+    runId,
   } = options
 
   try {
@@ -87,6 +98,52 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       } catch (shutdownError) {
         bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
           error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+        })
+      }
+    }
+
+    if (storeConfig.enabled === true) {
+      try {
+        const objectStoreLogger = createLogger({phase: 'object-store-artifacts'})
+        const adapter = createS3Adapter(storeConfig, objectStoreLogger)
+        const logPath = getOpenCodeLogPath()
+        const artifactResult = await syncArtifactsToStore(
+          adapter,
+          storeConfig,
+          agentIdentity,
+          repo,
+          runId,
+          logPath,
+          objectStoreLogger,
+        )
+        const snapshot = metrics.getMetrics()
+        const sessionIds = [...new Set([...snapshot.sessionsUsed, ...snapshot.sessionsCreated])]
+        const metadata = {
+          runId,
+          timestamp: new Date().toISOString(),
+          tokenUsage: snapshot.tokenUsage,
+          timing: {
+            startTime: snapshot.startTime,
+            endTime: snapshot.endTime,
+            duration: snapshot.duration,
+          },
+          cacheStatus: snapshot.cacheStatus,
+          cacheSource: snapshot.cacheSource,
+          sessionIds,
+          sessionsUsed: snapshot.sessionsUsed,
+          sessionsCreated: snapshot.sessionsCreated,
+          prsCreated: snapshot.prsCreated,
+          commitsCreated: snapshot.commitsCreated,
+          commentsPosted: snapshot.commentsPosted,
+          model: snapshot.model,
+          cost: snapshot.cost,
+          errors: snapshot.errors,
+          artifactUpload: artifactResult,
+        }
+        await syncMetadataToStore(adapter, storeConfig, agentIdentity, repo, runId, metadata, objectStoreLogger)
+      } catch (error) {
+        bootstrapLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
+          error: error instanceof Error ? error.message : String(error),
         })
       }
     }

@@ -1,5 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../shared/test-helpers.js'
+import {ok} from '../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
@@ -19,6 +20,16 @@ vi.mock('../services/cache/index.js', async importOriginal => {
 vi.mock('../services/artifact/index.js', () => ({
   uploadLogArtifact: vi.fn(),
 }))
+
+vi.mock('../services/object-store/index.js', async importOriginal => {
+  const original = await importOriginal<typeof import('../services/object-store/index.js')>()
+  return {
+    ...original,
+    createS3Adapter: vi.fn(),
+    syncArtifactsToStore: vi.fn(async () => ({uploaded: 0, failed: 0})),
+    syncMetadataToStore: vi.fn(async () => ({success: true})),
+  }
+})
 
 describe('post action', () => {
   beforeEach(() => {
@@ -231,7 +242,6 @@ describe('post action', () => {
     })
 
     it('should upload artifact when OPENCODE_PROMPT_ARTIFACT is enabled and not yet uploaded', async () => {
-      // #given artifact upload is enabled and not yet done
       process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
@@ -247,15 +257,12 @@ describe('post action', () => {
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
 
-      // #when runPost executes
       await runPost({logger})
 
-      // #then artifact upload is called
       expect(uploadLogArtifact).toHaveBeenCalledWith(expect.objectContaining({runId: 12345, runAttempt: 1}))
     })
 
     it('should skip artifact upload when already uploaded by main action', async () => {
-      // #given artifact was already uploaded
       process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
@@ -270,15 +277,12 @@ describe('post action', () => {
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
 
-      // #when runPost executes
       await runPost({logger})
 
-      // #then artifact upload is not called
       expect(uploadLogArtifact).not.toHaveBeenCalled()
     })
 
     it('should skip artifact upload when OPENCODE_PROMPT_ARTIFACT is not set', async () => {
-      // #given artifact upload is disabled
       delete process.env.OPENCODE_PROMPT_ARTIFACT
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
@@ -292,15 +296,12 @@ describe('post action', () => {
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
 
-      // #when runPost executes
       await runPost({logger})
 
-      // #then artifact upload is not called
       expect(uploadLogArtifact).not.toHaveBeenCalled()
     })
 
     it('should not fail when artifact upload throws in post action', async () => {
-      // #given artifact upload throws
       process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {
@@ -316,13 +317,57 @@ describe('post action', () => {
       const {runPost} = await import('./post.js')
       const logger = createMockLogger()
 
-      // #when runPost executes
       await expect(runPost({logger})).resolves.not.toThrow()
 
-      // #then it logs a warning but doesn't fail
       expect(logger.warning).toHaveBeenCalledWith(
         'Post-action artifact upload failed (non-fatal)',
         expect.objectContaining({error: 'Network timeout'}),
+      )
+    })
+
+    it('uploads minimal metadata when cleanup was skipped and storeConfig exists', async () => {
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'false'
+        if (key === 'storeConfig.enabled') return 'true'
+        if (key === 'storeConfig.bucket') return 'test-bucket'
+        if (key === 'storeConfig.region') return 'us-east-1'
+        if (key === 'storeConfig.prefix') return 'fro-bot-state'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
+      const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} =
+        await import('../services/object-store/index.js')
+      vi.mocked(createS3Adapter).mockReturnValue({
+        upload: async () => ok(undefined),
+        download: async () => ok(undefined),
+        list: async () => ok([]),
+      })
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      expect(syncMetadataToStore).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({enabled: true}),
+        'github',
+        'test-owner/test-repo',
+        '12345',
+        expect.objectContaining({runId: '12345', cleanupSkipped: true, runAttempt: 1}),
+        expect.any(Object),
+      )
+      expect(syncArtifactsToStore).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({enabled: true}),
+        'github',
+        'test-owner/test-repo',
+        '12345',
+        expect.any(String),
+        expect.any(Object),
       )
     })
   })

@@ -1,6 +1,8 @@
 import type {Logger} from '../../shared/logger.js'
 import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
+import {randomUUID} from 'node:crypto'
 import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildObjectStoreKey} from './key-builder.js'
@@ -20,6 +22,29 @@ function getSessionDbPath(sessionStoragePath: string, fileName: (typeof SESSION_
 function buildSessionsPrefix(config: ObjectStoreConfig, identity: string, repo: string): string | null {
   const result = buildObjectStoreKey(config, identity, repo, 'sessions')
   return result.success ? result.data : null
+}
+
+async function listFilesRecursively(rootPath: string): Promise<string[]> {
+  const entries = await fs.readdir(rootPath, {withFileTypes: true})
+  const files = await Promise.all(
+    entries.map(async entry => {
+      const entryPath = path.join(rootPath, entry.name)
+      if (entry.isDirectory()) {
+        return listFilesRecursively(entryPath)
+      }
+      if (entry.isFile()) {
+        return [entryPath]
+      }
+      return []
+    }),
+  )
+
+  return files.flat().sort((left, right) => left.localeCompare(right))
+}
+
+function toArtifactKey(prefix: string, runId: string, relativePath: string): string {
+  const normalizedRelativePath = relativePath.split(path.sep).join('/')
+  return `${prefix}${runId}/${normalizedRelativePath}`
 }
 
 export async function syncSessionsToStore(
@@ -128,4 +153,98 @@ export async function syncSessionsFromStore(
   }
 
   return {downloaded, failed, mainDbRestored}
+}
+
+export async function syncArtifactsToStore(
+  adapter: ObjectStoreAdapter,
+  config: ObjectStoreConfig,
+  identity: string,
+  repo: string,
+  runId: string,
+  logPath: string,
+  logger: Logger,
+): Promise<{uploaded: number; failed: number}> {
+  try {
+    await fs.access(logPath)
+  } catch {
+    return {uploaded: 0, failed: 0}
+  }
+
+  let uploaded = 0
+  let failed = 0
+  const files = await listFilesRecursively(logPath)
+  const prefixResult = buildObjectStoreKey(config, identity, repo, 'artifacts')
+
+  if (prefixResult.success === false) {
+    logger.warning('Failed to build object store artifact prefix for upload', {
+      runId,
+      error: toErrorMessage(prefixResult.error),
+    })
+    return {uploaded: 0, failed: 0}
+  }
+
+  for (const filePath of files) {
+    const relativePath = path.relative(logPath, filePath)
+    const key = toArtifactKey(prefixResult.data, runId, relativePath)
+
+    const uploadResult = await adapter.upload(key, filePath)
+    if (uploadResult.success) {
+      uploaded++
+      continue
+    }
+
+    failed++
+    logger.warning('Failed to upload artifact file to object store', {
+      key,
+      filePath,
+      error: toErrorMessage(uploadResult.error),
+    })
+  }
+
+  return {uploaded, failed}
+}
+
+export async function syncMetadataToStore(
+  adapter: ObjectStoreAdapter,
+  config: ObjectStoreConfig,
+  identity: string,
+  repo: string,
+  runId: string,
+  metadata: unknown,
+  logger: Logger,
+): Promise<{success: boolean}> {
+  const keyResult = buildObjectStoreKey(config, identity, repo, 'metadata', `${runId}.json`)
+  if (keyResult.success === false) {
+    logger.warning('Failed to build object store metadata key for upload', {
+      runId,
+      error: toErrorMessage(keyResult.error),
+    })
+    return {success: false}
+  }
+
+  const tempFilePath = path.join(os.tmpdir(), `fro-bot-metadata-${runId}-${randomUUID()}.json`)
+
+  try {
+    await fs.writeFile(tempFilePath, JSON.stringify(metadata, null, 2), 'utf8')
+    const uploadResult = await adapter.upload(keyResult.data, tempFilePath)
+    if (uploadResult.success === false) {
+      logger.warning('Failed to upload run metadata to object store', {
+        key: keyResult.data,
+        runId,
+        error: toErrorMessage(uploadResult.error),
+      })
+      return {success: false}
+    }
+
+    return {success: true}
+  } catch (error) {
+    logger.warning('Failed to upload run metadata to object store', {
+      key: keyResult.data,
+      runId,
+      error: toErrorMessage(error),
+    })
+    return {success: false}
+  } finally {
+    await fs.rm(tempFilePath, {force: true})
+  }
 }
