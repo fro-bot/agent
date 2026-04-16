@@ -1,18 +1,8 @@
 import type {Result} from '../../shared/types.js'
 
-export type ContentType = 'artifacts' | 'attachments' | 'metadata' | 'sessions'
+export type {ObjectStoreConfig} from '../../shared/types.js'
 
-export interface ObjectStoreConfig {
-  readonly enabled: boolean
-  readonly bucket: string
-  readonly region: string
-  readonly prefix: string
-  readonly endpoint?: string
-  readonly expectedBucketOwner?: string
-  readonly allowInsecureEndpoint?: boolean
-  readonly sseEncryption?: 'aws:kms' | 'AES256'
-  readonly sseKmsKeyId?: string
-}
+export type ContentType = 'artifacts' | 'attachments' | 'metadata' | 'sessions'
 
 export interface ObjectStoreAdapter {
   readonly upload: (key: string, localPath: string) => Promise<Result<void, Error>>

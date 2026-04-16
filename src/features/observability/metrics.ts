@@ -5,6 +5,7 @@ export interface MetricsCollector {
   start: () => void
   end: () => void
   setCacheStatus: (status: 'hit' | 'miss' | 'corrupted') => void
+  setCacheSource: (source: 'cache' | 'storage' | null) => void
   addSessionUsed: (sessionId: string) => void
   addSessionCreated: (sessionId: string) => void
   addPRCreated: (prUrl: string) => void
@@ -26,6 +27,7 @@ export function createMetricsCollector(): MetricsCollector {
   let startTime = 0
   let endTime: number | null = null
   let cacheStatus: 'hit' | 'miss' | 'corrupted' = 'miss'
+  let cacheSource: 'cache' | 'storage' | null = null
   const sessionsUsed: string[] = []
   const sessionsCreated: string[] = []
   const prsCreated: string[] = []
@@ -47,6 +49,10 @@ export function createMetricsCollector(): MetricsCollector {
 
     setCacheStatus(status: 'hit' | 'miss' | 'corrupted'): void {
       cacheStatus = status
+    },
+
+    setCacheSource(source: 'cache' | 'storage' | null): void {
+      cacheSource = source
     },
 
     addSessionUsed(sessionId: string): void {
@@ -100,6 +106,7 @@ export function createMetricsCollector(): MetricsCollector {
         endTime,
         duration,
         cacheStatus,
+        cacheSource,
         sessionsUsed: Object.freeze([...sessionsUsed]),
         sessionsCreated: Object.freeze([...sessionsCreated]),
         prsCreated: Object.freeze([...prsCreated]),

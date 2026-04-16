@@ -2,6 +2,7 @@ import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
 import type {Octokit} from '../services/github/types.js'
+import type {ObjectStoreConfig} from '../services/object-store/index.js'
 import * as core from '@actions/core'
 import {createMetricsCollector} from '../features/observability/index.js'
 import {createLogger} from '../shared/logger.js'
@@ -30,6 +31,12 @@ export async function run(): Promise<number> {
   let attachmentResult: AttachmentResult | null = null
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
+  let storeConfig: ObjectStoreConfig = {
+    enabled: false,
+    bucket: '',
+    region: '',
+    prefix: '',
+  }
 
   core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
   core.saveState(STATE_KEYS.CACHE_SAVED, 'false')
@@ -40,6 +47,7 @@ export async function run(): Promise<number> {
     const bootstrap = await runBootstrap(bootstrapLogger)
     if (bootstrap == null) return 1
     detectedOpencodeVersion = bootstrap.opencodeResult.version
+    storeConfig = bootstrap.inputs.storeConfig
 
     const routing = await runRouting(bootstrap, startTime)
     if (routing == null) return 0
@@ -51,10 +59,9 @@ export async function run(): Promise<number> {
 
     reactionCtx = await runAcknowledge(routing, bootstrap.logger)
 
-    const cacheRestore = await runCacheRestore(bootstrap)
+    const cacheRestore = await runCacheRestore(bootstrap, metrics)
     if (cacheRestore == null) return 1
     serverHandle = cacheRestore.serverHandle
-    metrics.setCacheStatus(cacheRestore.cacheStatus)
 
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
     attachmentResult = sessionPrep.attachmentResult
@@ -99,6 +106,7 @@ export async function run(): Promise<number> {
       attachmentResult,
       serverHandle,
       detectedOpencodeVersion,
+      storeConfig,
     })
   }
 

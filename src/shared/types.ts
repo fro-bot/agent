@@ -1,5 +1,4 @@
 import type {Result} from '@bfra.me/es/result'
-import type {ObjectStoreConfig} from '../services/object-store/index.js'
 
 // Re-export Result type and helpers for convenience
 export type {Err, Ok, Result} from '@bfra.me/es/result'
@@ -8,12 +7,27 @@ export {err, isErr, isOk, ok} from '@bfra.me/es/result'
 // Agent identity for cache scoping
 export type AgentIdentity = 'discord' | 'github'
 
+// Object store configuration (pure data shape; adapter lives in services/object-store/)
+export interface ObjectStoreConfig {
+  readonly enabled: boolean
+  readonly bucket: string
+  readonly region: string
+  readonly prefix: string
+  readonly endpoint?: string
+  readonly expectedBucketOwner?: string
+  readonly allowInsecureEndpoint?: boolean
+  readonly sseEncryption?: 'aws:kms' | 'AES256'
+  readonly sseKmsKeyId?: string
+}
+
 // Cache restore result
 export interface CacheResult {
   readonly hit: boolean
   readonly key: string | null
   readonly restoredPath: string | null
   readonly corrupted: boolean
+  /** null on miss, 'cache' on Actions cache hit, 'storage' on S3 fallback hit */
+  readonly source: 'cache' | 'storage' | null
 }
 
 // Run context from GitHub Actions

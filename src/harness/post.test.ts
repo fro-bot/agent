@@ -100,6 +100,67 @@ describe('post action', () => {
       expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
     })
 
+    it('reconstructs storeConfig from state and passes it to saveCache', async () => {
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'false'
+        if (key === 'storeConfig.enabled') return 'true'
+        if (key === 'storeConfig.bucket') return 'test-bucket'
+        if (key === 'storeConfig.region') return 'us-east-1'
+        if (key === 'storeConfig.prefix') return 'fro-bot-state'
+        if (key === 'storeConfig.endpoint') return 'https://example.r2.cloudflarestorage.com'
+        if (key === 'storeConfig.expectedBucketOwner') return '123456789012'
+        if (key === 'storeConfig.allowInsecureEndpoint') return 'false'
+        if (key === 'storeConfig.sseEncryption') return 'AES256'
+        if (key === 'storeConfig.sseKmsKeyId') return 'kms-key-1'
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      expect(saveCache).toHaveBeenCalledWith(
+        expect.objectContaining({
+          storeConfig: {
+            enabled: true,
+            bucket: 'test-bucket',
+            region: 'us-east-1',
+            prefix: 'fro-bot-state',
+            endpoint: 'https://example.r2.cloudflarestorage.com',
+            expectedBucketOwner: '123456789012',
+            allowInsecureEndpoint: false,
+            sseEncryption: 'AES256',
+            sseKmsKeyId: 'kms-key-1',
+          },
+        }),
+      )
+    })
+
+    it('skips storeConfig reconstruction when state keys are missing', async () => {
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'false'
+        if (key === 'storeConfig.enabled') return ''
+        if (key === 'storeConfig.bucket') return ''
+        return ''
+      })
+
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue(true)
+
+      const {runPost} = await import('./post.js')
+      await runPost({logger: createMockLogger()})
+
+      const firstCall = vi.mocked(saveCache).mock.calls[0]
+      expect(firstCall).toBeDefined()
+      expect(firstCall?.[0]).not.toHaveProperty('storeConfig')
+    })
+
     it('should log no content message when saveCache returns false', async () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {

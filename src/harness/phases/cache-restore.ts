@@ -1,4 +1,5 @@
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
+import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
@@ -15,7 +16,10 @@ export interface CacheRestorePhaseResult {
   readonly serverHandle: OpenCodeServerHandle
 }
 
-export async function runCacheRestore(bootstrap: BootstrapPhaseResult): Promise<CacheRestorePhaseResult | null> {
+export async function runCacheRestore(
+  bootstrap: BootstrapPhaseResult,
+  metrics: MetricsCollector,
+): Promise<CacheRestorePhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
   const cacheLogger = createLogger({phase: 'cache'})
@@ -29,6 +33,7 @@ export async function runCacheRestore(bootstrap: BootstrapPhaseResult): Promise<
     authPath: getOpenCodeAuthPath(),
     projectIdPath,
     opencodeVersion: bootstrap.opencodeResult.version,
+    storeConfig: bootstrap.inputs.storeConfig,
   })
 
   const cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted
@@ -36,6 +41,8 @@ export async function runCacheRestore(bootstrap: BootstrapPhaseResult): Promise<
     : cacheResult.hit
       ? 'hit'
       : 'miss'
+  metrics.setCacheStatus(cacheStatus)
+  metrics.setCacheSource(cacheResult.source)
   bootstrap.logger.info('Cache restore completed', {cacheStatus, key: cacheResult.key})
 
   const projectIdResult = await ensureProjectId({workspacePath, logger: cacheLogger})

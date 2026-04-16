@@ -12,6 +12,7 @@ export interface RunMetrics {
   readonly endTime: number | null
   readonly duration: number | null
   readonly cacheStatus: 'hit' | 'miss' | 'corrupted'
+  readonly cacheSource: 'cache' | 'storage' | null
   readonly sessionsUsed: readonly string[]
   readonly sessionsCreated: readonly string[]
   readonly prsCreated: readonly string[]

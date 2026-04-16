@@ -3,6 +3,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {createS3Adapter, syncSessionsToStore} from '../object-store/index.js'
 import {isSqliteBackend} from '../session/version.js'
 import {buildSaveCacheKey} from './cache-key.js'
 import {isPathInsideDirectory} from './restore.js'
@@ -108,6 +109,25 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
     }
 
     await writeStorageVersion(storagePath)
+
+    if (options.storeConfig?.enabled === true) {
+      try {
+        const adapter = options.storeAdapter ?? createS3Adapter(options.storeConfig, logger)
+        const syncResult = await syncSessionsToStore(
+          adapter,
+          options.storeConfig,
+          components.agentIdentity,
+          components.repo,
+          storagePath,
+          logger,
+        )
+        logger.info('Object store session sync completed', syncResult)
+      } catch (error) {
+        logger.warning('Object store session sync failed (non-fatal)', {
+          error: toErrorMessage(error),
+        })
+      }
+    }
 
     await cacheAdapter.saveCache(cachePaths, saveKey)
     logger.info('Cache saved', {saveKey})

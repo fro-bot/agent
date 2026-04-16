@@ -1,4 +1,5 @@
 import type {Logger} from '../../shared/logger.js'
+import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/index.js'
 import type {CacheKeyComponents} from './cache-key.js'
 import * as cache from '@actions/cache'
 
@@ -23,6 +24,8 @@ export interface RestoreCacheOptions {
   readonly authPath: string
   readonly projectIdPath?: string
   readonly opencodeVersion?: string | null
+  readonly storeConfig?: ObjectStoreConfig
+  readonly storeAdapter?: ObjectStoreAdapter
   readonly cacheAdapter?: CacheAdapter
 }
 
@@ -34,5 +37,7 @@ export interface SaveCacheOptions {
   readonly authPath: string
   readonly projectIdPath?: string
   readonly opencodeVersion?: string | null
+  readonly storeConfig?: ObjectStoreConfig
+  readonly storeAdapter?: ObjectStoreAdapter
   readonly cacheAdapter?: CacheAdapter
 }

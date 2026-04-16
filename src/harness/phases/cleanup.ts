@@ -2,6 +2,7 @@ import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {Octokit} from '../../services/github/types.js'
+import type {ObjectStoreConfig} from '../../services/object-store/index.js'
 import type {Logger} from '../../shared/logger.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
@@ -31,6 +32,7 @@ export interface CleanupPhaseOptions {
   readonly attachmentResult: AttachmentResult | null
   readonly serverHandle: OpenCodeServerHandle | null
   readonly detectedOpencodeVersion: string | null
+  readonly storeConfig: ObjectStoreConfig
 }
 
 export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
@@ -42,6 +44,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     attachmentResult,
     serverHandle,
     detectedOpencodeVersion,
+    storeConfig,
   } = options
 
   try {
@@ -100,6 +103,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
       authPath: getOpenCodeAuthPath(),
       projectIdPath: finalProjectIdPath,
       opencodeVersion: detectedOpencodeVersion,
+      storeConfig,
     })
 
     if (cacheSaved) {
