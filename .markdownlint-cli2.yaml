@@ -17,5 +17,6 @@ globs:
   - '!RFCs/**'
   - '!RFCS.md'
   - '!docs/brainstorms/**'
+  - '!docs/ideation/**'
   - '!docs/plans/**'
   - '!docs/solutions/**'
