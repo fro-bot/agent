@@ -1,4 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
+import type {ObjectStoreConfig} from '../services/object-store/index.js'
 
 // Re-export Result type and helpers for convenience
 export type {Err, Ok, Result} from '@bfra.me/es/result'
@@ -47,9 +48,7 @@ export interface ActionInputs {
   readonly authJson: string
   readonly prompt: string | null
   readonly sessionRetention: number
-  readonly s3Backup: boolean
-  readonly s3Bucket: string | null
-  readonly awsRegion: string | null
+  readonly storeConfig: ObjectStoreConfig
   // RFC-013: SDK execution configuration
   readonly agent: string
   readonly model: ModelConfig | null

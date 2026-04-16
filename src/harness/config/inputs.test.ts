@@ -1,38 +1,64 @@
-import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
+import {DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
 import {parseActionInputs, parseModelInput} from './inputs.js'
 
-// Mock @actions/core
-vi.mock('@actions/core', () => ({
-  getInput: vi.fn(),
+const mocks = vi.hoisted(() => ({
+  getInput: vi.fn<(name: string) => string>(),
+  setSecret: vi.fn<(value: string) => void>(),
+  warning: vi.fn<(message: string) => void>(),
+  githubContext: {
+    payload: {},
+  },
 }))
+
+vi.mock('@actions/core', () => ({
+  getInput: mocks.getInput,
+  setSecret: mocks.setSecret,
+  warning: mocks.warning,
+}))
+
+vi.mock('@actions/github', () => ({
+  context: mocks.githubContext,
+}))
+
+function mockInputs(overrides: Record<string, string>): void {
+  const defaults: Record<string, string> = {
+    'github-token': 'ghp_test123',
+    'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+  }
+
+  const inputs = {
+    ...defaults,
+    ...overrides,
+  }
+
+  mocks.getInput.mockImplementation((name: string) => inputs[name] ?? '')
+}
+
+function setGitHubPayload(payload: Record<string, unknown>): void {
+  mocks.githubContext.payload = payload
+}
 
 describe('parseActionInputs', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setGitHubPayload({})
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllEnvs()
   })
 
   describe('with valid inputs', () => {
     it('parses all required inputs correctly', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          prompt: 'Custom prompt',
-          'session-retention': '100',
-          's3-backup': 'true',
-          's3-bucket': 'my-bucket',
-          'aws-region': 'us-east-1',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        prompt: 'Custom prompt',
+        'session-retention': '100',
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        'aws-region': 'us-east-1',
       })
 
       const result = parseActionInputs()
@@ -42,21 +68,13 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.authJson).toBe('{"anthropic":{"type":"api","key":"sk-ant-test"}}')
       expect(result.success && result.data.prompt).toBe('Custom prompt')
       expect(result.success && result.data.sessionRetention).toBe(100)
-      expect(result.success && result.data.s3Backup).toBe(true)
-      expect(result.success && result.data.s3Bucket).toBe('my-bucket')
-      expect(result.success && result.data.awsRegion).toBe('us-east-1')
+      expect(result.success && result.data.storeConfig.enabled).toBe(true)
+      expect(result.success && result.data.storeConfig.bucket).toBe('my-bucket')
+      expect(result.success && result.data.storeConfig.region).toBe('us-east-1')
     })
 
     it('uses defaults for optional inputs when empty', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -64,21 +82,150 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.githubToken).toBe('ghp_test123')
       expect(result.success && result.data.sessionRetention).toBe(50) // DEFAULT_SESSION_RETENTION
       expect(result.success && result.data.prompt).toBeNull()
-      expect(result.success && result.data.s3Backup).toBe(false)
-      expect(result.success && result.data.s3Bucket).toBeNull()
-      expect(result.success && result.data.awsRegion).toBeNull()
+      expect(result.success && result.data.storeConfig.enabled).toBe(false)
+      expect(result.success && result.data.storeConfig.bucket).toBe('')
+      expect(result.success && result.data.storeConfig.region).toBe('')
+      expect(result.success && result.data.storeConfig.prefix).toBe(DEFAULT_S3_PREFIX)
+    })
+
+    it('parses all S3 inputs into storeConfig', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        'aws-region': 'us-east-1',
+        's3-endpoint': 'https://account.r2.cloudflarestorage.com',
+        's3-prefix': 'custom-prefix',
+        's3-expected-bucket-owner': '123456789012',
+        's3-allow-insecure-endpoint': 'true',
+        's3-sse-encryption': 'AES256',
+        's3-sse-kms-key-id': 'kms-key-123',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig).toEqual({
+        enabled: true,
+        bucket: 'my-bucket',
+        region: 'us-east-1',
+        prefix: 'custom-prefix',
+        endpoint: 'https://account.r2.cloudflarestorage.com',
+        expectedBucketOwner: '123456789012',
+        allowInsecureEndpoint: true,
+        sseEncryption: 'AES256',
+        sseKmsKeyId: 'kms-key-123',
+      })
+    })
+
+    it('applies the default prefix when s3-prefix is not provided', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        'aws-region': 'us-east-1',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.prefix).toBe(DEFAULT_S3_PREFIX)
+    })
+
+    it('passes through a valid custom endpoint', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'https://account.r2.cloudflarestorage.com',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.endpoint).toBe('https://account.r2.cloudflarestorage.com')
+    })
+
+    it('accepts an http endpoint when insecure endpoints are explicitly allowed', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'http://minio.example.test:9000',
+        's3-allow-insecure-endpoint': 'true',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.endpoint).toBe('http://minio.example.test:9000')
+      expect(result.success && result.data.storeConfig.allowInsecureEndpoint).toBe(true)
+    })
+
+    it('includes expectedBucketOwner when provided', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-expected-bucket-owner': '123456789012',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.expectedBucketOwner).toBe('123456789012')
+    })
+
+    it('includes sseEncryption and sseKmsKeyId when provided', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-sse-encryption': 'aws:kms',
+        's3-sse-kms-key-id': 'kms-key-123',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.sseEncryption).toBe('aws:kms')
+      expect(result.success && result.data.storeConfig.sseKmsKeyId).toBe('kms-key-123')
+    })
+
+    it('registers AWS credentials as masked secrets when present', () => {
+      vi.stubEnv('AWS_ACCESS_KEY_ID', 'AKIA_TEST_VALUE')
+      vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'secret-test-value')
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(mocks.setSecret).toHaveBeenCalledWith('AKIA_TEST_VALUE')
+      expect(mocks.setSecret).toHaveBeenCalledWith('secret-test-value')
+      expect(mocks.setSecret).toHaveBeenCalledTimes(2)
+    })
+
+    it('forces storeConfig.enabled to false for fork pull requests', () => {
+      setGitHubPayload({
+        pull_request: {
+          head: {
+            repo: {
+              fork: true,
+            },
+          },
+        },
+      })
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.enabled).toBe(false)
+      expect(mocks.warning).toHaveBeenCalled()
     })
   })
 
   describe('with invalid inputs', () => {
     it('returns error for missing github-token', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'github-token': '',
       })
 
       const result = parseActionInputs()
@@ -88,13 +235,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for missing auth-json', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'auth-json': '',
       })
 
       const result = parseActionInputs()
@@ -104,14 +246,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid auth-json (not valid JSON)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': 'not-valid-json',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'auth-json': 'not-valid-json',
       })
 
       const result = parseActionInputs()
@@ -122,15 +258,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid session-retention (negative)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'session-retention': '-5',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'session-retention': '-5',
       })
 
       const result = parseActionInputs()
@@ -140,15 +269,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid session-retention (not a number)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'session-retention': 'abc',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'session-retention': 'abc',
       })
 
       const result = parseActionInputs()
@@ -156,19 +278,65 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('session-retention')
     })
+
+    it('returns an error when s3-backup is true and s3-bucket is empty without echoing values', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': '   ',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('s3-bucket')
+      expect(!result.success && result.error.message).not.toContain('   ')
+      expect(!result.success && result.error.message).not.toContain('true')
+    })
+
+    it('rejects an insecure endpoint by default', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'http://internal',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('https')
+    })
+
+    it('rejects a link-local endpoint', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'https://169.254.169.254',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('loopback, link-local, or private network addresses')
+    })
+
+    it('rejects an invalid prefix', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-prefix': '../other-repo',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('prefix')
+    })
   })
 
   describe('edge cases', () => {
     it('rejects zero for session-retention (must be positive)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'session-retention': '0',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'session-retention': '0',
       })
 
       const result = parseActionInputs()
@@ -177,14 +345,9 @@ describe('parseActionInputs', () => {
     })
 
     it('trims whitespace from string inputs', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': '  ghp_test123  ',
-          'auth-json': '  {"anthropic":{"type":"api","key":"sk-ant-test"}}  ',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'github-token': '  ghp_test123  ',
+        'auth-json': '  {"anthropic":{"type":"api","key":"sk-ant-test"}}  ',
       })
 
       const result = parseActionInputs()
@@ -195,35 +358,35 @@ describe('parseActionInputs', () => {
     })
 
     it('handles s3-backup case insensitivity', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          's3-backup': 'TRUE',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        's3-backup': 'TRUE',
+        's3-bucket': 'my-bucket',
       })
 
       const result = parseActionInputs()
 
       expect(result.success).toBe(true)
-      expect(result.success && result.data.s3Backup).toBe(true)
+      expect(result.success && result.data.storeConfig.enabled).toBe(true)
+    })
+
+    it('keeps storeConfig disabled when s3-backup is false', () => {
+      mockInputs({
+        's3-backup': 'false',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'http://internal',
+        's3-prefix': '../other-repo',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.enabled).toBe(false)
     })
   })
 
   describe('RFC-013 SDK execution inputs', () => {
     it('parses agent input with default value', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -232,15 +395,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses custom agent input', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          agent: 'CustomAgent',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        agent: 'CustomAgent',
       })
 
       const result = parseActionInputs()
@@ -250,15 +406,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses model input correctly', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          model: 'anthropic/claude-sonnet-4-20250514',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        model: 'anthropic/claude-sonnet-4-20250514',
       })
 
       const result = parseActionInputs()
@@ -271,15 +420,7 @@ describe('parseActionInputs', () => {
     })
 
     it('returns null model when not specified', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -288,15 +429,7 @@ describe('parseActionInputs', () => {
     })
 
     it('parses timeout input with default value', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -305,15 +438,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses custom timeout input', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          timeout: '300000',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        timeout: '300000',
       })
 
       const result = parseActionInputs()
@@ -322,15 +448,7 @@ describe('parseActionInputs', () => {
     })
 
     it('parses systematic-version input with default value', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -339,15 +457,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses custom systematic-version input', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'systematic-version': '2.2.0',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'systematic-version': '2.2.0',
       })
 
       const result = parseActionInputs()
@@ -357,15 +468,8 @@ describe('parseActionInputs', () => {
     })
 
     it('accepts zero timeout for no limit', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          timeout: '0',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        timeout: '0',
       })
 
       const result = parseActionInputs()
@@ -375,15 +479,7 @@ describe('parseActionInputs', () => {
     })
 
     it('parses dedup-window with default value', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-        }
-        return inputs[name] ?? ''
-      })
+      mockInputs({})
 
       const result = parseActionInputs()
 
@@ -392,15 +488,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses custom dedup-window', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'dedup-window': '300000',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'dedup-window': '300000',
       })
 
       const result = parseActionInputs()
@@ -410,15 +499,8 @@ describe('parseActionInputs', () => {
     })
 
     it('accepts zero dedup-window to disable dedup', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'dedup-window': '0',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'dedup-window': '0',
       })
 
       const result = parseActionInputs()
@@ -428,15 +510,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid dedup-window value', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'dedup-window': 'not-a-number',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'dedup-window': 'not-a-number',
       })
 
       const result = parseActionInputs()
@@ -446,15 +521,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid model format (no slash)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          model: 'invalid-model',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        model: 'invalid-model',
       })
 
       const result = parseActionInputs()
@@ -464,15 +532,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error for invalid opencode-config (not valid JSON)', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': 'not-valid-json',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': 'not-valid-json',
       })
 
       const result = parseActionInputs()
@@ -483,15 +544,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error when opencode-config is JSON null literal', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': 'null',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': 'null',
       })
 
       const result = parseActionInputs()
@@ -502,15 +556,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error when opencode-config is a JSON array', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': '[1,2,3]',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': '[1,2,3]',
       })
 
       const result = parseActionInputs()
@@ -521,15 +568,8 @@ describe('parseActionInputs', () => {
     })
 
     it('returns error when opencode-config is a JSON string literal', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': '"literal"',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': '"literal"',
       })
 
       const result = parseActionInputs()
@@ -542,15 +582,8 @@ describe('parseActionInputs', () => {
 
   describe('with valid opencode-config', () => {
     it('parses valid JSON object in opencode-config', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': '{"model": "claude-opus-4", "temperature": 0.7}',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': '{"model": "claude-opus-4", "temperature": 0.7}',
       })
 
       const result = parseActionInputs()
@@ -560,15 +593,8 @@ describe('parseActionInputs', () => {
     })
 
     it('sets opencodeConfig to null when empty string', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'opencode-config': '',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'opencode-config': '',
       })
 
       const result = parseActionInputs()
@@ -578,15 +604,8 @@ describe('parseActionInputs', () => {
     })
 
     it('parses systematic-config when provided', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'systematic-config': '{"mode":"strict"}',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'systematic-config': '{"mode":"strict"}',
       })
 
       const result = parseActionInputs()
@@ -596,15 +615,8 @@ describe('parseActionInputs', () => {
     })
 
     it('sets systematicConfig to null when empty string', () => {
-      const mockGetInput = core.getInput as ReturnType<typeof vi.fn>
-
-      mockGetInput.mockImplementation((name: string) => {
-        const inputs: Record<string, string> = {
-          'github-token': 'ghp_test123',
-          'auth-json': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-          'systematic-config': '',
-        }
-        return inputs[name] ?? ''
+      mockInputs({
+        'systematic-config': '',
       })
 
       const result = parseActionInputs()
