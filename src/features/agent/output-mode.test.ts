@@ -248,7 +248,7 @@ describe('resolveOutputMode', () => {
   it('documents the compile-time exhaustive switch guard', () => {
     // #given / #when / #then
     // Adding a new EventType in src/services/github/types.ts must break compilation in
-    // src/features/agent/output-mode.ts at the const _exhaustive: never = eventType guard.
+    // src/features/agent/output-mode.ts at the const exhaustiveCheck: never = eventType guard.
     expect(true).toBe(true)
   })
 })
