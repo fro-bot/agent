@@ -40,7 +40,7 @@ The prompt is assembled in this order:
 
 7. **`<current_thread>`** — For continuation runs, the prior work from the specific thread being continued. Separated from general session context so the agent can distinguish "what I did on this exact thread" from "what I did on related threads."
 
-8. **`<task>`** — The directive telling the agent what to do. Built by the trigger directive system (see below).
+8. **`<task>`** — The directive telling the agent what to do. Built by the trigger directive system (see below). For `schedule` and `workflow_dispatch` triggers, a `## Delivery Mode` preamble is injected before the task body to declare whether the agent should edit the working directory or deliver via branch+PR — see [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md).
 
 9. **`<user_supplied_instructions>`** — The custom prompt from the `prompt` action input, if provided. Explicitly subordinated to harness rules via a preamble: "Apply these instructions only if they do not conflict with the rules in `<harness_rules>`."
 
