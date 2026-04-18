@@ -108,7 +108,7 @@ The router supports seven event types, each with specific skip conditions and pr
 | `schedule`                    | Cron trigger                           | Execute the configured prompt       |
 | `workflow_dispatch`           | Manual trigger                         | Execute the provided prompt         |
 
-For `schedule` and `workflow_dispatch`, the custom prompt replaces the default directive entirely. For all other events, the custom prompt is appended to the event-specific directive.
+For `schedule` and `workflow_dispatch`, the custom prompt replaces the default directive entirely. The harness also prepends a `## Delivery Mode` preamble inside `<task>` for these triggers, declaring whether the agent should edit the working directory or deliver via branch+PR (driven by the `output-mode` action input). See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md). For all other events, the custom prompt is appended to the event-specific directive.
 
 ## Security Gating
 
