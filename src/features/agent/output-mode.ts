@@ -3,6 +3,10 @@ import type {OutputMode, ResolvedOutputMode} from '../../shared/types.js'
 
 export type {OutputMode, ResolvedOutputMode} from '../../shared/types.js'
 
+// Frozen phrase list for the `auto` heuristic. New branch/PR delivery phrases
+// must be added here. NOTE: an additional special case is checked in
+// resolveAutoMode() for `pull the request` to preserve a documented v1 false
+// positive — keep the two locations in sync if you add or remove phrases.
 const BRANCH_PR_PHRASES = [
   'pull request',
   'open a pr',
@@ -30,6 +34,10 @@ function resolveAutoMode(prompt: string | null): ResolvedOutputMode {
     }
   }
 
+  // Special case (lives outside BRANCH_PR_PHRASES intentionally — see plan
+  // 2026-04-17-001): the documented v1 false positive "pull the request body
+  // into the summary" must resolve to branch-pr even though it does not
+  // contain any of the frozen phrases verbatim.
   if (normalizedPrompt.includes('pull the request')) {
     return 'branch-pr'
   }
@@ -60,6 +68,12 @@ export function resolveOutputMode(
           return 'branch-pr'
         case 'auto':
           return resolveAutoMode(prompt)
+        default: {
+          // Compile-time exhaustiveness check: adding a new OutputMode variant
+          // without updating this inner switch will fail TypeScript here.
+          const exhaustiveModeCheck: never = configuredMode
+          return exhaustiveModeCheck
+        }
       }
 
     default: {

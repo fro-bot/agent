@@ -111,3 +111,6 @@ eslint-typegen.d.ts
 
 # Oh My OpenCode
 .sisyphus/
+
+# Systematic skill scratch artifacts (ce:review, deepen-plan, etc.)
+.context/

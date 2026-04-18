@@ -77,8 +77,6 @@ const VALID_OMO_PROVIDERS = [
 
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
 
-type OutputModeInput = (typeof VALID_OUTPUT_MODES)[number]
-
 type OmoProviderInput = (typeof VALID_OMO_PROVIDERS)[number]
 
 function parseOmoProviders(input: string): OmoProviders {
@@ -363,10 +361,6 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
 }
 
 function parseOutputMode(input: string): OutputMode {
-  if (!VALID_OUTPUT_MODES.includes(input as OutputModeInput)) {
-    throw new Error(`Invalid output-mode value: "${input}". Valid values: ${VALID_OUTPUT_MODES.join(', ')}`)
-  }
-
   switch (input) {
     case 'auto':
     case 'working-dir':
