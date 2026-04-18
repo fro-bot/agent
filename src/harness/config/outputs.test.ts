@@ -22,14 +22,16 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_abc123',
+      resolvedOutputMode: 'working-dir',
       cacheStatus: 'hit',
       duration: 1500,
     }
 
     setActionOutputs(outputs)
 
-    expect(mockSetOutput).toHaveBeenCalledTimes(3)
+    expect(mockSetOutput).toHaveBeenCalledTimes(4)
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', 'ses_abc123')
+    expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', 'working-dir')
     expect(mockSetOutput).toHaveBeenCalledWith('cache-status', 'hit')
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 1500)
   })
@@ -38,6 +40,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: null,
+      resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: 500,
     }
@@ -45,6 +48,7 @@ describe('setActionOutputs', () => {
     setActionOutputs(outputs)
 
     expect(mockSetOutput).toHaveBeenCalledWith('session-id', '')
+    expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
     expect(mockSetOutput).toHaveBeenCalledWith('cache-status', 'miss')
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 500)
   })
@@ -53,6 +57,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: 'ses_xyz789',
+      resolvedOutputMode: 'branch-pr',
       cacheStatus: 'corrupted',
       duration: 2000,
     }
@@ -66,6 +71,7 @@ describe('setActionOutputs', () => {
     const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
     const outputs: ActionOutputs = {
       sessionId: null,
+      resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: 0,
     }
@@ -73,5 +79,33 @@ describe('setActionOutputs', () => {
     setActionOutputs(outputs)
 
     expect(mockSetOutput).toHaveBeenCalledWith('duration', 0)
+  })
+
+  it('emits resolved-output-mode field when set', () => {
+    const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
+    const outputs: ActionOutputs = {
+      sessionId: 'ses_output_mode',
+      resolvedOutputMode: 'branch-pr',
+      cacheStatus: 'hit',
+      duration: 42,
+    }
+
+    setActionOutputs(outputs)
+
+    expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', 'branch-pr')
+  })
+
+  it('emits empty string for resolved-output-mode when null', () => {
+    const mockSetOutput = core.setOutput as ReturnType<typeof vi.fn>
+    const outputs: ActionOutputs = {
+      sessionId: 'ses_output_mode',
+      resolvedOutputMode: null,
+      cacheStatus: 'hit',
+      duration: 42,
+    }
+
+    setActionOutputs(outputs)
+
+    expect(mockSetOutput).toHaveBeenCalledWith('resolved-output-mode', '')
   })
 })

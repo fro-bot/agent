@@ -16,6 +16,7 @@ export type {CollectAgentContextOptions} from './context.js'
 export {collectDiffContext} from './diff-context.js'
 
 export {executeOpenCode} from './execution.js'
+export {resolveOutputMode} from './output-mode.js'
 // Prompt construction
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 export type {TriggerDirective} from './prompt.js'
@@ -43,8 +44,10 @@ export type {
   AgentResult,
   EnsureOpenCodeResult,
   ExecutionConfig,
+  OutputMode,
   PromptOptions,
   ReactionContext,
+  ResolvedOutputMode,
 } from './types.js'
 
 export {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from './types.js'

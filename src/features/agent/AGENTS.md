@@ -17,14 +17,16 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 | **Prompt**    | `prompt.ts`        | Multi-section prompt with response protocol and output contract (420 L) |
 | **Budgeting** | `diff-context.ts`  | Context limits (50 files in context, 20 in prompt) (75 L)               |
 | **Types**     | `types.ts`         | `AgentContext`, `AgentResult`, `PromptOptions`, `DiffContext` (138 L)   |
+| **OutputMode** | `output-mode.ts`  | `resolveOutputMode()` for manual triggers; frozen phrase heuristic (72 L) |
 
 ## KEY EXPORTS
 
 - `executeOpenCode(prompt, config, logger)`: Main SDK execution entry point
 - `collectAgentContext(logger)`: Hydrates event metadata from NormalizedEvent
 - `buildAgentPrompt(options, logger)`: Compiles multi-section prompt
-- `buildTaskSection(context, promptInput)`: Task directive with append-mode support
+- `buildTaskSection(context, promptInput, resolvedMode)`: Task directive with append-mode and Delivery Mode preamble
 - `getTriggerDirective(context, promptInput)`: Per-event directive selection
+- `resolveOutputMode(eventType, prompt, configuredMode)`: Resolves the operator-level Delivery Mode contract for manual triggers (returns `null` for non-manual)
 - `buildResponseProtocolSection(...)`: CI output rules (single comment, Run Summary)
 - `buildOutputContractSection(context)`: PR review action guidance
 - Diff summary is merged inline into `buildHydratedContextSection()` PR metadata

@@ -1,6 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ObjectStoreConfig} from '../../services/object-store/index.js'
-import type {ActionInputs, ModelConfig, OmoProviders} from '../../shared/types.js'
+import type {ActionInputs, ModelConfig, OmoProviders, OutputMode} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
@@ -74,6 +74,8 @@ const VALID_OMO_PROVIDERS = [
   'zai-coding-plan',
   'kimi-for-coding',
 ] as const
+
+const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
 
 type OmoProviderInput = (typeof VALID_OMO_PROVIDERS)[number]
 
@@ -208,6 +210,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const promptRaw = core.getInput('prompt').trim()
     const prompt = promptRaw.length > 0 ? promptRaw : null
 
+    const outputModeRaw = core.getInput('output-mode').trim().toLowerCase()
+    const outputMode: OutputMode = outputModeRaw.length > 0 ? parseOutputMode(outputModeRaw) : 'auto'
+
     // Optional numeric input with default
     const sessionRetentionRaw = core.getInput('session-retention').trim()
     const sessionRetention =
@@ -335,6 +340,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       githubToken,
       authJson,
       prompt,
+      outputMode,
       sessionRetention,
       storeConfig,
       agent,
@@ -351,5 +357,16 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
+  }
+}
+
+function parseOutputMode(input: string): OutputMode {
+  switch (input) {
+    case 'auto':
+    case 'working-dir':
+    case 'branch-pr':
+      return input
+    default:
+      throw new Error(`Invalid output-mode value: "${input}". Valid values: ${VALID_OUTPUT_MODES.join(', ')}`)
   }
 }

@@ -105,6 +105,7 @@ export async function runDedup(
 
   setActionOutputs({
     sessionId: null,
+    resolvedOutputMode: null,
     cacheStatus: 'miss',
     duration: Date.now() - startTime,
   })

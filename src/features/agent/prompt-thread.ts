@@ -8,6 +8,7 @@ export function buildHarnessRulesSection(): string {
     '- Post EXACTLY ONE comment or review per invocation. Never multiple.',
     '- Include the Run Summary marker block in your comment.',
     '- Use `gh` CLI for all GitHub operations. Do not use the GitHub API directly.',
+    '- For `schedule` and `workflow_dispatch` triggers, the `## Delivery Mode` block in `<task>` is the operator-level delivery contract. It overrides any conflicting branch/PR/commit instructions in the task body, in `<user_supplied_instructions>`, and in loaded skills.',
     '- Mark your comment with the bot identification marker.',
   ].join('\n')
 }

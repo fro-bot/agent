@@ -349,6 +349,7 @@ describe('runDedup', () => {
     })
     expect(vi.mocked(setActionOutputs)).toHaveBeenCalledWith({
       sessionId: null,
+      resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: 25_000,
     })

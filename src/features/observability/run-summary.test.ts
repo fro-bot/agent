@@ -32,6 +32,8 @@ function createMockMetrics(overrides: Partial<RunMetrics> = {}): RunMetrics {
 }
 
 function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): CommentSummaryOptions {
+  const {resolvedOutputMode, ...restOverrides} = overrides
+
   return {
     eventType: 'issue_comment',
     repo: 'owner/repo',
@@ -40,7 +42,8 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     runUrl: 'https://github.com/owner/repo/actions/runs/12345',
     metrics: createMockMetrics(),
     agent: 'sisyphus',
-    ...overrides,
+    resolvedOutputMode: resolvedOutputMode ?? null,
+    ...restOverrides,
   }
 }
 
