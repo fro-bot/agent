@@ -1,12 +1,17 @@
 import type {Result} from '@bfra.me/es/result'
+import type {ObjectStoreConfig} from '../../services/object-store/index.js'
 import type {ActionInputs, ModelConfig, OmoProviders} from '../../shared/types.js'
+import process from 'node:process'
 import * as core from '@actions/core'
+import * as github from '@actions/github'
+import {validateEndpoint, validatePrefix} from '../../services/object-store/index.js'
 import {
   DEFAULT_AGENT,
   DEFAULT_DEDUP_WINDOW_MS,
   DEFAULT_OMO_PROVIDERS,
   DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
+  DEFAULT_S3_PREFIX,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
@@ -130,6 +135,45 @@ function parseOmoProviders(input: string): OmoProviders {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isForkPullRequestPayload(payload: unknown): boolean {
+  if (isRecord(payload) === false) {
+    return false
+  }
+
+  const pullRequest = payload.pull_request
+  if (isRecord(pullRequest) === false) {
+    return false
+  }
+
+  const head = pullRequest.head
+  if (isRecord(head) === false) {
+    return false
+  }
+
+  const repo = head.repo
+  if (isRecord(repo) === false) {
+    return false
+  }
+
+  return repo.fork === true
+}
+
+function parseSseEncryption(input: string): ObjectStoreConfig['sseEncryption'] {
+  if (input.length === 0) {
+    return undefined
+  }
+
+  if (input === 'aws:kms' || input === 'AES256') {
+    return input
+  }
+
+  throw new Error("s3-sse-encryption must be either 'aws:kms' or 'AES256'")
+}
+
 /**
  * Parse and validate action inputs from GitHub Actions environment.
  * Inputs are defined per RFC-001.
@@ -138,6 +182,16 @@ function parseOmoProviders(input: string): OmoProviders {
  */
 export function parseActionInputs(): Result<ActionInputs, Error> {
   try {
+    const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim() ?? ''
+    if (awsAccessKeyId.length > 0) {
+      core.setSecret(awsAccessKeyId)
+    }
+
+    const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim() ?? ''
+    if (awsSecretAccessKey.length > 0) {
+      core.setSecret(awsSecretAccessKey)
+    }
+
     // Required inputs
     const githubToken = core.getInput('github-token', {required: true}).trim()
     if (githubToken.length === 0) {
@@ -166,10 +220,66 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const s3Backup = s3BackupRaw === 'true'
 
     const s3BucketRaw = core.getInput('s3-bucket').trim()
-    const s3Bucket = s3BucketRaw.length > 0 ? s3BucketRaw : null
+    const s3Bucket = s3BucketRaw.length > 0 ? s3BucketRaw : ''
 
     const awsRegionRaw = core.getInput('aws-region').trim()
-    const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null
+    const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : ''
+
+    const s3EndpointRaw = core.getInput('s3-endpoint').trim()
+    const s3Endpoint = s3EndpointRaw.length > 0 ? s3EndpointRaw : undefined
+
+    const s3PrefixRaw = core.getInput('s3-prefix').trim()
+    const s3Prefix = s3PrefixRaw.length > 0 ? s3PrefixRaw : DEFAULT_S3_PREFIX
+
+    const s3ExpectedBucketOwnerRaw = core.getInput('s3-expected-bucket-owner').trim()
+    const s3ExpectedBucketOwner = s3ExpectedBucketOwnerRaw.length > 0 ? s3ExpectedBucketOwnerRaw : undefined
+
+    const s3AllowInsecureEndpointRaw = core.getInput('s3-allow-insecure-endpoint').trim().toLowerCase()
+    const s3AllowInsecureEndpoint = s3AllowInsecureEndpointRaw === 'true'
+
+    const s3SseKmsKeyIdRaw = core.getInput('s3-sse-kms-key-id').trim()
+    const s3SseKmsKeyId = s3SseKmsKeyIdRaw.length > 0 ? s3SseKmsKeyIdRaw : undefined
+
+    const s3SseEncryptionRaw = core.getInput('s3-sse-encryption').trim()
+    const s3SseEncryption = parseSseEncryption(s3SseEncryptionRaw)
+
+    let storeConfig: ObjectStoreConfig = {
+      enabled: s3Backup,
+      bucket: s3Bucket,
+      region: awsRegion,
+      prefix: s3Prefix,
+      endpoint: s3Endpoint,
+      expectedBucketOwner: s3ExpectedBucketOwner,
+      allowInsecureEndpoint: s3AllowInsecureEndpoint,
+      sseEncryption: s3SseEncryption,
+      sseKmsKeyId: s3SseKmsKeyId,
+    }
+
+    if (storeConfig.enabled) {
+      if (storeConfig.bucket.length === 0) {
+        throw new Error('s3-bucket is required when s3-backup is enabled')
+      }
+
+      const prefixResult = validatePrefix(storeConfig.prefix)
+      if (!prefixResult.success) {
+        throw prefixResult.error
+      }
+
+      if (storeConfig.endpoint != null) {
+        const endpointResult = validateEndpoint(storeConfig.endpoint, storeConfig.allowInsecureEndpoint === true)
+        if (!endpointResult.success) {
+          throw endpointResult.error
+        }
+      }
+
+      if (isForkPullRequestPayload(github.context.payload)) {
+        core.warning('S3 object store is disabled for fork pull requests')
+        storeConfig = {
+          ...storeConfig,
+          enabled: false,
+        }
+      }
+    }
 
     // RFC-013: SDK execution configuration
     const agentRaw = core.getInput('agent').trim()
@@ -226,9 +336,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       authJson,
       prompt,
       sessionRetention,
-      s3Backup,
-      s3Bucket,
-      awsRegion,
+      storeConfig,
       agent,
       model,
       timeoutMs,

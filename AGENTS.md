@@ -27,14 +27,15 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 │   │   ├── async.ts      # Async utilities (sleep)
 │   │   ├── console.ts    # Console output helpers
 │   │   └── paths.ts      # Path utilities
-│   ├── services/         # Layer 1: External adapters (GitHub, cache, session, setup)
+│   ├── services/         # Layer 1: External adapters (GitHub, cache, session, setup, object-store)
 │   │   ├── github/       # Octokit client, context parsing, NormalizedEvent
 │   │   ├── session/      # Persistence layer (search, prune, storage, writeback)
 │   │   ├── setup/        # Bun, oMo, OpenCode + Systematic config/install
 │   │   │   ├── ci-config.ts         # CI config assembly (extracted from setup.ts)
 │   │   │   ├── systematic-config.ts # Systematic plugin config writer
 │   │   │   └── adapters.ts          # Extracted adapter factories
-│   │   └── cache/        # Cache restore/save with corruption detection
+│   │   ├── cache/        # Cache restore/save with corruption detection (accelerator)
+│   │   └── object-store/ # S3-compatible canonical persistence (sessions, artifacts, metadata)
 │   ├── features/         # Layer 2: Business logic (agent, triggers, reviews, etc.)
 │   │   ├── agent/        # SDK execution, prompts, reactions, streaming
 │   │   ├── triggers/     # Event routing, skip conditions, context builders

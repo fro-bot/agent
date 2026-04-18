@@ -32,6 +32,7 @@ export const LLM_RETRY_DELAY_MS = 10_000
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
+export const DEFAULT_S3_PREFIX = 'fro-bot-state' as const
 export const TOOLS_CACHE_PREFIX = 'opencode-tools' as const
 
 // Dedup execution defaults

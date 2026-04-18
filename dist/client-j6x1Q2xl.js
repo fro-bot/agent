@@ -1,0 +1,7 @@
+import{n as e,r as t}from"./chunk-BjEoQXZ0.js";var n,r,i=e((()=>{n={warningEmitted:!1},r=e=>{e&&!n.warningEmitted&&parseInt(e.substring(1,e.indexOf(`.`)))<20&&(n.warningEmitted=!0,process.emitWarning(`NodeDeprecationWarning: The AWS SDK for JavaScript (v3) will
+no longer support Node.js ${e} in January 2026.
+
+To continue receiving updates to AWS services, bug fixes, and security
+updates please upgrade to a supported Node.js LTS version.
+
+More information can be found at: https://a.co/c895JFp`))}})),a,o,s,c=e((()=>{a=()=>(e,t)=>async n=>(t.__retryLongPoll=!0,e(n)),o={name:`longPollMiddleware`,tags:[`RETRY`],step:`initialize`,override:!0},s=e=>({applyToStack:e=>{e.add(a(),o)}})}));function l(e,t,n){return e.$source||={},e.$source[t]=n,e}var u=e((()=>{}));function d(e,t,n){e.__aws_sdk_context?e.__aws_sdk_context.features||(e.__aws_sdk_context.features={}):e.__aws_sdk_context={features:{}},e.__aws_sdk_context.features[t]=n}var f=e((()=>{}));function p(e,t,n){return e.$source||={},e.$source[t]=n,e}var m=e((()=>{})),h=t({emitWarningIfUnsupportedVersion:()=>r,getLongPollPlugin:()=>s,setCredentialFeature:()=>l,setFeature:()=>d,setTokenFeature:()=>p,state:()=>n}),g=e((()=>{i(),c(),u(),f(),m()}));export{r as i,g as n,l as r,h as t};

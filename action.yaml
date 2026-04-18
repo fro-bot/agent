@@ -27,6 +27,26 @@ inputs:
   aws-region:
     description: AWS region for S3 bucket
     required: false
+  s3-endpoint:
+    description: Custom S3-compatible endpoint URL (e.g., https://account.r2.cloudflarestorage.com). Use for Cloudflare R2, Backblaze B2, MinIO, etc. Must be HTTPS unless s3-allow-insecure-endpoint is true.
+    required: false
+  s3-prefix:
+    description: Prefix for all S3 keys. Defaults to 'fro-bot-state'.
+    required: false
+    default: fro-bot-state
+  s3-expected-bucket-owner:
+    description: AWS account ID of the expected bucket owner. When set, protects against bucket-name squatting.
+    required: false
+  s3-allow-insecure-endpoint:
+    description: 'Allow HTTP (non-HTTPS) S3 endpoints. Only for local MinIO dev. Default: false.'
+    required: false
+    default: 'false'
+  s3-sse-kms-key-id:
+    description: KMS key ID for SSE-KMS encryption. When set, uses customer-managed key instead of AWS-managed default.
+    required: false
+  s3-sse-encryption:
+    description: "Server-side encryption: 'aws:kms' or 'AES256'. Default: aws:kms for AWS S3, AES256 for custom endpoints."
+    required: false
   agent:
     description: 'Agent to use (default: sisyphus). Must be a primary agent, not subagent.'
     required: false

@@ -362,24 +362,30 @@ concurrency:
 
 ### Action Inputs
 
-| Input                | Required | Default    | Description                                        |
-| -------------------- | -------- | ---------- | -------------------------------------------------- |
-| `github-token`       | Yes      | —          | GitHub token with write permissions                |
-| `auth-json`          | Yes      | —          | JSON object mapping LLM providers to credentials   |
-| `prompt`             | No       | —          | Custom prompt for the agent                        |
-| `agent`              | No       | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
-| `model`              | No       | —          | Model override in `provider/model` format          |
-| `timeout`            | No       | `1800000`  | Execution timeout in milliseconds (0 = no limit)   |
-| `opencode-version`   | No       | `1.2.24`   | OpenCode CLI version for installation              |
-| `systematic-version` | No       | `2.1.0`    | Systematic plugin version for OpenCode             |
-| `session-retention`  | No       | `50`       | Number of sessions to retain before pruning        |
-| `s3-backup`          | No       | `false`    | Enable S3 write-through backup                     |
-| `s3-bucket`          | No       | —          | S3 bucket name (required if `s3-backup` is true)   |
-| `aws-region`         | No       | —          | AWS region for S3 bucket                           |
-| `skip-cache`         | No       | `false`    | Skip cache restore (useful for debugging)          |
-| `omo-config`         | No       | —          | Custom oMo configuration JSON (deep-merged)        |
-| `systematic-config`  | No       | —          | Custom Systematic configuration JSON (deep-merged) |
-| `opencode-config`    | No       | —          | Custom OpenCode configuration JSON (deep-merged)   |
+| Input | Required | Default | Description |
+| --- | --- | --- | --- |
+| `github-token` | Yes | — | GitHub token with write permissions |
+| `auth-json` | Yes | — | JSON object mapping LLM providers to credentials |
+| `prompt` | No | — | Custom prompt for the agent |
+| `agent` | No | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
+| `model` | No | — | Model override in `provider/model` format |
+| `timeout` | No | `1800000` | Execution timeout in milliseconds (0 = no limit) |
+| `opencode-version` | No | `1.2.24` | OpenCode CLI version for installation |
+| `systematic-version` | No | `2.1.0` | Systematic plugin version for OpenCode |
+| `session-retention` | No | `50` | Number of sessions to retain before pruning |
+| `s3-backup` | No | `false` | Enable S3-compatible object storage as canonical backend |
+| `s3-bucket` | No | — | Bucket name (required if `s3-backup` is true) |
+| `aws-region` | No | — | Region for the bucket (e.g. `us-east-1`, `auto` for R2) |
+| `s3-endpoint` | No | — | Custom endpoint URL for non-AWS providers (R2, B2, MinIO) |
+| `s3-prefix` | No | `fro-bot-state` | Prefix for all object keys |
+| `s3-expected-bucket-owner` | No | — | AWS account ID for bucket ownership pinning |
+| `s3-allow-insecure-endpoint` | No | `false` | Allow HTTP endpoints (local MinIO dev only) |
+| `s3-sse-encryption` | No | auto | `aws:kms` or `AES256` (auto-picked by endpoint) |
+| `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS |
+| `skip-cache` | No | `false` | Skip cache restore (useful for debugging) |
+| `omo-config` | No | — | Custom oMo configuration JSON (deep-merged) |
+| `systematic-config` | No | — | Custom Systematic configuration JSON (deep-merged) |
+| `opencode-config` | No | — | Custom OpenCode configuration JSON (deep-merged) |
 
 ### Action Outputs
 
@@ -482,9 +488,17 @@ jobs:
           prompt: ${{ inputs.prompt }}
 ```
 
-### S3 Backup for Long-Term Persistence
+### Durable Object Storage
 
-Enable S3 backup to protect against GitHub Actions cache eviction:
+Enable S3-compatible object storage as the canonical persistence backend. GitHub Actions cache acts as a hot accelerator; S3 is the source of truth and survives cache eviction.
+
+When enabled:
+
+1. Sessions, prompt artifacts, and run metadata are written to both cache and S3 on save
+2. Restore tries GitHub cache first (faster), falls back to S3 on miss/corruption
+3. S3 failures are logged but never fail the run
+
+#### AWS S3
 
 ```yaml
 - uses: fro-bot/agent@v0
@@ -494,20 +508,77 @@ Enable S3 backup to protect against GitHub Actions cache eviction:
     s3-backup: true
     s3-bucket: my-agent-sessions
     aws-region: us-east-1
+    s3-expected-bucket-owner: "123456789012"  # Your AWS account ID
   env:
     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
 
-When enabled, sessions are:
+#### Cloudflare R2
 
-1. Written to both cache and S3 simultaneously
-2. Restored from cache first (faster)
-3. Fallen back to S3 if cache misses or is corrupted
+```yaml
+- uses: fro-bot/agent@v0
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+    s3-backup: true
+    s3-bucket: my-agent-sessions
+    aws-region: auto
+    s3-endpoint: https://<account-id>.r2.cloudflarestorage.com
+    s3-sse-encryption: AES256  # R2 does not support aws:kms
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+```
+
+#### Backblaze B2
+
+```yaml
+- uses: fro-bot/agent@v0
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+    s3-backup: true
+    s3-bucket: my-agent-sessions
+    aws-region: us-west-004
+    s3-endpoint: https://s3.us-west-004.backblazeb2.com
+    s3-sse-encryption: AES256
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+```
+
+#### MinIO (local development only)
+
+```yaml
+- uses: fro-bot/agent@v0
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+    s3-backup: true
+    s3-bucket: agent-dev
+    aws-region: us-east-1
+    s3-endpoint: http://localhost:9000
+    s3-allow-insecure-endpoint: "true"  # Required for non-HTTPS endpoints
+    s3-sse-encryption: AES256
+  env:
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+```
+
+#### Security Defaults
+
+- **SSE-KMS** for AWS S3 (auto-selected when no custom endpoint); **AES256** for custom endpoints (R2/B2/MinIO)
+- **HTTPS required** unless `s3-allow-insecure-endpoint: true` is explicitly set
+- **SSRF protection**: link-local, loopback, and private IP endpoints are rejected by default
+- **Path traversal protection** on downloads — malicious S3 keys cannot escape the local storage directory
+- **Fork-PR writes are disabled** — prevents attacker-controlled prompts from writing to the canonical store
+- **Credentials** must come from env vars or IAM roles; never from action inputs
+- **IAM policy** requires `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` (with prefix condition); no `s3:DeleteObject` needed
 
 > [!TIP]
 >
-> S3 backup is recommended for production deployments where losing agent memory would significantly impact operations.
+> Durable object storage is recommended for production deployments where losing agent memory would significantly impact operations. The GitHub Actions cache remains a hot accelerator, so there is no latency penalty on cache hits.
 
 ## Troubleshooting
 

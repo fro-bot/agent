@@ -16,6 +16,15 @@ export const STATE_KEYS = {
   ARTIFACT_UPLOADED: 'artifactUploaded',
   /** OpenCode version detected during main action (for post-action cache path calculation) */
   OPENCODE_VERSION: 'opencodeVersion',
+  S3_ENABLED: 'storeConfig.enabled',
+  S3_BUCKET: 'storeConfig.bucket',
+  S3_REGION: 'storeConfig.region',
+  S3_PREFIX: 'storeConfig.prefix',
+  S3_ENDPOINT: 'storeConfig.endpoint',
+  S3_EXPECTED_BUCKET_OWNER: 'storeConfig.expectedBucketOwner',
+  S3_ALLOW_INSECURE_ENDPOINT: 'storeConfig.allowInsecureEndpoint',
+  S3_SSE_ENCRYPTION: 'storeConfig.sseEncryption',
+  S3_SSE_KMS_KEY_ID: 'storeConfig.sseKmsKeyId',
 } as const
 
 export type StateKey = (typeof STATE_KEYS)[keyof typeof STATE_KEYS]

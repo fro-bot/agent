@@ -35,6 +35,7 @@ function createMockMetrics(overrides: Partial<RunMetrics> = {}): RunMetrics {
     endTime: Date.now(),
     duration: 60000,
     cacheStatus: 'hit',
+    cacheSource: null,
     sessionsUsed: [],
     sessionsCreated: [],
     prsCreated: [],
