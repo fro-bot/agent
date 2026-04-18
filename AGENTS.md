@@ -53,6 +53,7 @@ GitHub Action harness for [OpenCode](https://opencode.ai/) + [oMo](https://githu
 ├── dist/                 # Bundled output (COMMITTED, must stay in sync)
 ├── RFCs/                 # 19 RFC documents (architecture specs)
 ├── docs/plans/           # Architecture plans and design docs
+├── docs/solutions/       # Documented solutions to past problems (bugs, best practices, workflow patterns) — searchable by YAML frontmatter (module, tags, problem_type)
 ├── action.yaml           # GitHub Action definition (node24)
 └── tsdown.config.ts      # esbuild bundler config (dual entry points)
 ```
