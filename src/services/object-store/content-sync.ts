@@ -1,6 +1,5 @@
 import type {Logger} from '../../shared/logger.js'
 import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
-import {randomUUID} from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -222,7 +221,12 @@ export async function syncMetadataToStore(
     return {success: false}
   }
 
-  const tempFilePath = path.join(os.tmpdir(), `fro-bot-metadata-${runId}-${randomUUID()}.json`)
+  // Create a private temp directory (mode 0700 on POSIX) before writing metadata
+  // to avoid CWE-377/378: files placed directly in os.tmpdir() are world-readable
+  // by default and the path is predictable, enabling information disclosure and
+  // race conditions with other users on shared runners.
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-metadata-'))
+  const tempFilePath = path.join(tempDir, `${runId}.json`)
 
   try {
     await fs.writeFile(tempFilePath, JSON.stringify(metadata, null, 2), 'utf8')
@@ -245,6 +249,6 @@ export async function syncMetadataToStore(
     })
     return {success: false}
   } finally {
-    await fs.rm(tempFilePath, {force: true})
+    await fs.rm(tempDir, {recursive: true, force: true})
   }
 }
