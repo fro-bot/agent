@@ -93,10 +93,11 @@ Credentials are handled with care:
 
 ## Action Inputs
 
-The action accepts 16 inputs defined in `action.yaml`. The most important ones:
+The action accepts 17 inputs defined in `action.yaml`. The most important ones:
 
 - `github-token` and `auth-json` are required — they provide GitHub API access and LLM provider credentials respectively.
 - `prompt` provides a custom instruction for the agent. Required for `schedule` and `workflow_dispatch` events.
+- `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). Determines whether file changes stay in the working directory for the caller workflow to commit, or whether the agent owns the branch/PR delivery. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
 - `agent` selects the OpenCode agent (default: `sisyphus`). Must be a primary agent, not a subagent.
 - `model` overrides the LLM model in `provider/model` format.
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
