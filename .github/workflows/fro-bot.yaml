@@ -201,5 +201,16 @@ jobs:
           model: ${{ vars.FRO_BOT_MODEL }}
           omo-providers: ${{ secrets.OMO_PROVIDERS }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
+          # Wiki paths opt into branch-pr explicitly so delivery contract is
+          # self-documenting and decoupled from prompt-wording drift. All other
+          # manual paths use auto, which resolves to working-dir for prompts
+          # without explicit branch/PR language (e.g., the daily DMR run).
+          # See docs/plans/2026-04-17-001-fix-manual-delivery-mode-plan.md.
+          output-mode: >-
+            ${{
+              (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && 'branch-pr')
+              || (github.event_name == 'schedule' && github.event.schedule == '0 20 * * 0' && 'branch-pr')
+              || 'auto'
+            }}
           prompt: ${{ env.PROMPT }}
           timeout: 0

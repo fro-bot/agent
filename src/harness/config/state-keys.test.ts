@@ -24,8 +24,20 @@ describe('state-keys', () => {
       expect(STATE_KEYS.ARTIFACT_UPLOADED).toBe('artifactUploaded')
     })
 
+    it('contains object store config state keys', () => {
+      expect(STATE_KEYS.S3_ENABLED).toBe('storeConfig.enabled')
+      expect(STATE_KEYS.S3_BUCKET).toBe('storeConfig.bucket')
+      expect(STATE_KEYS.S3_REGION).toBe('storeConfig.region')
+      expect(STATE_KEYS.S3_PREFIX).toBe('storeConfig.prefix')
+      expect(STATE_KEYS.S3_ENDPOINT).toBe('storeConfig.endpoint')
+      expect(STATE_KEYS.S3_EXPECTED_BUCKET_OWNER).toBe('storeConfig.expectedBucketOwner')
+      expect(STATE_KEYS.S3_ALLOW_INSECURE_ENDPOINT).toBe('storeConfig.allowInsecureEndpoint')
+      expect(STATE_KEYS.S3_SSE_ENCRYPTION).toBe('storeConfig.sseEncryption')
+      expect(STATE_KEYS.S3_SSE_KMS_KEY_ID).toBe('storeConfig.sseKmsKeyId')
+    })
+
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(5)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(14)
     })
 
     it('values are string type compatible', () => {

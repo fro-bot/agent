@@ -57,6 +57,7 @@ export async function runRouting(
     })
     setActionOutputs({
       sessionId: null,
+      resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration: Date.now() - startTime,
     })

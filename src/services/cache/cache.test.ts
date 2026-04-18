@@ -1,9 +1,11 @@
 import type {Logger} from '../../shared/logger.js'
+import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/index.js'
 import type {CacheKeyComponents} from './cache-key.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {ok} from '../../shared/types.js'
 import {
   isAuthPathSafe,
   isPathInsideDirectory,
@@ -49,6 +51,22 @@ function createMockCacheAdapter(options: {
   }
 }
 
+function createMockStoreAdapter(overrides: Partial<ObjectStoreAdapter> = {}): ObjectStoreAdapter {
+  return {
+    upload: async () => ok(undefined),
+    download: async () => ok(undefined),
+    list: async () => ok([]),
+    ...overrides,
+  }
+}
+
+const testStoreConfig: ObjectStoreConfig = {
+  enabled: true,
+  bucket: 'test-bucket',
+  region: 'us-east-1',
+  prefix: 'fro-bot-state',
+}
+
 describe('restoreCache', () => {
   let tempDir: string
   let storagePath: string
@@ -82,6 +100,7 @@ describe('restoreCache', () => {
     expect(result.hit).toBe(false)
     expect(result.key).toBeNull()
     expect(result.corrupted).toBe(false)
+    expect(result.source).toBeNull()
   })
 
   it('returns hit: true with key on cache hit', async () => {
@@ -108,6 +127,29 @@ describe('restoreCache', () => {
     expect(result.hit).toBe(true)
     expect(result.key).toBe(restoredKey)
     expect(result.corrupted).toBe(false)
+    expect(result.source).toBe('cache')
+  })
+
+  it('does not call object store on cache hit', async () => {
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const storeAdapter = createMockStoreAdapter({
+      list: vi.fn(async () => ok([])),
+    })
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: 'cache-key'}),
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    expect(result).toMatchObject({hit: true, source: 'cache'})
+    expect(storeAdapter.list).not.toHaveBeenCalled()
   })
 
   it('detects corruption when storage is not a directory', async () => {
@@ -130,9 +172,10 @@ describe('restoreCache', () => {
     // #when restoring cache
     const result = await restoreCache(options)
 
-    // #then result indicates corruption
-    expect(result.hit).toBe(true)
+    // #then result indicates corruption and falls back to miss semantics without object store
+    expect(result.hit).toBe(false)
     expect(result.corrupted).toBe(true)
+    expect(result.source).toBeNull()
   })
 
   it('detects version mismatch and treats as corruption', async () => {
@@ -154,9 +197,10 @@ describe('restoreCache', () => {
     // #when restoring cache
     const result = await restoreCache(options)
 
-    // #then version mismatch is treated as corruption
-    expect(result.hit).toBe(true)
+    // #then version mismatch is treated as corruption and falls back to miss semantics without object store
+    expect(result.hit).toBe(false)
     expect(result.corrupted).toBe(true)
+    expect(result.source).toBeNull()
   })
 
   it('deletes auth.json if present inside storage after restore', async () => {
@@ -229,6 +273,7 @@ describe('restoreCache', () => {
     // #then returns miss result
     expect(result.hit).toBe(false)
     expect(result.corrupted).toBe(false)
+    expect(result.source).toBeNull()
   })
 
   it('accepts matching version file', async () => {
@@ -254,6 +299,7 @@ describe('restoreCache', () => {
     // #then no corruption detected
     expect(result.hit).toBe(true)
     expect(result.corrupted).toBe(false)
+    expect(result.source).toBe('cache')
   })
 
   it('treats missing version file as compatible (first run)', async () => {
@@ -278,6 +324,112 @@ describe('restoreCache', () => {
     // #then no corruption (legacy compatibility)
     expect(result.hit).toBe(true)
     expect(result.corrupted).toBe(false)
+    expect(result.source).toBe('cache')
+  })
+
+  it('restores from object store on cache miss when configured', async () => {
+    const list = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']))
+    const download = vi.fn(async (key: string, localPath: string) => {
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, key)
+      return ok(undefined)
+    })
+    const storeAdapter = createMockStoreAdapter({list, download})
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    expect(result).toMatchObject({hit: true, source: 'storage', corrupted: false, restoredPath: storagePath})
+    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
+    await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db'), 'utf8')).resolves.toContain(
+      'opencode.db',
+    )
+  })
+
+  it('returns miss with null source on cache miss when object store is not configured', async () => {
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+    })
+
+    expect(result).toEqual({
+      hit: false,
+      key: null,
+      restoredPath: null,
+      corrupted: false,
+      source: null,
+    })
+  })
+
+  it('returns miss when object store download fails after cache miss', async () => {
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const storeAdapter = createMockStoreAdapter({
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']),
+      download: async () => ({success: false, error: new Error('download failed')}),
+    })
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    expect(result).toEqual({
+      hit: false,
+      key: null,
+      restoredPath: null,
+      corrupted: false,
+      source: null,
+    })
+    expect(logger.warning).toHaveBeenCalled()
+  })
+
+  it('returns miss when object store rejects malicious traversal key after cache miss', async () => {
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const download = vi.fn(async () => ok(undefined))
+    const storeAdapter = createMockStoreAdapter({
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/../escape.db']),
+      download,
+    })
+
+    const result = await restoreCache({
+      components: testComponents,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter,
+    })
+
+    expect(result.source).toBeNull()
+    expect(result.hit).toBe(false)
+    expect(download).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalled()
   })
 })
 
@@ -316,6 +468,101 @@ describe('saveCache', () => {
 
     // #then returns success
     expect(result).toBe(true)
+  })
+
+  it('writes to object store and cache when configured', async () => {
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const dbDir = path.dirname(storagePath)
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal data')
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm data')
+
+    const upload = vi.fn(async () => ok(undefined))
+    const saveCacheSpy = vi.fn(async () => 1)
+
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.3.13',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({upload}),
+    })
+
+    expect(result).toBe(true)
+    expect(upload).toHaveBeenCalledTimes(3)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    expect(upload.mock.invocationCallOrder[0]).toBeLessThan(saveCacheSpy.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('writes to cache only when object store is not configured', async () => {
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const saveCacheSpy = vi.fn(async () => 1)
+    const storeAdapter = createMockStoreAdapter({upload: vi.fn(async () => ok(undefined))})
+
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+      storeAdapter,
+    })
+
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    expect(storeAdapter.upload).not.toHaveBeenCalled()
+  })
+
+  it('continues cache save when object store upload fails', async () => {
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const dbDir = path.dirname(storagePath)
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'main db')
+
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    }
+    const saveCacheSpy = vi.fn(async () => 1)
+
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath,
+      opencodeVersion: '1.3.13',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({
+        upload: async () => ({success: false, error: new Error('upload failed')}),
+      }),
+    })
+
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalled()
   })
 
   it('returns false when storage has no content', async () => {

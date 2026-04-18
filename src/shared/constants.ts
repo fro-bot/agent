@@ -20,11 +20,11 @@ export const DEFAULT_MODEL = {
 } as const
 
 // Setup consolidation defaults
-export const DEFAULT_OPENCODE_VERSION = '1.4.7'
+export const DEFAULT_OPENCODE_VERSION = '1.4.11'
 export const DEFAULT_BUN_VERSION = '1.3.12'
 export const DEFAULT_OMO_VERSION = '3.17.4'
 export const DEFAULT_OMO_PROVIDERS = ''
-export const DEFAULT_SYSTEMATIC_VERSION = '2.3.3'
+export const DEFAULT_SYSTEMATIC_VERSION = '2.4.0'
 
 // Retry configuration
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const
@@ -32,6 +32,7 @@ export const LLM_RETRY_DELAY_MS = 10_000
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
+export const DEFAULT_S3_PREFIX = 'fro-bot-state' as const
 export const TOOLS_CACHE_PREFIX = 'opencode-tools' as const
 
 // Dedup execution defaults

@@ -26,9 +26,10 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
 
   logger.info('Action inputs parsed', {
     sessionRetention: inputs.sessionRetention,
-    s3Backup: inputs.s3Backup,
+    s3Backup: inputs.storeConfig.enabled,
     hasGithubToken: inputs.githubToken.length > 0,
     hasPrompt: inputs.prompt != null,
+    outputMode: inputs.outputMode,
     agent: inputs.agent,
     hasModelOverride: inputs.model != null,
     timeoutMs: inputs.timeoutMs,
@@ -53,6 +54,15 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   }
 
   core.saveState(STATE_KEYS.OPENCODE_VERSION, opencodeResult.version)
+  core.saveState(STATE_KEYS.S3_ENABLED, String(inputs.storeConfig.enabled))
+  core.saveState(STATE_KEYS.S3_BUCKET, inputs.storeConfig.bucket)
+  core.saveState(STATE_KEYS.S3_REGION, inputs.storeConfig.region)
+  core.saveState(STATE_KEYS.S3_PREFIX, inputs.storeConfig.prefix)
+  core.saveState(STATE_KEYS.S3_ENDPOINT, inputs.storeConfig.endpoint ?? '')
+  core.saveState(STATE_KEYS.S3_EXPECTED_BUCKET_OWNER, inputs.storeConfig.expectedBucketOwner ?? '')
+  core.saveState(STATE_KEYS.S3_ALLOW_INSECURE_ENDPOINT, String(inputs.storeConfig.allowInsecureEndpoint === true))
+  core.saveState(STATE_KEYS.S3_SSE_ENCRYPTION, inputs.storeConfig.sseEncryption ?? '')
+  core.saveState(STATE_KEYS.S3_SSE_KMS_KEY_ID, inputs.storeConfig.sseKmsKeyId ?? '')
   bootstrapLogger.debug('Bootstrap phase completed', {opencodeVersion: opencodeResult.version})
 
   return {

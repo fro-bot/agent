@@ -174,6 +174,9 @@ export default defineConfig({
     if (id.startsWith('@octokit/auth-app')) return true
     // Bundle @opencode-ai/sdk (RFC-013)
     if (id.startsWith('@opencode-ai/sdk')) return true
+    // Bundle @aws-sdk/client-s3 and @smithy transitive deps (durable object storage)
+    if (id.startsWith('@aws-sdk/')) return true
+    if (id.startsWith('@smithy/')) return true
     return false
   },
 })

@@ -1,4 +1,4 @@
-import type {TokenUsage} from '../../shared/types.js'
+import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 
 export interface ErrorRecord {
   readonly timestamp: string
@@ -12,6 +12,7 @@ export interface RunMetrics {
   readonly endTime: number | null
   readonly duration: number | null
   readonly cacheStatus: 'hit' | 'miss' | 'corrupted'
+  readonly cacheSource: 'cache' | 'storage' | null
   readonly sessionsUsed: readonly string[]
   readonly sessionsCreated: readonly string[]
   readonly prsCreated: readonly string[]
@@ -31,4 +32,5 @@ export interface CommentSummaryOptions {
   readonly runUrl: string
   readonly metrics: RunMetrics
   readonly agent: string
+  readonly resolvedOutputMode: ResolvedOutputMode | null
 }

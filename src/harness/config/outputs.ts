@@ -8,6 +8,7 @@ import * as core from '@actions/core'
  */
 export function setActionOutputs(outputs: ActionOutputs): void {
   core.setOutput('session-id', outputs.sessionId ?? '')
+  core.setOutput('resolved-output-mode', outputs.resolvedOutputMode ?? '')
   core.setOutput('cache-status', outputs.cacheStatus)
   core.setOutput('duration', outputs.duration)
 }

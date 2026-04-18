@@ -4,64 +4,12 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {isSqliteBackend} from '../session/version.js'
+import {createS3Adapter, syncSessionsFromStore} from '../object-store/index.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
+import {buildRestoreCachePaths, deleteAuthJson, isAuthPathSafe, isPathInsideDirectory} from './paths.js'
 import {defaultCacheAdapter, type RestoreCacheOptions} from './types.js'
 
-async function buildCachePaths(
-  storagePath: string,
-  projectIdPath: string | undefined,
-  opencodeVersion: string | null | undefined,
-): Promise<string[]> {
-  const paths = [storagePath]
-  if (projectIdPath != null) {
-    paths.push(projectIdPath)
-  }
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
-    paths.push(dbPath)
-    // Include WAL and SHM files for restore — they may exist in the archive
-    // if the server was running (WAL mode) when the cache was saved.
-    paths.push(`${dbPath}-wal`)
-    paths.push(`${dbPath}-shm`)
-  }
-  return paths
-}
-
-export function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
-  const resolvedFile = path.resolve(filePath)
-  const resolvedDir = path.resolve(directoryPath)
-  return resolvedFile.startsWith(resolvedDir + path.sep)
-}
-
-export function isAuthPathSafe(authPath: string, storagePath: string): boolean {
-  return !isPathInsideDirectory(authPath, storagePath)
-}
-
-async function deleteAuthJson(
-  authPath: string,
-  storagePath: string,
-  logger: RestoreCacheOptions['logger'],
-): Promise<void> {
-  if (!isPathInsideDirectory(authPath, storagePath)) {
-    logger.debug('auth.json is outside storage path - skipping deletion', {
-      authPath,
-      storagePath,
-    })
-    return
-  }
-
-  try {
-    await fs.unlink(authPath)
-    logger.debug('Deleted auth.json from cache storage')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      logger.warning('Failed to delete auth.json', {
-        error: toErrorMessage(error),
-      })
-    }
-  }
-}
+export {isAuthPathSafe, isPathInsideDirectory}
 
 async function checkStorageCorruption(storagePath: string, logger: RestoreCacheOptions['logger']): Promise<boolean> {
   try {
@@ -101,6 +49,71 @@ async function cleanStorage(storagePath: string): Promise<void> {
   } catch {}
 }
 
+async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<CacheResult> {
+  const {storeConfig, storeAdapter, logger, storagePath, components} = options
+
+  if (storeConfig?.enabled !== true) {
+    return {
+      hit: false,
+      key: null,
+      restoredPath: null,
+      corrupted: false,
+      source: null,
+    }
+  }
+
+  const adapter = storeAdapter ?? createS3Adapter(storeConfig, logger)
+  const syncResult = await syncSessionsFromStore(
+    adapter,
+    storeConfig,
+    components.agentIdentity,
+    components.repo,
+    storagePath,
+    logger,
+  )
+
+  if (syncResult.mainDbRestored === true) {
+    await fs.mkdir(storagePath, {recursive: true})
+    return {
+      hit: true,
+      key: null,
+      restoredPath: storagePath,
+      corrupted: false,
+      source: 'storage',
+    }
+  }
+
+  if (syncResult.downloaded > 0) {
+    logger.warning('Object store returned session sidecar files without main DB - treating as miss', {
+      downloaded: syncResult.downloaded,
+      failed: syncResult.failed,
+    })
+  }
+
+  return {
+    hit: false,
+    key: null,
+    restoredPath: null,
+    corrupted: false,
+    source: null,
+  }
+}
+
+async function restoreAfterCorruption(options: RestoreCacheOptions, restoredKey: string): Promise<CacheResult> {
+  const fallback = await restoreFromObjectStore(options)
+  if (fallback.hit === true) {
+    return fallback
+  }
+
+  return {
+    hit: false,
+    key: restoredKey,
+    restoredPath: null,
+    corrupted: true,
+    source: null,
+  }
+}
+
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
   const {
     components,
@@ -120,12 +133,13 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
       key: null,
       restoredPath: null,
       corrupted: false,
+      source: null,
     }
   }
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const cachePaths = await buildRestoreCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
@@ -135,12 +149,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     if (restoredKey == null) {
       logger.info('Cache miss - starting with fresh state')
       await fs.mkdir(storagePath, {recursive: true})
-      return {
-        hit: false,
-        key: null,
-        restoredPath: null,
-        corrupted: false,
-      }
+      return await restoreFromObjectStore(options)
     }
 
     logger.info('Cache restored', {restoredKey})
@@ -149,24 +158,14 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     if (isCorrupted === true) {
       logger.warning('Cache corruption detected - proceeding with clean state')
       await cleanStorage(storagePath)
-      return {
-        hit: true,
-        key: restoredKey,
-        restoredPath: storagePath,
-        corrupted: true,
-      }
+      return await restoreAfterCorruption(options, restoredKey)
     }
 
     const versionMatch = await checkStorageVersion(storagePath, logger)
     if (versionMatch === false) {
       logger.warning('Storage version mismatch - proceeding with clean state')
       await cleanStorage(storagePath)
-      return {
-        hit: true,
-        key: restoredKey,
-        restoredPath: storagePath,
-        corrupted: true,
-      }
+      return await restoreAfterCorruption(options, restoredKey)
     }
 
     await deleteAuthJson(authPath, storagePath, logger)
@@ -176,16 +175,12 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
       key: restoredKey,
       restoredPath: storagePath,
       corrupted: false,
+      source: 'cache',
     }
   } catch (error) {
     logger.warning('Cache restore failed', {
       error: toErrorMessage(error),
     })
-    return {
-      hit: false,
-      key: null,
-      restoredPath: null,
-      corrupted: false,
-    }
+    return restoreFromObjectStore(options)
   }
 }

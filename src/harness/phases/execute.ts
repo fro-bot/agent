@@ -1,14 +1,14 @@
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {ErrorInfo} from '../../features/comments/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
-import type {TokenUsage} from '../../shared/types.js'
+import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {executeOpenCode} from '../../features/agent/index.js'
+import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {findLatestSession, writeSessionSummary} from '../../services/session/index.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -25,6 +25,7 @@ export interface ExecutePhaseResult {
   readonly commitsCreated: readonly string[]
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
+  readonly resolvedOutputMode: ResolvedOutputMode | null
 }
 
 export async function runExecute(
@@ -35,6 +36,12 @@ export async function runExecute(
   metrics: MetricsCollector,
   startTime: number,
 ): Promise<ExecutePhaseResult> {
+  const resolvedOutputMode = resolveOutputMode(
+    routing.triggerResult.context.eventType,
+    bootstrap.inputs.prompt,
+    bootstrap.inputs.outputMode,
+  )
+
   const promptOptions: PromptOptions = {
     context: routing.agentContext,
     customPrompt: bootstrap.inputs.prompt,
@@ -47,6 +54,7 @@ export async function runExecute(
     isContinuation: sessionPrep.isContinuation,
     currentThreadSessionId: sessionPrep.continueSessionId ?? null,
     triggerContext: routing.triggerResult.context,
+    resolvedOutputMode,
     fileParts: sessionPrep.attachmentResult?.fileParts,
   }
 
@@ -68,6 +76,7 @@ export async function runExecute(
       commitsCreated: [],
       commentsPosted: 0,
       llmError: null,
+      resolvedOutputMode,
     }
   } else {
     const execLogger = createLogger({phase: 'execution'})
@@ -105,6 +114,7 @@ export async function runExecute(
     result = {
       ...execResult,
       sessionId,
+      resolvedOutputMode,
     }
 
     execLogger.info('Completed OpenCode execution', {

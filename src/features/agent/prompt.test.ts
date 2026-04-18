@@ -132,7 +132,7 @@ describe('buildAgentPrompt', () => {
     expect(prompt).not.toContain('## Reminder: Critical Rules')
 
     const harnessRulesIndex = prompt.indexOf('<harness_rules>')
-    const taskIndex = prompt.indexOf('<task>')
+    const taskIndex = prompt.indexOf('\n<task>\n')
 
     expect(harnessRulesIndex).toBe(0)
     expect(taskIndex).toBeGreaterThan(harnessRulesIndex)
@@ -219,7 +219,7 @@ describe('buildAgentPrompt', () => {
 
     const sessionContextIndex = prompt.indexOf('<session_context>')
     const currentThreadIndex = prompt.indexOf('<current_thread>')
-    const taskIndex = prompt.indexOf('<task>')
+    const taskIndex = prompt.indexOf('\n<task>\n')
 
     expect(currentThreadIndex).toBeGreaterThan(-1)
     expect(sessionContextIndex).toBeGreaterThan(-1)
@@ -811,7 +811,7 @@ describe('buildAgentPrompt', () => {
     const issueContextIndex = prompt.indexOf('<issue>')
     const sessionIndex = prompt.indexOf('<session_context>')
     const triggerCommentIndex = prompt.indexOf('<trigger_comment>')
-    const taskIndex = prompt.indexOf('<task>')
+    const taskIndex = prompt.indexOf('\n<task>\n')
     const agentContextIndex = prompt.indexOf('<agent_context>')
 
     expect(harnessRulesIndex).toBe(0)
@@ -1578,7 +1578,7 @@ describe('buildTaskSection', () => {
     const context = createMockTriggerContext({eventType: 'issue_comment'})
 
     // #when
-    const section = buildTaskSection(context, null)
+    const section = buildTaskSection(context, null, null)
 
     // #then
     expect(section).toContain('## Task')
@@ -1592,7 +1592,7 @@ describe('buildTaskSection', () => {
     const customPrompt = 'Focus on security issues'
 
     // #when
-    const section = buildTaskSection(context, customPrompt)
+    const section = buildTaskSection(context, customPrompt, null)
 
     // #then
     expect(section).toContain('## Task')
@@ -1607,7 +1607,7 @@ describe('buildTaskSection', () => {
     const customPrompt = 'Run maintenance tasks'
 
     // #when
-    const section = buildTaskSection(context, customPrompt)
+    const section = buildTaskSection(context, customPrompt, null)
 
     // #then
     expect(section).toContain('## Task')
@@ -1632,7 +1632,7 @@ describe('buildTaskSection', () => {
     })
 
     // #when
-    const section = buildTaskSection(context, null)
+    const section = buildTaskSection(context, null, null)
 
     // #then
     expect(section).toContain('**File:** `src/api/handler.ts`')
@@ -1684,6 +1684,127 @@ describe('buildTaskSection', () => {
     // #then
     expect(getXmlBlock(prompt, 'task')).toContain('Run maintenance tasks')
     expect(prompt).not.toContain('<user_supplied_instructions>\n')
+  })
+
+  it('renders working-dir preamble before ## Task heading for workflow_dispatch with output-mode: working-dir', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'workflow_dispatch',
+        issueNumber: null,
+        issueTitle: null,
+        issueType: null,
+        commentBody: null,
+      }),
+      customPrompt: 'Update README.md with the latest setup steps.',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'workflow_dispatch', target: null, commentBody: null}),
+      resolvedOutputMode: 'working-dir',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then
+    expect(taskBlock).toContain('## Delivery Mode')
+    expect(taskBlock).toContain('**Resolved output mode:** `working-dir`')
+    expect(taskBlock.indexOf('## Delivery Mode')).toBeLessThan(taskBlock.indexOf('## Task'))
+    expect(taskBlock).toContain('Update README.md with the latest setup steps.')
+  })
+
+  it('renders branch-pr preamble before ## Task heading for workflow_dispatch with output-mode: branch-pr', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'workflow_dispatch',
+        issueNumber: null,
+        issueTitle: null,
+        issueType: null,
+        commentBody: null,
+      }),
+      customPrompt: 'Refresh the docs and open a PR.',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'workflow_dispatch', target: null, commentBody: null}),
+      resolvedOutputMode: 'branch-pr',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then
+    expect(taskBlock).toContain('## Delivery Mode')
+    expect(taskBlock).toContain('**Resolved output mode:** `branch-pr`')
+    expect(taskBlock.indexOf('## Delivery Mode')).toBeLessThan(taskBlock.indexOf('## Task'))
+    expect(taskBlock).toContain('Refresh the docs and open a PR.')
+  })
+
+  it('does not render Delivery Mode preamble for issue_comment trigger', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext(),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'issue_comment'}),
+      resolvedOutputMode: 'working-dir',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then
+    expect(taskBlock).not.toContain('## Delivery Mode')
+    expect(taskBlock).toContain('## Task')
+  })
+
+  it('does not render Delivery Mode preamble for pull_request trigger (self-review regression)', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'pull_request',
+        issueType: 'pr',
+        issueNumber: 99,
+        commentBody: null,
+      }),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({
+        eventType: 'pull_request',
+        target: {kind: 'pr', number: 99, title: 'feat: add feature', body: '', locked: false, isDraft: false},
+      }),
+      resolvedOutputMode: 'branch-pr',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then
+    expect(taskBlock).not.toContain('## Delivery Mode')
+    expect(taskBlock).toContain('## Task')
+  })
+
+  it('preamble defers to <harness_rules> authority and does not re-declare priority', () => {
+    // #given
+    const options: PromptOptions = {
+      context: createMockContext({
+        eventName: 'workflow_dispatch',
+        issueNumber: null,
+        issueTitle: null,
+        issueType: null,
+        commentBody: null,
+      }),
+      customPrompt: 'Update docs/wiki/index.md',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'workflow_dispatch', target: null, commentBody: null}),
+      resolvedOutputMode: 'working-dir',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then
+    expect(taskBlock).toContain('## Delivery Mode')
+    expect(taskBlock).not.toContain('takes priority')
+    expect(taskBlock).not.toContain('overrides any conflicting')
   })
 })
 
