@@ -5,64 +5,11 @@ import process from 'node:process'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createS3Adapter, syncSessionsFromStore} from '../object-store/index.js'
-import {isSqliteBackend} from '../session/version.js'
 import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
+import {buildRestoreCachePaths, deleteAuthJson, isAuthPathSafe, isPathInsideDirectory} from './paths.js'
 import {defaultCacheAdapter, type RestoreCacheOptions} from './types.js'
 
-async function buildCachePaths(
-  storagePath: string,
-  projectIdPath: string | undefined,
-  opencodeVersion: string | null | undefined,
-): Promise<string[]> {
-  const paths = [storagePath]
-  if (projectIdPath != null) {
-    paths.push(projectIdPath)
-  }
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbPath = path.join(path.dirname(storagePath), 'opencode.db')
-    paths.push(dbPath)
-    // Include WAL and SHM files for restore — they may exist in the archive
-    // if the server was running (WAL mode) when the cache was saved.
-    paths.push(`${dbPath}-wal`)
-    paths.push(`${dbPath}-shm`)
-  }
-  return paths
-}
-
-export function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
-  const resolvedFile = path.resolve(filePath)
-  const resolvedDir = path.resolve(directoryPath)
-  return resolvedFile.startsWith(resolvedDir + path.sep)
-}
-
-export function isAuthPathSafe(authPath: string, storagePath: string): boolean {
-  return !isPathInsideDirectory(authPath, storagePath)
-}
-
-async function deleteAuthJson(
-  authPath: string,
-  storagePath: string,
-  logger: RestoreCacheOptions['logger'],
-): Promise<void> {
-  if (!isPathInsideDirectory(authPath, storagePath)) {
-    logger.debug('auth.json is outside storage path - skipping deletion', {
-      authPath,
-      storagePath,
-    })
-    return
-  }
-
-  try {
-    await fs.unlink(authPath)
-    logger.debug('Deleted auth.json from cache storage')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      logger.warning('Failed to delete auth.json', {
-        error: toErrorMessage(error),
-      })
-    }
-  }
-}
+export {isAuthPathSafe, isPathInsideDirectory}
 
 async function checkStorageCorruption(storagePath: string, logger: RestoreCacheOptions['logger']): Promise<boolean> {
   try {
@@ -192,7 +139,7 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
 
   const primaryKey = buildPrimaryCacheKey(components)
   const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const cachePaths = await buildRestoreCachePaths(storagePath, projectIdPath, opencodeVersion)
 
   logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 

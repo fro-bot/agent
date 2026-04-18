@@ -328,7 +328,7 @@ describe('restoreCache', () => {
   })
 
   it('restores from object store on cache miss when configured', async () => {
-    const list = vi.fn(async () => ok(['fro-bot-state/github/owner-repo/sessions/opencode.db']))
+    const list = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']))
     const download = vi.fn(async (key: string, localPath: string) => {
       await fs.mkdir(path.dirname(localPath), {recursive: true})
       await fs.writeFile(localPath, key)
@@ -347,7 +347,7 @@ describe('restoreCache', () => {
     })
 
     expect(result).toMatchObject({hit: true, source: 'storage', corrupted: false, restoredPath: storagePath})
-    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner-repo/sessions/')
+    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
     await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db'), 'utf8')).resolves.toContain(
       'opencode.db',
     )
@@ -379,7 +379,7 @@ describe('restoreCache', () => {
       error: vi.fn(),
     }
     const storeAdapter = createMockStoreAdapter({
-      list: async () => ok(['fro-bot-state/github/owner-repo/sessions/opencode.db']),
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']),
       download: async () => ({success: false, error: new Error('download failed')}),
     })
 
@@ -412,7 +412,7 @@ describe('restoreCache', () => {
     }
     const download = vi.fn(async () => ok(undefined))
     const storeAdapter = createMockStoreAdapter({
-      list: async () => ok(['fro-bot-state/github/owner-repo/sessions/../escape.db']),
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/../escape.db']),
       download,
     })
 

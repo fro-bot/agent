@@ -29,13 +29,17 @@ function readOptionalState(key: string): string | undefined {
 function reconstructStoreConfigFromState(): ObjectStoreConfig | undefined {
   const enabled = readOptionalState(STATE_KEYS.S3_ENABLED)
   const bucket = readOptionalState(STATE_KEYS.S3_BUCKET)
-  const region = readOptionalState(STATE_KEYS.S3_REGION)
   const prefix = readOptionalState(STATE_KEYS.S3_PREFIX)
 
-  if (enabled == null || bucket == null || region == null || prefix == null) {
+  // Region is intentionally not part of the required guard. Non-AWS providers
+  // (Cloudflare R2, MinIO, Backblaze B2) may run with an empty region value,
+  // and core.getState returns '' → undefined for readOptionalState. Requiring
+  // region here would silently disable post-action S3 sync for those providers.
+  if (enabled == null || bucket == null || prefix == null) {
     return undefined
   }
 
+  const region = readOptionalState(STATE_KEYS.S3_REGION) ?? ''
   const endpoint = readOptionalState(STATE_KEYS.S3_ENDPOINT)
   const expectedBucketOwner = readOptionalState(STATE_KEYS.S3_EXPECTED_BUCKET_OWNER)
   const allowInsecureEndpoint = readOptionalState(STATE_KEYS.S3_ALLOW_INSECURE_ENDPOINT)

@@ -170,7 +170,7 @@ describe('restore/save object-store integration flow', () => {
 
     // #then object store and cache both receive the save
     expect(saveResult).toBe(true)
-    expect(store.objects.get('fro-bot-state/github/owner-repo/sessions/opencode.db')?.toString('utf8')).toBe(
+    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
       'first-run-db',
     )
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
@@ -179,7 +179,7 @@ describe('restore/save object-store integration flow', () => {
   it('restores from object store on second run after cache miss', async () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter({
-      initialObjects: new Map([['fro-bot-state/github/owner-repo/sessions/opencode.db', Buffer.from('second-run-db')]]),
+      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('second-run-db')]]),
     })
 
     const restoreOptions: RestoreCacheOptions = {
@@ -211,7 +211,7 @@ describe('restore/save object-store integration flow', () => {
     const cache = createMockCacheAdapter('restored-cache-key')
     const store = createInMemoryStoreAdapter({
       initialObjects: new Map([
-        ['fro-bot-state/github/owner-repo/sessions/opencode.db', Buffer.from('stale-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('stale-store-db')],
       ]),
     })
 
@@ -259,7 +259,7 @@ describe('restore/save object-store integration flow', () => {
 
     // #then both object store and cache receive the updated session database
     expect(saveResult).toBe(true)
-    expect(store.objects.get('fro-bot-state/github/owner-repo/sessions/opencode.db')?.toString('utf8')).toBe(
+    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
       'cache-hit-db',
     )
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
@@ -268,7 +268,7 @@ describe('restore/save object-store integration flow', () => {
   it('rejects malicious object-store keys during restore', async () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter({
-      initialObjects: new Map([['fro-bot-state/github/owner-repo/sessions/../escape.db', Buffer.from('escape')]]),
+      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions/../escape.db', Buffer.from('escape')]]),
     })
 
     const restoreOptions: RestoreCacheOptions = {

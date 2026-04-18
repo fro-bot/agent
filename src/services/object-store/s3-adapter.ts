@@ -40,16 +40,27 @@ function logS3Error(logger: Logger, operation: string, error: unknown): Error {
   return createObjectStoreOperationError(`Object store ${operation} failed: ${message}`)
 }
 
+const S3_MAX_ATTEMPTS = 3
+const S3_LIST_MAX_ITERATIONS = 100
+
+function toRegion(config: ObjectStoreConfig): string | undefined {
+  return config.region.length > 0 ? config.region : undefined
+}
+
 function createClient(config: ObjectStoreConfig): S3Client {
+  const maxAttempts = S3_MAX_ATTEMPTS
+  const region = toRegion(config)
+
   if (config.endpoint != null) {
     return new S3Client({
       endpoint: config.endpoint,
       forcePathStyle: true,
-      region: config.region,
+      maxAttempts,
+      region,
     })
   }
 
-  return new S3Client({region: config.region})
+  return new S3Client({maxAttempts, region})
 }
 
 function getEffectiveEncryption(config: ObjectStoreConfig): 'AES256' | 'aws:kms' {
@@ -133,8 +144,19 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
       try {
         const keys: string[] = []
         let continuationToken: string | undefined
+        let iterations = 0
 
         do {
+          if (iterations >= S3_LIST_MAX_ITERATIONS) {
+            logger.warning('Object store list hit iteration cap, truncating result', {
+              prefix,
+              maxIterations: S3_LIST_MAX_ITERATIONS,
+              keysReturned: keys.length,
+            })
+            break
+          }
+          iterations++
+
           const response = await client.send(
             new ListObjectsV2Command({
               Bucket: config.bucket,

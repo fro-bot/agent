@@ -316,7 +316,34 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('cloud instance metadata services')
+    })
+
+    it('rejects a non-metadata link-local endpoint', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'https://169.254.1.1',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('loopback, link-local, or private network addresses')
+    })
+
+    it('rejects cloud metadata service endpoints even when insecure endpoints are allowed', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'http://169.254.169.254',
+        's3-allow-insecure-endpoint': 'true',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('cloud instance metadata services')
     })
 
     it('rejects an invalid prefix', () => {

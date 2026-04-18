@@ -140,14 +140,14 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
     expect(sendMock).toHaveBeenCalledTimes(1)
     expect(getCommandInput(0)).toMatchObject({
       Bucket: 'test-bucket',
-      Key: 'fro-bot-state/github/owner-repo/sessions/opencode.db',
+      Key: 'fro-bot-state/github/owner/repo/sessions/opencode.db',
       ServerSideEncryption: 'aws:kms',
     })
   })
@@ -161,7 +161,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -177,7 +177,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -196,7 +196,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -212,7 +212,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -231,7 +231,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -248,7 +248,7 @@ describe('createS3Adapter', () => {
     await fs.writeFile(localPath, 'db-bytes')
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)
@@ -270,7 +270,7 @@ describe('createS3Adapter', () => {
     const adapter = createS3Adapter(baseConfig, logger)
 
     // #when
-    const result = await adapter.upload('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(false)
@@ -289,25 +289,25 @@ describe('createS3Adapter', () => {
     // #given
     sendMock
       .mockResolvedValueOnce({
-        Contents: [{Key: 'fro-bot-state/github/owner-repo/sessions/opencode.db'}],
+        Contents: [{Key: 'fro-bot-state/github/owner/repo/sessions/opencode.db'}],
         IsTruncated: true,
         NextContinuationToken: 'page-2',
       })
       .mockResolvedValueOnce({
-        Contents: [{Key: 'fro-bot-state/github/owner-repo/sessions/opencode.db-wal'}],
+        Contents: [{Key: 'fro-bot-state/github/owner/repo/sessions/opencode.db-wal'}],
         IsTruncated: false,
       })
     const logger = createLogger()
     const adapter = createS3Adapter(baseConfig, logger)
 
     // #when
-    const result = await adapter.list('fro-bot-state/github/owner-repo/sessions/')
+    const result = await adapter.list('fro-bot-state/github/owner/repo/sessions/')
 
     // #then
     expect(result.success).toBe(true)
     expect(result.success && result.data).toEqual([
-      'fro-bot-state/github/owner-repo/sessions/opencode.db',
-      'fro-bot-state/github/owner-repo/sessions/opencode.db-wal',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
     ])
     expect(sendMock).toHaveBeenCalledTimes(2)
     expect(getCommandInput(1)).toMatchObject({ContinuationToken: 'page-2'})
@@ -321,7 +321,7 @@ describe('createS3Adapter', () => {
     const localPath = path.join(tempDir, 'downloaded.db')
 
     // #when
-    const result = await adapter.download('fro-bot-state/github/owner-repo/sessions/opencode.db', localPath)
+    const result = await adapter.download('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
     // #then
     expect(result.success).toBe(true)

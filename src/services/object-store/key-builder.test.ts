@@ -23,7 +23,7 @@ describe('buildObjectStoreKey', () => {
 
     // #then
     expect(result.success).toBe(true)
-    expect(result.success && result.data).toBe('fro-bot-state/github/owner-repo/artifacts/run-123-prompt.txt')
+    expect(result.success && result.data).toBe('fro-bot-state/github/owner/repo/artifacts/run-123-prompt.txt')
   })
 
   it('returns a content-type prefix when suffix is omitted', () => {
@@ -36,7 +36,7 @@ describe('buildObjectStoreKey', () => {
 
     // #then
     expect(result.success).toBe(true)
-    expect(result.success && result.data).toBe('fro-bot-state/github/owner-repo/sessions/')
+    expect(result.success && result.data).toBe('fro-bot-state/github/owner/repo/sessions/')
   })
 
   it('rejects key components that contain traversal markers', () => {

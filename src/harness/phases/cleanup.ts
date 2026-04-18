@@ -103,8 +103,8 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     }
 
     if (storeConfig.enabled === true) {
+      const objectStoreLogger = createLogger({phase: 'object-store-artifacts'})
       try {
-        const objectStoreLogger = createLogger({phase: 'object-store-artifacts'})
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
         const logPath = getOpenCodeLogPath()
         const artifactResult = await syncArtifactsToStore(
@@ -142,7 +142,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
         }
         await syncMetadataToStore(adapter, storeConfig, agentIdentity, repo, runId, metadata, objectStoreLogger)
       } catch (error) {
-        bootstrapLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
+        objectStoreLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
           error: error instanceof Error ? error.message : String(error),
         })
       }

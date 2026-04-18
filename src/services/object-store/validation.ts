@@ -80,6 +80,26 @@ function hasDisallowedAddress(hostname: string): boolean {
   return false
 }
 
+// Cloud instance metadata service addresses must be blocked even when insecure endpoints
+// are allowed — a leaked IAM role or SSRF via metadata service compromises the entire
+// runner environment regardless of whether the endpoint is otherwise "trusted".
+// This list is narrow by design: only exact metadata endpoints. Broader link-local and
+// private ranges are still blocked by hasDisallowedAddress when the insecure flag is off.
+function hasMetadataServiceAddress(hostname: string): boolean {
+  const normalized = hostname.toLowerCase()
+
+  if (normalized === '169.254.169.254' || normalized === 'metadata.google.internal') {
+    return true
+  }
+
+  const addressType = net.isIP(normalized)
+  if (addressType === 6) {
+    return normalized === 'fd00:ec2::254'
+  }
+
+  return false
+}
+
 export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolean): Result<URL, ValidationError> {
   let parsedEndpoint: URL
 
@@ -91,6 +111,10 @@ export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolea
 
   if (allowInsecureEndpoint === false && parsedEndpoint.protocol !== 'https:') {
     return err(createValidationError('s3 endpoint must use https unless insecure endpoints are explicitly allowed'))
+  }
+
+  if (hasMetadataServiceAddress(parsedEndpoint.hostname)) {
+    return err(createValidationError('s3 endpoint must not target cloud instance metadata services'))
   }
 
   if (allowInsecureEndpoint === false && hasDisallowedAddress(parsedEndpoint.hostname)) {

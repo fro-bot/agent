@@ -61,9 +61,9 @@ describe('content sync', () => {
     expect(result).toEqual({uploaded: 3, failed: 0})
     expect(upload).toHaveBeenCalledTimes(3)
     expect(upload.mock.calls.map(([key]) => key)).toEqual([
-      'fro-bot-state/github/owner-repo/sessions/opencode.db',
-      'fro-bot-state/github/owner-repo/sessions/opencode.db-wal',
-      'fro-bot-state/github/owner-repo/sessions/opencode.db-shm',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db-shm',
     ])
   })
 
@@ -78,7 +78,7 @@ describe('content sync', () => {
     expect(result).toEqual({uploaded: 1, failed: 0})
     expect(upload).toHaveBeenCalledTimes(1)
     expect(upload).toHaveBeenCalledWith(
-      'fro-bot-state/github/owner-repo/sessions/opencode.db',
+      'fro-bot-state/github/owner/repo/sessions/opencode.db',
       path.join(dbDir, 'opencode.db'),
     )
   })
@@ -125,14 +125,14 @@ describe('content sync', () => {
     expect(upload).toHaveBeenCalledTimes(3)
     expect(upload.mock.calls).toEqual([
       [
-        'fro-bot-state/github/owner-repo/artifacts/run-123/nested/issue-description.txt',
+        'fro-bot-state/github/owner/repo/artifacts/run-123/nested/issue-description.txt',
         path.join(logPath, 'nested', 'issue-description.txt'),
       ],
       [
-        'fro-bot-state/github/owner-repo/artifacts/run-123/pr-description.txt',
+        'fro-bot-state/github/owner/repo/artifacts/run-123/pr-description.txt',
         path.join(logPath, 'pr-description.txt'),
       ],
-      ['fro-bot-state/github/owner-repo/artifacts/run-123/prompt-main.txt', path.join(logPath, 'prompt-main.txt')],
+      ['fro-bot-state/github/owner/repo/artifacts/run-123/prompt-main.txt', path.join(logPath, 'prompt-main.txt')],
     ])
   })
 
@@ -195,7 +195,7 @@ describe('content sync', () => {
 
     expect(result).toEqual({success: true})
     expect(upload).toHaveBeenCalledTimes(1)
-    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner-repo/metadata/run-123.json')
+    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner/repo/metadata/run-123.json')
   })
 
   it('cleans up metadata temp file after upload', async () => {
@@ -227,9 +227,9 @@ describe('content sync', () => {
   it('downloads all keys returned by list', async () => {
     const list = vi.fn<ObjectStoreAdapter['list']>(async () =>
       ok([
-        'fro-bot-state/github/owner-repo/sessions/opencode.db',
-        'fro-bot-state/github/owner-repo/sessions/opencode.db-wal',
-        'fro-bot-state/github/owner-repo/sessions/opencode.db-shm',
+        'fro-bot-state/github/owner/repo/sessions/opencode.db',
+        'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
+        'fro-bot-state/github/owner/repo/sessions/opencode.db-shm',
       ]),
     )
     const download = vi.fn<ObjectStoreAdapter['download']>(async (key: string, localPath: string) => {
@@ -242,7 +242,7 @@ describe('content sync', () => {
     const result = await syncSessionsFromStore(adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
     expect(result).toEqual({downloaded: 3, failed: 0, mainDbRestored: true})
-    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner-repo/sessions/')
+    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
     expect(download).toHaveBeenCalledTimes(3)
     const dbDir = path.dirname(storagePath)
     await expect(fs.readFile(path.join(dbDir, 'opencode.db'), 'utf8')).resolves.toContain('opencode.db')
@@ -254,7 +254,7 @@ describe('content sync', () => {
     const logger = createLogger()
     const download = vi.fn(async () => ok(undefined))
     const adapter = createAdapter({
-      list: async () => ok(['fro-bot-state/github/owner-repo/sessions/../escape.db']),
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/../escape.db']),
       download,
     })
 
