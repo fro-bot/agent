@@ -35,6 +35,7 @@ function createMockMetrics(overrides: Partial<RunMetrics> = {}): RunMetrics {
     endTime: Date.now(),
     duration: 60000,
     cacheStatus: 'hit',
+    cacheSource: null,
     sessionsUsed: [],
     sessionsCreated: [],
     prsCreated: [],
@@ -49,6 +50,8 @@ function createMockMetrics(overrides: Partial<RunMetrics> = {}): RunMetrics {
 }
 
 function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): CommentSummaryOptions {
+  const {resolvedOutputMode, ...restOverrides} = overrides
+
   return {
     eventType: 'issue_comment',
     repo: 'owner/repo',
@@ -57,7 +60,8 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     runUrl: 'https://github.com/owner/repo/actions/runs/12345',
     metrics: createMockMetrics(),
     agent: 'sisyphus',
-    ...overrides,
+    resolvedOutputMode: resolvedOutputMode ?? null,
+    ...restOverrides,
   }
 }
 
@@ -101,6 +105,30 @@ describe('writeJobSummary', () => {
     expect(tableCall).toBeDefined()
     expect(tableCall.some(row => Array.isArray(row) && row.includes('issue_comment'))).toBe(true)
     expect(tableCall.some(row => Array.isArray(row) && row.includes('owner/repo'))).toBe(true)
+  })
+
+  it('includes Output Mode row when resolved mode is set', async () => {
+    // #given
+    const options = createMockOptions({resolvedOutputMode: 'working-dir'})
+
+    // #when
+    await writeJobSummary(options, logger)
+
+    // #then
+    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    expect(tableCall).toContainEqual(['Output Mode', 'working-dir'])
+  })
+
+  it('renders Output Mode as N/A when resolved mode is null', async () => {
+    // #given
+    const options = createMockOptions({resolvedOutputMode: null})
+
+    // #when
+    await writeJobSummary(options, logger)
+
+    // #then
+    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    expect(tableCall).toContainEqual(['Output Mode', 'N/A'])
   })
 
   it('includes sessions section when sessions exist', async () => {

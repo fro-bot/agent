@@ -84,6 +84,16 @@ describe('createMetricsCollector', () => {
     expect(collector.getMetrics().cacheStatus).toBe('corrupted')
   })
 
+  it('tracks cache source separately from cache status', () => {
+    const collector = createMetricsCollector()
+
+    collector.setCacheSource('storage')
+    expect(collector.getMetrics().cacheSource).toBe('storage')
+
+    collector.setCacheSource(null)
+    expect(collector.getMetrics().cacheSource).toBeNull()
+  })
+
   it('adds and deduplicates sessions used', () => {
     // #given
     const collector = createMetricsCollector()

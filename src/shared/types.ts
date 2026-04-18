@@ -7,12 +7,27 @@ export {err, isErr, isOk, ok} from '@bfra.me/es/result'
 // Agent identity for cache scoping
 export type AgentIdentity = 'discord' | 'github'
 
+// Object store configuration (pure data shape; adapter lives in services/object-store/)
+export interface ObjectStoreConfig {
+  readonly enabled: boolean
+  readonly bucket: string
+  readonly region: string
+  readonly prefix: string
+  readonly endpoint?: string
+  readonly expectedBucketOwner?: string
+  readonly allowInsecureEndpoint?: boolean
+  readonly sseEncryption?: 'aws:kms' | 'AES256'
+  readonly sseKmsKeyId?: string
+}
+
 // Cache restore result
 export interface CacheResult {
   readonly hit: boolean
   readonly key: string | null
   readonly restoredPath: string | null
   readonly corrupted: boolean
+  /** null on miss, 'cache' on Actions cache hit, 'storage' on S3 fallback hit */
+  readonly source: 'cache' | 'storage' | null
 }
 
 // Run context from GitHub Actions
@@ -41,15 +56,17 @@ export interface ModelConfig {
   readonly modelID: string
 }
 
+export type OutputMode = 'auto' | 'working-dir' | 'branch-pr'
+export type ResolvedOutputMode = 'working-dir' | 'branch-pr'
+
 // Action inputs (parsed and validated) - per RFC-001, RFC-013
 export interface ActionInputs {
   readonly githubToken: string
   readonly authJson: string
   readonly prompt: string | null
+  readonly outputMode: OutputMode
   readonly sessionRetention: number
-  readonly s3Backup: boolean
-  readonly s3Bucket: string | null
-  readonly awsRegion: string | null
+  readonly storeConfig: ObjectStoreConfig
   // RFC-013: SDK execution configuration
   readonly agent: string
   readonly model: ModelConfig | null
@@ -82,6 +99,7 @@ export interface OmoProviders {
 // Action outputs
 export interface ActionOutputs {
   readonly sessionId: string | null
+  readonly resolvedOutputMode: ResolvedOutputMode | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly duration: number
 }

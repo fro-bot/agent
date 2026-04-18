@@ -1,0 +1,1 @@
+import{i as e,t}from"./sts-CIi3TMDj.js";t();export{e as getDefaultRoleAssumer};

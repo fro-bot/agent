@@ -1,13 +1,16 @@
 # RFC-019: S3 Storage Backend
 
-**Status:** Pending
+**Status:** Superseded
 **Priority:** MUST
 **Complexity:** High
 **Phase:** 4
+**Superseded By:** [docs/plans/2026-04-15-001-feat-durable-object-storage-plan.md](../docs/plans/2026-04-15-001-feat-durable-object-storage-plan.md)
 
 ---
 
 ## Summary
+
+> **Superseded 2026-04-15.** This RFC framed S3 as a write-through *backup* sitting behind GitHub Actions cache. The durable-object-storage plan inverts the hierarchy: **S3 is the canonical source of truth; GitHub cache is an accelerator.** The plan also tightens security (SSRF protection on custom endpoints, path traversal validation on downloads, SDK-provider-chain credentials, SSE-KMS/AES256 defaults, fork-PR write gating, prefix sanitization) and works with any S3-compatible provider (AWS S3, Cloudflare R2, Backblaze B2, MinIO). The `object-store/` module (not `storage/`) avoids collision with `services/session/storage.ts`. See the plan for the current design.
 
 Implement S3 write-through backup for OpenCode storage, enabling cross-runner persistence and serving as the primary storage backend for Discord Bot (which operates outside GitHub Actions cache). This RFC extends RFC-002 (Cache Infrastructure) with a durable S3 layer.
 

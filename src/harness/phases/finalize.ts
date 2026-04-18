@@ -25,6 +25,7 @@ export async function runFinalize(
 
   setActionOutputs({
     sessionId: execution.sessionId,
+    resolvedOutputMode: execution.resolvedOutputMode,
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })
@@ -37,6 +38,7 @@ export async function runFinalize(
     runUrl: `https://github.com/${routing.agentContext.repo}/actions/runs/${routing.agentContext.runId}`,
     metrics: metrics.getMetrics(),
     agent: bootstrap.inputs.agent,
+    resolvedOutputMode: execution.resolvedOutputMode,
   }
   await writeJobSummary(summaryOptions, logger)
 

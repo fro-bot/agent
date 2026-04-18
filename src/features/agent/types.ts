@@ -8,10 +8,12 @@
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey} from '../../services/session/logical-key.js'
 import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
-import type {ModelConfig, OmoProviders, TokenUsage} from '../../shared/types.js'
+import type {ModelConfig, OmoProviders, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {ErrorInfo} from '../comments/types.js'
 import type {HydratedContext} from '../context/types.js'
 import type {TriggerContext} from '../triggers/types.js'
+
+export type {OutputMode, ResolvedOutputMode} from '../../shared/types.js'
 
 /**
  * Context collected from GitHub Actions for agent prompt construction.
@@ -87,6 +89,7 @@ export interface PromptOptions {
   readonly currentThreadSessionId?: string | null
   readonly sessionId?: string
   readonly triggerContext?: TriggerContext
+  readonly resolvedOutputMode?: ResolvedOutputMode | null
   readonly fileParts?: readonly FilePartInput[]
 }
 

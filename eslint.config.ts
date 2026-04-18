@@ -15,6 +15,8 @@ export default defineConfig(
       'RFCS.md',
       'RULES.md',
       'dist/**',
+      'docs/brainstorms/',
+      'docs/ideation/',
       'docs/plans/',
       'docs/solutions/',
     ],
