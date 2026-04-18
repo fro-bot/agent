@@ -47,7 +47,15 @@ export async function run(): Promise<number> {
     bootstrapLogger.info('Starting Fro Bot Agent')
 
     const bootstrap = await runBootstrap(bootstrapLogger)
-    if (bootstrap == null) return 1
+    if (bootstrap == null) {
+      setActionOutputs({
+        sessionId: null,
+        resolvedOutputMode: null,
+        cacheStatus: 'miss',
+        duration: Date.now() - startTime,
+      })
+      return 1
+    }
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
 
@@ -89,6 +97,7 @@ export async function run(): Promise<number> {
 
     setActionOutputs({
       sessionId: null,
+      resolvedOutputMode: null,
       cacheStatus: 'miss',
       duration,
     })

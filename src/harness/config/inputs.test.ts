@@ -86,6 +86,60 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.storeConfig.bucket).toBe('')
       expect(result.success && result.data.storeConfig.region).toBe('')
       expect(result.success && result.data.storeConfig.prefix).toBe(DEFAULT_S3_PREFIX)
+      expect(result.success && result.data.outputMode).toBe('auto')
+    })
+
+    it('parses output-mode default value as auto when input is empty', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.outputMode).toBe('auto')
+    })
+
+    it('parses output-mode=working-dir', () => {
+      mockInputs({
+        'output-mode': 'working-dir',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.outputMode).toBe('working-dir')
+    })
+
+    it('parses output-mode=branch-pr', () => {
+      mockInputs({
+        'output-mode': 'branch-pr',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.outputMode).toBe('branch-pr')
+    })
+
+    it('parses output-mode case-insensitively (e.g., WORKING-DIR)', () => {
+      mockInputs({
+        'output-mode': 'WORKING-DIR',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.outputMode).toBe('working-dir')
+    })
+
+    it('trims whitespace from output-mode input', () => {
+      mockInputs({
+        'output-mode': '  branch-pr  ',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.outputMode).toBe('branch-pr')
     })
 
     it('parses all S3 inputs into storeConfig', () => {
@@ -255,6 +309,18 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('auth-json')
       expect(!result.success && result.error.message).toContain('valid JSON')
+    })
+
+    it('returns error for invalid output-mode value listing valid values', () => {
+      mockInputs({
+        'output-mode': 'side-quest',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('Invalid output-mode value')
+      expect(!result.success && result.error.message).toContain('auto, working-dir, branch-pr')
     })
 
     it('returns error for invalid session-retention (negative)', () => {

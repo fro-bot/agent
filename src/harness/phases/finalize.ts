@@ -25,6 +25,7 @@ export async function runFinalize(
 
   setActionOutputs({
     sessionId: execution.sessionId,
+    resolvedOutputMode: null,
     cacheStatus: cacheRestore.cacheStatus,
     duration,
   })

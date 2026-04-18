@@ -29,6 +29,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     s3Backup: inputs.storeConfig.enabled,
     hasGithubToken: inputs.githubToken.length > 0,
     hasPrompt: inputs.prompt != null,
+    outputMode: inputs.outputMode,
     agent: inputs.agent,
     hasModelOverride: inputs.model != null,
     timeoutMs: inputs.timeoutMs,

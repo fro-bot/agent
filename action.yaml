@@ -13,6 +13,13 @@ inputs:
   prompt:
     description: Custom prompt for the agent
     required: false
+  output-mode:
+    description: >-
+      Requested delivery mode for schedule/workflow_dispatch runs only. Values:
+      auto, working-dir, branch-pr. Default: auto. Advisory only: reflects the
+      requested/resolved contract, not observed delivery behavior.
+    required: false
+    default: auto
   session-retention:
     description: Number of sessions to retain (default 50)
     required: false
@@ -103,6 +110,8 @@ inputs:
 outputs:
   session-id:
     description: OpenCode session ID used for this run
+  resolved-output-mode:
+    description: Resolved delivery mode for this run (working-dir, branch-pr, or empty string)
   cache-status:
     description: Cache restore status (hit/miss/corrupted)
   duration:

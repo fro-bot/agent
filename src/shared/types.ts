@@ -56,11 +56,15 @@ export interface ModelConfig {
   readonly modelID: string
 }
 
+export type OutputMode = 'auto' | 'working-dir' | 'branch-pr'
+export type ResolvedOutputMode = 'working-dir' | 'branch-pr'
+
 // Action inputs (parsed and validated) - per RFC-001, RFC-013
 export interface ActionInputs {
   readonly githubToken: string
   readonly authJson: string
   readonly prompt: string | null
+  readonly outputMode: OutputMode
   readonly sessionRetention: number
   readonly storeConfig: ObjectStoreConfig
   // RFC-013: SDK execution configuration
@@ -95,6 +99,7 @@ export interface OmoProviders {
 // Action outputs
 export interface ActionOutputs {
   readonly sessionId: string | null
+  readonly resolvedOutputMode: ResolvedOutputMode | null
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly duration: number
 }
