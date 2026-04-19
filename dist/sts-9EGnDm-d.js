@@ -1,0 +1,1 @@
+import{i as e,t}from"./sts-CGN3owaj.js";t();export{e as getDefaultRoleAssumer};
