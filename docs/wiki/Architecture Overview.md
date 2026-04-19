@@ -1,12 +1,13 @@
 ---
 type: architecture
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - src/main.ts
   - src/post.ts
   - src/harness/run.ts
   - src/harness/post.ts
+  - src/services/object-store/index.ts
   - AGENTS.md
   - action.yaml
 summary: "Four-layer architecture, dependency rules, and high-level module map"
@@ -44,9 +45,9 @@ The major modules, grouped by layer:
 
 **Shared** — `logger.ts` provides JSON-structured logging with automatic credential redaction. `types.ts` defines core interfaces (`ActionInputs`, `CacheResult`, `RunContext`). `constants.ts` pins default versions for OpenCode, Bun, oMo, and Systematic.
 
-**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `session/` handles persistence through the OpenCode SDK (see [[Session Persistence]]). `cache/` manages GitHub Actions cache with corruption detection and optional S3 backup. `setup/` orchestrates tool installation (see [[Setup and Configuration]]).
+**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `session/` handles persistence through the OpenCode SDK (see [[Session Persistence]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `object-store/` provides the durable S3-compatible persistence backend — an adapter, key builder, content sync functions, and input validation (see [[Session Persistence]]). `setup/` orchestrates tool installation (see [[Setup and Configuration]]).
 
-**Features** — `agent/` contains the prompt builder and SDK execution logic (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
+**Features** — `agent/` contains the prompt builder, SDK execution logic, and the output-mode resolver for manual triggers (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
 
 **Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases. `post.ts` handles the post-action cache save. `config/` parses action inputs and manages state keys.
 
@@ -60,7 +61,7 @@ The major modules, grouped by layer:
 
 **Result types for recoverable errors.** Functions that can fail return `Result<T, E>` from `@bfra.me/es` rather than throwing. Exceptions are reserved for truly unexpected failures.
 
-**ESM with `.js` extensions.** All relative imports use `.js` extensions, matching the Node 24 ESM resolution algorithm. This is enforced by the build and is a common source of errors for contributors unfamiliar with the convention.
+**ESM with `.js` extensions.** All relative imports use `.js` extensions, matching the Node 24 ESM resolution algorithm. This is enforced by the build and is a common source of errors for contributors unfamiliar with the convention. See [[Conventions and Patterns]] for the full set of coding conventions and anti-patterns.
 
 ## Build and Bundle
 
