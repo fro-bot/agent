@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -15,16 +15,18 @@ sources:
   - src/harness/phases/dedup.ts
   - src/harness/post.ts
   - src/features/triggers/router.ts
+  - src/features/agent/output-mode.ts
   - src/services/github/context.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
+  - RFCs/RFC-019-S3-Storage-Backend.md
 summary: "Phase-by-phase walkthrough of a single action run from trigger to cache save"
 ---
 
 # Execution Lifecycle
 
-Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/run.ts`. Each phase is a standalone module under `src/harness/phases/` — a deliberate design that keeps the orchestrator thin and each phase independently testable.
+Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/run.ts`. This page builds on the [[Architecture Overview]] — specifically the harness layer — and walks through each phase in execution order. Each phase is a standalone module under `src/harness/phases/`, a deliberate design that keeps the orchestrator thin and each phase independently testable.
 
 ## Phase Sequence
 
@@ -88,7 +90,7 @@ Writes a synthetic summary message into the session history so future runs can d
 
 ## 9. Cleanup (Always)
 
-Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Closes the SDK server handle if the main run owns it. Attempts a first cache save.
+Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server — importantly, this triggers a SQLite WAL checkpoint that merges in-flight session data into the main database file before cache save. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]). Finally, saves the cache and optionally uploads a prompt log artifact for observability.
 
 ## Post-Action Hook
 
