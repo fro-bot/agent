@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - src/services/session/storage.ts
   - src/services/session/search.ts
@@ -14,10 +14,15 @@ sources:
   - src/services/session/storage-message-mappers.ts
   - src/services/cache/restore.ts
   - src/services/cache/save.ts
+  - src/services/object-store/content-sync.ts
+  - src/services/object-store/s3-adapter.ts
+  - src/services/object-store/key-builder.ts
+  - src/services/object-store/validation.ts
+  - src/services/object-store/types.ts
   - RFCs/RFC-004-Session-Management.md
   - RFCs/RFC-002-Cache-Infrastructure.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "How agent memory survives across CI runs via cache, SDK sessions, and pruning"
+summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
 ---
 
 # Session Persistence
@@ -50,9 +55,33 @@ On restore, the cache module performs several safety checks:
 
 Cache saves happen twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`). The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history.
 
-## S3 Backup
+## Object Store (S3 Backup)
 
-GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3 write-through backend (RFC-019) writes session state to an S3 bucket alongside the normal cache save. On restore, the system tries the Actions cache first (faster) and falls back to S3 on miss or corruption.
+GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction.
+
+The implementation lives in `src/services/object-store/` and consists of five modules:
+
+- **`s3-adapter.ts`** — Creates an `ObjectStoreAdapter` wrapping `@aws-sdk/client-s3`. Handles upload (PutObject), download (GetObject with streaming pipeline), and list (ListObjectsV2 with pagination). All S3 error messages are sanitized to strip credentials before logging. The client retries up to 3 times and caps list pagination at 100 iterations.
+
+- **`content-sync.ts`** — Orchestrates bidirectional sync of three content types. `syncSessionsToStore` uploads the SQLite database files (`opencode.db`, `.db-wal`, `.db-shm`) to S3. `syncSessionsFromStore` downloads them back, with path traversal validation on every key. `syncArtifactsToStore` uploads the OpenCode log directory tree. `syncMetadataToStore` writes a JSON metadata blob (token usage, timing, session IDs, costs) to S3 via a secure temp file.
+
+- **`key-builder.ts`** — Constructs S3 object keys from config prefix, agent identity, repository, and content type (`sessions`, `artifacts`, `metadata`). Every component is sanitized and validated.
+
+- **`validation.ts`** — Endpoint validation (HTTPS enforcement, SSRF protection against link-local/loopback/private IPs, metadata service blocking for `169.254.169.254` and `fd00:ec2::254`), prefix validation, key component sanitization, and download path traversal checks.
+
+- **`types.ts`** — Defines `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`).
+
+### How It Integrates
+
+The object store hooks into the cache layer at two points:
+
+1. **On restore** — If the GitHub Actions cache misses or is corrupted, `restoreCache` in `src/services/cache/restore.ts` calls `syncSessionsFromStore` as a fallback. A successful S3 restore reports `source: 'storage'` in the `CacheResult` (vs. `source: 'cache'` for an Actions cache hit).
+
+2. **On save** — After the normal Actions cache save, `saveCache` in `src/services/cache/save.ts` calls `syncSessionsToStore` to write the session database to S3. This write-through approach means S3 always has a recent copy.
+
+3. **On cleanup** — The cleanup phase in `src/harness/phases/cleanup.ts` uploads run artifacts and metadata to S3 via `syncArtifactsToStore` and `syncMetadataToStore`. This happens after the server shuts down (ensuring WAL checkpoint) but before the cache save.
+
+S3 operations are always best-effort: failures are logged as warnings but never abort the run. The action supports AWS S3, Cloudflare R2, Backblaze B2, and MinIO, with SSE encryption auto-selected per endpoint type (`aws:kms` for AWS, `AES256` for custom endpoints).
 
 ## SDK Session Operations
 

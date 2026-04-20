@@ -1,11 +1,12 @@
 ---
 type: subsystem
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - src/features/agent/prompt.ts
   - src/features/agent/prompt-thread.ts
   - src/features/agent/prompt-sender.ts
+  - src/features/agent/output-mode.ts
   - src/features/agent/types.ts
   - src/features/agent/context.ts
   - src/features/agent/reference-files.ts
