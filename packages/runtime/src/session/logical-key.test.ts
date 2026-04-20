@@ -3,8 +3,16 @@ import type {EventType, GitHubContext} from '../../../../src/services/github/typ
 import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../../../../src/shared/test-helpers.js'
 import {buildLogicalKey, buildSessionTitle, findSessionByTitle, resolveSessionForLogicalKey} from './logical-key.js'
+
+function createMockLogger() {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+  }
+}
 
 function createRawContext(eventType: EventType): GitHubContext {
   return {

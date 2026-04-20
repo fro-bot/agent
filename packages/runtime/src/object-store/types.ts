@@ -1,6 +1,6 @@
-import type {Result} from '../../../../src/shared/types.js'
+import type {Result} from '../shared/types.js'
 
-export type {ObjectStoreConfig} from '../../../../src/shared/types.js'
+export type {ObjectStoreConfig} from '../shared/types.js'
 
 export type ContentType = 'artifacts' | 'metadata' | 'sessions'
 

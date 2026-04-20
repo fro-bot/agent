@@ -1,8 +1,8 @@
-import type {Result} from '../../../../src/shared/types.js'
+import type {Result} from '../shared/types.js'
 import * as net from 'node:net'
 import * as path from 'node:path'
 
-import {err, ok} from '../../../../src/shared/types.js'
+import {err, ok} from '../shared/types.js'
 import {
   createPathTraversalError,
   createValidationError,

@@ -1,4 +1,4 @@
-import type {Logger} from '../../../../src/shared/logger.js'
+import type {Logger} from '../shared/logger.js'
 import type {SessionClient} from './backend.js'
 
 export async function reassertSessionTitle(

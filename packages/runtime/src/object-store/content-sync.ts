@@ -1,9 +1,9 @@
-import type {Logger} from '../../../../src/shared/logger.js'
+import type {Logger} from '../shared/logger.js'
 import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {toErrorMessage} from '../../../../src/shared/errors.js'
+import {toErrorMessage} from '../shared/errors.js'
 import {buildObjectStoreKey} from './key-builder.js'
 import {validateDownloadPath} from './validation.js'
 

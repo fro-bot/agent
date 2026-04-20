@@ -1,8 +1,8 @@
-import type {RunSummary} from '../../../../src/shared/types.js'
+import type {RunSummary} from '../shared/types.js'
 import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
 
-import {toErrorMessage} from '../../../../src/shared/errors.js'
+import {toErrorMessage} from '../shared/errors.js'
 
 /**
  * Format run summary for session storage.

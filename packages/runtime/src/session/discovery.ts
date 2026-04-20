@@ -1,8 +1,12 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, ProjectInfo} from './types.js'
 
-import {normalizeWorkspacePath} from '../../../../src/shared/paths.js'
 import {isRecord, readString} from './storage-mappers.js'
+
+function normalizeWorkspacePath(workspacePath: string): string {
+  const resolved = new URL(`file://${workspacePath}`).pathname
+  return resolved.endsWith('/') && resolved.length > 1 ? resolved.slice(0, -1) : resolved
+}
 
 export async function listProjectsViaSDK(client: SessionClient, logger: Logger): Promise<readonly ProjectInfo[]> {
   const response = await client.project.list()

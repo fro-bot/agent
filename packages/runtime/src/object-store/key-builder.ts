@@ -1,7 +1,7 @@
-import type {Result} from '../../../../src/shared/types.js'
+import type {Result} from '../shared/types.js'
 import type {ContentType, ObjectStoreConfig, ValidationError} from './types.js'
 
-import {err, ok} from '../../../../src/shared/types.js'
+import {err, ok} from '../shared/types.js'
 import {createValidationError} from './types.js'
 import {sanitizeKeyComponent, validatePrefix} from './validation.js'
 

@@ -1,4 +1,4 @@
-import type {Logger} from '../../../../src/shared/logger.js'
+import type {Logger} from '../shared/logger.js'
 import type {ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'

@@ -38,7 +38,6 @@ export type {
   PermissionRuleset,
   ProjectInfo,
   PruneResult,
-  PruningConfig,
   ReasoningPart,
   SessionInfo,
   SessionMatch,

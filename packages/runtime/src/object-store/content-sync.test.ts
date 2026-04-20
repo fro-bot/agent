@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {err, ok} from '../../../../src/shared/types.js'
+import {err, ok} from '../shared/types.js'
 import {syncArtifactsToStore, syncMetadataToStore, syncSessionsFromStore, syncSessionsToStore} from './index.js'
 
 function createLogger() {
