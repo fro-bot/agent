@@ -11,6 +11,9 @@ export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {MAX_LLM_RETRIES, RETRY_DELAYS_MS, runPromptAttempt} from './retry.js'
+export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
+export type {OpenCodeServerHandle} from './server.js'
+export type {SetupAdapter} from './setup-adapter.js'
 export type {
   AcknowledgmentState,
   AgentContext,
