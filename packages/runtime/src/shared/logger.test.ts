@@ -1,15 +1,13 @@
-import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createLogger, DEFAULT_SENSITIVE_FIELDS, redactSensitiveFields} from './logger.js'
 
-// Mock @actions/core
-vi.mock('@actions/core', () => ({
+const sink = {
   debug: vi.fn(),
   info: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
-}))
+}
 
 interface LogEntry {
   level: string
@@ -27,6 +25,10 @@ interface LogEntry {
 describe('createLogger', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    sink.debug.mockReset()
+    sink.info.mockReset()
+    sink.warning.mockReset()
+    sink.error.mockReset()
   })
 
   afterEach(() => {
@@ -43,10 +45,10 @@ describe('createLogger', () => {
 
   describe('debug', () => {
     it('logs JSON with message and base context', () => {
-      const logger = createLogger({runId: 123})
+      const logger = createLogger({runId: 123}, sink)
       logger.debug('test message')
-      expect(core.debug).toHaveBeenCalledTimes(1)
-      const mockCalls = (core.debug as ReturnType<typeof vi.fn>).mock.calls
+      expect(sink.debug).toHaveBeenCalledTimes(1)
+      const mockCalls = sink.debug.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.level).toBe('debug')
@@ -56,9 +58,9 @@ describe('createLogger', () => {
     })
 
     it('merges additional context', () => {
-      const logger = createLogger({runId: 123})
+      const logger = createLogger({runId: 123}, sink)
       logger.debug('test', {extra: 'value'})
-      const mockCalls = (core.debug as ReturnType<typeof vi.fn>).mock.calls
+      const mockCalls = sink.debug.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.extra).toBe('value')
@@ -68,10 +70,10 @@ describe('createLogger', () => {
 
   describe('info', () => {
     it('logs JSON with info level', () => {
-      const logger = createLogger({})
+      const logger = createLogger({}, sink)
       logger.info('info message')
-      expect(core.info).toHaveBeenCalledTimes(1)
-      const mockCalls = (core.info as ReturnType<typeof vi.fn>).mock.calls
+      expect(sink.info).toHaveBeenCalledTimes(1)
+      const mockCalls = sink.info.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.level).toBe('info')
@@ -81,10 +83,10 @@ describe('createLogger', () => {
 
   describe('warning', () => {
     it('logs JSON with warning level', () => {
-      const logger = createLogger({})
+      const logger = createLogger({}, sink)
       logger.warning('warning message')
-      expect(core.warning).toHaveBeenCalledTimes(1)
-      const mockCalls = (core.warning as ReturnType<typeof vi.fn>).mock.calls
+      expect(sink.warning).toHaveBeenCalledTimes(1)
+      const mockCalls = sink.warning.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.level).toBe('warning')
@@ -94,10 +96,10 @@ describe('createLogger', () => {
 
   describe('error', () => {
     it('logs JSON with error level', () => {
-      const logger = createLogger({})
+      const logger = createLogger({}, sink)
       logger.error('error message')
-      expect(core.error).toHaveBeenCalledTimes(1)
-      const mockCalls = (core.error as ReturnType<typeof vi.fn>).mock.calls
+      expect(sink.error).toHaveBeenCalledTimes(1)
+      const mockCalls = sink.error.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.level).toBe('error')
@@ -105,10 +107,10 @@ describe('createLogger', () => {
     })
 
     it('includes error details when Error object provided', () => {
-      const logger = createLogger({})
+      const logger = createLogger({}, sink)
       const error = new Error('Something went wrong')
       logger.error('operation failed', {error})
-      const mockCalls = (core.error as ReturnType<typeof vi.fn>).mock.calls
+      const mockCalls = sink.error.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.error?.message).toBe('Something went wrong')
@@ -118,18 +120,18 @@ describe('createLogger', () => {
 
   describe('context merging', () => {
     it('call context overrides base context', () => {
-      const logger = createLogger({field: 'base'})
+      const logger = createLogger({field: 'base'}, sink)
       logger.info('test', {field: 'override'})
-      const mockCalls = (core.info as ReturnType<typeof vi.fn>).mock.calls
+      const mockCalls = sink.info.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       expect(parsed.field).toBe('override')
     })
 
     it('preserves timestamp format', () => {
-      const logger = createLogger({})
+      const logger = createLogger({}, sink)
       logger.info('test')
-      const mockCalls = (core.info as ReturnType<typeof vi.fn>).mock.calls
+      const mockCalls = sink.info.mock.calls
       const loggedArg = mockCalls[0]?.[0] as string
       const parsed = JSON.parse(loggedArg) as LogEntry
       // ISO 8601 format
@@ -246,12 +248,16 @@ describe('DEFAULT_SENSITIVE_FIELDS', () => {
 describe('createLogger with sensitive field filtering', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    sink.debug.mockReset()
+    sink.info.mockReset()
+    sink.warning.mockReset()
+    sink.error.mockReset()
   })
 
   it('redacts sensitive fields in context', () => {
-    const logger = createLogger({})
+    const logger = createLogger({}, sink)
     logger.info('test', {token: 'secret123', data: 'safe'})
-    const mockCalls = (core.info as ReturnType<typeof vi.fn>).mock.calls
+    const mockCalls = sink.info.mock.calls
     const loggedArg = mockCalls[0]?.[0] as string
     const parsed = JSON.parse(loggedArg) as Record<string, unknown>
     expect(parsed.token).toBe('[REDACTED]')
@@ -259,9 +265,9 @@ describe('createLogger with sensitive field filtering', () => {
   })
 
   it('redacts sensitive fields in base context', () => {
-    const logger = createLogger({apiKey: 'secret456'})
+    const logger = createLogger({apiKey: 'secret456'}, sink)
     logger.info('test')
-    const mockCalls = (core.info as ReturnType<typeof vi.fn>).mock.calls
+    const mockCalls = sink.info.mock.calls
     const loggedArg = mockCalls[0]?.[0] as string
     const parsed = JSON.parse(loggedArg) as Record<string, unknown>
     expect(parsed.apiKey).toBe('[REDACTED]')
