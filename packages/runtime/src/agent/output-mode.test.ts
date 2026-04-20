@@ -1,4 +1,4 @@
-import type {EventType} from '../../services/github/types.js'
+import type {EventType} from './types.js'
 import {describe, expect, it} from 'vitest'
 import {resolveOutputMode} from './output-mode.js'
 

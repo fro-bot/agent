@@ -1,11 +1,19 @@
-import type {Logger} from '../../shared/logger.js'
+import type {Logger} from '../shared/logger.js'
 import type {ReferenceFile} from './types.js'
 import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
 import {materializeReferenceFiles} from './reference-files.js'
+
+function createMockLogger(): Logger {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+  }
+}
 
 describe('materializeReferenceFiles', () => {
   afterEach(() => {

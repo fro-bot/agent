@@ -1,10 +1,24 @@
-import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '@fro-bot/runtime'
-import type {Logger} from '../../shared/logger.js'
-import type {TriggerContext} from '../triggers/types.js'
-import type {AgentContext, PromptOptions, SessionContext} from './types.js'
-import {beforeEach, describe, expect, it} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import type {Logger} from '../shared/logger.js'
+import type {
+  AgentContext,
+  LogicalSessionKey,
+  PromptOptions,
+  SessionContext,
+  SessionSearchResult,
+  SessionSummary,
+  TriggerContext,
+} from './types.js'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
+
+function createMockLogger(): Logger {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+  }
+}
 
 function getXmlBlock(prompt: string, tag: string): string {
   const match = prompt.match(new RegExp(String.raw`<${tag}>\n([\s\S]*?)\n</${tag}>`))
@@ -1414,7 +1428,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
     hasMention: true,
     command: null,
     isBotReviewRequested: false,
-    raw: {payload: {action: 'created'}} as unknown as TriggerContext['raw'],
+    raw: {payload: {action: 'created'}} as unknown,
     ...overrides,
   }
 }

@@ -2,6 +2,7 @@ import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 import type {ModelConfig, OmoProviders, ResolvedOutputMode, TokenUsage} from '../shared/types.js'
 
+export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 export type {OutputMode, ResolvedOutputMode} from '../shared/types.js'
 
 export const EVENT_TYPES = [

@@ -1,10 +1,8 @@
 import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
-import type {Logger} from '../../shared/logger.js'
-import type {EventStreamResult} from './streaming.js'
+import type {Logger} from '../shared/logger.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
-import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
-import {runPromptAttempt} from './retry.js'
+import {DEFAULT_AGENT, DEFAULT_MODEL} from '../shared/constants.js'
+import {createLLMFetchError, isLlmFetchError} from './llm-error-helpers.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
 Please continue where you left off. If you were in the middle of a task, resume it.
@@ -23,8 +21,24 @@ export interface AttemptResult {
   readonly error: string | null
   readonly llmError: ErrorInfo | null
   readonly shouldRetry: boolean
-  readonly eventStreamResult: EventStreamResult
+  readonly eventStreamResult: {
+    readonly tokens: unknown
+    readonly model: string | null
+    readonly cost: number | null
+    readonly prsCreated: readonly string[]
+    readonly commitsCreated: readonly string[]
+    readonly commentsPosted: number
+    readonly llmError: ErrorInfo | null
+  }
 }
+
+export type PromptAttemptRunner = (
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  timeoutMs: number,
+  logger: Logger,
+) => Promise<AttemptResult>
 
 export async function sendPromptToSession(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
@@ -34,6 +48,7 @@ export async function sendPromptToSession(
   directory: string,
   config: ExecutionConfig | undefined,
   logger: Logger,
+  runPromptAttempt?: PromptAttemptRunner,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -68,5 +83,9 @@ export async function sendPromptToSession(
     }
   }
 
-  return runPromptAttempt(client, sessionId, directory, config?.timeoutMs ?? DEFAULT_TIMEOUT_MS, logger)
+  if (runPromptAttempt == null) {
+    throw new Error('sendPromptToSession requires a prompt attempt runner')
+  }
+
+  return runPromptAttempt(client, sessionId, directory, config?.timeoutMs ?? 1800000, logger)
 }

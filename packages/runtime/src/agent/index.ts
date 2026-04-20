@@ -1,3 +1,14 @@
+export {resolveOutputMode} from './output-mode.js'
+
+export {
+  buildCurrentThreadContextSection,
+  buildHarnessRulesSection,
+  buildThreadIdentitySection,
+} from './prompt-thread.js'
+
+export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
+export type {TriggerDirective} from './prompt.js'
+export {materializeReferenceFiles} from './reference-files.js'
 export type {
   AcknowledgmentState,
   AgentContext,
@@ -22,7 +33,6 @@ export type {
   TriggerContext,
   TriggerTarget,
 } from './types.js'
-
 export {
   DEFAULT_CONTEXT_BUDGET,
   ERROR_TYPES,
