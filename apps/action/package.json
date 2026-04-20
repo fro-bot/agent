@@ -6,7 +6,7 @@
   "main": "dist/main.js",
   "module": "dist/main.js",
   "scripts": {
-    "build": "pnpm --dir ../.. exec tsc --noEmit && pnpm --dir ../.. exec tsdown",
+    "build": "pnpm --dir ../.. exec tsc --noEmit && pnpm --dir ../.. exec tsdown -c apps/action/tsdown.config.ts",
     "check-types": "pnpm --dir ../.. exec tsc --noEmit",
     "fix": "pnpm --dir ../.. exec eslint --fix src tsdown.config.ts eslint.config.ts",
     "lint": "pnpm --dir ../.. exec eslint src tsdown.config.ts eslint.config.ts",
