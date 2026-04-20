@@ -1,3 +1,5 @@
+export {executeOpenCode} from './execution.js'
+
 export {resolveOutputMode} from './output-mode.js'
 
 export {
@@ -5,10 +7,10 @@ export {
   buildHarnessRulesSection,
   buildThreadIdentitySection,
 } from './prompt-thread.js'
-
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
+export {MAX_LLM_RETRIES, RETRY_DELAYS_MS, runPromptAttempt} from './retry.js'
 export type {
   AcknowledgmentState,
   AgentContext,
