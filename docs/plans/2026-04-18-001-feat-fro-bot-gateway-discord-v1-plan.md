@@ -152,7 +152,7 @@ This partition is **cleaner than the original plan stated**: the runtime is genu
 - **Discord.js v14.26.2** — current stable. No sharding needed for single-server use. `allowedMentions: { parse: ['users'] }` client-wide default is critical. Shard lifecycle events (`shardError`, `shardDisconnect`, `shardReconnecting`, `shardResume`) should be logged. https://discord.js.org/docs/packages/discord.js/14.25.1
 - **@octokit/auth-app** (v8.2.0) — Installation Access Token refresh is **automatic** when used via `Octokit({ authStrategy: createAppAuth, auth: {...} })`. No manual refresh loop needed. JWT generated on-demand (10-min lifetime), IAT cached and renewed ~5 minutes before 1-hour expiry. https://github.com/octokit/auth-app.js
 - **workflow_dispatch with `return_run_details: true`** (Feb 2026) — returns `workflow_run_id` and `run_url` synchronously. Eliminates the "poll GitHub for the run that just got created" pattern. Max 25 input properties per workflow. https://docs.github.com/en/rest/actions/workflows
-- **AWS SDK v3 conditional writes** — `PutObjectCommand` with `IfNoneMatch: '*'` for atomic lock acquisition, `IfMatch: <etag>` for lease renewal. `PreconditionFailed` (412) signals lock contention. S3 lifecycle rules minimum granularity is 1 day; shorter TTLs (30-min locks) must be enforced in application logic by comparing `acquired_at` timestamps. https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html
+- **AWS SDK v3 conditional writes** — `PutObjectCommand` with `IfNoneMatch: '*'` for atomic lock acquisition, `IfMatch: <etag>` for lease renewal. `PreconditionFailed` (412) signals lock contention. S3 lifecycle rules minimum granularity is 1 day; shorter TTLs (15-min locks) must be enforced in application logic by comparing `acquired_at` timestamps. https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html
 - **mitmproxy regular proxy mode** — the straightforward path. Workspace container sets `http_proxy=http://mitmproxy:8080` and `https_proxy=http://mitmproxy:8080` env vars. mitmproxy generates a CA at startup; CA cert is mounted into workspace at `/usr/local/share/ca-certificates/mitmproxy.crt` and `update-ca-certificates` runs in entrypoint. No iptables, no shared netns, no privileged containers required. Transparent mode is NOT used in v1 — it would force network namespace sharing. https://docs.mitmproxy.org/stable/
 - **Docker Compose v2 secrets** — `_FILE` suffix convention (`DISCORD_TOKEN_FILE=/run/secrets/discord_token`) used by Postgres/MySQL/etc. Bind-mounted files, not encrypted. `chmod 600` on the host secret files; mount permissions set via the long-form `secrets:` syntax.
 - **Graceful Node.js shutdown (2026 best practice)** — SIGTERM handler, `server.closeIdleConnections()` (Node 18.2+), track in-flight work, 25-second hard timeout (must be less than K8s `terminationGracePeriodSeconds`), health check returns 503 during shutdown.
@@ -175,11 +175,11 @@ This partition is **cleaner than the original plan stated**: the runtime is genu
 | **GitHub App auth via `Octokit({ authStrategy: createAppAuth, auth: {...} })`, not manual token refresh** | `@octokit/auth-app` handles Installation Access Token refresh automatically in Octokit's request pipeline. No manual refresh loop, no cache-miss error handling. Zero refresh code for us to maintain. |
 | **`workflow_dispatch` with `return_run_details: true`** | Introduced Feb 2026. Returns `workflow_run_id` synchronously. Eliminates the "create then poll to find run ID" pattern. |
 | **Typed workflow_dispatch schema validated on both sides** | Gateway validates inputs (types, lengths, allowed chars) before dispatch; Action re-validates on receipt as defense-in-depth. User-authored content only reaches the Action via the `prompt` field, which the XML prompt architecture already treats as untrusted. |
-| **S3 `IfNoneMatch: '*'` lock acquisition with app-level TTL via `acquired_at` timestamp** | S3 lifecycle TTL minimum is 1 day. 30-minute lock TTL enforced by waiters: read lock, compare `acquired_at + ttl_seconds < now`, if stale attempt takeover. Works with any S3-compatible provider (R2, B2, MinIO). No DynamoDB/Redis dependency. |
+| **S3 `IfNoneMatch: '*'` lock acquisition with app-level TTL via `acquired_at` timestamp** | S3 lifecycle TTL minimum is 1 day. 15-minute lock TTL (heartbeat extends the lease for long-running runs) enforced by waiters: read lock, compare `acquired_at + ttl_seconds < now`, if stale attempt takeover. No DynamoDB/Redis dependency. Supported providers for the lock backend: AWS S3, Cloudflare R2 ≥ 2024-10, MinIO ≥ RELEASE.2024-08, Localstack ≥ 3.5. B2 lacks full `IfNoneMatch` support and is NOT supported for the lock backend (sessions, artifacts, and summaries still work on B2). |
 | **Action's harness adds a lock-acquisition phase after the existing dedup phase** | Closes the Discord-vs-Action cross-surface collision hole (Q1 from flow analysis). Placing acquisition after dedup means already-deduplicated runs don't block Discord unnecessarily. The lock is the cross-surface coordination authority; dedup remains the within-surface fast-path. **Fork-PR runs do NOT participate in the lock protocol** — the existing `storeConfig.enabled = false` security boundary at `apps/action/src/harness/config/inputs.ts` prevents forks from writing to S3. Fork-PR collisions with Discord runs are an accepted risk, documented in THREAT-MODEL.md. |
 | **30-second heartbeat interval, 60-second stale threshold** | Fast enough to detect gateway crashes within the duration of a typical Discord attention span. Slow enough not to hammer S3. 2× interval threshold is the standard heartbeat-staleness pattern. |
 | **Approval buttons keyed by short opaque token; full payload in S3** | Discord `custom_id` is limited to 100 characters and MCP tool names (e.g., `mcp__github__create_pull_request`) plus session IDs plus target hash would exceed that budget. v1 uses `custom_id = approve:<token>` or `deny:<token>` with the full payload (`{tool_name, session_id, target_hash, issued_at, channel_id}`) at `approvals/pending/{token}.json` in S3. Durable across gateway restart by design; Discord's 15-minute interaction-token expiry caps the staleness window. Channel-scoped approvals (any authorized user can approve); audit log captures who clicked. |
-| **Queue state persisted per-thread in S3** | `threads/{thread_id}/queue.json` — serialized on mutation. Survives restart. Current executing task is known from the run-state lifecycle record; pending tasks are just queued messages waiting for the lock. |
+| **Queue state: in-memory for v1, S3-persisted in v1.1** | v1 uses an in-memory queue inside the gateway. Tasks pending at gateway-restart time are lost (accepted scope trim for v1). v1.1 adds `threads/{thread_id}/queue.json` S3 persistence for durability across restarts. |
 | **Docker secrets via `_FILE` suffix convention** | Follows the established Postgres/MySQL/Redis convention. Application code has a `readSecret(name)` helper that reads from `${NAME}_FILE` path if set, falls back to `process.env[NAME]` for local development. |
 | **Discord.js client-wide `allowedMentions: { parse: ['users'] }`** | Hard default. Agent output cannot `@everyone`, `@here`, or role-mention regardless of what the model emits. Individual user mentions by ID remain possible but rare. |
 | **Working-message heartbeat UX: edit one message every 60-90 seconds with elapsed time + current phase** | Single in-place edit, no channel noise. The run-state lifecycle record's `current_phase` field feeds directly into this. |
@@ -247,11 +247,8 @@ fro-bot/agent/
 │   │   │   │   ├── execution.ts
 │   │   │   │   ├── prompt.ts
 │   │   │   │   ├── prompt-thread.ts
+│   │   │   │   ├── prompt-sender.ts
 │   │   │   │   ├── server.ts     # uses injected PathAdapter/ExecAdapter
-│   │   │   │   ├── streaming.ts
-│   │   │   │   ├── reactions.ts
-│   │   │   │   ├── context.ts
-│   │   │   │   ├── diff-context.ts
 │   │   │   │   ├── reference-files.ts
 │   │   │   │   ├── retry.ts
 │   │   │   │   ├── output-mode.ts
@@ -261,7 +258,7 @@ fro-bot/agent/
 │   │   │   ├── object-store/     # moved from src/services/object-store/
 │   │   │   ├── summaries/        # NEW: shared summary record schema (type-only in runtime)
 │   │   │   ├── coordination/     # NEW: lock + run-state + queue primitives
-│   │   │   │   │   ├── lock.ts
+│   │   │   │   ├── lock.ts
 │   │   │   │   ├── run-state.ts
 │   │   │   │   ├── heartbeat.ts
 │   │   │   │   └── types.ts
@@ -280,7 +277,7 @@ fro-bot/agent/
 │       │   │   │   ├── review.ts
 │       │   │   │   ├── cloud.ts
 │       │   │   │   ├── resume.ts
-│       │   │   │   ├── abort.ts
+│       │   │   │   ├── abort.ts             # deferred to v1.1
 │       │   │   │   ├── clear-queue.ts
 │       │   │   │   └── approvals.ts
 │       │   │   ├── mentions.ts   # @mention -> thread handling
@@ -573,7 +570,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 - If lock held by another Action run (dedup case): Action skips. Existing dedup phase behavior preserved.
 - If lock acquired: Action proceeds through existing phases. Cleanup phase releases the lock on success or failure.
 - `holder_id` for Action runs: `action:{github.run_id}:{github.run_attempt}`. For Discord runs: `gateway:{instance_id}:{run_id}`.
-- Lock TTL: 30 minutes. Action runs rarely exceed this (current median is ~2 minutes); if a run does, the lock extends via heartbeat.
+- Lock TTL: 15 minutes. Action runs rarely exceed this (current median is ~2 minutes); if a run does, the lock extends via heartbeat.
 
 **Patterns to follow:**
 - `apps/action/src/harness/phases/dedup.ts` — existing skip-phase pattern
@@ -584,7 +581,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 - Cross-surface — lock held by Discord gateway: Action skips cleanly, no work done, no error
 - Dedup interaction — lock held by another Action run (rare): same behavior as cross-surface (skip with clear log)
 - Failure path — S3 unavailable during lock acquisition: Action fails fast with clear error
-- Failure path — Action crashes mid-execution: lock TTL expires (30 min); next Action or gateway run can take over
+- Failure path — Action crashes mid-execution: lock TTL expires (15 min); next Action or gateway run can take over
 - Integration — full cycle: acquire → execute → release; observability metric for "lock contention" incremented when skipped
 
 **Verification:**
@@ -920,7 +917,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 - **Interaction graph:** The gateway becomes a second consumer of the S3 object-store. Both surfaces write run-state records, hold per-repo locks, share sessions. The Action gains a new `acquire-lock` phase in its routing pipeline. `finalize` phase gains a summary-write step.
 - **Error propagation:** Gateway errors surface in Discord (red-sidebar embeds). Action errors continue to surface as PR comments + GitHub job summaries. Cross-surface errors (e.g., gateway can't read Action's summary) degrade gracefully per Unit 7's summary-missing path.
-- **State lifecycle risks:** Stale run-state records from crashed gateway instances are cleaned up on next gateway startup via the 60s stale threshold. Stale locks are reclaimed via the 30-minute TTL. Queue state persists per-thread. Approval state persists per-channel. No state leaks between runs.
+- **State lifecycle risks:** Stale run-state records from crashed gateway instances are cleaned up on next gateway startup via the 60s stale threshold. Stale locks are reclaimed via the 15-minute TTL. Queue state persists per-thread. Approval state persists per-channel. No state leaks between runs.
 - **API surface parity:** `workflow_dispatch` inputs are validated on both sides. Session content is treated as user-authored input on both sides (matches existing posture for PR bodies, comments). `allowedMentions` safety default applies to all Discord-originated messages regardless of surface.
 - **Integration coverage:** Cross-layer scenarios that unit tests cannot prove: gateway↔workspace OpenCode SDK event stream; gateway↔Discord WS reconnection behavior under network partition; Action↔gateway lock coordination end-to-end; summaries bridge round-trip. Unit 4's `validate-stack.sh` script and Unit 6's integration tests cover these.
 - **Unchanged invariants:** Existing GitHub Action behavior is preserved — all 1230 tests pass after Unit 1. The `NormalizedEvent` discriminated union, `routeEvent()` logic, existing triggers, and delivery-mode contract (PR #517) remain exactly as shipped. The Action's cron-triggered DMR + wiki workflows run unchanged.
@@ -932,7 +929,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 | Unit 1 extraction breaks the Action's CI and the release pipeline | Characterization-first execution (existing 1230 tests are the fence). Strict scope boundary: no behavior changes, only relocation + adapter injection. Each refactor step builds + tests before moving on. Rollback plan: revert the workspace-layout commit; Action keeps working on the prior `src/` layout. |
 | OpenCode SDK doesn't support concurrent sessions within one server (documentation is silent) | Unit 6 starts with a one-session-per-workspace-container assumption. If concurrency works, we get a free optimization. If it doesn't, we shard by spinning up ephemeral OpenCode servers per session. Either way, the gateway's API surface doesn't change. |
 | mitmproxy regular-proxy-mode with env vars doesn't catch a process that hardcodes its own HTTP client config | Accepted risk — documented in THREAT-MODEL.md. The workspace image installs only known tools (OpenCode, oMo), all of which respect `http_proxy`. Future-added tools must be vetted. |
-| Action's new lock-acquisition phase silently skips runs when the gateway dies without releasing | Lock TTL (30 min) is the safety net. Action also logs lock-contention skips at WARN level so stuck locks are visible in GitHub run logs. Operations doc describes how to force-release a stuck lock via S3 console if needed. |
+| Action's new lock-acquisition phase silently skips runs when the gateway dies without releasing | Lock TTL (15 min, extended by heartbeat) is the safety net. Action also logs lock-contention skips at WARN level so stuck locks are visible in GitHub run logs. Operations doc describes how to force-release a stuck lock via S3 console if needed. |
 | GitHub App Installation Access Token refresh is library-managed and opaque | Fall-forward via exception handling: if any Octokit call throws an auth error, gateway logs it, attempts a fresh `octokit.auth({ type: 'installation' })` call, retries the original request once. @octokit/auth-app's automatic refresh should prevent this from ever firing in practice. |
 | pnpm workspace refactor disrupts CI that assumes `src/` at repo root | Unit 1 explicitly includes the CI updates (`tsdown.config.ts`, `action.yaml` paths). Dry-run via a draft PR before merging; verify `dist/` still passes `git diff` check. |
 | Discord rate limits on message edits (working-message heartbeat) interact with Discord.js REST queue | 60-90s heartbeat cadence is well below Discord's 5-edit-per-5-seconds rate limit per message. Discord.js handles the REST queue automatically. If rate-limited, heartbeat skips that tick and retries; the UX degradation is graceful (slightly stale elapsed time, not broken). |
@@ -951,7 +948,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 - **KNOWN-LIMITS.md** is user-facing, not operator-facing. Honest about what v1 doesn't do and why.
 - **Institutional learning doc** (`docs/solutions/best-practices/gateway-runtime-extraction-2026-04-18.md`) compounds the team's knowledge: "here's how we extracted a shared runtime without breaking a working CI pipeline."
 - **Log format:** structured JSON via the existing `packages/runtime/src/shared/logger.ts` (moved from `src/shared/logger.ts` in Unit 1). Docker Compose logs aggregate. Redaction baked in for credentials.
-- **Metrics:** v1 ships with a minimal `/health/ready` and structured logs. Prometheus/etc. is v1.1+.
+- **Metrics:** v1 uses structured logs only — no HTTP metrics or health endpoints. `/health/ready` and Prometheus metrics are v1.1+.
 - **Rollback plan:** the workspace-layout commit from Unit 1 is a single revert away from restoring the prior `src/` layout. All subsequent units build on top of that commit; a full rollback is a branch revert + redeploy.
 - **Release pipeline:** the Action's release pipeline is unchanged (Unit 1 preserves `action.yaml` semantics). The gateway's release pipeline is new — docker image push on merge to main, version tagged from `packages/gateway/package.json`. Unit 8 adds the GitHub Actions workflow for this.
 
