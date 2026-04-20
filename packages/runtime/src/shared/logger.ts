@@ -1,3 +1,5 @@
+import process from 'node:process'
+
 export interface LogContext {
   readonly [key: string]: unknown
 }
@@ -96,8 +98,8 @@ function formatLogEntry(level: LogLevel, message: string, baseContext: LogContex
 
 function createDefaultSink(): LogSink {
   return {
-    debug: message => console.debug(message),
-    info: message => console.info(message),
+    debug: message => process.stdout.write(`${message}\n`),
+    info: message => process.stdout.write(`${message}\n`),
     warning: message => console.warn(message),
     error: message => console.error(message),
   }

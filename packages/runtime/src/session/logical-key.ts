@@ -34,7 +34,18 @@ export function buildLogicalKey(context: TriggerContext): LogicalSessionKey | nu
   }
 
   if (context.eventType === 'schedule') {
-    const scheduleExpression = context.raw.event.type === 'schedule' ? context.raw.event.schedule : undefined
+    const rawEvent =
+      typeof context.raw === 'object' && context.raw != null && 'event' in context.raw ? context.raw.event : undefined
+    const scheduleExpression =
+      typeof rawEvent === 'object' &&
+      rawEvent != null &&
+      'type' in rawEvent &&
+      rawEvent.type === 'schedule' &&
+      'schedule' in rawEvent
+        ? typeof rawEvent.schedule === 'string'
+          ? rawEvent.schedule
+          : undefined
+        : undefined
     const hashSeed =
       scheduleExpression != null && scheduleExpression.trim().length > 0 ? scheduleExpression : context.action
     const hash = buildScheduleHash(hashSeed ?? 'default')
