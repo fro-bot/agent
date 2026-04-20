@@ -5,152 +5,41 @@
  * reactions/labels management, and OpenCode execution.
  */
 
-import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '@fro-bot/runtime'
-import type {FilePartInput} from '@opencode-ai/sdk'
-import type {ModelConfig, OmoProviders, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
-import type {ErrorInfo} from '../comments/types.js'
-import type {HydratedContext} from '../context/types.js'
-import type {TriggerContext} from '../triggers/types.js'
+export type {
+  AcknowledgmentState,
+  AgentContext,
+  AgentResult,
+  DiffContext,
+  DiffFileSummary,
+  EnsureOpenCodeResult,
+  ExecutionConfig,
+  PromptOptions,
+  PromptResult,
+  ReactionContext,
+  ReferenceFile,
+  SessionContext,
+} from '@fro-bot/runtime'
 
-export type {OutputMode, ResolvedOutputMode} from '../../shared/types.js'
+export {
+  DEFAULT_CONTEXT_BUDGET,
+  ERROR_TYPES,
+  EVENT_TYPES,
+  WORKING_LABEL,
+  WORKING_LABEL_COLOR,
+  WORKING_LABEL_DESCRIPTION,
+} from '@fro-bot/runtime'
 
-/**
- * Context collected from GitHub Actions for agent prompt construction.
- * Extracted from @actions/github event payload via RFC-003 utilities.
- */
-export interface AgentContext {
-  readonly eventName: string
-  readonly repo: string
-  readonly ref: string
-  readonly actor: string
-  readonly runId: string
-  readonly issueNumber: number | null
-  readonly issueTitle: string | null
-  readonly issueType: 'issue' | 'pr' | null
-  readonly commentBody: string | null
-  readonly commentAuthor: string | null
-  readonly commentId: number | null
-  readonly defaultBranch: string
-  readonly diffContext: DiffContext | null
-  readonly hydratedContext: HydratedContext | null
-  readonly authorAssociation: string | null
-  readonly isRequestedReviewer: boolean
-}
+export type {
+  ContextBudget,
+  ErrorInfo,
+  ErrorType,
+  EventType,
+  HydratedContext,
+  IssueContext,
+  ParsedCommand,
+  PullRequestContext,
+  TriggerContext,
+  TriggerTarget,
+} from '@fro-bot/runtime'
 
-/**
- * Result of OpenCode SDK execution.
- */
-export interface AgentResult {
-  readonly success: boolean
-  readonly exitCode: number
-  readonly duration: number
-  readonly sessionId: string | null
-  readonly error: string | null
-  readonly tokenUsage: TokenUsage | null
-  readonly model: string | null
-  readonly cost: number | null
-  readonly prsCreated: readonly string[]
-  readonly commitsCreated: readonly string[]
-  readonly commentsPosted: number
-  readonly llmError: ErrorInfo | null
-}
-
-/**
- * Context for reaction and label operations.
- */
-export interface ReactionContext {
-  readonly repo: string
-  readonly commentId: number | null
-  readonly issueNumber: number | null
-  readonly issueType: 'issue' | 'pr' | null
-  readonly botLogin: string | null
-}
-
-/**
- * Session context for prompt building (RFC-004 integration).
- * Provides prior session metadata and relevant search results.
- */
-export interface SessionContext {
-  readonly recentSessions: readonly SessionSummary[]
-  readonly priorWorkContext: readonly SessionSearchResult[]
-}
-
-/**
- * Options for building the agent prompt.
- */
-export interface PromptOptions {
-  readonly context: AgentContext
-  readonly customPrompt: string | null
-  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
-  readonly sessionContext?: SessionContext
-  readonly logicalKey?: LogicalSessionKey | null
-  readonly isContinuation?: boolean
-  readonly currentThreadSessionId?: string | null
-  readonly sessionId?: string
-  readonly triggerContext?: TriggerContext
-  readonly resolvedOutputMode?: ResolvedOutputMode | null
-  readonly fileParts?: readonly FilePartInput[]
-}
-
-export interface ReferenceFile {
-  readonly filename: string
-  readonly content: string
-}
-
-export interface PromptResult {
-  readonly text: string
-  readonly referenceFiles: readonly ReferenceFile[]
-}
-
-/**
- * PR diff context for review (RFC-009 integration).
- * Provides summarized diff information for the agent prompt.
- */
-export interface DiffContext {
-  readonly changedFiles: number
-  readonly additions: number
-  readonly deletions: number
-  readonly truncated: boolean
-  readonly files: readonly DiffFileSummary[]
-}
-
-/**
- * Summary of a changed file for prompt context.
- */
-export interface DiffFileSummary {
-  readonly filename: string
-  readonly status: string
-  readonly additions: number
-  readonly deletions: number
-}
-
-/**
- * State of acknowledgment lifecycle.
- */
-export type AcknowledgmentState = 'acknowledged' | 'completed' | 'failed' | 'pending'
-
-/**
- * Working label configuration.
- */
-export const WORKING_LABEL = 'agent: working' as const
-export const WORKING_LABEL_COLOR = 'fcf2e1' as const
-export const WORKING_LABEL_DESCRIPTION = 'Agent is currently working on this' as const
-
-/**
- * Execution configuration for SDK mode (RFC-013).
- * Passed from parsed action inputs to executeOpenCode.
- */
-export interface ExecutionConfig {
-  readonly agent: string
-  readonly model: ModelConfig | null
-  readonly timeoutMs: number
-  readonly omoProviders: OmoProviders
-  readonly continueSessionId?: string
-  readonly sessionTitle?: string
-}
-
-export interface EnsureOpenCodeResult {
-  readonly path: string
-  readonly version: string
-  readonly didSetup: boolean
-}
+export type {OutputMode, ResolvedOutputMode} from '@fro-bot/runtime'
