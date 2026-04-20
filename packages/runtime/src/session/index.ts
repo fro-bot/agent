@@ -3,9 +3,13 @@ export type {SessionClient} from './backend.js'
 
 export {findProjectByWorkspace, listProjectsViaSDK} from './discovery.js'
 
+// Logical session continuity
+export {buildLogicalKey, buildSessionTitle, findSessionByTitle, resolveSessionForLogicalKey} from './logical-key.js'
+
+export type {LogicalSessionKey, SessionResolution} from './logical-key.js'
+
 // Pruning
 export {DEFAULT_PRUNING_CONFIG, pruneSessions} from './prune.js'
-
 // Search operations
 export {getSessionInfo, listSessions, searchSessions} from './search.js'
 // Storage utilities
@@ -17,6 +21,9 @@ export {
   getSessionTodos,
   listSessionsForProject,
 } from './storage.js'
+
+// Title maintenance
+export {reassertSessionTitle} from './title-reassert.js'
 
 // Types
 export type {
@@ -50,7 +57,7 @@ export type {
 } from './types.js'
 
 // Version detection
-export {compareVersions, getOpenCodeDbPath, OPENCODE_SQLITE_VERSION} from './version.js'
+export {compareVersions, getOpenCodeDbPath, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
 
 // Writeback
 export {writeSessionSummary} from './writeback.js'

@@ -1,18 +1,22 @@
+import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '@fro-bot/runtime'
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
-import type {LogicalSessionKey} from '../../services/session/logical-key.js'
-import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
+import {
+  buildLogicalKey,
+  buildSessionTitle,
+  listSessions,
+  resolveSessionForLogicalKey,
+  searchSessions,
+} from '@fro-bot/runtime'
 import {
   buildAttachmentResult,
   downloadAttachments,
   parseAttachmentUrls,
   validateAttachments,
 } from '../../features/attachments/index.js'
-import {listSessions, searchSessions} from '../../services/session/index.js'
-import {buildLogicalKey, buildSessionTitle, resolveSessionForLogicalKey} from '../../services/session/logical-key.js'
 import {getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'

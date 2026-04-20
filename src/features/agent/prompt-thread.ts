@@ -1,4 +1,4 @@
-import type {LogicalSessionKey} from '../../services/session/logical-key.js'
+import type {LogicalSessionKey} from '@fro-bot/runtime'
 
 export function buildHarnessRulesSection(): string {
   return [

@@ -5,7 +5,7 @@
  * instructions, gh CLI examples, and run summary requirements.
  */
 
-import type {SessionSearchResult} from '../../services/session/types.js'
+import type {SessionSearchResult} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {HydratedContext} from '../context/types.js'
 import type {TriggerContext} from '../triggers/types.js'

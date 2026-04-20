@@ -8,12 +8,17 @@ import type {Logger} from '../../shared/logger.js'
 import type {AgentIdentity} from '../../shared/types.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
-import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
+import {
+  createS3Adapter,
+  DEFAULT_PRUNING_CONFIG,
+  pruneSessions,
+  syncArtifactsToStore,
+  syncMetadataToStore,
+} from '@fro-bot/runtime'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
-import {DEFAULT_PRUNING_CONFIG, pruneSessions} from '../../services/session/index.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,

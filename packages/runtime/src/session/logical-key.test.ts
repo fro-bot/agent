@@ -1,9 +1,9 @@
-import type {TriggerContext, TriggerTarget} from '../../features/triggers/types.js'
-import type {EventType, GitHubContext} from '../github/types.js'
+import type {TriggerContext, TriggerTarget} from '../../../../src/features/triggers/types.js'
+import type {EventType, GitHubContext} from '../../../../src/services/github/types.js'
 import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import {createMockLogger} from '../../../../src/shared/test-helpers.js'
 import {buildLogicalKey, buildSessionTitle, findSessionByTitle, resolveSessionForLogicalKey} from './logical-key.js'
 
 function createRawContext(eventType: EventType): GitHubContext {

@@ -33,16 +33,9 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   return {
     ...original,
     createS3Adapter: vi.fn(),
+    pruneSessions: vi.fn(async () => ({prunedCount: 0, remainingCount: 0})),
     syncArtifactsToStore: vi.fn(async () => ({uploaded: 0, failed: 0})),
     syncMetadataToStore: vi.fn(async () => ({success: true})),
-  }
-})
-
-vi.mock('../../services/session/index.js', async importOriginal => {
-  const original = await importOriginal<typeof import('../../services/session/index.js')>()
-  return {
-    ...original,
-    pruneSessions: vi.fn(async () => ({prunedCount: 0, remainingCount: 0})),
   }
 })
 

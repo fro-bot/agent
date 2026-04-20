@@ -10,6 +10,7 @@
     },
     "types": ["node"],
     "strict": true,
+    "ignoreDeprecations": "6.0",
     "noEmit": false
   }
 }

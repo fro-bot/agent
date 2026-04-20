@@ -1,5 +1,4 @@
-import type {LogicalSessionKey} from '../../services/session/logical-key.js'
-import type {SessionSearchResult, SessionSummary} from '../../services/session/types.js'
+import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {TriggerContext} from '../triggers/types.js'
 import type {AgentContext, PromptOptions, SessionContext} from './types.js'
