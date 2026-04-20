@@ -117,3 +117,4 @@ eslint-typegen.d.ts
 
 # Workspace package build output
 packages/runtime/dist/
+apps/action/dist/
