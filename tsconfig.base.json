@@ -1,0 +1,11 @@
+{
+  "extends": "@bfra.me/tsconfig",
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": false
+  }
+}

@@ -216,6 +216,21 @@ importers:
         specifier: 4.1.4
         version: 4.1.4(@types/node@24.12.2)(vite@7.3.2(@types/node@24.12.2)(jiti@2.6.1)(yaml@2.8.3))
 
+  apps/action:
+    dependencies:
+      '@fro-bot/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+
+  packages/runtime:
+    dependencies:
+      '@bfra.me/es':
+        specifier: 0.1.0
+        version: 0.1.0
+      '@opencode-ai/sdk':
+        specifier: 1.14.17
+        version: 1.14.17
+
 packages:
 
   '@actions/artifact@6.2.1':

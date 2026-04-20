@@ -1,11 +1,7 @@
 {
-  "extends": "@bfra.me/tsconfig",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "target": "ESNext",
     "rootDir": ".",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "types": ["node"],
     "noEmit": true
   },
   "include": ["**/*.ts"],

@@ -1,0 +1,18 @@
+{
+  "name": "@fro-bot/action",
+  "version": "0.0.0-development",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "module": "dist/main.js",
+  "scripts": {
+    "build": "pnpm --dir ../.. exec tsc --noEmit && pnpm --dir ../.. exec tsdown",
+    "check-types": "pnpm --dir ../.. exec tsc --noEmit",
+    "fix": "pnpm --dir ../.. exec eslint --fix src tsdown.config.ts eslint.config.ts",
+    "lint": "pnpm --dir ../.. exec eslint src tsdown.config.ts eslint.config.ts",
+    "test": "pnpm --dir ../.. exec vitest run"
+  },
+  "dependencies": {
+    "@fro-bot/runtime": "workspace:*"
+  }
+}

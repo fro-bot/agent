@@ -1,0 +1,26 @@
+{
+  "name": "@fro-bot/runtime",
+  "version": "0.0.0-development",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "scripts": {
+    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/index.ts --format esm --dts --out-dir dist",
+    "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
+    "fix": "pnpm --dir ../.. exec eslint --fix packages/runtime/src",
+    "lint": "pnpm --dir ../.. exec eslint packages/runtime/src",
+    "test": "pnpm exec vitest run --passWithNoTests packages/runtime/src"
+  },
+  "dependencies": {
+    "@bfra.me/es": "0.1.0",
+    "@opencode-ai/sdk": "1.14.17"
+  }
+}
