@@ -1,13 +1,12 @@
-import type {Logger} from '../../shared/logger.js'
 import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {err, ok} from '../../shared/types.js'
+import {err, ok} from '../../../../src/shared/types.js'
 import {syncArtifactsToStore, syncMetadataToStore, syncSessionsFromStore, syncSessionsToStore} from './index.js'
 
-function createLogger(): Logger {
+function createLogger() {
   return {
     debug: vi.fn(),
     info: vi.fn(),
@@ -244,10 +243,10 @@ describe('content sync', () => {
     expect(result).toEqual({downloaded: 3, failed: 0, mainDbRestored: true})
     expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
     expect(download).toHaveBeenCalledTimes(3)
-    const dbDir = path.dirname(storagePath)
-    await expect(fs.readFile(path.join(dbDir, 'opencode.db'), 'utf8')).resolves.toContain('opencode.db')
-    await expect(fs.readFile(path.join(dbDir, 'opencode.db-wal'), 'utf8')).resolves.toContain('opencode.db-wal')
-    await expect(fs.readFile(path.join(dbDir, 'opencode.db-shm'), 'utf8')).resolves.toContain('opencode.db-shm')
+    const currentDbDir = path.dirname(storagePath)
+    await expect(fs.readFile(path.join(currentDbDir, 'opencode.db'), 'utf8')).resolves.toContain('opencode.db')
+    await expect(fs.readFile(path.join(currentDbDir, 'opencode.db-wal'), 'utf8')).resolves.toContain('opencode.db-wal')
+    await expect(fs.readFile(path.join(currentDbDir, 'opencode.db-shm'), 'utf8')).resolves.toContain('opencode.db-shm')
   })
 
   it('rejects keys that fail path traversal validation', async () => {

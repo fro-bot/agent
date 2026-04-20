@@ -1,10 +1,10 @@
 import type {Result} from '@bfra.me/es/result'
-import type {ObjectStoreConfig} from '../../services/object-store/index.js'
+import type {ObjectStoreConfig} from '@fro-bot/runtime'
 import type {ActionInputs, ModelConfig, OmoProviders, OutputMode} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import {validateEndpoint, validatePrefix} from '../../services/object-store/index.js'
+import {validateEndpoint, validatePrefix} from '@fro-bot/runtime'
 import {
   DEFAULT_AGENT,
   DEFAULT_DEDUP_WINDOW_MS,

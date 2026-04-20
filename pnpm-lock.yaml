@@ -139,6 +139,9 @@ importers:
       '@bfra.me/es':
         specifier: 0.1.0
         version: 0.1.0
+      '@fro-bot/runtime':
+        specifier: workspace:*
+        version: link:packages/runtime
       '@octokit/auth-app':
         specifier: 8.2.0
         version: 8.2.0

@@ -1,8 +1,8 @@
-import type {Result} from '../../shared/types.js'
+import type {Result} from '../../../../src/shared/types.js'
 import * as net from 'node:net'
 import * as path from 'node:path'
 
-import {err, ok} from '../../shared/types.js'
+import {err, ok} from '../../../../src/shared/types.js'
 import {
   createPathTraversalError,
   createValidationError,
@@ -80,11 +80,6 @@ function hasDisallowedAddress(hostname: string): boolean {
   return false
 }
 
-// Cloud instance metadata service addresses must be blocked even when insecure endpoints
-// are allowed — a leaked IAM role or SSRF via metadata service compromises the entire
-// runner environment regardless of whether the endpoint is otherwise "trusted".
-// This list is narrow by design: only exact metadata endpoints. Broader link-local and
-// private ranges are still blocked by hasDisallowedAddress when the insecure flag is off.
 function hasMetadataServiceAddress(hostname: string): boolean {
   const normalized = hostname.toLowerCase()
 

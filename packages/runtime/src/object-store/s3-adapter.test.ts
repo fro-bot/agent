@@ -1,4 +1,4 @@
-import type {Logger} from '../../shared/logger.js'
+import type {Logger} from '../../../../src/shared/logger.js'
 import type {ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
@@ -103,13 +103,10 @@ describe('createS3Adapter', () => {
   })
 
   it('configures a custom HTTPS endpoint with path-style access', async () => {
-    // #given
     const logger = createLogger()
 
-    // #when
     createS3Adapter({...baseConfig, endpoint: 'https://example.r2.cloudflarestorage.com'}, logger)
 
-    // #then
     expect(clientConfigs).toHaveLength(1)
     expect(clientConfigs[0]).toMatchObject({
       endpoint: 'https://example.r2.cloudflarestorage.com',
@@ -119,30 +116,24 @@ describe('createS3Adapter', () => {
   })
 
   it('uses default AWS endpoint settings when no custom endpoint is provided', async () => {
-    // #given
     const logger = createLogger()
 
-    // #when
     createS3Adapter(baseConfig, logger)
 
-    // #then
     expect(clientConfigs).toHaveLength(1)
     expect(clientConfigs[0]).toMatchObject({region: 'us-east-1'})
     expect(clientConfigs[0]).not.toMatchObject({forcePathStyle: true})
   })
 
   it('defaults to aws:kms when no custom endpoint is set', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter(baseConfig, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(sendMock).toHaveBeenCalledTimes(1)
     expect(getCommandInput(0)).toMatchObject({
@@ -153,39 +144,32 @@ describe('createS3Adapter', () => {
   })
 
   it('defaults to AES256 when custom endpoint is set', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter({...baseConfig, endpoint: 'https://example.r2.cloudflarestorage.com'}, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({ServerSideEncryption: 'AES256'})
   })
 
   it('respects explicit sseEncryption equals AES256 override even without custom endpoint', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter({...baseConfig, sseEncryption: 'AES256'}, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({ServerSideEncryption: 'AES256'})
   })
 
   it('respects explicit sseEncryption equals aws:kms override even with custom endpoint', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter(
@@ -195,26 +179,21 @@ describe('createS3Adapter', () => {
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({ServerSideEncryption: 'aws:kms'})
   })
 
   it('includes SSEKMSKeyId when sseEncryption equals aws:kms and sseKmsKeyId is set', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter({...baseConfig, sseEncryption: 'aws:kms', sseKmsKeyId: 'kms-key-123'}, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({
       SSEKMSKeyId: 'kms-key-123',
@@ -223,40 +202,33 @@ describe('createS3Adapter', () => {
   })
 
   it('omits SSEKMSKeyId when sseEncryption equals AES256 even if sseKmsKeyId is set', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter({...baseConfig, sseEncryption: 'AES256', sseKmsKeyId: 'kms-key-123'}, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({ServerSideEncryption: 'AES256'})
     expect(getCommandInput(0)).not.toHaveProperty('SSEKMSKeyId')
   })
 
   it('sets ExpectedBucketOwner when configured', async () => {
-    // #given
     sendMock.mockResolvedValue({})
     const logger = createLogger()
     const adapter = createS3Adapter({...baseConfig, expectedBucketOwner: '123456789012'}, logger)
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     expect(getCommandInput(0)).toMatchObject({ExpectedBucketOwner: '123456789012'})
   })
 
   it('redacts signed S3 errors before logging and returns an error result', async () => {
-    // #given
     const logger = createLogger()
     const localPath = path.join(tempDir, 'opencode.db')
     await fs.writeFile(localPath, 'db-bytes')
@@ -269,10 +241,8 @@ describe('createS3Adapter', () => {
     )
     const adapter = createS3Adapter(baseConfig, logger)
 
-    // #when
     const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(false)
     expect(logger.warning).toHaveBeenCalledTimes(1)
     const context = vi.mocked(logger.warning).mock.calls[0]?.[1]
@@ -286,7 +256,6 @@ describe('createS3Adapter', () => {
   })
 
   it('lists all keys under a prefix across paginated responses', async () => {
-    // #given
     sendMock
       .mockResolvedValueOnce({
         Contents: [{Key: 'fro-bot-state/github/owner/repo/sessions/opencode.db'}],
@@ -300,10 +269,8 @@ describe('createS3Adapter', () => {
     const logger = createLogger()
     const adapter = createS3Adapter(baseConfig, logger)
 
-    // #when
     const result = await adapter.list('fro-bot-state/github/owner/repo/sessions/')
 
-    // #then
     expect(result.success).toBe(true)
     expect(result.success && result.data).toEqual([
       'fro-bot-state/github/owner/repo/sessions/opencode.db',
@@ -314,16 +281,13 @@ describe('createS3Adapter', () => {
   })
 
   it('downloads objects without throwing on S3 errors', async () => {
-    // #given
     sendMock.mockResolvedValue({Body: Readable.from(['downloaded bytes'])})
     const logger = createLogger()
     const adapter = createS3Adapter(baseConfig, logger)
-    const localPath = path.join(tempDir, 'downloaded.db')
+    const localPath = path.join(tempDir, 'download', 'opencode.db')
 
-    // #when
     const result = await adapter.download('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
 
-    // #then
     expect(result.success).toBe(true)
     await expect(fs.readFile(localPath, 'utf8')).resolves.toBe('downloaded bytes')
   })

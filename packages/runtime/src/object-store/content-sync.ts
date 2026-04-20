@@ -1,9 +1,9 @@
-import type {Logger} from '../../shared/logger.js'
+import type {Logger} from '../../../../src/shared/logger.js'
 import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {toErrorMessage} from '../../shared/errors.js'
+import {toErrorMessage} from '../../../../src/shared/errors.js'
 import {buildObjectStoreKey} from './key-builder.js'
 import {validateDownloadPath} from './validation.js'
 
@@ -221,10 +221,6 @@ export async function syncMetadataToStore(
     return {success: false}
   }
 
-  // Create a private temp directory (mode 0700 on POSIX) before writing metadata
-  // to avoid CWE-377/378: files placed directly in os.tmpdir() are world-readable
-  // by default and the path is predictable, enabling information disclosure and
-  // race conditions with other users on shared runners.
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-metadata-'))
   const tempFilePath = path.join(tempDir, `${runId}.json`)
 

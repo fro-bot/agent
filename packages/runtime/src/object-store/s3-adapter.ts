@@ -1,4 +1,4 @@
-import type {Logger} from '../../shared/logger.js'
+import type {Logger} from '../../../../src/shared/logger.js'
 import * as fs from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import * as path from 'node:path'
@@ -6,7 +6,7 @@ import {Readable} from 'node:stream'
 import {pipeline} from 'node:stream/promises'
 import {GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client} from '@aws-sdk/client-s3'
 
-import {err, ok} from '../../shared/types.js'
+import {err, ok} from '../../../../src/shared/types.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
 
 function sanitizeS3ErrorMessage(message: string): string {
