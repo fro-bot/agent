@@ -22,7 +22,7 @@ export {
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
-export {MAX_LLM_RETRIES, RETRY_DELAYS_MS, runPromptAttempt} from './retry.js'
+export {MAX_LLM_RETRIES, runPromptAttempt} from './retry.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle} from './server.js'
 export type {SetupAdapter} from './setup-adapter.js'

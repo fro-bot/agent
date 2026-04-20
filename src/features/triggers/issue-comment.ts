@@ -1,4 +1,4 @@
-import type {Octokit} from '../../services/github/types.js'
+import type {GitHubContext, Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {Thread} from '../comments/types.js'
 import type {TriggerContext} from './types.js'
@@ -16,7 +16,7 @@ export async function handleIssueComment(
   botLogin: string | null,
   logger: Logger,
 ): Promise<IssueCommentResult> {
-  const target = getCommentTarget(context.raw)
+  const target = getCommentTarget(context.raw as GitHubContext)
 
   if (target == null) {
     logger.debug('No comment target found for event', {eventType: context.eventType})
