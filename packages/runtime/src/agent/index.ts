@@ -1,7 +1,19 @@
+export {
+  createAgentError,
+  createErrorInfo,
+  createLLMFetchError,
+  createLLMTimeoutError,
+  createRateLimitError,
+  formatErrorComment,
+  isAgentNotFoundError,
+  isLlmFetchError,
+} from './error-format/format.js'
+
+export type {ErrorInfo, ErrorType} from './error-format/types.js'
+
+export {ERROR_TYPES} from './error-format/types.js'
 export {executeOpenCode} from './execution.js'
-
 export {resolveOutputMode} from './output-mode.js'
-
 export {
   buildCurrentThreadContextSection,
   buildHarnessRulesSection,
@@ -22,8 +34,6 @@ export type {
   DiffContext,
   DiffFileSummary,
   EnsureOpenCodeResult,
-  ErrorInfo,
-  ErrorType,
   EventType,
   ExecutionConfig,
   HydratedContext,
@@ -40,7 +50,6 @@ export type {
 } from './types.js'
 export {
   DEFAULT_CONTEXT_BUDGET,
-  ERROR_TYPES,
   EVENT_TYPES,
   WORKING_LABEL,
   WORKING_LABEL_COLOR,

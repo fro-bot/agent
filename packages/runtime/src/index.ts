@@ -1,3 +1,5 @@
+export * from './agent/error-format/format.js'
+export * from './agent/error-format/types.js'
 export * from './agent/index.js'
 export * from './object-store/index.js'
 export * from './session/index.js'

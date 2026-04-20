@@ -11,7 +11,7 @@ import {sleep} from '../shared/async.js'
 import {DEFAULT_AGENT, DEFAULT_TIMEOUT_MS} from '../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
-import {createLLMFetchError, isLlmFetchError} from './llm-error-helpers.js'
+import {createLLMFetchError, isLlmFetchError} from './error-format/format.js'
 import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
@@ -114,7 +114,15 @@ export async function executeOpenCode(
     const referenceFileParts = await materializeReferenceFiles(referenceFiles, logPath, logger)
     const allFileParts = [...(promptOptions.fileParts ?? []), ...referenceFileParts]
 
-    let final = {
+    let final: {
+      tokens: unknown
+      model: string | null
+      cost: number | null
+      prsCreated: readonly string[]
+      commitsCreated: readonly string[]
+      commentsPosted: number
+      llmError: ErrorInfo | null
+    } = {
       tokens: null,
       model: null,
       cost: null,

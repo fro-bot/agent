@@ -2,7 +2,7 @@ import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sd
 import type {Logger} from '../shared/logger.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {DEFAULT_AGENT, DEFAULT_MODEL} from '../shared/constants.js'
-import {createLLMFetchError, isLlmFetchError} from './llm-error-helpers.js'
+import {createLLMFetchError, isLlmFetchError} from './error-format/format.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
 Please continue where you left off. If you were in the middle of a task, resume it.

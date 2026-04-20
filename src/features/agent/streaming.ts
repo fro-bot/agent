@@ -1,10 +1,10 @@
+import type {ErrorInfo} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
-import type {ErrorInfo} from '../comments/types.js'
+import {createAgentError, createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
-import {createAgentError, createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 
 export interface EventStreamResult {
   readonly tokens: TokenUsage | null

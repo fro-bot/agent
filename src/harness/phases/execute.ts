@@ -1,5 +1,5 @@
+import type {ErrorInfo} from '@fro-bot/runtime'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
-import type {ErrorInfo} from '../../features/comments/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
