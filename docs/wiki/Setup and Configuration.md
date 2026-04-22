@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -13,8 +13,10 @@ sources:
   - src/services/setup/auth-json.ts
   - src/services/setup/tools-cache.ts
   - src/shared/constants.ts
+  - src/harness/config/inputs.ts
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
+  - RFCs/RFC-019-S3-Storage-Backend.md
 summary: "Tool installation, configuration assembly, credential management, and cache strategy"
 ---
 
@@ -93,14 +95,14 @@ Credentials are handled with care:
 
 ## Action Inputs
 
-The action accepts 17 inputs defined in `action.yaml`. The most important ones:
+The action accepts over 20 inputs defined in `action.yaml`, grouped into core, agent, S3, and configuration categories. The most important ones:
 
 - `github-token` and `auth-json` are required — they provide GitHub API access and LLM provider credentials respectively.
 - `prompt` provides a custom instruction for the agent. Required for `schedule` and `workflow_dispatch` events.
-- `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). Determines whether file changes stay in the working directory for the caller workflow to commit, or whether the agent owns the branch/PR delivery. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
+- `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). When set to `auto`, the resolver in `src/features/agent/output-mode.ts` scans the prompt text for branch/PR-related phrases (e.g., "pull request", "create a pr", "git push") and selects `branch-pr` if any match, otherwise `working-dir`. This heuristic is frozen — new phrases require a code change. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
 - `agent` selects the OpenCode agent (default: `sisyphus`). Must be a primary agent, not a subagent.
 - `model` overrides the LLM model in `provider/model` format.
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
-- `s3-backup` / `s3-bucket` / `aws-region` enable optional S3 session backup (see [[Session Persistence]]).
+- `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation rejects SSRF-vulnerable endpoints (metadata services, private IPs) and enforces HTTPS unless explicitly overridden.
 - `session-retention` controls how many sessions to keep before pruning (default: 50).
 - `dedup-window` configures the deduplication window in milliseconds (default: 10 minutes).
