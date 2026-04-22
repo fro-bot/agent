@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-04-13"
-updated-by: "86e5bad"
+last-updated: "2026-04-19"
+updated-by: "92324bf"
 sources:
   - AGENTS.md
   - src/shared/logger.ts
