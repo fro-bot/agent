@@ -2,12 +2,19 @@ import type {Result} from '../shared/types.js'
 
 export type {ObjectStoreConfig} from '../shared/types.js'
 
-export type ContentType = 'artifacts' | 'metadata' | 'sessions'
+export type ContentType = 'artifacts' | 'locks' | 'metadata' | 'runs' | 'sessions'
 
 export interface ObjectStoreAdapter {
   readonly upload: (key: string, localPath: string) => Promise<Result<void, Error>>
   readonly download: (key: string, localPath: string) => Promise<Result<void, Error>>
   readonly list: (prefix: string) => Promise<Result<string[], Error>>
+  readonly conditionalPut?: (
+    key: string,
+    data: string,
+    options: {ifNoneMatch?: string; ifMatch?: string},
+  ) => Promise<Result<{etag: string}, Error>>
+  readonly conditionalDelete?: (key: string, options: {ifMatch: string}) => Promise<Result<void, Error>>
+  readonly getObject?: (key: string) => Promise<Result<{data: string; etag: string}, Error>>
 }
 
 export interface ValidationError extends Error {
