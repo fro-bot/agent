@@ -1,6 +1,7 @@
+import type {ReactionContext} from '@fro-bot/runtime'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {ReactionContext} from './types.js'
+import {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from '@fro-bot/runtime'
 import {
   addLabelsToIssue,
   createCommentReaction,
@@ -10,7 +11,6 @@ import {
   removeLabelFromIssue,
 } from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {WORKING_LABEL, WORKING_LABEL_COLOR, WORKING_LABEL_DESCRIPTION} from './types.js'
 
 export async function addEyesReaction(client: Octokit, ctx: ReactionContext, logger: Logger): Promise<boolean> {
   if (ctx.commentId == null) {

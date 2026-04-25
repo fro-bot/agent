@@ -1,8 +1,8 @@
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import {isSqliteBackend} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
-import {isSqliteBackend} from '../session/version.js'
 
 export function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
   const resolvedFile = path.resolve(filePath)

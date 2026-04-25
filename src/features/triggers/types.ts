@@ -5,7 +5,7 @@
  * Works alongside github/context.ts utilities, not replacing them.
  */
 
-import type {EventType, GitHubContext} from '../../services/github/types.js'
+import type {TriggerContext as RuntimeTriggerContext} from '@fro-bot/runtime'
 import {ALLOWED_ASSOCIATIONS} from '../../shared/types.js'
 
 export {ALLOWED_ASSOCIATIONS}
@@ -96,40 +96,7 @@ export interface ParsedCommand {
  * Full context for a trigger event.
  * Built by routeEvent() from GitHubContext.
  */
-export interface TriggerContext {
-  /** Classified event type */
-  readonly eventType: EventType
-  /** Original GitHub event name */
-  readonly eventName: string
-  /** Repository owner and name */
-  readonly repo: {readonly owner: string; readonly repo: string}
-  /** Git ref (branch/tag) */
-  readonly ref: string
-  /** Commit SHA */
-  readonly sha: string
-  /** Workflow run ID */
-  readonly runId: number
-  /** Actor who triggered the event */
-  readonly actor: string
-  /** Event action (e.g., 'created', 'opened', 'edited') */
-  readonly action: string | null
-  /** Author of the comment (if applicable) */
-  readonly author: AuthorInfo | null
-  /** Target of the trigger */
-  readonly target: TriggerTarget | null
-  /** Comment body (if applicable) */
-  readonly commentBody: string | null
-  /** Comment ID (if applicable) */
-  readonly commentId: number | null
-  /** Whether the bot was mentioned in the comment */
-  readonly hasMention: boolean
-  /** Parsed command from the mention (if any) */
-  readonly command: ParsedCommand | null
-  /** Whether pull_request event targets this bot as requested reviewer */
-  readonly isBotReviewRequested: boolean
-  /** Original GitHub context for advanced use */
-  readonly raw: GitHubContext
-}
+export type TriggerContext = RuntimeTriggerContext
 
 /**
  * Reasons why a trigger should be skipped.

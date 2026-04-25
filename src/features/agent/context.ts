@@ -5,11 +5,9 @@
  * comment data, author info, and target info. Avoids duplicating parsing.
  */
 
+import type {AgentContext, HydratedContext, TriggerContext} from '@fro-bot/runtime'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {HydratedContext} from '../context/types.js'
-import type {TriggerContext} from '../triggers/types.js'
-import type {AgentContext} from './types.js'
 import {getDefaultBranch} from '../../services/github/api.js'
 import {
   DEFAULT_CONTEXT_BUDGET,

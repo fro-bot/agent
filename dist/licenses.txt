@@ -8030,6 +8030,10 @@ WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
 ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
+@nodable/entities@2.1.0
+MIT
+MIT
+
 @octokit/auth-app@8.2.0
 MIT
 The MIT License
@@ -8374,7 +8378,7 @@ The above copyright notice and this permission notice (including the next paragr
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-@opencode-ai/sdk@1.14.18
+@opencode-ai/sdk@1.14.20
 MIT
 MIT
 
@@ -19739,13 +19743,11 @@ Apache-2.0
    limitations under the License.
 
 
-balanced-match@4.0.4
+balanced-match@1.0.2
 MIT
 (MIT)
 
-Original code Copyright Julian Gruber <julian@juliangruber.com>
-
-Port to TypeScript Copyright Isaac Z. Schlueter <i@izs.me>
+Copyright (c) 2013 Julian Gruber &lt;julian@juliangruber.com&gt;
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -21297,13 +21299,11 @@ programs and associated documentation files created by the
 Original Author, when distributed with the Software.
 
 
-brace-expansion@5.0.5
+brace-expansion@2.1.0
 MIT
 MIT License
 
-Copyright Julian Gruber <julian@juliangruber.com>
-
-TypeScript port Copyright Isaac Z. Schlueter <i@izs.me>
+Copyright (c) 2013 Julian Gruber <julian@juliangruber.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -21436,6 +21436,28 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+
+concat-map@0.0.1
+MIT
+This software is released under the MIT license:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 
 core-util-is@1.0.3
 MIT
@@ -22072,7 +22094,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 
-fast-xml-builder@1.1.4
+fast-xml-builder@1.1.5
 MIT
 MIT License
 
@@ -22097,7 +22119,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-fast-xml-parser@5.5.8
+fast-xml-parser@5.7.2
 MIT
 MIT License
 
@@ -22775,7 +22797,7 @@ will be liable to anyone for any damages related to this
 software or this license, under any kind of legal claim.***
 
 
-path-expression-matcher@1.2.0
+path-expression-matcher@1.5.0
 MIT
 MIT License
 
@@ -23369,7 +23391,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-strnum@2.2.0
+strnum@2.2.3
 MIT
 MIT License
 

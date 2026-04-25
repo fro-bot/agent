@@ -21,8 +21,8 @@ vi.mock('../services/artifact/index.js', () => ({
   uploadLogArtifact: vi.fn(),
 }))
 
-vi.mock('../services/object-store/index.js', async importOriginal => {
-  const original = await importOriginal<typeof import('../services/object-store/index.js')>()
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
   return {
     ...original,
     createS3Adapter: vi.fn(),
@@ -340,8 +340,7 @@ describe('post action', () => {
       const {saveCache} = await import('../services/cache/index.js')
       vi.mocked(saveCache).mockResolvedValue(true)
 
-      const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} =
-        await import('../services/object-store/index.js')
+      const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
       vi.mocked(createS3Adapter).mockReturnValue({
         upload: async () => ok(undefined),
         download: async () => ok(undefined),

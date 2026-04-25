@@ -1,0 +1,135 @@
+import type {Result} from '@bfra.me/es/result'
+
+// Re-export Result type and helpers for convenience
+export type {Err, Ok, Result} from '@bfra.me/es/result'
+export {err, isErr, isOk, ok} from '@bfra.me/es/result'
+
+// Agent identity for cache scoping
+export type AgentIdentity = 'discord' | 'github'
+
+// Object store configuration (pure data shape; adapter lives in services/object-store/)
+export interface ObjectStoreConfig {
+  readonly enabled: boolean
+  readonly bucket: string
+  readonly region: string
+  readonly prefix: string
+  readonly endpoint?: string
+  readonly expectedBucketOwner?: string
+  readonly allowInsecureEndpoint?: boolean
+  readonly sseEncryption?: 'aws:kms' | 'AES256'
+  readonly sseKmsKeyId?: string
+}
+
+// Cache restore result
+export interface CacheResult {
+  readonly hit: boolean
+  readonly key: string | null
+  readonly restoredPath: string | null
+  readonly corrupted: boolean
+  /** null on miss, 'cache' on Actions cache hit, 'storage' on S3 fallback hit */
+  readonly source: 'cache' | 'storage' | null
+}
+
+// Run context from GitHub Actions
+export interface RunContext {
+  readonly eventName: string
+  readonly repo: string
+  readonly ref: string
+  readonly runId: number
+  readonly actor: string
+  readonly agentIdentity: AgentIdentity
+}
+
+// Author association for permission gating
+export const ALLOWED_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'] as const
+export type AuthorAssociation = (typeof ALLOWED_ASSOCIATIONS)[number]
+
+// Session pruning configuration
+export interface PruningConfig {
+  readonly maxSessions: number
+  readonly maxAgeDays: number
+}
+
+// Model configuration for SDK execution (RFC-013)
+export interface ModelConfig {
+  readonly providerID: string
+  readonly modelID: string
+}
+
+export type OutputMode = 'auto' | 'working-dir' | 'branch-pr'
+export type ResolvedOutputMode = 'working-dir' | 'branch-pr'
+
+// Action inputs (parsed and validated) - per RFC-001, RFC-013
+export interface ActionInputs {
+  readonly githubToken: string
+  readonly authJson: string
+  readonly prompt: string | null
+  readonly outputMode: OutputMode
+  readonly sessionRetention: number
+  readonly storeConfig: ObjectStoreConfig
+  // RFC-013: SDK execution configuration
+  readonly agent: string
+  readonly model: ModelConfig | null
+  readonly timeoutMs: number
+  // Setup consolidation: auto-setup inputs
+  readonly opencodeVersion: string
+  readonly skipCache: boolean
+  readonly omoVersion: string
+  readonly systematicVersion: string
+  // oMo provider configuration
+  readonly omoProviders: OmoProviders
+  // OpenCode config to merge with baseline
+  readonly opencodeConfig: string | null
+  readonly systematicConfig: string | null
+  // Dedup execution: skip if agent already ran for this entity recently (0 = disabled)
+  readonly dedupWindow: number
+}
+
+// oMo provider configuration for installer
+export interface OmoProviders {
+  readonly claude: 'no' | 'yes' | 'max20'
+  readonly copilot: 'no' | 'yes'
+  readonly gemini: 'no' | 'yes'
+  readonly openai: 'no' | 'yes'
+  readonly opencodeZen: 'no' | 'yes'
+  readonly zaiCodingPlan: 'no' | 'yes'
+  readonly kimiForCoding: 'no' | 'yes'
+}
+
+// Action outputs
+export interface ActionOutputs {
+  readonly sessionId: string | null
+  readonly resolvedOutputMode: ResolvedOutputMode | null
+  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
+  readonly duration: number
+}
+
+// Token usage tracking (matches OpenCode SDK structure)
+export interface TokenUsage {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cache: {
+    readonly read: number
+    readonly write: number
+  }
+}
+
+// Run summary for session writeback (RFC-004)
+export interface RunSummary {
+  readonly eventType: string
+  readonly repo: string
+  readonly ref: string
+  readonly runId: number
+  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
+  readonly sessionIds: readonly string[]
+  readonly logicalKey?: string
+  readonly createdPRs: readonly string[]
+  readonly createdCommits: readonly string[]
+  readonly duration: number
+  readonly tokenUsage: TokenUsage | null
+}
+
+// Validation result type aliases for common use cases
+export type ValidationResult<T> = Result<T, Error>
+export type ParseResult<T> = Result<T, Error>

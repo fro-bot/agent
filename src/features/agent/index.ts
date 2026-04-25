@@ -33,9 +33,10 @@ export {
 } from './reactions.js'
 
 // OpenCode execution (RFC-013: SDK mode)
-export {bootstrapOpenCodeServer, ensureOpenCodeAvailable, verifyOpenCodeAvailable} from './server.js'
+export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server-adapter.js'
+export type {OpenCodeServerHandle} from './server-adapter.js'
 
-export type {OpenCodeServerHandle} from './server.js'
+export {verifyOpenCodeAvailable} from './server.js'
 
 // Types
 export type {
