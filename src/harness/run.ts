@@ -5,10 +5,12 @@ import type {AttachmentResult} from '../features/attachments/index.js'
 import type {Octokit} from '../services/github/types.js'
 import * as core from '@actions/core'
 import {createMetricsCollector} from '../features/observability/index.js'
+import {getGitHubRunAttempt} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
 import {runAcknowledge} from './phases/acknowledge.js'
+import {runAcquireLock} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
@@ -33,6 +35,7 @@ export async function run(): Promise<number> {
   let serverHandle: OpenCodeServerHandle | null = null
   let repo = ''
   let runId = ''
+  let lockEtag: string | null = null
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -67,6 +70,36 @@ export async function run(): Promise<number> {
     runId = routing.agentContext.runId
     const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
     if (!dedup.shouldProceed) return 0
+
+    const lockResult = await runAcquireLock({
+      storeConfig,
+      repo,
+      runId,
+      runAttempt: getGitHubRunAttempt(),
+    })
+    switch (lockResult.outcome) {
+      case 'acquired':
+        lockEtag = lockResult.lockEtag
+        break
+      case 'held-by-other':
+        bootstrapLogger.info('Skipping run — coordination lock held by another surface', {
+          heldBy: lockResult.holder?.holder_id ?? null,
+          surface: lockResult.holder?.surface ?? null,
+        })
+        return 0
+      case 's3-disabled':
+      case 'error':
+        // S3 disabled: lock is opt-in, proceed without coordination.
+        // Error: lock acquisition failed (network, permissions, etc.) — log and proceed
+        // to preserve single-surface behavior. The 15-minute TTL of any leaked lock from
+        // a prior crash recovers via stale-takeover on the next acquisition attempt.
+        if (lockResult.outcome === 'error') {
+          bootstrapLogger.warning('Coordination lock acquisition failed; proceeding without lock', {
+            error: lockResult.error.message,
+          })
+        }
+        break
+    }
 
     reactionCtx = await runAcknowledge(routing, bootstrap.logger)
 
@@ -123,6 +156,7 @@ export async function run(): Promise<number> {
       agentIdentity: 'github',
       repo,
       runId,
+      lockEtag,
     })
   }
 

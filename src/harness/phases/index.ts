@@ -1,4 +1,5 @@
 export {runAcknowledge} from './acknowledge.js'
+export {runAcquireLock} from './acquire-lock.js'
 export {runBootstrap} from './bootstrap.js'
 export {runCacheRestore} from './cache-restore.js'
 export {runCleanup} from './cleanup.js'
