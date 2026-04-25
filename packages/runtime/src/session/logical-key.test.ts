@@ -1,5 +1,4 @@
-import type {TriggerContext, TriggerTarget} from '../../../../src/features/triggers/types.js'
-import type {EventType, GitHubContext} from '../../../../src/services/github/types.js'
+import type {EventType, TriggerContext, TriggerTarget} from '../agent/types.js'
 import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'
 import {describe, expect, it, vi} from 'vitest'
@@ -14,7 +13,8 @@ function createMockLogger() {
   }
 }
 
-function createRawContext(eventType: EventType): GitHubContext {
+/** Minimal raw context matching what TriggerContext.raw expects (typed as unknown). */
+function createRawContext(eventType: EventType) {
   return {
     eventName: eventType,
     eventType,

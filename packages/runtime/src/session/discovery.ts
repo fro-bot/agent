@@ -1,11 +1,14 @@
 import type {SessionClient} from './backend.js'
 import type {Logger, ProjectInfo} from './types.js'
+import path from 'node:path'
 
 import {isRecord, readString} from './storage-mappers.js'
 
 function normalizeWorkspacePath(workspacePath: string): string {
-  const resolved = new URL(`file://${workspacePath}`).pathname
-  return resolved.endsWith('/') && resolved.length > 1 ? resolved.slice(0, -1) : resolved
+  // Use path.resolve + path.normalize for correct cross-platform behavior.
+  // The URL constructor would mangle Windows drive-letter paths (C:\foo → /C:/foo).
+  const resolved = path.resolve(path.normalize(workspacePath))
+  return resolved.endsWith(path.sep) && resolved.length > 1 ? resolved.slice(0, -1) : resolved
 }
 
 export async function listProjectsViaSDK(client: SessionClient, logger: Logger): Promise<readonly ProjectInfo[]> {

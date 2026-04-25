@@ -49,6 +49,8 @@ export function getRunnerOS(): string {
     case 'cygwin':
     case 'netbsd':
       return 'Linux'
+    default:
+      return platform
   }
 }
 

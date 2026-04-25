@@ -125,6 +125,23 @@ describe('getRunnerOS', () => {
     const result = getRunnerOS()
     expect(['Linux', 'macOS', 'Windows']).toContain(result)
   })
+
+  it('returns the raw platform string for unrecognized os.platform() values', () => {
+    // #given
+    delete process.env.RUNNER_OS
+    const originalPlatform = process.platform
+    // Force an unknown platform value to exercise the default branch
+    Object.defineProperty(process, 'platform', {value: 'unknownos', configurable: true})
+
+    // #when
+    const result = getRunnerOS()
+
+    // #then
+    expect(result).toBe('unknownos')
+
+    // Restore
+    Object.defineProperty(process, 'platform', {value: originalPlatform, configurable: true})
+  })
 })
 
 describe('getGitHubRepository', () => {

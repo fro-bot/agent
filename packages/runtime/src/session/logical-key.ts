@@ -1,4 +1,4 @@
-import type {TriggerContext} from '../../../../src/features/triggers/types.js'
+import type {TriggerContext} from '../agent/types.js'
 import type {Logger} from '../shared/logger.js'
 import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'

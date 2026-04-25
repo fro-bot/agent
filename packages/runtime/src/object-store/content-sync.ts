@@ -221,6 +221,10 @@ export async function syncMetadataToStore(
     return {success: false}
   }
 
+  // Create a private temp directory (mode 0700 on POSIX) before writing metadata
+  // to avoid CWE-377/378: files placed directly in os.tmpdir() are world-readable
+  // by default and the path is predictable, enabling information disclosure and
+  // race conditions with other users on shared runners.
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-metadata-'))
   const tempFilePath = path.join(tempDir, `${runId}.json`)
 

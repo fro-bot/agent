@@ -134,7 +134,7 @@ export function buildTaskSection(
   promptInput: string | null,
   resolvedMode: ResolvedOutputMode | null,
 ): string {
-  const {directive, appendMode} = getTriggerDirective(context, promptInput)
+  const {directive} = getTriggerDirective(context, promptInput)
   const lines: string[] = []
 
   if ((context.eventType === 'schedule' || context.eventType === 'workflow_dispatch') && resolvedMode != null) {
@@ -143,11 +143,7 @@ export function buildTaskSection(
 
   lines.push('## Task')
 
-  if (appendMode) {
-    lines.push(directive)
-  } else {
-    lines.push(directive)
-  }
+  lines.push(directive)
 
   lines.push('')
   return lines.join('\n')

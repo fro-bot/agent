@@ -109,6 +109,9 @@ export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolea
   }
 
   if (hasMetadataServiceAddress(parsedEndpoint.hostname)) {
+    // Cloud instance metadata service addresses must be blocked even when insecure endpoints
+    // are allowed — a leaked IAM role or SSRF via metadata service compromises the entire
+    // runner environment regardless of whether the endpoint is otherwise "trusted".
     return err(createValidationError('s3 endpoint must not target cloud instance metadata services'))
   }
 

@@ -26,9 +26,8 @@ export const DEFAULT_OMO_VERSION = '3.17.4'
 export const DEFAULT_OMO_PROVIDERS = ''
 export const DEFAULT_SYSTEMATIC_VERSION = '2.4.1'
 
-// Retry configuration
-export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const
-export const LLM_RETRY_DELAY_MS = 10_000
+// Retry configuration lives in agent/retry.ts (RETRY_DELAYS_MS, MAX_LLM_RETRIES)
+// to colocate with the retry logic that consumes the values.
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
