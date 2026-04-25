@@ -87,6 +87,7 @@ describe('runCleanup', () => {
       agentIdentity: 'github',
       repo: 'owner/repo',
       runId: 'run-123',
+      lockEtag: null,
     })
 
     expect(createS3Adapter).toHaveBeenCalled()
@@ -133,6 +134,7 @@ describe('runCleanup', () => {
       agentIdentity: 'github',
       repo: 'owner/repo',
       runId: 'run-123',
+      lockEtag: null,
     })
 
     expect(createS3Adapter).not.toHaveBeenCalled()
@@ -169,6 +171,7 @@ describe('runCleanup', () => {
         agentIdentity: 'github',
         repo: 'owner/repo',
         runId: 'run-123',
+        lockEtag: null,
       }),
     ).resolves.toBeUndefined()
 
