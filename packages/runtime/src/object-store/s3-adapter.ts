@@ -1,10 +1,17 @@
 import type {Logger} from '../shared/logger.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import * as path from 'node:path'
 import {Readable} from 'node:stream'
 import {pipeline} from 'node:stream/promises'
-import {GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client} from '@aws-sdk/client-s3'
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3'
 
 import {err, ok} from '../shared/types.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
@@ -38,6 +45,39 @@ function logS3Error(logger: Logger, operation: string, error: unknown): Error {
   })
 
   return createObjectStoreOperationError(`Object store ${operation} failed: ${message}`)
+}
+
+async function readResponseBody(body: unknown): Promise<string> {
+  if (body instanceof Readable) {
+    const chunks: Buffer[] = []
+    for await (const chunk of body) {
+      if (typeof chunk === 'string') {
+        chunks.push(Buffer.from(chunk))
+        continue
+      }
+
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+    }
+
+    return Buffer.concat(chunks).toString('utf8')
+  }
+
+  if (typeof body === 'object' && body != null && 'transformToString' in body) {
+    const transformToString = body.transformToString
+    if (typeof transformToString === 'function') {
+      return String(await transformToString.call(body))
+    }
+  }
+
+  throw createObjectStoreOperationError('Object store getObject failed: response body was not readable')
+}
+
+function normalizeEtag(etag: string | undefined, operation: string): string {
+  if (etag == null || etag.length === 0) {
+    throw createObjectStoreOperationError(`Object store ${operation} failed: missing ETag in response`)
+  }
+
+  return etag
 }
 
 const S3_MAX_ATTEMPTS = 3
@@ -179,6 +219,71 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
         return ok(keys)
       } catch (error) {
         return err(logS3Error(logger, 'list', error))
+      }
+    },
+    conditionalPut: async (key, data, options) => {
+      logger.debug('Conditionally uploading object store data', {key, options})
+
+      try {
+        const response = await client.send(
+          new PutObjectCommand({
+            Body: data,
+            Bucket: config.bucket,
+            ExpectedBucketOwner: config.expectedBucketOwner,
+            IfMatch: options.ifMatch,
+            IfNoneMatch: options.ifNoneMatch,
+            Key: key,
+            ServerSideEncryption: effectiveEncryption,
+            ...(effectiveEncryption === 'aws:kms' && config.sseKmsKeyId != null
+              ? {SSEKMSKeyId: config.sseKmsKeyId}
+              : {}),
+          }),
+        )
+
+        const etag = normalizeEtag(response.ETag, 'conditionalPut')
+        logger.info('Conditionally uploaded object store data', {key, etag})
+        return ok({etag})
+      } catch (error) {
+        return err(logS3Error(logger, 'conditionalPut', error))
+      }
+    },
+    conditionalDelete: async (key, options) => {
+      logger.debug('Conditionally deleting object store data', {key})
+
+      try {
+        await client.send(
+          new DeleteObjectCommand({
+            Bucket: config.bucket,
+            ExpectedBucketOwner: config.expectedBucketOwner,
+            IfMatch: options.ifMatch,
+            Key: key,
+          }),
+        )
+
+        logger.info('Conditionally deleted object store data', {key})
+        return ok(undefined)
+      } catch (error) {
+        return err(logS3Error(logger, 'conditionalDelete', error))
+      }
+    },
+    getObject: async key => {
+      logger.debug('Reading object store data', {key})
+
+      try {
+        const response = await client.send(
+          new GetObjectCommand({
+            Bucket: config.bucket,
+            ExpectedBucketOwner: config.expectedBucketOwner,
+            Key: key,
+          }),
+        )
+
+        const data = await readResponseBody(response.Body)
+        const etag = normalizeEtag(response.ETag, 'getObject')
+        logger.info('Read object store data', {key, etag})
+        return ok({data, etag})
+      } catch (error) {
+        return err(logS3Error(logger, 'getObject', error))
       }
     },
   }

@@ -20,6 +20,9 @@ function createAdapter(overrides: Partial<ObjectStoreAdapter> = {}): ObjectStore
     upload: async () => ok(undefined),
     download: async () => ok(undefined),
     list: async () => ok([]),
+    conditionalPut: async () => ok({etag: 'etag-1'}),
+    conditionalDelete: async () => ok(undefined),
+    getObject: async () => ok({data: '{}', etag: 'etag-1'}),
     ...overrides,
   }
 }

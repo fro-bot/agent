@@ -40,6 +40,14 @@ vi.mock('@aws-sdk/client-s3', () => {
     }
   }
 
+  class MockDeleteObjectCommand {
+    readonly input: unknown
+
+    constructor(input: unknown) {
+      this.input = input
+    }
+  }
+
   class MockListObjectsV2Command {
     readonly input: unknown
 
@@ -52,6 +60,7 @@ vi.mock('@aws-sdk/client-s3', () => {
     S3Client: MockS3Client,
     PutObjectCommand: MockPutObjectCommand,
     GetObjectCommand: MockGetObjectCommand,
+    DeleteObjectCommand: MockDeleteObjectCommand,
     ListObjectsV2Command: MockListObjectsV2Command,
   }
 })
@@ -290,5 +299,152 @@ describe('createS3Adapter', () => {
 
     expect(result.success).toBe(true)
     await expect(fs.readFile(localPath, 'utf8')).resolves.toBe('downloaded bytes')
+  })
+
+  it('conditionally uploads object data and returns the etag on success', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut(
+      'fro-bot-state/github/owner/repo/locks/repo.json',
+      JSON.stringify({holder_id: 'gateway-1'}),
+      {ifNoneMatch: '*'},
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data : undefined).toEqual({etag: 'etag-123'})
+    expect(getCommandInput(0)).toMatchObject({
+      Body: JSON.stringify({holder_id: 'gateway-1'}),
+      IfNoneMatch: '*',
+      Key: 'fro-bot-state/github/owner/repo/locks/repo.json',
+    })
+  })
+
+  it('returns an error when conditional upload hits a precondition failure', async () => {
+    // #given
+    sendMock.mockRejectedValue(
+      Object.assign(new Error('precondition failed'), {
+        Code: 'PreconditionFailed',
+        $metadata: {httpStatusCode: 412},
+        name: 'S3ServiceException',
+      }),
+    )
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalPut = adapter.conditionalPut
+
+    if (conditionalPut == null) {
+      throw new Error('Expected conditionalPut to be defined')
+    }
+
+    // #when
+    const result = await conditionalPut('fro-bot-state/github/owner/repo/locks/repo.json', '{}', {ifNoneMatch: '*'})
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
+  })
+
+  it('conditionally deletes an object when the etag matches', async () => {
+    // #given
+    sendMock.mockResolvedValue({})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalDelete = adapter.conditionalDelete
+
+    if (conditionalDelete == null) {
+      throw new Error('Expected conditionalDelete to be defined')
+    }
+
+    // #when
+    const result = await conditionalDelete('fro-bot-state/github/owner/repo/locks/repo.json', {ifMatch: 'etag-123'})
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(getCommandInput(0)).toMatchObject({
+      IfMatch: 'etag-123',
+      Key: 'fro-bot-state/github/owner/repo/locks/repo.json',
+    })
+  })
+
+  it('returns an error when conditional delete etag does not match', async () => {
+    // #given
+    sendMock.mockRejectedValue(
+      Object.assign(new Error('precondition failed'), {
+        Code: 'PreconditionFailed',
+        $metadata: {httpStatusCode: 412},
+        name: 'S3ServiceException',
+      }),
+    )
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const conditionalDelete = adapter.conditionalDelete
+
+    if (conditionalDelete == null) {
+      throw new Error('Expected conditionalDelete to be defined')
+    }
+
+    // #when
+    const result = await conditionalDelete('fro-bot-state/github/owner/repo/locks/repo.json', {ifMatch: 'wrong-etag'})
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
+  })
+
+  it('reads object data and etag together', async () => {
+    // #given
+    sendMock.mockResolvedValue({Body: Readable.from(['{"phase":"PENDING"}']), ETag: 'etag-456'})
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const getObject = adapter.getObject
+
+    if (getObject == null) {
+      throw new Error('Expected getObject to be defined')
+    }
+
+    // #when
+    const result = await getObject('fro-bot-state/github/owner/repo/runs/run-1.json')
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data : undefined).toEqual({
+      data: '{"phase":"PENDING"}',
+      etag: 'etag-456',
+    })
+  })
+
+  it('returns an error when getting a missing object', async () => {
+    // #given
+    sendMock.mockRejectedValue(
+      Object.assign(new Error('not found'), {
+        Code: 'NoSuchKey',
+        $metadata: {httpStatusCode: 404},
+        name: 'S3ServiceException',
+      }),
+    )
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const getObject = adapter.getObject
+
+    if (getObject == null) {
+      throw new Error('Expected getObject to be defined')
+    }
+
+    // #when
+    const result = await getObject('fro-bot-state/github/owner/repo/runs/missing.json')
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
   })
 })
