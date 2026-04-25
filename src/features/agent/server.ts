@@ -1,5 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
-import type {SessionClient} from '../../services/session/backend.js'
+import type {SessionClient} from '@fro-bot/runtime'
 import type {SetupInputs} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {EnsureOpenCodeResult} from './types.js'

@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.tsbuildinfo",
+    "rootDir": "../../src",
+    "noEmit": true
+  },
+  "references": [{"path": "../../packages/runtime"}],
+  "include": ["../../src/**/*.ts", "../../tsdown.config.ts", "../../eslint.config.ts"],
+  "exclude": ["../../dist", "../../node_modules"]
+}

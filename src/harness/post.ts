@@ -1,9 +1,9 @@
-import type {ObjectStoreConfig} from '../services/object-store/index.js'
+import type {ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../shared/logger.js'
 import * as core from '@actions/core'
+import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
-import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '../services/object-store/index.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,

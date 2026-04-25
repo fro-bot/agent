@@ -1,19 +1,28 @@
+import type {ObjectStoreConfig} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/metrics.js'
 import type {Octokit} from '../../services/github/types.js'
-import type {ObjectStoreConfig} from '../../services/object-store/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentIdentity} from '../../shared/types.js'
 import * as path from 'node:path'
 import * as core from '@actions/core'
+import {
+  createS3Adapter,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_LOCK_TTL_SECONDS,
+  DEFAULT_PRUNING_CONFIG,
+  DEFAULT_STALE_THRESHOLD_MS,
+  pruneSessions,
+  releaseLock,
+  syncArtifactsToStore,
+  syncMetadataToStore,
+} from '@fro-bot/runtime'
 import {completeAcknowledgment} from '../../features/agent/index.js'
 import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
-import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '../../services/object-store/index.js'
-import {DEFAULT_PRUNING_CONFIG, pruneSessions} from '../../services/session/index.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,
@@ -40,6 +49,12 @@ export interface CleanupPhaseOptions {
   readonly agentIdentity: AgentIdentity
   readonly repo: string
   readonly runId: string
+  /**
+   * Coordination lock ETag from `runAcquireLock`. When non-null, cleanup releases the lock
+   * after all S3 sync and cache save operations complete so the next surface waits for a
+   * coherent state. Null when the Action ran without a lock (S3 disabled or no lock acquired).
+   */
+  readonly lockEtag: string | null
 }
 
 export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
@@ -56,6 +71,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     agentIdentity,
     repo,
     runId,
+    lockEtag,
   } = options
 
   try {
@@ -183,5 +199,40 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<void> {
     bootstrapLogger.warning('Cleanup failed (non-fatal)', {
       error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
     })
+  } finally {
+    // Always release the coordination lock — even if cleanup steps above failed —
+    // so the next surface (Action or Discord gateway) can proceed without waiting
+    // for the 15-minute TTL to expire.
+    if (lockEtag != null && storeConfig.enabled === true) {
+      const releaseLogger = createLogger({phase: 'lock-release'})
+      try {
+        const adapter = createS3Adapter(storeConfig, releaseLogger)
+        const releaseResult = await releaseLock(
+          {
+            storeAdapter: adapter,
+            storeConfig,
+            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+          },
+          repo,
+          lockEtag,
+          releaseLogger,
+        )
+        if (releaseResult.success === false) {
+          releaseLogger.warning('Lock release failed (non-fatal)', {
+            error: releaseResult.error.message,
+            repo,
+          })
+        } else {
+          releaseLogger.debug('Lock released', {repo})
+        }
+      } catch (releaseError) {
+        releaseLogger.warning('Lock release threw (non-fatal)', {
+          error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          repo,
+        })
+      }
+    }
   }
 }

@@ -28,21 +28,14 @@ vi.mock('../../services/cache/index.js', async importOriginal => {
   }
 })
 
-vi.mock('../../services/object-store/index.js', async importOriginal => {
-  const original = await importOriginal<typeof import('../../services/object-store/index.js')>()
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
   return {
     ...original,
     createS3Adapter: vi.fn(),
+    pruneSessions: vi.fn(async () => ({prunedCount: 0, remainingCount: 0})),
     syncArtifactsToStore: vi.fn(async () => ({uploaded: 0, failed: 0})),
     syncMetadataToStore: vi.fn(async () => ({success: true})),
-  }
-})
-
-vi.mock('../../services/session/index.js', async importOriginal => {
-  const original = await importOriginal<typeof import('../../services/session/index.js')>()
-  return {
-    ...original,
-    pruneSessions: vi.fn(async () => ({prunedCount: 0, remainingCount: 0})),
   }
 })
 
@@ -64,8 +57,7 @@ describe('runCleanup', () => {
   })
 
   it('uploads artifacts and metadata with metrics when storeConfig is enabled', async () => {
-    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} =
-      await import('../../services/object-store/index.js')
+    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
     vi.mocked(createS3Adapter).mockReturnValue({
       upload: async () => ok(undefined),
       download: async () => ok(undefined),
@@ -95,6 +87,7 @@ describe('runCleanup', () => {
       agentIdentity: 'github',
       repo: 'owner/repo',
       runId: 'run-123',
+      lockEtag: null,
     })
 
     expect(createS3Adapter).toHaveBeenCalled()
@@ -125,8 +118,7 @@ describe('runCleanup', () => {
   })
 
   it('skips artifact and metadata uploads when storeConfig is disabled', async () => {
-    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} =
-      await import('../../services/object-store/index.js')
+    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
     const {runCleanup} = await import('./cleanup.js')
 
     await runCleanup({
@@ -142,6 +134,7 @@ describe('runCleanup', () => {
       agentIdentity: 'github',
       repo: 'owner/repo',
       runId: 'run-123',
+      lockEtag: null,
     })
 
     expect(createS3Adapter).not.toHaveBeenCalled()
@@ -150,8 +143,7 @@ describe('runCleanup', () => {
   })
 
   it('does not fail cleanup when artifact upload fails', async () => {
-    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} =
-      await import('../../services/object-store/index.js')
+    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
     vi.mocked(createS3Adapter).mockReturnValue({
       upload: async () => ok(undefined),
       download: async () => ok(undefined),
@@ -179,6 +171,7 @@ describe('runCleanup', () => {
         agentIdentity: 'github',
         repo: 'owner/repo',
         runId: 'run-123',
+        lockEtag: null,
       }),
     ).resolves.toBeUndefined()
 
