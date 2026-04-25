@@ -3,13 +3,32 @@ import type {CoordinationConfig, RunState} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
-import {requireConditionalPut, requireGetObject} from './adapter-guards.js'
+import {requireConditionalPut, requireGetObject, resolveGetObject} from './adapter-guards.js'
 import {renewLease} from './lock.js'
 import {parseRunState} from './run-state.js'
 
+export interface HeartbeatStopResult {
+  /** Current ETag of the run-state object after the final heartbeat tick. */
+  readonly runEtag: string
+  /** Current run state after the final heartbeat tick. */
+  readonly runState: RunState
+  /** Current ETag of the lock record after the most recent lease renewal. */
+  readonly lockEtag: string
+}
+
 export interface HeartbeatController {
   readonly start: () => void
-  readonly stop: () => Promise<void>
+  /**
+   * Quiesce the heartbeat timer and return an authoritative snapshot of the run state.
+   *
+   * `stop()` is liveness-only: it does not perform a terminal `transitionRun`. The caller
+   * owns the run lifecycle and uses the returned `runEtag` to transition the run to
+   * `COMPLETED`, `FAILED`, or `CANCELLED` after handling any post-shutdown work.
+   *
+   * If a heartbeat tick failed since the last successful tick, returns the tick error.
+   * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.
+   */
+  readonly stop: () => Promise<Result<HeartbeatStopResult, Error>>
   readonly isRunning: boolean
 }
 
@@ -34,9 +53,7 @@ export function createHeartbeatController(
   let running = false
   let inFlight: Promise<void> | null = null
   let tickError: Error | null = null
-  let currentRunEtag: string | null = null
   let currentLockEtag = lockEtag
-  let lastObservedRunState: RunState | null = null
 
   const runKey = getRunKey(config, identity, repo, runId)
   if (runKey.success === false) {
@@ -49,14 +66,12 @@ export function createHeartbeatController(
       throw current.error
     }
 
-    currentRunEtag = current.data.etag
     const parsedCurrent = parseRunState(current.data.data)
     if (parsedCurrent.success === false) {
       throw parsedCurrent.error
     }
 
     const nextState: RunState = {...parsedCurrent.data, last_heartbeat: new Date().toISOString()}
-    lastObservedRunState = nextState
 
     // Renew lock lease BEFORE writing heartbeat — if renewal fails, the heartbeat
     // timestamp stays stale so findStaleRuns correctly flags this run. The reverse
@@ -88,8 +103,6 @@ export function createHeartbeatController(
     if (written.success === false) {
       throw written.error
     }
-
-    currentRunEtag = written.data.etag
   }
 
   const runTick = (): void => {
@@ -119,11 +132,7 @@ export function createHeartbeatController(
       running = true
       intervalHandle = setInterval(runTick, config.heartbeatIntervalMs)
     },
-    stop: async () => {
-      if (running === false) {
-        return
-      }
-
+    stop: async (): Promise<Result<HeartbeatStopResult, Error>> => {
       logger.debug('Stopping heartbeat controller', {repo, runId})
       running = false
       if (intervalHandle != null) {
@@ -134,38 +143,29 @@ export function createHeartbeatController(
       await inFlight
 
       if (tickError != null) {
-        throw tickError
+        return err(tickError)
       }
 
-      let baseState = lastObservedRunState
-      let etag = currentRunEtag
-      if (baseState == null || etag == null) {
-        const current = await requireGetObject(config)(runKey.data)
-        if (current.success === false) {
-          throw current.error
-        }
-
-        const parsedCurrent = parseRunState(current.data.data)
-        if (parsedCurrent.success === false) {
-          throw parsedCurrent.error
-        }
-
-        baseState = parsedCurrent.data
-        etag = current.data.etag
+      const getObject = resolveGetObject(config)
+      if (getObject.success === false) {
+        return err(getObject.error)
       }
 
-      const terminalState: RunState = {
-        ...baseState,
-        details: {reason: 'heartbeat-stopped'},
-        last_heartbeat: baseState.last_heartbeat,
-        phase: 'FAILED',
+      const current = await getObject.data(runKey.data)
+      if (current.success === false) {
+        return err(current.error)
       }
-      const writeResult = await requireConditionalPut(config)(runKey.data, JSON.stringify(terminalState), {
-        ifMatch: etag,
+
+      const parsedCurrent = parseRunState(current.data.data)
+      if (parsedCurrent.success === false) {
+        return err(parsedCurrent.error)
+      }
+
+      return ok({
+        runEtag: current.data.etag,
+        runState: parsedCurrent.data,
+        lockEtag: currentLockEtag,
       })
-      if (writeResult.success === false) {
-        throw writeResult.error
-      }
     },
     get isRunning() {
       return running

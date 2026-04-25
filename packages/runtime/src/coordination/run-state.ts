@@ -3,7 +3,7 @@ import type {CoordinationConfig, RunPhase, RunState} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
-import {requireConditionalPut, requireGetObject} from './adapter-guards.js'
+import {resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
 
 const VALID_TRANSITIONS: Record<RunPhase, readonly RunPhase[]> = {
   PENDING: ['ACKNOWLEDGED'],
@@ -71,10 +71,6 @@ export function parseRunState(data: string): Result<RunState, Error> {
   }
 }
 
-function requireList(config: CoordinationConfig): CoordinationConfig['storeAdapter']['list'] {
-  return config.storeAdapter.list
-}
-
 function isTransitionAllowed(currentPhase: RunPhase, nextPhase: RunPhase): boolean {
   return VALID_TRANSITIONS[currentPhase].includes(nextPhase)
 }
@@ -91,8 +87,13 @@ export async function createRun(
     return err(key.error)
   }
 
+  const conditionalPut = resolveConditionalPut(config)
+  if (conditionalPut.success === false) {
+    return err(conditionalPut.error)
+  }
+
   logger.debug('Creating run-state record', {key: key.data, phase: runState.phase, repo, runId: runState.run_id})
-  return requireConditionalPut(config)(key.data, JSON.stringify(runState), {ifNoneMatch: '*'})
+  return conditionalPut.data(key.data, JSON.stringify(runState), {ifNoneMatch: '*'})
 }
 
 export async function transitionRun(
@@ -109,13 +110,19 @@ export async function transitionRun(
     return err(key.error)
   }
 
-  const current = await requireGetObject(config)(key.data)
-  if (current.success === false) {
-    return err(current.error)
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
   }
 
-  if (current.data.etag !== etag) {
-    return err(new Error(`optimistic concurrency failure for run ${runId}`))
+  const conditionalPut = resolveConditionalPut(config)
+  if (conditionalPut.success === false) {
+    return err(conditionalPut.error)
+  }
+
+  const current = await getObject.data(key.data)
+  if (current.success === false) {
+    return err(current.error)
   }
 
   const parsedCurrent = parseRunState(current.data.data)
@@ -127,6 +134,8 @@ export async function transitionRun(
     return err(new Error(`Invalid run-state transition: ${parsedCurrent.data.phase} -> ${newPhase}`))
   }
 
+  // The caller-supplied etag is the single concurrency gate. S3's IfMatch enforces atomicity —
+  // a 412 here means another writer modified the object since the caller's last fetch.
   const nextState: RunState = {...parsedCurrent.data, phase: newPhase}
   logger.debug('Transitioning run-state', {
     key: key.data,
@@ -135,7 +144,7 @@ export async function transitionRun(
     runId,
     to: newPhase,
   })
-  const writeResult = await requireConditionalPut(config)(key.data, JSON.stringify(nextState), {ifMatch: etag})
+  const writeResult = await conditionalPut.data(key.data, JSON.stringify(nextState), {ifMatch: etag})
   if (writeResult.success === false) {
     return err(writeResult.error)
   }
@@ -154,7 +163,12 @@ export async function findStaleRuns(
     return err(prefix.error)
   }
 
-  const listed = await requireList(config)(prefix.data)
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const listed = await config.storeAdapter.list(prefix.data)
   if (listed.success === false) {
     return err(listed.error)
   }
@@ -162,7 +176,7 @@ export async function findStaleRuns(
   const threshold = Date.now() - config.staleThresholdMs
   const staleRuns: RunState[] = []
   for (const key of listed.data) {
-    const current = await requireGetObject(config)(key)
+    const current = await getObject.data(key)
     if (current.success === false) {
       logger.debug('Skipping unreadable run-state file', {key, error: current.error.message})
       continue

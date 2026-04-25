@@ -130,12 +130,11 @@ describe('heartbeat controller', () => {
     )
   })
 
-  it('stops the timer and writes a terminal failed state on shutdown', async () => {
+  it('returns the current run snapshot from stop without writing a terminal state', async () => {
     // #given
     const conditionalPut = vi
       .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
       .mockResolvedValueOnce(ok({etag: 'etag-heartbeat'}))
-      .mockResolvedValueOnce(ok({etag: 'etag-terminal'}))
     const controller = createHeartbeatController(
       createCoordinationConfig(createStoreAdapter({conditionalPut})),
       'coordination',
@@ -148,29 +147,22 @@ describe('heartbeat controller', () => {
     await vi.advanceTimersByTimeAsync(30_000)
 
     // #when
-    await controller.stop()
+    const result = await controller.stop()
 
     // #then
     expect(controller.isRunning).toBe(false)
     expect(vi.getTimerCount()).toBe(0)
-    expect(conditionalPut).toHaveBeenLastCalledWith(
-      'fro-bot-state/coordination/owner/repo/runs/run-1.json',
-      JSON.stringify(
-        createRunState({
-          phase: 'FAILED',
-          last_heartbeat: '2026-04-24T18:15:30.000Z',
-          details: {reason: 'heartbeat-stopped'},
-        }),
-      ),
-      {ifMatch: 'etag-heartbeat'},
-    )
+    // stop() does NOT perform a terminal write — only the heartbeat tick wrote.
+    expect(conditionalPut).toHaveBeenCalledTimes(1)
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.runEtag : null).toBe('etag-current')
+    expect(result.success === true ? result.data.runState.phase : null).toBe('EXECUTING')
+    expect(result.success === true ? result.data.lockEtag : null).toBe('lock-etag-next')
   })
 
-  it('writes terminal state even when stopped before the first heartbeat tick', async () => {
+  it('returns an authoritative snapshot when stopped before the first heartbeat tick', async () => {
     // #given
-    const conditionalPut = vi
-      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
-      .mockImplementation(async () => ok({etag: 'etag-terminal'}))
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>()
     const controller = createHeartbeatController(
       createCoordinationConfig(createStoreAdapter({conditionalPut})),
       'coordination',
@@ -182,20 +174,15 @@ describe('heartbeat controller', () => {
     controller.start()
 
     // #when
-    await controller.stop()
+    const result = await controller.stop()
 
     // #then
-    expect(conditionalPut).toHaveBeenCalledTimes(1)
-    expect(conditionalPut).toHaveBeenCalledWith(
-      'fro-bot-state/coordination/owner/repo/runs/run-1.json',
-      JSON.stringify(
-        createRunState({
-          phase: 'FAILED',
-          details: {reason: 'heartbeat-stopped'},
-        }),
-      ),
-      {ifMatch: 'etag-current'},
-    )
+    expect(conditionalPut).not.toHaveBeenCalled()
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.runEtag : null).toBe('etag-current')
+    expect(result.success === true ? result.data.runState.phase : null).toBe('EXECUTING')
+    // No tick ran, so the lock etag is still the constructor value.
+    expect(result.success === true ? result.data.lockEtag : null).toBe('lock-etag-1')
     expect(controller.isRunning).toBe(false)
   })
 
@@ -206,16 +193,13 @@ describe('heartbeat controller', () => {
     const heartbeatStarted = new Promise<void>(resolve => {
       markHeartbeatStarted = resolve
     })
-    const conditionalPut = vi
-      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
-      .mockImplementationOnce(
-        async () =>
-          new Promise(resolve => {
-            markHeartbeatStarted?.()
-            heartbeatGate.resolve = value => resolve(value)
-          }),
-      )
-      .mockResolvedValueOnce(ok({etag: 'etag-terminal'}))
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>().mockImplementationOnce(
+      async () =>
+        new Promise(resolve => {
+          markHeartbeatStarted?.()
+          heartbeatGate.resolve = value => resolve(value)
+        }),
+    )
     const controller = createHeartbeatController(
       createCoordinationConfig(createStoreAdapter({conditionalPut})),
       'coordination',
@@ -269,7 +253,7 @@ describe('heartbeat controller', () => {
     )
   })
 
-  it('surfaces heartbeat failures when stopping after a failed tick', async () => {
+  it('returns the tick error when stopping after a failed tick', async () => {
     // #given
     const conditionalPut = vi
       .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
@@ -286,18 +270,19 @@ describe('heartbeat controller', () => {
 
     // #when
     await vi.advanceTimersByTimeAsync(30_000)
+    const result = await controller.stop()
 
     // #then
-    await expect(controller.stop()).rejects.toThrow('optimistic concurrency failure')
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe('optimistic concurrency failure')
   })
 
-  it('clears tick error after a subsequent successful tick', async () => {
+  it('returns ok after a tick error is cleared by a subsequent successful tick', async () => {
     // #given
     const conditionalPut = vi
       .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
       .mockResolvedValueOnce(err(new Error('optimistic concurrency failure')))
       .mockResolvedValueOnce(ok({etag: 'etag-recovered'}))
-      .mockResolvedValueOnce(ok({etag: 'etag-terminal'}))
     const controller = createHeartbeatController(
       createCoordinationConfig(createStoreAdapter({conditionalPut})),
       'coordination',
@@ -311,9 +296,10 @@ describe('heartbeat controller', () => {
     // #when
     await vi.advanceTimersByTimeAsync(30_000)
     await vi.advanceTimersByTimeAsync(30_000)
+    const result = await controller.stop()
 
     // #then
-    await expect(controller.stop()).resolves.toBeUndefined()
+    expect(result.success).toBe(true)
   })
 
   it('skips tick when a previous tick is still in-flight', async () => {
@@ -327,7 +313,7 @@ describe('heartbeat controller', () => {
             pendingWrite.resolve = value => resolve(value)
           }),
       )
-      .mockResolvedValueOnce(ok({etag: 'etag-terminal'}))
+      .mockResolvedValueOnce(ok({etag: 'etag-recovered'}))
     const controller = createHeartbeatController(
       createCoordinationConfig(createStoreAdapter({conditionalPut})),
       'coordination',
@@ -349,16 +335,18 @@ describe('heartbeat controller', () => {
     await controller.stop()
 
     // #then
-    expect(conditionalPut).toHaveBeenCalledTimes(2)
+    // Only the first tick made a write; the overlapping second tick was skipped, and stop()
+    // performs no terminal write — exactly one conditionalPut call.
+    expect(conditionalPut).toHaveBeenCalledTimes(1)
   })
 
-  it('fails stop when the terminal state write fails', async () => {
+  it('returns an error when stop fails to fetch the authoritative snapshot', async () => {
     // #given
-    const conditionalPut = vi
-      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
-      .mockResolvedValueOnce(err(new Error('terminal write failed')))
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(err(new Error('S3 unavailable on stop')))
     const controller = createHeartbeatController(
-      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      createCoordinationConfig(createStoreAdapter({getObject})),
       'coordination',
       'owner/repo',
       'run-1',
@@ -368,9 +356,10 @@ describe('heartbeat controller', () => {
     controller.start()
 
     // #when
-    const stopResult = controller.stop()
+    const result = await controller.stop()
 
     // #then
-    await expect(stopResult).rejects.toThrow('terminal write failed')
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe('S3 unavailable on stop')
   })
 })

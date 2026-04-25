@@ -3,7 +3,7 @@ import type {CoordinationConfig, LockAcquisitionResult, LockRecord, Surface} fro
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
-import {requireConditionalDelete, requireConditionalPut, requireGetObject} from './adapter-guards.js'
+import {resolveConditionalDelete, resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
 
 const COORDINATION_IDENTITY = 'coordination'
 
@@ -50,26 +50,6 @@ function parseLockRecord(data: string): Result<LockRecord, Error> {
     }
 
     return ok(parsed)
-  } catch (error) {
-    return err(error instanceof Error ? error : new Error(String(error)))
-  }
-}
-
-function resolveConditionalPut(
-  config: CoordinationConfig,
-): Result<NonNullable<CoordinationConfig['storeAdapter']['conditionalPut']>, Error> {
-  try {
-    return ok(requireConditionalPut(config))
-  } catch (error) {
-    return err(error instanceof Error ? error : new Error(String(error)))
-  }
-}
-
-function resolveGetObject(
-  config: CoordinationConfig,
-): Result<NonNullable<CoordinationConfig['storeAdapter']['getObject']>, Error> {
-  try {
-    return ok(requireGetObject(config))
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
   }
@@ -165,8 +145,13 @@ export async function releaseLock(
     return err(key.error)
   }
 
+  const conditionalDelete = resolveConditionalDelete(config)
+  if (conditionalDelete.success === false) {
+    return err(conditionalDelete.error)
+  }
+
   logger.debug('Releasing lock', {key: key.data, repo})
-  return requireConditionalDelete(config)(key.data, {ifMatch: etag})
+  return conditionalDelete.data(key.data, {ifMatch: etag})
 }
 
 export async function renewLease(
@@ -181,9 +166,14 @@ export async function renewLease(
     return err(key.error)
   }
 
+  const conditionalPut = resolveConditionalPut(config)
+  if (conditionalPut.success === false) {
+    return err(conditionalPut.error)
+  }
+
   const nextRecord: LockRecord = {...lockRecord, acquired_at: new Date().toISOString()}
   logger.debug('Renewing lock lease', {key: key.data, repo})
-  return requireConditionalPut(config)(key.data, JSON.stringify(nextRecord), {ifMatch: etag})
+  return conditionalPut.data(key.data, JSON.stringify(nextRecord), {ifMatch: etag})
 }
 
 export async function forceReleaseLock(
@@ -197,6 +187,11 @@ export async function forceReleaseLock(
     return err(key.error)
   }
 
+  const conditionalDelete = resolveConditionalDelete(config)
+  if (conditionalDelete.success === false) {
+    return err(conditionalDelete.error)
+  }
+
   logger.debug('Force releasing lock', {key: key.data, repo})
-  return requireConditionalDelete(config)(key.data, {ifMatch: etag})
+  return conditionalDelete.data(key.data, {ifMatch: etag})
 }

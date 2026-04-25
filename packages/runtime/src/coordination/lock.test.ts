@@ -328,6 +328,72 @@ describe('lock coordination', () => {
     )
   })
 
+  it('returns an error instead of throwing when releaseLock has no conditionalDelete adapter support', async () => {
+    // #given
+    const storeAdapter: ObjectStoreAdapter = {
+      upload: async () => ok(undefined),
+      download: async () => ok(undefined),
+      list: async () => ok([]),
+      conditionalPut: async () => ok({etag: 'etag-1'}),
+      getObject: async () => ok({data: JSON.stringify(createLockRecord()), etag: 'etag-1'}),
+    }
+    const config = createCoordinationConfig(storeAdapter as Required<ObjectStoreAdapter>)
+    const logger = createLogger()
+
+    // #when
+    const result = await releaseLock(config, 'owner/repo', 'etag-1', logger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe(
+      'Object store adapter does not support conditionalDelete',
+    )
+  })
+
+  it('returns an error instead of throwing when forceReleaseLock has no conditionalDelete adapter support', async () => {
+    // #given
+    const storeAdapter: ObjectStoreAdapter = {
+      upload: async () => ok(undefined),
+      download: async () => ok(undefined),
+      list: async () => ok([]),
+      conditionalPut: async () => ok({etag: 'etag-1'}),
+      getObject: async () => ok({data: JSON.stringify(createLockRecord()), etag: 'etag-1'}),
+    }
+    const config = createCoordinationConfig(storeAdapter as Required<ObjectStoreAdapter>)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseLock(config, 'owner/repo', 'etag-1', logger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe(
+      'Object store adapter does not support conditionalDelete',
+    )
+  })
+
+  it('returns an error instead of throwing when renewLease has no conditionalPut adapter support', async () => {
+    // #given
+    const storeAdapter: ObjectStoreAdapter = {
+      upload: async () => ok(undefined),
+      download: async () => ok(undefined),
+      list: async () => ok([]),
+      conditionalDelete: async () => ok(undefined),
+      getObject: async () => ok({data: JSON.stringify(createLockRecord()), etag: 'etag-1'}),
+    }
+    const config = createCoordinationConfig(storeAdapter as Required<ObjectStoreAdapter>)
+    const logger = createLogger()
+
+    // #when
+    const result = await renewLease(config, 'owner/repo', createLockRecord(), 'etag-1', logger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe(
+      'Object store adapter does not support conditionalPut',
+    )
+  })
+
   it('returns an error when an existing lock payload is structurally invalid json', async () => {
     // #given
     const storeAdapter = createStoreAdapter({
