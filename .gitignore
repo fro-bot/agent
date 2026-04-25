@@ -114,3 +114,7 @@ eslint-typegen.d.ts
 
 # Systematic skill scratch artifacts (ce:review, deepen-plan, etc.)
 .context/
+
+# Workspace package build output
+packages/runtime/dist/
+apps/action/dist/

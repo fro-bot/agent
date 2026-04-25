@@ -1,5 +1,5 @@
+import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/index.js'
 import type {CacheKeyComponents} from './cache-key.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'

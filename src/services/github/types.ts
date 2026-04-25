@@ -27,7 +27,7 @@ export const EVENT_TYPES = [
   'workflow_dispatch',
 ] as const
 
-export type EventType = (typeof EVENT_TYPES)[number]
+export type EventType = import('@fro-bot/runtime').EventType
 
 // Normalized event data (discriminated union by eventType)
 export type NormalizedEvent =

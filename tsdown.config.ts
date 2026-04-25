@@ -5,17 +5,11 @@ import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
 import {defineConfig} from 'tsdown'
 
-/**
- * Extracts package name from dependency string.
- */
 function parsePackageName(dep: string): string {
   const name = dep.split('@').find(Boolean) ?? ''
   return dep.startsWith('@') ? `@${name}` : name
 }
 
-/**
- * Compares two semantic version strings.
- */
 function compareVersions(a: string, b: string): number {
   const aParts = a.split('.').map(Number)
   const bParts = b.split('.').map(Number)
@@ -160,23 +154,19 @@ function licenseCollectorPlugin(): Plugin {
 }
 
 export default defineConfig({
-  entry: ['src/main.ts', 'src/post.ts'],
+  entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
   fixedExtension: false,
   inlineOnly: false,
   minify: true,
   plugins: [licenseCollectorPlugin()],
   noExternal: id => {
-    // Bundle all @bfra.me/es subpaths
     if (id.startsWith('@bfra.me/es')) return true
-    // Bundle all @actions/* packages
     if (id.startsWith('@actions/')) return true
-    // Bundle @octokit/auth-app
     if (id.startsWith('@octokit/auth-app')) return true
-    // Bundle @opencode-ai/sdk (RFC-013)
     if (id.startsWith('@opencode-ai/sdk')) return true
-    // Bundle @aws-sdk/client-s3 and @smithy transitive deps (durable object storage)
     if (id.startsWith('@aws-sdk/')) return true
     if (id.startsWith('@smithy/')) return true
+    if (id.startsWith('@fro-bot/runtime')) return true
     return false
   },
 })

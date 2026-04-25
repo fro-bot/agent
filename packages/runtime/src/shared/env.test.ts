@@ -1,0 +1,317 @@
+import process from 'node:process'
+import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {
+  getGitHubRefName,
+  getGitHubRepository,
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getGitHubWorkspace,
+  getOpenCodeAuthPath,
+  getOpenCodeStoragePath,
+  getRunnerOS,
+  getXdgDataHome,
+} from './env.js'
+
+describe('getXdgDataHome', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns XDG_DATA_HOME when set', () => {
+    process.env.XDG_DATA_HOME = '/custom/data'
+    expect(getXdgDataHome()).toBe('/custom/data')
+  })
+
+  it('returns default path when XDG_DATA_HOME is not set', () => {
+    delete process.env.XDG_DATA_HOME
+    const result = getXdgDataHome()
+    expect(result).toMatch(/\.local\/share$/)
+  })
+
+  it('returns default path when XDG_DATA_HOME is empty string', () => {
+    process.env.XDG_DATA_HOME = ''
+    const result = getXdgDataHome()
+    expect(result).toMatch(/\.local\/share$/)
+  })
+})
+
+describe('getOpenCodeStoragePath', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns storage path under XDG_DATA_HOME', () => {
+    process.env.XDG_DATA_HOME = '/custom/data'
+    expect(getOpenCodeStoragePath()).toBe('/custom/data/opencode/storage')
+  })
+
+  it('returns storage path under default data home', () => {
+    delete process.env.XDG_DATA_HOME
+    const result = getOpenCodeStoragePath()
+    expect(result).toMatch(/\.local\/share\/opencode\/storage$/)
+  })
+})
+
+describe('getOpenCodeAuthPath', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns auth.json path under XDG_DATA_HOME', () => {
+    process.env.XDG_DATA_HOME = '/custom/data'
+    expect(getOpenCodeAuthPath()).toBe('/custom/data/opencode/auth.json')
+  })
+
+  it('returns auth.json path under default data home', () => {
+    delete process.env.XDG_DATA_HOME
+    const result = getOpenCodeAuthPath()
+    expect(result).toMatch(/\.local\/share\/opencode\/auth\.json$/)
+  })
+})
+
+describe('getRunnerOS', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns RUNNER_OS when set', () => {
+    process.env.RUNNER_OS = 'Linux'
+    expect(getRunnerOS()).toBe('Linux')
+  })
+
+  it('returns RUNNER_OS Windows when set', () => {
+    process.env.RUNNER_OS = 'Windows'
+    expect(getRunnerOS()).toBe('Windows')
+  })
+
+  it('returns RUNNER_OS macOS when set', () => {
+    process.env.RUNNER_OS = 'macOS'
+    expect(getRunnerOS()).toBe('macOS')
+  })
+
+  it('returns fallback based on platform when RUNNER_OS not set', () => {
+    delete process.env.RUNNER_OS
+    const result = getRunnerOS()
+    // Should return one of the valid OS types based on platform
+    expect(['Linux', 'macOS', 'Windows']).toContain(result)
+  })
+
+  it('returns fallback when RUNNER_OS is empty string', () => {
+    process.env.RUNNER_OS = ''
+    const result = getRunnerOS()
+    expect(['Linux', 'macOS', 'Windows']).toContain(result)
+  })
+
+  it('returns the raw platform string for unrecognized os.platform() values', () => {
+    // #given
+    delete process.env.RUNNER_OS
+    const originalPlatform = process.platform
+    // Force an unknown platform value to exercise the default branch
+    Object.defineProperty(process, 'platform', {value: 'unknownos', configurable: true})
+
+    // #when
+    const result = getRunnerOS()
+
+    // #then
+    expect(result).toBe('unknownos')
+
+    // Restore
+    Object.defineProperty(process, 'platform', {value: originalPlatform, configurable: true})
+  })
+})
+
+describe('getGitHubRepository', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_REPOSITORY when set', () => {
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    expect(getGitHubRepository()).toBe('owner/repo')
+  })
+
+  it('returns default when GITHUB_REPOSITORY not set', () => {
+    delete process.env.GITHUB_REPOSITORY
+    expect(getGitHubRepository()).toBe('unknown/unknown')
+  })
+
+  it('returns default when GITHUB_REPOSITORY is empty', () => {
+    process.env.GITHUB_REPOSITORY = ''
+    expect(getGitHubRepository()).toBe('unknown/unknown')
+  })
+})
+
+describe('getGitHubRefName', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_REF_NAME when set', () => {
+    process.env.GITHUB_REF_NAME = 'feature-branch'
+    expect(getGitHubRefName()).toBe('feature-branch')
+  })
+
+  it('returns default when GITHUB_REF_NAME not set', () => {
+    delete process.env.GITHUB_REF_NAME
+    expect(getGitHubRefName()).toBe('main')
+  })
+
+  it('returns default when GITHUB_REF_NAME is empty', () => {
+    process.env.GITHUB_REF_NAME = ''
+    expect(getGitHubRefName()).toBe('main')
+  })
+})
+
+describe('getGitHubRunId', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_RUN_ID as number when set', () => {
+    process.env.GITHUB_RUN_ID = '12345678'
+    expect(getGitHubRunId()).toBe(12345678)
+  })
+
+  it('returns 0 when GITHUB_RUN_ID not set', () => {
+    delete process.env.GITHUB_RUN_ID
+    expect(getGitHubRunId()).toBe(0)
+  })
+
+  it('returns 0 when GITHUB_RUN_ID is empty', () => {
+    process.env.GITHUB_RUN_ID = ''
+    expect(getGitHubRunId()).toBe(0)
+  })
+})
+
+describe('getGitHubRunAttempt', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_RUN_ATTEMPT as number when set', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '3'
+    expect(getGitHubRunAttempt()).toBe(3)
+  })
+
+  it('returns 1 when GITHUB_RUN_ATTEMPT not set', () => {
+    delete process.env.GITHUB_RUN_ATTEMPT
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 when GITHUB_RUN_ATTEMPT is empty', () => {
+    process.env.GITHUB_RUN_ATTEMPT = ''
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for non-numeric values', () => {
+    process.env.GITHUB_RUN_ATTEMPT = 'abc'
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for zero', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '0'
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+
+  it('returns 1 for negative values', () => {
+    process.env.GITHUB_RUN_ATTEMPT = '-1'
+    expect(getGitHubRunAttempt()).toBe(1)
+  })
+})
+
+describe('getGitHubWorkspace', () => {
+  const originalEnv = process.env
+  const originalCwd = process.cwd()
+
+  beforeEach(() => {
+    process.env = {...originalEnv}
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  it('returns GITHUB_WORKSPACE when set', () => {
+    // #given GITHUB_WORKSPACE is set
+    process.env.GITHUB_WORKSPACE = '/home/runner/work/repo/repo'
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns the workspace path
+    expect(result).toBe('/home/runner/work/repo/repo')
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE not set', () => {
+    // #given GITHUB_WORKSPACE is not set
+    delete process.env.GITHUB_WORKSPACE
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE is empty', () => {
+    // #given GITHUB_WORKSPACE is empty string
+    process.env.GITHUB_WORKSPACE = ''
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
+  })
+
+  it('returns process.cwd() fallback when GITHUB_WORKSPACE is whitespace only', () => {
+    // #given GITHUB_WORKSPACE is whitespace only
+    process.env.GITHUB_WORKSPACE = '   '
+    // #when getGitHubWorkspace is called
+    const result = getGitHubWorkspace()
+    // #then it returns process.cwd()
+    expect(result).toBe(originalCwd)
+  })
+})

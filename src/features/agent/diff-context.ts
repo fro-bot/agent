@@ -1,7 +1,6 @@
+import type {DiffContext, TriggerContext} from '@fro-bot/runtime'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {TriggerContext} from '../triggers/types.js'
-import type {DiffContext} from './types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {getPRDiff} from '../reviews/index.js'
 

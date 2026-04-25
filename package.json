@@ -1,5 +1,5 @@
 {
-  "name": "@fro-bot/agent",
+  "name": "@fro-bot/agent-workspace",
   "version": "0.0.0-development",
   "private": true,
   "description": "@fro-bot Agent",
@@ -15,15 +15,18 @@
   "license": "MIT",
   "author": "Fro Bot <agent@fro.bot>",
   "type": "module",
-  "main": "dist/main.js",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "bootstrap": "SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
-    "build": "pnpm check-types && tsdown",
-    "check-types": "tsc --noEmit",
-    "fix": "eslint --fix",
+    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build",
+    "check-types": "pnpm --filter @fro-bot/runtime check-types && pnpm --filter @fro-bot/action check-types",
+    "fix": "pnpm --filter @fro-bot/runtime fix && pnpm --filter @fro-bot/action fix",
     "postinstall": "simple-git-hooks",
-    "lint": "eslint",
-    "test": "vitest run"
+    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint",
+    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",
@@ -44,6 +47,7 @@
     "@actions/tool-cache": "4.0.0",
     "@aws-sdk/client-s3": "3.1031.0",
     "@bfra.me/es": "0.1.0",
+    "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
     "@opencode-ai/sdk": "1.14.18"
   },
@@ -72,5 +76,10 @@
     "typescript": "6.0.3",
     "vitest": "4.1.4"
   },
-  "packageManager": "pnpm@10.33.0"
+  "packageManager": "pnpm@10.33.0",
+  "pnpm": {
+    "overrides": {
+      "fast-xml-parser": ">=5.7.0"
+    }
+  }
 }

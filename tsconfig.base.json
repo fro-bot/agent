@@ -1,0 +1,16 @@
+{
+  "extends": "@bfra.me/tsconfig",
+  "compilerOptions": {
+    "target": "ESNext",
+    "baseUrl": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@fro-bot/runtime": ["packages/runtime/src/index.ts"]
+    },
+    "types": ["node"],
+    "strict": true,
+    "ignoreDeprecations": "6.0",
+    "noEmit": false
+  }
+}

@@ -75,19 +75,7 @@ export const ERROR_TYPES = [
   'validation',
 ] as const
 
-export type ErrorType = (typeof ERROR_TYPES)[number]
-
-/**
- * Structured error information for formatted error comments.
- */
-export interface ErrorInfo {
-  readonly type: ErrorType
-  readonly message: string
-  readonly details?: string
-  readonly suggestedAction?: string
-  readonly retryable: boolean
-  readonly resetTime?: Date // For rate limit errors
-}
+export type {ErrorInfo, ErrorType} from '@fro-bot/runtime'
 
 /**
  * GraphQL response types for discussion queries.

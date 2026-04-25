@@ -1,10 +1,9 @@
 import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {ErrorInfo} from '../comments/types.js'
 import type {EventStreamResult} from './streaming.js'
-import type {ExecutionConfig} from './types.js'
+import type {ErrorInfo, ExecutionConfig} from './types.js'
+import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
-import {createLLMFetchError, isLlmFetchError} from '../comments/error-format.js'
 import {runPromptAttempt} from './retry.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
