@@ -558,36 +558,48 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 **Dependencies:** Unit 2
 
-**Files:**
-- Create: `apps/action/src/harness/phases/acquire-lock.ts` (new phase inserted **after `dedup`** — already-deduplicated runs don't waste lock-hold windows blocking Discord)
-- Modify: `apps/action/src/harness/phases/cleanup.ts` (release the lock if held)
-- Modify: `apps/action/src/harness/run.ts` (wire the new phase)
-- Test: `apps/action/src/harness/phases/acquire-lock.test.ts`
+**Files:** (paths reflect current repo: action source lives at `src/`, not `apps/action/src/` — `apps/action/src/main.ts` is a thin re-export shim)
+- Create: `src/harness/phases/acquire-lock.ts` (new phase inserted **after `dedup`** — already-deduplicated runs don't waste lock-hold windows blocking Discord)
+- Modify: `src/harness/phases/cleanup.ts` (release the lock if held)
+- Modify: `src/harness/run.ts` (wire the new phase)
+- Test: `src/harness/phases/acquire-lock.test.ts`
+
+**Decisions resolved (2026-04-25):**
+- **Self-test scope:** Skip `validateProviderSemantics` on Action invocations. Gateway runs the validation at startup (long-lived process); Action assumes provider semantics are valid because gateway is the canonical surface. Document the assumption in a code comment.
+- **Heartbeat in Action:** Skip in v1. Action runs rarely exceed the 15-min TTL (median ~2min); if a run does exceed, the next run takes over via stale-takeover. Reconsider in v1.1 if telemetry shows enough long runs.
+- **Run-state record:** Lock-only in v1 Action. Skip `createRun`/`transitionRun` — lock alone provides cross-surface mutual exclusion. GitHub already tracks workflow run state; run-state records are more useful for the gateway's threaded conversation model.
+- **S3-disabled behavior:** When `storeConfig.enabled === false`, skip lock acquisition entirely with a `coordination-disabled` debug log and proceed. Preserves single-surface backward compatibility. Discord gateway operators MUST configure S3 (documented in SETUP.md from Unit 4).
+- **Event-type scope:** Lock all event types, including schedule and workflow_dispatch. Existing dedup phase handles PR/issue duplicates; lock handles cross-surface (and cron-vs-cron edge cases).
 
 **Approach:**
-- New phase acquires the per-repo lock before doing work. Lock key: `default/locks/{owner}/{repo}.json`.
-- If lock held by Discord gateway: Action logs `lock-held-by-other-surface` and skips (exits cleanly — do not queue from the Action side; Action runs are webhook/cron-triggered and the triggering event will re-fire).
-- If lock held by another Action run (dedup case): Action skips. Existing dedup phase behavior preserved.
-- If lock acquired: Action proceeds through existing phases. Cleanup phase releases the lock on success or failure.
-- `holder_id` for Action runs: `action:{github.run_id}:{github.run_attempt}`. For Discord runs: `gateway:{instance_id}:{run_id}`.
-- Lock TTL: 15 minutes. Action runs rarely exceed this (current median is ~2 minutes); if a run does, the lock extends via heartbeat.
+- New phase calls `acquireLock` from `@fro-bot/runtime`. Lock key built by `buildObjectStoreKey(storeConfig, 'coordination', repo, 'locks', 'repo.json')`.
+- If `storeConfig.enabled === false`: skip lock acquisition, log `coordination-disabled`, return `{acquired: true, lockEtag: null, reason: 's3-disabled'}` so cleanup knows not to release.
+- If lock held by Discord gateway: Action logs `lock-held-by-other-surface` with the holder details, returns `{acquired: false}`. `run.ts` returns 0 cleanly (same exit pattern as dedup skip).
+- If lock held by another Action run: same as cross-surface (skip with clear log).
+- If lock acquired: Action proceeds. `lockEtag` flows through to cleanup via `RunContext`-style state.
+- `holder_id` for Action runs: `action:{github.run_id}:{github.run_attempt}`.
+- `surface: 'github'`. `runId` from existing `runId` plumbed in `run.ts:67`.
+- Lock TTL: `DEFAULT_LOCK_TTL_SECONDS` (900s = 15min) — no heartbeat.
+- Cleanup: if `lockEtag != null`, call `releaseLock`. If release fails (e.g., another writer took over due to stale takeover after a hang), log warning and proceed — don't fail the run for a lock-release error.
 
 **Patterns to follow:**
-- `apps/action/src/harness/phases/dedup.ts` — existing skip-phase pattern
-- `apps/action/src/harness/run.ts` — phase wiring
+- `src/harness/phases/dedup.ts` — existing skip-phase pattern (returns `{shouldProceed: boolean}`, caller exits 0 cleanly on skip)
+- `src/harness/run.ts` — phase wiring with try/finally cleanup
+- `src/services/cache/restore.ts` — Result-checking pattern for runtime calls
 
 **Test scenarios:**
 - Happy path — Action acquires lock, executes, releases in cleanup
 - Cross-surface — lock held by Discord gateway: Action skips cleanly, no work done, no error
-- Dedup interaction — lock held by another Action run (rare): same behavior as cross-surface (skip with clear log)
+- Dedup interaction — lock held by another Action run: same behavior as cross-surface
+- S3 disabled — `storeConfig.enabled === false`: phase returns acquired=true with no lock, agent proceeds, cleanup skips release
 - Failure path — S3 unavailable during lock acquisition: Action fails fast with clear error
-- Failure path — Action crashes mid-execution: lock TTL expires (15 min); next Action or gateway run can take over
-- Integration — full cycle: acquire → execute → release; observability metric for "lock contention" incremented when skipped
+- Cleanup release failure — lock release returns err: warning logged, run completes successfully
+- Stale takeover scenario — existing lock is stale (older than TTL): Action takes it over via `acquireLock`'s built-in stale handling
 
 **Verification:**
-- Existing 1230-test suite still passes
-- New phase tests cover the three outcomes: acquired, held-by-other, error
-- Manual end-to-end test (simulated): trigger Action from `workflow_dispatch` while gateway holds lock; verify Action skips with clear log message
+- Existing 1630-test suite still passes
+- New phase tests cover all 7 scenarios above
+- Manual end-to-end test (simulated): trigger Action from `workflow_dispatch` while a stub lock record exists; verify Action skips with clear log message
 
 ---
 
