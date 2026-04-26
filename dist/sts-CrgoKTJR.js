@@ -1,1 +1,0 @@
-import{i as e,t}from"./sts-BbL48JVY.js";t();export{e as getDefaultRoleAssumer};
