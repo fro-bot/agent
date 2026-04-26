@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -12,6 +12,7 @@ sources:
   - src/services/setup/gh-auth.ts
   - src/services/setup/auth-json.ts
   - src/services/setup/tools-cache.ts
+  - packages/runtime/src/shared/constants.ts
   - src/shared/constants.ts
   - src/harness/config/inputs.ts
   - action.yaml
@@ -54,7 +55,7 @@ The `runSetup()` orchestrator follows this sequence:
 
 ## Pinned Versions
 
-Default versions are defined in `src/shared/constants.ts`:
+Default versions are defined in `packages/runtime/src/shared/constants.ts` (shared across surfaces) and `src/shared/constants.ts` (action-specific overrides):
 
 | Tool         | Constant                     | Purpose                                  |
 | ------------ | ---------------------------- | ---------------------------------------- |

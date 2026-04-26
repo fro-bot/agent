@@ -1,55 +1,82 @@
 ---
 type: architecture
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
   - src/main.ts
   - src/post.ts
   - src/harness/run.ts
   - src/harness/post.ts
-  - src/services/object-store/index.ts
+  - packages/runtime/src/index.ts
+  - packages/runtime/src/coordination/types.ts
   - AGENTS.md
   - action.yaml
-summary: "Four-layer architecture, dependency rules, and high-level module map"
+  - pnpm-workspace.yaml
+summary: "Monorepo structure, four-layer action architecture, runtime package, and module map"
 ---
 
 # Architecture Overview
 
 Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode + oMo) inside GitHub Actions workflows and preserves the agent's session state across runs. The codebase is TypeScript, ESM-only, targeting Node 24.
 
-## Layered Architecture
+## Monorepo Structure
 
-The source tree follows a strict four-layer dependency hierarchy. Each layer may import only from layers below it — never sideways or upward.
+The project is organized as a pnpm workspace monorepo with two workspace areas:
+
+| Package | Path | Purpose |
+| --- | --- | --- |
+| `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Designed to be consumed by any Fro Bot surface (GitHub Action, Discord gateway, etc.). |
+| Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
+
+The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support future surfaces (like a Discord gateway) that share the runtime package but have their own entry points.
+
+## Layered Architecture (Action)
+
+Within the action (`src/`), the source tree follows a strict four-layer dependency hierarchy. Each layer may import only from layers below it — never sideways or upward.
 
 | Layer | Directory | Responsibility |
 | --- | --- | --- |
 | 0 — Shared | `src/shared/` | Pure types, constants, utilities. Zero external dependencies beyond Node built-ins and `@actions/core`. |
-| 1 — Services | `src/services/` | External adapters: GitHub API client, session persistence, cache operations, environment setup. |
+| 1 — Services | `src/services/` | External adapters: GitHub API client, cache operations, environment setup. |
 | 2 — Features | `src/features/` | Business logic: agent execution, event routing, comment/review posting, observability. |
 | 3 — Harness | `src/harness/` | Workflow composition: the two entry points (`main.ts`, `post.ts`) and their orchestration phases. |
 
-This layering prevents circular dependencies and keeps testability high — lower layers can be unit-tested without mocking upper ones.
+All layers may also import from `@fro-bot/runtime`, which is treated as a peer dependency at the same level as `src/shared/`. This layering prevents circular dependencies and keeps testability high — lower layers can be unit-tested without mocking upper ones.
 
 ## Dual Entry Points
 
 The action defines two Node 24 entry points in `action.yaml`:
 
-- **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
+- **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acquires a coordination lock, acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
 - **`dist/post.js`** — A post-action hook (RFC-017) that runs after the main step completes, even on failure or cancellation. Its sole job is a durable cache save so that session state survives even if the main step is killed mid-execution.
 
 Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `post.ts` delegates to `harness/post.ts`.
 
 ## Module Map
 
-The major modules, grouped by layer:
+### Runtime Package (`packages/runtime/`)
+
+The runtime package exports five module groups:
+
+**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]).
+
+**Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
+
+**Object Store** (`object-store/`) — S3-compatible persistence: adapter, key builder, content sync, and endpoint/key validation (see [[Session Persistence]]).
+
+**Coordination** (`coordination/`) — S3-backed distributed lock, heartbeat controller, and run-state primitives for cross-surface mutual exclusion (see [[Execution Lifecycle]]).
+
+**Shared** (`shared/`) — Logger with credential redaction, Result types, constants, environment helpers, async utilities, and formatting.
+
+### Action Modules (`src/`)
 
 **Shared** — `logger.ts` provides JSON-structured logging with automatic credential redaction. `types.ts` defines core interfaces (`ActionInputs`, `CacheResult`, `RunContext`). `constants.ts` pins default versions for OpenCode, Bun, oMo, and Systematic.
 
-**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `session/` handles persistence through the OpenCode SDK (see [[Session Persistence]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `object-store/` provides the durable S3-compatible persistence backend — an adapter, key builder, content sync functions, and input validation (see [[Session Persistence]]). `setup/` orchestrates tool installation (see [[Setup and Configuration]]).
+**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `setup/` orchestrates tool installation (see [[Setup and Configuration]]).
 
-**Features** — `agent/` contains the prompt builder, SDK execution logic, and the output-mode resolver for manual triggers (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
+**Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
 
-**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases. `post.ts` handles the post-action cache save. `config/` parses action inputs and manages state keys.
+**Harness** — `run.ts` orchestrates the full execution lifecycle through discrete phases, including the new lock acquisition phase. `post.ts` handles the post-action cache save. `config/` parses action inputs and manages state keys.
 
 ## Design Decisions
 
@@ -67,8 +94,10 @@ The major modules, grouped by layer:
 
 The project uses `tsdown` (an esbuild-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `pnpm build` and checking for diffs.
 
+The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
+
 Testing uses Vitest with colocated `.test.ts` files. The project follows test-driven development: failing test first, minimal implementation, then refactor.
 
 ## RFCs
 
-Architecture decisions are documented in 19 RFC documents under `RFCs/`. They cover the foundation types (RFC-001), cache infrastructure (RFC-002), GitHub client (RFC-003), session management (RFC-004), trigger routing (RFC-005), security gating (RFC-006), observability (RFC-007), and more. When a module's behavior seems surprising, the corresponding RFC usually explains the reasoning.
+Architecture decisions are documented in RFC documents under `RFCs/`. They cover the foundation types (RFC-001), cache infrastructure (RFC-002), GitHub client (RFC-003), session management (RFC-004), trigger routing (RFC-005), security gating (RFC-006), observability (RFC-007), S3 storage (RFC-019), and more. When a module's behavior seems surprising, the corresponding RFC usually explains the reasoning.
