@@ -611,8 +611,17 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 **Dependencies:** None (parallel with Unit 1-3)
 
+**Step 1 — Effect foundation** (per `docs/brainstorms/2026-04-25-effect-adoption-gateway-requirements.md`):
+- Add `effect` (3.x, pinned) as a dependency in `packages/gateway/package.json`.
+- Create `packages/gateway/src/runtime-effect.ts` — adapter wrapping every runtime function the gateway uses (`acquireLock`, `releaseLock`, `renewLease`, `forceReleaseLock`, `createRun`, `transitionRun`, `findStaleRuns`, `validateProviderSemantics`, S3 sync helpers). Each wrapper: `Effect.tryPromise` → flatMap on the Result tag → `Effect.fail(error)` on `success: false`, `Effect.succeed(data)` on `success: true`.
+- Decide during this step: `@effect/vitest` vs vanilla vitest with `Effect.runPromise` wrappers; adapter filename (`runtime-effect.ts` vs `runtime/index.ts`).
+- Document the Effect/Result<> boundary in `packages/gateway/AGENTS.md`.
+- All subsequent gateway code (Discord client, slash commands, queue, approval flow, locking) uses Effect natively. Use `Effect.Schedule` for retries; use `Effect.Schema` for Discord interaction validation and approval-token records.
+
 **Files:**
 - Create: `packages/gateway/package.json`, `packages/gateway/tsconfig.json`
+- Create: `packages/gateway/AGENTS.md` (documents Effect/Result<> boundary)
+- Create: `packages/gateway/src/runtime-effect.ts` (Result<>→Effect adapter for runtime functions)
 - Create: `packages/gateway/src/main.ts` (entry point; connects Discord.js client, registers slash commands, graceful shutdown)
 - Create: `packages/gateway/src/config.ts` (`readSecret` helper, env var parsing, `ObjectStoreConfig` assembly)
 - Create: `packages/gateway/src/discord/client.ts` (Discord.js client with `allowedMentions: { parse: ['users'] }` + shard event logging)

@@ -1,6 +1,11 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
+  // dist/ is bundled vendor code (committed for the GitHub Action runtime).
+  // Skip it from all Renovate scans, including the hidden-Unicode detector,
+  // which trips on legitimate non-ASCII literals in dependencies like
+  // fast-xml-parser's HTML entity tables and AWS SDK helpers.
+  ignorePaths: ['dist/**'],
   customManagers: [
     {
       customType: 'regex',
