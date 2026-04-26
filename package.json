@@ -41,15 +41,15 @@
   "dependencies": {
     "@actions/artifact": "6.2.1",
     "@actions/cache": "6.0.0",
-    "@actions/core": "3.0.0",
+    "@actions/core": "3.0.1",
     "@actions/exec": "3.0.0",
-    "@actions/github": "9.1.0",
+    "@actions/github": "9.1.1",
     "@actions/tool-cache": "4.0.0",
-    "@aws-sdk/client-s3": "3.1031.0",
+    "@aws-sdk/client-s3": "3.1035.0",
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
-    "@opencode-ai/sdk": "1.14.20"
+    "@opencode-ai/sdk": "1.14.21"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.51.0",
@@ -61,7 +61,7 @@
     "@types/node": "24.12.2",
     "@vitest/eslint-plugin": "1.6.16",
     "conventional-changelog-conventionalcommits": "9.3.1",
-    "eslint": "10.2.0",
+    "eslint": "10.2.1",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
     "generate-license-file": "4.1.1",
@@ -72,11 +72,11 @@
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.3",
     "simple-git-hooks": "2.13.1",
-    "tsdown": "0.21.9",
+    "tsdown": "0.21.10",
     "typescript": "6.0.3",
-    "vitest": "4.1.4"
+    "vitest": "4.1.5"
   },
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@10.33.1",
   "pnpm": {
     "overrides": {
       "fast-xml-parser": ">=5.7.0"
