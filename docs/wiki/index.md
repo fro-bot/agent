@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-04-19"
+last-updated: "2026-04-26"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -16,7 +16,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Architecture Overview](Architecture%20Overview.md) | architecture | Four-layer architecture, dependency rules, and high-level module map |
+| [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, four-layer action architecture, runtime package, and module map |
 | [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run from trigger to cache save |
 
 ### Subsystems

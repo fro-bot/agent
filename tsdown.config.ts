@@ -1,6 +1,7 @@
 import type {Plugin} from 'rolldown'
 import {execFile} from 'node:child_process'
-import {writeFile} from 'node:fs/promises'
+import {readdir, readFile, writeFile} from 'node:fs/promises'
+import {join} from 'node:path'
 import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
 import {defineConfig} from 'tsdown'
@@ -114,6 +115,42 @@ function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
   return map
 }
 
+/**
+ * Match the same hidden-Unicode characters Renovate flags via
+ * `lib/util/unicode.ts` in the renovatebot/renovate repo. Bundled vendor code
+ * (e.g. @actions/artifact's HTML entity tables) embeds these as raw bytes,
+ * which trips Renovate's "Hidden Unicode characters" warning on the dependency
+ * dashboard. Replacing the raw bytes with `\uXXXX` JS escapes preserves the
+ * runtime string value but keeps the on-disk bytes ASCII-only.
+ */
+const HIDDEN_UNICODE_RE = /[\u00A0\u00AD\u1680\u2000-\u200C\u200E\u200F\u2028\u2029\u202A-\u202F\u205F\u3000\uFEFF]/g
+
+function escapeHiddenUnicodePlugin(): Plugin {
+  return {
+    name: 'escape-hidden-unicode',
+    async writeBundle(options) {
+      const dir = options.dir ?? 'dist'
+      // Read entries with their file-type bits in one syscall; avoid the
+      // stat→read TOCTOU pattern CodeQL flags (js/file-system-race).
+      const entries = await readdir(dir, {withFileTypes: true})
+      await Promise.all(
+        entries.map(async entry => {
+          if (!entry.isFile() || !entry.name.endsWith('.js')) return
+          const path = join(dir, entry.name)
+          const content = await readFile(path, 'utf8')
+          if (!HIDDEN_UNICODE_RE.test(content)) return
+          HIDDEN_UNICODE_RE.lastIndex = 0
+          const fixed = content.replace(HIDDEN_UNICODE_RE, char => {
+            const code = char.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')
+            return String.raw`\u${code}`
+          })
+          await writeFile(path, fixed)
+        }),
+      )
+    },
+  }
+}
+
 function licenseCollectorPlugin(): Plugin {
   return {
     name: 'license-collector',
@@ -158,7 +195,7 @@ export default defineConfig({
   fixedExtension: false,
   inlineOnly: false,
   minify: true,
-  plugins: [licenseCollectorPlugin()],
+  plugins: [licenseCollectorPlugin(), escapeHiddenUnicodePlugin()],
   noExternal: id => {
     if (id.startsWith('@bfra.me/es')) return true
     if (id.startsWith('@actions/')) return true

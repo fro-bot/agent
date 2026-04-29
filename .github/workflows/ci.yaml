@@ -49,14 +49,18 @@ jobs:
             dist-changed: &dist-changed
               - dist/**
             src-changed: &src-changed
+              - apps/**
               - assets/**
+              - packages/**
               - src/**
               - action.yaml
               - package.json
-              - tsconfig.json
+              - tsconfig*.json
+              - tsdown.config.ts
             should-lint:
               - added|modified: *config
               - added|modified: *src-changed
+              - scripts/** # Lint changes to CI scripts even if no src changes, since they can affect linting
             should-build:
               - added|modified: *config
               - added|modified: *dist-changed
