@@ -1,15 +1,16 @@
 ---
 type: subsystem
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
+  - packages/runtime/src/agent/prompt.ts
+  - packages/runtime/src/agent/prompt-thread.ts
+  - packages/runtime/src/agent/prompt-sender.ts
+  - packages/runtime/src/agent/output-mode.ts
+  - packages/runtime/src/agent/types.ts
+  - packages/runtime/src/agent/reference-files.ts
   - src/features/agent/prompt.ts
-  - src/features/agent/prompt-thread.ts
-  - src/features/agent/prompt-sender.ts
-  - src/features/agent/output-mode.ts
-  - src/features/agent/types.ts
   - src/features/agent/context.ts
-  - src/features/agent/reference-files.ts
   - src/features/context/types.ts
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
 summary: "How the multi-section XML-tagged prompt is assembled and why each section exists"
@@ -17,7 +18,7 @@ summary: "How the multi-section XML-tagged prompt is assembled and why each sect
 
 # Prompt Architecture
 
-The prompt sent to the AI agent is the most complex artifact Fro Bot constructs. It is a multi-section XML-tagged document assembled conditionally based on the trigger event, available context, and session history. The assembly logic lives in `src/features/agent/prompt.ts` (762 lines — one of the project's complexity hotspots).
+The prompt sent to the AI agent is the most complex artifact Fro Bot constructs. It is a multi-section XML-tagged document assembled conditionally based on the trigger event, available context, and session history. The core prompt-building functions live in `packages/runtime/src/agent/prompt.ts` (part of `@fro-bot/runtime`), while the action-specific prompt assembly and GitHub context integration live in `src/features/agent/prompt.ts`.
 
 ## Why XML Tags?
 

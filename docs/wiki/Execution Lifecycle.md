@@ -1,11 +1,12 @@
 ---
 type: architecture
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
   - src/harness/phases/routing.ts
+  - src/harness/phases/acquire-lock.ts
   - src/harness/phases/acknowledge.ts
   - src/harness/phases/cache-restore.ts
   - src/harness/phases/session-prep.ts
@@ -17,6 +18,8 @@ sources:
   - src/features/triggers/router.ts
   - src/features/agent/output-mode.ts
   - src/services/github/context.ts
+  - packages/runtime/src/coordination/lock.ts
+  - packages/runtime/src/coordination/types.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
@@ -33,15 +36,16 @@ Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/
 ```text
 main.ts
   └─ run()
-       ├─ 1. Bootstrap
-       ├─ 2. Routing
-       ├─ 3. Deduplication
-       ├─ 4. Acknowledge
-       ├─ 5. Cache Restore
-       ├─ 6. Session Prep
-       ├─ 7. Execute
-       ├─ 8. Finalize
-       └─ 9. Cleanup (always, via finally)
+       ├─  1. Bootstrap
+       ├─  2. Routing
+       ├─  3. Deduplication
+       ├─  4. Acquire Lock
+       ├─  5. Acknowledge
+       ├─  6. Cache Restore
+       ├─  7. Session Prep
+       ├─  8. Execute
+       ├─  9. Finalize
+       └─ 10. Cleanup (always, via finally)
 
 post.ts
   └─ runPost()
@@ -64,33 +68,48 @@ Then `routeEvent()` applies skip conditions to decide whether to proceed. Skip c
 
 A lightweight guard against duplicate runs for the same entity within a configurable window (default: 10 minutes). Uses cache-based sentinel markers — not an in-flight lock. This is best-effort suppression; workflow-level concurrency groups provide the stronger guarantee.
 
-## 4. Acknowledge
+## 4. Acquire Lock
+
+When the S3 object store is enabled, the harness acquires a per-repo coordination lock (`src/harness/phases/acquire-lock.ts`) so that multiple surfaces — the GitHub Action and a future Discord gateway — cannot execute concurrently against the same repository. The lock is an S3 object (JSON `LockRecord`) written with conditional-put semantics (`If-None-Match: *` for initial acquisition).
+
+The lock result is a discriminated union with four outcomes:
+
+- **`acquired`** — This run holds the lock. The returned `lockEtag` is carried through to the cleanup phase for release.
+- **`held-by-other`** — Another surface (or another Action run) already holds the lock. The current run exits cleanly with code 0.
+- **`s3-disabled`** — S3 is not configured. Coordination is opt-in, so the run proceeds without a lock.
+- **`error`** — Lock acquisition failed unexpectedly. The run proceeds without a lock to preserve single-surface behavior. The 15-minute TTL on any orphaned lock from a prior crash allows recovery via stale-takeover on the next attempt.
+
+The lock has a 15-minute TTL. In v1, the Action does not run a heartbeat to extend the lease — the median Action run (~2 minutes) is well within TTL, and rare long runs recover through stale takeover.
+
+## 5. Acknowledge
 
 Posts visual feedback so the user knows the agent received their request. For comment-triggered events, this means adding an `eyes` (👀) reaction to the triggering comment and applying an `agent: working` label to the issue or PR. These are non-fatal — if the GitHub API call fails, execution continues.
 
-## 5. Cache Restore
+## 6. Cache Restore
 
 Restores the OpenCode storage directory from GitHub Actions cache (or S3 backup if configured). The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
 
 This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases.
 
-## 6. Session Prep
+## 7. Session Prep
 
 Processes any file attachments from the triggering context, searches prior sessions for relevant context (see [[Session Persistence]]), and builds the agent prompt (see [[Prompt Architecture]]). The prompt is a multi-section XML-tagged document that includes environment metadata, issue/PR context, session history, the task directive, and response protocol rules.
 
-## 7. Execute
+## 8. Execute
 
 The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK session, sends the assembled prompt, and streams events back in real time. The SDK lifecycle follows the pattern: spawn server, connect client, create session, send prompt, process event stream, close.
 
 If the LLM returns a fetch error (transient provider failure), the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) aborts execution if the agent runs too long.
 
-## 8. Finalize
+## 9. Finalize
 
 Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Posts the run summary to GitHub. Collects metrics and sets action outputs (session ID, cache status, duration).
 
-## 9. Cleanup (Always)
+## 10. Cleanup (Always)
 
-Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server — importantly, this triggers a SQLite WAL checkpoint that merges in-flight session data into the main database file before cache save. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]). Finally, saves the cache and optionally uploads a prompt log artifact for observability.
+Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server — importantly, this triggers a SQLite WAL checkpoint that merges in-flight session data into the main database file before cache save. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]). Saves the cache and optionally uploads a prompt log artifact for observability.
+
+The cleanup phase has its own `finally` block for lock release: if a coordination lock was acquired in phase 4, it is released after all S3 sync and cache save operations complete. This ordering ensures the next surface sees a coherent state. Lock release is always attempted, even if earlier cleanup steps failed.
 
 ## Post-Action Hook
 

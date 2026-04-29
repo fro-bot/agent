@@ -1,21 +1,23 @@
 ---
 type: convention
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
   - AGENTS.md
+  - packages/runtime/src/shared/logger.ts
+  - packages/runtime/src/shared/types.ts
   - src/shared/logger.ts
   - src/shared/types.ts
   - src/services/github/context.ts
   - src/services/github/types.ts
   - src/features/triggers/router.ts
-  - src/features/agent/execution.ts
+  - src/features/agent/execution-adapter.ts
 summary: "Coding conventions, architectural patterns, and anti-patterns enforced across the project"
 ---
 
 # Conventions and Patterns
 
-This page documents the recurring patterns and conventions in the Fro Bot Agent codebase. Understanding these is essential for contributors — the project enforces them strictly, and deviations will fail CI.
+This page documents the recurring patterns and conventions in the Fro Bot Agent codebase. These conventions apply uniformly across both the action (`src/`) and the runtime package (`packages/runtime/`). Understanding them is essential for contributors — the project enforces them strictly, and deviations will fail CI.
 
 ## Language and Module System
 
@@ -34,7 +36,7 @@ The entire codebase uses plain functions — no ES6 classes anywhere. Stateful p
 
 ## Logger Injection
 
-Every function that produces output takes a `Logger` parameter rather than importing a global logger. The logger (`src/shared/logger.ts`) outputs JSON-structured messages with automatic credential redaction — any string matching known secret patterns is replaced before output.
+Every function that produces output takes a `Logger` parameter rather than importing a global logger. The logger (available in both `packages/runtime/src/shared/logger.ts` and `src/shared/logger.ts`) outputs JSON-structured messages with automatic credential redaction — any string matching known secret patterns is replaced before output.
 
 ```typescript
 export function restoreCache(options: CacheOptions, logger: Logger): Promise<CacheResult>
