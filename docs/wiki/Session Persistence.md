@@ -1,24 +1,24 @@
 ---
 type: subsystem
-last-updated: "2026-04-19"
-updated-by: "92324bf"
+last-updated: "2026-04-26"
+updated-by: "ca17d5e"
 sources:
-  - src/services/session/storage.ts
-  - src/services/session/search.ts
-  - src/services/session/prune.ts
-  - src/services/session/writeback.ts
-  - src/services/session/types.ts
-  - src/services/session/discovery.ts
-  - src/services/session/backend.ts
-  - src/services/session/storage-mappers.ts
-  - src/services/session/storage-message-mappers.ts
+  - packages/runtime/src/session/storage.ts
+  - packages/runtime/src/session/search.ts
+  - packages/runtime/src/session/prune.ts
+  - packages/runtime/src/session/writeback.ts
+  - packages/runtime/src/session/types.ts
+  - packages/runtime/src/session/discovery.ts
+  - packages/runtime/src/session/backend.ts
+  - packages/runtime/src/session/storage-mappers.ts
+  - packages/runtime/src/session/storage-message-mappers.ts
+  - packages/runtime/src/object-store/content-sync.ts
+  - packages/runtime/src/object-store/s3-adapter.ts
+  - packages/runtime/src/object-store/key-builder.ts
+  - packages/runtime/src/object-store/validation.ts
+  - packages/runtime/src/object-store/types.ts
   - src/services/cache/restore.ts
   - src/services/cache/save.ts
-  - src/services/object-store/content-sync.ts
-  - src/services/object-store/s3-adapter.ts
-  - src/services/object-store/key-builder.ts
-  - src/services/object-store/validation.ts
-  - src/services/object-store/types.ts
   - RFCs/RFC-004-Session-Management.md
   - RFCs/RFC-002-Cache-Infrastructure.md
   - RFCs/RFC-019-S3-Storage-Backend.md
@@ -34,8 +34,8 @@ The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI
 Session persistence involves three cooperating subsystems:
 
 1. **Cache layer** (`src/services/cache/`) — Saves and restores the OpenCode storage directory to/from GitHub Actions cache, with optional S3 write-through backup.
-2. **Session layer** (`src/services/session/`) — Reads, searches, and manages individual sessions within that storage directory via the OpenCode SDK.
-3. **Writeback** (`src/services/session/writeback.ts`) — Injects synthetic summary messages into session history after each run, making past work discoverable by future runs.
+2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages individual sessions within that storage directory via the OpenCode SDK. Part of the `@fro-bot/runtime` package (see [[Architecture Overview]]).
+3. **Writeback** (`packages/runtime/src/session/writeback.ts`) — Injects synthetic summary messages into session history after each run, making past work discoverable by future runs.
 
 ## Cache Strategy
 
@@ -59,7 +59,7 @@ Cache saves happen twice: once during the cleanup phase of the main step, and ag
 
 GitHub Actions cache has a 10 GB limit per repository and entries expire after 7 days of inactivity. For repositories where losing agent memory would be costly, the optional S3-compatible object store backend (RFC-019) provides durable persistence that survives cache eviction.
 
-The implementation lives in `src/services/object-store/` and consists of five modules:
+The implementation lives in `packages/runtime/src/object-store/` and consists of five modules:
 
 - **`s3-adapter.ts`** — Creates an `ObjectStoreAdapter` wrapping `@aws-sdk/client-s3`. Handles upload (PutObject), download (GetObject with streaming pipeline), and list (ListObjectsV2 with pagination). All S3 error messages are sanitized to strip credentials before logging. The client retries up to 3 times and caps list pagination at 100 iterations.
 
@@ -98,7 +98,7 @@ All SDK operations return empty arrays or `null` on failure — they never throw
 
 ## Mapper Architecture
 
-SDK types don't perfectly match the project's local types. The mapper layer (`storage-mappers.ts`, `storage-message-mappers.ts`) translates between them:
+SDK types don't perfectly match the project's local types. The mapper layer in `packages/runtime/src/session/` (`storage-mappers.ts`, `storage-message-mappers.ts`) translates between them:
 
 - **Session mappers** convert `SdkSessionExtended` (which includes fields the SDK type definitions omit, like `permission` and `time.archived`) into the local `SessionInfo` type.
 - **Message mappers** convert SDK messages into local `Message` types, sorting chronologically by `time.created`. The SDK returns messages unsorted, so this step is essential.
@@ -109,7 +109,7 @@ The local types in `types.ts` are authoritative — they define the canonical sh
 
 ## Session Search
 
-The search module (`search.ts`) provides two capabilities consumed by the prompt builder:
+The search module (`packages/runtime/src/session/search.ts`) provides two capabilities consumed by the prompt builder:
 
 - **`listSessions`** — Returns recent non-child sessions sorted by `updatedAt`. Child sessions (those with a `parentID`, representing agent-spawned branches) are filtered out of the main listing.
 - **`searchSessions`** — Full-text search across session message content. Returns excerpts with context so the agent can decide which prior sessions are relevant without reading every message.
@@ -118,7 +118,7 @@ During the session-prep phase of each run (see [[Execution Lifecycle]]), the sys
 
 ## Pruning
 
-Without pruning, the storage directory would grow unboundedly. The pruning module (`prune.ts`) uses a dual-condition retention policy:
+Without pruning, the storage directory would grow unboundedly. The pruning module (`packages/runtime/src/session/prune.ts`) uses a dual-condition retention policy:
 
 A session is kept if **either**:
 

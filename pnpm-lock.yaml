@@ -30,8 +30,8 @@ importers:
         specifier: 4.0.0
         version: 4.0.0
       '@aws-sdk/client-s3':
-        specifier: 3.1035.0
-        version: 3.1035.0
+        specifier: 3.1037.0
+        version: 3.1037.0
       '@bfra.me/es':
         specifier: 0.1.0
         version: 0.1.0
@@ -42,8 +42,8 @@ importers:
         specifier: 8.2.0
         version: 8.2.0
       '@opencode-ai/sdk':
-        specifier: 1.14.21
-        version: 1.14.21
+        specifier: 1.14.25
+        version: 1.14.25
     devDependencies:
       '@bfra.me/eslint-config':
         specifier: 0.51.0
@@ -127,8 +127,8 @@ importers:
         specifier: 0.1.0
         version: 0.1.0
       '@opencode-ai/sdk':
-        specifier: 1.14.21
-        version: 1.14.21
+        specifier: 1.14.25
+        version: 1.14.25
 
 packages:
 
@@ -185,8 +185,8 @@ packages:
   '@aws-crypto/util@5.2.0':
     resolution: {integrity: sha512-4RkU9EsI6ZpBve5fseQlGNUWKMa1RLPQ1dnjnQoe07ldfIzcsGb5hC5W0Dm7u423KWzawlrpbjXBrXCEv9zazQ==}
 
-  '@aws-sdk/client-s3@3.1035.0':
-    resolution: {integrity: sha512-Bh1h96CjHMpxg6Rn2G4EE30YiiBh9w/7WmSZIfwLB0X/6lblaJcHggcryrq2uNN2Bx1/CNErMjTpGQzqhA7Rhg==}
+  '@aws-sdk/client-s3@3.1037.0':
+    resolution: {integrity: sha512-DBmA1jAW8ST6C4srBxeL1/RLIir/d8WOm4s4mi59mGp6mBktHM59Kwb7GuURaCO60cotuce5zr0sKpMLPcBQyA==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.974.5':
@@ -907,8 +907,8 @@ packages:
   '@octokit/webhooks-types@7.6.1':
     resolution: {integrity: sha512-S8u2cJzklBC0FgTwWVLaM8tMrDuDMVE4xiTK4EYXM9GntyvrdbSoxqDQa+Fh57CCNApyIpyeqPhhFEmHPfrXgw==}
 
-  '@opencode-ai/sdk@1.14.21':
-    resolution: {integrity: sha512-WA9a1hTn2Nzjs6rI2fiMlPrBghmsFi771ABRxKlGZkTfT0PpKemJr6LP4vu+PilINFseLze2ZKmylRr84xFHuA==}
+  '@opencode-ai/sdk@1.14.25':
+    resolution: {integrity: sha512-YSb+77OgIylwnk9aLoIyfr7FOx3MDD1ASEy2cUbOGTnhNqcR7S2sZAWLgkNWBBOkIH4tG6ouOckcG8lg12a3Tg==}
 
   '@ota-meshi/ast-token-store@0.3.0':
     resolution: {integrity: sha512-XRO0zi2NIUKq2lUk3T1ecFSld1fMWRKE6naRFGkgkdeosx7IslyUKNv5Dcb5PJTja9tHJoFu0v/7yEpAkrkrTg==}
@@ -4849,7 +4849,7 @@ snapshots:
       '@smithy/util-utf8': 2.3.0
       tslib: 2.8.1
 
-  '@aws-sdk/client-s3@3.1035.0':
+  '@aws-sdk/client-s3@3.1037.0':
     dependencies:
       '@aws-crypto/sha1-browser': 5.2.0
       '@aws-crypto/sha256-browser': 5.2.0
@@ -5932,7 +5932,7 @@ snapshots:
 
   '@octokit/webhooks-types@7.6.1': {}
 
-  '@opencode-ai/sdk@1.14.21':
+  '@opencode-ai/sdk@1.14.25':
     dependencies:
       cross-spawn: 7.0.6
 
