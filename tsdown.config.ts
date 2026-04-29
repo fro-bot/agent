@@ -1,6 +1,6 @@
 import type {Plugin} from 'rolldown'
 import {execFile} from 'node:child_process'
-import {readdir, readFile, stat, writeFile} from 'node:fs/promises'
+import {readdir, readFile, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
@@ -130,13 +130,13 @@ function escapeHiddenUnicodePlugin(): Plugin {
     name: 'escape-hidden-unicode',
     async writeBundle(options) {
       const dir = options.dir ?? 'dist'
-      const entries = await readdir(dir)
+      // Read entries with their file-type bits in one syscall; avoid the
+      // stat→read TOCTOU pattern CodeQL flags (js/file-system-race).
+      const entries = await readdir(dir, {withFileTypes: true})
       await Promise.all(
-        entries.map(async name => {
-          if (!name.endsWith('.js')) return
-          const path = join(dir, name)
-          const info = await stat(path)
-          if (!info.isFile()) return
+        entries.map(async entry => {
+          if (!entry.isFile() || !entry.name.endsWith('.js')) return
+          const path = join(dir, entry.name)
           const content = await readFile(path, 'utf8')
           if (!HIDDEN_UNICODE_RE.test(content)) return
           HIDDEN_UNICODE_RE.lastIndex = 0
