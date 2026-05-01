@@ -21,6 +21,6 @@
   },
   "dependencies": {
     "@bfra.me/es": "0.1.0",
-    "@opencode-ai/sdk": "1.14.28"
+    "@opencode-ai/sdk": "1.14.30"
   }
 }
