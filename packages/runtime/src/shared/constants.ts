@@ -24,7 +24,7 @@ export const DEFAULT_OPENCODE_VERSION = '1.14.30'
 export const DEFAULT_BUN_VERSION = '1.3.13'
 export const DEFAULT_OMO_VERSION = '3.17.6'
 export const DEFAULT_OMO_PROVIDERS = ''
-export const DEFAULT_SYSTEMATIC_VERSION = '2.7.0'
+export const DEFAULT_SYSTEMATIC_VERSION = '2.7.1'
 
 // Retry configuration lives in agent/retry.ts (RETRY_DELAYS_MS, MAX_LLM_RETRIES)
 // to colocate with the retry logic that consumes the values.
