@@ -713,7 +713,7 @@ describe('executeOpenCode', () => {
     expect(mockLogger.info).toHaveBeenCalledWith(
       'Executing OpenCode agent (SDK mode)',
       expect.objectContaining({
-        agent: 'sisyphus',
+        agent: null,
       }),
     )
   })
@@ -1281,6 +1281,7 @@ describe('ensureOpenCodeAvailable', () => {
       opencodeVersion: 'latest',
       githubToken: 'ghs_test_token',
       authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+      enableOmo: false,
       omoVersion: '3.7.4',
       systematicVersion: '2.1.0',
       omoProviders: {
@@ -1315,6 +1316,7 @@ describe('ensureOpenCodeAvailable', () => {
         opencodeVersion: 'latest',
         githubToken: 'ghs_test_token',
         authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+        enableOmo: false,
         omoVersion: '3.7.4',
         systematicVersion: '2.1.0',
         omoProviders: {

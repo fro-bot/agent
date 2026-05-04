@@ -8,7 +8,7 @@ import * as path from 'node:path'
 import {createOpencode as createOpencodeClient} from '@opencode-ai/sdk'
 import {reassertSessionTitle} from '../session/index.js'
 import {sleep} from '../shared/async.js'
-import {DEFAULT_AGENT, DEFAULT_TIMEOUT_MS} from '../shared/constants.js'
+import {DEFAULT_TIMEOUT_MS} from '../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLLMFetchError, isLlmFetchError} from './error-format/format.js'
@@ -59,7 +59,7 @@ export async function executeOpenCode(
   }
 
   logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? DEFAULT_AGENT,
+    agent: config?.agent ?? null,
     hasModelOverride: config?.model != null,
     timeoutMs,
   })

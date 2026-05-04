@@ -18,6 +18,7 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
     opencodeConfig: null,
     systematicConfig: null,
     omoConfig: null,
+    enableOmo: false,
     omoVersion: '3.7.4',
     systematicVersion: '2.1.0',
     omoProviders: {

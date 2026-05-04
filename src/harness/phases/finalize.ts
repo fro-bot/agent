@@ -37,7 +37,7 @@ export async function runFinalize(
     runId: Number(routing.agentContext.runId),
     runUrl: `https://github.com/${routing.agentContext.repo}/actions/runs/${routing.agentContext.runId}`,
     metrics: metrics.getMetrics(),
-    agent: bootstrap.inputs.agent,
+    agent: bootstrap.inputs.agent ?? '',
     resolvedOutputMode: execution.resolvedOutputMode,
   }
   await writeJobSummary(summaryOptions, logger)

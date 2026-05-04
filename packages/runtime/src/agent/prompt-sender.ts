@@ -1,7 +1,7 @@
 import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../shared/logger.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
-import {DEFAULT_AGENT, DEFAULT_MODEL} from '../shared/constants.js'
+import {DEFAULT_MODEL} from '../shared/constants.js'
 import {createLLMFetchError, isLlmFetchError} from './error-format/format.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
@@ -59,8 +59,8 @@ export async function sendPromptToSession(
   } = {parts}
   const model = resolvePromptModel(config)
   if (model != null) body.model = model
-  const agentName = config?.agent ?? DEFAULT_AGENT
-  if (agentName !== DEFAULT_AGENT) body.agent = agentName
+  const agentName = config?.agent ?? null
+  if (agentName != null) body.agent = agentName
 
   const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
   if (response.error != null) {

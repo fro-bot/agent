@@ -6,7 +6,6 @@ import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {validateEndpoint, validatePrefix} from '@fro-bot/runtime'
 import {
-  DEFAULT_AGENT,
   DEFAULT_DEDUP_WINDOW_MS,
   DEFAULT_OMO_PROVIDERS,
   DEFAULT_OMO_VERSION,
@@ -15,9 +14,13 @@ import {
   DEFAULT_SESSION_RETENTION,
   DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
+  OMO_PROVIDERS_DISABLED,
 } from '../../shared/constants.js'
 import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
+
+// Known oMo-provided agent names for migration warnings
+const KNOWN_OMO_AGENTS = new Set(['sisyphus', 'hephaestus', 'oracle', 'librarian', 'prometheus', 'explore'])
 
 /**
  * Parse model input string in "provider/model" format.
@@ -287,8 +290,11 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     }
 
     // RFC-013: SDK execution configuration
+    const enableOmoRaw = core.getInput('enable-omo').trim().toLowerCase()
+    const enableOmo = enableOmoRaw === 'true'
+
     const agentRaw = core.getInput('agent').trim()
-    const agent = agentRaw.length > 0 ? agentRaw : DEFAULT_AGENT
+    const agent = agentRaw.length > 0 ? agentRaw : null
 
     const modelRaw = core.getInput('model').trim()
     const model = modelRaw.length > 0 ? parseModelInput(modelRaw) : null
@@ -310,7 +316,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
 
     const omoProvidersRaw = core.getInput('omo-providers').trim()
-    const omoProviders = parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+    const omoProviders = enableOmo
+      ? parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
+      : OMO_PROVIDERS_DISABLED
 
     const opencodeConfigRaw = core.getInput('opencode-config').trim()
     const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
@@ -336,6 +344,29 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       }
     }
 
+    // Disabled-mode warnings
+    if (!enableOmo) {
+      const ignoredInputs: string[] = []
+      if (omoProvidersRaw.length > 0) {
+        ignoredInputs.push('omo-providers')
+      }
+      if (omoVersionRaw.length > 0 && omoVersionRaw !== DEFAULT_OMO_VERSION) {
+        ignoredInputs.push('omo-version')
+      }
+      if (ignoredInputs.length > 0) {
+        core.warning(
+          `oMo is disabled (enable-omo: false). The following inputs are ignored: ${ignoredInputs.join(', ')}. Set enable-omo: true to use oMo features.`,
+        )
+      }
+
+      // Agent migration warning for known oMo-provided agents
+      if (agent != null && KNOWN_OMO_AGENTS.has(agent.toLowerCase())) {
+        core.warning(
+          `Agent "${agent}" is a known oMo-provided agent but oMo is disabled (enable-omo: false). Set enable-omo: true to use oMo agents, or configure "${agent}" via your OpenCode config.`,
+        )
+      }
+    }
+
     return ok({
       githubToken,
       authJson,
@@ -346,6 +377,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       agent,
       model,
       timeoutMs,
+      enableOmo,
       opencodeVersion,
       skipCache,
       omoVersion,
