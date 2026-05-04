@@ -105,6 +105,19 @@ describe('writeJobSummary', () => {
     expect(tableCall).toBeDefined()
     expect(tableCall.some(row => Array.isArray(row) && row.includes('issue_comment'))).toBe(true)
     expect(tableCall.some(row => Array.isArray(row) && row.includes('owner/repo'))).toBe(true)
+    expect(tableCall.some(row => Array.isArray(row) && row.includes('sisyphus'))).toBe(true)
+  })
+
+  it('renders build (default) when agent is null', async () => {
+    // #given
+    const options = createMockOptions({agent: 'build (default)'})
+
+    // #when
+    await writeJobSummary(options, logger)
+
+    // #then
+    const tableCall = vi.mocked(core.summary.addTable).mock.calls[0]![0]
+    expect(tableCall).toContainEqual(['Agent', 'build (default)'])
   })
 
   it('includes Output Mode row when resolved mode is set', async () => {

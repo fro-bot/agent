@@ -59,7 +59,7 @@ export async function executeOpenCode(
   }
 
   logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? null,
+    agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
     timeoutMs,
   })
