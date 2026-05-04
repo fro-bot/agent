@@ -711,6 +711,52 @@ describe('setup', () => {
         expect(callArgs?.systematicVersion).toBe('2.1.0')
       })
 
+      it('passes disabled cacheMode to restoreToolsCache when enableOmo is false', async () => {
+        // #given - default disabled mode
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(callArgs?.cacheMode).toBe('disabled')
+      })
+
+      it('passes enabled cacheMode to restoreToolsCache when enableOmo is true', async () => {
+        // #given - enabled mode
+
+        // #when
+        await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
+
+        // #then
+        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(callArgs?.cacheMode).toBe('enabled')
+      })
+
+      it('passes disabled cacheMode to saveToolsCache when enableOmo is false', async () => {
+        // #given - default disabled mode
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
+        expect(saveArgs?.cacheMode).toBe('disabled')
+      })
+
+      it('passes enabled cacheMode to saveToolsCache when enableOmo is true on cache miss', async () => {
+        // #given - enabled mode with cache miss
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
+        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+
+        // #when
+        await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
+
+        // #then
+        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
+        expect(saveArgs?.cacheMode).toBe('enabled')
+      })
+
       it('calls saveToolsCache after successful installs on cache miss', async () => {
         // #given
 
