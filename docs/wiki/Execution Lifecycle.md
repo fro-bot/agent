@@ -54,7 +54,7 @@ post.ts
 
 ## 1. Bootstrap
 
-Parses action inputs (`parseActionInputs`), validates credentials, and ensures OpenCode and its dependencies are available. If the tools aren't already cached, the setup module installs Bun, oMo, and the OpenCode CLI (see [[Setup and Configuration]]). On failure, the run exits immediately with code 1.
+Parses action inputs (`parseActionInputs`), validates credentials, and ensures the OpenCode CLI is available. If the tools aren't already cached, the setup module installs OpenCode. When `enable-omo: true`, it also installs Bun and oMo (see [[Setup and Configuration]]). On failure, the run exits immediately with code 1.
 
 ## 2. Routing
 
