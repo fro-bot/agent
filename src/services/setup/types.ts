@@ -16,7 +16,6 @@ export interface SetupInputs {
   readonly privateKey: string | null
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
-  readonly omoConfig: string | null
   readonly enableOmo: boolean
   readonly omoVersion: string
   readonly systematicVersion: string
@@ -30,7 +29,7 @@ export interface SetupResult {
   readonly opencodePath: string
   readonly opencodeVersion: string
   readonly ghAuthenticated: boolean
-  readonly omoInstalled: boolean
+  readonly omoStatus: 'installed' | 'failed' | 'skipped'
   readonly omoError: string | null
   readonly toolsCacheStatus: 'hit' | 'miss'
   readonly duration: number
