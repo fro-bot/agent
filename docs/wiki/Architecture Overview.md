@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-04-26"
-updated-by: "ca17d5e"
+last-updated: "2026-05-03"
+updated-by: "328fcc5"
 sources:
   - src/main.ts
   - src/post.ts
