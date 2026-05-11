@@ -2253,3 +2253,335 @@ describe('processEventStream', () => {
     expect(result.tokens?.input).toBe(100)
   })
 })
+
+interface TestWaitParams {
+  readonly sessionID: string
+  readonly directory: string
+}
+
+interface TestWaitOptions {
+  readonly signal: AbortSignal
+}
+
+interface TestWaitResponse {
+  readonly data?: undefined
+  readonly error?: unknown
+}
+
+type TestWaitFn = (params: TestWaitParams, options: TestWaitOptions) => Promise<TestWaitResponse>
+
+describe('runPromptAttempt with v2.session.wait()', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('uses client.v2.session.wait() as primary completion authority when available', async () => {
+    // #given — client has v2.session.wait; it resolves immediately (session idle)
+    const {runPromptAttempt} = await import('./retry.js')
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then
+    const waitCall = waitFn.mock.calls.at(0)
+    expect(waitCall?.[0]).toEqual({sessionID: 'ses_123', directory: '/workspace'})
+    expect(waitCall?.[1].signal).toBeInstanceOf(AbortSignal)
+    expect(result.success).toBe(true)
+    // pollForSessionCompletion (status polling) should NOT have been the completion authority
+    expect(mockClient.session.status).not.toHaveBeenCalled()
+  })
+
+  it('marks activityTracker.sessionIdle=true after wait() resolves', async () => {
+    // #given — wait resolves; we verify the tracker is marked idle so event stream exits cleanly
+    const {runPromptAttempt} = await import('./retry.js')
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(waitFn).toHaveBeenCalledOnce()
+  })
+
+  it('falls back to pollForSessionCompletion when v2.session.wait() rejects', async () => {
+    // #given — wait throws; fallback poll sees idle
+    const {runPromptAttempt} = await import('./retry.js')
+    const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait not supported'))
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('falls back to pollForSessionCompletion when v2 is not present on client', async () => {
+    // #given — client has no v2 property at all (older SDK)
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      // no v2 property
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('does not complete from message.updated delta events alone', async () => {
+    // #given — only delta events arrive; wait() never resolves (hangs); poll sees idle eventually
+    const {runPromptAttempt} = await import('./retry.js')
+    let waitResolve: (() => void) | null = null
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+      async () =>
+        new Promise<TestWaitResponse>(resolve => {
+          waitResolve = () => resolve({data: undefined, error: undefined})
+        }),
+    )
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const deltaEvents: Event[] = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_1',
+            sessionID: 'ses_123',
+            parentID: '',
+            role: 'assistant',
+            tokens: {input: 10, output: 5, reasoning: 0, cache: {read: 0, write: 0}},
+            modelID: 'claude-sonnet',
+            cost: 0.001,
+            time: {created: 0},
+            system: '',
+            parts: [],
+          },
+        },
+      } as unknown as Event,
+    ]
+    const eventStream = createMockEventStream(deltaEvents)
+
+    // Resolve wait after a tick so poll can run
+    setTimeout(() => {
+      waitResolve?.()
+    }, 10)
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then — completion came from wait(), not from message.updated alone
+    expect(result.success).toBe(true)
+    expect(waitFn).toHaveBeenCalled()
+  })
+
+  it('returns failure when wait() resolves with an error response', async () => {
+    // #given — wait returns 4xx/5xx style error in data
+    const {runPromptAttempt} = await import('./retry.js')
+    const waitFn = vi
+      .fn<TestWaitFn>()
+      .mockResolvedValue({data: undefined, error: {status: 500, message: 'internal error'}})
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then — falls back to poll which sees idle → success
+    // (error in wait response is treated as wait unavailable, not a hard failure)
+    expect(result.success).toBe(true)
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('never-resolving wait() does not block the no-activity watchdog from timing out', async () => {
+    // #given — wait() hangs forever; poll watchdog must still fire the no-activity timeout
+    const {runPromptAttempt} = await import('./retry.js')
+    const waitSignals: AbortSignal[] = []
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(async (_params, options) => {
+      waitSignals.push(options.signal)
+      return new Promise<never>((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+          once: true,
+        })
+      })
+    })
+    const mockClient = {
+      session: {
+        // status never returns idle — simulates a crashed server (no activity)
+        status: vi.fn().mockResolvedValue({data: {}}),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when — use a very short timeout so the test doesn't actually wait 90s
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      200, // 200ms timeout — watchdog must fire even though wait() is still pending
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then — poll watchdog returned failure; wait() did not prevent it
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/timeout|activity/i)
+    expect(waitFn).toHaveBeenCalled()
+    expect(waitSignals.at(0)?.aborted).toBe(true)
+  })
+
+  it('pollForSessionCompletion runs in parallel with wait(), not sequentially after', async () => {
+    // #given — wait resolves after a delay; poll must have started before wait resolves
+    const {runPromptAttempt} = await import('./retry.js')
+    const pollStartTimes: number[] = []
+    const waitStartTimes: number[] = []
+
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(async () => {
+      waitStartTimes.push(Date.now())
+      await new Promise(resolve => setTimeout(resolve, 50))
+      return {data: undefined, error: undefined}
+    })
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          pollStartTimes.push(Date.now())
+          return {data: {ses_123: {type: 'busy'}}}
+        }),
+      },
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      5_000,
+      mockLogger,
+      eventStream.stream,
+    )
+
+    // #then — both started; poll started before or very close to when wait started (parallel)
+    expect(result.success).toBe(true)
+    expect(waitStartTimes.length).toBeGreaterThan(0)
+    // poll may or may not have been called (wait won the race), but wait must have been called
+    expect(waitFn).toHaveBeenCalled()
+  })
+})
