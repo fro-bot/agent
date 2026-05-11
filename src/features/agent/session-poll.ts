@@ -51,7 +51,7 @@ export async function pollForSessionCompletion(
       continue
     }
 
-    if (activityTracker?.sessionIdle === true) {
+    if (activityTracker?.sessionIdle === true && activityTracker.firstMeaningfulEventReceived) {
       logger.debug('Session idle detected via event stream', {sessionId})
       return {completed: true, error: null}
     }
@@ -70,9 +70,12 @@ export async function pollForSessionCompletion(
       if (sessionStatus == null) {
         logger.debug('Session status not found in poll response', {sessionId})
       } else if (sessionStatus.type === 'idle') {
-        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
-        logger.debug('Session idle detected via polling', {sessionId})
-        return {completed: true, error: null}
+        if (activityTracker != null && !activityTracker.firstMeaningfulEventReceived) {
+          logger.debug('Session idle detected before current-turn activity; continuing watchdog', {sessionId})
+        } else {
+          logger.debug('Session idle detected via polling', {sessionId})
+          return {completed: true, error: null}
+        }
       } else {
         if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         logger.debug('Session status', {sessionId, type: sessionStatus.type})

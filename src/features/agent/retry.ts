@@ -55,9 +55,24 @@ async function startV2SessionWait(
       })
       return false
     }
+    // Guard: only accept wait() as the completion signal if current-turn activity has been
+    // observed on the event stream. wait() can resolve before the event processor loop has
+    // had a chance to process the first event (async scheduling gap), so we poll briefly
+    // (up to 500ms in 10ms ticks) to give the event processor time to catch up.
+    // If no activity is observed within the grace period, the session was idle from a prior
+    // turn — fall back to the poll watchdog so we don't declare success prematurely.
+    const ACTIVITY_GRACE_MS = 500
+    const ACTIVITY_POLL_INTERVAL_MS = 10
+    const deadline = Date.now() + ACTIVITY_GRACE_MS
+    while (!activityTracker.firstMeaningfulEventReceived && Date.now() < deadline && !signal.aborted) {
+      await new Promise(resolve => setTimeout(resolve, ACTIVITY_POLL_INTERVAL_MS))
+    }
+    if (!activityTracker.firstMeaningfulEventReceived) {
+      logger.debug('v2.session.wait() resolved before current-turn activity — deferring to poll watchdog', {sessionId})
+      return false
+    }
     logger.debug('v2.session.wait() resolved — session is idle', {sessionId})
     activityTracker.sessionIdle = true
-    activityTracker.firstMeaningfulEventReceived = true
     return true
   } catch (error) {
     logger.debug('v2.session.wait() threw, relying on poll watchdog', {sessionId, error: toErrorMessage(error)})
