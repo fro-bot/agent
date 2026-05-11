@@ -1818,7 +1818,7 @@ describe('pollForSessionCompletion', () => {
     expect(result.error).toContain('No agent activity detected')
   })
 
-  it('treats matching session status as activity while continuing to poll', async () => {
+  it('does not treat matching busy session status as activity', async () => {
     // #given
     const mockClient = {
       session: {
@@ -1840,15 +1840,13 @@ describe('pollForSessionCompletion', () => {
       activityTracker,
     )
     await vi.advanceTimersByTimeAsync(INITIAL_ACTIVITY_TIMEOUT_MS + 1000)
-    abortController.abort()
-    await vi.advanceTimersByTimeAsync(500)
     const result = await resultPromise
     vi.useRealTimers()
 
     // #then
-    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(false)
     expect(result.completed).toBe(false)
-    expect(result.error).toBe('Aborted')
+    expect(result.error).toContain('No agent activity detected')
   })
 
   it('continues polling when session status is not found', async () => {
@@ -2372,6 +2370,49 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(mockClient.session.status).toHaveBeenCalled()
   })
 
+  it('does not treat session.status busy as current-turn activity for wait completion', async () => {
+    // #given — models the green-but-no-review CI bug: the stream has no current-turn events,
+    // status briefly reports busy, and v2 wait resolves. Status has no turn identity, so busy
+    // must not unlock wait() completion.
+    let resolveWait!: () => void
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+      async () =>
+        new Promise<TestWaitResponse>(resolve => {
+          resolveWait = () => resolve({data: undefined, error: undefined})
+        }),
+    )
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    let statusCalls = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          statusCalls++
+          return {data: {ses_123: {type: statusCalls === 1 ? 'busy' : 'idle'}}}
+        }),
+      },
+    }
+    const eventStream = createMockEventStream([])
+    setTimeout(() => resolveWait(), 20)
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      1_200,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:1234',
+    )
+
+    // #then
+    expect(waitFn).toHaveBeenCalled()
+    expect(mockClient.session.status).toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
   it('wait() completing after current-turn activity is observed signals success correctly', async () => {
     // #given — wait resolves, but only AFTER firstMeaningfulEventReceived is already true
     // (a message.part.delta event arrived first, proving the current turn started)
@@ -2546,7 +2587,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
   })
 
   it('falls back to pollForSessionCompletion when v2.session.wait() rejects', async () => {
-    // #given — wait throws; fallback poll sees busy then idle (activity gate satisfied by busy)
+    // #given — wait throws; fallback poll sees busy then idle after real stream activity
     const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait not supported'))
     vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
     const {runPromptAttempt} = await import('./retry.js')
@@ -2559,7 +2600,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
-    const eventStream = createMockEventStream([])
+    const eventStream = createCurrentTurnActivityStream()
 
     // #when
     const result = await runPromptAttempt(
@@ -2589,7 +2630,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
-    const eventStream = createMockEventStream([])
+    const eventStream = createCurrentTurnActivityStream()
 
     // #when — omit serverUrl
     const result = await runPromptAttempt(
@@ -2622,7 +2663,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
-    const eventStream = createMockEventStream([])
+    const eventStream = createCurrentTurnActivityStream()
 
     // #when
     const result = await runPromptAttempt(
@@ -2703,7 +2744,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
   })
 
   it('returns failure when wait() resolves with an error response', async () => {
-    // #given — wait returns 4xx/5xx style error in data; fallback poll sees busy then idle
+    // #given — wait returns 4xx/5xx style error in data; fallback poll sees busy then idle after real stream activity
     const waitFn = vi
       .fn<TestWaitFn>()
       .mockResolvedValue({data: undefined, error: {status: 500, message: 'internal error'}})
@@ -2718,7 +2759,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
-    const eventStream = createMockEventStream([])
+    const eventStream = createCurrentTurnActivityStream()
 
     // #when
     const result = await runPromptAttempt(

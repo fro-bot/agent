@@ -77,7 +77,6 @@ export async function pollForSessionCompletion(
           return {completed: true, error: null}
         }
       } else {
-        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       }
 
