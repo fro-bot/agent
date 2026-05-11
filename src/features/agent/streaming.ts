@@ -62,6 +62,27 @@ function getSessionID(value: unknown): string | null {
   return typeof descriptor?.value === 'string' ? descriptor.value : null
 }
 
+function getStringProperty(value: unknown, property: string): string | null {
+  if (value == null || typeof value !== 'object') return null
+
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'string' ? descriptor.value : null
+}
+
+function getObjectProperty(value: unknown, property: string): unknown {
+  if (value == null || typeof value !== 'object') return null
+
+  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
+}
+
+function getEventSessionID(event: Event): string | null {
+  return getSessionID(getObjectProperty(event, 'properties')) ?? getSessionID(getObjectProperty(event, 'data'))
+}
+
+function isStreamActivityEvent(eventType: string | null): boolean {
+  return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
+}
+
 export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
@@ -81,6 +102,11 @@ export async function processEventStream(
   for await (const event of stream) {
     if (signal.aborted) break
     logServerEvent(event, logger)
+
+    if (activityTracker != null && isStreamActivityEvent(getStringProperty(event, 'type'))) {
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID === sessionId) activityTracker.firstMeaningfulEventReceived = true
+    }
 
     if (event.type === 'message.part.updated') {
       const part = event.properties.part

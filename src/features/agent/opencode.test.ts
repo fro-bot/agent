@@ -1909,6 +1909,73 @@ describe('processEventStream', () => {
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
   })
 
+  it('marks activity tracker when message part deltas arrive', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {
+          sessionID: 'ses_123',
+          messageID: 'msg_123',
+          partID: 'prt_123',
+          field: 'text',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
+  it('marks activity tracker when session-next text deltas arrive', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.next.text.delta',
+        properties: {
+          timestamp: 1,
+          sessionID: 'ses_123',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
+  it('marks activity tracker when session-next events include the session on data', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.next.text.delta',
+        data: {
+          sessionID: 'ses_123',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
   it('sets sessionIdle on activity tracker when session.idle received', async () => {
     // #given
     const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
