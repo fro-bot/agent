@@ -34,6 +34,7 @@ export async function sendPromptToSession(
   directory: string,
   config: ExecutionConfig | undefined,
   logger: Logger,
+  serverUrl?: string | null,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -76,5 +77,6 @@ export async function sendPromptToSession(
     config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     logger,
     events.stream as AsyncIterable<Event>,
+    serverUrl,
   )
 }

@@ -45,11 +45,16 @@ export async function executeOpenCode(
 
   try {
     let client: Awaited<ReturnType<typeof createOpencode>>['client']
+    let serverUrl: string | null = null
     if (serverHandle == null) {
       const opencode = await createOpencode({signal: abortController.signal})
       client = opencode.client
       server = opencode.server
-    } else client = serverHandle.client
+      serverUrl = opencode.server.url
+    } else {
+      client = serverHandle.client
+      serverUrl = serverHandle.server.url
+    }
 
     let sessionId: string
     if (config?.continueSessionId == null) {
@@ -123,7 +128,7 @@ export async function executeOpenCode(
       const files = allFileParts.length > 0 ? allFileParts : undefined
       const result = await (async () => {
         try {
-          return await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger)
+          return await sendPromptToSession(client, sessionId, prompt, files, directory, config, logger, serverUrl)
         } finally {
           await reassertSessionTitle(client, sessionId, config?.sessionTitle, logger)
         }

@@ -2270,6 +2270,18 @@ interface TestWaitResponse {
 
 type TestWaitFn = (params: TestWaitParams, options: TestWaitOptions) => Promise<TestWaitResponse>
 
+function makeV2Module(waitFn: TestWaitFn) {
+  return {
+    createOpencodeClient: vi.fn().mockReturnValue({
+      v2: {
+        session: {
+          wait: waitFn,
+        },
+      },
+    }),
+  }
+}
+
 describe('runPromptAttempt with v2.session.wait()', () => {
   let mockLogger: Logger
 
@@ -2282,23 +2294,21 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     vi.restoreAllMocks()
   })
 
-  it('uses client.v2.session.wait() as primary completion authority when available', async () => {
-    // #given — client has v2.session.wait; it resolves immediately (session idle)
-    const {runPromptAttempt} = await import('./retry.js')
+  it('uses @opencode-ai/sdk/v2 createOpencodeClient (not client.v2) as primary completion authority', async () => {
+    // #given — v2 module resolves immediately; client has NO v2 property
     const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
+        // status stays busy — if poll were the authority, result would be failure
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
       },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
-      },
+      // deliberately no v2 property — proves we don't duck-type client.v2
     }
     const eventStream = createMockEventStream([])
 
-    // #when
+    // #when — pass serverUrl so the v2 client can be created
     const result = await runPromptAttempt(
       mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
       'ses_123',
@@ -2306,29 +2316,54 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
-    // #then
+    // #then — wait() was called with correct params; completion came from v2 module, not client.v2
     const waitCall = waitFn.mock.calls.at(0)
     expect(waitCall?.[0]).toEqual({sessionID: 'ses_123', directory: '/workspace'})
     expect(waitCall?.[1].signal).toBeInstanceOf(AbortSignal)
     expect(result.success).toBe(true)
-    // pollForSessionCompletion (status polling) should NOT have been the completion authority
+    // poll should NOT have been the completion authority (status was always busy)
     expect(mockClient.session.status).not.toHaveBeenCalled()
+  })
+
+  it('createOpencodeClient is called with the existing server URL, not a new server', async () => {
+    // #given — capture the baseUrl passed to createOpencodeClient
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    const createOpencodeClientMock = vi.fn().mockReturnValue({
+      v2: {session: {wait: waitFn}},
+    })
+    vi.doMock('@opencode-ai/sdk/v2', () => ({createOpencodeClient: createOpencodeClientMock}))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})},
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when
+    await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:9999',
+    )
+
+    // #then — createOpencodeClient was called with the URL we passed in (existing server)
+    expect(createOpencodeClientMock).toHaveBeenCalledWith({baseUrl: 'http://localhost:9999'})
   })
 
   it('marks activityTracker.sessionIdle=true after wait() resolves', async () => {
     // #given — wait resolves; we verify the tracker is marked idle so event stream exits cleanly
-    const {runPromptAttempt} = await import('./retry.js')
     const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const eventStream = createMockEventStream([])
@@ -2341,6 +2376,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then
@@ -2350,16 +2386,12 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('falls back to pollForSessionCompletion when v2.session.wait() rejects', async () => {
     // #given — wait throws; fallback poll sees idle
-    const {runPromptAttempt} = await import('./retry.js')
     const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait not supported'))
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const eventStream = createMockEventStream([])
@@ -2372,6 +2404,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then
@@ -2379,14 +2412,42 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(mockClient.session.status).toHaveBeenCalled()
   })
 
-  it('falls back to pollForSessionCompletion when v2 is not present on client', async () => {
-    // #given — client has no v2 property at all (older SDK)
+  it('falls back to pollForSessionCompletion when no serverUrl is provided', async () => {
+    // #given — no serverUrl → v2 client cannot be created → poll is the only path
     const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
-      // no v2 property
+    }
+    const eventStream = createMockEventStream([])
+
+    // #when — omit serverUrl
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      eventStream.stream,
+      // no serverUrl
+    )
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(mockClient.session.status).toHaveBeenCalled()
+  })
+
+  it('falls back to pollForSessionCompletion when @opencode-ai/sdk/v2 import fails', async () => {
+    // #given — module import throws (older SDK without v2 export)
+    vi.doMock('@opencode-ai/sdk/v2', () => {
+      throw new Error('Cannot find module')
+    })
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
     }
     const eventStream = createMockEventStream([])
 
@@ -2398,6 +2459,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then
@@ -2407,7 +2469,6 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('does not complete from message.updated delta events alone', async () => {
     // #given — only delta events arrive; wait() never resolves (hangs); poll sees idle eventually
-    const {runPromptAttempt} = await import('./retry.js')
     let waitResolve: (() => void) | null = null
     const waitFn = vi.fn<TestWaitFn>().mockImplementation(
       async () =>
@@ -2415,14 +2476,11 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           waitResolve = () => resolve({data: undefined, error: undefined})
         }),
     )
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const deltaEvents: Event[] = [
@@ -2459,6 +2517,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then — completion came from wait(), not from message.updated alone
@@ -2468,18 +2527,14 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('returns failure when wait() resolves with an error response', async () => {
     // #given — wait returns 4xx/5xx style error in data
-    const {runPromptAttempt} = await import('./retry.js')
     const waitFn = vi
       .fn<TestWaitFn>()
       .mockResolvedValue({data: undefined, error: {status: 500, message: 'internal error'}})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const eventStream = createMockEventStream([])
@@ -2492,6 +2547,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       30_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then — falls back to poll which sees idle → success
@@ -2502,7 +2558,6 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('never-resolving wait() does not block the no-activity watchdog from timing out', async () => {
     // #given — wait() hangs forever; poll watchdog must still fire the no-activity timeout
-    const {runPromptAttempt} = await import('./retry.js')
     const waitSignals: AbortSignal[] = []
     const waitFn = vi.fn<TestWaitFn>().mockImplementation(async (_params, options) => {
       waitSignals.push(options.signal)
@@ -2512,15 +2567,12 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         })
       })
     })
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         // status never returns idle — simulates a crashed server (no activity)
         status: vi.fn().mockResolvedValue({data: {}}),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const eventStream = createMockEventStream([])
@@ -2533,6 +2585,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       200, // 200ms timeout — watchdog must fire even though wait() is still pending
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then — poll watchdog returned failure; wait() did not prevent it
@@ -2544,7 +2597,6 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('pollForSessionCompletion runs in parallel with wait(), not sequentially after', async () => {
     // #given — wait resolves after a delay; poll must have started before wait resolves
-    const {runPromptAttempt} = await import('./retry.js')
     const pollStartTimes: number[] = []
     const waitStartTimes: number[] = []
 
@@ -2553,17 +2605,14 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       await new Promise(resolve => setTimeout(resolve, 50))
       return {data: undefined, error: undefined}
     })
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
     const mockClient = {
       session: {
         status: vi.fn().mockImplementation(async () => {
           pollStartTimes.push(Date.now())
           return {data: {ses_123: {type: 'busy'}}}
         }),
-      },
-      v2: {
-        session: {
-          wait: waitFn,
-        },
       },
     }
     const eventStream = createMockEventStream([])
@@ -2576,6 +2625,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       5_000,
       mockLogger,
       eventStream.stream,
+      'http://localhost:1234',
     )
 
     // #then — both started; poll started before or very close to when wait started (parallel)

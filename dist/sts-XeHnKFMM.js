@@ -1,1 +1,0 @@
-import{i as e,t}from"./sts-CRNAP_jM.js";t();export{e as getDefaultRoleAssumer};

@@ -1,4 +1,5 @@
 import type {createOpencode, Event} from '@opencode-ai/sdk'
+import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult} from './streaming.js'
@@ -9,51 +10,44 @@ import {processEventStream} from './streaming.js'
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
-interface WaitParams {
-  readonly sessionID: string
-  readonly directory: string
-}
-
-interface WaitOptions {
-  readonly signal: AbortSignal
-}
-
-interface WaitResponse {
-  readonly error?: unknown
+/**
+ * Create a v2 client attached to an existing OpenCode server URL.
+ * Returns null if the import fails (older SDK) or no URL is provided.
+ * Does NOT start a new server — only attaches to the existing one.
+ */
+async function tryCreateV2Client(
+  serverUrl: string | null | undefined,
+): Promise<ReturnType<typeof createOpencodeClient> | null> {
+  if (serverUrl == null) return null
+  try {
+    const {createOpencodeClient: create} = await import('@opencode-ai/sdk/v2')
+    return create({baseUrl: serverUrl})
+  } catch {
+    return null
+  }
 }
 
 /**
- * Start `client.v2.session.wait()` if available (SDK 1.14.39+).
- * Returns a promise that resolves to true when the session is idle, false if
- * unavailable or errored. On success marks the activityTracker so the concurrent
- * poller exits on its next tick.
+ * Call v2.session.wait() on an existing server via a v2 client.
+ * Returns true when the session is idle, false if unavailable or errored.
+ * On success marks the activityTracker so the concurrent poller exits on its next tick.
  *
  * This is intentionally non-blocking — callers start it in parallel with
  * pollForSessionCompletion() so the watchdog timeout is never suppressed.
  */
 async function startV2SessionWait(
-  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  serverUrl: string | null | undefined,
   sessionId: string,
   directory: string,
   activityTracker: ActivityTracker,
   logger: Logger,
   signal: AbortSignal,
 ): Promise<boolean> {
-  // Duck-type: v2.session.wait may not exist on older SDK versions
-  const clientUnknown = client as unknown as Record<string, unknown>
-  const v2 = clientUnknown.v2
-  if (v2 == null || typeof v2 !== 'object') return false
-  const session = (v2 as Record<string, unknown>).session
-  if (session == null || typeof session !== 'object') return false
-  const waitFn = (session as Record<string, unknown>).wait
-  if (typeof waitFn !== 'function') return false
+  const v2Client = await tryCreateV2Client(serverUrl)
+  if (v2Client == null) return false
 
   try {
-    const response = await (waitFn as (params: WaitParams, options: WaitOptions) => Promise<WaitResponse>).call(
-      session,
-      {sessionID: sessionId, directory},
-      {signal},
-    )
+    const response = await v2Client.v2.session.wait({sessionID: sessionId, directory}, {signal})
     if (response.error != null) {
       logger.debug('v2.session.wait() returned error, relying on poll watchdog', {
         sessionId,
@@ -78,6 +72,7 @@ export async function runPromptAttempt(
   timeoutMs: number,
   logger: Logger,
   eventStream?: AsyncIterable<Event>,
+  serverUrl?: string | null,
 ): Promise<AttemptResult> {
   const eventAbortController = new AbortController()
   const waitAbortController = new AbortController()
@@ -134,7 +129,7 @@ export async function runPromptAttempt(
     // On success it marks activityTracker idle so the poller exits on its next tick.
     // On error/rejection it resolves false and we rely solely on the poller.
     const waitPromise = startV2SessionWait(
-      client,
+      serverUrl,
       sessionId,
       directory,
       activityTracker,
