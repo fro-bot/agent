@@ -14,6 +14,7 @@ export async function runPromptAttempt(
   directory: string,
   timeoutMs: number,
   logger: Logger,
+  eventStream?: AsyncIterable<Event>,
 ): Promise<AttemptResult> {
   const eventAbortController = new AbortController()
   const activityTracker: ActivityTracker = {
@@ -22,7 +23,7 @@ export async function runPromptAttempt(
     sessionError: null,
   }
 
-  const events = await client.event.subscribe()
+  const events = eventStream ?? (await client.event.subscribe()).stream
 
   let eventStreamResult: EventStreamResult = {
     tokens: null,
@@ -34,13 +35,7 @@ export async function runPromptAttempt(
     llmError: null,
   }
 
-  const eventProcessor = processEventStream(
-    events.stream as AsyncIterable<Event>,
-    sessionId,
-    eventAbortController.signal,
-    logger,
-    activityTracker,
-  )
+  const eventProcessor = processEventStream(events, sessionId, eventAbortController.signal, logger, activityTracker)
     .then(result => {
       eventStreamResult = result
     })

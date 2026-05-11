@@ -1,4 +1,4 @@
-import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
@@ -47,6 +47,7 @@ export async function sendPromptToSession(
   const agentName = config?.agent ?? DEFAULT_AGENT
   if (agentName !== DEFAULT_AGENT) body.agent = agentName
 
+  const events = await client.event.subscribe()
   const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
   if (response.error != null) {
     const promptError = String(response.error)
@@ -68,5 +69,12 @@ export async function sendPromptToSession(
     }
   }
 
-  return runPromptAttempt(client, sessionId, directory, config?.timeoutMs ?? DEFAULT_TIMEOUT_MS, logger)
+  return runPromptAttempt(
+    client,
+    sessionId,
+    directory,
+    config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    logger,
+    events.stream as AsyncIterable<Event>,
+  )
 }

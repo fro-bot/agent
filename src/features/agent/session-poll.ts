@@ -70,9 +70,11 @@ export async function pollForSessionCompletion(
       if (sessionStatus == null) {
         logger.debug('Session status not found in poll response', {sessionId})
       } else if (sessionStatus.type === 'idle') {
+        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         logger.debug('Session idle detected via polling', {sessionId})
         return {completed: true, error: null}
       } else {
+        if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       }
 

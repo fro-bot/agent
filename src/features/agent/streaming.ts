@@ -69,6 +69,13 @@ function getStringProperty(value: unknown, property: string): string | null {
   return typeof descriptor?.value === 'string' ? descriptor.value : null
 }
 
+function getNumberProperty(value: unknown, property: string): number | null {
+  if (value == null || typeof value !== 'object') return null
+
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'number' ? descriptor.value : null
+}
+
 function getObjectProperty(value: unknown, property: string): unknown {
   if (value == null || typeof value !== 'object') return null
 
@@ -77,6 +84,17 @@ function getObjectProperty(value: unknown, property: string): unknown {
 
 function getEventSessionID(event: Event): string | null {
   return getSessionID(getObjectProperty(event, 'properties')) ?? getSessionID(getObjectProperty(event, 'data'))
+}
+
+function getEventKind(event: Event): string | null {
+  const eventType = getStringProperty(event, 'type')
+  if (eventType !== 'sync') return eventType
+
+  return getStringProperty(event, 'name')?.replace(/\.\d+$/, '') ?? eventType
+}
+
+function getEventPayload(event: Event): unknown {
+  return getObjectProperty(event, 'properties') ?? getObjectProperty(event, 'data')
 }
 
 function isStreamActivityEvent(eventType: string | null): boolean {
@@ -102,56 +120,66 @@ export async function processEventStream(
   for await (const event of stream) {
     if (signal.aborted) break
     logServerEvent(event, logger)
+    const eventType = getEventKind(event)
+    const eventPayload = getEventPayload(event)
 
-    if (activityTracker != null && isStreamActivityEvent(getStringProperty(event, 'type'))) {
+    if (activityTracker != null && isStreamActivityEvent(eventType)) {
       const eventSessionID = getEventSessionID(event)
       if (eventSessionID === sessionId) activityTracker.firstMeaningfulEventReceived = true
     }
 
-    if (event.type === 'message.part.updated') {
-      const part = event.properties.part
-      const eventSessionID = getSessionID(event.properties) ?? getSessionID(part)
+    if (eventType === 'message.part.updated') {
+      const part = getObjectProperty(eventPayload, 'part')
+      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
       if (eventSessionID !== sessionId) continue
       if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
 
-      if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
-        lastText = part.text
-        const endTime = 'time' in part ? part.time?.end : undefined
-        if (endTime != null && Number.isFinite(endTime)) {
+      const partType = getStringProperty(part, 'type')
+      if (partType === 'text') {
+        const text = getStringProperty(part, 'text')
+        if (text != null) lastText = text
+        const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
+        if (endTime != null) {
           outputTextContent(lastText)
           lastText = ''
         }
-      } else if (part.type === 'tool') {
-        const toolState = part.state
-        if (toolState.status === 'completed') {
-          outputToolExecution(part.tool, toolState.title)
-          if (part.tool.toLowerCase() === 'bash') {
-            const command = String(toolState.input.command ?? toolState.input.cmd ?? '')
-            const output = String(toolState.output)
+      } else if (partType === 'tool') {
+        const toolState = getObjectProperty(part, 'state')
+        if (getStringProperty(toolState, 'status') === 'completed') {
+          const tool = getStringProperty(part, 'tool') ?? ''
+          outputToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''))
+          if (tool.toLowerCase() === 'bash') {
+            const input = getObjectProperty(toolState, 'input')
+            const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
+            const output = String(getObjectProperty(toolState, 'output') ?? '')
             detectArtifacts(command, output, prsCreated, commitsCreated, () => {
               commentsPosted++
             })
           }
         }
       }
-    } else if (event.type === 'message.updated') {
-      const msg = event.properties.info
-      const eventSessionID = getSessionID(event.properties) ?? getSessionID(msg)
-      if (eventSessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+    } else if (eventType === 'message.updated') {
+      const msg = getObjectProperty(eventPayload, 'info')
+      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(msg)
+      const tokensData = getObjectProperty(msg, 'tokens')
+      if (eventSessionID === sessionId && getStringProperty(msg, 'role') === 'assistant' && tokensData != null) {
         if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         tokens = {
-          input: msg.tokens.input ?? 0,
-          output: msg.tokens.output ?? 0,
-          reasoning: msg.tokens.reasoning ?? 0,
-          cache: {read: msg.tokens.cache?.read ?? 0, write: msg.tokens.cache?.write ?? 0},
+          input: getNumberProperty(tokensData, 'input') ?? 0,
+          output: getNumberProperty(tokensData, 'output') ?? 0,
+          reasoning: getNumberProperty(tokensData, 'reasoning') ?? 0,
+          cache: {
+            read: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'read') ?? 0,
+            write: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'write') ?? 0,
+          },
         }
-        model = msg.modelID ?? null
-        cost = msg.cost ?? null
+        model = getStringProperty(msg, 'modelID')
+        cost = getNumberProperty(msg, 'cost')
         logger.debug('Token usage received', {tokens, model, cost})
       }
-    } else if (event.type === 'session.error') {
-      if (event.properties.sessionID === sessionId) {
-        const sessionError = event.properties.error
+    } else if (eventType === 'session.error') {
+      if (getSessionID(eventPayload) === sessionId) {
+        const sessionError = getObjectProperty(eventPayload, 'error')
         const errorStr = typeof sessionError === 'string' ? sessionError : String(sessionError)
         logger.error('Session error', {error: sessionError})
         llmError = isLlmFetchError(sessionError)
@@ -159,7 +187,7 @@ export async function processEventStream(
           : createAgentError(errorStr)
         if (activityTracker != null) activityTracker.sessionError = errorStr
       }
-    } else if (event.type === 'session.idle' && event.properties.sessionID === sessionId) {
+    } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
       if (activityTracker != null) activityTracker.sessionIdle = true
       if (lastText.length > 0) {
         outputTextContent(lastText)

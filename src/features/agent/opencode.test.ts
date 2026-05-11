@@ -298,6 +298,26 @@ describe('executeOpenCode', () => {
     })
   })
 
+  it('subscribes to events before sending the prompt', async () => {
+    // #given
+    const mockClient = createMockClient({
+      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    const subscribeOrder = vi.mocked(mockClient.event.subscribe).mock.invocationCallOrder[0]
+    const promptOrder = vi.mocked(mockClient.session.promptAsync).mock.invocationCallOrder[0]
+    expect(subscribeOrder).toBeDefined()
+    expect(promptOrder).toBeDefined()
+    if (subscribeOrder == null || promptOrder == null) throw new Error('Expected subscribe and prompt calls')
+    expect(subscribeOrder).toBeLessThan(promptOrder)
+  })
+
   it('omits default model when omo providers are configured', async () => {
     // #given
     const mockClient = createMockClient({
@@ -1734,7 +1754,7 @@ describe('pollForSessionCompletion', () => {
     // #given
     const mockClient = {
       session: {
-        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        status: vi.fn().mockResolvedValue({data: {}}),
       },
     }
     const abortController = new AbortController()
@@ -1758,6 +1778,39 @@ describe('pollForSessionCompletion', () => {
     // #then
     expect(result.completed).toBe(false)
     expect(result.error).toContain('No agent activity detected')
+  })
+
+  it('treats matching session status as activity while continuing to poll', async () => {
+    // #given
+    const mockClient = {
+      session: {
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+    const abortController = new AbortController()
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    vi.useFakeTimers()
+
+    // #when
+    const resultPromise = pollForSessionCompletion(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      abortController.signal,
+      mockLogger,
+      INITIAL_ACTIVITY_TIMEOUT_MS * 2,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(INITIAL_ACTIVITY_TIMEOUT_MS + 1000)
+    abortController.abort()
+    await vi.advanceTimersByTimeAsync(500)
+    const result = await resultPromise
+    vi.useRealTimers()
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+    expect(result.completed).toBe(false)
+    expect(result.error).toBe('Aborted')
   })
 
   it('continues polling when session status is not found', async () => {
@@ -1974,6 +2027,47 @@ describe('processEventStream', () => {
 
     // #then
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
+  it('marks activity tracker when sync session-next deltas arrive', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.next.text.delta.1',
+        data: {
+          sessionID: 'ses_123',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
+  it('sets sessionIdle when sync session idle arrives', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.idle.1',
+        data: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.sessionIdle).toBe(true)
   })
 
   it('ignores stream activity events for other sessions', async () => {
