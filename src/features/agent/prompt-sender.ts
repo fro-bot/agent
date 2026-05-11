@@ -49,8 +49,10 @@ export async function sendPromptToSession(
   if (agentName !== DEFAULT_AGENT) body.agent = agentName
 
   const events = await client.event.subscribe()
-  const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
-  if (response.error != null) {
+  const startPrompt = async () => {
+    const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
+    if (response.error == null) return null
+
     const promptError = String(response.error)
     const promptLlmError = isLlmFetchError(response.error) ? createLLMFetchError(promptError) : null
     return {
@@ -78,5 +80,6 @@ export async function sendPromptToSession(
     logger,
     events.stream as AsyncIterable<Event>,
     serverUrl,
+    startPrompt,
   )
 }

@@ -2332,6 +2332,55 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     vi.resetModules()
   })
 
+  it('starts consuming the lazy event stream before prompt submission and ignores pre-arm stale events', async () => {
+    // #given — event.subscribe().stream is lazy; the first next() call must happen before promptAsync.
+    // The stale same-session idle event arrives before the prompt turn is armed and must not complete the run.
+    const {runPromptAttempt} = await import('./retry.js')
+    let statusCalls = 0
+    const mockClient = {
+      session: {
+        status: vi.fn().mockImplementation(async () => {
+          statusCalls++
+          return {data: {ses_123: {type: statusCalls === 1 ? 'busy' : 'idle'}}}
+        }),
+      },
+    }
+    let streamStarted = false
+    let releasePostArmEvent!: () => void
+    const postArmEventReady = new Promise<void>(resolve => {
+      releasePostArmEvent = resolve
+    })
+    const stalePreArmEvent: Event = {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+    const currentTurnEvent = createCurrentTurnActivityEvent()
+    const stream = (async function* () {
+      streamStarted = true
+      yield stalePreArmEvent
+      await postArmEventReady
+      yield currentTurnEvent
+    })()
+    const startPrompt = vi.fn(async () => {
+      expect(streamStarted).toBe(true)
+      releasePostArmEvent()
+      return null
+    })
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      stream,
+      undefined,
+      startPrompt,
+    )
+
+    // #then
+    expect(startPrompt).toHaveBeenCalledOnce()
+    expect(result.success).toBe(true)
+  })
+
   it('prevents wait() resolving before any current-turn activity from declaring success', async () => {
     // #given — models the exact CI bug: prompt sent, v2 wait resolves immediately (session was
     // already idle from a prior turn), no event-stream activity for the current turn yet.

@@ -7,6 +7,9 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
 import {processEventStream} from './streaming.js'
 
+export type PromptStartResult = AttemptResult | null
+export type PromptStarter = () => Promise<PromptStartResult>
+
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
@@ -88,11 +91,13 @@ export async function runPromptAttempt(
   logger: Logger,
   eventStream?: AsyncIterable<Event>,
   serverUrl?: string | null,
+  startPrompt?: PromptStarter,
 ): Promise<AttemptResult> {
   const eventAbortController = new AbortController()
   const waitAbortController = new AbortController()
   const activityTracker: ActivityTracker = {
     firstMeaningfulEventReceived: false,
+    currentTurnArmed: startPrompt == null,
     sessionIdle: false,
     sessionError: null,
   }
@@ -126,6 +131,19 @@ export async function runPromptAttempt(
   }
 
   try {
+    // Ensure the lazy SDK SSE stream begins connecting before prompt submission. Without this,
+    // event.subscribe().stream is only consumed after promptAsync returns, so early current-turn
+    // events can be missed while the agent is already working.
+    await Promise.resolve()
+    if (startPrompt != null) {
+      activityTracker.currentTurnArmed = true
+      const promptStartResult = await startPrompt()
+      if (promptStartResult != null) {
+        await collectEventResults()
+        return promptStartResult
+      }
+    }
+
     // Start the polling watchdog immediately — it enforces the no-activity timeout and
     // serves as fallback completion detection via session.idle events and session.status().
     // This must always run in parallel; never awaited before starting.

@@ -19,6 +19,7 @@ export interface EventStreamResult {
 /** Mutable by design — updated in-place during stream processing. */
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
+  currentTurnArmed?: boolean
   sessionIdle: boolean
   sessionError: string | null
 }
@@ -120,6 +121,7 @@ export async function processEventStream(
   for await (const event of stream) {
     if (signal.aborted) break
     logServerEvent(event, logger)
+    if (activityTracker?.currentTurnArmed === false) continue
     const eventType = getEventKind(event)
     const eventPayload = getEventPayload(event)
 
