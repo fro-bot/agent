@@ -1884,6 +1884,31 @@ describe('processEventStream', () => {
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
   })
 
+  it('marks activity tracker from message part envelope session when part omits sessionID', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.updated',
+        properties: {
+          sessionID: 'ses_123',
+          part: {type: 'text', text: 'Hello', time: {}},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
+  })
+
   it('sets sessionIdle on activity tracker when session.idle received', async () => {
     // #given
     const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
@@ -2009,6 +2034,39 @@ describe('processEventStream', () => {
     // #then — idle flag set AND late-arriving token counts captured
     expect(activityTracker.sessionIdle).toBe(true)
     expect(result.tokens).not.toBeNull()
+    expect(result.tokens?.input).toBe(100)
+  })
+
+  it('captures token usage from message envelope session when message info omits sessionID', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.updated',
+        properties: {
+          sessionID: 'ses_123',
+          info: {
+            role: 'assistant',
+            tokens: {input: 100, output: 50, reasoning: 0},
+            modelID: 'claude-3',
+            cost: 0.01,
+          },
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(
+      eventStream.stream,
+      'ses_123',
+      abortController.signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
     expect(result.tokens?.input).toBe(100)
   })
 })

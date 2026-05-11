@@ -55,6 +55,13 @@ export function detectArtifacts(
   }
 }
 
+function getSessionID(value: unknown): string | null {
+  if (value == null || typeof value !== 'object') return null
+
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'sessionID')
+  return typeof descriptor?.value === 'string' ? descriptor.value : null
+}
+
 export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
@@ -77,7 +84,8 @@ export async function processEventStream(
 
     if (event.type === 'message.part.updated') {
       const part = event.properties.part
-      if (part.sessionID !== sessionId) continue
+      const eventSessionID = getSessionID(event.properties) ?? getSessionID(part)
+      if (eventSessionID !== sessionId) continue
       if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
 
       if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
@@ -102,7 +110,8 @@ export async function processEventStream(
       }
     } else if (event.type === 'message.updated') {
       const msg = event.properties.info
-      if (msg.sessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
+      const eventSessionID = getSessionID(event.properties) ?? getSessionID(msg)
+      if (eventSessionID === sessionId && msg.role === 'assistant' && msg.tokens != null) {
         if (activityTracker != null) activityTracker.firstMeaningfulEventReceived = true
         tokens = {
           input: msg.tokens.input ?? 0,
