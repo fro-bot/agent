@@ -20,6 +20,7 @@ export interface EventStreamResult {
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
   currentTurnArmed?: boolean
+  baselineMessageIds?: ReadonlySet<string>
   sessionIdle: boolean
   sessionError: string | null
 }

@@ -110,8 +110,55 @@ function createCurrentTurnActivityEvent(sessionID = 'ses_123'): Event {
   } as unknown as Event
 }
 
-function createCurrentTurnActivityStream(): ReturnType<typeof createMockEventStream> {
-  return createMockEventStream([createCurrentTurnActivityEvent()])
+function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
+  stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
+} {
+  // Emit the activity event after a setTimeout(0) so that runPromptAttempt has time
+  // to set activityTracker.currentTurnArmed = true before the event is processed.
+  // Without this delay the event arrives while currentTurnArmed is still false
+  // (listSessionMessageIds hasn't resolved yet) and is silently skipped, causing
+  // executeOpenCode tests to hang waiting for firstMeaningfulEventReceived.
+  // setTimeout(0) fires after the current microtask queue drains (including the
+  // listSessionMessageIds await chain), making this reliable without fake timers.
+  // Tests using fake timers must call vi.advanceTimersByTimeAsync(0) or similar.
+  return {
+    stream: (async function* () {
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+      yield createCurrentTurnActivityEvent(sessionID)
+    })(),
+    controller: {abort: vi.fn()},
+  }
+}
+
+function createPromptStartedActivityStream(
+  promptAsync: ReturnType<typeof vi.fn>,
+  sessionID = 'ses_123',
+): {
+  stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
+} {
+  return createPromptStartedEventStream(promptAsync, [createCurrentTurnActivityEvent(sessionID)])
+}
+
+function createPromptStartedEventStream(
+  promptAsync: ReturnType<typeof vi.fn>,
+  events: Event[],
+): {
+  stream: AsyncIterable<Event>
+  controller: {abort: ReturnType<typeof vi.fn>}
+} {
+  return {
+    stream: (async function* () {
+      const callsBeforeSubscribe = promptAsync.mock.calls.length
+      while (promptAsync.mock.calls.length === callsBeforeSubscribe) await Promise.resolve()
+      await Promise.resolve()
+      for (const event of events) {
+        yield event
+      }
+    })(),
+    controller: {abort: vi.fn()},
+  }
 }
 
 type SessionStatus = {type: 'idle'} | {type: 'retry'; attempt: number; message: string; next: number} | {type: 'busy'}
@@ -125,7 +172,7 @@ function createMockClient(options: {
   sessionStatus?: Record<string, SessionStatus>
   statusSequence?: Record<string, SessionStatus>[]
 }) {
-  // Default sequence: busy first (sets firstMeaningfulEventReceived via poll), then idle (completes).
+  // Default sequence: busy first, then idle (completes after stream activity).
   // A session that was just sent a prompt will always be busy before going idle.
   // Tests that need a specific sequence should pass statusSequence explicitly.
   const statusSequence = options.statusSequence ?? [
@@ -133,6 +180,10 @@ function createMockClient(options: {
     {ses_123: {type: 'idle'}},
   ]
   let statusIndex = 0
+  const promptAsync = options.throwOnPrompt
+    ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
+    : vi.fn().mockResolvedValue({data: options.promptResponse})
+
   return {
     app: {
       log: options.throwOnLog
@@ -144,9 +195,8 @@ function createMockClient(options: {
         ? vi.fn().mockRejectedValue(new Error('Session creation failed'))
         : vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
       update: vi.fn().mockResolvedValue({data: {id: 'ses_123', title: 'Test', version: '1'}}),
-      promptAsync: options.throwOnPrompt
-        ? vi.fn().mockRejectedValue(new Error('Prompt failed'))
-        : vi.fn().mockResolvedValue({data: options.promptResponse}),
+      promptAsync,
+      messages: vi.fn().mockResolvedValue({data: []}),
       status: vi.fn().mockImplementation(async () => {
         const statusResponse = statusSequence[Math.min(statusIndex, statusSequence.length - 1)]
         statusIndex += 1
@@ -154,7 +204,13 @@ function createMockClient(options: {
       }),
     },
     event: {
-      subscribe: vi.fn().mockResolvedValue(createMockEventStream(options.events ?? [createCurrentTurnActivityEvent()])),
+      subscribe: vi
+        .fn()
+        .mockImplementation(async () =>
+          options.events == null
+            ? createPromptStartedActivityStream(promptAsync)
+            : createPromptStartedEventStream(promptAsync, options.events),
+        ),
     },
   }
 }
@@ -900,7 +956,9 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createCurrentTurnActivityStream()),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
       },
     }
 
@@ -939,7 +997,9 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createCurrentTurnActivityStream()),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
       },
     }
 
@@ -981,7 +1041,9 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createCurrentTurnActivityStream()),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
       },
     }
 
@@ -1037,7 +1099,7 @@ describe('executeOpenCode retry behavior', () => {
               },
             } as unknown as Event,
           ]
-          return Promise.resolve(createMockEventStream(events))
+          return Promise.resolve(createPromptStartedEventStream(mockClient.session.promptAsync, events))
         }),
       },
     }
@@ -1084,7 +1146,9 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createCurrentTurnActivityStream()),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
       },
     }
 
@@ -1145,7 +1209,9 @@ describe('executeOpenCode retry behavior', () => {
           .mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi.fn().mockImplementation(async () => createCurrentTurnActivityStream()),
+        subscribe: vi
+          .fn()
+          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
       },
     }
 
@@ -2460,6 +2526,110 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(mockClient.session.status).toHaveBeenCalled()
     expect(result.success).toBe(false)
     expect(result.error).toContain('Poll timeout')
+  })
+
+  it('does not treat a new user message as current-turn activity', async () => {
+    // #given — the submitted prompt appears as a new user message, but no assistant output exists yet.
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockResolvedValueOnce({data: []})
+          .mockResolvedValue({data: [{info: {id: 'msg_user', role: 'user', time: {created: 1}}}]}),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      700,
+      mockLogger,
+      createMockEventStream([]).stream,
+      'http://localhost:1234',
+      async () => null,
+    )
+
+    // #then
+    expect(waitFn).toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
+  it('disables message fallback when baseline message listing fails', async () => {
+    // #given — fail closed: an old completed assistant message must not become "new" on baseline failure.
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockRejectedValueOnce(new Error('message list failed'))
+          .mockResolvedValue({
+            data: [{info: {id: 'old_assistant', role: 'assistant', time: {created: 1, completed: 2}}}],
+          }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      700,
+      mockLogger,
+      createMockEventStream([]).stream,
+      'http://localhost:1234',
+      async () => null,
+    )
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
+  it('times out baseline message listing and still submits the prompt', async () => {
+    // #given — baseline listing hangs before prompt submission; it must not hang the harness forever.
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const startPrompt = vi.fn(async () => null)
+      const mockClient = {
+        session: {
+          messages: vi.fn().mockImplementation(async () => new Promise<never>(() => {})),
+          status: vi.fn().mockResolvedValue({data: {}}),
+        },
+      }
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        700,
+        mockLogger,
+        createMockEventStream([]).stream,
+        undefined,
+        startPrompt,
+      )
+      await vi.advanceTimersByTimeAsync(5_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await resultPromise
+
+      // #then
+      expect(startPrompt).toHaveBeenCalledOnce()
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('Poll timeout')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('wait() completing after current-turn activity is observed signals success correctly', async () => {

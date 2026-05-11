@@ -10,6 +10,60 @@ import {processEventStream} from './streaming.js'
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
 
+function getMessageID(value: unknown): string | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'id')
+  return typeof descriptor?.value === 'string' ? descriptor.value : null
+}
+
+function getObjectProperty(value: unknown, property: string): unknown {
+  if (value == null || typeof value !== 'object') return null
+  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
+}
+
+const BASELINE_MESSAGES_TIMEOUT_MS = 5_000
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeout != null) clearTimeout(timeout)
+  }
+}
+
+async function listSessionMessageIds(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  logger: Logger,
+): Promise<ReadonlySet<string> | null> {
+  if (typeof client.session.messages !== 'function') return null
+
+  try {
+    const response = await withTimeout(
+      client.session.messages({path: {id: sessionId}, query: {directory}}),
+      BASELINE_MESSAGES_TIMEOUT_MS,
+      'baseline session.messages()',
+    )
+    const messages = Array.isArray(response.data) ? response.data : []
+    return new Set(messages.flatMap(message => getMessageID(getObjectProperty(message, 'info')) ?? []))
+  } catch (error) {
+    logger.debug('Unable to read baseline session messages; disabling message activity fallback', {
+      sessionId,
+      error: toErrorMessage(error),
+    })
+    return null
+  }
+}
+
 export const MAX_LLM_RETRIES = 4
 export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
 
@@ -98,6 +152,7 @@ export async function runPromptAttempt(
   const activityTracker: ActivityTracker = {
     firstMeaningfulEventReceived: false,
     currentTurnArmed: startPrompt == null,
+    baselineMessageIds: undefined,
     sessionIdle: false,
     sessionError: null,
   }
@@ -136,6 +191,8 @@ export async function runPromptAttempt(
     // events can be missed while the agent is already working.
     await Promise.resolve()
     if (startPrompt != null) {
+      activityTracker.baselineMessageIds =
+        (await listSessionMessageIds(client, sessionId, directory, logger)) ?? undefined
       activityTracker.currentTurnArmed = true
       const promptStartResult = await startPrompt()
       if (promptStartResult != null) {

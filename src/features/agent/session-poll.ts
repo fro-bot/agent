@@ -11,6 +11,7 @@ type SessionStatus =
   | {readonly type: 'busy'}
 
 const POLL_INTERVAL_MS = 500
+const POLL_REQUEST_TIMEOUT_MS = 5_000
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
@@ -18,6 +19,78 @@ export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 interface PollResult {
   readonly completed: boolean
   readonly error: string | null
+}
+
+function getStringProperty(value: unknown, property: string): string | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'string' ? descriptor.value : null
+}
+
+function getNumberProperty(value: unknown, property: string): number | null {
+  if (value == null || typeof value !== 'object') return null
+  const descriptor = Object.getOwnPropertyDescriptor(value, property)
+  return typeof descriptor?.value === 'number' ? descriptor.value : null
+}
+
+function getObjectProperty(value: unknown, property: string): unknown {
+  if (value == null || typeof value !== 'object') return null
+  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
+}
+
+async function withRequestTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeout != null) clearTimeout(timeout)
+  }
+}
+
+async function detectMessageActivity(
+  client: Awaited<ReturnType<typeof createOpencode>>['client'],
+  sessionId: string,
+  directory: string,
+  activityTracker: ActivityTracker | undefined,
+  logger: Logger,
+): Promise<PollResult | null> {
+  if (activityTracker?.baselineMessageIds == null) return null
+
+  if (typeof client.session.messages !== 'function') {
+    logger.debug('session.messages() unavailable; skipping message activity poll', {sessionId})
+    return null
+  }
+
+  const messagesResponse = await withRequestTimeout(
+    client.session.messages({path: {id: sessionId}, query: {directory}}),
+    POLL_REQUEST_TIMEOUT_MS,
+    'session.messages()',
+  )
+  const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
+  for (const message of messages) {
+    const info = getObjectProperty(message, 'info')
+    const id = getStringProperty(info, 'id')
+    if (id == null || activityTracker.baselineMessageIds.has(id)) continue
+
+    const role = getStringProperty(info, 'role')
+    if (role !== 'assistant') continue
+
+    activityTracker.firstMeaningfulEventReceived = true
+    const completedAt = getNumberProperty(getObjectProperty(info, 'time'), 'completed')
+    if (completedAt != null) {
+      logger.debug('Session completion detected via new assistant message', {sessionId, messageId: id})
+      return {completed: true, error: null}
+    }
+  }
+
+  return null
 }
 
 export async function pollForSessionCompletion(
@@ -63,7 +136,14 @@ export async function pollForSessionCompletion(
     }
 
     try {
-      const statusResponse = await client.session.status({query: {directory}})
+      const messageResult = await detectMessageActivity(client, sessionId, directory, activityTracker, logger)
+      if (messageResult != null) return messageResult
+
+      const statusResponse = await withRequestTimeout(
+        client.session.status({query: {directory}}),
+        POLL_REQUEST_TIMEOUT_MS,
+        'session.status()',
+      )
       const statuses = statusResponse.data ?? {}
       const sessionStatus = statuses[sessionId] as SessionStatus | undefined
 
