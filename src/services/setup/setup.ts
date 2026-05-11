@@ -1,5 +1,5 @@
 import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
-import {readFile, writeFile} from 'node:fs/promises'
+import {mkdir, readFile, writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
@@ -157,6 +157,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     }
 
     const opencodeConfigPath = join(configDir, 'opencode.json')
+    await mkdir(configDir, {recursive: true})
 
     if (inputs.enableOmo) {
       // Enabled mode: merge CI config with existing opencode.json (e.g. oMo plugin registration)

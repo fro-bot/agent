@@ -465,6 +465,21 @@ describe('setup', () => {
         expect(config.default_agent).toBe('build')
       })
 
+      it('creates the OpenCode config directory before writing disabled-mode config', async () => {
+        // #given - disabled mode does not run oMo, so setup owns config dir creation
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(fs.mkdir).toHaveBeenCalledWith(expect.stringMatching(/\.config\/opencode$/), {recursive: true})
+        expect(fs.writeFile).toHaveBeenCalledWith(
+          expect.stringMatching(/\.config\/opencode\/opencode\.json$/),
+          expect.any(String),
+        )
+      })
+
       it('does not call Bun installer, bunx, installOmo, or writeOmoConfig', async () => {
         // #given
         const bunModule = await import('./bun.js')
