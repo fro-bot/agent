@@ -1976,6 +1976,28 @@ describe('processEventStream', () => {
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
   })
 
+  it('ignores stream activity events for other sessions', async () => {
+    // #given
+    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'session.next.text.delta',
+        properties: {
+          timestamp: 1,
+          sessionID: 'ses_other',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger(), activityTracker)
+
+    // #then
+    expect(activityTracker.firstMeaningfulEventReceived).toBe(false)
+  })
+
   it('sets sessionIdle on activity tracker when session.idle received', async () => {
     // #given
     const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
