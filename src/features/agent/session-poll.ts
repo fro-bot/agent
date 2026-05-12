@@ -14,6 +14,7 @@ const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
+const COMPLETED_ASSISTANT_MESSAGE_STABILITY_MS = 1_000
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
 interface PollResult {
@@ -74,6 +75,7 @@ async function detectMessageActivity(
     'session.messages()',
   )
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
+  let latestAssistantMessageInfo: unknown = null
   for (const message of messages) {
     const info = getObjectProperty(message, 'info')
     const id = getStringProperty(info, 'id')
@@ -82,16 +84,50 @@ async function detectMessageActivity(
     const role = getStringProperty(info, 'role')
     if (role !== 'assistant') continue
 
-    activityTracker.firstMeaningfulEventReceived = true
-    const completedAt = getNumberProperty(getObjectProperty(info, 'time'), 'completed')
-    if (completedAt != null) {
-      activityTracker.currentTurnTerminalSignalReceived = true
-      logger.debug('Session completion detected via new assistant message', {sessionId, messageId: id})
-      return {completed: true, error: null}
-    }
+    latestAssistantMessageInfo = info
   }
 
-  return null
+  if (latestAssistantMessageInfo == null) return null
+
+  activityTracker.firstMeaningfulEventReceived = true
+  const latestAssistantMessageId = getStringProperty(latestAssistantMessageInfo, 'id')
+  const completedAt = getNumberProperty(getObjectProperty(latestAssistantMessageInfo, 'time'), 'completed')
+
+  if (latestAssistantMessageId == null || completedAt == null) {
+    activityTracker.completedAssistantMessageId = undefined
+    activityTracker.completedAssistantMessageObservedAt = undefined
+    return null
+  }
+
+  const now = Date.now()
+  if (activityTracker.completedAssistantMessageId !== latestAssistantMessageId) {
+    activityTracker.completedAssistantMessageId = latestAssistantMessageId
+    activityTracker.completedAssistantMessageObservedAt = now
+    logger.debug('Completed assistant message observed; waiting for stability before completion', {
+      sessionId,
+      messageId: latestAssistantMessageId,
+    })
+    return null
+  }
+
+  const observedAt = activityTracker.completedAssistantMessageObservedAt ?? now
+  const stableForMs = now - observedAt
+  if (stableForMs < COMPLETED_ASSISTANT_MESSAGE_STABILITY_MS) {
+    logger.debug('Completed assistant message not stable yet; continuing watchdog', {
+      sessionId,
+      messageId: latestAssistantMessageId,
+      stableForMs,
+    })
+    return null
+  }
+
+  activityTracker.currentTurnTerminalSignalReceived = true
+  logger.debug('Session completion detected via stable completed assistant message', {
+    sessionId,
+    messageId: latestAssistantMessageId,
+    stableForMs,
+  })
+  return {completed: true, error: null}
 }
 
 export async function pollForSessionCompletion(

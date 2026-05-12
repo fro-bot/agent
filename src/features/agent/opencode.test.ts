@@ -2759,8 +2759,9 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(result.error).toContain('Poll timeout')
   })
 
-  it('new assistant message WITH time.completed completes the attempt', async () => {
-    // #given — detectMessageActivity finds a new assistant message with time.completed set
+  it('new assistant message WITH stable time.completed completes the attempt', async () => {
+    // #given — detectMessageActivity finds a new assistant message with time.completed set and no newer assistant
+    // message appears during the stability window.
     const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
     vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
     const {runPromptAttempt} = await import('./retry.js')
@@ -2791,6 +2792,42 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
     // #then — completed assistant message IS a terminal signal
     expect(result.success).toBe(true)
+  })
+
+  it('does not complete when a completed assistant message is followed by a newer in-progress assistant message', async () => {
+    // #given — models the false-pass on c025372: OpenCode completed one assistant message, then immediately
+    // started the next loop step. The first completed message is not terminal for the whole agent run.
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const completedAssistant = {info: {id: 'msg_step_0', role: 'assistant', time: {created: 1, completed: 2}}}
+    const nextAssistant = {info: {id: 'msg_step_1', role: 'assistant', time: {created: 3}}}
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockResolvedValueOnce({data: []})
+          .mockResolvedValueOnce({data: [completedAssistant]})
+          .mockResolvedValue({data: [completedAssistant, nextAssistant]}),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      1_200,
+      mockLogger,
+      createMockEventStream([]).stream,
+      'http://localhost:1234',
+      async () => null,
+    )
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
   })
 
   it('disables message fallback when baseline message listing fails', async () => {

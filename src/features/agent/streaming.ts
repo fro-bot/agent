@@ -23,6 +23,8 @@ export interface ActivityTracker {
   currentTurnTerminalSignalReceived: boolean
   currentTurnArmed?: boolean
   baselineMessageIds?: ReadonlySet<string>
+  completedAssistantMessageId?: string
+  completedAssistantMessageObservedAt?: number
   sessionIdle: boolean
   sessionError: string | null
 }
