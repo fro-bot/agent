@@ -71,6 +71,7 @@ function createSession(options: {
   readonly id: string
   readonly title: string
   readonly updated: number
+  readonly directory?: string
   readonly archived?: number
   readonly compacting?: number
 }): SessionInfo {
@@ -78,7 +79,7 @@ function createSession(options: {
     id: options.id,
     version: '1.1.53',
     projectID: 'proj_1',
-    directory: '/workspace',
+    directory: options.directory ?? '/workspace',
     title: options.title,
     time: {
       created: options.updated - 100,
@@ -358,6 +359,53 @@ describe('resolveSessionForLogicalKey', () => {
 
     // #then
     expect(result).toEqual({status: 'not-found'})
+  })
+
+  it('returns not-found when the matching session belongs to a different workspace directory', async () => {
+    // #given
+    const key = {key: 'pr-347', entityType: 'pr' as const, entityId: '347'}
+    const staleSession = createSession({
+      id: 'ses_stale',
+      title: 'fro-bot: pr-347',
+      updated: 500,
+      directory: '/workspace-parent',
+    })
+    const client = createMockSdkClient({sessionListResponse: {data: [staleSession]}})
+
+    // #when
+    const result = await resolveSessionForLogicalKey(
+      client as unknown as SessionClient,
+      '/workspace',
+      key,
+      createMockLogger(),
+    )
+
+    // #then
+    expect(result).toEqual({status: 'not-found'})
+  })
+
+  it('returns the latest matching session in the current workspace when a newer stale-directory match exists', async () => {
+    // #given
+    const key = {key: 'pr-347', entityType: 'pr' as const, entityId: '347'}
+    const validSession = createSession({id: 'ses_valid', title: 'fro-bot: pr-347', updated: 400})
+    const staleSession = createSession({
+      id: 'ses_stale',
+      title: 'fro-bot: pr-347',
+      updated: 500,
+      directory: '/workspace-parent',
+    })
+    const client = createMockSdkClient({sessionListResponse: {data: [validSession, staleSession]}})
+
+    // #when
+    const result = await resolveSessionForLogicalKey(
+      client as unknown as SessionClient,
+      '/workspace',
+      key,
+      createMockLogger(),
+    )
+
+    // #then
+    expect(result).toEqual({status: 'found', session: validSession})
   })
 
   it('returns error when SDK list call throws', async () => {

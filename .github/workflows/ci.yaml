@@ -191,13 +191,16 @@ jobs:
           echo "Installed versions:"
           which bun && bun --version || true
           which opencode && opencode --version || true
-          bunx oh-my-openagent get-local-version || true
 
-          echo "OPENCODE_CONFIG_CONTENT (should include @fro.bot/systematic):"
+          echo "OPENCODE_CONFIG_CONTENT (should include @fro.bot/systematic and disabled-mode defaults):"
           echo "$OPENCODE_CONFIG_CONTENT" | jq . 2>/dev/null || echo "$OPENCODE_CONFIG_CONTENT"
 
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '.default_agent == "build"'
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("oh-my-openagent"))] | length == 0'
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("@fro.bot/systematic"))] | length == 1'
+
           echo "OpenCode config files:"
-          find ~/.config/opencode -maxdepth 2 -type f | sort
+          [ ! -d ~/.config/opencode ] || find ~/.config/opencode -maxdepth 2 -type f | sort
           [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
           [ -f ~/.config/opencode/oh-my-openagent.json ] && cat ~/.config/opencode/oh-my-openagent.json || true
           [ -f ~/.config/opencode/oh-my-opencode.json ] && echo "Legacy oMo config:" && cat ~/.config/opencode/oh-my-opencode.json || true
@@ -206,8 +209,14 @@ jobs:
           ls -lA ~/.local/share/opencode || true
           ls -lA ~/.local/share/opencode/log || true
 
-          echo "Check oh-my-openagent installation:"
-          bunx oh-my-openagent doctor --verbose || true
+          echo "Check oh-my-openagent disabled-mode absence:"
+          if command -v bunx; then
+            echo "bunx is present; skipping oMo doctor because enable-omo is false"
+          else
+            echo "bunx is absent as expected when enable-omo is false"
+          fi
+          [ ! -f ~/.config/opencode/oh-my-openagent.json ]
+          [ ! -f ~/.config/opencode/oh-my-opencode.json ]
 
           echo "OpenCode storage folder:"
           ls -lA ~/.local/share/opencode/storage || true

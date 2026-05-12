@@ -10,7 +10,6 @@ export const DEFAULT_SESSION_RETENTION = 50
 export const DEFAULT_MAX_AGE_DAYS = 30
 
 // SDK execution defaults - per RFC-013
-export const DEFAULT_AGENT = 'sisyphus'
 export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 
 // Default model for OpenCode Zen - ensures inference starts
@@ -25,6 +24,17 @@ export const DEFAULT_BUN_VERSION = '1.3.13'
 export const DEFAULT_OMO_VERSION = '3.17.15'
 export const DEFAULT_OMO_PROVIDERS = ''
 export const DEFAULT_SYSTEMATIC_VERSION = '2.12.2'
+
+// All-'no' OmoProviders sentinel for disabled oMo mode
+export const OMO_PROVIDERS_DISABLED = {
+  claude: 'no',
+  copilot: 'no',
+  gemini: 'no',
+  openai: 'no',
+  opencodeZen: 'no',
+  zaiCodingPlan: 'no',
+  kimiForCoding: 'no',
+} as const
 
 // Retry configuration lives in agent/retry.ts (RETRY_DELAYS_MS, MAX_LLM_RETRIES)
 // to colocate with the retry logic that consumes the values.

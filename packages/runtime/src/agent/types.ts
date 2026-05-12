@@ -293,7 +293,7 @@ export const WORKING_LABEL_COLOR = 'fcf2e1' as const
 export const WORKING_LABEL_DESCRIPTION = 'Agent is currently working on this' as const
 
 export interface ExecutionConfig {
-  readonly agent: string
+  readonly agent: string | null
   readonly model: ModelConfig | null
   readonly timeoutMs: number
   readonly omoProviders: OmoProviders

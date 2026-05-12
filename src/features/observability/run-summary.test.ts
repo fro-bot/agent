@@ -159,6 +159,17 @@ describe('generateCommentSummary', () => {
     expect(summary).toContain('✅ hit')
   })
 
+  it('renders build (default) when agent is the fallback label', () => {
+    // #given
+    const options = createMockOptions({agent: 'build (default)'})
+
+    // #when
+    const summary = generateCommentSummary(options)
+
+    // #then
+    expect(summary).toContain('build (default)')
+  })
+
   it('includes bot marker for identification', () => {
     // #given
     const options = createMockOptions()
