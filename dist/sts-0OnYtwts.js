@@ -1,1 +1,0 @@
-import{i as e,t}from"./sts-CMFaLzKS.js";t();export{e as getDefaultRoleAssumer};
