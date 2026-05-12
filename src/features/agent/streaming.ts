@@ -30,7 +30,16 @@ export interface ActivityTracker {
 }
 
 export function logServerEvent(event: Event, logger: Logger): void {
-  logger.debug('Server event', {eventType: event.type, properties: event.properties})
+  const eventType = getStringProperty(event, 'type')
+  if (eventType === 'sync') {
+    const name = getStringProperty(event, 'name')
+    const kind = name?.replace(/\.\d+$/, '') ?? 'sync'
+    const data = getObjectProperty(event, 'data')
+    const sessionID = getSessionID(data)
+    logger.debug('Server event', {eventKind: kind, sessionID})
+  } else {
+    logger.debug('Server event', {eventType, properties: getObjectProperty(event, 'properties')})
+  }
 }
 
 export function detectArtifacts(
@@ -107,6 +116,11 @@ function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
 
+interface ToolCallInfo {
+  readonly tool: string
+  readonly input: unknown
+}
+
 export async function processEventStream(
   stream: AsyncIterable<Event>,
   sessionId: string,
@@ -122,6 +136,8 @@ export async function processEventStream(
   const commitsCreated: string[] = []
   let commentsPosted = 0
   let llmError: ErrorInfo | null = null
+  // V2 sync tool lifecycle: correlate called→success by callID
+  const pendingToolCalls = new Map<string, ToolCallInfo>()
 
   for await (const event of stream) {
     if (signal.aborted) break
@@ -135,7 +151,78 @@ export async function processEventStream(
       if (eventSessionID === sessionId) activityTracker.firstMeaningfulEventReceived = true
     }
 
-    if (eventType === 'message.part.updated') {
+    if (eventType === 'message.part.delta') {
+      // New SDK shape: streaming text delta events accumulate into lastText, flushed on session.idle.
+      // delta may be an object {type:'text', text:string} or a plain string when field === 'text'.
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID === sessionId) {
+        const delta = getObjectProperty(eventPayload, 'delta')
+        const deltaType = getStringProperty(delta, 'type')
+        const deltaText = getStringProperty(delta, 'text')
+        if (deltaType === 'text' && deltaText != null) {
+          lastText += deltaText
+        } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
+          lastText += delta
+        }
+      }
+    } else if (eventType === 'session.next.text.delta') {
+      // Sync/session.next shape: delta is either a plain string or {type:'text', text:string}
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID === sessionId) {
+        const deltaRaw = getObjectProperty(eventPayload, 'delta')
+        const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
+        if (deltaText != null) lastText += deltaText
+      }
+    } else if (eventType === 'session.next.tool.called') {
+      // V2 sync tool lifecycle: cache call info for correlation with success event
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID === sessionId) {
+        const callID = getStringProperty(eventPayload, 'callID')
+        const tool = getStringProperty(eventPayload, 'tool')
+        const input = getObjectProperty(eventPayload, 'input')
+        if (callID != null && tool != null) {
+          pendingToolCalls.set(callID, {tool, input})
+          logger.debug('Tool called', {callID, tool})
+        }
+      }
+    } else if (eventType === 'session.next.tool.success') {
+      // V2 sync tool lifecycle: render output and detect artifacts using correlated call info
+      const eventSessionID = getEventSessionID(event)
+      if (eventSessionID === sessionId) {
+        const callID = getStringProperty(eventPayload, 'callID')
+        if (callID === null) continue
+
+        const callInfo = pendingToolCalls.get(callID)
+        if (callInfo !== undefined) {
+          pendingToolCalls.delete(callID)
+          const {tool, input} = callInfo
+          // Title resolution: structured.title → input.title → bash command → tool name
+          const structured = getObjectProperty(eventPayload, 'structured')
+          const title =
+            getStringProperty(structured, 'title') ??
+            getStringProperty(input, 'title') ??
+            (tool.toLowerCase() === 'bash'
+              ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
+              : tool)
+          outputToolExecution(tool, title)
+          if (tool.toLowerCase() === 'bash') {
+            const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
+            // Collect text output from content array for artifact detection
+            const contentArr = getObjectProperty(eventPayload, 'content')
+            const outputText = Array.isArray(contentArr)
+              ? contentArr
+                  .map((item: unknown) =>
+                    getStringProperty(item, 'type') === 'text' ? (getStringProperty(item, 'text') ?? '') : '',
+                  )
+                  .join('\n')
+              : ''
+            detectArtifacts(command, outputText, prsCreated, commitsCreated, () => {
+              commentsPosted++
+            })
+          }
+        }
+      }
+    } else if (eventType === 'message.part.updated') {
       const part = getObjectProperty(eventPayload, 'part')
       const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
       if (eventSessionID !== sessionId) continue

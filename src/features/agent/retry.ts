@@ -86,8 +86,8 @@ async function tryCreateV2Client(
 
 /**
  * Call v2.session.wait() on an existing server via a v2 client.
- * Returns true when the session is idle, false if unavailable or errored.
- * On success marks the activityTracker so the concurrent poller exits on its next tick.
+ * Returns true when wait() resolves and a terminal signal for the current turn has been observed,
+ * false if unavailable, errored, or the terminal signal was not received within the grace window.
  *
  * This is intentionally non-blocking — callers start it in parallel with
  * pollForSessionCompletion() so the watchdog timeout is never suppressed.
@@ -121,10 +121,14 @@ async function startV2SessionWait(
     const TERMINAL_GRACE_MS = 500
     const TERMINAL_POLL_INTERVAL_MS = 10
     const deadline = Date.now() + TERMINAL_GRACE_MS
-    while (!activityTracker.currentTurnTerminalSignalReceived && Date.now() < deadline && !signal.aborted) {
+    while (
+      activityTracker.currentTurnTerminalSignalReceived !== true &&
+      Date.now() < deadline &&
+      signal.aborted !== true
+    ) {
       await new Promise(resolve => setTimeout(resolve, TERMINAL_POLL_INTERVAL_MS))
     }
-    if (!activityTracker.currentTurnTerminalSignalReceived) {
+    if (activityTracker.currentTurnTerminalSignalReceived !== true) {
       logger.debug('v2.session.wait() resolved without terminal signal — deferring to poll watchdog', {sessionId})
       return false
     }

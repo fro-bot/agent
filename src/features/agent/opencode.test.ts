@@ -1509,6 +1509,23 @@ describe('logServerEvent', () => {
       },
     })
   })
+
+  it('logs sync events with normalized kind and sessionID only — does not dump full payload', () => {
+    // #given — sync events carry name + data instead of type + properties
+    const event = {
+      type: 'sync',
+      name: 'session.next.text.delta.3',
+      data: {sessionID: 'ses_123', delta: 'some sensitive text'},
+    } as unknown as Event
+
+    // #when
+    logServerEvent(event, mockLogger)
+
+    // #then — kind normalized (index stripped), sessionID present, raw delta NOT logged
+    const [, loggedMeta] = vi.mocked(mockLogger.debug).mock.calls.find(([msg]) => msg === 'Server event') ?? []
+    expect(loggedMeta).toMatchObject({eventKind: 'session.next.text.delta', sessionID: 'ses_123'})
+    expect(JSON.stringify(loggedMeta)).not.toContain('some sensitive text')
+  })
 })
 
 describe('bootstrapOpenCodeServer', () => {
@@ -2461,6 +2478,227 @@ describe('processEventStream', () => {
     // #then
     expect(activityTracker.firstMeaningfulEventReceived).toBe(true)
     expect(result.tokens?.input).toBe(100)
+  })
+
+  it('renders visible stdout text from message.part.delta with string delta when field is text', async () => {
+    // #given — string-shaped delta with field:'text' metadata
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {
+          sessionID: 'ses_123',
+          field: 'text',
+          delta: 'Hello',
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — string delta must flush to stdout on idle
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Hello'))
+    writeSpy.mockRestore()
+  })
+
+  it('renders visible stdout text from message.part.delta events flushed on session.idle', async () => {
+    // #given
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {
+          sessionID: 'ses_123',
+          messageID: 'msg_1',
+          partID: 'prt_1',
+          delta: {type: 'text', text: 'Hello from delta'},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — text accumulated from delta must be flushed to stdout on idle
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Hello from delta'))
+    writeSpy.mockRestore()
+  })
+
+  it('renders visible stdout text from sync session.next.text.delta events flushed on session.idle', async () => {
+    // #given
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.next.text.delta.1',
+        data: {
+          sessionID: 'ses_123',
+          delta: 'Sync delta text',
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — text accumulated from sync delta must be flushed to stdout on idle
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Sync delta text'))
+    writeSpy.mockRestore()
+  })
+
+  it('renders visible stdout text from sync session.next.text.delta with object-shaped delta', async () => {
+    // #given — delta may be an object {type:'text', text:'...'} not just a plain string
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.next.text.delta.1',
+        data: {
+          sessionID: 'ses_123',
+          delta: {type: 'text', text: 'Object sync delta text'},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — object-shaped delta must flush to stdout on idle
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Object sync delta text'))
+    writeSpy.mockRestore()
+  })
+
+  it('renders visible stdout tool execution from V2 sync session.next.tool.called + success events', async () => {
+    // #given — V2 SDK emits tool lifecycle as sync events, not message.part.updated
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.next.tool.called.1',
+        data: {
+          sessionID: 'ses_123',
+          callID: 'call_1',
+          tool: 'bash',
+          input: {command: 'Check for existing wiki PR'},
+          provider: {executed: true},
+        },
+      } as unknown as Event,
+      {
+        type: 'sync',
+        name: 'session.next.tool.success.1',
+        data: {
+          sessionID: 'ses_123',
+          callID: 'call_1',
+          structured: {},
+          content: [{type: 'text', text: 'done'}],
+          provider: {executed: true},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — tool line must appear: "| Bash       Check for existing wiki PR"
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Bash'))
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Check for existing wiki PR'))
+    writeSpy.mockRestore()
+  })
+
+  it('detects PR artifacts from V2 sync session.next.tool.called + success for gh pr create', async () => {
+    // #given — artifact detection must correlate called command with success content
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'sync',
+        name: 'session.next.tool.called.1',
+        data: {
+          sessionID: 'ses_123',
+          callID: 'call_pr',
+          tool: 'bash',
+          input: {command: 'gh pr create --title "Test PR"'},
+          provider: {executed: true},
+        },
+      } as unknown as Event,
+      {
+        type: 'sync',
+        name: 'session.next.tool.success.1',
+        data: {
+          sessionID: 'ses_123',
+          callID: 'call_pr',
+          structured: {},
+          content: [{type: 'text', text: 'https://github.com/owner/repo/pull/42'}],
+          provider: {executed: true},
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    const result = await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — PR URL must be captured in prsCreated
+    expect(result.prsCreated).toContain('https://github.com/owner/repo/pull/42')
+  })
+
+  it('renders visible stdout tool execution from message.part.updated tool completed events', async () => {
+    // #given — regression guard: old event shape must still produce output
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            sessionID: 'ses_123',
+            type: 'tool',
+            tool: 'Bash',
+            state: {status: 'completed', title: 'Check for existing wiki PR'},
+          },
+        },
+      } as unknown as Event,
+      {
+        type: 'session.idle',
+        properties: {sessionID: 'ses_123'},
+      } as unknown as Event,
+    ])
+
+    // #when
+    await processEventStream(eventStream.stream, 'ses_123', abortController.signal, createMockLogger())
+
+    // #then — tool line must appear: "| Bash       Check for existing wiki PR"
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Bash'))
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Check for existing wiki PR'))
+    writeSpy.mockRestore()
   })
 })
 

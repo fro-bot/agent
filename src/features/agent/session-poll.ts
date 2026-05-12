@@ -187,7 +187,7 @@ export async function pollForSessionCompletion(
       if (sessionStatus == null) {
         logger.debug('Session status not found in poll response', {sessionId})
       } else if (sessionStatus.type === 'idle') {
-        if (activityTracker != null && !activityTracker.currentTurnTerminalSignalReceived) {
+        if (activityTracker != null && activityTracker.currentTurnTerminalSignalReceived !== true) {
           logger.debug('Session idle detected before terminal signal; continuing watchdog', {sessionId})
         } else {
           logger.debug('Session idle detected via polling', {sessionId})
