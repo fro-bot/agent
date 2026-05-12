@@ -12,7 +12,7 @@ import {createLogger} from '../../shared/logger.js'
 import {createExecAdapter, createToolCacheAdapter} from './adapters.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
-import {buildCIConfig} from './ci-config.js'
+import {buildCIConfig, pluginPrefix} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
@@ -195,11 +195,8 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       const mergedPlugins = [...existingPlugins]
       for (const ciPlugin of ciPlugins) {
         if (typeof ciPlugin !== 'string') continue
-        const prefix = ciPlugin
-          .split('@')
-          .slice(0, ciPlugin.startsWith('@') ? 2 : 1)
-          .join('@')
-        const alreadyPresent = mergedPlugins.some(p => typeof p === 'string' && p.startsWith(prefix))
+        const prefix = pluginPrefix(ciPlugin)
+        const alreadyPresent = mergedPlugins.some(p => typeof p === 'string' && pluginPrefix(p) === prefix)
         if (!alreadyPresent) {
           mergedPlugins.push(ciPlugin)
         }

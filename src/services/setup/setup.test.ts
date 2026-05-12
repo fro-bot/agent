@@ -548,7 +548,8 @@ describe('setup', () => {
           .mocked(core.exportVariable)
           .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
         expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
+        expect(typeof configExportCall?.[1]).toBe('string')
+        const config = JSON.parse(String(configExportCall?.[1])) as Record<string, unknown>
         expect(config.default_agent).toBe('build')
 
         // Should NOT contain oh-my-openagent
@@ -669,6 +670,28 @@ describe('setup', () => {
         const plugins = config.plugin as unknown[]
         expect(plugins).toContain('oh-my-openagent@3.7.4')
         expect(plugins).toContain('custom-plugin@1.0.0')
+      })
+
+      it('keeps distinct scoped plugins that share a package-name prefix', async () => {
+        // #given - existing plugin differs only by the suffix after the package name
+        vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({plugin: ['@scope/name-extra@1.0.0']}))
+
+        // #when
+        const result = await runSetup(
+          createSetupInputs({enableOmo: true, opencodeConfig: '{"plugin":["@scope/name@2.0.0"]}'}),
+          'ghs_test_token',
+        )
+
+        // #then
+        expect(result).not.toBeNull()
+        const configExportCall = vi
+          .mocked(core.exportVariable)
+          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
+        expect(configExportCall).toBeDefined()
+        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
+        const plugins = config.plugin as unknown[]
+        expect(plugins).toContain('@scope/name-extra@1.0.0')
+        expect(plugins).toContain('@scope/name@2.0.0')
       })
 
       it('writes Systematic config when provided in enabled mode', async () => {

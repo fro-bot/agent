@@ -15,12 +15,9 @@ const OMO_PLUGIN_PREFIXES = ['oh-my-openagent']
  * Extract the package prefix from a plugin specifier.
  * Handles scoped packages (@scope/name) and unscoped packages (name).
  */
-function pluginPrefix(plugin: string): string {
-  if (plugin.startsWith('@')) {
-    const parts = plugin.split('@')
-    return parts.length >= 3 ? `@${parts[1]}/${parts[2]!.split('@')[0]!}` : plugin
-  }
-  return plugin.split('@')[0]!
+export function pluginPrefix(plugin: string): string {
+  const versionSeparator = plugin.lastIndexOf('@')
+  return versionSeparator > 0 ? plugin.slice(0, versionSeparator) : plugin
 }
 
 /**

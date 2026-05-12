@@ -1,13 +1,23 @@
 import type {Logger} from './types.js'
 import {describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {buildCIConfig} from './ci-config.js'
+import {buildCIConfig, pluginPrefix} from './ci-config.js'
 
 function createLogger(): Logger {
   return createMockLogger()
 }
 
 describe('buildCIConfig', () => {
+  describe('pluginPrefix', () => {
+    it('strips version suffix from scoped package names', () => {
+      expect(pluginPrefix('@scope/name@1.0.0')).toBe('@scope/name')
+    })
+
+    it('strips version suffix from unscoped package names', () => {
+      expect(pluginPrefix('name@1.0.0')).toBe('name')
+    })
+  })
+
   describe('enabled mode (enableOmo: true)', () => {
     it('returns autoupdate baseline with systematic plugin when no user config', () => {
       // #given
