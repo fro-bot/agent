@@ -1,4 +1,4 @@
-import type {createOpencode, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
@@ -34,6 +34,7 @@ export async function sendPromptToSession(
   directory: string,
   config: ExecutionConfig | undefined,
   logger: Logger,
+  serverUrl?: string | null,
 ): Promise<AttemptResult> {
   const textPart: TextPartInput = {type: 'text', text: promptText}
   const parts: (TextPartInput | FilePartInput)[] = [textPart, ...(fileParts ?? [])]
@@ -47,8 +48,11 @@ export async function sendPromptToSession(
   const agentName = config?.agent ?? DEFAULT_AGENT
   if (agentName !== DEFAULT_AGENT) body.agent = agentName
 
-  const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
-  if (response.error != null) {
+  const events = await client.event.subscribe()
+  const startPrompt = async () => {
+    const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
+    if (response.error == null) return null
+
     const promptError = String(response.error)
     const promptLlmError = isLlmFetchError(response.error) ? createLLMFetchError(promptError) : null
     return {
@@ -68,5 +72,14 @@ export async function sendPromptToSession(
     }
   }
 
-  return runPromptAttempt(client, sessionId, directory, config?.timeoutMs ?? DEFAULT_TIMEOUT_MS, logger)
+  return runPromptAttempt(
+    client,
+    sessionId,
+    directory,
+    config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    logger,
+    events.stream as AsyncIterable<Event>,
+    serverUrl,
+    startPrompt,
+  )
 }
