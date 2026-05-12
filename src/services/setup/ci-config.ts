@@ -40,6 +40,27 @@ function stripOmoPlugins(plugins: unknown[]): {cleaned: unknown[]; removed: bool
   return {cleaned, removed: removedCount > 0}
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function denyBuildExternalDirectoryPermission(config: Record<string, unknown>): void {
+  const agent = isRecord(config.agent) ? config.agent : {}
+  const build = isRecord(agent.build) ? agent.build : {}
+  const permission = isRecord(build.permission) ? build.permission : {}
+
+  config.agent = {
+    ...agent,
+    build: {
+      ...build,
+      permission: {
+        ...permission,
+        external_directory: 'deny',
+      },
+    },
+  }
+}
+
 export function buildCIConfig(
   inputs: {opencodeConfig: string | null; systematicVersion: string; enableOmo: boolean},
   logger: Logger,
@@ -90,6 +111,7 @@ export function buildCIConfig(
     // Pin default_agent to "build" — overrides any user-provided value
     const userAgent: unknown = ciConfig.default_agent
     ciConfig.default_agent = 'build'
+    denyBuildExternalDirectoryPermission(ciConfig)
     if (userAgent != null && userAgent !== 'build') {
       rewrittenFields.push('default_agent')
     }

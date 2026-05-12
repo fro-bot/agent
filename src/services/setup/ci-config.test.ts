@@ -129,6 +129,13 @@ describe('buildCIConfig', () => {
         autoupdate: false,
         plugin: ['@fro.bot/systematic@2.1.0'],
         default_agent: 'build',
+        agent: {
+          build: {
+            permission: {
+              external_directory: 'deny',
+            },
+          },
+        },
       })
     })
 
@@ -320,6 +327,26 @@ describe('buildCIConfig', () => {
       // #then
       expect(result.error).toBeNull()
       expect(result.config.plugin).toContain('@fro.bot/systematic@2.1.0')
+    })
+
+    it('denies external directory access for the build agent so disabled mode cannot block on permission prompts', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config).toMatchObject({
+        agent: {
+          build: {
+            permission: {
+              external_directory: 'deny',
+            },
+          },
+        },
+      })
     })
   })
 

@@ -3,6 +3,7 @@ import type {Logger} from '../shared/logger.js'
 import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'
 import {createHash} from 'node:crypto'
+import * as path from 'node:path'
 import {listSessionsForProject} from './storage.js'
 
 export interface LogicalSessionKey {
@@ -113,6 +114,14 @@ export function findSessionByTitle(sessions: readonly SessionInfo[], title: stri
   return matchingSessions.reduce((latest, current) => (current.time.updated > latest.time.updated ? current : latest))
 }
 
+function normalizeWorkspacePath(workspacePath: string): string {
+  const resolved = path.resolve(workspacePath)
+  if (resolved.endsWith(path.sep) && resolved.length > 1) {
+    return resolved.slice(0, -1)
+  }
+  return resolved
+}
+
 export async function resolveSessionForLogicalKey(
   client: SessionClient,
   workspacePath: string,
@@ -122,9 +131,21 @@ export async function resolveSessionForLogicalKey(
   try {
     const sessions = await listSessionsForProject(client, workspacePath, logger)
     const title = buildSessionTitle(key)
-    const matchedSession = findSessionByTitle(sessions, title)
+    const normalizedWorkspacePath = normalizeWorkspacePath(workspacePath)
+    const matchingWorkspaceSessions = sessions.filter(
+      session => normalizeWorkspacePath(session.directory) === normalizedWorkspacePath,
+    )
+    const matchedSession = findSessionByTitle(matchingWorkspaceSessions, title)
 
     if (matchedSession == null) {
+      const staleDirectoryMatch = findSessionByTitle(sessions, title)
+      if (staleDirectoryMatch != null) {
+        logger.warning('Session continuity: matching session has different workspace directory, ignoring', {
+          sessionId: staleDirectoryMatch.id,
+          sessionDirectory: staleDirectoryMatch.directory,
+          workspacePath,
+        })
+      }
       return {status: 'not-found'}
     }
 
