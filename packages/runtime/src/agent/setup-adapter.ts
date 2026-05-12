@@ -13,6 +13,7 @@ export interface SetupInputs {
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
   readonly omoConfig: string | null
+  readonly enableOmo: boolean
   readonly omoVersion: string
   readonly systematicVersion: string
   readonly omoProviders: OmoProviders

@@ -331,7 +331,7 @@ describe('comments/error-format', () => {
   })
 
   describe('createAgentError', () => {
-    it('creates non-retryable agent error', () => {
+    it('creates non-retryable agent error with enable-omo suggestion', () => {
       // #when creating an agent error
       const error = createAgentError('agent not found', 'sisyphus')
 
@@ -340,7 +340,7 @@ describe('comments/error-format', () => {
       expect(error.retryable).toBe(false)
       expect(error.message).toContain('agent not found')
       expect(error.details).toContain('sisyphus')
-      expect(error.suggestedAction).toBeDefined()
+      expect(error.suggestedAction).toContain('enable-omo: true')
     })
 
     it('creates error without agent when not provided', () => {
@@ -351,6 +351,7 @@ describe('comments/error-format', () => {
       expect(error.type).toBe('configuration')
       expect(error.message).toContain('unknown agent error')
       expect(error.details).toBeUndefined()
+      expect(error.suggestedAction).not.toContain('enable-omo')
     })
   })
 })

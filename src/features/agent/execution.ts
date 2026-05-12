@@ -9,7 +9,7 @@ import * as path from 'node:path'
 import {createLLMFetchError, isLlmFetchError, reassertSessionTitle} from '@fro-bot/runtime'
 import {createOpencode} from '@opencode-ai/sdk'
 import {sleep} from '../../shared/async.js'
-import {DEFAULT_AGENT, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
+import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {getGitHubWorkspace, getOpenCodeLogPath, isOpenCodePromptArtifactEnabled} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {CONTINUATION_PROMPT, sendPromptToSession} from './prompt-sender.js'
@@ -38,7 +38,7 @@ export async function executeOpenCode(
       abortController.abort()
     }, timeoutMs)
   logger.info('Executing OpenCode agent (SDK mode)', {
-    agent: config?.agent ?? DEFAULT_AGENT,
+    agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
     timeoutMs,
   })

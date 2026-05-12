@@ -1,6 +1,11 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
+import {
+  DEFAULT_OMO_VERSION,
+  DEFAULT_S3_PREFIX,
+  DEFAULT_SYSTEMATIC_VERSION,
+  OMO_PROVIDERS_DISABLED,
+} from '../../shared/constants.js'
 import {parseActionInputs, parseModelInput} from './inputs.js'
 
 const mocks = vi.hoisted(() => ({
@@ -478,13 +483,13 @@ describe('parseActionInputs', () => {
   })
 
   describe('RFC-013 SDK execution inputs', () => {
-    it('parses agent input with default value', () => {
+    it('parses agent input with null default when not provided', () => {
       mockInputs({})
 
       const result = parseActionInputs()
 
       expect(result.success).toBe(true)
-      expect(result.success && result.data.agent).toBe('sisyphus')
+      expect(result.success && result.data.agent).toBeNull()
     })
 
     it('parses custom agent input', () => {
@@ -716,6 +721,241 @@ describe('parseActionInputs', () => {
 
       expect(result.success).toBe(true)
       expect(result.success && result.data.systematicConfig).toBe(null)
+    })
+  })
+
+  // --- Unit 1: enable-omo and agent contract tests ---
+
+  describe('enable-omo mode flag', () => {
+    it('defaults to false when enable-omo is not provided', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+    })
+
+    it('parses enable-omo as true when set', () => {
+      mockInputs({
+        'enable-omo': 'true',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(true)
+    })
+
+    it('handles enable-omo case insensitivity', () => {
+      mockInputs({
+        'enable-omo': 'TRUE',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(true)
+    })
+  })
+
+  describe('agent parsing (no default)', () => {
+    it('defaults to null when agent is not provided', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.agent).toBeNull()
+    })
+
+    it('parses explicit agent value', () => {
+      mockInputs({
+        agent: 'custom-agent',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.agent).toBe('custom-agent')
+    })
+
+    it('trims whitespace from agent input', () => {
+      mockInputs({
+        agent: '  my-agent  ',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.agent).toBe('my-agent')
+    })
+  })
+
+  describe('omo-providers parsing', () => {
+    // Happy path: no enable-omo, no agent -> enableOmo=false, agent=null, providers=all-no
+    it('defaults to disabled providers when oMo is disabled', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(result.success && result.data.agent).toBeNull()
+      expect(result.success && result.data.omoProviders).toEqual(OMO_PROVIDERS_DISABLED)
+    })
+
+    // Happy path: enable-omo=true, valid omo-providers -> providers parse as today
+    it('parses omo-providers when oMo is enabled', () => {
+      mockInputs({
+        'enable-omo': 'true',
+        'omo-providers': 'claude-max20,copilot,gemini',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(true)
+      expect(result.success && result.data.omoProviders).toEqual({
+        claude: 'max20',
+        copilot: 'yes',
+        gemini: 'yes',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      })
+    })
+
+    // Happy path: explicit agent: custom with disabled oMo
+    it('parses explicit agent with disabled oMo', () => {
+      mockInputs({
+        agent: 'custom',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(result.success && result.data.agent).toBe('custom')
+      expect(result.success && result.data.omoProviders).toEqual(OMO_PROVIDERS_DISABLED)
+    })
+
+    // Edge: disabled oMo + invalid omo-providers -> parse succeeds, providers all-no, exactly one warning
+    it('ignores invalid omo-providers when oMo is disabled and emits one warning', () => {
+      mockInputs({
+        'omo-providers': 'invalid-provider',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(result.success && result.data.omoProviders).toEqual(OMO_PROVIDERS_DISABLED)
+      // Assert exactly one warning (ignored-input) and no provider parse error
+      expect(mocks.warning).toHaveBeenCalledTimes(1)
+      expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('omo-providers'))
+    })
+
+    // Edge: disabled oMo + empty raw inputs -> no warning
+    it('emits no warning when disabled oMo and no oMo inputs are set', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(mocks.warning).toHaveBeenCalledTimes(0)
+    })
+
+    // Edge: disabled oMo + explicit default omo-version -> no warning
+    it('emits no warning when omo-version matches the pinned default even when explicitly set', () => {
+      mockInputs({
+        'omo-version': DEFAULT_OMO_VERSION,
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(mocks.warning).toHaveBeenCalledTimes(0)
+    })
+
+    // Edge: disabled oMo + non-default omo-version + omo-providers -> one warning naming both
+    it('emits one ignored-input warning when omo-version and omo-providers are set but oMo is disabled', () => {
+      mockInputs({
+        'omo-version': '9.9.9',
+        'omo-providers': 'claude',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(mocks.warning).toHaveBeenCalledTimes(1)
+      const warningMsg = (mocks.warning.mock.calls[0]?.[0] as string) ?? ''
+      expect(warningMsg).toContain('omo-providers')
+      expect(warningMsg).toContain('omo-version')
+      expect(warningMsg).toContain('enable-omo: false')
+    })
+
+    // Edge: disabled oMo + agent: sisyphus -> parse succeeds and emits migration warning
+    it('emits an agent migration warning when agent is a known oMo agent and oMo is disabled', () => {
+      mockInputs({
+        agent: 'sisyphus',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(result.success && result.data.agent).toBe('sisyphus')
+      // Migration warning for sisyphus agent
+      expect(mocks.warning).toHaveBeenCalledTimes(1)
+      expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('sisyphus'))
+      expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('enable-omo: true'))
+    })
+
+    // Edge: disabled oMo + invalid omo-providers + agent: sisyphus -> exactly two warnings
+    it('emits exactly two warnings when oMo inputs ignored and agent is a known oMo agent', () => {
+      mockInputs({
+        'omo-providers': 'invalid-provider',
+        agent: 'sisyphus',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(result.success && result.data.omoProviders).toEqual(OMO_PROVIDERS_DISABLED)
+      expect(result.success && result.data.agent).toBe('sisyphus')
+      expect(mocks.warning).toHaveBeenCalledTimes(2)
+    })
+
+    // Error: enabled oMo + invalid omo-providers -> parser fails
+    it('fails when oMo is enabled with invalid omo-providers', () => {
+      mockInputs({
+        'enable-omo': 'true',
+        'omo-providers': 'invalid-provider',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+    })
+
+    // Edge: disabled oMo + non-default omo-version only -> one warning
+    it('emits warning when only omo-version is non-default and oMo is disabled', () => {
+      mockInputs({
+        'omo-version': '9.9.9',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmo).toBe(false)
+      expect(mocks.warning).toHaveBeenCalledTimes(1)
+      expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('omo-version'))
     })
   })
 })

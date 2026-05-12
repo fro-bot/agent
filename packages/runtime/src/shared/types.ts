@@ -68,9 +68,11 @@ export interface ActionInputs {
   readonly sessionRetention: number
   readonly storeConfig: ObjectStoreConfig
   // RFC-013: SDK execution configuration
-  readonly agent: string
+  readonly agent: string | null
   readonly model: ModelConfig | null
   readonly timeoutMs: number
+  // oMo mode flag (default: false)
+  readonly enableOmo: boolean
   // Setup consolidation: auto-setup inputs
   readonly opencodeVersion: string
   readonly skipCache: boolean

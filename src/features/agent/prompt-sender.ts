@@ -3,7 +3,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {EventStreamResult} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
-import {DEFAULT_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
+import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {runPromptAttempt} from './retry.js'
 
 export const CONTINUATION_PROMPT = `The previous request was interrupted by a network error (fetch failed).
@@ -45,8 +45,8 @@ export async function sendPromptToSession(
   } = {parts}
   const model = resolvePromptModel(config)
   if (model != null) body.model = model
-  const agentName = config?.agent ?? DEFAULT_AGENT
-  if (agentName !== DEFAULT_AGENT) body.agent = agentName
+  const agentName = config?.agent ?? null
+  if (agentName != null) body.agent = agentName
 
   const events = await client.event.subscribe()
   const startPrompt = async () => {
