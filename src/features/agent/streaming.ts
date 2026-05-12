@@ -12,8 +12,13 @@ export interface EventStreamResult {
   readonly cost: number | null
   readonly prsCreated: string[]
   readonly commitsCreated: string[]
+  readonly commentsPostedUrls?: string[]
   readonly commentsPosted: number
   readonly llmError: ErrorInfo | null
+}
+
+export interface FallbackRenderOptions {
+  readonly renderVisibleOutput: boolean
 }
 
 /** Mutable by design — updated in-place during stream processing. */
@@ -25,6 +30,10 @@ export interface ActivityTracker {
   baselineMessageIds?: ReadonlySet<string>
   completedAssistantMessageId?: string
   completedAssistantMessageObservedAt?: number
+  /** True once outputTextContent or outputToolExecution has been called during stream processing. */
+  visibleOutputEmitted?: boolean
+  /** Parts from the fallback completed assistant message, set by detectMessageActivity. */
+  fallbackMessageParts?: readonly unknown[]
   sessionIdle: boolean
   sessionError: string | null
 }
@@ -48,6 +57,7 @@ export function detectArtifacts(
   prsCreated: string[],
   commitsCreated: string[],
   onCommentPosted: () => void,
+  commentsPostedUrls?: string[],
 ): void {
   const urls = extractGithubUrls(output)
   if (command.includes('gh pr create')) {
@@ -65,8 +75,13 @@ export function detectArtifacts(
   }
 
   if (command.includes('gh issue comment') || command.includes('gh pr comment')) {
-    const hasComment = urls.some(url => url.includes('#issuecomment'))
-    if (hasComment) onCommentPosted()
+    const commentUrls = urls.filter(url => url.includes('#issuecomment'))
+    for (const url of commentUrls) {
+      if (commentsPostedUrls == null || !commentsPostedUrls.includes(url)) {
+        commentsPostedUrls?.push(url)
+        onCommentPosted()
+      }
+    }
   }
 }
 
@@ -116,6 +131,24 @@ function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
 
+function markVisibleOutputEmitted(activityTracker: ActivityTracker | undefined): void {
+  if (activityTracker != null) activityTracker.visibleOutputEmitted = true
+}
+
+function outputStreamTextContent(text: string, activityTracker: ActivityTracker | undefined): void {
+  outputTextContent(text)
+  markVisibleOutputEmitted(activityTracker)
+}
+
+function outputStreamToolExecution(
+  toolName: string,
+  title: string,
+  activityTracker: ActivityTracker | undefined,
+): void {
+  outputToolExecution(toolName, title)
+  markVisibleOutputEmitted(activityTracker)
+}
+
 interface ToolCallInfo {
   readonly tool: string
   readonly input: unknown
@@ -134,6 +167,7 @@ export async function processEventStream(
   let cost: number | null = null
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
+  const commentsPostedUrls: string[] = []
   let commentsPosted = 0
   let llmError: ErrorInfo | null = null
   // V2 sync tool lifecycle: correlate called→success by callID
@@ -204,7 +238,7 @@ export async function processEventStream(
             (tool.toLowerCase() === 'bash'
               ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
               : tool)
-          outputToolExecution(tool, title)
+          outputStreamToolExecution(tool, title, activityTracker)
           if (tool.toLowerCase() === 'bash') {
             const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
             // Collect text output from content array for artifact detection
@@ -216,9 +250,16 @@ export async function processEventStream(
                   )
                   .join('\n')
               : ''
-            detectArtifacts(command, outputText, prsCreated, commitsCreated, () => {
-              commentsPosted++
-            })
+            detectArtifacts(
+              command,
+              outputText,
+              prsCreated,
+              commitsCreated,
+              () => {
+                commentsPosted++
+              },
+              commentsPostedUrls,
+            )
           }
         }
       }
@@ -234,21 +275,28 @@ export async function processEventStream(
         if (text != null) lastText = text
         const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
         if (endTime != null) {
-          outputTextContent(lastText)
+          outputStreamTextContent(lastText, activityTracker)
           lastText = ''
         }
       } else if (partType === 'tool') {
         const toolState = getObjectProperty(part, 'state')
         if (getStringProperty(toolState, 'status') === 'completed') {
           const tool = getStringProperty(part, 'tool') ?? ''
-          outputToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''))
+          outputStreamToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''), activityTracker)
           if (tool.toLowerCase() === 'bash') {
             const input = getObjectProperty(toolState, 'input')
             const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
             const output = String(getObjectProperty(toolState, 'output') ?? '')
-            detectArtifacts(command, output, prsCreated, commitsCreated, () => {
-              commentsPosted++
-            })
+            detectArtifacts(
+              command,
+              output,
+              prsCreated,
+              commitsCreated,
+              () => {
+                commentsPosted++
+              },
+              commentsPostedUrls,
+            )
           }
         }
       }
@@ -287,12 +335,66 @@ export async function processEventStream(
         activityTracker.currentTurnTerminalSignalReceived = true
       }
       if (lastText.length > 0) {
-        outputTextContent(lastText)
+        outputStreamTextContent(lastText, activityTracker)
         lastText = ''
       }
     }
   }
 
-  if (lastText.length > 0) outputTextContent(lastText)
-  return {tokens, model, cost, prsCreated, commitsCreated, commentsPosted, llmError}
+  if (lastText.length > 0) outputStreamTextContent(lastText, activityTracker)
+  return {tokens, model, cost, prsCreated, commitsCreated, commentsPostedUrls, commentsPosted, llmError}
+}
+
+/**
+ * Render completed assistant message parts from the message-fallback path.
+ * Only called when the live SSE stream did not emit any visible output.
+ * Returns a partial EventStreamResult with artifacts detected from the parts.
+ */
+export function renderFallbackMessageParts(
+  parts: readonly unknown[],
+  logger: Logger,
+  options: FallbackRenderOptions = {renderVisibleOutput: true},
+): Pick<EventStreamResult, 'prsCreated' | 'commitsCreated' | 'commentsPostedUrls' | 'commentsPosted'> {
+  const prsCreated: string[] = []
+  const commitsCreated: string[] = []
+  const commentsPostedUrls: string[] = []
+  let commentsPosted = 0
+
+  for (const part of parts) {
+    const partType = getStringProperty(part, 'type')
+    if (partType === 'text') {
+      const text = getStringProperty(part, 'text')
+      if (text != null && options.renderVisibleOutput) {
+        outputTextContent(text)
+        logger.debug('Fallback: rendered text part')
+      }
+    } else if (partType === 'tool') {
+      const toolState = getObjectProperty(part, 'state')
+      if (getStringProperty(toolState, 'status') === 'completed') {
+        const tool = getStringProperty(part, 'tool') ?? ''
+        const title = String(getObjectProperty(toolState, 'title') ?? '')
+        if (options.renderVisibleOutput) {
+          outputToolExecution(tool, title)
+          logger.debug('Fallback: rendered tool part', {tool, title})
+        }
+        if (tool.toLowerCase() === 'bash') {
+          const input = getObjectProperty(toolState, 'input')
+          const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
+          const output = String(getObjectProperty(toolState, 'output') ?? '')
+          detectArtifacts(
+            command,
+            output,
+            prsCreated,
+            commitsCreated,
+            () => {
+              commentsPosted++
+            },
+            commentsPostedUrls,
+          )
+        }
+      }
+    }
+  }
+
+  return {prsCreated, commitsCreated, commentsPostedUrls, commentsPosted}
 }
