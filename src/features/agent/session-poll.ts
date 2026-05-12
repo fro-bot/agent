@@ -127,6 +127,20 @@ async function detectMessageActivity(
     messageId: latestAssistantMessageId,
     stableForMs,
   })
+
+  // Store the message parts only after the completed assistant message has passed
+  // the stability window so retry.ts renders/merges the final persisted parts.
+  const latestMessage = messages.find((m: unknown) => {
+    const info = getObjectProperty(m, 'info')
+    return getStringProperty(info, 'id') === latestAssistantMessageId
+  })
+  if (latestMessage != null) {
+    const parts = getObjectProperty(latestMessage, 'parts')
+    if (Array.isArray(parts)) {
+      activityTracker.fallbackMessageParts = parts
+    }
+  }
+
   return {completed: true, error: null}
 }
 
