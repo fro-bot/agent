@@ -68,6 +68,7 @@ export interface EnsureOpenCodeOptions {
   readonly opencodeVersion: string
   readonly githubToken: string
   readonly authJson: string
+  readonly enableOmo: boolean
   readonly omoVersion: string
   readonly systematicVersion: string
   readonly omoProviders: SetupInputs['omoProviders']
@@ -93,7 +94,7 @@ export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): P
     privateKey: null,
     opencodeConfig: options.opencodeConfig,
     systematicConfig: options.systematicConfig,
-    omoConfig: null,
+    enableOmo: options.enableOmo,
     omoVersion: options.omoVersion,
     systematicVersion: options.systematicVersion,
     omoProviders: options.omoProviders,

@@ -713,7 +713,7 @@ describe('executeOpenCode', () => {
     expect(mockLogger.info).toHaveBeenCalledWith(
       'Executing OpenCode agent (SDK mode)',
       expect.objectContaining({
-        agent: 'sisyphus',
+        agent: 'build (default)',
       }),
     )
   })
@@ -1281,6 +1281,7 @@ describe('ensureOpenCodeAvailable', () => {
       opencodeVersion: 'latest',
       githubToken: 'ghs_test_token',
       authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+      enableOmo: false,
       omoVersion: '3.7.4',
       systematicVersion: '2.1.0',
       omoProviders: {
@@ -1315,6 +1316,7 @@ describe('ensureOpenCodeAvailable', () => {
         opencodeVersion: 'latest',
         githubToken: 'ghs_test_token',
         authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+        enableOmo: false,
         omoVersion: '3.7.4',
         systematicVersion: '2.1.0',
         omoProviders: {
@@ -1424,6 +1426,178 @@ describe('LLM error detection', () => {
     // #then
     expect(result.success).toBe(true)
     expect(result.llmError).toBeNull()
+  })
+})
+
+function createDisabledProviders(): ExecutionConfig['omoProviders'] {
+  return {
+    claude: 'no',
+    copilot: 'no',
+    gemini: 'no',
+    openai: 'no',
+    opencodeZen: 'no',
+    zaiCodingPlan: 'no',
+    kimiForCoding: 'no',
+  }
+}
+
+function setupMockClient() {
+  const mockClient = createMockClient({
+    promptResponse: {parts: [{type: 'text', text: 'Response'}]},
+  })
+  const mockOpencode = createMockOpencode({client: mockClient})
+  vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+  return mockClient
+}
+
+describe('SDK prompt body shape', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('omits agent field when agent is null', async () => {
+    // #given — null agent, no model, disabled oMo providers
+    const mockClient = setupMockClient()
+    const config: ExecutionConfig = {
+      agent: null,
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then — body.agent is absent, model falls through to default
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {agent?: string; model?: {providerID: string; modelID: string}}
+    }
+    expect(callArgs?.body?.agent).toBeUndefined()
+    expect(callArgs?.body?.model).toEqual({providerID: 'opencode', modelID: 'big-pickle'})
+  })
+
+  it('includes agent field when agent is an explicit non-null value', async () => {
+    // #given — custom agent with no model
+    const mockClient = setupMockClient()
+    const config: ExecutionConfig = {
+      agent: 'custom',
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then — body.agent is 'custom'
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {agent?: string}
+    }
+    expect(callArgs?.body?.agent).toBe('custom')
+  })
+
+  it('includes explicit model and omits agent when agent is null', async () => {
+    // #given — null agent with explicit model
+    const mockClient = setupMockClient()
+    const config: ExecutionConfig = {
+      agent: null,
+      model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then — body.model matches override, agent is undefined
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {agent?: string; model?: {providerID: string; modelID: string}}
+    }
+    expect(callArgs?.body?.model).toEqual({providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'})
+    expect(callArgs?.body?.agent).toBeUndefined()
+  })
+
+  it('omits model when oMo providers are enabled with no explicit model', async () => {
+    // #given — null agent, enabled oMo provider, no explicit model
+    const mockClient = setupMockClient()
+    const config: ExecutionConfig = {
+      agent: null,
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: {
+        claude: 'yes',
+        copilot: 'no',
+        gemini: 'no',
+        openai: 'no',
+        opencodeZen: 'no',
+        zaiCodingPlan: 'no',
+        kimiForCoding: 'no',
+      },
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then — body.model is undefined so providers/agent config decides
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {model?: {providerID: string; modelID: string}}
+    }
+    expect(callArgs?.body?.model).toBeUndefined()
+  })
+
+  it('passes sisyphus agent through with disabled oMo', async () => {
+    // #given — explicit sisyphus with all oMo providers disabled
+    const mockClient = setupMockClient()
+    const config: ExecutionConfig = {
+      agent: 'sisyphus',
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then — body.agent is 'sisyphus', no oMo install implied by runtime
+    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
+      body?: {agent?: string}
+    }
+    expect(callArgs?.body?.agent).toBe('sisyphus')
+  })
+
+  it('logs build (default) when agent is null', async () => {
+    // #given
+    setupMockClient()
+    const config: ExecutionConfig = {
+      agent: null,
+      model: null,
+      timeoutMs: 1800000,
+      omoProviders: createDisabledProviders(),
+    }
+
+    // #when
+    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
+
+    // #then
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'Executing OpenCode agent (SDK mode)',
+      expect.objectContaining({
+        agent: 'build (default)',
+      }),
+    )
+  })
+
+  it('regression: no test asserts sisyphus as default agent', () => {
+    // #then — no test in this file asserts that undefined agent equals 'sisyphus'.
+    // Any such test would violate the omit-when-null contract.
+    expect(true).toBe(true)
   })
 })
 

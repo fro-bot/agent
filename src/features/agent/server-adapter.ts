@@ -17,6 +17,7 @@ export async function ensureOpenCodeAvailable(options: {
   readonly opencodeVersion: string
   readonly githubToken: string
   readonly authJson: string
+  readonly enableOmo: boolean
   readonly omoVersion: string
   readonly systematicVersion: string
   readonly omoProviders: {

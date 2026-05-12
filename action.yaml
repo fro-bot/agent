@@ -55,9 +55,12 @@ inputs:
     description: "Server-side encryption: 'aws:kms' or 'AES256'. Default: aws:kms for AWS S3, AES256 for custom endpoints."
     required: false
   agent:
-    description: 'Agent to use (default: sisyphus). Must be a primary agent, not subagent.'
+    description: 'Agent to use. When unset, uses OpenCode build agent. Must be a primary agent, not subagent.'
     required: false
-    default: sisyphus
+  enable-omo:
+    description: 'Enable Oh My OpenAgent (oMo) for extended provider and agent support. Default: false.'
+    required: false
+    default: 'false'
   model:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
@@ -88,11 +91,6 @@ inputs:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).
       Values are merged on top of the autoupdate:false baseline; user values win on conflicts.
-    required: false
-  omo-config:
-    description: >-
-      Custom oMo configuration JSON. Written before installer runs.
-      Deep-merged with existing config.
     required: false
   systematic-config:
     description: Custom Systematic plugin configuration JSON (deep-merged with existing config).

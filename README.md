@@ -16,7 +16,7 @@
 
 ## Overview
 
-Fro Bot Agent is a GitHub Action that brings AI automation to your repository using [OpenCode](https://opencode.ai/) with [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) agent workflows. It can respond to issues, review pull requests, participate in discussions, and execute scheduled tasks—all while **remembering previous interactions**.
+Fro Bot Agent is a GitHub Action that brings AI automation to your repository using [OpenCode](https://opencode.ai/). It optionally supports [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) for extended provider and agent workflows when `enable-omo: true` is set. It can respond to issues, review pull requests, participate in discussions, and execute scheduled tasks—all while **remembering previous interactions**.
 
 ### Why Fro Bot?
 
@@ -33,7 +33,7 @@ Traditional CI-based AI agents are stateless: they process each request independ
 
 - **🔄 Persistent Memory** — Session state survives workflow runs via cache
 - **🤖 Multiple Triggers** — Responds to comments, PRs, issues, reviews, and scheduled events
-- **⚡ Auto-Setup** — Zero-config installation of OpenCode and oMo on first run
+- **⚡ Auto-Setup** — Zero-config installation of OpenCode on first run (oMo is opt-in)
 - **👀 User Feedback** — Visual acknowledgment with reactions and labels
 - **🔐 Security-First** — Enforces permission gating and credential hygiene
 - **📊 Observability** — Detailed run summaries with metrics and error tracking
@@ -99,7 +99,7 @@ Comment `@fro-bot` on any issue or pull request. The agent will:
 
 > [!NOTE]
 >
-> On first run, the action automatically installs OpenCode and oMo—no manual setup required!
+> On first run, the action automatically installs OpenCode — no manual setup required! If you need oMo agent workflows with Sisyphus or other oMo-provided agents, set `enable-omo: true` in your workflow.
 
 > [!TIP]
 >
@@ -367,7 +367,8 @@ concurrency:
 | `github-token` | Yes | — | GitHub token with write permissions |
 | `auth-json` | Yes | — | JSON object mapping LLM providers to credentials |
 | `prompt` | No | — | Custom prompt for the agent |
-| `agent` | No | `Sisyphus` | Agent to use (must be primary agent, not subagent) |
+| `agent` | No | — | Agent to use. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent. |
+| `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support. When `true`, installs Bun and oMo, and oMo configures Sisyphus as the default agent. |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | Execution timeout in milliseconds (0 = no limit) |
 | `opencode-version` | No | `1.2.24` | OpenCode CLI version for installation |
@@ -383,9 +384,15 @@ concurrency:
 | `s3-sse-encryption` | No | auto | `aws:kms` or `AES256` (auto-picked by endpoint) |
 | `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS |
 | `skip-cache` | No | `false` | Skip cache restore (useful for debugging) |
-| `omo-config` | No | — | Custom oMo configuration JSON (deep-merged) |
 | `systematic-config` | No | — | Custom Systematic configuration JSON (deep-merged) |
 | `opencode-config` | No | — | Custom OpenCode configuration JSON (deep-merged) |
+
+> [!IMPORTANT]
+> **Migration: oMo default change.** Previous versions of this action shipped with Oh My OpenAgent enabled by default. As of this release, oMo is opt-in. If your workflow relies on oMo-provided agents (such as Sisyphus), set `enable-omo: true`. When oMo is disabled (the default):
+>
+> - `default_agent` in the generated OpenCode config is forced to `"build"`.
+> - `oh-my-openagent` entries are stripped from both `plugin` and legacy `plugins` in any user-provided `opencode-config` (a warning names rewritten fields).
+> - Both behaviors are bypassed when `enable-omo: true` — oMo manages its own config and agent selection.
 
 ### Action Outputs
 

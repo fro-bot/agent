@@ -1,12 +1,65 @@
-import type {Logger, SetupInputs} from './types.js'
+import type {Logger} from './types.js'
 
 export interface CIConfigResult {
   readonly config: Record<string, unknown>
   readonly error: string | null
 }
 
+/**
+ * Known oMo plugin specifier prefixes to strip in disabled mode.
+ * Matches bare names and versioned variants (e.g., oh-my-openagent, oh-my-openagent@latest, oh-my-openagent@3.7.4).
+ */
+const OMO_PLUGIN_PREFIXES = ['oh-my-openagent']
+
+/**
+ * Extract the package prefix from a plugin specifier.
+ * Handles scoped packages (@scope/name) and unscoped packages (name).
+ */
+export function pluginPrefix(plugin: string): string {
+  const versionSeparator = plugin.lastIndexOf('@')
+  return versionSeparator > 0 ? plugin.slice(0, versionSeparator) : plugin
+}
+
+/**
+ * Check whether a plugin specifier matches any known oMo plugin prefix.
+ */
+function isOmoPlugin(plugin: string): boolean {
+  const prefix = pluginPrefix(plugin)
+  return OMO_PLUGIN_PREFIXES.includes(prefix)
+}
+
+/**
+ * Filter oMo plugin entries from a plugin array, returning cleaned array and a flag indicating whether anything was removed.
+ */
+function stripOmoPlugins(plugins: unknown[]): {cleaned: unknown[]; removed: boolean} {
+  const removedCount = plugins.filter(p => typeof p === 'string' && isOmoPlugin(p)).length
+  const cleaned = plugins.filter(p => typeof p !== 'string' || !isOmoPlugin(p))
+  return {cleaned, removed: removedCount > 0}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function denyBuildExternalDirectoryPermission(config: Record<string, unknown>): void {
+  const agent = isRecord(config.agent) ? config.agent : {}
+  const build = isRecord(agent.build) ? agent.build : {}
+  const permission = isRecord(build.permission) ? build.permission : {}
+
+  config.agent = {
+    ...agent,
+    build: {
+      ...build,
+      permission: {
+        ...permission,
+        external_directory: 'deny',
+      },
+    },
+  }
+}
+
 export function buildCIConfig(
-  inputs: Pick<SetupInputs, 'opencodeConfig' | 'systematicVersion'>,
+  inputs: {opencodeConfig: string | null; systematicVersion: string; enableOmo: boolean},
   logger: Logger,
 ): CIConfigResult {
   const ciConfig: Record<string, unknown> = {autoupdate: false}
@@ -32,6 +85,39 @@ export function buildCIConfig(
   )
   if (!hasSystematic) {
     ciConfig.plugin = [...rawPlugins, systematicPlugin]
+  }
+
+  // Disabled mode: strip oMo plugins, strip legacy plugins key, pin default_agent to build
+  if (!inputs.enableOmo) {
+    const rewrittenFields: string[] = []
+
+    // Strip oMo entries from 'plugin' array
+    const currentPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
+    const {cleaned: cleanedPlugins, removed: removedOmo} = stripOmoPlugins(currentPlugins)
+    if (removedOmo) {
+      rewrittenFields.push('plugin')
+      ciConfig.plugin = cleanedPlugins
+    }
+
+    // Strip legacy 'plugins' (plural) key entirely
+    if ('plugins' in ciConfig) {
+      delete ciConfig.plugins
+      rewrittenFields.push('plugins')
+    }
+
+    // Pin default_agent to "build" — overrides any user-provided value
+    const userAgent: unknown = ciConfig.default_agent
+    ciConfig.default_agent = 'build'
+    denyBuildExternalDirectoryPermission(ciConfig)
+    if (userAgent != null && userAgent !== 'build') {
+      rewrittenFields.push('default_agent')
+    }
+
+    if (rewrittenFields.length > 0) {
+      logger.warning(
+        `OpenCode config rewritten for disabled oMo mode (enable-omo: false): ${rewrittenFields.join(', ')}. oMo plugin entries are stripped and default_agent is pinned to "build". Set enable-omo: true to use oMo features.`,
+      )
+    }
   }
 
   logger.debug('Built CI OpenCode config', {
