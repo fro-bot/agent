@@ -112,24 +112,23 @@ async function startV2SessionWait(
       })
       return false
     }
-    // Guard: only accept wait() as the completion signal if current-turn activity has been
-    // observed on the event stream. wait() can resolve before the event processor loop has
-    // had a chance to process the first event (async scheduling gap), so we poll briefly
-    // (up to 500ms in 10ms ticks) to give the event processor time to catch up.
-    // If no activity is observed within the grace period, the session was idle from a prior
-    // turn — fall back to the poll watchdog so we don't declare success prematurely.
-    const ACTIVITY_GRACE_MS = 500
-    const ACTIVITY_POLL_INTERVAL_MS = 10
-    const deadline = Date.now() + ACTIVITY_GRACE_MS
-    while (!activityTracker.firstMeaningfulEventReceived && Date.now() < deadline && !signal.aborted) {
-      await new Promise(resolve => setTimeout(resolve, ACTIVITY_POLL_INTERVAL_MS))
+    // Guard: only accept wait() as the completion signal if a terminal signal for the current
+    // turn has been received (session.idle event or completed assistant message). wait() can
+    // resolve before the event processor has processed the terminal event (async scheduling gap),
+    // so we poll briefly (up to 500ms in 10ms ticks) to give the event processor time to catch up.
+    // Crucially, firstMeaningfulEventReceived (LLM stream start) is NOT sufficient — the session
+    // must have actually finished, not just started. Fall back to poll watchdog otherwise.
+    const TERMINAL_GRACE_MS = 500
+    const TERMINAL_POLL_INTERVAL_MS = 10
+    const deadline = Date.now() + TERMINAL_GRACE_MS
+    while (!activityTracker.currentTurnTerminalSignalReceived && Date.now() < deadline && !signal.aborted) {
+      await new Promise(resolve => setTimeout(resolve, TERMINAL_POLL_INTERVAL_MS))
     }
-    if (!activityTracker.firstMeaningfulEventReceived) {
-      logger.debug('v2.session.wait() resolved before current-turn activity — deferring to poll watchdog', {sessionId})
+    if (!activityTracker.currentTurnTerminalSignalReceived) {
+      logger.debug('v2.session.wait() resolved without terminal signal — deferring to poll watchdog', {sessionId})
       return false
     }
-    logger.debug('v2.session.wait() resolved — session is idle', {sessionId})
-    activityTracker.sessionIdle = true
+    logger.debug('v2.session.wait() resolved with terminal signal — session is done', {sessionId})
     return true
   } catch (error) {
     logger.debug('v2.session.wait() threw, relying on poll watchdog', {sessionId, error: toErrorMessage(error)})
@@ -151,6 +150,7 @@ export async function runPromptAttempt(
   const waitAbortController = new AbortController()
   const activityTracker: ActivityTracker = {
     firstMeaningfulEventReceived: false,
+    currentTurnTerminalSignalReceived: false,
     currentTurnArmed: startPrompt == null,
     baselineMessageIds: undefined,
     sessionIdle: false,

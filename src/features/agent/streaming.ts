@@ -19,6 +19,8 @@ export interface EventStreamResult {
 /** Mutable by design — updated in-place during stream processing. */
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
+  /** Set only by truly terminal signals: session.idle event or completed assistant message. */
+  currentTurnTerminalSignalReceived: boolean
   currentTurnArmed?: boolean
   baselineMessageIds?: ReadonlySet<string>
   sessionIdle: boolean
@@ -191,7 +193,10 @@ export async function processEventStream(
         if (activityTracker != null) activityTracker.sessionError = errorStr
       }
     } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
-      if (activityTracker != null) activityTracker.sessionIdle = true
+      if (activityTracker != null) {
+        activityTracker.sessionIdle = true
+        activityTracker.currentTurnTerminalSignalReceived = true
+      }
       if (lastText.length > 0) {
         outputTextContent(lastText)
         lastText = ''

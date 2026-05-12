@@ -126,6 +126,8 @@ function createCurrentTurnActivityStream(sessionID = 'ses_123'): {
     stream: (async function* () {
       await new Promise<void>(resolve => setTimeout(resolve, 0))
       yield createCurrentTurnActivityEvent(sessionID)
+      // session.idle is the terminal signal — required for currentTurnTerminalSignalReceived
+      yield {type: 'session.idle', properties: {sessionID}} as unknown as Event
     })(),
     controller: {abort: vi.fn()},
   }
@@ -138,7 +140,12 @@ function createPromptStartedActivityStream(
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
-  return createPromptStartedEventStream(promptAsync, [createCurrentTurnActivityEvent(sessionID)])
+  // Include session.idle after the activity event so currentTurnTerminalSignalReceived is set.
+  // Without it, the poll's status().idle check is blocked and executeOpenCode tests hang.
+  return createPromptStartedEventStream(promptAsync, [
+    createCurrentTurnActivityEvent(sessionID),
+    {type: 'session.idle', properties: {sessionID}} as unknown as Event,
+  ])
 }
 
 function createPromptStartedEventStream(
@@ -148,16 +155,29 @@ function createPromptStartedEventStream(
   stream: AsyncIterable<Event>
   controller: {abort: ReturnType<typeof vi.fn>}
 } {
+  let aborted = false
+  const controller = {
+    abort: vi.fn(() => {
+      aborted = true
+    }),
+  }
   return {
     stream: (async function* () {
       const callsBeforeSubscribe = promptAsync.mock.calls.length
-      while (promptAsync.mock.calls.length === callsBeforeSubscribe) await Promise.resolve()
+      while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
+        if (aborted) return
+        await new Promise<void>(resolve => {
+          setTimeout(resolve, 0)
+        })
+      }
+      if (aborted) return
       await Promise.resolve()
       for (const event of events) {
+        if (aborted) return
         yield event
       }
     })(),
-    controller: {abort: vi.fn()},
+    controller,
   }
 }
 
@@ -997,9 +1017,7 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi
-          .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+        subscribe: vi.fn().mockImplementation(async () => createMockEventStream([])),
       },
     }
 
@@ -1041,9 +1059,7 @@ describe('executeOpenCode retry behavior', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
       },
       event: {
-        subscribe: vi
-          .fn()
-          .mockImplementation(async () => createPromptStartedActivityStream(mockClient.session.promptAsync)),
+        subscribe: vi.fn().mockImplementation(async () => createMockEventStream([])),
       },
     }
 
@@ -1098,6 +1114,7 @@ describe('executeOpenCode retry behavior', () => {
                 },
               },
             } as unknown as Event,
+            {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
           ]
           return Promise.resolve(createPromptStartedEventStream(mockClient.session.promptAsync, events))
         }),
@@ -1779,7 +1796,12 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false, sessionError: 'LLM fetch failed'}
+    const activityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: 'LLM fetch failed',
+    }
     vi.useFakeTimers()
 
     // #when
@@ -1862,7 +1884,12 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     vi.useFakeTimers()
 
     // #when
@@ -1892,7 +1919,12 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     vi.useFakeTimers()
 
     // #when
@@ -1957,7 +1989,12 @@ describe('pollForSessionCompletion', () => {
       },
     }
     const abortController = new AbortController()
-    const activityTracker = {firstMeaningfulEventReceived: true, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: true,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     vi.useFakeTimers()
 
     // #when — start polling, then simulate event stream setting sessionIdle
@@ -1974,6 +2011,7 @@ describe('pollForSessionCompletion', () => {
     // After first poll cycle, simulate the event stream detecting session.idle
     await vi.advanceTimersByTimeAsync(500)
     activityTracker.sessionIdle = true
+    activityTracker.currentTurnTerminalSignalReceived = true
     await vi.advanceTimersByTimeAsync(500)
     const result = await resultPromise
     vi.useRealTimers()
@@ -2017,7 +2055,12 @@ describe('waitForEventProcessorShutdown', () => {
 describe('processEventStream', () => {
   it('marks activity tracker when message part updates arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2041,7 +2084,12 @@ describe('processEventStream', () => {
 
   it('marks activity tracker from message part envelope session when part omits sessionID', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2066,7 +2114,12 @@ describe('processEventStream', () => {
 
   it('marks activity tracker when message part deltas arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2090,7 +2143,12 @@ describe('processEventStream', () => {
 
   it('marks activity tracker when session-next text deltas arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2112,7 +2170,12 @@ describe('processEventStream', () => {
 
   it('marks activity tracker when session-next events include the session on data', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2133,7 +2196,12 @@ describe('processEventStream', () => {
 
   it('marks activity tracker when sync session-next deltas arrive', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2155,7 +2223,12 @@ describe('processEventStream', () => {
 
   it('sets sessionIdle when sync session idle arrives', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2174,7 +2247,12 @@ describe('processEventStream', () => {
 
   it('ignores stream activity events for other sessions', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2196,7 +2274,12 @@ describe('processEventStream', () => {
 
   it('sets sessionIdle on activity tracker when session.idle received', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2214,7 +2297,12 @@ describe('processEventStream', () => {
 
   it('sets sessionIdle only for matching session', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2236,7 +2324,12 @@ describe('processEventStream', () => {
 
   it('sets sessionError on activity tracker when session.error received', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2254,7 +2347,12 @@ describe('processEventStream', () => {
 
   it('continues processing events after session.error without breaking', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2286,7 +2384,12 @@ describe('processEventStream', () => {
 
   it('continues processing events after session.idle without breaking', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2324,7 +2427,12 @@ describe('processEventStream', () => {
 
   it('captures token usage from message envelope session when message info omits sessionID', async () => {
     // #given
-    const activityTracker = {firstMeaningfulEventReceived: false, sessionIdle: false, sessionError: null}
+    const activityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
     const abortController = new AbortController()
     const eventStream = createMockEventStream([
       {
@@ -2395,7 +2503,6 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
-    vi.resetModules()
   })
 
   it('starts consuming the lazy event stream before prompt submission and ignores pre-arm stale events', async () => {
@@ -2423,6 +2530,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       yield stalePreArmEvent
       await postArmEventReady
       yield currentTurnEvent
+      // session.idle after arm provides the terminal signal (currentTurnTerminalSignalReceived)
+      yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
     })()
     const startPrompt = vi.fn(async () => {
       expect(streamStarted).toBe(true)
@@ -2561,6 +2670,129 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(result.error).toContain('Poll timeout')
   })
 
+  it('bUG: stream activity (message.part.delta) + v2 wait resolving does NOT complete — needs terminal signal', async () => {
+    // #given — models the exact false-pass from commit 1116332:
+    // LLM stream starts (message.part.delta / message.updated events arrive), v2.session.wait()
+    // resolves, session.status() reports idle — but no session.idle event and no completed
+    // assistant message. The harness must NOT declare success; it must keep polling until timeout.
+    let resolveWait!: () => void
+    const waitFn = vi.fn<TestWaitFn>().mockImplementation(
+      async () =>
+        new Promise<TestWaitResponse>(resolve => {
+          resolveWait = () => resolve({data: undefined, error: undefined})
+        }),
+    )
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        // status reports idle after activity — this was the false-pass path
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+    // Stream emits current-turn start events (LLM streaming began) but NO session.idle
+    const activityEvents: Event[] = [
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
+      } as unknown as Event,
+      {
+        type: 'message.updated',
+        properties: {sessionID: 'ses_123', info: {role: 'assistant', tokens: {input: 10, output: 5}}},
+      } as unknown as Event,
+    ]
+    const eventStream = createMockEventStream(activityEvents)
+    // Resolve wait after activity events are processed
+    setTimeout(() => resolveWait(), 30)
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      700,
+      mockLogger,
+      eventStream.stream,
+      'http://localhost:1234',
+    )
+
+    // #then — activity observed + wait resolved + status idle is NOT enough; need terminal signal
+    expect(waitFn).toHaveBeenCalled()
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
+  it('new assistant message without time.completed counts activity but does NOT complete', async () => {
+    // #given — detectMessageActivity finds a new assistant message but it has no time.completed
+    // (the LLM is still streaming). Must count as activity (firstMeaningfulEventReceived) but
+    // must NOT return completed: true.
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockResolvedValueOnce({data: []}) // baseline: empty
+          .mockResolvedValue({
+            // poll: new assistant message, no time.completed
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1}}}],
+          }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      700,
+      mockLogger,
+      createMockEventStream([]).stream,
+      'http://localhost:1234',
+      async () => null,
+    )
+
+    // #then — incomplete assistant message must not complete the attempt
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Poll timeout')
+  })
+
+  it('new assistant message WITH time.completed completes the attempt', async () => {
+    // #given — detectMessageActivity finds a new assistant message with time.completed set
+    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockResolvedValueOnce({data: []}) // baseline: empty
+          .mockResolvedValue({
+            // poll: new assistant message with time.completed
+            data: [{info: {id: 'msg_new', role: 'assistant', time: {created: 1, completed: 2}}}],
+          }),
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+      },
+    }
+
+    // #when
+    const result = await runPromptAttempt(
+      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+      'ses_123',
+      '/workspace',
+      30_000,
+      mockLogger,
+      createMockEventStream([]).stream,
+      'http://localhost:1234',
+      async () => null,
+    )
+
+    // #then — completed assistant message IS a terminal signal
+    expect(result.success).toBe(true)
+  })
+
   it('disables message fallback when baseline message listing fails', async () => {
     // #given — fail closed: an old completed assistant message must not become "new" on baseline failure.
     const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
@@ -2632,9 +2864,9 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
-  it('wait() completing after current-turn activity is observed signals success correctly', async () => {
-    // #given — wait resolves, but only AFTER firstMeaningfulEventReceived is already true
-    // (a message.part.delta event arrived first, proving the current turn started)
+  it('wait() completing after current-turn terminal signal is observed signals success correctly', async () => {
+    // #given — wait resolves after BOTH firstMeaningfulEventReceived AND currentTurnTerminalSignalReceived
+    // are true. The terminal signal is session.idle (not just message.part.delta stream start).
     let resolveWait!: () => void
     const waitFn = vi.fn<TestWaitFn>().mockImplementation(
       async () =>
@@ -2650,16 +2882,18 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
       },
     }
-    // Emit a meaningful event (message.part.delta) to set firstMeaningfulEventReceived=true,
-    // then resolve wait after a short delay
-    const activityEvent: Event = {
-      type: 'message.part.delta',
-      properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
-    } as unknown as Event
-    const eventStream = createMockEventStream([activityEvent])
+    // Emit activity event then session.idle (the terminal signal), then resolve wait
+    const events: Event[] = [
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ]
+    const eventStream = createMockEventStream(events)
 
-    // Resolve wait shortly after the event is processed
-    setTimeout(() => resolveWait(), 20)
+    // Resolve wait shortly after the terminal event is processed
+    setTimeout(() => resolveWait(), 30)
 
     // #when
     const result = await runPromptAttempt(
@@ -2672,7 +2906,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       'http://localhost:1234',
     )
 
-    // #then — wait() resolved after activity was observed → success, poll was NOT the authority
+    // #then — wait() resolved after terminal signal → success, poll was NOT the authority
     expect(result.success).toBe(true)
     expect(waitFn).toHaveBeenCalled()
     // poll should not have been the completion authority (status was always busy)
@@ -2697,12 +2931,14 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       },
       // deliberately no v2 property — proves we don't duck-type client.v2
     }
-    // Emit activity first, then resolve wait
-    const activityEvent: Event = {
-      type: 'message.part.delta',
-      properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
-    } as unknown as Event
-    const eventStream = createMockEventStream([activityEvent])
+    // Emit activity + session.idle (terminal signal), then resolve wait
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hello'}},
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
     setTimeout(() => resolveWait(), 20)
 
     // #when — pass serverUrl so the v2 client can be created
@@ -2743,11 +2979,13 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     const mockClient = {
       session: {status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})},
     }
-    const activityEvent: Event = {
-      type: 'message.part.delta',
-      properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
-    } as unknown as Event
-    const eventStream = createMockEventStream([activityEvent])
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
     setTimeout(() => resolveWait(), 20)
 
     // #when
@@ -2765,8 +3003,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(createOpencodeClientMock).toHaveBeenCalledWith({baseUrl: 'http://localhost:9999'})
   })
 
-  it('marks activityTracker.sessionIdle=true after wait() resolves (with prior activity)', async () => {
-    // #given — wait resolves after activity; we verify the tracker is marked idle
+  it('marks activityTracker.sessionIdle=true after wait() resolves (with prior terminal signal)', async () => {
+    // #given — wait resolves after session.idle event (terminal signal); we verify the tracker is marked idle
     let resolveWait!: () => void
     const waitFn = vi.fn<TestWaitFn>().mockImplementation(
       async () =>
@@ -2781,12 +3019,15 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
       },
     }
-    const activityEvent: Event = {
-      type: 'message.part.delta',
-      properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
-    } as unknown as Event
-    const eventStream = createMockEventStream([activityEvent])
-    setTimeout(() => resolveWait(), 20)
+    const events: Event[] = [
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ]
+    const eventStream = createMockEventStream(events)
+    setTimeout(() => resolveWait(), 30)
 
     // #when
     const result = await runPromptAttempt(
@@ -2832,9 +3073,9 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       'http://localhost:1234',
     )
 
-    // #then
+    // #then — wait rejects so v2 unavailable; session.idle event from stream provides
+    // terminal signal, poll completes via sessionIdle check (status not needed)
     expect(result.success).toBe(true)
-    expect(mockClient.session.status).toHaveBeenCalled()
   })
 
   it('falls back to pollForSessionCompletion when no serverUrl is provided', async () => {
@@ -2862,9 +3103,9 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       // no serverUrl
     )
 
-    // #then
+    // #then — no serverUrl so v2 wait skipped; session.idle event from stream provides
+    // terminal signal, poll completes via sessionIdle check (status not needed)
     expect(result.success).toBe(true)
-    expect(mockClient.session.status).toHaveBeenCalled()
   })
 
   it('falls back to pollForSessionCompletion when @opencode-ai/sdk/v2 import fails', async () => {
@@ -2895,9 +3136,9 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       'http://localhost:1234',
     )
 
-    // #then
+    // #then — import fails so v2 wait is unavailable; session.idle event from stream
+    // provides the terminal signal, poll completes via sessionIdle check (status not needed)
     expect(result.success).toBe(true)
-    expect(mockClient.session.status).toHaveBeenCalled()
   })
 
   it('does not complete from message.updated delta events alone', async () => {
@@ -2920,6 +3161,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
+    // message.updated without time.completed — activity but NOT a terminal signal
     const deltaEvents: Event[] = [
       {
         type: 'message.updated',
@@ -2938,10 +3180,12 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           },
         },
       } as unknown as Event,
+      // session.idle provides the terminal signal — wait() alone after delta is not enough
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
     ]
     const eventStream = createMockEventStream(deltaEvents)
 
-    // Resolve wait after a tick so poll can run
+    // Resolve wait after a tick so the terminal signal (session.idle) is observed first
     setTimeout(() => {
       waitResolve?.()
     }, 10)
@@ -2957,7 +3201,8 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       'http://localhost:1234',
     )
 
-    // #then — completion came from wait(), not from message.updated alone
+    // #then — message.updated alone did not complete; session.idle provided terminal signal
+    // then wait() resolved confirming completion
     expect(result.success).toBe(true)
     expect(waitFn).toHaveBeenCalled()
   })
@@ -2991,10 +3236,10 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       'http://localhost:1234',
     )
 
-    // #then — falls back to poll which sees idle → success
-    // (error in wait response is treated as wait unavailable, not a hard failure)
+    // #then — wait error treated as unavailable; session.idle event from stream provides
+    // the terminal signal (currentTurnTerminalSignalReceived), so poll completes via
+    // sessionIdle check without needing to call status().
     expect(result.success).toBe(true)
-    expect(mockClient.session.status).toHaveBeenCalled()
   })
 
   it('never-resolving wait() does not block the no-activity watchdog from timing out', async () => {
@@ -3056,12 +3301,15 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         }),
       },
     }
-    // Emit activity immediately so the activity gate is satisfied before wait resolves
-    const activityEvent: Event = {
-      type: 'message.part.delta',
-      properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
-    } as unknown as Event
-    const eventStream = createMockEventStream([activityEvent])
+    // Emit activity + session.idle (terminal signal) so currentTurnTerminalSignalReceived is set
+    // before wait resolves at 50ms. Without session.idle, wait falls back to poll (busy→timeout).
+    const eventStream = createMockEventStream([
+      {
+        type: 'message.part.delta',
+        properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'hi'}},
+      } as unknown as Event,
+      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
+    ])
 
     // #when
     const result = await runPromptAttempt(
