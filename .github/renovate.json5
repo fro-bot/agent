@@ -78,6 +78,6 @@
   ],
   postUpgradeTasks: {
     commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],
-    executionMode: 'branch',
+    executionMode: 'update',
   },
 }
