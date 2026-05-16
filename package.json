@@ -59,7 +59,7 @@
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.12.2",
-    "@vitest/eslint-plugin": "1.6.16",
+    "@vitest/eslint-plugin": "1.6.17",
     "conventional-changelog-conventionalcommits": "9.3.1",
     "eslint": "10.3.0",
     "eslint-config-prettier": "10.1.8",
