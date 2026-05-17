@@ -603,7 +603,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [ ] **Unit 4: Gateway daemon skeleton + Docker Compose stack**
+- [x] **Unit 4: Gateway daemon skeleton + Docker Compose stack**
 
 **Goal:** Stand up the gateway container, the workspace container, and the mitmproxy container as a 3-service Compose stack. Gateway connects to Discord, registers slash commands, responds to `@mention` with a minimal "pong". Workspace container boots with mitmproxy CA installed and `http_proxy` env vars set. No agent execution yet — this unit verifies plumbing.
 
