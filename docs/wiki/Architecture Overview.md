@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-05-03"
-updated-by: "328fcc5"
+last-updated: "2026-05-17"
+updated-by: "ec2c628"
 sources:
   - src/main.ts
   - src/post.ts
@@ -9,10 +9,11 @@ sources:
   - src/harness/post.ts
   - packages/runtime/src/index.ts
   - packages/runtime/src/coordination/types.ts
+  - packages/gateway/src/main.ts
   - AGENTS.md
   - action.yaml
   - pnpm-workspace.yaml
-summary: "Monorepo structure, four-layer action architecture, runtime package, and module map"
+summary: "Monorepo structure, four-layer action architecture, runtime and gateway packages, and module map"
 ---
 
 # Architecture Overview
@@ -25,10 +26,11 @@ The project is organized as a pnpm workspace monorepo with two workspace areas:
 
 | Package | Path | Purpose |
 | --- | --- | --- |
-| `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Designed to be consumed by any Fro Bot surface (GitHub Action, Discord gateway, etc.). |
+| `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Consumed by both the Action and the Gateway. |
+| `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo coordination lock, and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
 
-The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support future surfaces (like a Discord gateway) that share the runtime package but have their own entry points.
+The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support multiple surfaces (the Discord gateway is now live) that share the runtime package but have their own entry points.
 
 ## Layered Architecture (Action)
 
@@ -54,6 +56,20 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 ## Module Map
 
+### Gateway Package (`packages/gateway/`)
+
+The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs. Key modules:
+
+**Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`), and mention handler (`mentions.ts`). The mention handler parses `@fro-bot` mentions from Discord messages and maps them to agent prompts.
+
+**Config** (`config.ts`) — Loads and validates gateway configuration (Discord token, guild ID, S3/coordination settings) from environment variables.
+
+**Shutdown** (`shutdown.ts`) — Installs SIGINT/SIGTERM handlers for graceful shutdown, ensuring the coordination lock is released and in-flight interactions complete.
+
+**Effect runtime** (`runtime-effect.ts`) — Bootstraps the Effect runtime used for typed error propagation and structured concurrency throughout the gateway.
+
+The gateway is designed to run as a Docker container alongside a mitmproxy allowlist sidecar (see `deploy/`). The allowlist proxy enforces egress control — only Discord and GitHub API hosts are permitted.
+
 ### Runtime Package (`packages/runtime/`)
 
 The runtime package exports five module groups:
@@ -72,7 +88,7 @@ The runtime package exports five module groups:
 
 **Shared** — `logger.ts` provides JSON-structured logging with automatic credential redaction. `types.ts` defines core interfaces (`ActionInputs`, `CacheResult`, `RunContext`). `constants.ts` pins default versions for OpenCode, Bun, oMo, and Systematic.
 
-**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `setup/` orchestrates tool installation (see [[Setup and Configuration]]).
+**Services** — `github/` wraps Octokit and the `NormalizedEvent` system (see [[Execution Lifecycle]]). `cache/` manages GitHub Actions cache with corruption detection and S3 fallback. `setup/` orchestrates tool installation, including the new opt-in oMo installation controlled by the `enable-omo` input (see [[Setup and Configuration]]).
 
 **Features** — `agent/` bridges the runtime prompt builder with GitHub-specific context and the output-mode resolver (see [[Prompt Architecture]]). `triggers/` implements event routing and skip-condition logic. `comments/` and `reviews/` handle GitHub comment and PR review posting. `context/` hydrates issue/PR data via GraphQL. `observability/` collects metrics and generates run summaries. `attachments/` processes file attachments. `delegated/` manages branch, commit, and PR operations the agent performs.
 
