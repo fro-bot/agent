@@ -267,6 +267,64 @@ def test_request_s3_allowed_with_env_var():
 
 
 # ===========================================================================
+# Todo 016 — Wildcard and invalid hostname rejection
+# ===========================================================================
+
+
+def test_object_store_hosts_rejects_wildcard_apex():
+    """OBJECT_STORE_HOSTS='*.s3.amazonaws.com' must raise ValueError containing 'wildcard'."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "*.s3.amazonaws.com"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        assert "wildcard" in str(e).lower(), f"Expected 'wildcard' in error: {e}"
+
+
+def test_object_store_hosts_rejects_wildcard_subdomain():
+    """OBJECT_STORE_HOSTS='*.example.com' must raise ValueError containing 'wildcard'."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "*.example.com"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        assert "wildcard" in str(e).lower(), f"Expected 'wildcard' in error: {e}"
+
+
+def test_object_store_hosts_rejects_invalid_hostname():
+    """OBJECT_STORE_HOSTS='invalid host' (space) must raise ValueError."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "invalid host"})
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass  # expected
+
+
+def test_object_store_hosts_accepts_valid_bucket_host():
+    """OBJECT_STORE_HOSTS='my-bucket.s3.amazonaws.com' must load without error."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com"})
+    assert mod._is_allowed("my-bucket.s3.amazonaws.com") is True
+
+
+# ===========================================================================
+# Todo 015 — Uppercase normalization and port rejection
+# ===========================================================================
+
+
+def test_object_store_hosts_uppercase_normalized():
+    """Uppercase OBJECT_STORE_HOSTS entry must allow the lowercase request host."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "FOO.S3.AMAZONAWS.COM"})
+    assert mod._is_allowed("foo.s3.amazonaws.com") is True
+
+
+def test_object_store_hosts_rejects_port_in_host():
+    """OBJECT_STORE_HOSTS='localhost:9000' must raise ValueError."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "localhost:9000"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        assert "port" in str(e).lower(), f"Expected 'port' in error: {e}"
+
+
+# ===========================================================================
 # Standalone runner (no pytest required)
 # ===========================================================================
 
