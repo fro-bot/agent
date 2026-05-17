@@ -414,7 +414,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ## Implementation Units
 
-- [ ] **Unit 1: Extract shared runtime package**
+- [x] **Unit 1: Extract shared runtime package** (shipped in PR #541, 2026-04-25)
 
 **Goal:** Move agent execution, session storage, prompt assembly, and object-store into `packages/runtime/`. Action keeps working end-to-end on the extracted runtime with zero behavior change.
 
@@ -497,7 +497,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [ ] **Unit 2: Coordination primitives — run-state lifecycle, per-repo lock, per-thread queue**
+- [x] **Unit 2: Coordination primitives — run-state lifecycle, per-repo lock, per-thread queue** (shipped in PR #547, 2026-04-25)
 
 **Goal:** Build the S3-backed coordination primitives that both surfaces depend on: run-state records with heartbeat, per-repo single-writer locks, and per-thread queue persistence.
 
@@ -550,7 +550,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [ ] **Unit 3: Action participates in lock protocol**
+- [x] **Unit 3: Action participates in lock protocol** (shipped in PR #548, 2026-04-25)
 
 **Goal:** Add per-repo lock acquisition to the Action's harness so Action runs and Discord runs on the same repo don't collide. Close the cross-surface correctness hole flagged by flow analysis (Q1).
 
