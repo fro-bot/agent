@@ -1,4 +1,4 @@
-import type {ObjectStoreConfig} from '@fro-bot/runtime'
+import type {ObjectStoreConfig} from './runtime-effect.js'
 
 import {existsSync, readFileSync} from 'node:fs'
 import process from 'node:process'

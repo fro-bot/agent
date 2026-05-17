@@ -26,7 +26,7 @@ import {
   transitionRun,
   validateProviderSemantics,
 } from '@fro-bot/runtime'
-import {Effect, Exit} from 'effect'
+import {Effect} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
@@ -86,6 +86,18 @@ function err(error: Error) {
   return {success: false as const, error}
 }
 
+async function assertEffectFailsWith<E extends Error>(
+  effect: Effect.Effect<unknown, E>,
+  expectedMessageSubstring: string,
+): Promise<void> {
+  const result = await Effect.runPromise(Effect.either(effect))
+  expect(result._tag).toBe('Left')
+  if (result._tag === 'Left') {
+    expect(result.left).toBeInstanceOf(Error)
+    expect((result.left as Error).message).toContain(expectedMessageSubstring)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // acquireLockEffect
 // ---------------------------------------------------------------------------
@@ -110,28 +122,44 @@ describe('acquireLockEffect', () => {
   // #given underlying returns failure Result
   // #when Effect runs
   // #then fails with the error
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
-    const error = new Error('lock conflict')
-    vi.mocked(acquireLock).mockResolvedValue(err(error))
+    vi.mocked(acquireLock).mockResolvedValue(err(new Error('lock conflict')))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       acquireLockEffect(config, 'repo', 'holder', 'discord', 'run-1', coordLogger),
+      'lock conflict',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 
   // #given underlying throws
   // #when Effect runs
   // #then fails with wrapped error
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(acquireLock).mockRejectedValue(new Error('network error'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       acquireLockEffect(config, 'repo', 'holder', 'discord', 'run-1', coordLogger),
+      'network error',
     )
+  })
 
-    expect(Exit.isFailure(exit)).toBe(true)
+  // eslint-disable-next-line vitest/expect-expect
+  it('preserves the error message when Result is failure', async () => {
+    vi.mocked(acquireLock).mockResolvedValue(err(new Error('lock conflict')))
+
+    await assertEffectFailsWith(
+      acquireLockEffect(config, 'repo', 'holder', 'discord', 'run-1', coordLogger),
+      'lock conflict',
+    )
+  })
+
+  // eslint-disable-next-line vitest/expect-expect
+  it('wraps non-Error rejections into an Error instance', async () => {
+    vi.mocked(acquireLock).mockRejectedValue('oops')
+
+    await assertEffectFailsWith(acquireLockEffect(config, 'repo', 'holder', 'discord', 'run-1', coordLogger), 'oops')
   })
 })
 
@@ -150,21 +178,18 @@ describe('releaseLockEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
-    const error = new Error('delete failed')
-    vi.mocked(releaseLock).mockResolvedValue(err(error))
+    vi.mocked(releaseLock).mockResolvedValue(err(new Error('delete failed')))
 
-    const exit = await Effect.runPromiseExit(releaseLockEffect(config, 'repo', 'etag-1', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(releaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'delete failed')
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(releaseLock).mockRejectedValue(new Error('boom'))
 
-    const exit = await Effect.runPromiseExit(releaseLockEffect(config, 'repo', 'etag-1', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(releaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'boom')
   })
 })
 
@@ -192,20 +217,21 @@ describe('renewLeaseEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'new-etag'}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(renewLease).mockResolvedValue(err(new Error('precondition failed')))
 
-    const exit = await Effect.runPromiseExit(renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(
+      renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger),
+      'precondition failed',
+    )
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(renewLease).mockRejectedValue('string error')
 
-    const exit = await Effect.runPromiseExit(renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger), 'string error')
   })
 })
 
@@ -224,20 +250,18 @@ describe('forceReleaseLockEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(forceReleaseLock).mockResolvedValue(err(new Error('force delete failed')))
 
-    const exit = await Effect.runPromiseExit(forceReleaseLockEffect(config, 'repo', 'etag-1', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(forceReleaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'force delete failed')
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(forceReleaseLock).mockRejectedValue(new Error('boom'))
 
-    const exit = await Effect.runPromiseExit(forceReleaseLockEffect(config, 'repo', 'etag-1', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(forceReleaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'boom')
   })
 })
 
@@ -268,20 +292,18 @@ describe('createRunEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'etag-1'}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(createRun).mockResolvedValue(err(new Error('already exists')))
 
-    const exit = await Effect.runPromiseExit(createRunEffect(config, 'identity', 'repo', runState, coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(createRunEffect(config, 'identity', 'repo', runState, coordLogger), 'already exists')
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(createRun).mockRejectedValue(new Error('network'))
 
-    const exit = await Effect.runPromiseExit(createRunEffect(config, 'identity', 'repo', runState, coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(createRunEffect(config, 'identity', 'repo', runState, coordLogger), 'network')
   })
 })
 
@@ -314,24 +336,24 @@ describe('transitionRunEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'etag-2', state: {phase: 'ACKNOWLEDGED'}}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(transitionRun).mockResolvedValue(err(new Error('invalid transition')))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       transitionRunEffect(config, 'identity', 'repo', 'run-1', 'ACKNOWLEDGED', 'etag-1', coordLogger),
+      'invalid transition',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(transitionRun).mockRejectedValue(new Error('timeout'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       transitionRunEffect(config, 'identity', 'repo', 'run-1', 'ACKNOWLEDGED', 'etag-1', coordLogger),
+      'timeout',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 })
 
@@ -350,20 +372,18 @@ describe('findStaleRunsEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: []})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(findStaleRuns).mockResolvedValue(err(new Error('list failed')))
 
-    const exit = await Effect.runPromiseExit(findStaleRunsEffect(config, 'identity', 'repo', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(findStaleRunsEffect(config, 'identity', 'repo', coordLogger), 'list failed')
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(findStaleRuns).mockRejectedValue(new Error('boom'))
 
-    const exit = await Effect.runPromiseExit(findStaleRunsEffect(config, 'identity', 'repo', coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(findStaleRunsEffect(config, 'identity', 'repo', coordLogger), 'boom')
   })
 })
 
@@ -382,20 +402,18 @@ describe('validateProviderSemanticsEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(validateProviderSemantics).mockResolvedValue(err(new Error('semantics check failed')))
 
-    const exit = await Effect.runPromiseExit(validateProviderSemanticsEffect(config, coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(validateProviderSemanticsEffect(config, coordLogger), 'semantics check failed')
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(validateProviderSemantics).mockRejectedValue(new Error('provider unreachable'))
 
-    const exit = await Effect.runPromiseExit(validateProviderSemanticsEffect(config, coordLogger))
-
-    expect(Exit.isFailure(exit)).toBe(true)
+    await assertEffectFailsWith(validateProviderSemanticsEffect(config, coordLogger), 'provider unreachable')
   })
 })
 
@@ -416,14 +434,14 @@ describe('syncSessionsToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {uploaded: 2, failed: 0}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncSessionsToStore).mockRejectedValue(new Error('upload error'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       syncSessionsToStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
+      'upload error',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 })
 
@@ -440,14 +458,14 @@ describe('syncSessionsFromStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {downloaded: 3, failed: 0, mainDbRestored: true}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncSessionsFromStore).mockRejectedValue(new Error('download error'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       syncSessionsFromStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
+      'download error',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 })
 
@@ -464,14 +482,14 @@ describe('syncArtifactsToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {uploaded: 1, failed: 0}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncArtifactsToStore).mockRejectedValue(new Error('artifact error'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       syncArtifactsToStoreEffect(adapter, storeConfig, 'identity', 'repo', 'run-1', '/logs', logger),
+      'artifact error',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 })
 
@@ -488,13 +506,13 @@ describe('syncMetadataToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {success: true}})
   })
 
+  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncMetadataToStore).mockRejectedValue(new Error('metadata error'))
 
-    const exit = await Effect.runPromiseExit(
+    await assertEffectFailsWith(
       syncMetadataToStoreEffect(adapter, storeConfig, 'identity', 'repo', 'run-1', {key: 'val'}, logger),
+      'metadata error',
     )
-
-    expect(Exit.isFailure(exit)).toBe(true)
   })
 })

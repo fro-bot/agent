@@ -5,7 +5,7 @@ import process from 'node:process'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {DEFAULT_DRAIN_MS, installShutdownHandlers} from './shutdown.js'
+import {__resetShuttingDownForTests, DEFAULT_DRAIN_MS, installShutdownHandlers} from './shutdown.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,6 +45,8 @@ describe('installShutdownHandlers', () => {
       // branch to fire process.exit(1) again, masking the real exit code.
       return undefined as never
     })
+    // Todo 008: reset module-level shuttingDown so tests don't leak state.
+    __resetShuttingDownForTests()
   })
 
   afterEach(() => {
@@ -156,5 +158,53 @@ describe('installShutdownHandlers', () => {
     // #given the module default export
     // #then the drain timeout is 25 seconds
     expect(DEFAULT_DRAIN_MS).toBe(25_000)
+  })
+
+  // Todo 013: cover client.destroy() rejection path
+  it('logs shutdown failed and exits 1 when client.destroy() rejects', async () => {
+    // #given
+    const {logger, calls} = makeLogger()
+    const client = makeClient(0)
+    ;(client.destroy as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('destroy failed'))
+    const drainMs = 1_000
+    const cleanup = installShutdownHandlers(client, logger, drainMs)
+
+    // #when
+    process.emit('SIGTERM')
+    await vi.runAllTimersAsync()
+    cleanup()
+
+    // #then
+    expect(calls.some(c => c.method === 'info' && c.msg === 'shutdown initiated')).toBe(true)
+    expect(calls.some(c => c.method === 'warn' && c.msg === 'client.destroy() rejected during shutdown')).toBe(true)
+    expect(calls.some(c => c.method === 'warn' && c.msg === 'shutdown failed')).toBe(true)
+    expect(exitCodes).toContain(1)
+    expect(exitCodes).not.toContain(0)
+  })
+
+  // Todo 008: idempotency across multiple installs
+  it('is idempotent across multiple installs', async () => {
+    // #given two separate installShutdownHandlers calls
+    const {logger, calls} = makeLogger()
+    const client1 = makeClient(0)
+    const client2 = makeClient(0)
+    const cleanup1 = installShutdownHandlers(client1, logger, 1_000)
+    const cleanup2 = installShutdownHandlers(client2, logger, 1_000)
+
+    // #when one SIGTERM arrives
+    process.emit('SIGTERM')
+    await vi.runAllTimersAsync()
+    cleanup1()
+    cleanup2()
+
+    // #then exactly one shutdown initiated, exactly one process.exit
+    expect(calls.filter(c => c.method === 'info' && c.msg === 'shutdown initiated')).toHaveLength(1)
+    expect(exitCodes.filter(c => c === 0)).toHaveLength(1)
+    expect(exitCodes).not.toContain(1)
+
+    // #and — only ONE of the two clients had destroy() called total
+    const destroy1Count = (client1.destroy as ReturnType<typeof vi.fn>).mock.calls.length
+    const destroy2Count = (client2.destroy as ReturnType<typeof vi.fn>).mock.calls.length
+    expect(destroy1Count + destroy2Count).toBe(1)
   })
 })

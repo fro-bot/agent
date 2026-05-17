@@ -33,6 +33,8 @@ import {
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
 
+export type {ObjectStoreConfig} from '@fro-bot/runtime'
+
 // ---------------------------------------------------------------------------
 // Shared logger type used by all coordination functions
 // ---------------------------------------------------------------------------
