@@ -39,7 +39,7 @@ services:
       - sandbox-net
     restart: unless-stopped
     healthcheck:
-      test: [CMD, node, -e, process.exit(0)]
+      test: [CMD-SHELL, test -s /etc/ssl/certs/mitmproxy-ca-cert.pem]
       interval: 30s
       timeout: 5s
       retries: 3

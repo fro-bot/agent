@@ -120,6 +120,29 @@ def test_is_allowed_empty_allowlist():
 
 
 # ===========================================================================
+# _is_valid_hostname — dot-boundary edge cases (Fix 1)
+# ===========================================================================
+
+
+def test_is_valid_hostname_rejects_leading_dot():
+    """.example.com must return False — leading dot creates an empty label."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname(".example.com") is False
+
+
+def test_is_valid_hostname_rejects_trailing_dot():
+    """example.com. must return False — trailing dot is not a valid RFC 1123 host."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname("example.com.") is False
+
+
+def test_is_valid_hostname_rejects_consecutive_dots():
+    """example..com must return False — consecutive dots create an empty label."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname("example..com") is False
+
+
+# ===========================================================================
 # OBJECT_STORE_HOSTS env-var merging
 # ===========================================================================
 
@@ -264,6 +287,94 @@ def test_request_s3_allowed_with_env_var():
     addon.request(flow)
     assert flow.response is None
     mitmproxy_http_mock.Response.make.assert_not_called()
+
+
+# ===========================================================================
+# Todo 016 — Wildcard and invalid hostname rejection
+# ===========================================================================
+
+
+def test_object_store_hosts_rejects_wildcard_apex():
+    """OBJECT_STORE_HOSTS='*.s3.amazonaws.com' must raise ValueError with actionable guidance."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "*.s3.amazonaws.com"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "*.s3.amazonaws.com" in msg, f"Expected wildcard entry name in error: {e}"
+
+
+def test_object_store_hosts_rejects_wildcard_subdomain():
+    """OBJECT_STORE_HOSTS='*.example.com' must raise ValueError with actionable guidance."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "*.example.com"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "*.example.com" in msg, f"Expected wildcard entry name in error: {e}"
+
+
+def test_object_store_hosts_rejects_invalid_hostname():
+    """OBJECT_STORE_HOSTS='invalid host' (space) must raise ValueError with entry name."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "invalid host"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        # The validator sees "invalid host" as a single entry (space is not a comma),
+        # which fails RFC 1123 — the error must name the offending entry.
+        assert "invalid host" in msg, f"Expected entry name in error: {e}"
+
+
+def test_object_store_hosts_accepts_valid_bucket_host():
+    """OBJECT_STORE_HOSTS='my-bucket.s3.amazonaws.com' must load without error."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com"})
+    assert mod._is_allowed("my-bucket.s3.amazonaws.com") is True
+
+
+# ===========================================================================
+# Todo 015 — Uppercase normalization and port rejection
+# ===========================================================================
+
+
+def test_object_store_hosts_uppercase_normalized():
+    """Uppercase OBJECT_STORE_HOSTS entry must allow the lowercase request host."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "FOO.S3.AMAZONAWS.COM"})
+    assert mod._is_allowed("foo.s3.amazonaws.com") is True
+
+
+def test_object_store_hosts_rejects_port_in_host():
+    """OBJECT_STORE_HOSTS='localhost:9000' must raise ValueError."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "localhost:9000"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        assert "port" in str(e).lower(), f"Expected 'port' in error: {e}"
+
+
+def test_object_store_hosts_rejects_ipv6_literal():
+    """OBJECT_STORE_HOSTS='::1' must raise ValueError mentioning IPv6, not 'port'."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "::1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "IPv6" in msg, f"Expected 'IPv6' in error, got: {e}"
+        assert "contains a port" not in msg.lower(), f"Error should not say 'contains a port' for IPv6: {e}"
+
+
+def test_object_store_hosts_accepts_ipv4_literal() -> None:
+    """IPv4 literals are intentionally accepted to support self-hosted MinIO.
+
+    See todo 017 for the deferred decision on whether to reject private/
+    metadata-service IP ranges. This test documents current behavior so
+    a future refactor doesn't accidentally change it without an explicit
+    decision.
+    """
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "10.0.0.5"})
+    assert mod._is_allowed("10.0.0.5") is True
 
 
 # ===========================================================================

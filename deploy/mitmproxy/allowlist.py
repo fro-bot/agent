@@ -30,6 +30,11 @@ from mitmproxy import http
 # ---------------------------------------------------------------------------
 # Allowlist — production-safe defaults for fro-bot v1.
 # Entries starting with "*." match any subdomain of the given domain.
+#
+# Wildcard entries (*.foo.com) are permitted in this static list because they
+# go through code review. The same wildcards are REJECTED when supplied via
+# OBJECT_STORE_HOSTS env var to prevent operators (or attackers with deploy-
+# config access) from silently re-introducing over-broad allowlist holes.
 # ---------------------------------------------------------------------------
 ALLOWLIST: list[str] = [
     # GitHub
@@ -54,12 +59,93 @@ ALLOWLIST: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Hostname validation helper (RFC 1123 subset).
+# ---------------------------------------------------------------------------
+
+def _is_valid_hostname(hostname: str) -> bool:
+    """Return True if *hostname* is a valid RFC 1123 hostname.
+
+    Accepts 1-253 characters composed of labels separated by dots. Each label
+    must be 1-63 characters of [a-z0-9-], must not start or end with a hyphen.
+    Uppercase is not accepted here — callers must lowercase first.
+    """
+    if not (1 <= len(hostname) <= 253):
+        return False
+    # Reject leading/trailing dots and consecutive dots — these create empty
+    # labels that pass the per-label check but are not valid RFC 1123 hosts.
+    if hostname.startswith(".") or hostname.endswith("."):
+        return False
+    if ".." in hostname:
+        return False
+    labels = hostname.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if not all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in label):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Merge OBJECT_STORE_HOSTS env var into the allowlist at module import time.
+#
+# Validation order per entry (after strip):
+#   1. empty-skip   — blank entries are silently ignored
+#   2. wildcard-reject — entries starting with "*." are rejected (more
+#                        actionable error than the generic hostname check)
+#   3. port-reject  — entries containing ":" are rejected (mitmproxy
+#                     flow.request.host may or may not include the port
+#                     depending on version/mode; bare hostnames only)
+#   4. hostname-validate — must pass RFC 1123 check (after lowercasing)
+#   5. lowercase-normalize — stored in lowercase for consistent matching
 # ---------------------------------------------------------------------------
 _object_store_hosts_raw = os.environ.get("OBJECT_STORE_HOSTS", "")
-_object_store_hosts: list[str] = [
-    h.strip() for h in _object_store_hosts_raw.split(",") if h.strip()
-]
+_object_store_hosts: list[str] = []
+for _entry in _object_store_hosts_raw.split(","):
+    _h = _entry.strip()
+    if not _h:
+        # 1. empty-skip
+        continue
+    if _h.startswith("*."):
+        # 2. wildcard-reject
+        raise ValueError(
+            f"OBJECT_STORE_HOSTS contains a wildcard entry '{_h}'. "
+            "Wildcards are not allowed in object-store hosts to prevent "
+            "re-introducing the over-broad-allowlist security gap. "
+            "Set exact bucket hostnames (e.g. 'my-bucket.s3.amazonaws.com')."
+        )
+    if ":" in _h:
+        # 3. port-reject (also catches IPv6 literals, which contain multiple colons)
+        if _h.count(":") > 1 or _h.startswith("["):
+            raise ValueError(
+                f"OBJECT_STORE_HOSTS entry '{_h}' looks like an IPv6 address. "
+                "IPv6 is not yet supported; use IPv4 or a hostname for now."
+            )
+        raise ValueError(
+            f"OBJECT_STORE_HOSTS entry '{_h}' contains a port. mitmproxy may "
+            "or may not include the port in flow.request.host depending on "
+            "version and proxy mode. Set bare hostnames only "
+            "(e.g. 'localhost' or 'minio')."
+        )
+    _h_lower = _h.lower()
+    # Note: this validator intentionally accepts IPv4 literals (e.g. "10.0.0.5",
+    # "192.168.1.1") because the MinIO/self-hosted object-store use case often
+    # uses IPs. An attacker with deploy-config access could point this at metadata-
+    # service IPs (169.254.169.254) — that risk is accepted because deploy-config
+    # is already a trust boundary. Tracked for future tightening in
+    # .context/systematic/todos/017-ready-p3-object-store-hosts-ip-literal-decision.md
+    if not _is_valid_hostname(_h_lower):
+        # 4. hostname-validate
+        raise ValueError(
+            f"OBJECT_STORE_HOSTS entry '{_h}' is not a valid hostname. "
+            "Use RFC 1123 hostnames composed of labels separated by dots "
+            "(e.g. 'my-bucket.s3.amazonaws.com')."
+        )
+    # 5. lowercase-normalize
+    _object_store_hosts.append(_h_lower)
+
 ALLOWLIST = ALLOWLIST + _object_store_hosts
 
 
