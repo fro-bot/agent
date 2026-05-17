@@ -58,10 +58,7 @@ export async function runPromptAttempt(
     sessionError: null,
   }
 
-  // Pass `directory` so the SSE subscription routes to the same workspace instance as the
-  // prompt. Without it the subscription resolves to the server's default instance
-  // (process.cwd at server boot) and never sees publishes from this directory's bus.
-  const events = await client.event.subscribe({query: {directory}})
+  const events = await client.event.subscribe()
 
   let eventStreamResult: EventStreamResult = {
     tokens: null,
