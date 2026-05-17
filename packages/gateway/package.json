@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*",
+    "discord.js": "14.26.4",
     "effect": "3.18.4"
   }
 }
