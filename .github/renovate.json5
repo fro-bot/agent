@@ -58,6 +58,15 @@
       semanticCommitType: 'build',
     },
     {
+      // Pin OpenCode to 1.14.41. Versions 1.14.42+ regressed the /event SSE
+      // stream so SyncEvent publishes (message.part.updated, message.updated,
+      // session.next.*) never reach bus.subscribeAll() subscribers, breaking
+      // visible tool-call output in the harness. Revisit when upstream fixes
+      // the bus delivery contract.
+      matchPackageNames: ['anomalyco/opencode', '@opencode-ai/sdk'],
+      allowedVersions: '<=1.14.41',
+    },
+    {
       matchUpdateTypes: ['lockFileMaintenance'],
       semanticCommitType: 'build',
     },
