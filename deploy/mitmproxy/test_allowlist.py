@@ -120,6 +120,29 @@ def test_is_allowed_empty_allowlist():
 
 
 # ===========================================================================
+# _is_valid_hostname — dot-boundary edge cases (Fix 1)
+# ===========================================================================
+
+
+def test_is_valid_hostname_rejects_leading_dot():
+    """.example.com must return False — leading dot creates an empty label."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname(".example.com") is False
+
+
+def test_is_valid_hostname_rejects_trailing_dot():
+    """example.com. must return False — trailing dot is not a valid RFC 1123 host."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname("example.com.") is False
+
+
+def test_is_valid_hostname_rejects_consecutive_dots():
+    """example..com must return False — consecutive dots create an empty label."""
+    mod = _load_allowlist()
+    assert mod._is_valid_hostname("example..com") is False
+
+
+# ===========================================================================
 # OBJECT_STORE_HOSTS env-var merging
 # ===========================================================================
 
@@ -272,30 +295,37 @@ def test_request_s3_allowed_with_env_var():
 
 
 def test_object_store_hosts_rejects_wildcard_apex():
-    """OBJECT_STORE_HOSTS='*.s3.amazonaws.com' must raise ValueError containing 'wildcard'."""
+    """OBJECT_STORE_HOSTS='*.s3.amazonaws.com' must raise ValueError with actionable guidance."""
     try:
         _load_allowlist({"OBJECT_STORE_HOSTS": "*.s3.amazonaws.com"})
         assert False, "Expected ValueError"
     except ValueError as e:
-        assert "wildcard" in str(e).lower(), f"Expected 'wildcard' in error: {e}"
+        msg = str(e)
+        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "*.s3.amazonaws.com" in msg, f"Expected wildcard entry name in error: {e}"
 
 
 def test_object_store_hosts_rejects_wildcard_subdomain():
-    """OBJECT_STORE_HOSTS='*.example.com' must raise ValueError containing 'wildcard'."""
+    """OBJECT_STORE_HOSTS='*.example.com' must raise ValueError with actionable guidance."""
     try:
         _load_allowlist({"OBJECT_STORE_HOSTS": "*.example.com"})
         assert False, "Expected ValueError"
     except ValueError as e:
-        assert "wildcard" in str(e).lower(), f"Expected 'wildcard' in error: {e}"
+        msg = str(e)
+        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "*.example.com" in msg, f"Expected wildcard entry name in error: {e}"
 
 
 def test_object_store_hosts_rejects_invalid_hostname():
-    """OBJECT_STORE_HOSTS='invalid host' (space) must raise ValueError."""
+    """OBJECT_STORE_HOSTS='invalid host' (space) must raise ValueError with entry name."""
     try:
         _load_allowlist({"OBJECT_STORE_HOSTS": "invalid host"})
         assert False, "Expected ValueError"
-    except ValueError:
-        pass  # expected
+    except ValueError as e:
+        msg = str(e)
+        # The validator sees "invalid host" as a single entry (space is not a comma),
+        # which fails RFC 1123 — the error must name the offending entry.
+        assert "invalid host" in msg, f"Expected entry name in error: {e}"
 
 
 def test_object_store_hosts_accepts_valid_bucket_host():

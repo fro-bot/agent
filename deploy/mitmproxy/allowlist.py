@@ -64,9 +64,15 @@ def _is_valid_hostname(hostname: str) -> bool:
     must be 1-63 characters of [a-z0-9-], must not start or end with a hyphen.
     Uppercase is not accepted here — callers must lowercase first.
     """
-    if not hostname or len(hostname) > 253:
+    if not (1 <= len(hostname) <= 253):
         return False
-    labels = hostname.rstrip(".").split(".")
+    # Reject leading/trailing dots and consecutive dots — these create empty
+    # labels that pass the per-label check but are not valid RFC 1123 hosts.
+    if hostname.startswith(".") or hostname.endswith("."):
+        return False
+    if ".." in hostname:
+        return False
+    labels = hostname.split(".")
     for label in labels:
         if not label or len(label) > 63:
             return False
