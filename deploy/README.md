@@ -124,8 +124,19 @@ The mitmproxy addon at `deploy/mitmproxy/allowlist.py` enforces a static allowli
 
 - GitHub API + raw content
 - npm registry
-- S3-compatible object stores (AWS + Cloudflare R2)
 - Discord API + gateway
 - LLM providers (Anthropic, OpenAI, Google)
 
-Any host not on the list receives a 403 and the connection is dropped.
+Any host not on the list receives a 403 and the connection is dropped. Both HTTPS CONNECT tunnels and plain HTTP requests are enforced.
+
+### Object-store bucket scoping
+
+The allowlist does **not** include broad S3/R2 wildcards (`*.s3.amazonaws.com`, `*.r2.cloudflarestorage.com`). Instead, set the `OBJECT_STORE_HOSTS` environment variable on the `mitmproxy` service to the exact bucket host(s) your deployment uses:
+
+```
+OBJECT_STORE_HOSTS=my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.com
+```
+
+If `OBJECT_STORE_HOSTS` is unset or empty, all S3/R2 traffic is blocked (fail-closed default). This prevents workspace processes from exfiltrating data to attacker-controlled buckets in those clouds.
+
+Set the variable in your `.env` file or `compose.override.yaml` (see `compose.override.example.yaml` for an example).

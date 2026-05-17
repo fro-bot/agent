@@ -69,6 +69,13 @@ services:
       --listen-port 8080
       --set confdir=/home/mitmproxy/.mitmproxy
       --set ssl_insecure=false
+    environment:
+      # Comma-separated list of exact object-store hosts to allow (e.g.
+      # "my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.com").
+      # The static allowlist does NOT include broad S3/R2 wildcards — set this
+      # to the exact bucket host(s) your deployment uses. If unset or empty,
+      # all S3/R2 traffic is blocked (fail-closed default).
+      OBJECT_STORE_HOSTS: ${OBJECT_STORE_HOSTS:-}
     volumes:
       - ./mitmproxy/allowlist.py:/scripts/allowlist.py:ro
       # Named volume: mitmproxy writes CA here; gateway/workspace read it for trust

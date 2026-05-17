@@ -23,6 +23,11 @@ services:
       --web-port 8081
       --set confdir=/home/mitmproxy/.mitmproxy
       --set ssl_insecure=false
+    environment:
+      # Set OBJECT_STORE_HOSTS to the exact bucket host(s) your deployment uses.
+      # Example: "my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.com"
+      # If unset or empty, all S3/R2 traffic is blocked (fail-closed default).
+      OBJECT_STORE_HOSTS: ''
 
   gateway:
     # Override the mitmproxy-certs volume path for dev if you want a local dir
