@@ -249,7 +249,8 @@ export async function runPromptAttempt(
     currentTurnTerminalSignalReceived: false,
     currentTurnArmed: startPrompt == null,
     baselineMessageIds: undefined,
-    visibleOutputEmitted: false,
+    textOutputEmitted: false,
+    toolOutputEmitted: false,
     sessionIdle: false,
     sessionError: null,
   }
@@ -357,12 +358,13 @@ export async function runPromptAttempt(
       }
     }
 
-    // If the live SSE stream emitted no visible output but the message fallback found a completed
-    // assistant message with parts, render those parts now so the user sees the agent's response.
-    // When visible output already streamed, do one immediate message read only to merge missed
-    // artifacts; do not wait the stability window because there is nothing left to render.
-    const fallbackMessageMaxWaitMs =
-      activityTracker.visibleOutputEmitted === true ? 0 : FALLBACK_MESSAGES_STABILITY_WAIT_MS
+    // Render any visible output the live stream missed by reading the completed assistant
+    // message and rendering its parts. Text and tool rendering are gated independently so the
+    // common case (live text streamed, no tool events seen) still renders tool execution lines.
+    // Wait the stability window only when either signal is still missing; if both were emitted
+    // live, do one immediate read just to merge missed artifacts.
+    const liveStreamComplete = activityTracker.textOutputEmitted === true && activityTracker.toolOutputEmitted === true
+    const fallbackMessageMaxWaitMs = liveStreamComplete ? 0 : FALLBACK_MESSAGES_STABILITY_WAIT_MS
     const fallbackMessageParts =
       activityTracker.fallbackMessageParts ??
       (await readCompletedAssistantMessageParts(
@@ -376,7 +378,8 @@ export async function runPromptAttempt(
 
     if (fallbackMessageParts != null) {
       const fallback = renderFallbackMessageParts(fallbackMessageParts, logger, {
-        renderVisibleOutput: activityTracker.visibleOutputEmitted !== true,
+        renderText: activityTracker.textOutputEmitted !== true,
+        renderTools: activityTracker.toolOutputEmitted !== true,
       })
       const merged = mergeEventStreamAndFallbackResults(eventStreamResult, fallback)
       return {

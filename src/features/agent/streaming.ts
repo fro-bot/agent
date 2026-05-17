@@ -18,7 +18,8 @@ export interface EventStreamResult {
 }
 
 export interface FallbackRenderOptions {
-  readonly renderVisibleOutput: boolean
+  readonly renderText: boolean
+  readonly renderTools: boolean
 }
 
 /** Mutable by design — updated in-place during stream processing. */
@@ -30,8 +31,10 @@ export interface ActivityTracker {
   baselineMessageIds?: ReadonlySet<string>
   completedAssistantMessageId?: string
   completedAssistantMessageObservedAt?: number
-  /** True once outputTextContent or outputToolExecution has been called during stream processing. */
-  visibleOutputEmitted?: boolean
+  /** True once outputTextContent has been called during live stream processing. */
+  textOutputEmitted?: boolean
+  /** True once outputToolExecution has been called during live stream processing. */
+  toolOutputEmitted?: boolean
   /** Parts from the fallback completed assistant message, set by detectMessageActivity. */
   fallbackMessageParts?: readonly unknown[]
   sessionIdle: boolean
@@ -131,13 +134,17 @@ function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
 
-function markVisibleOutputEmitted(activityTracker: ActivityTracker | undefined): void {
-  if (activityTracker != null) activityTracker.visibleOutputEmitted = true
+function markTextOutputEmitted(activityTracker: ActivityTracker | undefined): void {
+  if (activityTracker != null) activityTracker.textOutputEmitted = true
+}
+
+function markToolOutputEmitted(activityTracker: ActivityTracker | undefined): void {
+  if (activityTracker != null) activityTracker.toolOutputEmitted = true
 }
 
 function outputStreamTextContent(text: string, activityTracker: ActivityTracker | undefined): void {
   outputTextContent(text)
-  markVisibleOutputEmitted(activityTracker)
+  markTextOutputEmitted(activityTracker)
 }
 
 function outputStreamToolExecution(
@@ -146,7 +153,7 @@ function outputStreamToolExecution(
   activityTracker: ActivityTracker | undefined,
 ): void {
   outputToolExecution(toolName, title)
-  markVisibleOutputEmitted(activityTracker)
+  markToolOutputEmitted(activityTracker)
 }
 
 interface ToolCallInfo {
@@ -347,13 +354,15 @@ export async function processEventStream(
 
 /**
  * Render completed assistant message parts from the message-fallback path.
- * Only called when the live SSE stream did not emit any visible output.
- * Returns a partial EventStreamResult with artifacts detected from the parts.
+ * Called after the live SSE stream completes to backfill any visible output it missed.
+ * Text and tool rendering are gated independently via FallbackRenderOptions so callers can
+ * suppress whichever side already streamed live (avoids double-printing).
+ * Returns a partial EventStreamResult with artifacts detected from the bash tool parts.
  */
 export function renderFallbackMessageParts(
   parts: readonly unknown[],
   logger: Logger,
-  options: FallbackRenderOptions = {renderVisibleOutput: true},
+  options: FallbackRenderOptions = {renderText: true, renderTools: true},
 ): Pick<EventStreamResult, 'prsCreated' | 'commitsCreated' | 'commentsPostedUrls' | 'commentsPosted'> {
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
@@ -364,7 +373,7 @@ export function renderFallbackMessageParts(
     const partType = getStringProperty(part, 'type')
     if (partType === 'text') {
       const text = getStringProperty(part, 'text')
-      if (text != null && options.renderVisibleOutput) {
+      if (text != null && options.renderText === true) {
         outputTextContent(text)
         logger.debug('Fallback: rendered text part')
       }
@@ -373,7 +382,7 @@ export function renderFallbackMessageParts(
       if (getStringProperty(toolState, 'status') === 'completed') {
         const tool = getStringProperty(part, 'tool') ?? ''
         const title = String(getObjectProperty(toolState, 'title') ?? '')
-        if (options.renderVisibleOutput) {
+        if (options.renderTools === true) {
           outputToolExecution(tool, title)
           logger.debug('Fallback: rendered tool part', {tool, title})
         }

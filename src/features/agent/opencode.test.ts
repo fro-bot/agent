@@ -1420,7 +1420,9 @@ describe('LLM error detection', () => {
 
     // #when
     const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
-    await vi.advanceTimersByTimeAsync(1000)
+    // Advance past the FALLBACK_MESSAGES_STABILITY_WAIT_MS (1500ms) so the fallback
+    // message poll loop exits when no completed assistant message is found.
+    await vi.advanceTimersByTimeAsync(2000)
     const result = await resultPromise
 
     // #then
@@ -2688,7 +2690,8 @@ describe('processEventStream', () => {
     const activityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
-      visibleOutputEmitted: false,
+      textOutputEmitted: false,
+      toolOutputEmitted: false,
       sessionIdle: false,
       sessionError: null,
     }
@@ -2713,7 +2716,7 @@ describe('processEventStream', () => {
 
     // #then — text accumulated from delta must be flushed to stdout on idle
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Hello from delta'))
-    expect(activityTracker.visibleOutputEmitted).toBe(true)
+    expect(activityTracker.textOutputEmitted).toBe(true)
     writeSpy.mockRestore()
   })
 
@@ -2778,7 +2781,8 @@ describe('processEventStream', () => {
     const activityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
-      visibleOutputEmitted: false,
+      textOutputEmitted: false,
+      toolOutputEmitted: false,
       sessionIdle: false,
       sessionError: null,
     }
@@ -2817,7 +2821,7 @@ describe('processEventStream', () => {
     // #then — tool line must appear: "| Bash       Check for existing wiki PR"
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Bash'))
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Check for existing wiki PR'))
-    expect(activityTracker.visibleOutputEmitted).toBe(true)
+    expect(activityTracker.toolOutputEmitted).toBe(true)
     writeSpy.mockRestore()
   })
 
@@ -4002,8 +4006,102 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       const allWrites = writeSpy.mock.calls.map(c => String(c[0])).join('')
       expect(allWrites).toContain('Live stream text')
       expect(allWrites).not.toContain('Fallback text should not duplicate')
-      expect(allWrites).not.toContain('Create PR')
+      // Tool was NOT emitted live (toolOutputEmitted=false), so fallback MUST render it
+      expect(allWrites).toContain('Create PR')
       expect(result.eventStreamResult.prsCreated).toContain('https://github.com/owner/repo/pull/43')
+    } finally {
+      writeSpy.mockRestore()
+    }
+  })
+
+  it('renders fallback tool parts even when live stream emitted final text', async () => {
+    // #given — live stream emits text deltas (setting textOutputEmitted=true) but no tool parts.
+    // The completed assistant message fetched after completion contains BOTH a text part AND a
+    // completed bash tool part. The fallback renderer must render the tool part (toolOutputEmitted
+    // was never set) but must NOT re-render the text part (textOutputEmitted was set by live stream).
+    const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait unavailable'))
+    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
+    const {runPromptAttempt} = await import('./retry.js')
+
+    const completedAssistantMessage = {
+      info: {
+        id: 'msg_text_and_tool',
+        role: 'assistant',
+        time: {created: 1, completed: 2},
+      },
+      parts: [
+        {type: 'text', text: 'Live streamed text content'},
+        {
+          type: 'tool',
+          tool: 'bash',
+          state: {
+            status: 'completed',
+            title: 'Check for existing wiki PR',
+            input: {command: 'gh pr list --search "wiki"'},
+            output: 'no PRs found',
+          },
+        },
+      ],
+    }
+
+    const mockClient = {
+      session: {
+        messages: vi
+          .fn()
+          .mockResolvedValueOnce({data: []}) // baseline: empty
+          .mockResolvedValue({data: [completedAssistantMessage]}), // poll: completed assistant
+        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+      },
+    }
+
+    // Live stream emits text deltas but no tool parts
+    const eventStream = {
+      stream: (async function* () {
+        await new Promise<void>(resolve => {
+          setTimeout(resolve, 0)
+        })
+        yield {
+          type: 'message.part.delta',
+          properties: {
+            sessionID: 'ses_123',
+            messageID: 'msg_live',
+            partID: 'prt_live',
+            field: 'text',
+            delta: 'Live streamed text content',
+          },
+        } as unknown as Event
+        yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
+      })(),
+      controller: {abort: vi.fn()},
+    }
+
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+
+    try {
+      // #when
+      const result = await runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        'http://localhost:1234',
+        async () => null,
+      )
+
+      // #then — succeeded
+      expect(result.success).toBe(true)
+
+      const allWrites = writeSpy.mock.calls.map(c => String(c[0])).join('')
+
+      // Tool part MUST be rendered (this is the regression: previously suppressed when text was live-streamed)
+      expect(allWrites).toContain('Bash')
+      expect(allWrites).toContain('Check for existing wiki PR')
+
+      // Text must appear exactly once — live stream rendered it; fallback must NOT re-render it
+      const textOccurrences = allWrites.split('Live streamed text content').length - 1
+      expect(textOccurrences).toBe(1)
     } finally {
       writeSpy.mockRestore()
     }
