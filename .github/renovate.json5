@@ -63,7 +63,7 @@
       // session.next.*) never reach bus.subscribeAll() subscribers, breaking
       // visible tool-call output in the harness. Revisit when upstream fixes
       // the bus delivery contract.
-      matchPackageNames: ['anomalyco/opencode', '@opencode-ai/sdk'],
+      matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
       allowedVersions: '<=1.14.41',
     },
     {
@@ -87,6 +87,6 @@
   ],
   postUpgradeTasks: {
     commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],
-    executionMode: 'update',
+    executionMode: 'branch',
   },
 }
