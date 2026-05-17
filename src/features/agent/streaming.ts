@@ -17,10 +17,6 @@ export interface EventStreamResult {
   readonly llmError: ErrorInfo | null
 }
 
-export interface FallbackRenderOptions {
-  readonly renderVisibleOutput: boolean
-}
-
 /** Mutable by design — updated in-place during stream processing. */
 export interface ActivityTracker {
   firstMeaningfulEventReceived: boolean
@@ -28,12 +24,8 @@ export interface ActivityTracker {
   currentTurnTerminalSignalReceived: boolean
   currentTurnArmed?: boolean
   baselineMessageIds?: ReadonlySet<string>
+  /** Tracks last observed completed assistant message ID so the polling fallback can confirm it remains the latest across two polls before reporting completion — guards against races with the next agent loop step. */
   completedAssistantMessageId?: string
-  completedAssistantMessageObservedAt?: number
-  /** True once outputTextContent or outputToolExecution has been called during stream processing. */
-  visibleOutputEmitted?: boolean
-  /** Parts from the fallback completed assistant message, set by detectMessageActivity. */
-  fallbackMessageParts?: readonly unknown[]
   sessionIdle: boolean
   sessionError: string | null
 }
@@ -131,24 +123,6 @@ function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
 
-function markVisibleOutputEmitted(activityTracker: ActivityTracker | undefined): void {
-  if (activityTracker != null) activityTracker.visibleOutputEmitted = true
-}
-
-function outputStreamTextContent(text: string, activityTracker: ActivityTracker | undefined): void {
-  outputTextContent(text)
-  markVisibleOutputEmitted(activityTracker)
-}
-
-function outputStreamToolExecution(
-  toolName: string,
-  title: string,
-  activityTracker: ActivityTracker | undefined,
-): void {
-  outputToolExecution(toolName, title)
-  markVisibleOutputEmitted(activityTracker)
-}
-
 interface ToolCallInfo {
   readonly tool: string
   readonly input: unknown
@@ -238,7 +212,7 @@ export async function processEventStream(
             (tool.toLowerCase() === 'bash'
               ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
               : tool)
-          outputStreamToolExecution(tool, title, activityTracker)
+          outputToolExecution(tool, title)
           if (tool.toLowerCase() === 'bash') {
             const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
             // Collect text output from content array for artifact detection
@@ -275,14 +249,14 @@ export async function processEventStream(
         if (text != null) lastText = text
         const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
         if (endTime != null) {
-          outputStreamTextContent(lastText, activityTracker)
+          outputTextContent(lastText)
           lastText = ''
         }
       } else if (partType === 'tool') {
         const toolState = getObjectProperty(part, 'state')
         if (getStringProperty(toolState, 'status') === 'completed') {
           const tool = getStringProperty(part, 'tool') ?? ''
-          outputStreamToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''), activityTracker)
+          outputToolExecution(tool, String(getObjectProperty(toolState, 'title') ?? ''))
           if (tool.toLowerCase() === 'bash') {
             const input = getObjectProperty(toolState, 'input')
             const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
@@ -335,25 +309,25 @@ export async function processEventStream(
         activityTracker.currentTurnTerminalSignalReceived = true
       }
       if (lastText.length > 0) {
-        outputStreamTextContent(lastText, activityTracker)
+        outputTextContent(lastText)
         lastText = ''
       }
     }
   }
 
-  if (lastText.length > 0) outputStreamTextContent(lastText, activityTracker)
+  if (lastText.length > 0) outputTextContent(lastText)
   return {tokens, model, cost, prsCreated, commitsCreated, commentsPostedUrls, commentsPosted, llmError}
 }
 
 /**
- * Render completed assistant message parts from the message-fallback path.
- * Only called when the live SSE stream did not emit any visible output.
- * Returns a partial EventStreamResult with artifacts detected from the parts.
+ * Pure artifact scanner over completed assistant message parts.
+ * Called after the live SSE stream completes to reconcile any artifacts the stream may have missed.
+ * No console writes — only detects PR/commit/comment artifacts from bash tool parts.
+ * Returns a partial EventStreamResult with artifacts detected from the bash tool parts.
  */
-export function renderFallbackMessageParts(
+export function detectArtifactsFromMessageParts(
   parts: readonly unknown[],
   logger: Logger,
-  options: FallbackRenderOptions = {renderVisibleOutput: true},
 ): Pick<EventStreamResult, 'prsCreated' | 'commitsCreated' | 'commentsPostedUrls' | 'commentsPosted'> {
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
@@ -362,25 +336,15 @@ export function renderFallbackMessageParts(
 
   for (const part of parts) {
     const partType = getStringProperty(part, 'type')
-    if (partType === 'text') {
-      const text = getStringProperty(part, 'text')
-      if (text != null && options.renderVisibleOutput) {
-        outputTextContent(text)
-        logger.debug('Fallback: rendered text part')
-      }
-    } else if (partType === 'tool') {
+    if (partType === 'tool') {
       const toolState = getObjectProperty(part, 'state')
       if (getStringProperty(toolState, 'status') === 'completed') {
         const tool = getStringProperty(part, 'tool') ?? ''
-        const title = String(getObjectProperty(toolState, 'title') ?? '')
-        if (options.renderVisibleOutput) {
-          outputToolExecution(tool, title)
-          logger.debug('Fallback: rendered tool part', {tool, title})
-        }
         if (tool.toLowerCase() === 'bash') {
           const input = getObjectProperty(toolState, 'input')
           const command = String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? '')
           const output = String(getObjectProperty(toolState, 'output') ?? '')
+          logger.debug('Artifact scan: bash tool part', {command: command.slice(0, 80)})
           detectArtifacts(
             command,
             output,
