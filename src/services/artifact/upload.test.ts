@@ -49,7 +49,7 @@ describe('uploadLogArtifact', () => {
     // #given the log directory exists but contains no files
     const fs = await import('node:fs/promises')
     vi.mocked(fs.access).mockResolvedValue(undefined)
-    vi.mocked(fs.readdir).mockResolvedValue([] as unknown as Awaited<ReturnType<typeof fs.readdir>>)
+    vi.mocked(fs.readdir).mockResolvedValue([])
 
     const {uploadLogArtifact} = await import('./upload.js')
     const logger = createMockLogger()
