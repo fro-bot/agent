@@ -46,6 +46,7 @@ jobs:
               - '**.md'
               - '**.yaml'
               - '**.yml'
+              - deploy/**
             dist-changed: &dist-changed
               - dist/**
             src-changed: &src-changed
