@@ -55,7 +55,7 @@ describe('bun', () => {
 
   beforeEach(async () => {
     mockLogger = createMockLogger()
-    mockAddPath = vi.fn() as unknown as (inputPath: string) => void
+    mockAddPath = vi.fn()
     originalPlatform = process.platform
     originalArch = process.arch
 

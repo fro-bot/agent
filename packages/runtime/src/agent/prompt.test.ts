@@ -1428,7 +1428,7 @@ function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): Trig
     hasMention: true,
     command: null,
     isBotReviewRequested: false,
-    raw: {payload: {action: 'created'}} as unknown,
+    raw: {payload: {action: 'created'}},
     ...overrides,
   }
 }
