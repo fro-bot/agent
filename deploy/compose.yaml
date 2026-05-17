@@ -67,7 +67,7 @@ services:
     restart: unless-stopped
 
   mitmproxy:
-    image: mitmproxy/mitmproxy:11.0.2
+    image: mitmproxy/mitmproxy:11.0.2@sha256:92ab9e0626ec73a3abae9c460e5475323f414745d7d0001205c8fa0c77ad31a2
     command: >
       mitmdump
       -s /scripts/allowlist.py
