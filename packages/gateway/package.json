@@ -1,0 +1,18 @@
+{
+  "name": "@fro-bot/gateway",
+  "version": "0.0.0-development",
+  "private": true,
+  "type": "module",
+  "main": "src/main.ts",
+  "scripts": {
+    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/main.ts --format esm --out-dir dist",
+    "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
+    "fix": "pnpm --dir ../.. exec eslint --fix packages/gateway/src",
+    "lint": "pnpm --dir ../.. exec eslint packages/gateway/src",
+    "test": "pnpm exec vitest run --passWithNoTests src"
+  },
+  "dependencies": {
+    "@fro-bot/runtime": "workspace:*",
+    "effect": "3.18.4"
+  }
+}

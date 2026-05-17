@@ -117,6 +117,7 @@ eslint-typegen.d.ts
 
 # Workspace package build output
 packages/runtime/dist/
+packages/gateway/dist/
 apps/action/dist/
 
 # BEGIN oh-my-opencode-slim clonedeps
