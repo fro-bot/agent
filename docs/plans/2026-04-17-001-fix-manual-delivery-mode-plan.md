@@ -1,10 +1,11 @@
 ---
 title: "fix: Add explicit delivery mode for manual file-edit runs"
 type: fix
-status: active
+status: completed
 date: 2026-04-17
 gap_review: 2026-04-17 (Metis — critical + important gaps closed)
 deepened: 2026-04-17 (research-grounded — repo verification, prompt-priority research, system-wide impact, pattern alignment)
+shipped: 2026-04-18 (PR #517 — feat(action): add output-mode input to fix manual-trigger side-branch delivery)
 ---
 
 # fix: Add explicit delivery mode for manual file-edit runs
@@ -131,7 +132,7 @@ resolved mode
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add public input/output surface for delivery mode**
+- [x] **Unit 1: Add public input/output surface for delivery mode** (shipped in PR #517)
 
 **Goal:** Expose a caller-controlled delivery contract and make the resolved mode visible at runtime.
 
@@ -180,7 +181,7 @@ resolved mode
 
 ---
 
-- [ ] **Unit 2: Centralize mode resolution and inject authoritative task guardrails**
+- [x] **Unit 2: Centralize mode resolution and inject authoritative task guardrails** (shipped in PR #517)
 
 **Goal:** Convert the configured mode into a resolved manual-run contract and render that contract into the prompt where the model will see it before taking git actions.
 
@@ -264,7 +265,7 @@ resolved mode
 
 ---
 
-- [ ] **Unit 3: Make the internal wiki caller explicit and lock in regression coverage**
+- [x] **Unit 3: Make the internal wiki caller explicit and lock in regression coverage** (shipped in PR #517)
 
 **Goal:** Preserve known branch/PR-based automation while the new default fixes checkout-edit workflows.
 

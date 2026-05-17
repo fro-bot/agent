@@ -1,10 +1,11 @@
 ---
 title: "feat: Add compounding project wiki maintained by Fro Bot"
 type: feat
-status: active
+status: completed
 date: 2026-04-13
 origin: docs/brainstorms/2026-04-13-compounding-wiki-requirements.md
 deepened: 2026-04-13
+shipped: 2026-04-14 (PR #489 — workflow scaffold + boolean dispatch inputs; PR #491 — seed wiki pages; PR #494 — eslint/gitignore for Obsidian vault)
 ---
 
 # feat: Add compounding project wiki maintained by Fro Bot
@@ -104,7 +105,7 @@ Fro Bot accumulates deep knowledge through session memory and project memories, 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Scaffold Obsidian vault and .gitignore**
+- [x] **Unit 1: Scaffold Obsidian vault and .gitignore** (shipped in PR #489)
 
   **Goal:** Create the `docs/wiki/` directory structure with Obsidian vault config, `.gitignore` for user-specific files, and a placeholder `index.md`.
 
@@ -150,7 +151,7 @@ Fro Bot accumulates deep knowledge through session memory and project memories, 
   - `.gitignore` excludes user-specific files
   - `index.md` renders in both Obsidian and GitHub (standard markdown links for GitHub navigation)
 
-- [ ] **Unit 2: Add weekly wiki schedule to fro-bot.yaml**
+- [x] **Unit 2: Add weekly wiki schedule to fro-bot.yaml** (shipped in PR #489)
 
   **Goal:** Add a second cron entry for weekly wiki updates and a `WIKI_PROMPT` env var with the wiki maintenance instructions.
 
@@ -207,7 +208,7 @@ Fro Bot accumulates deep knowledge through session memory and project memories, 
   - PROMPT expression correctly discriminates between the two cron strings
   - Existing DMR functionality unchanged
 
-- [ ] **Unit 3: Generate initial seed wiki pages**
+- [x] **Unit 3: Generate initial seed wiki pages** (shipped in PR #491; 6 canonical pages + index live in docs/wiki/)
 
   **Goal:** Create the 6 canonical wiki pages with full content, wikilinks, and frontmatter. This is the initial "seed" generation — all pages from scratch.
 
