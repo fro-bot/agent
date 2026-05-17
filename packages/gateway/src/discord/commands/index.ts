@@ -46,8 +46,26 @@ export function dispatchCommand(
             content: `Unknown command: \`${commandName}\``,
             ephemeral: true,
           }),
-        catch: () => new Error('ack-failed'),
-      }).pipe(Effect.catchAll(() => Effect.void))
+        catch: (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
+      }).pipe(
+        Effect.tapError(err =>
+          Effect.sync(() => {
+            // TODO(future): plumb a logger Effect.Service through dispatchCommand so
+            // we can stop using bare console.warn here. The unknown-command ack path
+            // is the only place in the gateway that does this; eliminating it
+            // completes the structured-logging story.
+            // Log the ack failure but don't propagate it — the unknown-command error
+            // is the meaningful signal for the caller. We can't pass a logger Effect.Service
+            // through dispatchCommand without changing its signature, so use console.warn
+            // directly here. This is the only place in dispatchCommand that does so.
+
+            console.warn(
+              JSON.stringify({level: 'warn', msg: 'ack failed for unknown command', commandName, err: String(err)}),
+            )
+          }),
+        ),
+        Effect.catchAll(() => Effect.void),
+      )
       return yield* Effect.fail(new Error(`Unknown command: ${commandName}`))
     })
   }

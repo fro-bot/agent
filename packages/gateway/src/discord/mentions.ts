@@ -30,5 +30,44 @@ export function handleMention(message: Message, botUserId: string): Effect.Effec
       await thread.send('pong')
     },
     catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
+  }).pipe(
+    Effect.catchAll(threadError =>
+      Effect.gen(function* () {
+        console.warn(
+          JSON.stringify({level: 'warn', msg: 'handleMention: startThread failed', err: String(threadError)}),
+        )
+        yield* Effect.tryPromise({
+          try: async () => message.react('❌'),
+          catch: (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
+        }).pipe(
+          Effect.tapError(err =>
+            Effect.sync(() => {
+              console.warn(JSON.stringify({level: 'warn', msg: 'handleMention: react failed', err: String(err)}))
+            }),
+          ),
+          Effect.catchAll(() => Effect.void),
+        )
+        yield* Effect.tryPromise({
+          try: async () =>
+            message.reply({content: 'Could not start a session here — please try again or check channel permissions.'}),
+          catch: (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
+        }).pipe(
+          Effect.tapError(err =>
+            Effect.sync(() => {
+              console.warn(
+                JSON.stringify({level: 'warn', msg: 'handleMention: fallback reply failed', err: String(err)}),
+              )
+            }),
+          ),
+          // Defense-in-depth: the inner Effect.catchAll branches above already
+          // swallow react and reply rejections, so this outer catchAll should
+          // never fire. Kept defensively in case a future refactor changes the
+          // inner shape — it ensures the fallback chain can never re-fail the
+          // outer Effect with a non-original error.
+          Effect.catchAll(() => Effect.void),
+        )
+        return yield* Effect.fail(threadError)
+      }),
+    ),
+  )
 }
