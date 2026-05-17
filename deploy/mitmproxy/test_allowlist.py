@@ -171,22 +171,30 @@ def test_object_store_hosts_other_bucket_blocked():
 # ===========================================================================
 
 
+def _reset_response_mock():
+    """Reset the shared Response.make mock to prevent cross-test contamination."""
+    mitmproxy_http_mock.Response.make.reset_mock()
+
+
 def test_http_connect_allowed_no_response():
     """Allowed CONNECT → flow.response must remain unset (pass-through)."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("api.github.com")
     addon.http_connect(flow)
     assert flow.response is None
+    mitmproxy_http_mock.Response.make.assert_not_called()
 
 
 def test_http_connect_blocked_sets_403():
     """Blocked CONNECT → flow.response set to 403 text/plain."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("evil.example.com")
     addon.http_connect(flow)
-    mitmproxy_http_mock.Response.make.assert_called_with(
+    mitmproxy_http_mock.Response.make.assert_called_once_with(
         403,
         "Blocked by fro-bot egress allowlist: evil.example.com",
         {"Content-Type": "text/plain"},
@@ -202,21 +210,23 @@ def test_http_connect_blocked_sets_403():
 
 def test_request_allowed_no_response():
     """Allowed plain HTTP request → flow.response must remain unset."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("api.github.com")
     addon.request(flow)
     assert flow.response is None
+    mitmproxy_http_mock.Response.make.assert_not_called()
 
 
 def test_request_blocked_sets_403():
     """Blocked plain HTTP request → flow.response set to 403 text/plain."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("evil.example.com")
-    mitmproxy_http_mock.Response.make.reset_mock()
     addon.request(flow)
-    mitmproxy_http_mock.Response.make.assert_called_with(
+    mitmproxy_http_mock.Response.make.assert_called_once_with(
         403,
         "Blocked by fro-bot egress allowlist: evil.example.com",
         {"Content-Type": "text/plain"},
@@ -226,6 +236,7 @@ def test_request_blocked_sets_403():
 
 def test_request_blocked_does_not_kill_flow():
     """Blocked request must set response, not call flow.kill()."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("evil.example.com")
@@ -235,10 +246,10 @@ def test_request_blocked_does_not_kill_flow():
 
 def test_request_s3_blocked_without_env_var():
     """Without OBJECT_STORE_HOSTS, any S3 host must be blocked via request hook."""
+    _reset_response_mock()
     mod = _load_allowlist()
     addon = mod.AllowlistAddon()
     flow = _make_flow("attacker-bucket.s3.amazonaws.com")
-    mitmproxy_http_mock.Response.make.reset_mock()
     addon.request(flow)
     mitmproxy_http_mock.Response.make.assert_called_once()
     assert flow.response is not None
@@ -246,11 +257,13 @@ def test_request_s3_blocked_without_env_var():
 
 def test_request_s3_allowed_with_env_var():
     """With OBJECT_STORE_HOSTS set, the configured bucket passes the request hook."""
+    _reset_response_mock()
     mod = _load_allowlist({"OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com"})
     addon = mod.AllowlistAddon()
     flow = _make_flow("my-bucket.s3.amazonaws.com")
     addon.request(flow)
     assert flow.response is None
+    mitmproxy_http_mock.Response.make.assert_not_called()
 
 
 # ===========================================================================
@@ -261,26 +274,8 @@ if __name__ == "__main__":
     import traceback
 
     tests = [
-        test_is_allowed_exact_match,
-        test_is_allowed_exact_no_match,
-        test_is_allowed_wildcard_apex,
-        test_is_allowed_wildcard_subdomain,
-        test_is_allowed_case_normalization,
-        test_is_allowed_non_match,
-        test_is_allowed_empty_allowlist,
-        test_object_store_hosts_included_when_set,
-        test_object_store_hosts_not_in_static_list,
-        test_object_store_hosts_empty_string,
-        test_object_store_hosts_whitespace_padded,
-        test_object_store_hosts_is_allowed,
-        test_object_store_hosts_other_bucket_blocked,
-        test_http_connect_allowed_no_response,
-        test_http_connect_blocked_sets_403,
-        test_request_allowed_no_response,
-        test_request_blocked_sets_403,
-        test_request_blocked_does_not_kill_flow,
-        test_request_s3_blocked_without_env_var,
-        test_request_s3_allowed_with_env_var,
+        obj for name, obj in sorted(globals().items())
+        if name.startswith("test_") and callable(obj)
     ]
 
     passed = 0

@@ -85,17 +85,17 @@ def _is_allowed(host: str) -> bool:
 
 
 class AllowlistAddon:
-    def http_connect(self, flow: http.HTTPFlow) -> None:
-        """Enforce allowlist for HTTPS CONNECT tunnels."""
+    def _enforce(self, flow: http.HTTPFlow, kind: str) -> None:
+        """Apply the allowlist to *flow*. *kind* is 'connect' or 'request' for logging."""
         host = flow.request.host
         if not _is_allowed(host):
             print(
-                f"[allowlist] BLOCKED connect host={host} "
+                f"[allowlist] BLOCKED {kind} host={host} "
                 f"client={flow.client_conn.peername}",
                 file=sys.stderr,
                 flush=True,
             )
-            # Setting flow.response short-circuits the CONNECT before mitmproxy
+            # Setting flow.response short-circuits the request before mitmproxy
             # establishes the upstream tunnel. We intentionally do NOT call
             # flow.kill() — that would also produce a redundant "killed" log
             # line in some mitmproxy versions.
@@ -106,10 +106,14 @@ class AllowlistAddon:
             )
         else:
             print(
-                f"[allowlist] ALLOWED connect host={host}",
+                f"[allowlist] ALLOWED {kind} host={host}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    def http_connect(self, flow: http.HTTPFlow) -> None:
+        """Enforce allowlist for HTTPS CONNECT tunnels."""
+        self._enforce(flow, "connect")
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Enforce allowlist for plain HTTP requests.
@@ -119,25 +123,8 @@ class AllowlistAddon:
         Without this check, a workspace container could bypass the allowlist
         entirely by using http:// URLs.
         """
-        host = flow.request.host
-        if not _is_allowed(host):
-            print(
-                f"[allowlist] BLOCKED request host={host} "
-                f"client={flow.client_conn.peername}",
-                file=sys.stderr,
-                flush=True,
-            )
-            flow.response = http.Response.make(
-                403,
-                f"Blocked by fro-bot egress allowlist: {host}",
-                {"Content-Type": "text/plain"},
-            )
-        else:
-            print(
-                f"[allowlist] ALLOWED request host={host}",
-                file=sys.stderr,
-                flush=True,
-            )
+        self._enforce(flow, "request")
+
 
 
 addons = [AllowlistAddon()]
