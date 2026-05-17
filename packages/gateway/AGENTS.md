@@ -31,13 +31,15 @@ Effect.tryPromise(() => runtimeFn(args)) // catches promise rejections
 
 All gateway code outside `runtime-effect.ts` works exclusively in Effect — `Effect.Effect<A, E, R>` everywhere. Subagents asked to add a new runtime call should add the wrapper to `runtime-effect.ts` first, never import directly from `@fro-bot/runtime` outside that adapter.
 
-### Effect surface used
+### Effect surface used (Unit 4)
 
-- **Core** (`Effect.Effect`, `pipe`, `Effect.tryPromise`, `Effect.flatMap`, `Effect.gen`, `Effect.runPromise`, `Effect.runSync`) — composing async error paths
-- **Schedule** (`Effect.retry`, `Schedule.exponential`, `Schedule.recurs`) — retry policies on Discord API calls and runtime adapter calls
-- **Schema** (`Schema.Struct`, `Schema.String`, `Schema.decodeUnknown`) — Discord interaction payload validation, approval-token record decode
+- **Core** (`Effect.Effect`, `pipe`, `Effect.tryPromise`, `Effect.flatMap`, `Effect.gen`, `Effect.runPromise`, `Effect.try`, `Effect.succeed`, `Effect.fail`, `Effect.either`, `Effect.void`, `Effect.catchAll`) — composing async error paths
 
-Not used in v1:
+Not used in Unit 4 (planned for Unit 6+):
+- **Schedule** (`Schedule.exponential`, `Schedule.recurs`) — retry policies; not yet wired
+- **Schema** (`Schema.Struct`, `Schema.decodeUnknown`) — payload validation; not yet wired
+
+Not used at this scope:
 - Effect runtime / Layer / Context (overkill for v1; revisit when DI complexity warrants)
 - STM (no shared mutable state at this scope)
 - Streams (Discord.js handles its own event stream)

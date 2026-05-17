@@ -38,7 +38,7 @@ import {Effect} from 'effect'
 // ---------------------------------------------------------------------------
 
 export interface CoordinationLogger {
-  debug: (message: string, context?: Record<string, unknown>) => void
+  readonly debug: (message: string, context?: Record<string, unknown>) => void
 }
 
 // ---------------------------------------------------------------------------

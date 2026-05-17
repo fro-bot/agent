@@ -13,8 +13,10 @@ import {installShutdownHandlers} from './shutdown.js'
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — pino can replace this in a later unit.
-// Only console.warn and console.error are permitted by the lint rules, so we
-// route all levels through those two channels.
+// warn and error use the lint-permitted console channels directly.
+// debug and info use console.log with scoped eslint-disable because they are
+// informational, not warnings — routing them through console.warn would
+// poison log-aggregator severity classification.
 // ---------------------------------------------------------------------------
 
 function makeLogger(level: 'debug' | 'info' | 'warn' | 'error'): GatewayLogger {
@@ -23,10 +25,12 @@ function makeLogger(level: 'debug' | 'info' | 'warn' | 'error'): GatewayLogger {
 
   return {
     debug: (ctx, msg) => {
-      if (minLevel <= levels.debug) console.warn(JSON.stringify({level: 'debug', ...ctx, msg}))
+      // eslint-disable-next-line no-console
+      if (minLevel <= levels.debug) console.log(JSON.stringify({level: 'debug', ...ctx, msg}))
     },
     info: (ctx, msg) => {
-      if (minLevel <= levels.info) console.warn(JSON.stringify({level: 'info', ...ctx, msg}))
+      // eslint-disable-next-line no-console
+      if (minLevel <= levels.info) console.log(JSON.stringify({level: 'info', ...ctx, msg}))
     },
     warn: (ctx, msg) => {
       if (minLevel <= levels.warn) console.warn(JSON.stringify({level: 'warn', ...ctx, msg}))
@@ -52,7 +56,7 @@ const program = Effect.gen(function* () {
   const logger = makeLogger(config.logLevel)
 
   // c. Create Discord client
-  const client = createDiscordClient(config.discordToken, {logger})
+  const client = createDiscordClient({logger})
 
   // d. Build command registry
   const registry = getCommandRegistry()

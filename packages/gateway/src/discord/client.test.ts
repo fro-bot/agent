@@ -9,22 +9,16 @@ import {createDiscordClient, DEFAULT_INTENTS} from './client.js'
 
 describe('createDiscordClient', () => {
   it('returns a Client with allowedMentions locked to users-only', () => {
-    // #given a token
-    const token = 'Bot test-token'
-
     // #when the client is created
-    const client = createDiscordClient(token)
+    const client = createDiscordClient()
 
     // #then allowedMentions prevents @everyone / @here
     expect(client.options.allowedMentions).toEqual({parse: ['users'], repliedUser: false})
   })
 
   it('default intents include MessageContent (required to read mention text)', () => {
-    // #given
-    const token = 'Bot test-token'
-
     // #when
-    const client = createDiscordClient(token)
+    const client = createDiscordClient()
 
     // #then
     const intents = client.options.intents
@@ -35,11 +29,10 @@ describe('createDiscordClient', () => {
 
   it('optional intent override merges with defaults (dedup via Set)', () => {
     // #given a custom intent list including one not in defaults
-    const token = 'Bot test-token'
     const customIntents = [GatewayIntentBits.DirectMessages, GatewayIntentBits.Guilds] // Guilds is already default
 
     // #when
-    const client = createDiscordClient(token, {intents: customIntents})
+    const client = createDiscordClient({intents: customIntents})
 
     // #then the BitField is the union of defaults + extras (no duplicates)
     const expected = [...new Set<GatewayIntentBits>([...DEFAULT_INTENTS, ...customIntents])]
@@ -57,10 +50,9 @@ describe('createDiscordClient', () => {
       warn: vi.fn(),
       error: vi.fn(),
     }
-    const token = 'Bot test-token'
 
     // #when
-    const client = createDiscordClient(token, {logger})
+    const client = createDiscordClient({logger})
 
     // #then shard events emit log calls
     const emitter = client as unknown as EventEmitter

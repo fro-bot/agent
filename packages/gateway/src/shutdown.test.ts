@@ -153,6 +153,8 @@ describe('installShutdownHandlers', () => {
   })
 
   it('default drain ms is 25000', () => {
+    // #given the module default export
+    // #then the drain timeout is 25 seconds
     expect(DEFAULT_DRAIN_MS).toBe(25_000)
   })
 })

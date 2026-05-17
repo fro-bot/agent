@@ -26,13 +26,8 @@ export interface DiscordClientOptions {
  *   accidental @everyone / @here pings.
  * - Shard lifecycle events are wired to structured log lines when a logger is provided.
  * - Does NOT call `client.login()` — the caller (main.ts) is responsible for that.
- *
- * The token is intentionally NOT stored on the returned Client. discord.js
- * sets `client.token` only after `client.login()` resolves, so callers that
- * need the raw token before login (e.g. `registerSlashCommands`) must pass
- * it as a plain parameter instead of reading it back off the client.
  */
-export function createDiscordClient(_token: string, options: DiscordClientOptions = {}): Client {
+export function createDiscordClient(options: DiscordClientOptions = {}): Client {
   // Merge caller's intents with defaults — dedupe via Set since intents are numeric bitfield values.
   const intents =
     options.intents === undefined
