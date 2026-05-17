@@ -1,0 +1,83 @@
+name: fro-bot
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/gateway.Dockerfile
+    depends_on:
+      mitmproxy:
+        condition: service_started
+    environment:
+      # Secret file paths (read via readSecret helper)
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DISCORD_APPLICATION_ID_FILE: /run/secrets/discord_application_id
+      S3_BUCKET_FILE: /run/secrets/s3_bucket
+      S3_REGION_FILE: /run/secrets/s3_region
+      S3_ENDPOINT_FILE: /run/secrets/s3_endpoint
+      # Egress proxy (regular proxy mode — NOT transparent)
+      HTTPS_PROXY: http://mitmproxy:8080
+      HTTP_PROXY: http://mitmproxy:8080
+      NO_PROXY: workspace,localhost,127.0.0.1
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/mitmproxy-ca-cert.pem
+    volumes:
+      # Credentials — bind-mounted as accepted-risk (no Docker Swarm secrets in v1)
+      - ./secrets/discord-token:/run/secrets/discord_token:ro
+      - ./secrets/discord-application-id:/run/secrets/discord_application_id:ro
+      - ./secrets/s3-bucket:/run/secrets/s3_bucket:ro
+      - ./secrets/s3-region:/run/secrets/s3_region:ro
+      - ./secrets/s3-endpoint:/run/secrets/s3_endpoint:ro
+      # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
+      - mitmproxy-certs:/etc/ssl/certs:ro
+    networks:
+      - gateway-net
+      - sandbox-net
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, node, -e, process.exit(0)]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  workspace:
+    build:
+      context: ..
+      dockerfile: deploy/workspace.Dockerfile
+    environment:
+      # Egress proxy — same as gateway
+      HTTPS_PROXY: http://mitmproxy:8080
+      HTTP_PROXY: http://mitmproxy:8080
+      NO_PROXY: localhost,127.0.0.1,workspace
+    networks:
+      - sandbox-net
+    restart: unless-stopped
+
+  mitmproxy:
+    image: mitmproxy/mitmproxy:11.0.2
+    command: >
+      mitmdump
+      -s /scripts/allowlist.py
+      --listen-host 0.0.0.0
+      --listen-port 8080
+      --set confdir=/home/mitmproxy/.mitmproxy
+      --set ssl_insecure=false
+    volumes:
+      - ./mitmproxy/allowlist.py:/scripts/allowlist.py:ro
+      # Named volume: mitmproxy writes CA here; gateway/workspace read it for trust
+      - mitmproxy-certs:/home/mitmproxy/.mitmproxy
+    networks:
+      - sandbox-net
+    restart: unless-stopped
+
+volumes:
+  # Shared CA cert volume: mitmproxy writes, gateway + workspace read
+  mitmproxy-certs:
+
+networks:
+  # External-facing network for gateway ↔ Discord
+  gateway-net:
+    driver: bridge
+  # Internal sandbox network: workspace + mitmproxy; gateway bridges both
+  sandbox-net:
+    driver: bridge
+    internal: true

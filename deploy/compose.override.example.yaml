@@ -1,0 +1,33 @@
+# compose.override.example.yaml
+#
+# Copy this file to compose.override.yaml and edit for your local dev environment.
+# compose.override.yaml is gitignored — never commit it.
+#
+# Usage:
+#   docker compose -f compose.yaml -f compose.override.yaml up -d
+#
+# This file is intentionally minimal. Only override what differs from compose.yaml.
+
+services:
+  mitmproxy:
+    # Expose the mitmproxy web UI on the host for dev inspection.
+    # Remove or comment out in production.
+    ports:
+      - '127.0.0.1:8081:8081'
+    command: >
+      mitmdump
+      -s /scripts/allowlist.py
+      --listen-host 0.0.0.0
+      --listen-port 8080
+      --web-host 0.0.0.0
+      --web-port 8081
+      --set confdir=/home/mitmproxy/.mitmproxy
+      --set ssl_insecure=false
+
+  gateway:
+    # Override the mitmproxy-certs volume path for dev if you want a local dir
+    # instead of the named volume (useful for inspecting the CA cert directly).
+    # volumes:
+    #   - ./dev-certs:/etc/ssl/certs:ro
+    environment:
+      LOG_LEVEL: debug

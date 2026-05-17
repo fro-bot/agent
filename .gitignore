@@ -123,3 +123,7 @@ apps/action/dist/
 # BEGIN oh-my-opencode-slim clonedeps
 .slim/clonedeps/repos/
 # END oh-my-opencode-slim clonedeps
+
+# Deploy stack — secrets and local overrides
+deploy/secrets/
+deploy/compose.override.yaml
