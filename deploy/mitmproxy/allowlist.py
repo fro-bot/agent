@@ -23,6 +23,7 @@ OBJECT_STORE_HOSTS
     If unset or empty, all S3/R2 traffic is blocked (fail-closed default).
 """
 
+import ipaddress
 import os
 import sys
 from mitmproxy import http
@@ -62,6 +63,48 @@ ALLOWLIST: list[str] = [
 # Hostname validation helper (RFC 1123 subset).
 # ---------------------------------------------------------------------------
 
+
+def _validate_ip_literal_or_none(entry: str) -> str | None:
+    """If *entry* parses as an IP literal, validate it.
+
+    Returns None if the entry is not an IP (caller should fall through to the
+    hostname validator). Raises ValueError if the entry is an IP in a
+    reserved/private/loopback/link-local range.
+
+    Public IPs are accepted to support self-hosted MinIO deployments that use
+    a public IP. Reserved ranges are rejected to prevent egress to internal
+    services (e.g. cloud metadata at 169.254.169.254, loopback at 127.0.0.1,
+    private networks at 10.x/172.16-31.x/192.168.x). Implements todo 017
+    Option 2: reject private/loopback/link-local/reserved, allow public IPs.
+    """
+    try:
+        ip = ipaddress.ip_address(entry)
+    except ValueError:
+        return None  # not an IP — let the hostname validator handle it
+
+    # Reject any address that is not globally routable. ip.is_global is True only
+    # for truly globally-routable unicast addresses; it excludes:
+    #   - RFC 1918 private (10/8, 172.16/12, 192.168/16)
+    #   - loopback (127/8, ::1/128)
+    #   - link-local (169.254/16, fe80::/10)
+    #   - shared address space / CGNAT (100.64/10, RFC 6598)
+    #   - documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32)
+    #   - benchmarking (198.18/15)
+    #   - multicast, unspecified (0.0.0.0, ::), site-local, unique local IPv6 (fc00::/7)
+    if not ip.is_global:
+        raise ValueError(
+            f"OBJECT_STORE_HOSTS entry '{entry}' is not a globally-routable public IP.\n"
+            "Rejected: private (10.x/172.16-31.x/192.168.x), loopback (127.0.0.1, ::1),\n"
+            "link-local (169.254/16, fe80::/10), shared address space / CGNAT (100.64/10),\n"
+            "documentation (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::/32),\n"
+            "multicast, and reserved ranges are blocked to prevent egress to internal\n"
+            "or unroutable destinations. Use a public IP, or set up a hostname mapping\n"
+            "for internal endpoints."
+        )
+
+    return entry  # public IP — accept
+
+
 def _is_valid_hostname(hostname: str) -> bool:
     """Return True if *hostname* is a valid RFC 1123 hostname.
 
@@ -92,14 +135,19 @@ def _is_valid_hostname(hostname: str) -> bool:
 # Merge OBJECT_STORE_HOSTS env var into the allowlist at module import time.
 #
 # Validation order per entry (after strip):
-#   1. empty-skip   — blank entries are silently ignored
-#   2. wildcard-reject — entries starting with "*." are rejected (more
-#                        actionable error than the generic hostname check)
-#   3. port-reject  — entries containing ":" are rejected (mitmproxy
-#                     flow.request.host may or may not include the port
-#                     depending on version/mode; bare hostnames only)
-#   4. hostname-validate — must pass RFC 1123 check (after lowercasing)
-#   5. lowercase-normalize — stored in lowercase for consistent matching
+#   1. empty-skip        — blank entries are silently ignored
+#   2. wildcard-reject   — entries starting with "*." are rejected
+#   3. ip-literal-validate — if the entry parses as an IP address, validate it:
+#                            public IPs are accepted (MinIO/self-hosted use case);
+#                            private/loopback/link-local/reserved IPs are rejected
+#                            to prevent egress to internal services such as the
+#                            cloud metadata endpoint (169.254.169.254). Bare IPv6
+#                            literals (e.g. "::1", "2001:db8::1") are caught here
+#                            before the port-reject step.
+#   4. port-reject       — entries containing ":" that did NOT parse as a bare IP
+#                          are rejected (bracket-form IPv6+port, hostname:port).
+#   5. hostname-validate — must pass RFC 1123 check (after lowercasing)
+#   6. lowercase-normalize — stored in lowercase for consistent matching
 # ---------------------------------------------------------------------------
 _object_store_hosts_raw = os.environ.get("OBJECT_STORE_HOSTS", "")
 _object_store_hosts: list[str] = []
@@ -116,12 +164,21 @@ for _entry in _object_store_hosts_raw.split(","):
             "re-introducing the over-broad-allowlist security gap. "
             "Set exact bucket hostnames (e.g. 'my-bucket.s3.amazonaws.com')."
         )
+    # 3. ip-literal-validate — fires before port-reject so bare IPv6 literals
+    # (which contain colons) are handled correctly. Returns the entry if it is
+    # a valid public IP, raises on reserved ranges, returns None if not an IP.
+    _maybe_ip = _validate_ip_literal_or_none(_h)
+    if _maybe_ip is not None:
+        _object_store_hosts.append(_maybe_ip)
+        continue
     if ":" in _h:
-        # 3. port-reject (also catches IPv6 literals, which contain multiple colons)
+        # 4. port-reject — entry was not a bare IP but still contains ":".
+        # Could be hostname:port or bracket-form IPv6+port ([::1]:9000).
         if _h.count(":") > 1 or _h.startswith("["):
             raise ValueError(
-                f"OBJECT_STORE_HOSTS entry '{_h}' looks like an IPv6 address. "
-                "IPv6 is not yet supported; use IPv4 or a hostname for now."
+                f"OBJECT_STORE_HOSTS entry '{_h}' looks like an IPv6 address with a port "
+                "or bracket notation. Bare IPv6 addresses are validated above; "
+                "IPv6+port is not supported. Use a bare IPv6 address or a hostname."
             )
         raise ValueError(
             f"OBJECT_STORE_HOSTS entry '{_h}' contains a port. mitmproxy may "
@@ -130,20 +187,14 @@ for _entry in _object_store_hosts_raw.split(","):
             "(e.g. 'localhost' or 'minio')."
         )
     _h_lower = _h.lower()
-    # Note: this validator intentionally accepts IPv4 literals (e.g. "10.0.0.5",
-    # "192.168.1.1") because the MinIO/self-hosted object-store use case often
-    # uses IPs. An attacker with deploy-config access could point this at metadata-
-    # service IPs (169.254.169.254) — that risk is accepted because deploy-config
-    # is already a trust boundary. Tracked for future tightening in
-    # .context/systematic/todos/017-ready-p3-object-store-hosts-ip-literal-decision.md
     if not _is_valid_hostname(_h_lower):
-        # 4. hostname-validate
+        # 5. hostname-validate
         raise ValueError(
             f"OBJECT_STORE_HOSTS entry '{_h}' is not a valid hostname. "
             "Use RFC 1123 hostnames composed of labels separated by dots "
             "(e.g. 'my-bucket.s3.amazonaws.com')."
         )
-    # 5. lowercase-normalize
+    # 6. lowercase-normalize
     _object_store_hosts.append(_h_lower)
 
 ALLOWLIST = ALLOWLIST + _object_store_hosts

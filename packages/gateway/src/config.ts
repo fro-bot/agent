@@ -41,11 +41,16 @@ export function readSecret(name: string): string {
 export function readOptionalSecret(name: string): string | null {
   const filePath = process.env[`${name}_FILE`]
   if (filePath !== undefined && existsSync(filePath)) {
-    return readFileSync(filePath, 'utf8').trimEnd()
+    const contents = readFileSync(filePath, 'utf8')
+    // Strip only trailing whitespace (newline/spaces from echo) so leading whitespace
+    // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].
+    // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets).
+    const trailingTrimmed = contents.trimEnd()
+    return trailingTrimmed.trim() === '' ? null : trailingTrimmed
   }
 
   const value = process.env[name]
-  if (value !== undefined) {
+  if (value !== undefined && value.trim() !== '') {
     return value
   }
 

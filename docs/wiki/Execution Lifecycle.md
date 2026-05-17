@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-04-26"
-updated-by: "ca17d5e"
+last-updated: "2026-05-17"
+updated-by: "ec2c628"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts

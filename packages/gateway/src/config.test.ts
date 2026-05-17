@@ -157,6 +157,60 @@ describe('readOptionalSecret', () => {
     // #then
     expect(result).toBe('optional-value')
   })
+
+  it('returns null when MISSING_FILE points to an empty file', () => {
+    // #given an empty file — e.g. `touch deploy/secrets/discord-guild-id` for global registration
+    const secretFile = join(tmpDir, 'empty.txt')
+    writeFileSync(secretFile, '')
+    process.env.MISSING_FILE = secretFile
+
+    // #when
+    const result = readOptionalSecret('MISSING')
+
+    // #then empty file is treated as "not set"
+    expect(result).toBeNull()
+  })
+
+  it('returns null when MISSING_FILE points to a whitespace-only file', () => {
+    // #given a file containing only whitespace/newlines
+    const secretFile = join(tmpDir, 'whitespace.txt')
+    writeFileSync(secretFile, '  \n  \n')
+    process.env.MISSING_FILE = secretFile
+
+    // #when
+    const result = readOptionalSecret('MISSING')
+
+    // #then whitespace-only is treated as "not set"
+    expect(result).toBeNull()
+  })
+
+  it('returns null when env var is set to an empty string', () => {
+    process.env.EMPTY_ENV_VAR = ''
+    expect(readOptionalSecret('EMPTY_ENV_VAR')).toBeNull()
+    delete process.env.EMPTY_ENV_VAR
+  })
+
+  it('returns null when env var is set to whitespace only', () => {
+    process.env.WS_ENV_VAR = '   '
+    expect(readOptionalSecret('WS_ENV_VAR')).toBeNull()
+    delete process.env.WS_ENV_VAR
+  })
+
+  it('preserves leading whitespace in file contents', () => {
+    // Some operators may legitimately have secrets with leading whitespace
+    // (e.g. tokens copied from a UI that quoted with leading padding).
+    // The env-var path preserves it via process.env[name]; the file-backed
+    // path must too, for consistency.
+    const secretFile = join(tmpDir, 'leading-ws.txt')
+    writeFileSync(secretFile, '  some-value\n')
+    process.env.MISSING_FILE = secretFile
+
+    // #when
+    const result = readOptionalSecret('MISSING')
+
+    // #then leading whitespace is preserved, trailing newline stripped
+    expect(result).toBe('  some-value')
+  })
 })
 
 // ---------------------------------------------------------------------------
