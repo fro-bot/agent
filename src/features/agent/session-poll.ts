@@ -14,7 +14,6 @@ const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const ERROR_GRACE_CYCLES = 3
-const COMPLETED_ASSISTANT_MESSAGE_STABILITY_MS = 1_000
 export const INITIAL_ACTIVITY_TIMEOUT_MS = 90_000
 
 interface PollResult {
@@ -95,28 +94,17 @@ async function detectMessageActivity(
 
   if (latestAssistantMessageId == null || completedAt == null) {
     activityTracker.completedAssistantMessageId = undefined
-    activityTracker.completedAssistantMessageObservedAt = undefined
     return null
   }
 
-  const now = Date.now()
+  // Confirm the same completed assistant remains the latest across two consecutive polls
+  // before reporting completion — guards against the race where one agent loop step has
+  // completed but the next step has not yet produced its in-progress assistant message.
   if (activityTracker.completedAssistantMessageId !== latestAssistantMessageId) {
     activityTracker.completedAssistantMessageId = latestAssistantMessageId
-    activityTracker.completedAssistantMessageObservedAt = now
-    logger.debug('Completed assistant message observed; waiting for stability before completion', {
+    logger.debug('Completed assistant message observed; waiting for confirmation poll', {
       sessionId,
       messageId: latestAssistantMessageId,
-    })
-    return null
-  }
-
-  const observedAt = activityTracker.completedAssistantMessageObservedAt ?? now
-  const stableForMs = now - observedAt
-  if (stableForMs < COMPLETED_ASSISTANT_MESSAGE_STABILITY_MS) {
-    logger.debug('Completed assistant message not stable yet; continuing watchdog', {
-      sessionId,
-      messageId: latestAssistantMessageId,
-      stableForMs,
     })
     return null
   }
@@ -125,21 +113,7 @@ async function detectMessageActivity(
   logger.debug('Session completion detected via stable completed assistant message', {
     sessionId,
     messageId: latestAssistantMessageId,
-    stableForMs,
   })
-
-  // Store the message parts only after the completed assistant message has passed
-  // the stability window so retry.ts renders/merges the final persisted parts.
-  const latestMessage = messages.find((m: unknown) => {
-    const info = getObjectProperty(m, 'info')
-    return getStringProperty(info, 'id') === latestAssistantMessageId
-  })
-  if (latestMessage != null) {
-    const parts = getObjectProperty(latestMessage, 'parts')
-    if (Array.isArray(parts)) {
-      activityTracker.fallbackMessageParts = parts
-    }
-  }
 
   return {completed: true, error: null}
 }

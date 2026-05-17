@@ -1420,7 +1420,8 @@ describe('LLM error detection', () => {
 
     // #when
     const resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger)
-    await vi.advanceTimersByTimeAsync(1000)
+    // Advance timers so the fallback message one-shot read completes.
+    await vi.advanceTimersByTimeAsync(2000)
     const result = await resultPromise
 
     // #then
@@ -2688,7 +2689,6 @@ describe('processEventStream', () => {
     const activityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
-      visibleOutputEmitted: false,
       sessionIdle: false,
       sessionError: null,
     }
@@ -2713,7 +2713,6 @@ describe('processEventStream', () => {
 
     // #then — text accumulated from delta must be flushed to stdout on idle
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Hello from delta'))
-    expect(activityTracker.visibleOutputEmitted).toBe(true)
     writeSpy.mockRestore()
   })
 
@@ -2778,7 +2777,6 @@ describe('processEventStream', () => {
     const activityTracker = {
       firstMeaningfulEventReceived: false,
       currentTurnTerminalSignalReceived: false,
-      visibleOutputEmitted: false,
       sessionIdle: false,
       sessionError: null,
     }
@@ -2817,7 +2815,6 @@ describe('processEventStream', () => {
     // #then — tool line must appear: "| Bash       Check for existing wiki PR"
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Bash'))
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Check for existing wiki PR'))
-    expect(activityTracker.visibleOutputEmitted).toBe(true)
     writeSpy.mockRestore()
   })
 
@@ -3794,221 +3791,6 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     expect(waitFn).toHaveBeenCalled()
   })
 
-  it('renders fallback assistant message parts to stdout when stream emitted no visible output', async () => {
-    // #given — the live SSE stream is empty (no message.part.delta / session.next events).
-    // detectMessageActivity finds a new stable completed assistant message with a text part
-    // and a completed bash tool part. runPromptAttempt must render both to stdout and capture
-    // any PR URLs from the bash output in eventStreamResult.prsCreated.
-    //
-    // session.status stays busy so the poll does NOT exit via status:idle before
-    // detectMessageActivity has stored fallbackMessageParts. Real timers run: two poll cycles
-    // (500ms each) + 1000ms stability window ≈ 1.5s, so this test uses a 10s timeout.
-    // wait() must fail so startV2SessionWait returns false and the poll watchdog drives
-    // completion via detectMessageActivity (which stores fallbackMessageParts).
-    // If wait() succeeds it wins the race before the first poll cycle runs, leaving
-    // fallbackMessageParts unset.
-    const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait unavailable'))
-    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
-    const {runPromptAttempt} = await import('./retry.js')
-
-    const completedAssistantMessage = {
-      info: {
-        id: 'msg_fallback',
-        role: 'assistant',
-        time: {created: 1, completed: 2},
-      },
-      parts: [
-        {type: 'text', text: 'Final assistant text'},
-        {
-          type: 'tool',
-          tool: 'bash',
-          state: {
-            status: 'completed',
-            title: 'Create PR',
-            input: {command: 'gh pr create --title "Fix bug"'},
-            output: 'https://github.com/owner/repo/pull/42',
-          },
-        },
-      ],
-    }
-
-    const mockClient = {
-      session: {
-        messages: vi
-          .fn()
-          .mockResolvedValueOnce({data: []}) // baseline: empty
-          .mockResolvedValue({data: [completedAssistantMessage]}), // poll: completed assistant
-        // Keep status busy so the poll does NOT exit via session.status:idle before
-        // detectMessageActivity has a chance to store fallbackMessageParts.
-        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
-      },
-    }
-
-    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
-
-    // #when — empty event stream; completion via message fallback.
-    // Real timers: two poll cycles (500ms each) + 1000ms stability window = ~1.5s.
-    const result = await runPromptAttempt(
-      mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-      'ses_123',
-      '/workspace',
-      30_000,
-      mockLogger,
-      createMockEventStream([]).stream,
-      'http://localhost:1234',
-      async () => null,
-    )
-
-    // #then — succeeded via message fallback
-    expect(result.success).toBe(true)
-
-    // Text part must have been rendered to stdout
-    const allWrites = writeSpy.mock.calls.map(c => String(c[0])).join('')
-    expect(allWrites).toContain('Final assistant text')
-
-    // Bash tool part must have been rendered to stdout (display name is 'Bash', title is 'Create PR')
-    expect(allWrites).toContain('Bash')
-
-    // PR URL from bash output must be captured in eventStreamResult
-    expect(result.eventStreamResult.prsCreated).toContain('https://github.com/owner/repo/pull/42')
-    // Baseline + three poll cycles. No extra completed-message read is needed because
-    // pollForSessionCompletion already stored activityTracker.fallbackMessageParts.
-    expect(mockClient.session.messages).toHaveBeenCalledTimes(4)
-
-    writeSpy.mockRestore()
-  }, 10_000)
-
-  it('renders fallback assistant message parts after a terminal-only stream', async () => {
-    // #given — v2 wait succeeds and the stream carries only session.idle. This is the blank-log
-    // failure mode: completion is real, but the live stream missed the visible text/tool parts.
-    const waitFn = vi.fn<TestWaitFn>().mockResolvedValue({data: undefined, error: undefined})
-    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
-    const {runPromptAttempt} = await import('./retry.js')
-    const completedAssistantMessage = {
-      info: {
-        id: 'msg_terminal_only',
-        role: 'assistant',
-        time: {created: 1, completed: 2},
-      },
-      parts: [{type: 'text', text: 'Terminal-only fallback text'}],
-    }
-    const mockClient = {
-      session: {
-        messages: vi
-          .fn()
-          .mockResolvedValueOnce({data: []})
-          .mockResolvedValueOnce({data: []})
-          .mockResolvedValue({data: [completedAssistantMessage]}),
-        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
-      },
-    }
-    const eventStream = createMockEventStream([
-      {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event,
-    ])
-    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
-
-    try {
-      // #when
-      const result = await runPromptAttempt(
-        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-        'ses_123',
-        '/workspace',
-        30_000,
-        mockLogger,
-        eventStream.stream,
-        'http://localhost:1234',
-        async () => null,
-      )
-
-      // #then
-      expect(result.success).toBe(true)
-      expect(writeSpy.mock.calls.map(c => String(c[0])).join('')).toContain('Terminal-only fallback text')
-      expect(mockClient.session.messages.mock.calls.length).toBeGreaterThanOrEqual(3)
-    } finally {
-      writeSpy.mockRestore()
-    }
-  })
-
-  it('merges fallback artifacts without duplicating already streamed visible output', async () => {
-    // #given — live stream renders text, but misses the completed bash tool output that creates a PR.
-    const waitFn = vi.fn<TestWaitFn>().mockRejectedValue(new Error('wait unavailable'))
-    vi.doMock('@opencode-ai/sdk/v2', () => makeV2Module(waitFn))
-    const {runPromptAttempt} = await import('./retry.js')
-    const completedAssistantMessage = {
-      info: {
-        id: 'msg_partial_stream',
-        role: 'assistant',
-        time: {created: 1, completed: 2},
-      },
-      parts: [
-        {type: 'text', text: 'Fallback text should not duplicate'},
-        {
-          type: 'tool',
-          tool: 'bash',
-          state: {
-            status: 'completed',
-            title: 'Create PR',
-            input: {command: 'gh pr create --title "Fix bug"'},
-            output: 'https://github.com/owner/repo/pull/43',
-          },
-        },
-      ],
-    }
-    const mockClient = {
-      session: {
-        messages: vi
-          .fn()
-          .mockResolvedValueOnce({data: []})
-          .mockResolvedValue({data: [completedAssistantMessage]}),
-        status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
-      },
-    }
-    const eventStream = {
-      stream: (async function* () {
-        await new Promise<void>(resolve => {
-          setTimeout(resolve, 0)
-        })
-        yield {
-          type: 'message.part.delta',
-          properties: {
-            sessionID: 'ses_123',
-            messageID: 'msg_live',
-            partID: 'prt_live',
-            field: 'text',
-            delta: 'Live stream text',
-          },
-        } as unknown as Event
-        yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
-      })(),
-      controller: {abort: vi.fn()},
-    }
-    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true)
-
-    try {
-      // #when
-      const result = await runPromptAttempt(
-        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
-        'ses_123',
-        '/workspace',
-        30_000,
-        mockLogger,
-        eventStream.stream,
-        'http://localhost:1234',
-        async () => null,
-      )
-
-      // #then
-      expect(result.success).toBe(true)
-      const allWrites = writeSpy.mock.calls.map(c => String(c[0])).join('')
-      expect(allWrites).toContain('Live stream text')
-      expect(allWrites).not.toContain('Fallback text should not duplicate')
-      expect(allWrites).not.toContain('Create PR')
-      expect(result.eventStreamResult.prsCreated).toContain('https://github.com/owner/repo/pull/43')
-    } finally {
-      writeSpy.mockRestore()
-    }
-  })
-
   it('does not double-count comment artifacts detected by both stream and fallback parts', async () => {
     // #given — live stream observes a completed comment-posting bash tool, and the completed
     // assistant message fallback later contains the same tool output.
@@ -4086,7 +3868,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
   it('does not sum duplicate counter-only fallback comment artifacts when no comment URLs are available', async () => {
     // #given — defensive coverage for legacy/counter-only comment tracking where neither path
     // produced URL-tracked comment artifacts.
-    const {mergeEventStreamAndFallbackResults} = await import('./retry.js')
+    const {mergeArtifactResults} = await import('./retry.js')
     const eventStreamResult = {
       tokens: null,
       model: null,
@@ -4104,7 +3886,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
 
     // #when
-    const result = mergeEventStreamAndFallbackResults(eventStreamResult, fallback)
+    const result = mergeArtifactResults(eventStreamResult, fallback)
 
     // #then
     expect(result.commentsPosted).toBe(1)

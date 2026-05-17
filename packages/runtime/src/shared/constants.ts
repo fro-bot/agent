@@ -19,8 +19,15 @@ export const DEFAULT_MODEL = {
 } as const
 
 // Setup consolidation defaults
-export const DEFAULT_OPENCODE_VERSION = '1.14.48'
-export const DEFAULT_BUN_VERSION = '1.3.13'
+// Pinned to 1.14.41. OpenCode 1.14.42+ regressed the /event SSE stream so that
+// SyncEvent publishes (`message.part.updated`, `message.updated`, `session.next.*`)
+// no longer reach `bus.subscribeAll()` subscribers, breaking visible tool-call
+// output in the Fro Bot harness. BusEvent publishes (`session.status`,
+// `session.diff`, `session.idle`, `message.part.delta`) still work, which is
+// why text deltas survived but tool execution lines disappeared. See the
+// Renovate allowedVersions rule in .github/renovate.json5.
+export const DEFAULT_OPENCODE_VERSION = '1.14.41'
+export const DEFAULT_BUN_VERSION = '1.3.14'
 export const DEFAULT_OMO_VERSION = '3.17.15'
 export const DEFAULT_OMO_PROVIDERS = ''
 export const DEFAULT_SYSTEMATIC_VERSION = '2.14.2'

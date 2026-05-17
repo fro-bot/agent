@@ -3,10 +3,9 @@ import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult} from './streaming.js'
-import {sleep} from '../../shared/async.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
-import {processEventStream, renderFallbackMessageParts} from './streaming.js'
+import {detectArtifactsFromMessageParts, processEventStream} from './streaming.js'
 
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
@@ -35,8 +34,6 @@ function getObjectProperty(value: unknown, property: string): unknown {
 }
 
 const BASELINE_MESSAGES_TIMEOUT_MS = 5_000
-const FALLBACK_MESSAGES_STABILITY_WAIT_MS = 1_500
-const FALLBACK_MESSAGES_POLL_INTERVAL_MS = 250
 
 function appendUniqueStrings(existing: readonly string[], additions: readonly string[]): string[] {
   return [...existing, ...additions.filter(value => !existing.includes(value))]
@@ -89,53 +86,47 @@ async function readCompletedAssistantMessageParts(
   directory: string,
   baselineMessageIds: ReadonlySet<string> | undefined,
   logger: Logger,
-  maxWaitMs: number,
 ): Promise<readonly unknown[] | null> {
   if (baselineMessageIds == null || typeof client.session.messages !== 'function') return null
 
-  const startedAt = Date.now()
-  while (true) {
-    try {
-      const response = await withTimeout(
-        client.session.messages({path: {id: sessionId}, query: {directory}}),
-        BASELINE_MESSAGES_TIMEOUT_MS,
-        'completed assistant session.messages()',
-      )
-      const messages = Array.isArray(response.data) ? response.data : []
-      let latestCompletedAssistantMessage: unknown = null
-      let latestCreatedAt = Number.NEGATIVE_INFINITY
+  try {
+    const response = await withTimeout(
+      client.session.messages({path: {id: sessionId}, query: {directory}}),
+      BASELINE_MESSAGES_TIMEOUT_MS,
+      'completed assistant session.messages()',
+    )
+    const messages = Array.isArray(response.data) ? response.data : []
+    let latestCompletedAssistantMessage: unknown = null
+    let latestCreatedAt = Number.NEGATIVE_INFINITY
 
-      for (const message of messages) {
-        const info = getObjectProperty(message, 'info')
-        const id = getStringProperty(info, 'id')
-        if (id == null || baselineMessageIds.has(id)) continue
-        if (getStringProperty(info, 'role') !== 'assistant') continue
+    for (const message of messages) {
+      const info = getObjectProperty(message, 'info')
+      const id = getStringProperty(info, 'id')
+      if (id == null || baselineMessageIds.has(id)) continue
+      if (getStringProperty(info, 'role') !== 'assistant') continue
 
-        const time = getObjectProperty(info, 'time')
-        if (getNumberProperty(time, 'completed') == null) continue
+      const time = getObjectProperty(info, 'time')
+      if (getNumberProperty(time, 'completed') == null) continue
 
-        const createdAt = getNumberProperty(time, 'created') ?? 0
-        if (latestCompletedAssistantMessage == null || createdAt >= latestCreatedAt) {
-          latestCompletedAssistantMessage = message
-          latestCreatedAt = createdAt
-        }
+      const createdAt = getNumberProperty(time, 'created') ?? 0
+      if (latestCompletedAssistantMessage == null || createdAt >= latestCreatedAt) {
+        latestCompletedAssistantMessage = message
+        latestCreatedAt = createdAt
       }
-
-      if (latestCompletedAssistantMessage != null) {
-        const parts = getObjectProperty(latestCompletedAssistantMessage, 'parts')
-        if (Array.isArray(parts)) return Array.from(parts, (part: unknown): unknown => part)
-      }
-    } catch (error) {
-      logger.debug('Unable to read completed assistant message parts', {sessionId, error: toErrorMessage(error)})
-      return null
     }
 
-    if (Date.now() - startedAt >= maxWaitMs) return null
-    await sleep(FALLBACK_MESSAGES_POLL_INTERVAL_MS)
+    if (latestCompletedAssistantMessage != null) {
+      const parts = getObjectProperty(latestCompletedAssistantMessage, 'parts')
+      if (Array.isArray(parts)) return Array.from(parts, (part: unknown): unknown => part)
+    }
+    return null
+  } catch (error) {
+    logger.debug('Unable to read completed assistant message parts', {sessionId, error: toErrorMessage(error)})
+    return null
   }
 }
 
-export function mergeEventStreamAndFallbackResults(
+export function mergeArtifactResults(
   eventStreamResult: EventStreamResult,
   fallback: Pick<EventStreamResult, 'prsCreated' | 'commitsCreated' | 'commentsPostedUrls' | 'commentsPosted'>,
 ): EventStreamResult {
@@ -249,7 +240,6 @@ export async function runPromptAttempt(
     currentTurnTerminalSignalReceived: false,
     currentTurnArmed: startPrompt == null,
     baselineMessageIds: undefined,
-    visibleOutputEmitted: false,
     sessionIdle: false,
     sessionError: null,
   }
@@ -357,28 +347,20 @@ export async function runPromptAttempt(
       }
     }
 
-    // If the live SSE stream emitted no visible output but the message fallback found a completed
-    // assistant message with parts, render those parts now so the user sees the agent's response.
-    // When visible output already streamed, do one immediate message read only to merge missed
-    // artifacts; do not wait the stability window because there is nothing left to render.
-    const fallbackMessageMaxWaitMs =
-      activityTracker.visibleOutputEmitted === true ? 0 : FALLBACK_MESSAGES_STABILITY_WAIT_MS
-    const fallbackMessageParts =
-      activityTracker.fallbackMessageParts ??
-      (await readCompletedAssistantMessageParts(
-        client,
-        sessionId,
-        directory,
-        activityTracker.baselineMessageIds,
-        logger,
-        fallbackMessageMaxWaitMs,
-      ))
+    // Post-idle artifact reconciliation: one-shot read of the completed assistant message
+    // to capture any artifacts (PRs, commits, comments) the live stream may have missed.
+    // No polling loop, no stability window, no visible rendering.
+    const fallbackMessageParts = await readCompletedAssistantMessageParts(
+      client,
+      sessionId,
+      directory,
+      activityTracker.baselineMessageIds,
+      logger,
+    )
 
     if (fallbackMessageParts != null) {
-      const fallback = renderFallbackMessageParts(fallbackMessageParts, logger, {
-        renderVisibleOutput: activityTracker.visibleOutputEmitted !== true,
-      })
-      const merged = mergeEventStreamAndFallbackResults(eventStreamResult, fallback)
+      const fallback = detectArtifactsFromMessageParts(fallbackMessageParts, logger)
+      const merged = mergeArtifactResults(eventStreamResult, fallback)
       return {
         success: true,
         error: null,
