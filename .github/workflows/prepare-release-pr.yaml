@@ -70,11 +70,22 @@ jobs:
 
       - name: Reset to last release tag and merge `main`
         run: |
+          set -euo pipefail
           last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
           echo "Resetting to ${last_tag}"
           git reset --hard "${last_tag}"
           git fetch origin main
-          git merge --no-ff -Xtheirs -m 'skip: merge main [skip release]' origin/main
+          if ! git merge --no-ff -Xtheirs -m 'skip: merge main [skip release]' origin/main; then
+            # Typical trigger: rename/rename on dist/artifact-*.js (the bundle hash
+            # changes every commit on main). -Xtheirs handles content conflicts but
+            # cannot resolve rename/rename. Bias fully to main's tree on conflict —
+            # the release branch's purpose is to mirror main.
+            echo "Merge had unresolvable conflicts; taking main's tree verbatim."
+            git merge --abort
+            git checkout origin/main -- .
+            git add -A
+            git commit --no-verify -m 'skip: merge main [skip release] (conflict-resolved)'
+          fi
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
