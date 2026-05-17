@@ -30,7 +30,7 @@ export const DEFAULT_OPENCODE_VERSION = '1.14.41'
 export const DEFAULT_BUN_VERSION = '1.3.14'
 export const DEFAULT_OMO_VERSION = '3.17.15'
 export const DEFAULT_OMO_PROVIDERS = ''
-export const DEFAULT_SYSTEMATIC_VERSION = '2.14.2'
+export const DEFAULT_SYSTEMATIC_VERSION = '2.16.0'
 
 // All-'no' OmoProviders sentinel for disabled oMo mode
 export const OMO_PROVIDERS_DISABLED = {
