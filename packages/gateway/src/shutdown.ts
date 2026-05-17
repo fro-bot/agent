@@ -22,7 +22,20 @@ export function installShutdownHandlers(
   logger: GatewayLogger,
   drainMs: number = DEFAULT_DRAIN_MS,
 ): () => void {
+  // SIGTERM and SIGINT can arrive in quick succession (e.g. a container
+  // orchestrator that escalates after a few seconds). Without this guard
+  // both signals would race two concurrent destroy chains and call
+  // process.exit twice. The first call wins; subsequent calls log and
+  // return without scheduling new work.
+  let shuttingDown = false
+
   const handler = (signal: string) => {
+    if (shuttingDown) {
+      logger.debug({signal}, 'shutdown signal received while already shutting down — ignoring')
+      return
+    }
+    shuttingDown = true
+
     logger.info({signal}, 'shutdown initiated')
 
     let drainTimer: ReturnType<typeof setTimeout> | undefined

@@ -59,7 +59,8 @@ const program = Effect.gen(function* () {
 
   // e. Register slash commands
   yield* Effect.tryPromise({
-    try: async () => registerSlashCommands(client, config.discordApplicationId, config.discordGuildId, registry),
+    try: async () =>
+      registerSlashCommands(config.discordToken, config.discordApplicationId, config.discordGuildId, registry),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   })
 

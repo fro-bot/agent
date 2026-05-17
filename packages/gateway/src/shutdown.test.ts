@@ -122,6 +122,36 @@ describe('installShutdownHandlers', () => {
     expect(exitCodes).toContain(1)
   })
 
+  it('ignores duplicate signals while a shutdown is already in flight', async () => {
+    // #given
+    const {logger, calls} = makeLogger()
+    const client = makeClient(50)
+    const cleanup = installShutdownHandlers(client, logger, 5_000)
+
+    // #when — SIGTERM and SIGINT arrive in rapid succession (orchestrator
+    // escalates after a few seconds; both signals reach the same handler)
+    process.emit('SIGTERM')
+    process.emit('SIGINT')
+    await vi.advanceTimersByTimeAsync(100)
+    cleanup()
+
+    // #then — only ONE shutdown initiated message, only ONE clean exit
+    const initiated = calls.filter(c => c.method === 'info' && c.msg === 'shutdown initiated')
+    expect(initiated).toHaveLength(1)
+    const cleanExits = calls.filter(c => c.method === 'info' && c.msg === 'shutdown clean')
+    expect(cleanExits).toHaveLength(1)
+    // process.exit called exactly once with code 0
+    expect(exitCodes.filter(c => c === 0)).toHaveLength(1)
+    expect(exitCodes).not.toContain(1)
+    // client.destroy called exactly once — no concurrent destroy chain
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const destroyMock = client.destroy as unknown as ReturnType<typeof vi.fn>
+    expect(destroyMock).toHaveBeenCalledOnce()
+    // The ignored signal is logged at debug so operators can see what happened
+    const ignored = calls.filter(c => c.method === 'debug' && c.msg.includes('already shutting down'))
+    expect(ignored).toHaveLength(1)
+  })
+
   it('default drain ms is 25000', () => {
     expect(DEFAULT_DRAIN_MS).toBe(25_000)
   })

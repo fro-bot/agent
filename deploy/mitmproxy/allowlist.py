@@ -2,14 +2,13 @@
 mitmproxy egress allowlist addon — fro-bot gateway v1.
 
 Enforces a static allowlist of permitted CONNECT destinations.
-Any host not on the list receives a synthetic 403 and the connection is killed.
+Any host not on the list receives a synthetic 403 short-circuit response.
 
 Changes to the allowlist require restarting the mitmproxy container (no runtime
 YAML override in v1 — the list is intentionally a code-level constant so that
 changes go through review).
 """
 
-import re
 import sys
 from mitmproxy import http
 
@@ -42,11 +41,17 @@ ALLOWLIST: list[str] = [
 
 
 def _is_allowed(host: str) -> bool:
-    """Return True if *host* matches any entry in ALLOWLIST."""
+    """Return True if *host* matches any entry in ALLOWLIST.
+
+    Wildcard semantics: "*.example.com" matches both the bare apex
+    (example.com) and any subdomain (api.example.com). This is intentional
+    — most providers expose both an apex and subdomain surface, and listing
+    them separately doubles the allowlist without any security benefit.
+    """
     host = host.lower()
     for entry in ALLOWLIST:
         if entry.startswith("*."):
-            # Wildcard: match any subdomain of the base domain.
+            # Wildcard: match the apex domain OR any subdomain of it.
             base = entry[2:]  # strip "*."
             if host == base or host.endswith("." + base):
                 return True
@@ -66,12 +71,15 @@ class AllowlistAddon:
                 file=sys.stderr,
                 flush=True,
             )
+            # Setting flow.response short-circuits the CONNECT before mitmproxy
+            # establishes the upstream tunnel. We intentionally do NOT call
+            # flow.kill() — that would also produce a redundant "killed" log
+            # line in some mitmproxy versions.
             flow.response = http.Response.make(
                 403,
                 f"Blocked by fro-bot egress allowlist: {host}",
                 {"Content-Type": "text/plain"},
             )
-            flow.kill()
         else:
             print(
                 f"[allowlist] ALLOWED connect host={host}",

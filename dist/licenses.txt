@@ -23289,7 +23289,7 @@ Apache-2.0
    limitations under the License.
 
 
-effect@3.18.4
+effect@3.21.2
 MIT
 MIT License
 

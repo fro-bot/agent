@@ -1,4 +1,4 @@
-import type {ChatInputCommandInteraction, Client, SlashCommandBuilder} from 'discord.js'
+import type {ChatInputCommandInteraction, SlashCommandBuilder} from 'discord.js'
 import {REST, Routes} from 'discord.js'
 import {Effect} from 'effect'
 
@@ -18,7 +18,18 @@ export function getCommandRegistry(): SlashCommand[] {
 
 /**
  * Find the matching command in the registry and run it.
- * Returns Effect.fail if no command matches.
+ *
+ * When the command name is not in the registry, the interaction is
+ * acknowledged with an ephemeral reply BEFORE the Effect fails. Discord
+ * gives interaction tokens a 3-second response window; without an ack the
+ * user sees "This interaction failed" even though our handler logged the
+ * error correctly. Common cause: a stale global command that was removed
+ * from the registry but still exists in Discord, or an interaction from
+ * another bot in the same guild reaching this dispatcher.
+ *
+ * If the ack itself fails (e.g. token already expired) we swallow that
+ * inner error so the outer caller still sees the original "unknown
+ * command" failure, not a misleading reply-failed message.
  */
 export function dispatchCommand(
   interaction: ChatInputCommandInteraction,
@@ -28,7 +39,17 @@ export function dispatchCommand(
   const command = registry.find(c => c.data.name === commandName)
 
   if (command === undefined) {
-    return Effect.fail(new Error(`Unknown command: ${commandName}`))
+    return Effect.gen(function* () {
+      yield* Effect.tryPromise({
+        try: async () =>
+          interaction.reply({
+            content: `Unknown command: \`${commandName}\``,
+            ephemeral: true,
+          }),
+        catch: () => new Error('ack-failed'),
+      }).pipe(Effect.catchAll(() => Effect.void))
+      return yield* Effect.fail(new Error(`Unknown command: ${commandName}`))
+    })
   }
 
   return command.execute(interaction)
@@ -36,21 +57,22 @@ export function dispatchCommand(
 
 /**
  * Register slash commands via Discord REST API.
+ *
+ * `token` must be passed explicitly. The client's `.token` field is null
+ * until `client.login()` resolves, and slash-command registration runs
+ * BEFORE login in the gateway boot sequence — passing the token as a plain
+ * parameter avoids coupling this module to a stale third-party-private
+ * field on the Client object.
+ *
  * - Guild-scoped when `guildId` is provided (instant propagation, good for dev).
  * - Global when `guildId` is null (up to 1h propagation, for production).
  */
 export async function registerSlashCommands(
-  client: Client,
+  token: string,
   applicationId: string,
   guildId: string | null,
   registry: SlashCommand[],
 ): Promise<void> {
-  const token = (client as unknown as {_pendingToken?: string; token?: string | null})._pendingToken ?? client.token
-
-  if (token === null || token === undefined) {
-    throw new Error('Discord client has no token — call createDiscordClient with a token before registering commands')
-  }
-
   const rest = new REST().setToken(token)
   const body = registry.map(cmd => cmd.data.toJSON())
 
