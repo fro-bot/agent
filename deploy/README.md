@@ -14,6 +14,16 @@ Docker Compose v2 stack for the fro-bot gateway. Runs three services:
 - Access to a Discord application (bot token + application ID)
 - An S3-compatible object store (bucket, region, optional endpoint)
 
+## Testing-Only Configuration (Discord Plumbing)
+
+If you're just verifying the gateway connects to Discord and responds to slash commands and mentions, you do not need a working S3 bucket. The gateway daemon validates S3 credentials at startup but does not write to S3 in v1.
+
+For testing-only:
+
+- Put any plausible-looking values in `deploy/secrets/s3-bucket` and `deploy/secrets/s3-region` (e.g. `test-bucket` and `us-east-1`). Validation only checks they're non-empty.
+- Leave `OBJECT_STORE_HOSTS` unset in `deploy/.env`. The default fail-closed behaviour blocks all S3 traffic — fine for testing, since no S3 calls are made.
+- Use a real bucket and `OBJECT_STORE_HOSTS` value only when Units 5–7 ship the agent and workspace pieces that actually exercise S3.
+
 ## One-Time Setup
 
 ### 1. Copy the override example
@@ -35,11 +45,18 @@ echo -n 'YOUR_DISCORD_BOT_TOKEN'      > deploy/secrets/discord-token
 echo -n 'YOUR_DISCORD_APP_ID'         > deploy/secrets/discord-application-id
 echo -n 'your-s3-bucket-name'         > deploy/secrets/s3-bucket
 echo -n 'us-east-1'                   > deploy/secrets/s3-region
-# Optional — omit for AWS S3; set for R2 or other S3-compatible stores:
-echo -n 'https://your-endpoint.r2.dev' > deploy/secrets/s3-endpoint
+# Optional — leave empty for standard AWS S3; set for R2 or other S3-compatible stores.
+touch deploy/secrets/s3-endpoint
+# echo -n 'https://your-endpoint.r2.dev' > deploy/secrets/s3-endpoint
+# Optional — guild-scoped slash command registration (propagates in ~5s vs up to 1h globally).
+# Leave the file empty (or omit the echo) to register slash commands globally instead:
+touch deploy/secrets/discord-guild-id
+# echo -n 'YOUR_GUILD_ID' > deploy/secrets/discord-guild-id
 
 chmod 0600 deploy/secrets/*
 ```
+
+> **Important:** All files under `deploy/secrets/` must exist before running `docker compose config`, `up`, or `down`. Compose bind-mounts these paths unconditionally — if a file is missing, Docker creates an empty directory at the mount target and the gateway will fail to read the secret. For optional secrets that you don't want to set (e.g. `discord-guild-id`), create the file empty: `touch deploy/secrets/discord-guild-id`. The gateway treats empty and whitespace-only files as unset.
 
 `deploy/secrets/` is gitignored — never commit secret files.
 
@@ -130,6 +147,8 @@ The mitmproxy addon at `deploy/mitmproxy/allowlist.py` enforces a static allowli
 Any host not on the list receives a 403 and the connection is dropped. Both HTTPS CONNECT tunnels and plain HTTP requests are enforced.
 
 ### Object-store bucket scoping
+
+For testing the gateway itself, see [Testing-Only Configuration](#testing-only-configuration-discord-plumbing) — S3 isn't exercised in v1.
 
 The allowlist does **not** include broad S3/R2 wildcards (`*.s3.amazonaws.com`, `*.r2.cloudflarestorage.com`). Instead, set the `OBJECT_STORE_HOSTS` environment variable on the `mitmproxy` service to the exact bucket host(s) your deployment uses:
 

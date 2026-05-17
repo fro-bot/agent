@@ -355,26 +355,220 @@ def test_object_store_hosts_rejects_port_in_host():
 
 
 def test_object_store_hosts_rejects_ipv6_literal():
-    """OBJECT_STORE_HOSTS='::1' must raise ValueError mentioning IPv6, not 'port'."""
+    """OBJECT_STORE_HOSTS='::1' must raise ValueError — loopback IPv6 is a reserved range."""
     try:
         _load_allowlist({"OBJECT_STORE_HOSTS": "::1"})
         assert False, "Expected ValueError"
     except ValueError as e:
         msg = str(e)
-        assert "IPv6" in msg, f"Expected 'IPv6' in error, got: {e}"
-        assert "contains a port" not in msg.lower(), f"Error should not say 'contains a port' for IPv6: {e}"
+        # The IP-literal check fires before port-reject, so the error should
+        # mention reserved/loopback, not "contains a port" or "IPv6 not supported".
+        assert "reserved" in msg.lower() or "loopback" in msg.lower(), (
+            f"Expected 'reserved' or 'loopback' in error, got: {e}"
+        )
+        assert "contains a port" not in msg.lower(), (
+            f"Error should not say 'contains a port' for bare IPv6: {e}"
+        )
 
 
 def test_object_store_hosts_accepts_ipv4_literal() -> None:
-    """IPv4 literals are intentionally accepted to support self-hosted MinIO.
+    """Public IPv4 literals are accepted; private/reserved ranges are rejected.
 
-    See todo 017 for the deferred decision on whether to reject private/
-    metadata-service IP ranges. This test documents current behavior so
-    a future refactor doesn't accidentally change it without an explicit
-    decision.
+    This test was updated in todo 017 (Option 2 implementation) to reflect the
+    new behavior: private IPs like 10.0.0.5 are now rejected to prevent egress
+    to internal services. Public IPs (e.g. 8.8.8.8) are accepted to support
+    self-hosted MinIO deployments that use a public IP address.
+
+    Previously (PR #638) this test documented that 10.0.0.5 was accepted on
+    deploy-config-trust grounds. That decision has been superseded — reserved
+    ranges are now blocked unconditionally.
     """
-    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "10.0.0.5"})
-    assert mod._is_allowed("10.0.0.5") is True
+    # Public IP must be accepted
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "8.8.8.8"})
+    assert mod._is_allowed("8.8.8.8") is True
+
+    # Private IP must be rejected
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "10.0.0.5"})
+        assert False, "Expected ValueError for private IP 10.0.0.5"
+    except ValueError as e:
+        assert "reserved" in str(e).lower() or "private" in str(e).lower(), (
+            f"Expected 'reserved' or 'private' in error: {e}"
+        )
+
+
+# ===========================================================================
+# Todo 017 — IP literal validation (public allowed, reserved rejected)
+# ===========================================================================
+
+
+def test_object_store_hosts_rejects_metadata_service_ipv4():
+    """169.254.169.254 (cloud metadata) must be rejected as link-local/reserved."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "169.254.169.254"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "metadata" in msg or "link-local" in msg, (
+            f"Expected 'reserved', 'metadata', or 'link-local' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_private_ipv4_10():
+    """10.0.0.5 (RFC 1918 private) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "10.0.0.5"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "private" in msg, (
+            f"Expected 'reserved' or 'private' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_private_ipv4_172():
+    """172.16.0.1 (RFC 1918 private) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "172.16.0.1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "private" in msg, (
+            f"Expected 'reserved' or 'private' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_private_ipv4_192():
+    """192.168.1.1 (RFC 1918 private) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "192.168.1.1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "private" in msg, (
+            f"Expected 'reserved' or 'private' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_loopback_ipv4():
+    """127.0.0.1 (loopback) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "127.0.0.1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "loopback" in msg, (
+            f"Expected 'reserved' or 'loopback' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_unspecified_ipv4():
+    """0.0.0.0 (unspecified) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "0.0.0.0"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "unspecified" in msg or "private" in msg, (
+            f"Expected 'reserved', 'unspecified', or 'private' in error: {e}"
+        )
+
+
+def test_object_store_hosts_accepts_public_ipv6():
+    """2001:4860:4860::8888 (Google IPv6 DNS) is a public IP and must be accepted."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "2001:4860:4860::8888"})
+    assert mod._is_allowed("2001:4860:4860::8888") is True
+
+
+def test_object_store_hosts_rejects_loopback_ipv6():
+    """::1 (IPv6 loopback) must be rejected — IP check fires before port-reject."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "::1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "loopback" in msg, (
+            f"Expected 'reserved' or 'loopback' in error: {e}"
+        )
+        assert "contains a port" not in msg, (
+            f"Error should not say 'contains a port' for bare IPv6 loopback: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_link_local_ipv6():
+    """fe80::1 (IPv6 link-local) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "fe80::1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "link-local" in msg or "private" in msg, (
+            f"Expected 'reserved', 'link-local', or 'private' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_unique_local_ipv6():
+    """fc00::1 (IPv6 unique local / fc00::/7) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "fc00::1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "private" in msg, (
+            f"Expected 'reserved' or 'private' in error: {e}"
+        )
+
+
+# ===========================================================================
+# CGNAT and documentation range regression guards
+# ===========================================================================
+
+
+def test_object_store_hosts_rejects_cgnat_ipv4():
+    """100.64.0.1 (RFC 6598 CGNAT / shared address space) must be rejected.
+
+    Python's ipaddress module returns False for is_private, is_reserved,
+    is_link_local, is_multicast, and is_global on 100.64.0.0/10. The old
+    OR-chain guard (is_private or is_loopback or ...) silently accepted these
+    addresses as "public". The new not-is_global guard correctly rejects them.
+    """
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "100.64.0.1"})
+        assert False, "Expected ValueError for CGNAT IP 100.64.0.1"
+    except ValueError as e:
+        msg = str(e)
+        assert "globally-routable" in msg.lower() or "cgnat" in msg.lower(), (
+            f"Expected 'globally-routable' or 'CGNAT' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_documentation_ipv4():
+    """192.0.2.1 (TEST-NET-1, RFC 5737) must be rejected.
+
+    Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are not
+    globally routable. Under the new not-is_global guard these are rejected
+    regardless of whether is_private returns True or False.
+    """
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "192.0.2.1"})
+        assert False, "Expected ValueError for documentation IP 192.0.2.1"
+    except ValueError as e:
+        msg = str(e)
+        assert "globally-routable" in msg.lower() or "documentation" in msg.lower() or "reserved" in msg.lower(), (
+            f"Expected 'globally-routable', 'documentation', or 'reserved' in error: {e}"
+        )
+
+
+def test_object_store_hosts_rejects_documentation_ipv6():
+    """2001:db8::1 (IPv6 documentation range, RFC 3849) must be rejected."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "2001:db8::1"})
+        assert False, "Expected ValueError for documentation IPv6 2001:db8::1"
+    except ValueError as e:
+        msg = str(e)
+        assert "globally-routable" in msg.lower() or "documentation" in msg.lower() or "reserved" in msg.lower(), (
+            f"Expected 'globally-routable', 'documentation', or 'reserved' in error: {e}"
+        )
 
 
 # ===========================================================================
