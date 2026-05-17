@@ -255,7 +255,11 @@ export async function runPromptAttempt(
     sessionError: null,
   }
 
-  const events = eventStream ?? (await client.event.subscribe()).stream
+  // CRITICAL: pass `directory` so the SSE subscription routes to the same workspace
+  // instance as the prompt. Without it the subscription routes to the server's default
+  // instance (process.cwd at server boot) and never sees publishes from this directory's
+  // bus, so only the initial `server.connected` event arrives before the stream idles.
+  const events = eventStream ?? (await client.event.subscribe({query: {directory}})).stream
 
   let eventStreamResult: EventStreamResult = {
     tokens: null,

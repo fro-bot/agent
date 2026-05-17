@@ -48,7 +48,10 @@ export async function sendPromptToSession(
   const agentName = config?.agent ?? null
   if (agentName != null) body.agent = agentName
 
-  const events = await client.event.subscribe()
+  // Pass `directory` so the SSE subscription routes to the same workspace instance as the
+  // prompt below. Without it the subscription resolves to the server's default instance
+  // (process.cwd at server boot) and never sees publishes from this directory's bus.
+  const events = await client.event.subscribe({query: {directory}})
   const startPrompt = async () => {
     const response = await client.session.promptAsync({path: {id: sessionId}, body, query: {directory}})
     if (response.error == null) return null
