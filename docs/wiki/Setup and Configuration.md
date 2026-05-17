@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-05-03"
-updated-by: "328fcc5"
+last-updated: "2026-05-17"
+updated-by: "ec2c628"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -18,7 +18,7 @@ sources:
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "Tool installation, configuration assembly, credential management, and cache strategy"
+summary: "Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in"
 ---
 
 # Setup and Configuration
@@ -90,6 +90,7 @@ The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in 
 - **Systematic plugin injected** — Ensures `@fro.bot/systematic@{version}` is registered as an OpenCode plugin. The version is pinned to prevent drift.
 
 The final config is the result of merging:
+
 - In disabled mode: CI config (with `default_agent: "build"`) + user-provided `opencode-config` input. Existing local `opencode.json` files are ignored to prevent stale oMo config from leaking in.
 - In enabled mode: CI config (without `default_agent` pin) + existing `opencode.json` (from oMo installer) + user-provided `opencode-config` input.
 
@@ -100,11 +101,13 @@ User values win on conflicts. In disabled mode, `oh-my-openagent` plugin entries
 The setup module maintains its own cache (separate from the session cache) for installed binaries. The key is **mode-partitioned**: disabled mode excludes oMo version and restricts cached paths to OpenCode tooling only, preventing stale oMo config from being restored.
 
 Disabled-mode key:
+
 ```text
 opencode-tools-disabled-{opencodeVersion}-{systematicVersion}-{os}
 ```
 
 Enabled-mode key:
+
 ```text
 opencode-tools-enabled-{opencodeVersion}-{omoVersion}-{systematicVersion}-{os}
 ```
