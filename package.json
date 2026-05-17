@@ -1,6 +1,6 @@
 {
   "name": "@fro-bot/agent-workspace",
-  "version": "0.0.0-development",
+  "version": "0.43.2",
   "private": true,
   "description": "@fro-bot Agent",
   "keywords": [
