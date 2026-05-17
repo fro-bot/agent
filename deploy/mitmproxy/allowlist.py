@@ -30,6 +30,11 @@ from mitmproxy import http
 # ---------------------------------------------------------------------------
 # Allowlist — production-safe defaults for fro-bot v1.
 # Entries starting with "*." match any subdomain of the given domain.
+#
+# Wildcard entries (*.foo.com) are permitted in this static list because they
+# go through code review. The same wildcards are REJECTED when supplied via
+# OBJECT_STORE_HOSTS env var to prevent operators (or attackers with deploy-
+# config access) from silently re-introducing over-broad allowlist holes.
 # ---------------------------------------------------------------------------
 ALLOWLIST: list[str] = [
     # GitHub
@@ -112,14 +117,25 @@ for _entry in _object_store_hosts_raw.split(","):
             "Set exact bucket hostnames (e.g. 'my-bucket.s3.amazonaws.com')."
         )
     if ":" in _h:
-        # 3. port-reject
+        # 3. port-reject (also catches IPv6 literals, which contain multiple colons)
+        if _h.count(":") > 1 or _h.startswith("["):
+            raise ValueError(
+                f"OBJECT_STORE_HOSTS entry '{_h}' looks like an IPv6 address. "
+                "IPv6 is not yet supported; use IPv4 or a hostname for now."
+            )
         raise ValueError(
-            f"OBJECT_STORE_HOSTS entry '{_h}' contains a port. "
-            "mitmproxy may or may not include the port in flow.request.host "
-            "depending on version and proxy mode. "
-            "Set bare hostnames only (e.g. 'localhost' or 'minio')."
+            f"OBJECT_STORE_HOSTS entry '{_h}' contains a port. mitmproxy may "
+            "or may not include the port in flow.request.host depending on "
+            "version and proxy mode. Set bare hostnames only "
+            "(e.g. 'localhost' or 'minio')."
         )
     _h_lower = _h.lower()
+    # Note: this validator intentionally accepts IPv4 literals (e.g. "10.0.0.5",
+    # "192.168.1.1") because the MinIO/self-hosted object-store use case often
+    # uses IPs. An attacker with deploy-config access could point this at metadata-
+    # service IPs (169.254.169.254) — that risk is accepted because deploy-config
+    # is already a trust boundary. Tracked for future tightening in
+    # .context/systematic/todos/017-ready-p3-object-store-hosts-ip-literal-decision.md
     if not _is_valid_hostname(_h_lower):
         # 4. hostname-validate
         raise ValueError(

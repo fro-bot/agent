@@ -354,6 +354,29 @@ def test_object_store_hosts_rejects_port_in_host():
         assert "port" in str(e).lower(), f"Expected 'port' in error: {e}"
 
 
+def test_object_store_hosts_rejects_ipv6_literal():
+    """OBJECT_STORE_HOSTS='::1' must raise ValueError mentioning IPv6, not 'port'."""
+    try:
+        _load_allowlist({"OBJECT_STORE_HOSTS": "::1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "IPv6" in msg, f"Expected 'IPv6' in error, got: {e}"
+        assert "contains a port" not in msg.lower(), f"Error should not say 'contains a port' for IPv6: {e}"
+
+
+def test_object_store_hosts_accepts_ipv4_literal() -> None:
+    """IPv4 literals are intentionally accepted to support self-hosted MinIO.
+
+    See todo 017 for the deferred decision on whether to reject private/
+    metadata-service IP ranges. This test documents current behavior so
+    a future refactor doesn't accidentally change it without an explicit
+    decision.
+    """
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "10.0.0.5"})
+    assert mod._is_allowed("10.0.0.5") is True
+
+
 # ===========================================================================
 # Standalone runner (no pytest required)
 # ===========================================================================
