@@ -79,7 +79,10 @@
   "packageManager": "pnpm@10.33.4",
   "pnpm": {
     "overrides": {
-      "fast-xml-parser": ">=5.7.0"
+      "fast-uri": ">=3.1.2",
+      "fast-xml-builder": ">=1.1.7",
+      "fast-xml-parser": ">=5.7.0",
+      "ip-address": ">=10.1.1"
     }
   }
 }
