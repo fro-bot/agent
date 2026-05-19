@@ -59,11 +59,6 @@ services:
       options:
         max-size: 10m
         max-file: '3'
-    healthcheck:
-      test: [CMD-SHELL, test -s /etc/ssl/certs/mitmproxy-ca-cert.pem]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   workspace:
     build:

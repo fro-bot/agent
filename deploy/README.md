@@ -48,6 +48,15 @@ echo -n 'us-east-1'                   > deploy/secrets/s3-region
 # Optional — leave empty for standard AWS S3; set for R2 or other S3-compatible stores.
 touch deploy/secrets/s3-endpoint
 # echo -n 'https://your-endpoint.r2.dev' > deploy/secrets/s3-endpoint
+# Optional — AWS credentials for explicit S3 authentication. Leave empty
+# to fall back to the SDK default credential chain (env vars, ~/.aws,
+# or EC2/EKS instance role).
+touch deploy/secrets/aws-access-key-id
+touch deploy/secrets/aws-secret-access-key
+touch deploy/secrets/aws-session-token
+# echo -n 'AKIAI...' > deploy/secrets/aws-access-key-id
+# echo -n 'wJal...' > deploy/secrets/aws-secret-access-key
+# echo -n 'FwoG...' > deploy/secrets/aws-session-token  # only for STS temporary credentials
 # Optional — guild-scoped slash command registration (propagates in ~5s vs up to 1h globally).
 # Leave the file empty (or omit the echo) to register slash commands globally instead:
 touch deploy/secrets/discord-guild-id
@@ -106,6 +115,15 @@ This checks:
 - Service status
 - Recent log output
 - Gateway exit code (fails if gateway crashed in the last cycle)
+
+## Gateway Readiness
+
+The gateway container is considered healthy only after two conditions are both true:
+
+1. The Discord `clientReady` event has fired — the bot is fully connected and ready to receive events. At that point the process writes `/tmp/gateway-ready`.
+2. The daemon process (PID 1) is still alive (`kill -0 1`).
+
+The flag is cleared at process startup, so a stale `/tmp/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
 
 ## Stopping the Stack
 
