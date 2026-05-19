@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-05-03"
+last-updated: "2026-05-17"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -16,7 +16,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 | Page | Type | Summary |
 | --- | --- | --- |
-| [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, four-layer action architecture, runtime package, and module map |
+| [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, four-layer action architecture, runtime and gateway packages, and module map |
 | [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Phase-by-phase walkthrough of a single action run from trigger to cache save |
 
 ### Subsystems
@@ -25,7 +25,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | --- | --- | --- |
 | [Session Persistence](Session%20Persistence.md) | subsystem | How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
-| [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, and cache strategy |
+| [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in |
 
 ### Conventions
 
