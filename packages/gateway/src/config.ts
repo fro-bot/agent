@@ -1,6 +1,6 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 
-import {existsSync, readFileSync} from 'node:fs'
+import {existsSync, readFileSync, statSync} from 'node:fs'
 import process from 'node:process'
 
 const DEFAULT_S3_PREFIX = 'fro-bot-state'
@@ -41,6 +41,12 @@ export function readSecret(name: string): string {
 export function readOptionalSecret(name: string): string | null {
   const filePath = process.env[`${name}_FILE`]
   if (filePath !== undefined && existsSync(filePath)) {
+    const stat = statSync(filePath)
+    if (!stat.isFile()) {
+      throw new Error(
+        `Secret path is a directory, not a file: ${filePath} (the bind-mount source likely doesn't exist on the host)`,
+      )
+    }
     const contents = readFileSync(filePath, 'utf8')
     // Strip only trailing whitespace (newline/spaces from echo) so leading whitespace
     // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].

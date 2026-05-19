@@ -20,6 +20,9 @@ services:
       S3_BUCKET_FILE: /run/secrets/s3_bucket
       S3_REGION_FILE: /run/secrets/s3_region
       S3_ENDPOINT_FILE: /run/secrets/s3_endpoint
+      AWS_ACCESS_KEY_ID_FILE: /run/secrets/aws_access_key_id
+      AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/aws_secret_access_key
+      AWS_SESSION_TOKEN_FILE: /run/secrets/aws_session_token
       # Optional — guild-scoped slash command registration (fast dev propagation)
       DISCORD_GUILD_ID_FILE: /run/secrets/discord_guild_id
       # Egress proxy (regular proxy mode — NOT transparent)
@@ -34,6 +37,13 @@ services:
       - ./secrets/s3-bucket:/run/secrets/s3_bucket:ro
       - ./secrets/s3-region:/run/secrets/s3_region:ro
       - ./secrets/s3-endpoint:/run/secrets/s3_endpoint:ro
+      # Optional — AWS credentials for explicit S3 authentication. Leave the
+      # access-key-id and secret-access-key files empty (`touch deploy/secrets/aws-access-key-id`)
+      # to fall back to the AWS SDK default credential chain (env, ~/.aws, IMDS).
+      # AWS_SESSION_TOKEN is only needed for STS temporary credentials.
+      - ./secrets/aws-access-key-id:/run/secrets/aws_access_key_id:ro
+      - ./secrets/aws-secret-access-key:/run/secrets/aws_secret_access_key:ro
+      - ./secrets/aws-session-token:/run/secrets/aws_session_token:ro
       # Optional — guild-scoped slash command registration (fast dev propagation).
       # Create the file empty (`touch deploy/secrets/discord-guild-id`) to register
       # slash commands globally; the gateway treats empty files as unset.
@@ -44,6 +54,11 @@ services:
       - gateway-net
       - sandbox-net
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     healthcheck:
       test: [CMD-SHELL, test -s /etc/ssl/certs/mitmproxy-ca-cert.pem]
       interval: 30s
@@ -65,6 +80,11 @@ services:
     networks:
       - sandbox-net
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
 
   mitmproxy:
     image: mitmproxy/mitmproxy:11.0.2@sha256:92ab9e0626ec73a3abae9c460e5475323f414745d7d0001205c8fa0c77ad31a2
@@ -89,6 +109,11 @@ services:
     networks:
       - sandbox-net
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     healthcheck:
       # Gate dependent services on the CA actually existing in the shared
       # volume. mitmproxy generates ~/.mitmproxy/mitmproxy-ca-cert.pem on
