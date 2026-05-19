@@ -20,6 +20,8 @@ services:
       S3_BUCKET_FILE: /run/secrets/s3_bucket
       S3_REGION_FILE: /run/secrets/s3_region
       S3_ENDPOINT_FILE: /run/secrets/s3_endpoint
+      # Optional — guild-scoped slash command registration (fast dev propagation)
+      DISCORD_GUILD_ID_FILE: /run/secrets/discord_guild_id
       # Egress proxy (regular proxy mode — NOT transparent)
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
@@ -32,6 +34,10 @@ services:
       - ./secrets/s3-bucket:/run/secrets/s3_bucket:ro
       - ./secrets/s3-region:/run/secrets/s3_region:ro
       - ./secrets/s3-endpoint:/run/secrets/s3_endpoint:ro
+      # Optional — guild-scoped slash command registration (fast dev propagation).
+      # Create the file empty (`touch deploy/secrets/discord-guild-id`) to register
+      # slash commands globally; the gateway treats empty files as unset.
+      - ./secrets/discord-guild-id:/run/secrets/discord_guild_id:ro
       # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
       - mitmproxy-certs:/etc/ssl/certs:ro
     networks:
@@ -61,7 +67,7 @@ services:
     restart: unless-stopped
 
   mitmproxy:
-    image: mitmproxy/mitmproxy:11.0.2
+    image: mitmproxy/mitmproxy:11.0.2@sha256:92ab9e0626ec73a3abae9c460e5475323f414745d7d0001205c8fa0c77ad31a2
     command: >
       mitmdump
       -s /scripts/allowlist.py

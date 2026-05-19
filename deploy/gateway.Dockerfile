@@ -1,7 +1,7 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:2780b5c3bab67f1f76c781860de469442999ed1a0d7992a5efdf2cffc0e3d769
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:24-alpine AS build
+FROM node:24-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS build
 
 WORKDIR /workspace
 
@@ -25,7 +25,7 @@ RUN pnpm --filter @fro-bot/runtime build
 RUN pnpm --filter @fro-bot/gateway build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24-alpine AS runtime
+FROM node:24-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS runtime
 
 WORKDIR /app
 
