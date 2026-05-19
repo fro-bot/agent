@@ -4,7 +4,7 @@ import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {loadGatewayConfig, readOptionalSecret, readSecret} from './config.js'
 
@@ -39,6 +39,12 @@ beforeEach(() => {
     'TOKEN_FILE',
     'MISSING',
     'MISSING_FILE',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_ACCESS_KEY_ID_FILE',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_SECRET_ACCESS_KEY_FILE',
+    'AWS_SESSION_TOKEN',
+    'AWS_SESSION_TOKEN_FILE',
   ]) {
     delete process.env[key]
   }
@@ -350,5 +356,154 @@ describe('loadGatewayConfig', () => {
 
     // #then
     expect(config.objectStore.endpoint).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AWS credentials
+// ---------------------------------------------------------------------------
+
+describe('AWS credentials', () => {
+  it('happy path: both credentials set, no session token', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    })
+    expect(config.objectStore.credentials).not.toHaveProperty('sessionToken')
+  })
+
+  it('happy path: all three credentials set', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    const tokenFile = join(tmpDir, 'aws-session-token.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    writeFileSync(tokenFile, 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+    process.env.AWS_SESSION_TOKEN_FILE = tokenFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      sessionToken: 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN',
+    })
+  })
+
+  it('happy path: no credentials set — credentials is undefined', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toBeUndefined()
+  })
+
+  it('edge case: empty credential files treated as not set — credentials is undefined', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id-empty.txt')
+    const secretFile = join(tmpDir, 'aws-secret-empty.txt')
+    writeFileSync(keyFile, '')
+    writeFileSync(secretFile, '')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty files are treated as "not set" by readOptionalSecret
+    expect(config.objectStore.credentials).toBeUndefined()
+  })
+
+  it('edge case: pair present + empty session-token file — sessionToken omitted', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    const tokenFile = join(tmpDir, 'aws-session-token-empty.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    writeFileSync(tokenFile, '')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+    process.env.AWS_SESSION_TOKEN_FILE = tokenFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty session token file is treated as "not set"
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    })
+    expect(config.objectStore.credentials).not.toHaveProperty('sessionToken')
+  })
+
+  it('error path: only AWS_ACCESS_KEY_ID set — throws with pair error message', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_ACCESS_KEY_ID)',
+    )
+  })
+
+  it('error path: only AWS_SECRET_ACCESS_KEY set — throws with pair error message', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_SECRET_ACCESS_KEY)',
+    )
+  })
+
+  it('edge case: orphan session token — no throw, credentials undefined, warning logged', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_SESSION_TOKEN = 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN'
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — assert before restoring spy so mock.calls is still populated
+    expect(config.objectStore.credentials).toBeUndefined()
+    expect(consoleSpy).toHaveBeenCalledTimes(1)
+    const loggedArg: unknown = consoleSpy.mock.calls[0]?.[0]
+    expect(typeof loggedArg).toBe('string')
+    const parsed: unknown = JSON.parse(loggedArg as string)
+    expect(parsed).toMatchObject({
+      level: 'info',
+      msg: expect.stringContaining(
+        'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY',
+      ) as unknown,
+    })
+    consoleSpy.mockRestore()
   })
 })

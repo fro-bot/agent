@@ -447,4 +447,34 @@ describe('createS3Adapter', () => {
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
   })
+
+  it('passes credentials to S3Client when credentials are provided in config', () => {
+    // #given
+    const credentials = {
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    }
+    const configWithCredentials: ObjectStoreConfig = {...baseConfig, credentials}
+    clientConfigs.length = 0
+
+    // #when
+    createS3Adapter(configWithCredentials, createLogger())
+
+    // #then
+    expect(clientConfigs).toHaveLength(1)
+    expect(clientConfigs[0]).toHaveProperty('credentials', credentials)
+  })
+
+  it('does not set credentials on S3Client when credentials are absent in config', () => {
+    // #given
+    const configWithoutCredentials: ObjectStoreConfig = {...baseConfig}
+    clientConfigs.length = 0
+
+    // #when
+    createS3Adapter(configWithoutCredentials, createLogger())
+
+    // #then
+    expect(clientConfigs).toHaveLength(1)
+    expect(clientConfigs[0]).not.toHaveProperty('credentials')
+  })
 })

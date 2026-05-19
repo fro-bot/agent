@@ -1,4 +1,4 @@
-import type {ObjectStoreConfig} from './runtime-effect.js'
+import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 
 import {existsSync, readFileSync} from 'node:fs'
 import process from 'node:process'
@@ -81,6 +81,41 @@ export function loadGatewayConfig(): GatewayConfig {
   }
   const logLevel = rawLogLevel as GatewayConfig['logLevel']
 
+  const awsAccessKeyId = readOptionalSecret('AWS_ACCESS_KEY_ID')
+  const awsSecretAccessKey = readOptionalSecret('AWS_SECRET_ACCESS_KEY')
+  const awsSessionToken = readOptionalSecret('AWS_SESSION_TOKEN')
+
+  // Pair validation: both must be set together, or neither
+  if (awsAccessKeyId !== null && awsSecretAccessKey === null) {
+    throw new Error(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_ACCESS_KEY_ID). Set both, or set neither to use the SDK default credential chain.',
+    )
+  }
+
+  if (awsSecretAccessKey !== null && awsAccessKeyId === null) {
+    throw new Error(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_SECRET_ACCESS_KEY). Set both, or set neither to use the SDK default credential chain.',
+    )
+  }
+
+  let credentials: AwsCredentials | undefined
+
+  if (awsAccessKeyId !== null && awsSecretAccessKey !== null) {
+    credentials = {
+      accessKeyId: awsAccessKeyId,
+      secretAccessKey: awsSecretAccessKey,
+      ...(awsSessionToken === null ? {} : {sessionToken: awsSessionToken}),
+    }
+  } else if (awsSessionToken !== null) {
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        level: 'info',
+        msg: 'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; ignoring it and falling back to SDK default credential chain.',
+      }),
+    )
+  }
+
   const objectStore: ObjectStoreConfig = {
     enabled: true,
     bucket: s3Bucket,
@@ -88,6 +123,7 @@ export function loadGatewayConfig(): GatewayConfig {
     prefix: s3Prefix,
     ...(s3Endpoint === undefined ? {} : {endpoint: s3Endpoint}),
     ...(s3Sse === undefined ? {} : {sseEncryption: s3Sse as ObjectStoreConfig['sseEncryption']}),
+    ...(credentials === undefined ? {} : {credentials}),
   }
 
   return {
