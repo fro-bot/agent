@@ -11,6 +11,7 @@
     "types": ["node"],
     "strict": true,
     "ignoreDeprecations": "6.0",
+    "declarationMap": false,
     "noEmit": false
   }
 }
