@@ -1,13 +1,18 @@
 import type {EventEmitter} from 'node:events'
 
 import {GatewayIntentBits} from 'discord.js'
-import {describe, expect, it, vi} from 'vitest'
+import {beforeAll, describe, expect, it, vi} from 'vitest'
 
 import {createDiscordClient, DEFAULT_INTENTS} from './client.js'
+import {validateTokenIsFake} from './test-token-guard.js'
 
 // discord.js Client constructor makes no network calls — safe to instantiate in tests.
 
 describe('createDiscordClient', () => {
+  beforeAll(() => {
+    validateTokenIsFake(process.env.DISCORD_TOKEN)
+  })
+
   it('returns a Client with allowedMentions locked to users-only', () => {
     // #when the client is created
     const client = createDiscordClient()
@@ -16,15 +21,8 @@ describe('createDiscordClient', () => {
     expect(client.options.allowedMentions).toEqual({parse: ['users'], repliedUser: false})
   })
 
-  it('default intents include MessageContent (required to read mention text)', () => {
-    // #when
-    const client = createDiscordClient()
-
-    // #then
-    const intents = client.options.intents
-    // discord.js stores intents as a BitField; check via DEFAULT_INTENTS constant
-    expect(DEFAULT_INTENTS).toContain(GatewayIntentBits.MessageContent)
-    expect(intents).toBeDefined()
+  it('default intents are the non-privileged baseline only', () => {
+    expect([...DEFAULT_INTENTS]).toEqual([GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages])
   })
 
   it('optional intent override merges with defaults (dedup via Set)', () => {
@@ -61,5 +59,58 @@ describe('createDiscordClient', () => {
 
     emitter.emit('shardReconnecting', 0)
     expect(logger.info).toHaveBeenCalledWith({shardId: 0}, 'discord shard reconnecting')
+  })
+
+  it('boots with the non-privileged baseline only when no privileged intents are passed', () => {
+    // #when called with no options
+    const client = createDiscordClient()
+
+    // #then the bitfield is exactly the non-privileged baseline
+    const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+    const expectedBitfield = new (
+      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
+    ).constructor(expected).bitfield
+    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+  })
+
+  it('opts into MessageContent when passed via options.intents', () => {
+    // #given an opt-in for MessageContent only
+    const client = createDiscordClient({intents: [GatewayIntentBits.MessageContent]})
+
+    // #then the bitfield includes MessageContent and the non-privileged baseline
+    const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    const expectedBitfield = new (
+      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
+    ).constructor(expected).bitfield
+    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+  })
+
+  it('opts into GuildMembers when passed via options.intents', () => {
+    // #given an opt-in for GuildMembers only
+    const client = createDiscordClient({intents: [GatewayIntentBits.GuildMembers]})
+
+    // #then the bitfield includes GuildMembers and the non-privileged baseline
+    const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers]
+    const expectedBitfield = new (
+      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
+    ).constructor(expected).bitfield
+    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+  })
+
+  it('opts into both MessageContent and GuildMembers when both are passed', () => {
+    // #given an opt-in for both privileged intents
+    const client = createDiscordClient({intents: [GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers]})
+
+    // #then the bitfield includes both privileged intents and the non-privileged baseline
+    const expected = [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildMembers,
+    ]
+    const expectedBitfield = new (
+      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
+    ).constructor(expected).bitfield
+    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
   })
 })

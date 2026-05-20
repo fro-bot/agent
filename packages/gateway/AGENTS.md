@@ -52,6 +52,25 @@ Not used at this scope:
 - `src/discord/` — Discord.js integration. Client construction with safe `allowedMentions` defaults, command registry, mention handler.
 - `src/shutdown.ts` — SIGTERM handler with 25s drain.
 
+## Configuration knobs
+
+### `DISCORD_PRIVILEGED_INTENTS`
+
+Opts the gateway into Discord's privileged intents. Default is non-privileged
+only (`Guilds` + `GuildMessages`); set this env var (or the matching
+`DISCORD_PRIVILEGED_INTENTS_FILE` secret) to add `MessageContent`,
+`GuildMembers`, or both.
+
+- **Allowed values:** `MessageContent`, `GuildMembers` (case-sensitive)
+- **Format:** comma-separated; whitespace tolerated (`MessageContent, GuildMembers ` works)
+- **Empty / unset:** non-privileged baseline only — no opt-in
+- **Typo or unknown value:** fail-fast at startup with an error naming the offending token
+- **File fallback:** `DISCORD_PRIVILEGED_INTENTS_FILE` mirrors the `${NAME}_FILE` convention from `readOptionalSecret`
+
+Existing deployments that need the privileged set must set this on the next
+deploy. The allowlist is intentionally narrow — operators cannot enable
+arbitrary Discord intents via this knob.
+
 ## Build
 
 ```bash
