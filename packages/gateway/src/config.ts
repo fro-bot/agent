@@ -1,6 +1,6 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 
-import {readFileSync} from 'node:fs'
+import {closeSync, constants, fstatSync, openSync, readFileSync} from 'node:fs'
 import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
@@ -23,6 +23,86 @@ export interface GatewayConfig {
   readonly identity: string
   readonly logLevel: 'debug' | 'info' | 'warn' | 'error'
   readonly privilegedIntents: readonly GatewayIntentBits[]
+}
+
+const MAX_SECRET_BYTES = 4096
+
+class SecretFileNotFoundError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SecretFileNotFoundError'
+  }
+}
+
+/**
+ * Read a secret file with hardened path validation. Uses `openSync` with
+ * `O_NOFOLLOW` so symlinks fail at open (no TOCTOU window between validation
+ * and read), then `fstatSync` on the already-open file descriptor to confirm
+ * the file is a regular file under the size limit.
+ *
+ * Throws on:
+ * - ENOENT: file does not exist (SecretFileNotFoundError — callers can catch
+ *   this specifically to fall through to env-var fallbacks)
+ * - Symlink (ELOOP from openSync with O_NOFOLLOW)
+ * - Not a regular file: FIFOs, devices, directories (rejected after fstat)
+ * - Size > MAX_SECRET_BYTES: prevents memory exhaustion
+ *
+ * The 4096-byte limit is generous for any reasonable secret. AWS keys are
+ * typically <50 bytes; Discord tokens are <100; OAuth refresh tokens are
+ * occasionally larger but well under 4KB.
+ *
+ * Note: O_NOFOLLOW is a POSIX extension supported on Linux and macOS. On
+ * Windows (where Node's openSync silently ignores the flag), symlinks fall
+ * through to the fstat-based rejection — same outcome, just at a later check.
+ */
+function readSecretFile(filePath: string): string {
+  let fd: number
+  try {
+    // O_NOFOLLOW: open fails immediately if path is a symlink (Linux/macOS).
+    // This removes the lstat-then-read TOCTOU window — we can never race on a
+    // symlink swap because the open() syscall itself refuses to follow.
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error) {
+      if (error.code === 'ENOENT') {
+        throw new SecretFileNotFoundError(`Secret file does not exist: ${filePath}`)
+      }
+      if (error.code === 'ELOOP') {
+        // O_NOFOLLOW path-is-symlink rejection on Linux/macOS
+        throw new Error(
+          `Secret path is not a regular file: ${filePath} (got symlink). Symlinks are not supported — bind-mount a real file.`,
+        )
+      }
+    }
+    throw error
+  }
+  try {
+    const stat = fstatSync(fd)
+    if (stat.isFile() === false) {
+      const kind = describeStatKind(stat)
+      throw new Error(
+        `Secret path is not a regular file: ${filePath} (got ${kind}). FIFOs, devices, and directories are not supported — bind-mount a real file.`,
+      )
+    }
+    if (stat.size > MAX_SECRET_BYTES) {
+      throw new Error(
+        `Secret file is too large: ${filePath} (${stat.size} bytes > ${MAX_SECRET_BYTES} byte limit). Secrets should be a single value on a single line.`,
+      )
+    }
+    return readFileSync(fd, 'utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function describeStatKind(stat: import('node:fs').Stats): string {
+  if (stat.isSymbolicLink()) return 'symlink'
+  if (stat.isFIFO()) return 'FIFO/pipe'
+  if (stat.isCharacterDevice()) return 'character device'
+  if (stat.isBlockDevice()) return 'block device'
+  if (stat.isDirectory()) return 'directory'
+  if (stat.isSocket()) return 'socket'
+  return 'unknown non-file'
 }
 
 /**
@@ -51,18 +131,10 @@ export function readOptionalSecret(name: string): string | null {
   if (filePath !== undefined) {
     let contents: string | undefined
     try {
-      contents = readFileSync(filePath, 'utf8')
+      contents = readSecretFile(filePath)
     } catch (error) {
-      if (error instanceof Error && 'code' in error) {
-        if (error.code === 'ENOENT') {
-          // file not present; fall through to env-var fallback
-        } else if (error.code === 'EISDIR') {
-          throw new Error(
-            `Secret path is a directory, not a file: ${filePath} (the bind-mount source likely doesn't exist on the host)`,
-          )
-        } else {
-          throw error
-        }
+      if (error instanceof SecretFileNotFoundError) {
+        // file not present; fall through to env-var fallback
       } else {
         throw error
       }
