@@ -117,7 +117,7 @@ export function loadGatewayConfig(): GatewayConfig {
       .filter(token => token.length > 0)
     const seen = new Set<GatewayIntentBits>()
     for (const token of tokens) {
-      if (!(token in ALLOWED_PRIVILEGED_INTENTS)) {
+      if (Object.prototype.hasOwnProperty.call(ALLOWED_PRIVILEGED_INTENTS, token) === false) {
         const allowed = Object.keys(ALLOWED_PRIVILEGED_INTENTS).join(', ')
         throw new Error(
           `Invalid DISCORD_PRIVILEGED_INTENTS value: "${token}". Allowed values: ${allowed} (case-sensitive, comma-separated).`,

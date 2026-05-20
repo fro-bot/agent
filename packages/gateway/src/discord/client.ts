@@ -7,10 +7,10 @@ export interface GatewayLogger {
   readonly error: (context: Record<string, unknown>, message: string) => void
 }
 
-const DEFAULT_INTENTS: GatewayIntentBits[] = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+const DEFAULT_INTENTS: readonly GatewayIntentBits[] = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 
 export interface DiscordClientOptions {
-  readonly intents?: GatewayIntentBits[]
+  readonly intents?: readonly GatewayIntentBits[]
   readonly logger?: GatewayLogger
 }
 

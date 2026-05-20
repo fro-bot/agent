@@ -57,7 +57,7 @@ const program = Effect.gen(function* () {
   const logger = makeLogger(config.logLevel)
 
   // c. Create Discord client
-  const client = createDiscordClient({intents: [...config.privilegedIntents], logger})
+  const client = createDiscordClient({intents: config.privilegedIntents, logger})
 
   // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
   //     Must run BEFORE client.login() so the event cannot be missed.

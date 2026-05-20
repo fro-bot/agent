@@ -662,6 +662,24 @@ describe('DISCORD_PRIVILEGED_INTENTS', () => {
     expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "GuildPresences"/)
   })
 
+  it('rejects prototype-property tokens (constructor)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'constructor'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "constructor"/)
+  })
+
+  it('rejects prototype-property tokens (__proto__)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = '__proto__'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "__proto__"/)
+  })
+
+  it('rejects prototype-property tokens (toString)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'toString'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "toString"/)
+  })
+
   it('edge: DISCORD_PRIVILEGED_INTENTS_FILE with trailing newline → parsed correctly', () => {
     // #given
     setRequiredEnv()

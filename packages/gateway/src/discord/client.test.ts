@@ -1,5 +1,7 @@
 import type {EventEmitter} from 'node:events'
 
+import type {Client} from 'discord.js'
+
 import {GatewayIntentBits} from 'discord.js'
 import {beforeAll, describe, expect, it, vi} from 'vitest'
 
@@ -7,6 +9,13 @@ import {createDiscordClient, DEFAULT_INTENTS} from './client.js'
 import {validateTokenIsFake} from './test-token-guard.js'
 
 // discord.js Client constructor makes no network calls — safe to instantiate in tests.
+
+function expectClientIntents(client: Client, expected: readonly GatewayIntentBits[]): void {
+  const expectedBitfield = new (
+    client.options.intents as unknown as {constructor: new (bits: readonly GatewayIntentBits[]) => {bitfield: number}}
+  ).constructor(expected).bitfield
+  expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+}
 
 describe('createDiscordClient', () => {
   beforeAll(() => {
@@ -34,10 +43,7 @@ describe('createDiscordClient', () => {
 
     // #then the BitField is the union of defaults + extras (no duplicates)
     const expected = [...new Set<GatewayIntentBits>([...DEFAULT_INTENTS, ...customIntents])]
-    const expectedBitfield = new (
-      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
-    ).constructor(expected).bitfield
-    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+    expectClientIntents(client, expected)
   })
 
   it('wires shard events to logger when logger is provided', () => {
@@ -67,10 +73,7 @@ describe('createDiscordClient', () => {
 
     // #then the bitfield is exactly the non-privileged baseline
     const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
-    const expectedBitfield = new (
-      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
-    ).constructor(expected).bitfield
-    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+    expectClientIntents(client, expected)
   })
 
   it('opts into MessageContent when passed via options.intents', () => {
@@ -79,10 +82,7 @@ describe('createDiscordClient', () => {
 
     // #then the bitfield includes MessageContent and the non-privileged baseline
     const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-    const expectedBitfield = new (
-      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
-    ).constructor(expected).bitfield
-    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+    expectClientIntents(client, expected)
   })
 
   it('opts into GuildMembers when passed via options.intents', () => {
@@ -91,10 +91,7 @@ describe('createDiscordClient', () => {
 
     // #then the bitfield includes GuildMembers and the non-privileged baseline
     const expected = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers]
-    const expectedBitfield = new (
-      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
-    ).constructor(expected).bitfield
-    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+    expectClientIntents(client, expected)
   })
 
   it('opts into both MessageContent and GuildMembers when both are passed', () => {
@@ -108,9 +105,6 @@ describe('createDiscordClient', () => {
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     ]
-    const expectedBitfield = new (
-      client.options.intents as unknown as {constructor: new (bits: GatewayIntentBits[]) => {bitfield: number}}
-    ).constructor(expected).bitfield
-    expect((client.options.intents as unknown as {bitfield: number}).bitfield).toBe(expectedBitfield)
+    expectClientIntents(client, expected)
   })
 })
