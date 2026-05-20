@@ -20,6 +20,9 @@ services:
       S3_BUCKET_FILE: /run/secrets/s3_bucket
       S3_REGION_FILE: /run/secrets/s3_region
       S3_ENDPOINT_FILE: /run/secrets/s3_endpoint
+      AWS_ACCESS_KEY_ID_FILE: /run/secrets/aws_access_key_id
+      AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/aws_secret_access_key
+      AWS_SESSION_TOKEN_FILE: /run/secrets/aws_session_token
       # Optional — guild-scoped slash command registration (fast dev propagation)
       DISCORD_GUILD_ID_FILE: /run/secrets/discord_guild_id
       # Egress proxy (regular proxy mode — NOT transparent)
@@ -28,27 +31,81 @@ services:
       NO_PROXY: workspace,localhost,127.0.0.1
       NODE_EXTRA_CA_CERTS: /etc/ssl/certs/mitmproxy-ca-cert.pem
     volumes:
-      # Credentials — bind-mounted as accepted-risk (no Docker Swarm secrets in v1)
-      - ./secrets/discord-token:/run/secrets/discord_token:ro
-      - ./secrets/discord-application-id:/run/secrets/discord_application_id:ro
-      - ./secrets/s3-bucket:/run/secrets/s3_bucket:ro
-      - ./secrets/s3-region:/run/secrets/s3_region:ro
-      - ./secrets/s3-endpoint:/run/secrets/s3_endpoint:ro
+      # Credentials — bind-mounted as accepted-risk (no Docker Swarm secrets in v1).
+      # create_host_path: false ensures a missing source file causes a clear Compose
+      # error at `docker compose up` time instead of Docker silently creating a directory.
+      - type: bind
+        source: ./secrets/discord-token
+        target: /run/secrets/discord_token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/discord-application-id
+        target: /run/secrets/discord_application_id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-bucket
+        target: /run/secrets/s3_bucket
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-region
+        target: /run/secrets/s3_region
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-endpoint
+        target: /run/secrets/s3_endpoint
+        read_only: true
+        bind:
+          create_host_path: false
+      # Optional — AWS credentials for explicit S3 authentication. Leave the
+      # access-key-id and secret-access-key files empty (`touch deploy/secrets/aws-access-key-id`)
+      # to fall back to the AWS SDK default credential chain (env, ~/.aws, IMDS).
+      # AWS_SESSION_TOKEN is only needed for STS temporary credentials.
+      - type: bind
+        source: ./secrets/aws-access-key-id
+        target: /run/secrets/aws_access_key_id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/aws-secret-access-key
+        target: /run/secrets/aws_secret_access_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/aws-session-token
+        target: /run/secrets/aws_session_token
+        read_only: true
+        bind:
+          create_host_path: false
       # Optional — guild-scoped slash command registration (fast dev propagation).
       # Create the file empty (`touch deploy/secrets/discord-guild-id`) to register
       # slash commands globally; the gateway treats empty files as unset.
-      - ./secrets/discord-guild-id:/run/secrets/discord_guild_id:ro
+      - type: bind
+        source: ./secrets/discord-guild-id
+        target: /run/secrets/discord_guild_id
+        read_only: true
+        bind:
+          create_host_path: false
       # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
       - mitmproxy-certs:/etc/ssl/certs:ro
     networks:
       - gateway-net
       - sandbox-net
     restart: unless-stopped
-    healthcheck:
-      test: [CMD-SHELL, test -s /etc/ssl/certs/mitmproxy-ca-cert.pem]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
 
   workspace:
     build:
@@ -65,6 +122,11 @@ services:
     networks:
       - sandbox-net
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
 
   mitmproxy:
     image: mitmproxy/mitmproxy:11.0.2@sha256:92ab9e0626ec73a3abae9c460e5475323f414745d7d0001205c8fa0c77ad31a2
@@ -89,6 +151,11 @@ services:
     networks:
       - sandbox-net
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     healthcheck:
       # Gate dependent services on the CA actually existing in the shared
       # volume. mitmproxy generates ~/.mitmproxy/mitmproxy-ca-cert.pem on

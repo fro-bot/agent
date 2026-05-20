@@ -7,6 +7,13 @@ export {err, isErr, isOk, ok} from '@bfra.me/es/result'
 // Agent identity for cache scoping
 export type AgentIdentity = 'discord' | 'github'
 
+// AWS credential identity for explicit S3 authentication
+export interface AwsCredentials {
+  readonly accessKeyId: string
+  readonly secretAccessKey: string
+  readonly sessionToken?: string
+}
+
 // Object store configuration (pure data shape; adapter lives in services/object-store/)
 export interface ObjectStoreConfig {
   readonly enabled: boolean
@@ -18,6 +25,7 @@ export interface ObjectStoreConfig {
   readonly allowInsecureEndpoint?: boolean
   readonly sseEncryption?: 'aws:kms' | 'AES256'
   readonly sseKmsKeyId?: string
+  readonly credentials?: AwsCredentials
 }
 
 // Cache restore result

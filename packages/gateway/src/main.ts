@@ -1,4 +1,4 @@
-import type {ChatInputCommandInteraction, Message} from 'discord.js'
+import type {ChatInputCommandInteraction, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayLogger} from './discord/client.js'
 
 import process from 'node:process'
@@ -9,6 +9,7 @@ import {loadGatewayConfig} from './config.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
+import {setupReadinessFlag} from './readiness.js'
 import {installShutdownHandlers} from './shutdown.js'
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,19 @@ function makeLogger(level: 'debug' | 'info' | 'warn' | 'error'): GatewayLogger {
 }
 
 // ---------------------------------------------------------------------------
+// Composition helper — exported for unit testing only.
+// Keeps the wiring between GatewayConfig.privilegedIntents and
+// createDiscordClient() explicit and independently verifiable.
+// ---------------------------------------------------------------------------
+
+export function makeDiscordClientFromConfig(
+  config: {privilegedIntents: readonly GatewayIntentBits[]},
+  logger: GatewayLogger,
+): ReturnType<typeof createDiscordClient> {
+  return createDiscordClient({intents: config.privilegedIntents, logger})
+}
+
+// ---------------------------------------------------------------------------
 // Main Effect program
 // ---------------------------------------------------------------------------
 
@@ -56,7 +70,11 @@ const program = Effect.gen(function* () {
   const logger = makeLogger(config.logLevel)
 
   // c. Create Discord client
-  const client = createDiscordClient({logger})
+  const client = makeDiscordClientFromConfig(config, logger)
+
+  // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
+  //     Must run BEFORE client.login() so the event cannot be missed.
+  yield* Effect.sync(() => setupReadinessFlag(client, logger))
 
   // d. Build command registry
   const registry = getCommandRegistry()

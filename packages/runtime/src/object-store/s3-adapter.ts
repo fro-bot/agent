@@ -97,10 +97,15 @@ function createClient(config: ObjectStoreConfig): S3Client {
       forcePathStyle: true,
       maxAttempts,
       region,
+      ...(config.credentials == null ? {} : {credentials: config.credentials}),
     })
   }
 
-  return new S3Client({maxAttempts, region})
+  return new S3Client({
+    maxAttempts,
+    region,
+    ...(config.credentials == null ? {} : {credentials: config.credentials}),
+  })
 }
 
 function getEffectiveEncryption(config: ObjectStoreConfig): 'AES256' | 'aws:kms' {

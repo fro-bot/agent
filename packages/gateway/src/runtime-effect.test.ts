@@ -122,7 +122,7 @@ describe('acquireLockEffect', () => {
   // #given underlying returns failure Result
   // #when Effect runs
   // #then fails with the error
-  // eslint-disable-next-line vitest/expect-expect
+
   it('fails with error when Result is failure', async () => {
     vi.mocked(acquireLock).mockResolvedValue(err(new Error('lock conflict')))
 
@@ -135,7 +135,7 @@ describe('acquireLockEffect', () => {
   // #given underlying throws
   // #when Effect runs
   // #then fails with wrapped error
-  // eslint-disable-next-line vitest/expect-expect
+
   it('fails when underlying function throws', async () => {
     vi.mocked(acquireLock).mockRejectedValue(new Error('network error'))
 
@@ -145,7 +145,6 @@ describe('acquireLockEffect', () => {
     )
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('preserves the error message when Result is failure', async () => {
     vi.mocked(acquireLock).mockResolvedValue(err(new Error('lock conflict')))
 
@@ -155,7 +154,6 @@ describe('acquireLockEffect', () => {
     )
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('wraps non-Error rejections into an Error instance', async () => {
     vi.mocked(acquireLock).mockRejectedValue('oops')
 
@@ -178,14 +176,12 @@ describe('releaseLockEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(releaseLock).mockResolvedValue(err(new Error('delete failed')))
 
     await assertEffectFailsWith(releaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'delete failed')
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(releaseLock).mockRejectedValue(new Error('boom'))
 
@@ -217,7 +213,6 @@ describe('renewLeaseEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'new-etag'}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(renewLease).mockResolvedValue(err(new Error('precondition failed')))
 
@@ -227,7 +222,6 @@ describe('renewLeaseEffect', () => {
     )
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(renewLease).mockRejectedValue('string error')
 
@@ -250,14 +244,12 @@ describe('forceReleaseLockEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(forceReleaseLock).mockResolvedValue(err(new Error('force delete failed')))
 
     await assertEffectFailsWith(forceReleaseLockEffect(config, 'repo', 'etag-1', coordLogger), 'force delete failed')
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(forceReleaseLock).mockRejectedValue(new Error('boom'))
 
@@ -292,14 +284,12 @@ describe('createRunEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'etag-1'}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(createRun).mockResolvedValue(err(new Error('already exists')))
 
     await assertEffectFailsWith(createRunEffect(config, 'identity', 'repo', runState, coordLogger), 'already exists')
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(createRun).mockRejectedValue(new Error('network'))
 
@@ -336,7 +326,6 @@ describe('transitionRunEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'etag-2', state: {phase: 'ACKNOWLEDGED'}}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(transitionRun).mockResolvedValue(err(new Error('invalid transition')))
 
@@ -346,7 +335,6 @@ describe('transitionRunEffect', () => {
     )
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(transitionRun).mockRejectedValue(new Error('timeout'))
 
@@ -372,14 +360,12 @@ describe('findStaleRunsEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: []})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(findStaleRuns).mockResolvedValue(err(new Error('list failed')))
 
     await assertEffectFailsWith(findStaleRunsEffect(config, 'identity', 'repo', coordLogger), 'list failed')
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(findStaleRuns).mockRejectedValue(new Error('boom'))
 
@@ -402,14 +388,12 @@ describe('validateProviderSemanticsEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success'})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails with error when Result is failure', async () => {
     vi.mocked(validateProviderSemantics).mockResolvedValue(err(new Error('semantics check failed')))
 
     await assertEffectFailsWith(validateProviderSemanticsEffect(config, coordLogger), 'semantics check failed')
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(validateProviderSemantics).mockRejectedValue(new Error('provider unreachable'))
 
@@ -434,7 +418,6 @@ describe('syncSessionsToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {uploaded: 2, failed: 0}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncSessionsToStore).mockRejectedValue(new Error('upload error'))
 
@@ -458,7 +441,6 @@ describe('syncSessionsFromStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {downloaded: 3, failed: 0, mainDbRestored: true}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncSessionsFromStore).mockRejectedValue(new Error('download error'))
 
@@ -482,7 +464,6 @@ describe('syncArtifactsToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {uploaded: 1, failed: 0}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncArtifactsToStore).mockRejectedValue(new Error('artifact error'))
 
@@ -506,7 +487,6 @@ describe('syncMetadataToStoreEffect', () => {
     expect(exit).toMatchObject({_tag: 'Success', value: {success: true}})
   })
 
-  // eslint-disable-next-line vitest/expect-expect
   it('fails when underlying function throws', async () => {
     vi.mocked(syncMetadataToStore).mockRejectedValue(new Error('metadata error'))
 

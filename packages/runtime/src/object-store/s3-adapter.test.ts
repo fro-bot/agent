@@ -447,4 +447,58 @@ describe('createS3Adapter', () => {
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
   })
+
+  it('passes credentials to S3Client when credentials are provided in config', () => {
+    // #given
+    const credentials = {
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    }
+    const configWithCredentials: ObjectStoreConfig = {...baseConfig, credentials}
+    clientConfigs.length = 0
+
+    // #when
+    createS3Adapter(configWithCredentials, createLogger())
+
+    // #then
+    expect(clientConfigs).toHaveLength(1)
+    expect(clientConfigs[0]).toHaveProperty('credentials', credentials)
+  })
+
+  it('does not set credentials on S3Client when credentials are absent in config', () => {
+    // #given
+    const configWithoutCredentials: ObjectStoreConfig = {...baseConfig}
+    clientConfigs.length = 0
+
+    // #when
+    createS3Adapter(configWithoutCredentials, createLogger())
+
+    // #then
+    expect(clientConfigs).toHaveLength(1)
+    expect(clientConfigs[0]).not.toHaveProperty('credentials')
+  })
+
+  it('passes credentials to S3Client constructor when endpoint and credentials are both set', () => {
+    // #given — custom endpoint (e.g. Cloudflare R2) with explicit credentials
+    const config: ObjectStoreConfig = {
+      ...baseConfig,
+      endpoint: 'https://r2.cloudflarestorage.com',
+      credentials: {
+        accessKeyId: 'AKIA...',
+        secretAccessKey: 'wJal...',
+      },
+    }
+    clientConfigs.length = 0
+
+    // #when
+    createS3Adapter(config, createLogger())
+
+    // #then — both endpoint config and credentials must be forwarded together
+    expect(clientConfigs).toHaveLength(1)
+    expect(clientConfigs[0]).toMatchObject({
+      endpoint: 'https://r2.cloudflarestorage.com',
+      forcePathStyle: true,
+      credentials: {accessKeyId: 'AKIA...', secretAccessKey: 'wJal...'},
+    })
+  })
 })
