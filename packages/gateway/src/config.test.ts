@@ -4,6 +4,7 @@ import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
+import {GatewayIntentBits} from 'discord.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {loadGatewayConfig, readOptionalSecret, readSecret} from './config.js'
@@ -45,6 +46,8 @@ beforeEach(() => {
     'AWS_SECRET_ACCESS_KEY_FILE',
     'AWS_SESSION_TOKEN',
     'AWS_SESSION_TOKEN_FILE',
+    'DISCORD_PRIVILEGED_INTENTS',
+    'DISCORD_PRIVILEGED_INTENTS_FILE',
   ]) {
     delete process.env[key]
   }
@@ -519,5 +522,157 @@ describe('AWS credentials', () => {
     ) as unknown
     expect(parsed).toMatchObject({level: 'warn', msg: sessionTokenMsg})
     consoleSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DISCORD_PRIVILEGED_INTENTS
+// ---------------------------------------------------------------------------
+
+describe('DISCORD_PRIVILEGED_INTENTS', () => {
+  it('happy: unset → privilegedIntents is []', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([])
+  })
+
+  it('happy: MessageContent → [GatewayIntentBits.MessageContent]', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
+  })
+
+  it('happy: GuildMembers → [GatewayIntentBits.GuildMembers]', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.GuildMembers])
+  })
+
+  it('happy: MessageContent,GuildMembers → both values, ordered as parsed', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('edge: empty string → [] (treated as null by readOptionalSecret)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = ''
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty string is treated as "not set"
+    expect(config.privilegedIntents).toEqual([])
+  })
+
+  it('edge: extra whitespace around tokens → both parsed correctly', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = ' MessageContent , GuildMembers '
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('edge: duplicate token → deduped to single value', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,MessageContent'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
+  })
+
+  it('edge: empty middle token (MessageContent,,GuildMembers) → both parsed, no error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,,GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty tokens are filtered out
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('error: typo "MesageContent" → throws with offending value and allowed list', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MesageContent'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "MesageContent"/)
+    expect(() => loadGatewayConfig()).toThrow(/MessageContent, GuildMembers/)
+  })
+
+  it('error: wrong case "messagecontent" → throws (case-sensitive)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'messagecontent'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "messagecontent"/)
+  })
+
+  it('error: non-privileged intent "Guilds" → throws', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'Guilds'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "Guilds"/)
+  })
+
+  it('error: privileged intent not on allowlist "GuildPresences" → throws', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'GuildPresences'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "GuildPresences"/)
+  })
+
+  it('edge: DISCORD_PRIVILEGED_INTENTS_FILE with trailing newline → parsed correctly', () => {
+    // #given
+    setRequiredEnv()
+    const intentFile = join(tmpDir, 'privileged-intents.txt')
+    writeFileSync(intentFile, 'MessageContent\n', {mode: 0o600})
+    process.env.DISCORD_PRIVILEGED_INTENTS_FILE = intentFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — trailing newline stripped by readOptionalSecret, value parsed correctly
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
   })
 })

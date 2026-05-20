@@ -3,10 +3,17 @@ import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 import {readFileSync} from 'node:fs'
 import process from 'node:process'
 
+import {GatewayIntentBits} from 'discord.js'
+
 const DEFAULT_S3_PREFIX = 'fro-bot-state'
 const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
 const DEFAULT_LOG_LEVEL = 'info' as const
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
+
+const ALLOWED_PRIVILEGED_INTENTS = {
+  MessageContent: GatewayIntentBits.MessageContent,
+  GuildMembers: GatewayIntentBits.GuildMembers,
+} as const
 
 export interface GatewayConfig {
   readonly discordToken: string
@@ -15,6 +22,7 @@ export interface GatewayConfig {
   readonly objectStore: ObjectStoreConfig
   readonly identity: string
   readonly logLevel: 'debug' | 'info' | 'warn' | 'error'
+  readonly privilegedIntents: readonly GatewayIntentBits[]
 }
 
 /**
@@ -100,6 +108,29 @@ export function loadGatewayConfig(): GatewayConfig {
   }
   const logLevel = rawLogLevel as GatewayConfig['logLevel']
 
+  const rawIntents = readOptionalSecret('DISCORD_PRIVILEGED_INTENTS')
+  const privilegedIntents: GatewayIntentBits[] = []
+  if (rawIntents !== null) {
+    const tokens = rawIntents
+      .split(',')
+      .map(token => token.trim())
+      .filter(token => token.length > 0)
+    const seen = new Set<GatewayIntentBits>()
+    for (const token of tokens) {
+      if (!(token in ALLOWED_PRIVILEGED_INTENTS)) {
+        const allowed = Object.keys(ALLOWED_PRIVILEGED_INTENTS).join(', ')
+        throw new Error(
+          `Invalid DISCORD_PRIVILEGED_INTENTS value: "${token}". Allowed values: ${allowed} (case-sensitive, comma-separated).`,
+        )
+      }
+      const intent = ALLOWED_PRIVILEGED_INTENTS[token as keyof typeof ALLOWED_PRIVILEGED_INTENTS]
+      if (seen.has(intent) === false) {
+        seen.add(intent)
+        privilegedIntents.push(intent)
+      }
+    }
+  }
+
   const awsAccessKeyId = readOptionalSecret('AWS_ACCESS_KEY_ID')
   const awsSecretAccessKey = readOptionalSecret('AWS_SECRET_ACCESS_KEY')
   const awsSessionToken = readOptionalSecret('AWS_SESSION_TOKEN')
@@ -151,5 +182,6 @@ export function loadGatewayConfig(): GatewayConfig {
     objectStore,
     identity,
     logLevel,
+    privilegedIntents,
   }
 }
