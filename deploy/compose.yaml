@@ -25,6 +25,8 @@ services:
       AWS_SESSION_TOKEN_FILE: /run/secrets/aws_session_token
       # Optional — guild-scoped slash command registration (fast dev propagation)
       DISCORD_GUILD_ID_FILE: /run/secrets/discord_guild_id
+      # Optional — opt into Discord privileged intents (MessageContent, GuildMembers)
+      DISCORD_PRIVILEGED_INTENTS_FILE: /run/secrets/discord_privileged_intents
       # Egress proxy (regular proxy mode — NOT transparent)
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
@@ -92,6 +94,15 @@ services:
       - type: bind
         source: ./secrets/discord-guild-id
         target: /run/secrets/discord_guild_id
+        read_only: true
+        bind:
+          create_host_path: false
+      # Optional — Discord privileged intents (MessageContent, GuildMembers).
+      # Leave the file empty to use the non-privileged baseline (Guilds + GuildMessages only).
+      # Set the contents to a comma-separated list of intent names to opt in.
+      - type: bind
+        source: ./secrets/discord-privileged-intents
+        target: /run/secrets/discord_privileged_intents
         read_only: true
         bind:
           create_host_path: false
