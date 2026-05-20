@@ -1,6 +1,6 @@
-import type {ObjectStoreConfig} from './runtime-effect.js'
+import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 
-import {existsSync, readFileSync} from 'node:fs'
+import {readFileSync} from 'node:fs'
 import process from 'node:process'
 
 const DEFAULT_S3_PREFIX = 'fro-bot-state'
@@ -40,13 +40,32 @@ export function readSecret(name: string): string {
  */
 export function readOptionalSecret(name: string): string | null {
   const filePath = process.env[`${name}_FILE`]
-  if (filePath !== undefined && existsSync(filePath)) {
-    const contents = readFileSync(filePath, 'utf8')
-    // Strip only trailing whitespace (newline/spaces from echo) so leading whitespace
-    // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].
-    // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets).
-    const trailingTrimmed = contents.trimEnd()
-    return trailingTrimmed.trim() === '' ? null : trailingTrimmed
+  if (filePath !== undefined) {
+    let contents: string | undefined
+    try {
+      contents = readFileSync(filePath, 'utf8')
+    } catch (error) {
+      if (error instanceof Error && 'code' in error) {
+        if (error.code === 'ENOENT') {
+          // file not present; fall through to env-var fallback
+        } else if (error.code === 'EISDIR') {
+          throw new Error(
+            `Secret path is a directory, not a file: ${filePath} (the bind-mount source likely doesn't exist on the host)`,
+          )
+        } else {
+          throw error
+        }
+      } else {
+        throw error
+      }
+    }
+    if (contents !== undefined) {
+      // Strip only trailing whitespace (newline/spaces from echo) so leading whitespace
+      // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].
+      // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets).
+      const trailingTrimmed = contents.trimEnd()
+      return trailingTrimmed.trim() === '' ? null : trailingTrimmed
+    }
   }
 
   const value = process.env[name]
@@ -81,6 +100,40 @@ export function loadGatewayConfig(): GatewayConfig {
   }
   const logLevel = rawLogLevel as GatewayConfig['logLevel']
 
+  const awsAccessKeyId = readOptionalSecret('AWS_ACCESS_KEY_ID')
+  const awsSecretAccessKey = readOptionalSecret('AWS_SECRET_ACCESS_KEY')
+  const awsSessionToken = readOptionalSecret('AWS_SESSION_TOKEN')
+
+  // Pair validation: both must be set together, or neither
+  if (awsAccessKeyId !== null && awsSecretAccessKey === null) {
+    throw new Error(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_ACCESS_KEY_ID). Set both, or set neither to use the SDK default credential chain.',
+    )
+  }
+
+  if (awsSecretAccessKey !== null && awsAccessKeyId === null) {
+    throw new Error(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_SECRET_ACCESS_KEY). Set both, or set neither to use the SDK default credential chain.',
+    )
+  }
+
+  let credentials: AwsCredentials | undefined
+
+  if (awsAccessKeyId !== null && awsSecretAccessKey !== null) {
+    credentials = {
+      accessKeyId: awsAccessKeyId,
+      secretAccessKey: awsSecretAccessKey,
+      ...(awsSessionToken === null ? {} : {sessionToken: awsSessionToken}),
+    }
+  } else if (awsSessionToken !== null) {
+    console.warn(
+      JSON.stringify({
+        level: 'warn',
+        msg: 'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; ignoring it and falling back to SDK default credential chain.',
+      }),
+    )
+  }
+
   const objectStore: ObjectStoreConfig = {
     enabled: true,
     bucket: s3Bucket,
@@ -88,6 +141,7 @@ export function loadGatewayConfig(): GatewayConfig {
     prefix: s3Prefix,
     ...(s3Endpoint === undefined ? {} : {endpoint: s3Endpoint}),
     ...(s3Sse === undefined ? {} : {sseEncryption: s3Sse as ObjectStoreConfig['sseEncryption']}),
+    ...(credentials === undefined ? {} : {credentials}),
   }
 
   return {

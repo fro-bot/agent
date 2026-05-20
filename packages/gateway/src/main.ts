@@ -9,6 +9,7 @@ import {loadGatewayConfig} from './config.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
+import {setupReadinessFlag} from './readiness.js'
 import {installShutdownHandlers} from './shutdown.js'
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,10 @@ const program = Effect.gen(function* () {
 
   // c. Create Discord client
   const client = createDiscordClient({logger})
+
+  // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
+  //     Must run BEFORE client.login() so the event cannot be missed.
+  yield* Effect.sync(() => setupReadinessFlag(client, logger))
 
   // d. Build command registry
   const registry = getCommandRegistry()

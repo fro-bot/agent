@@ -38,8 +38,17 @@ COPY --from=build /workspace/packages/gateway/dist/ ./packages/gateway/dist/
 
 WORKDIR /app/packages/gateway
 
-# Placeholder healthcheck — real HTTP health endpoint arrives in Unit 7
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD node -e 'process.exit(0)'
+# Readiness flag directory. Kept outside /tmp so static-analysis tools
+# don't flag the predictable-path pattern, and so the flag survives any
+# future tmpfs-mount changes to /tmp.
+RUN mkdir -p /var/run/fro-bot && chmod 0700 /var/run/fro-bot
+
+# Readiness healthcheck — passes when the Discord `clientReady` event has
+# fired (writes /var/run/fro-bot/gateway-ready) AND PID 1 is alive. Cleared
+# at process startup so a stale flag from a prior process cannot mask a
+# current-run failure. A real liveness probe (HTTP /healthz) lands alongside
+# the workspace agent.
+HEALTHCHECK --interval=10s --timeout=3s --retries=12 --start-period=45s \
+  CMD test -f /var/run/fro-bot/gateway-ready && kill -0 1
 
 CMD ["node", "dist/main.mjs"]
