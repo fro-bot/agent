@@ -125,10 +125,10 @@ This checks:
 
 The gateway container is considered healthy only after two conditions are both true:
 
-1. The Discord `clientReady` event has fired — the bot is fully connected and ready to receive events. At that point the process writes `/tmp/gateway-ready`.
+1. The Discord `clientReady` event has fired — the bot is fully connected and ready to receive events. At that point the process writes `/var/run/fro-bot/gateway-ready`.
 2. The daemon process (PID 1) is still alive (`kill -0 1`).
 
-The flag is cleared at process startup, so a stale `/tmp/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
+The flag is cleared at process startup, so a stale `/var/run/fro-bot/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
 
 ## Stopping the Stack
 

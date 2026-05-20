@@ -1,9 +1,10 @@
 import type {GatewayLogger} from './discord/client.js'
 
 import {unlinkSync, writeFileSync} from 'node:fs'
+import process from 'node:process'
 
 // ---------------------------------------------------------------------------
-// Gateway readiness flag — /tmp/gateway-ready
+// Gateway readiness flag — /var/run/fro-bot/gateway-ready
 //
 // The Dockerfile healthcheck polls for this file. It is written when the
 // Discord `clientReady` event fires (i.e. the bot is fully connected and
@@ -28,12 +29,12 @@ export interface ReadinessClient {
  *
  * @param client - Discord client (or compatible mock)
  * @param logger - Structured logger
- * @param flagPath - Path to the readiness flag file (default: /tmp/gateway-ready)
+ * @param flagPath - Path to the readiness flag file (default: /var/run/fro-bot/gateway-ready)
  */
 export function setupReadinessFlag(
   client: ReadinessClient,
   logger: GatewayLogger,
-  flagPath = '/tmp/gateway-ready',
+  flagPath = process.env.FRO_BOT_READY_FLAG_PATH ?? '/var/run/fro-bot/gateway-ready',
 ): void {
   // Clear any stale flag from a prior process. ENOENT is expected on fresh
   // containers and is silently ignored. Other errors are non-fatal here
