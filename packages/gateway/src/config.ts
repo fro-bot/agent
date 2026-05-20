@@ -42,7 +42,7 @@ export function readOptionalSecret(name: string): string | null {
   const filePath = process.env[`${name}_FILE`]
   if (filePath !== undefined && existsSync(filePath)) {
     const stat = statSync(filePath)
-    if (!stat.isFile()) {
+    if (stat.isFile() === false) {
       throw new Error(
         `Secret path is a directory, not a file: ${filePath} (the bind-mount source likely doesn't exist on the host)`,
       )
@@ -113,10 +113,9 @@ export function loadGatewayConfig(): GatewayConfig {
       ...(awsSessionToken === null ? {} : {sessionToken: awsSessionToken}),
     }
   } else if (awsSessionToken !== null) {
-    // eslint-disable-next-line no-console
-    console.log(
+    console.warn(
       JSON.stringify({
-        level: 'info',
+        level: 'warn',
         msg: 'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; ignoring it and falling back to SDK default credential chain.',
       }),
     )

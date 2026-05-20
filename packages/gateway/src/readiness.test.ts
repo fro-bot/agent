@@ -96,25 +96,23 @@ describe('setupReadinessFlag', () => {
     // Pre-create a stale flag
     writeFileSync(flagPath, 'stale')
 
-    const removalOrder: string[] = []
+    // Capture filesystem state at the exact moment once() is called
+    let flagExistedAtRegistration: boolean | undefined
 
-    // Intercept `once` to record when the listener is registered
     const {client} = makeClient()
     const originalOnce = client.once.bind(client)
     vi.spyOn(client, 'once').mockImplementation((event, listener) => {
-      removalOrder.push('listener-registered')
+      // Record whether the flag still exists when the listener is being registered
+      flagExistedAtRegistration = existsSync(flagPath)
       return originalOnce(event, listener)
     })
 
-    // The stale flag should be gone before once() is called
-    const originalSetup = setupReadinessFlag
-    // We can't easily intercept unlinkSync mid-function, so instead we verify
-    // the observable outcome: after setup, the flag is absent (cleared), and
-    // the listener is registered (once was called).
-    originalSetup(client, logger, flagPath)
+    setupReadinessFlag(client, logger, flagPath)
 
+    // The flag must have been absent at the moment of listener registration
+    expect(flagExistedAtRegistration).toBe(false)
+    // And still absent after setup completes
     expect(existsSync(flagPath)).toBe(false)
-    expect(removalOrder).toContain('listener-registered')
   })
 
   // #given no flag file exists (fresh container)

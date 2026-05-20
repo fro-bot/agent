@@ -51,6 +51,11 @@ touch deploy/secrets/s3-endpoint
 # Optional — AWS credentials for explicit S3 authentication. Leave empty
 # to fall back to the SDK default credential chain (env vars, ~/.aws,
 # or EC2/EKS instance role).
+```
+
+> **Pair contract:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` must both be provided or both left empty. `AWS_SESSION_TOKEN` is only used when the pair is present — it is ignored otherwise. With neither pair value set, the AWS SDK default credential chain takes over (env vars, `~/.aws`, EC2/EKS instance role).
+
+```sh
 touch deploy/secrets/aws-access-key-id
 touch deploy/secrets/aws-secret-access-key
 touch deploy/secrets/aws-session-token

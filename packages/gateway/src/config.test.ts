@@ -506,7 +506,7 @@ describe('AWS credentials', () => {
     // #given
     setRequiredEnv()
     process.env.AWS_SESSION_TOKEN = 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN'
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
 
     // #when
     const config = loadGatewayConfig()
@@ -516,13 +516,11 @@ describe('AWS credentials', () => {
     expect(consoleSpy).toHaveBeenCalledTimes(1)
     const loggedArg: unknown = consoleSpy.mock.calls[0]?.[0]
     expect(typeof loggedArg).toBe('string')
-    const parsed: unknown = JSON.parse(loggedArg as string)
-    expect(parsed).toMatchObject({
-      level: 'info',
-      msg: expect.stringContaining(
-        'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY',
-      ) as unknown,
-    })
+    const parsed: unknown = JSON.parse(String(loggedArg)) as unknown
+    const sessionTokenMsg = expect.stringContaining(
+      'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY',
+    ) as unknown
+    expect(parsed).toMatchObject({level: 'warn', msg: sessionTokenMsg})
     consoleSpy.mockRestore()
   })
 })

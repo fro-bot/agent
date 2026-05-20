@@ -42,7 +42,7 @@ export function setupReadinessFlag(
   try {
     unlinkSync(flagPath)
   } catch (error) {
-    if (!(error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
       logger.warn({err: error}, 'failed to clear stale gateway-ready flag')
     }
   }
