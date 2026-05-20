@@ -51,7 +51,7 @@ export function setupReadinessFlag(
   // Register the listener BEFORE login() so the event cannot be missed.
   client.once('clientReady', () => {
     try {
-      writeFileSync(flagPath, '')
+      writeFileSync(flagPath, '', {mode: 0o600})
       logger.info({}, 'gateway ready')
     } catch (error) {
       logger.error({err: error}, 'failed to write gateway-ready flag')

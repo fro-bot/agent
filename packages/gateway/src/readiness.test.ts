@@ -94,7 +94,7 @@ describe('setupReadinessFlag', () => {
     const {logger} = makeLogger()
 
     // Pre-create a stale flag
-    writeFileSync(flagPath, 'stale')
+    writeFileSync(flagPath, 'stale', {mode: 0o600})
 
     // Capture filesystem state at the exact moment once() is called
     let flagExistedAtRegistration: boolean | undefined
