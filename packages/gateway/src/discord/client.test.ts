@@ -10,6 +10,16 @@ import {validateTokenIsFake} from './test-token-guard.js'
 
 // discord.js Client constructor makes no network calls — safe to instantiate in tests.
 
+/**
+ * Compare a Discord.js Client's intent bitfield against an expected list of intents.
+ *
+ * discord.js stores intents internally as a BitField instance — the public type
+ * (`ClientOptions['intents']`) doesn't expose the constructor or `.bitfield` numeric
+ * value. Tests use the double-`unknown` cast to reach into the runtime shape. This is
+ * brittle against discord.js internal API changes; if the cast breaks on an upgrade,
+ * recompute the expected bitfield via `new IntentsBitField(expected).bitfield` (from
+ * `discord.js`) and compare directly.
+ */
 function expectClientIntents(client: Client, expected: readonly GatewayIntentBits[]): void {
   const expectedBitfield = new (
     client.options.intents as unknown as {constructor: new (bits: readonly GatewayIntentBits[]) => {bitfield: number}}

@@ -1,4 +1,4 @@
-import type {ChatInputCommandInteraction, Message} from 'discord.js'
+import type {ChatInputCommandInteraction, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayLogger} from './discord/client.js'
 
 import process from 'node:process'
@@ -43,6 +43,19 @@ function makeLogger(level: 'debug' | 'info' | 'warn' | 'error'): GatewayLogger {
 }
 
 // ---------------------------------------------------------------------------
+// Composition helper — exported for unit testing only.
+// Keeps the wiring between GatewayConfig.privilegedIntents and
+// createDiscordClient() explicit and independently verifiable.
+// ---------------------------------------------------------------------------
+
+export function makeDiscordClientFromConfig(
+  config: {privilegedIntents: readonly GatewayIntentBits[]},
+  logger: GatewayLogger,
+): ReturnType<typeof createDiscordClient> {
+  return createDiscordClient({intents: config.privilegedIntents, logger})
+}
+
+// ---------------------------------------------------------------------------
 // Main Effect program
 // ---------------------------------------------------------------------------
 
@@ -57,7 +70,7 @@ const program = Effect.gen(function* () {
   const logger = makeLogger(config.logLevel)
 
   // c. Create Discord client
-  const client = createDiscordClient({intents: config.privilegedIntents, logger})
+  const client = makeDiscordClientFromConfig(config, logger)
 
   // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
   //     Must run BEFORE client.login() so the event cannot be missed.
