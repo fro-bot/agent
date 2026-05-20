@@ -68,6 +68,13 @@ touch deploy/secrets/aws-session-token
 # Leave the file empty (or omit the echo) to register slash commands globally instead:
 touch deploy/secrets/discord-guild-id
 # echo -n 'YOUR_GUILD_ID' > deploy/secrets/discord-guild-id
+# Optional — opt into Discord privileged intents. Leave the file empty
+# to use the non-privileged baseline (Guilds + GuildMessages only). Set
+# the contents to a comma-separated list of `MessageContent` and/or
+# `GuildMembers` to opt in. Operators rotating intents must restart
+# the gateway after writing the new value.
+touch deploy/secrets/discord-privileged-intents
+# echo -n 'MessageContent,GuildMembers' > deploy/secrets/discord-privileged-intents
 
 chmod 0600 deploy/secrets/*
 ```
@@ -131,6 +138,25 @@ The gateway container is considered healthy only after two conditions are both t
 2. The daemon process (PID 1) is still alive (`kill -0 1`).
 
 The flag is cleared at process startup, so a stale `/var/run/fro-bot/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
+
+## Upgrading existing deployments
+
+The compose stack bind-mounts each secret file individually with `create_host_path: false`. A missing source file produces a clear `docker compose up` error instead of silently materializing as a directory. This is the fail-fast diagnostic — but it means **every time the compose stack adds a new optional secret, existing deployments must `touch` the new file before their next `docker compose up`**.
+
+Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
+
+### Current optional secrets
+
+| Secret file | Purpose | When added |
+| --- | --- | --- |
+| `deploy/secrets/discord-guild-id` | Guild-scoped slash command registration (propagates in ~5 s vs up to 1 h globally) | Initial compose layout |
+| `deploy/secrets/discord-privileged-intents` | Discord privileged intents opt-in (`MessageContent`, `GuildMembers`) | Added later; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/aws-access-key-id` | AWS access key for explicit S3 authentication | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/aws-secret-access-key` | AWS secret key for explicit S3 authentication | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/aws-session-token` | AWS session token for STS temporary credentials | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/s3-endpoint` | Custom S3-compatible endpoint (e.g. Cloudflare R2) | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+
+When a new optional secret is added to `compose.yaml` in the future, add a row here so operators know what to `touch` on their next upgrade.
 
 ## Stopping the Stack
 
