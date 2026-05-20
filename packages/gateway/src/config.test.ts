@@ -221,6 +221,65 @@ describe('readOptionalSecret', () => {
   // fallback, EISDIR throws a clear error. There is no stat-then-read sequence, so no TOCTOU
   // window exists. The directory test below exercises the EISDIR path directly.
 
+  it('throws with a clear message when secret file contains embedded newline mid-value', () => {
+    // #given a file with an embedded newline (copy-paste from a wrapped terminal)
+    const secretFile = join(tmpDir, 'embedded-newline.txt')
+    writeFileSync(secretFile, 'AKIA\nIOSFODNN7EXAMPLE')
+    process.env.MISSING_FILE = secretFile
+
+    // #when / #then
+    expect(() => readOptionalSecret('MISSING')).toThrow(secretFile)
+    expect(() => readOptionalSecret('MISSING')).toThrow('contains embedded line-breaking characters')
+
+    delete process.env.MISSING_FILE
+  })
+
+  it('throws with a clear message when env var contains embedded newline mid-value', () => {
+    // #given an env var with an embedded newline (copy-paste with line-wrapping)
+    process.env.NEWLINE_SECRET = 'AKIA\nIOSFODNN7EXAMPLE'
+
+    // #when / #then
+    expect(() => readOptionalSecret('NEWLINE_SECRET')).toThrow('NEWLINE_SECRET')
+    expect(() => readOptionalSecret('NEWLINE_SECRET')).toThrow('contains embedded line-breaking characters')
+
+    delete process.env.NEWLINE_SECRET
+  })
+
+  it('rejects env var with Unicode next-line character (U+0085)', () => {
+    // #given an env var with U+0085 (NEL) — line-breaking character not in basic [\r\n]
+    process.env.NEL_SECRET = 'AKIA\u0085IOSFODNN7EXAMPLE'
+
+    // #when / #then
+    expect(() => readOptionalSecret('NEL_SECRET')).toThrow('NEL_SECRET')
+    expect(() => readOptionalSecret('NEL_SECRET')).toThrow('contains embedded line-breaking characters')
+
+    delete process.env.NEL_SECRET
+  })
+
+  it('rejects secret file with embedded carriage return (U+000D)', () => {
+    // #given a file with U+000D (\r) — single CR without LF
+    const secretFile = join(tmpDir, 'cr.txt')
+    writeFileSync(secretFile, 'AKIA\rIOSFODNN7EXAMPLE')
+    process.env.CR_SECRET_FILE = secretFile
+
+    // #when / #then
+    expect(() => readOptionalSecret('CR_SECRET')).toThrow('contains embedded line-breaking characters')
+
+    delete process.env.CR_SECRET_FILE
+  })
+
+  it('rejects secret file with Unicode line separator (U+2028)', () => {
+    // #given a file with U+2028 — a character that bypasses the trivial [\r\n] check
+    const secretFile = join(tmpDir, 'u2028.txt')
+    writeFileSync(secretFile, 'AKIA\u2028IOSFODNN7EXAMPLE')
+    process.env.U2028_SECRET_FILE = secretFile
+
+    // #when / #then
+    expect(() => readOptionalSecret('U2028_SECRET')).toThrow('contains embedded line-breaking characters')
+
+    delete process.env.U2028_SECRET_FILE
+  })
+
   it('preserves leading whitespace in file contents', () => {
     // Some operators may legitimately have secrets with leading whitespace
     // (e.g. tokens copied from a UI that quoted with leading padding).

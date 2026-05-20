@@ -1,4 +1,5 @@
-import type {ChatInputCommandInteraction, GatewayIntentBits, Message} from 'discord.js'
+import type {ChatInputCommandInteraction, Client, GatewayIntentBits, Message} from 'discord.js'
+import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 
 import process from 'node:process'
@@ -56,6 +57,77 @@ export function makeDiscordClientFromConfig(
 }
 
 // ---------------------------------------------------------------------------
+// Injectable deps interface — exported so tests can supply spies.
+// ---------------------------------------------------------------------------
+
+export interface GatewayProgramDeps {
+  readonly makeClient: (config: GatewayConfig, logger: GatewayLogger) => Client
+  readonly setupReadinessFlag: (client: Client, logger: GatewayLogger) => void
+  readonly login: (client: Client, token: string) => Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Extracted program factory — exported for unit testing only.
+// Accepts injectable deps so tests can assert call ordering without touching
+// the network or requiring a real Discord token.
+// ---------------------------------------------------------------------------
+
+export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConfig): Effect.Effect<void, Error> {
+  return Effect.gen(function* () {
+    // b. Create logger
+    const logger = makeLogger(config.logLevel)
+
+    // c. Create Discord client
+    const client = deps.makeClient(config, logger)
+
+    // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
+    //     Must run BEFORE client.login() so the event cannot be missed.
+    yield* Effect.sync(() => deps.setupReadinessFlag(client, logger))
+
+    // d. Build command registry
+    const registry = getCommandRegistry()
+
+    // e. Register slash commands
+    yield* Effect.tryPromise({
+      try: async () =>
+        registerSlashCommands(config.discordToken, config.discordApplicationId, config.discordGuildId, registry),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
+    // f. Wire client events
+    client.on('interactionCreate', interaction => {
+      if (!interaction.isChatInputCommand()) return
+      // isChatInputCommand() narrows to ChatInputCommandInteraction — cast is safe.
+      const cmd = interaction as unknown as ChatInputCommandInteraction
+      Effect.runPromise(dispatchCommand(cmd, registry)).catch((error: unknown) => {
+        logger.error({err: error, commandName: cmd.commandName}, 'command dispatch failed')
+      })
+    })
+
+    client.on('messageCreate', (message: Message) => {
+      if (message.author.bot) return
+      if (client.user === null) return
+      if (!message.mentions.has(client.user.id)) return
+      Effect.runPromise(handleMention(message, client.user.id)).catch((error: unknown) => {
+        logger.error({err: error}, 'mention handler failed')
+      })
+    })
+
+    // g. Install shutdown handlers
+    installShutdownHandlers(client, logger)
+
+    // h. Login
+    yield* Effect.tryPromise({
+      try: async () => deps.login(client, config.discordToken),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
+    // i. Log startup
+    logger.info({applicationId: config.discordApplicationId}, 'gateway started')
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Main Effect program
 // ---------------------------------------------------------------------------
 
@@ -66,56 +138,16 @@ const program = Effect.gen(function* () {
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   })
 
-  // b. Create logger
-  const logger = makeLogger(config.logLevel)
-
-  // c. Create Discord client
-  const client = makeDiscordClientFromConfig(config, logger)
-
-  // c2. Set up readiness flag — clears stale flag, registers clientReady listener.
-  //     Must run BEFORE client.login() so the event cannot be missed.
-  yield* Effect.sync(() => setupReadinessFlag(client, logger))
-
-  // d. Build command registry
-  const registry = getCommandRegistry()
-
-  // e. Register slash commands
-  yield* Effect.tryPromise({
-    try: async () =>
-      registerSlashCommands(config.discordToken, config.discordApplicationId, config.discordGuildId, registry),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
-
-  // f. Wire client events
-  client.on('interactionCreate', interaction => {
-    if (!interaction.isChatInputCommand()) return
-    // isChatInputCommand() narrows to ChatInputCommandInteraction — cast is safe.
-    const cmd = interaction as unknown as ChatInputCommandInteraction
-    Effect.runPromise(dispatchCommand(cmd, registry)).catch((error: unknown) => {
-      logger.error({err: error, commandName: cmd.commandName}, 'command dispatch failed')
-    })
-  })
-
-  client.on('messageCreate', (message: Message) => {
-    if (message.author.bot) return
-    if (client.user === null) return
-    if (!message.mentions.has(client.user.id)) return
-    Effect.runPromise(handleMention(message, client.user.id)).catch((error: unknown) => {
-      logger.error({err: error}, 'mention handler failed')
-    })
-  })
-
-  // g. Install shutdown handlers
-  installShutdownHandlers(client, logger)
-
-  // h. Login
-  yield* Effect.tryPromise({
-    try: async () => client.login(config.discordToken),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
-
-  // i. Log startup
-  logger.info({applicationId: config.discordApplicationId}, 'gateway started')
+  yield* makeGatewayProgram(
+    {
+      makeClient: makeDiscordClientFromConfig,
+      setupReadinessFlag,
+      login: async (client, token) => {
+        await client.login(token)
+      },
+    },
+    config,
+  )
 })
 
 // ---------------------------------------------------------------------------
