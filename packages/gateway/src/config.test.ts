@@ -1,6 +1,6 @@
 import type {GatewayConfig} from './config.js'
 
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -212,14 +212,14 @@ describe('readOptionalSecret', () => {
     process.env.FAKE_DIR_FILE = dirPath
 
     // #when / #then
-    expect(() => readOptionalSecret('FAKE_DIR')).toThrow('Secret path is a directory, not a file:')
+    expect(() => readOptionalSecret('FAKE_DIR')).toThrow('not a regular file')
+    expect(() => readOptionalSecret('FAKE_DIR')).toThrow('directory')
 
     delete process.env.FAKE_DIR_FILE
   })
 
-  // readOptionalSecret uses a single readFileSync call — ENOENT falls through to the env-var
-  // fallback, EISDIR throws a clear error. There is no stat-then-read sequence, so no TOCTOU
-  // window exists. The directory test below exercises the EISDIR path directly.
+  // readOptionalSecret uses readSecretFile which lstat-checks before reading — ENOENT falls
+  // through to the env-var fallback; all other non-regular-file types throw immediately.
 
   it('throws with a clear message when secret file contains embedded newline mid-value', () => {
     // #given a file with an embedded newline (copy-paste from a wrapped terminal)
@@ -294,6 +294,87 @@ describe('readOptionalSecret', () => {
 
     // #then leading whitespace is preserved, trailing newline stripped
     expect(result).toBe('  some-value')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// readOptionalSecret — path validation (hardened readSecretFile)
+// ---------------------------------------------------------------------------
+
+describe('readOptionalSecret — path validation', () => {
+  let testDir: string
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'gateway-secret-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(testDir, {recursive: true, force: true})
+    delete process.env.PATH_TEST_FILE
+    delete process.env.PATH_TEST
+  })
+
+  it('rejects symlink to another file (does not follow)', () => {
+    // #given a symlink to a real file
+    const realFile = join(testDir, 'real.txt')
+    const symlinkPath = join(testDir, 'link.txt')
+    writeFileSync(realFile, 'AKIA-real-secret')
+    symlinkSync(realFile, symlinkPath)
+    process.env.PATH_TEST_FILE = symlinkPath
+
+    // #when / #then
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('not a regular file')
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('symlink')
+  })
+
+  it('rejects directory pointed at by _FILE env var', () => {
+    // #given a directory at the secret path
+    const dirPath = join(testDir, 'a-dir')
+    mkdirSync(dirPath)
+    process.env.PATH_TEST_FILE = dirPath
+
+    // #when / #then
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('not a regular file')
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('directory')
+  })
+
+  it('rejects file exceeding size limit', () => {
+    // #given a file > 4096 bytes
+    const largePath = join(testDir, 'large.txt')
+    writeFileSync(largePath, 'x'.repeat(5000))
+    process.env.PATH_TEST_FILE = largePath
+
+    // #when / #then
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('too large')
+    expect(() => readOptionalSecret('PATH_TEST')).toThrow('5000 bytes')
+  })
+
+  it('accepts file at exactly the size limit', () => {
+    // #given a file at exactly 4096 bytes
+    const limitPath = join(testDir, 'limit.txt')
+    writeFileSync(limitPath, 'x'.repeat(4096))
+    process.env.PATH_TEST_FILE = limitPath
+
+    // #when / #then
+    expect(readOptionalSecret('PATH_TEST')).toBe('x'.repeat(4096))
+  })
+
+  it('reports ENOENT through readOptionalSecret as null (env var fallback)', () => {
+    // #given a path that does not exist
+    process.env.PATH_TEST_FILE = join(testDir, 'missing.txt')
+    delete process.env.PATH_TEST
+
+    // #when / #then — falls through to env-var fallback, which is also unset → null
+    expect(readOptionalSecret('PATH_TEST')).toBe(null)
+  })
+
+  it('falls through to env-var fallback when _FILE points to nonexistent file but env var is set', () => {
+    // #given _FILE missing but env var set
+    process.env.PATH_TEST_FILE = join(testDir, 'missing.txt')
+    process.env.PATH_TEST = 'env-var-value'
+
+    // #when / #then — uses env var
+    expect(readOptionalSecret('PATH_TEST')).toBe('env-var-value')
   })
 })
 
