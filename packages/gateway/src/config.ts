@@ -72,12 +72,23 @@ export function readOptionalSecret(name: string): string | null {
       // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].
       // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets).
       const trailingTrimmed = contents.trimEnd()
-      return trailingTrimmed.trim() === '' ? null : trailingTrimmed
+      if (trailingTrimmed.trim() === '') return null
+      if (/[\r\n\u0085\u2028\u2029]/.test(trailingTrimmed)) {
+        throw new Error(
+          `Secret value at ${filePath} contains embedded line-breaking characters — likely a copy-paste with line-wrapping. Remove the line break and rewrite the file as a single line.`,
+        )
+      }
+      return trailingTrimmed
     }
   }
 
   const value = process.env[name]
   if (value !== undefined && value.trim() !== '') {
+    if (/[\r\n\u0085\u2028\u2029]/.test(value)) {
+      throw new Error(
+        `Environment variable ${name} contains embedded line-breaking characters — likely a copy-paste with line-wrapping. Remove the line break and set it as a single line.`,
+      )
+    }
     return value
   }
 
