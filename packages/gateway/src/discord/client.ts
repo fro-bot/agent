@@ -7,21 +7,19 @@ export interface GatewayLogger {
   readonly error: (context: Record<string, unknown>, message: string) => void
 }
 
-const DEFAULT_INTENTS: GatewayIntentBits[] = [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent,
-  GatewayIntentBits.GuildMembers,
-]
+const DEFAULT_INTENTS: readonly GatewayIntentBits[] = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 
 export interface DiscordClientOptions {
-  readonly intents?: GatewayIntentBits[]
+  readonly intents?: readonly GatewayIntentBits[]
   readonly logger?: GatewayLogger
 }
 
 /**
  * Create a Discord.js Client with safe defaults.
  *
+ * - Default intents are `Guilds` and `GuildMessages` only — the non-privileged baseline.
+ *   Callers that need `MessageContent` or `GuildMembers` must pass them via `options.intents`;
+ *   they are merged with (not replacing) the defaults.
  * - `allowedMentions` is locked to `{ parse: ['users'], repliedUser: false }` to prevent
  *   accidental @everyone / @here pings.
  * - Shard lifecycle events are wired to structured log lines when a logger is provided.

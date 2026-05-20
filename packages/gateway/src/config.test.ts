@@ -4,7 +4,8 @@ import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {GatewayIntentBits} from 'discord.js'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {loadGatewayConfig, readOptionalSecret, readSecret} from './config.js'
 
@@ -39,6 +40,14 @@ beforeEach(() => {
     'TOKEN_FILE',
     'MISSING',
     'MISSING_FILE',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_ACCESS_KEY_ID_FILE',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_SECRET_ACCESS_KEY_FILE',
+    'AWS_SESSION_TOKEN',
+    'AWS_SESSION_TOKEN_FILE',
+    'DISCORD_PRIVILEGED_INTENTS',
+    'DISCORD_PRIVILEGED_INTENTS_FILE',
   ]) {
     delete process.env[key]
   }
@@ -196,6 +205,22 @@ describe('readOptionalSecret', () => {
     delete process.env.WS_ENV_VAR
   })
 
+  it('throws with a clear message when _FILE points to a directory', () => {
+    // #given a temp directory (simulates a Docker bind-mount where the host path doesn't exist,
+    // causing Docker to create a directory at the container mount point instead of a file)
+    const dirPath = mkdtempSync(join(tmpDir, 'fake-dir-secret-'))
+    process.env.FAKE_DIR_FILE = dirPath
+
+    // #when / #then
+    expect(() => readOptionalSecret('FAKE_DIR')).toThrow('Secret path is a directory, not a file:')
+
+    delete process.env.FAKE_DIR_FILE
+  })
+
+  // readOptionalSecret uses a single readFileSync call — ENOENT falls through to the env-var
+  // fallback, EISDIR throws a clear error. There is no stat-then-read sequence, so no TOCTOU
+  // window exists. The directory test below exercises the EISDIR path directly.
+
   it('preserves leading whitespace in file contents', () => {
     // Some operators may legitimately have secrets with leading whitespace
     // (e.g. tokens copied from a UI that quoted with leading padding).
@@ -350,5 +375,322 @@ describe('loadGatewayConfig', () => {
 
     // #then
     expect(config.objectStore.endpoint).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AWS credentials
+// ---------------------------------------------------------------------------
+
+describe('AWS credentials', () => {
+  it('happy path: both credentials set, no session token', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    })
+    expect(config.objectStore.credentials).not.toHaveProperty('sessionToken')
+  })
+
+  it('happy path: all three credentials set', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    const tokenFile = join(tmpDir, 'aws-session-token.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    writeFileSync(tokenFile, 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+    process.env.AWS_SESSION_TOKEN_FILE = tokenFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      sessionToken: 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN',
+    })
+  })
+
+  it('happy path: no credentials set — credentials is undefined', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toBeUndefined()
+  })
+
+  it('edge case: empty credential files treated as not set — credentials is undefined', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id-empty.txt')
+    const secretFile = join(tmpDir, 'aws-secret-empty.txt')
+    writeFileSync(keyFile, '')
+    writeFileSync(secretFile, '')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty files are treated as "not set" by readOptionalSecret
+    expect(config.objectStore.credentials).toBeUndefined()
+  })
+
+  it('edge case: pair present + empty session-token file — sessionToken omitted', () => {
+    // #given
+    setRequiredEnv()
+    const keyFile = join(tmpDir, 'aws-key-id.txt')
+    const secretFile = join(tmpDir, 'aws-secret.txt')
+    const tokenFile = join(tmpDir, 'aws-session-token-empty.txt')
+    writeFileSync(keyFile, 'AKIAIOSFODNN7EXAMPLE')
+    writeFileSync(secretFile, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+    writeFileSync(tokenFile, '')
+    process.env.AWS_ACCESS_KEY_ID_FILE = keyFile
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = secretFile
+    process.env.AWS_SESSION_TOKEN_FILE = tokenFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty session token file is treated as "not set"
+    expect(config.objectStore.credentials).toEqual({
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    })
+    expect(config.objectStore.credentials).not.toHaveProperty('sessionToken')
+  })
+
+  it('error path: only AWS_ACCESS_KEY_ID set — throws with pair error message', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_ACCESS_KEY_ID)',
+    )
+  })
+
+  it('error path: only AWS_SECRET_ACCESS_KEY set — throws with pair error message', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together (received: AWS_SECRET_ACCESS_KEY)',
+    )
+  })
+
+  it('edge case: orphan session token — no throw, credentials undefined, warning logged', () => {
+    // #given
+    setRequiredEnv()
+    process.env.AWS_SESSION_TOKEN = 'AQoXnyc4lcK4w4OIaHPuTZat//SESSION_TOKEN'
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — assert before restoring spy so mock.calls is still populated
+    expect(config.objectStore.credentials).toBeUndefined()
+    expect(consoleSpy).toHaveBeenCalledTimes(1)
+    const loggedArg: unknown = consoleSpy.mock.calls[0]?.[0]
+    expect(typeof loggedArg).toBe('string')
+    const parsed: unknown = JSON.parse(String(loggedArg)) as unknown
+    const sessionTokenMsg = expect.stringContaining(
+      'AWS_SESSION_TOKEN is set without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY',
+    ) as unknown
+    expect(parsed).toMatchObject({level: 'warn', msg: sessionTokenMsg})
+    consoleSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DISCORD_PRIVILEGED_INTENTS
+// ---------------------------------------------------------------------------
+
+describe('DISCORD_PRIVILEGED_INTENTS', () => {
+  it('happy: unset → privilegedIntents is []', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([])
+  })
+
+  it('happy: MessageContent → [GatewayIntentBits.MessageContent]', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
+  })
+
+  it('happy: GuildMembers → [GatewayIntentBits.GuildMembers]', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.GuildMembers])
+  })
+
+  it('happy: MessageContent,GuildMembers → both values, ordered as parsed', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('edge: empty string → [] (treated as null by readOptionalSecret)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = ''
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty string is treated as "not set"
+    expect(config.privilegedIntents).toEqual([])
+  })
+
+  it('edge: extra whitespace around tokens → both parsed correctly', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = ' MessageContent , GuildMembers '
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('edge: duplicate token → deduped to single value', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,MessageContent'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
+  })
+
+  it('edge: empty middle token (MessageContent,,GuildMembers) → both parsed, no error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MessageContent,,GuildMembers'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — empty tokens are filtered out
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers])
+  })
+
+  it('error: typo "MesageContent" → throws with offending value and allowed list', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'MesageContent'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "MesageContent"/)
+    expect(() => loadGatewayConfig()).toThrow(/MessageContent, GuildMembers/)
+  })
+
+  it('error: wrong case "messagecontent" → throws (case-sensitive)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'messagecontent'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "messagecontent"/)
+  })
+
+  it('error: non-privileged intent "Guilds" → throws', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'Guilds'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "Guilds"/)
+  })
+
+  it('error: privileged intent not on allowlist "GuildPresences" → throws', () => {
+    // #given
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'GuildPresences'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "GuildPresences"/)
+  })
+
+  it('rejects prototype-property tokens (constructor)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'constructor'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "constructor"/)
+  })
+
+  it('rejects prototype-property tokens (__proto__)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = '__proto__'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "__proto__"/)
+  })
+
+  it('rejects prototype-property tokens (toString)', () => {
+    setRequiredEnv()
+    process.env.DISCORD_PRIVILEGED_INTENTS = 'toString'
+    expect(() => loadGatewayConfig()).toThrow(/Invalid DISCORD_PRIVILEGED_INTENTS value: "toString"/)
+  })
+
+  it('edge: DISCORD_PRIVILEGED_INTENTS_FILE with trailing newline → parsed correctly', () => {
+    // #given
+    setRequiredEnv()
+    const intentFile = join(tmpDir, 'privileged-intents.txt')
+    writeFileSync(intentFile, 'MessageContent\n', {mode: 0o600})
+    process.env.DISCORD_PRIVILEGED_INTENTS_FILE = intentFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — trailing newline stripped by readOptionalSecret, value parsed correctly
+    expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
   })
 })
