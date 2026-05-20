@@ -115,32 +115,47 @@ function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
   return map
 }
 
-/**
- * Match the same hidden-Unicode characters Renovate flags via
- * `lib/util/unicode.ts` in the renovatebot/renovate repo. Bundled vendor code
- * (e.g. @actions/artifact's HTML entity tables) embeds these as raw bytes,
- * which trips Renovate's "Hidden Unicode characters" warning on the dependency
- * dashboard. Replacing the raw bytes with `\uXXXX` JS escapes preserves the
- * runtime string value but keeps the on-disk bytes ASCII-only.
- */
+// Character class mirrors renovatebot/renovate's `lib/util/unicode.ts`. The
+// `/g`-flagged instance is for `.replaceAll`; the unflagged one is for the
+// per-file guard, since stateful regexes leak `lastIndex` across concurrent
+// `Promise.all` iterations and silently skip matches.
+const HIDDEN_UNICODE_TEST_RE =
+  /[\u00A0\u00AD\u1680\u2000-\u200C\u200E\u200F\u2028\u2029\u202A-\u202F\u205F\u3000\uFEFF]/
 const HIDDEN_UNICODE_RE = /[\u00A0\u00AD\u1680\u2000-\u200C\u200E\u200F\u2028\u2029\u202A-\u202F\u205F\u3000\uFEFF]/g
+
+const BINARY_EXTENSIONS = new Set([
+  'br',
+  'gif',
+  'gz',
+  'ico',
+  'jpeg',
+  'jpg',
+  'otf',
+  'pdf',
+  'png',
+  'tar',
+  'ttf',
+  'woff',
+  'woff2',
+  'zip',
+])
 
 function escapeHiddenUnicodePlugin(): Plugin {
   return {
     name: 'escape-hidden-unicode',
     async writeBundle(options) {
       const dir = options.dir ?? 'dist'
-      // Read entries with their file-type bits in one syscall; avoid the
-      // stat→read TOCTOU pattern CodeQL flags (js/file-system-race).
+      // `withFileTypes` avoids the stat→read TOCTOU CodeQL flags.
       const entries = await readdir(dir, {withFileTypes: true})
       await Promise.all(
         entries.map(async entry => {
-          if (!entry.isFile() || !entry.name.endsWith('.js')) return
+          if (!entry.isFile()) return
+          const ext = entry.name.split('.').pop() ?? ''
+          if (BINARY_EXTENSIONS.has(ext)) return
           const path = join(dir, entry.name)
           const content = await readFile(path, 'utf8')
-          if (!HIDDEN_UNICODE_RE.test(content)) return
-          HIDDEN_UNICODE_RE.lastIndex = 0
-          const fixed = content.replace(HIDDEN_UNICODE_RE, char => {
+          if (!HIDDEN_UNICODE_TEST_RE.test(content)) return
+          const fixed = content.replaceAll(HIDDEN_UNICODE_RE, char => {
             const code = char.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')
             return String.raw`\u${code}`
           })
@@ -195,6 +210,8 @@ export default defineConfig({
   fixedExtension: false,
   inlineOnly: false,
   minify: true,
+  // Source maps roughly triple committed dist/ size and the action never reads them.
+  sourcemap: false,
   plugins: [licenseCollectorPlugin(), escapeHiddenUnicodePlugin()],
   noExternal: id => {
     if (id.startsWith('@bfra.me/es')) return true
