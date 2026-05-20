@@ -49,6 +49,6 @@ RUN mkdir -p /var/run/fro-bot && chmod 0700 /var/run/fro-bot
 # current-run failure. A real liveness probe (HTTP /healthz) lands alongside
 # the workspace agent.
 HEALTHCHECK --interval=10s --timeout=3s --retries=12 --start-period=45s \
-  CMD test -f /var/run/fro-bot/gateway-ready && kill -0 1 || exit 1
+  CMD test -f /var/run/fro-bot/gateway-ready && kill -0 1
 
 CMD ["node", "dist/main.mjs"]

@@ -31,23 +31,70 @@ services:
       NO_PROXY: workspace,localhost,127.0.0.1
       NODE_EXTRA_CA_CERTS: /etc/ssl/certs/mitmproxy-ca-cert.pem
     volumes:
-      # Credentials — bind-mounted as accepted-risk (no Docker Swarm secrets in v1)
-      - ./secrets/discord-token:/run/secrets/discord_token:ro
-      - ./secrets/discord-application-id:/run/secrets/discord_application_id:ro
-      - ./secrets/s3-bucket:/run/secrets/s3_bucket:ro
-      - ./secrets/s3-region:/run/secrets/s3_region:ro
-      - ./secrets/s3-endpoint:/run/secrets/s3_endpoint:ro
+      # Credentials — bind-mounted as accepted-risk (no Docker Swarm secrets in v1).
+      # create_host_path: false ensures a missing source file causes a clear Compose
+      # error at `docker compose up` time instead of Docker silently creating a directory.
+      - type: bind
+        source: ./secrets/discord-token
+        target: /run/secrets/discord_token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/discord-application-id
+        target: /run/secrets/discord_application_id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-bucket
+        target: /run/secrets/s3_bucket
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-region
+        target: /run/secrets/s3_region
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/s3-endpoint
+        target: /run/secrets/s3_endpoint
+        read_only: true
+        bind:
+          create_host_path: false
       # Optional — AWS credentials for explicit S3 authentication. Leave the
       # access-key-id and secret-access-key files empty (`touch deploy/secrets/aws-access-key-id`)
       # to fall back to the AWS SDK default credential chain (env, ~/.aws, IMDS).
       # AWS_SESSION_TOKEN is only needed for STS temporary credentials.
-      - ./secrets/aws-access-key-id:/run/secrets/aws_access_key_id:ro
-      - ./secrets/aws-secret-access-key:/run/secrets/aws_secret_access_key:ro
-      - ./secrets/aws-session-token:/run/secrets/aws_session_token:ro
+      - type: bind
+        source: ./secrets/aws-access-key-id
+        target: /run/secrets/aws_access_key_id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/aws-secret-access-key
+        target: /run/secrets/aws_secret_access_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/aws-session-token
+        target: /run/secrets/aws_session_token
+        read_only: true
+        bind:
+          create_host_path: false
       # Optional — guild-scoped slash command registration (fast dev propagation).
       # Create the file empty (`touch deploy/secrets/discord-guild-id`) to register
       # slash commands globally; the gateway treats empty files as unset.
-      - ./secrets/discord-guild-id:/run/secrets/discord_guild_id:ro
+      - type: bind
+        source: ./secrets/discord-guild-id
+        target: /run/secrets/discord_guild_id
+        read_only: true
+        bind:
+          create_host_path: false
       # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
       - mitmproxy-certs:/etc/ssl/certs:ro
     networks:

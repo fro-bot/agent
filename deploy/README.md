@@ -55,6 +55,8 @@ touch deploy/secrets/s3-endpoint
 
 > **Pair contract:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` must both be provided or both left empty. `AWS_SESSION_TOKEN` is only used when the pair is present — it is ignored otherwise. With neither pair value set, the AWS SDK default credential chain takes over (env vars, `~/.aws`, EC2/EKS instance role).
 
+> **Rotation:** Static credentials read from `AWS_*_FILE` are loaded at gateway startup. Rotate by writing the new value into the secret file and restarting the gateway container. For refreshable credentials (STS temporary tokens, EC2/EKS instance roles), leave the pair empty and rely on the SDK default credential chain — it refreshes without restart.
+
 ```sh
 touch deploy/secrets/aws-access-key-id
 touch deploy/secrets/aws-secret-access-key

@@ -214,12 +214,9 @@ describe('readOptionalSecret', () => {
     delete process.env.FAKE_DIR_FILE
   })
 
-  // TOCTOU resilience: we intentionally do NOT add a test where existsSync returns true but
-  // statSync throws ENOENT. The existing test suite uses real temp files (no vi.mock('node:fs')),
-  // so there's no seam to inject that race condition without restructuring the entire test module.
-  // The TOCTOU behaviour is correct by construction: statSync is called immediately after existsSync
-  // with no await in between, and Node's synchronous fs calls are not interruptible. The plan's
-  // "if practical" qualifier applies here — it is not practical without mocking.
+  // readOptionalSecret uses a single readFileSync call — ENOENT falls through to the env-var
+  // fallback, EISDIR throws a clear error. There is no stat-then-read sequence, so no TOCTOU
+  // window exists. The directory test below exercises the EISDIR path directly.
 
   it('preserves leading whitespace in file contents', () => {
     // Some operators may legitimately have secrets with leading whitespace
