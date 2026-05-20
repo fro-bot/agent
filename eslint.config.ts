@@ -36,6 +36,7 @@ export default defineConfig(
     name: 'vitest overrides',
     files: ['**/*.test.ts', '**/*.spec.ts'],
     rules: {
+      'vitest/expect-expect': ['error', {assertFunctionNames: ['expect', 'expect*', 'assert*']}],
       'vitest/prefer-lowercase-title': ['error', {ignore: ['describe']}],
     },
   },
