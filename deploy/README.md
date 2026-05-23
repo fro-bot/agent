@@ -132,12 +132,15 @@ This checks:
 
 ## Gateway Readiness
 
-The gateway container is considered healthy only after two conditions are both true:
+The gateway container is considered healthy only after three conditions are all true:
 
 1. The Discord `clientReady` event has fired — the bot is fully connected and ready to receive events. At that point the process writes `/var/run/fro-bot/gateway-ready`.
 2. The daemon process (PID 1) is still alive (`kill -0 1`).
+3. mitmproxy is reachable via TCP (`nc -z mitmproxy 8080`) — makes mitmproxy loss visible: if mitmproxy crashes but leaves its CA cert file on disk, the gateway shows `unhealthy` in `docker ps` so the problem is immediately apparent.
 
 The flag is cleared at process startup, so a stale `/var/run/fro-bot/gateway-ready` from a prior container run cannot mask a current-run failure. `docker compose up --wait` blocks until the gateway is genuinely connected to Discord before returning.
+
+The healthcheck is baked into `deploy/gateway.Dockerfile` — there is no override in `compose.yaml`. Note that `restart: unless-stopped` only acts on process exit, not healthcheck failure; an `unhealthy` gateway requires operator intervention (restart the stack or investigate logs). Automatic restart on healthcheck failure would require an autoheal sidecar or an in-process probe that exits the gateway — both are out of scope here.
 
 ## Upgrading existing deployments
 
