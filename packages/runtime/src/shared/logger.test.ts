@@ -160,7 +160,7 @@ describe('redactSensitiveFields', () => {
         name: 'test',
       },
     }
-    const result = redactSensitiveFields(input) as {config: {apiKey: string; name: string}}
+    const result = redactSensitiveFields(input)
     expect(result.config.apiKey).toBe('[REDACTED]')
     expect(result.config.name).toBe('test')
   })
@@ -169,7 +169,7 @@ describe('redactSensitiveFields', () => {
     const input = {
       items: [{secret: 'hidden', value: 'visible'}],
     }
-    const result = redactSensitiveFields(input) as {items: {secret: string; value: string}[]}
+    const result = redactSensitiveFields(input)
     expect(result.items[0]?.secret).toBe('[REDACTED]')
     expect(result.items[0]?.value).toBe('visible')
   })

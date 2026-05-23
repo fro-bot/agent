@@ -86,11 +86,11 @@ describe('validateNonEmptyString', () => {
   })
 
   it('rejects non-string types - number', () => {
-    expect(() => validateNonEmptyString(123 as unknown, 'name')).toThrow('name must be a string, received number')
+    expect(() => validateNonEmptyString(123, 'name')).toThrow('name must be a string, received number')
   })
 
   it('rejects non-string types - null', () => {
-    expect(() => validateNonEmptyString(null as unknown, 'name')).toThrow('name must be a string, received object')
+    expect(() => validateNonEmptyString(null, 'name')).toThrow('name must be a string, received object')
   })
 
   it('rejects non-string types - undefined', () => {
@@ -100,6 +100,6 @@ describe('validateNonEmptyString', () => {
   })
 
   it('rejects non-string types - object', () => {
-    expect(() => validateNonEmptyString({} as unknown, 'name')).toThrow('name must be a string, received object')
+    expect(() => validateNonEmptyString({}, 'name')).toThrow('name must be a string, received object')
   })
 })

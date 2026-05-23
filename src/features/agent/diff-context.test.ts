@@ -26,7 +26,7 @@ function createTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerC
     hasMention: false,
     command: null,
     isBotReviewRequested: false,
-    raw: {} as TriggerContext['raw'],
+    raw: {},
     ...overrides,
   }
 }
