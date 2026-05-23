@@ -100,7 +100,7 @@ export function mapSdkPartToPart(p: SdkPart): Part {
 
 export function mapSdkMessageToMessage(m: SdkMessageExtended): Message {
   if (m.role === 'user') {
-    const user = m as SdkUserMessage & {variant?: string}
+    const user = m
     return {
       id: user.id,
       sessionID: user.sessionID,
@@ -124,7 +124,7 @@ export function mapSdkMessageToMessage(m: SdkMessageExtended): Message {
       variant: user.variant,
     }
   }
-  const assistant = m as SdkAssistantMessage & {agent?: string}
+  const assistant = m
   return {
     id: assistant.id,
     sessionID: assistant.sessionID,
@@ -155,7 +155,7 @@ export function mapSdkMessages(messages: readonly (SdkMessage | SdkMessageWithPa
   return [
     ...messages.map(item => {
       const sdkMessage = 'info' in item ? item.info : item
-      const message = mapSdkMessageToMessage(sdkMessage as SdkMessageExtended)
+      const message = mapSdkMessageToMessage(sdkMessage)
       const parts = 'parts' in item ? item.parts.map(mapSdkPartToPart) : undefined
       return parts == null || parts.length === 0 ? message : ({...message, parts} as unknown as Message)
     }),
