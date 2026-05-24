@@ -48,6 +48,11 @@ beforeEach(() => {
     'AWS_SESSION_TOKEN_FILE',
     'DISCORD_PRIVILEGED_INTENTS',
     'DISCORD_PRIVILEGED_INTENTS_FILE',
+    'GITHUB_APP_ID',
+    'GITHUB_APP_ID_FILE',
+    'GITHUB_APP_PRIVATE_KEY',
+    'GITHUB_APP_PRIVATE_KEY_FILE',
+    'GATEWAY_GITHUB_APP_INSTALL_URL',
   ]) {
     delete process.env[key]
   }
@@ -387,6 +392,11 @@ function setRequiredEnv(): void {
   process.env.DISCORD_APPLICATION_ID = 'test-app-id'
   process.env.S3_BUCKET = 'test-bucket'
   process.env.S3_REGION = 'us-east-1'
+  process.env.GITHUB_APP_ID = 'test-github-app-id'
+  // Private key has embedded newlines — must be provided via _FILE, not env var.
+  const keyFile = join(tmpDir, 'github-app-private-key-default')
+  writeFileSync(keyFile, '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----', {mode: 0o600})
+  process.env.GITHUB_APP_PRIVATE_KEY_FILE = keyFile
 }
 
 describe('loadGatewayConfig', () => {
@@ -832,5 +842,96 @@ describe('DISCORD_PRIVILEGED_INTENTS', () => {
 
     // #then — trailing newline stripped by readOptionalSecret, value parsed correctly
     expect(config.privilegedIntents).toEqual([GatewayIntentBits.MessageContent])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GitHub App config
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GitHub App credentials', () => {
+  it('happy path: both secrets present → config includes githubAppId and githubAppPrivateKey', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.githubAppId).toBe('test-github-app-id')
+    expect(config.githubAppPrivateKey).toContain('BEGIN RSA PRIVATE KEY')
+  })
+
+  it('happy path: GITHUB_APP_ID_FILE → reads from file', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GITHUB_APP_ID
+    const idFile = join(tmpDir, 'github-app-id')
+    writeFileSync(idFile, '99999\n', {mode: 0o600})
+    process.env.GITHUB_APP_ID_FILE = idFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.githubAppId).toBe('99999')
+  })
+
+  it('happy path: GITHUB_APP_PRIVATE_KEY_FILE → reads from file', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GITHUB_APP_PRIVATE_KEY
+    delete process.env.GITHUB_APP_PRIVATE_KEY_FILE
+    const keyFile = join(tmpDir, 'github-app-private-key')
+    writeFileSync(keyFile, '-----BEGIN RSA PRIVATE KEY-----\nfromfile\n-----END RSA PRIVATE KEY-----', {mode: 0o600})
+    process.env.GITHUB_APP_PRIVATE_KEY_FILE = keyFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.githubAppPrivateKey).toContain('fromfile')
+  })
+
+  it('error: GITHUB_APP_ID unset → throws with clear message', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GITHUB_APP_ID
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GITHUB_APP_ID/)
+  })
+
+  it('error: GITHUB_APP_PRIVATE_KEY unset → throws with clear message', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GITHUB_APP_PRIVATE_KEY
+    delete process.env.GITHUB_APP_PRIVATE_KEY_FILE
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GITHUB_APP_PRIVATE_KEY/)
+  })
+
+  it('happy path: GATEWAY_GITHUB_APP_INSTALL_URL overridden via env', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_GITHUB_APP_INSTALL_URL = 'https://github.com/apps/my-custom-app/installations/new'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.gatewayGitHubAppInstallUrl).toBe('https://github.com/apps/my-custom-app/installations/new')
+  })
+
+  it('happy path: GATEWAY_GITHUB_APP_INSTALL_URL defaults to fro-bot install URL', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.gatewayGitHubAppInstallUrl).toBe('https://github.com/apps/fro-bot/installations/new')
   })
 })

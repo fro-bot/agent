@@ -4,7 +4,7 @@ import {createMockLogger} from '../../shared/test-helpers.js'
 import {runAcquireLock} from './acquire-lock.js'
 
 const acquireLockMock = vi.hoisted(() => vi.fn())
-const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({}) as unknown))
+const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({})))
 
 vi.mock('@fro-bot/runtime', async () => {
   const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')

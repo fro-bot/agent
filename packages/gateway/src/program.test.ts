@@ -2,21 +2,8 @@ import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 
 import {GatewayIntentBits} from 'discord.js'
+import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
-
-// Prevent the top-level Effect.runPromise(program) in main.ts from executing
-// when the module is imported. The program tries to load config from env vars
-// and call process.exit(1) on failure — both are unwanted in tests.
-vi.mock('effect', async importOriginal => {
-  const actual = await importOriginal<typeof import('effect')>()
-  return {
-    ...actual,
-    Effect: {
-      ...actual.Effect,
-      runPromise: vi.fn().mockResolvedValue(undefined),
-    },
-  }
-})
 
 // Spy on createDiscordClient so we can assert the intents wiring without
 // touching the network or requiring a real Discord token.
@@ -37,7 +24,7 @@ vi.mock('./discord/commands/index.js', async importOriginal => {
   }
 })
 
-const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./main.js')
+const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
 
@@ -111,6 +98,9 @@ describe('makeGatewayProgram', () => {
         region: 'us-east-1',
         prefix: 'test-prefix',
       },
+      githubAppId: 'test-app-id',
+      githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
+      gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
     }
 
     // Minimal fake client — just needs to satisfy the Client shape enough for
@@ -131,10 +121,8 @@ describe('makeGatewayProgram', () => {
       login: loginSpy,
     }
 
-    // #when — run the program with the real Effect runtime (not the mocked runPromise).
-    // vi.importActual bypasses the module mock so we get the real runPromise.
-    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
-    await ActualEffect.runPromise(makeGatewayProgram(deps, fakeConfig))
+    // #when — run the program with the real Effect runtime.
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
 
     // #then — setupReadinessFlag must have been called before login
     expect(setupReadinessFlagSpy).toHaveBeenCalledTimes(1)

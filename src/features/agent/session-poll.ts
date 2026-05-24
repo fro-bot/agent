@@ -5,11 +5,6 @@ import {sleep} from '../../shared/async.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
-type SessionStatus =
-  | {readonly type: 'idle'}
-  | {readonly type: 'retry'; readonly attempt: number; readonly message: string; readonly next: number}
-  | {readonly type: 'busy'}
-
 const POLL_INTERVAL_MS = 500
 const POLL_REQUEST_TIMEOUT_MS = 5_000
 const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
@@ -170,7 +165,7 @@ export async function pollForSessionCompletion(
         'session.status()',
       )
       const statuses = statusResponse.data ?? {}
-      const sessionStatus = statuses[sessionId] as SessionStatus | undefined
+      const sessionStatus = statuses[sessionId]
 
       if (sessionStatus == null) {
         logger.debug('Session status not found in poll response', {sessionId})

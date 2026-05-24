@@ -27,6 +27,9 @@ services:
       DISCORD_GUILD_ID_FILE: /run/secrets/discord_guild_id
       # Optional — opt into Discord privileged intents (MessageContent, GuildMembers)
       DISCORD_PRIVILEGED_INTENTS_FILE: /run/secrets/discord_privileged_intents
+      # GitHub App credentials (required for repository access)
+      GITHUB_APP_ID_FILE: /run/secrets/github_app_id
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
       # Egress proxy (regular proxy mode — NOT transparent)
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
@@ -106,6 +109,20 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # GitHub App credentials (required for repository access).
+      # See deploy/README.md for setup instructions.
+      - type: bind
+        source: ./secrets/github-app-id
+        target: /run/secrets/github_app_id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/github-app-private-key
+        target: /run/secrets/github_app_private_key
+        read_only: true
+        bind:
+          create_host_path: false
       # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
       - mitmproxy-certs:/etc/ssl/certs:ro
     networks:
@@ -140,7 +157,7 @@ services:
         max-file: '3'
 
   mitmproxy:
-    image: mitmproxy/mitmproxy:11.0.2@sha256:92ab9e0626ec73a3abae9c460e5475323f414745d7d0001205c8fa0c77ad31a2
+    image: mitmproxy/mitmproxy:11.1.3@sha256:e0deb0df7edf9f909053f274a067cd1cacb90f5c17d74459e1693179c0b98d8f
     command: >
       mitmdump
       -s /scripts/allowlist.py

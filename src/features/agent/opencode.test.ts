@@ -261,7 +261,7 @@ function createMockServerHandle(options: {
     handle: {
       client: options.client as unknown as OpenCodeServerHandle['client'],
       server: mockServer as unknown as OpenCodeServerHandle['server'],
-      shutdown: vi.fn() as unknown as () => void,
+      shutdown: vi.fn(),
     },
     mockServer,
   }

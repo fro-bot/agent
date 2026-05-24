@@ -52,16 +52,16 @@
     "@opencode-ai/sdk": "1.14.41"
   },
   "devDependencies": {
-    "@bfra.me/eslint-config": "0.51.0",
-    "@bfra.me/prettier-config": "0.16.8",
-    "@bfra.me/tsconfig": "0.13.0",
+    "@bfra.me/eslint-config": "0.51.1",
+    "@bfra.me/prettier-config": "0.16.9",
+    "@bfra.me/tsconfig": "0.13.1",
     "@octokit/webhooks-types": "7.6.1",
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.12.2",
     "@vitest/eslint-plugin": "1.6.17",
     "conventional-changelog-conventionalcommits": "9.3.1",
-    "eslint": "10.3.0",
+    "eslint": "10.4.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
     "generate-license-file": "4.1.1",
@@ -76,13 +76,5 @@
     "typescript": "6.0.3",
     "vitest": "4.1.6"
   },
-  "packageManager": "pnpm@10.33.4",
-  "pnpm": {
-    "overrides": {
-      "fast-uri": ">=3.1.2",
-      "fast-xml-builder": ">=1.1.7",
-      "fast-xml-parser": ">=5.7.0",
-      "ip-address": ">=10.1.1"
-    }
-  }
+  "packageManager": "pnpm@10.33.4"
 }
