@@ -23,6 +23,9 @@ export interface GatewayConfig {
   readonly identity: string
   readonly logLevel: 'debug' | 'info' | 'warn' | 'error'
   readonly privilegedIntents: readonly GatewayIntentBits[]
+  readonly githubAppId: string
+  readonly githubAppPrivateKey: string
+  readonly gatewayGitHubAppInstallUrl: string
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -119,6 +122,53 @@ export function readSecret(name: string): string {
     throw new Error(`Missing required secret: ${name} (set ${name} env var or ${name}_FILE pointing to a file)`)
   }
   return value
+}
+
+/**
+ * Read a required secret that may contain embedded newlines (e.g. PEM private keys).
+ *
+ * Same precedence as `readSecret` but skips the line-break rejection check.
+ * Only use for secrets where multi-line content is expected and valid.
+ */
+export function readMultilineSecret(name: string): string {
+  const value = readOptionalMultilineSecret(name)
+  if (value === null) {
+    throw new Error(`Missing required secret: ${name} (set ${name} env var or ${name}_FILE pointing to a file)`)
+  }
+  return value
+}
+
+/**
+ * Read an optional secret that may contain embedded newlines (e.g. PEM private keys).
+ *
+ * Same precedence as `readOptionalSecret` but skips the line-break rejection check.
+ */
+export function readOptionalMultilineSecret(name: string): string | null {
+  const filePath = process.env[`${name}_FILE`]
+  if (filePath !== undefined) {
+    let contents: string | undefined
+    try {
+      contents = readSecretFile(filePath)
+    } catch (error) {
+      if (error instanceof SecretFileNotFoundError) {
+        // file not present; fall through to env-var fallback
+      } else {
+        throw error
+      }
+    }
+    if (contents !== undefined) {
+      const trimmed = contents.trimEnd()
+      if (trimmed.trim() === '') return null
+      return trimmed
+    }
+  }
+
+  const value = process.env[name]
+  if (value !== undefined && value.trim() !== '') {
+    return value
+  }
+
+  return null
 }
 
 /**
@@ -258,6 +308,11 @@ export function loadGatewayConfig(): GatewayConfig {
     ...(credentials === undefined ? {} : {credentials}),
   }
 
+  const githubAppId = readSecret('GITHUB_APP_ID')
+  const githubAppPrivateKey = readMultilineSecret('GITHUB_APP_PRIVATE_KEY')
+  const gatewayGitHubAppInstallUrl =
+    readOptionalSecret('GATEWAY_GITHUB_APP_INSTALL_URL') ?? 'https://github.com/apps/fro-bot/installations/new'
+
   return {
     discordToken,
     discordApplicationId,
@@ -266,5 +321,8 @@ export function loadGatewayConfig(): GatewayConfig {
     identity,
     logLevel,
     privilegedIntents,
+    githubAppId,
+    githubAppPrivateKey,
+    gatewayGitHubAppInstallUrl,
   }
 }

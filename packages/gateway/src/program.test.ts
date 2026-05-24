@@ -98,6 +98,9 @@ describe('makeGatewayProgram', () => {
         region: 'us-east-1',
         prefix: 'test-prefix',
       },
+      githubAppId: 'test-app-id',
+      githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
+      gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
     }
 
     // Minimal fake client — just needs to satisfy the Client shape enough for
