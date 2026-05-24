@@ -76,6 +76,10 @@ touch deploy/secrets/discord-guild-id
 touch deploy/secrets/discord-privileged-intents
 # echo -n 'MessageContent,GuildMembers' > deploy/secrets/discord-privileged-intents
 
+# GitHub App credentials (required — see "GitHub App" section below)
+echo -n 'YOUR_GITHUB_APP_ID'          > deploy/secrets/github-app-id
+cp ~/Downloads/your-app.private-key.pem deploy/secrets/github-app-private-key
+
 chmod 0600 deploy/secrets/*
 ```
 
@@ -158,8 +162,52 @@ Run the full `touch` block from [Create secrets](#2-create-secrets) on every upg
 | `deploy/secrets/aws-secret-access-key` | AWS secret key for explicit S3 authentication | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/aws-session-token` | AWS session token for STS temporary credentials | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/s3-endpoint` | Custom S3-compatible endpoint (e.g. Cloudflare R2) | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/github-app-id` | GitHub App ID (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
+| `deploy/secrets/github-app-private-key` | GitHub App private key PEM (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 
 When a new optional secret is added to `compose.yaml` in the future, add a row here so operators know what to `touch` on their next upgrade.
+
+## GitHub App
+
+The gateway uses a GitHub App to authenticate against repositories. This is required for the `/add-project` command and any feature that reads repository content.
+
+### Creating the App
+
+1. Go to [GitHub → Settings → Developer settings → GitHub Apps](https://github.com/settings/apps) and click **New GitHub App**.
+2. Set the App name, homepage URL, and webhook URL (webhook is not used by the gateway — set it to any valid URL).
+3. Under **Permissions → Repository permissions**, grant:
+   - **Contents**: Read-only (minimum required)
+   - Grant only the minimum permissions needed. Over-privileged installations produce a `WARN` log entry at runtime but do not block operation. Under-privileged installations fail fast at `/add-project` time with a clear error message.
+4. Disable **Webhook** (the gateway does not receive webhooks from GitHub).
+5. Click **Create GitHub App**.
+6. Note the **App ID** shown on the App settings page.
+7. Scroll to **Private keys** and click **Generate a private key**. Save the downloaded `.pem` file.
+
+### Writing the credential files
+
+```bash
+mkdir -p deploy/secrets
+echo -n 'YOUR_GITHUB_APP_ID' > deploy/secrets/github-app-id
+cp ~/Downloads/your-app.private-key.pem deploy/secrets/github-app-private-key
+chmod 0600 deploy/secrets/github-app-id deploy/secrets/github-app-private-key
+```
+
+> **Key rotation:** The private key is read at gateway startup. Rotating the key requires writing the new `.pem` file and running `docker compose restart gateway` to pick up the change. Bind-mounted files are not reloaded by the running process.
+
+### Installing the App
+
+Install the App on the repositories you want the gateway to access:
+
+1. Go to `https://github.com/apps/fro-bot/installations/new` (or the URL for your App).
+2. Select the account or organization and choose the repositories to grant access to.
+3. Click **Install**.
+
+The gateway auto-discovers the installation ID at runtime — you do not need to configure it manually.
+
+### Permission behaviour
+
+- **Under-privileged** (e.g. `contents: none`): the gateway returns an error at `/add-project` time with a message naming the missing permissions and a link to the installation settings page.
+- **Over-privileged** (e.g. `contents: write` when only `read` is required): the gateway logs a `WARN` entry listing the over-privileged scopes but does not block the request. Operators should review and reduce permissions to the minimum needed.
 
 ## Stopping the Stack
 
