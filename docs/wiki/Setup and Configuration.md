@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-05-17"
-updated-by: "ec2c628"
+last-updated: "2026-05-24"
+updated-by: "201b294"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
