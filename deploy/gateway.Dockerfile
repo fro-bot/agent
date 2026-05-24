@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:2780b5c3bab67f1f76c781860de469442999ed1a0d7992a5efdf2cffc0e3d769
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
 FROM node:24-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS build
@@ -43,12 +43,18 @@ WORKDIR /app/packages/gateway
 # future tmpfs-mount changes to /tmp.
 RUN mkdir -p /var/run/fro-bot && chmod 0700 /var/run/fro-bot
 
-# Readiness healthcheck — passes when the Discord `clientReady` event has
-# fired (writes /var/run/fro-bot/gateway-ready) AND PID 1 is alive. Cleared
-# at process startup so a stale flag from a prior process cannot mask a
-# current-run failure. A real liveness probe (HTTP /healthz) lands alongside
-# the workspace agent.
-HEALTHCHECK --interval=10s --timeout=3s --retries=12 --start-period=45s \
-  CMD test -f /var/run/fro-bot/gateway-ready && kill -0 1
+# nc is used by the healthcheck TCP probe below.
+RUN apk add --no-cache netcat-openbsd
+
+# Layered healthcheck:
+#   1. Readiness flag — written by the Discord `clientReady` handler.
+#   2. PID 1 alive — catches silent process death.
+#   3. TCP probe to mitmproxy:8080 — catches mitmproxy crashes that leave the
+#      cert file on disk but the proxy unreachable. "mitmproxy" is the compose
+#      service name defined in deploy/compose.yaml; rename both together.
+# The flag is cleared at process startup so a stale file from a prior run
+# cannot mask a current-run failure.
+HEALTHCHECK --interval=10s --timeout=3s --retries=4 --start-period=45s \
+  CMD test -f /var/run/fro-bot/gateway-ready && kill -0 1 && nc -z mitmproxy 8080
 
 CMD ["node", "dist/main.mjs"]

@@ -14,7 +14,7 @@ export async function reassertSessionTitle(
   try {
     const response = await client.session.update({
       path: {id: sessionId},
-      body: {title} as Record<string, unknown>,
+      body: {title},
     })
 
     if (response.error != null) {

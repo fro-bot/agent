@@ -6,7 +6,7 @@ date: 2026-04-18
 origin: docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md
 reviewed: 2026-04-18
 review_coverage: full (coherence + feasibility + scope-guardian, 3 reviewers)
-revised: 2026-04-18 (P0/P1 findings resolved post-review; see Sources & References)
+revised: 2026-05-20 (Units 1-4 shipped + deploy-readiness hardening; ready to start Unit 5)
 ---
 
 # feat: Fro Bot Gateway — Discord-first action-taking agent (v1)
@@ -603,7 +603,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [x] **Unit 4: Gateway daemon skeleton + Docker Compose stack**
+- [x] **Unit 4: Gateway daemon skeleton + Docker Compose stack** (initial scaffold shipped in PR #635/#638/#639/#644 2026-05-17; deploy contract hardened to deploy-ready in PR #649/#651/#652/#654/#655/#656 2026-05-19/20 — see "Deploy-Readiness Hardening" log below)
 
 **Goal:** Stand up the gateway container, the workspace container, and the mitmproxy container as a 3-service Compose stack. Gateway connects to Discord, registers slash commands, responds to `@mention` with a minimal "pong". Workspace container boots with mitmproxy CA installed and `http_proxy` env vars set. No agent execution yet — this unit verifies plumbing.
 
@@ -989,3 +989,53 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
   - Docker Compose secrets: https://docs.docker.com/reference/compose-file/secrets/
   - Kimaki (reference architecture): https://github.com/remorses/kimaki
   - sachitv sandbox (reference architecture): https://github.com/sachitv/opencode-omo-sandbox-docker
+
+
+## Deploy-Readiness Hardening (post-Unit 4)
+
+Unit 4 shipped a working scaffold but exposed contract gaps when first-deploy was attempted against `marcusrbrown/infra`. The following PRs took the deploy contract from "minimum-viable scaffold" to "external operators can stand up the compose stack from infra-as-code with no manual fixups required". These were not in the original Unit 4 scope; they're tracked here so future readers can see the path from scaffold to deploy-ready.
+
+| PR | Concern | Resolution |
+|----|---------|------------|
+| #649 | AWS credential plumbing missing from compose; readiness flag was a no-op; secret-file directory guard absent; no log rotation | Added `AWS_*_FILE` mounts + SDK credential injection; real `clientReady` → `/tmp/gateway-ready` flag; `isFile()` guard around secret reads; `logging:` blocks on all 3 services |
+| #651 | Default Discord intent set included privileged intents (`MessageContent`, `GuildMembers`) — operators had to know to remove them | Flipped `DEFAULT_INTENTS` to `[Guilds, GuildMessages]`; added `DISCORD_PRIVILEGED_INTENTS` env-var allowlist for explicit opt-in |
+| #652 | `DISCORD_PRIVILEGED_INTENTS_FILE` env wasn't plumbed through `deploy/compose.yaml` | Added the bind-mount; documented operator migration path for adding new optional secrets |
+| #654 | Renovate Dependency Dashboard kept flagging hidden-Unicode characters in `dist/*.js.map` bundles (introduced by tsdown 0.22.0 source-map default) | Set `sourcemap: false` explicitly; broadened the escape plugin to scrub every text file in `dist/`; fixed stateful-regex race between concurrent `Promise.all` iterations |
+| #655 | `clientReady` only fires once per Discord session; readiness flag never re-armed on real reconnect cycles; `shardDisconnect` cleanup could crash the gateway; embedded newlines in secret values broke S3 signing with opaque AWS errors; startup ordering was untested | Listen on `clientReady` / `shardReady` / `shardResume` for re-arm + `shardDisconnect` for clear; log-and-swallow non-ENOENT unlink errors; reject `\r\n\u0085\u2028\u2029` in secret values with operator-friendly error; extracted `makeGatewayProgram` factory for testable startup ordering |
+| #656 | Operator-controlled `_FILE` paths could point at symlinks (data leak), FIFOs (startup hang), character devices (memory exhaustion), or oversized files | `openSync(path, O_RDONLY \| O_NOFOLLOW)` + `fstatSync` on fd + 4 KB size cap; eliminates the lstat-then-read TOCTOU window; custom `SecretFileNotFoundError` for clean ENOENT fallback to env-var path |
+
+**Net deploy-readiness state after PR #656 (2026-05-20):**
+
+- Compose stack runs unattended after first-time CA bootstrap
+- Healthcheck reflects actual Discord connection state across the full reconnect lifecycle
+- All `_FILE` secret paths are validated against symlink/FIFO/device/size attacks before reading
+- AWS SDK gets credentials from the standard `_FILE` convention; `aws-region` empty for R2/MinIO/B2 path works
+- Privileged Discord intents are opt-in, not default
+- Build output reproducible across tsdown versions (no source-map drift)
+
+**What this does NOT cover** (still left for Unit 5+):
+- Channel-repo binding store (`bindings/{channel_id}.json` in S3)
+- `/fro-bot add-project` slash command
+- Workspace HTTP API (`apps/workspace-agent/`)
+- Discord channel creation flow
+- The end-to-end "tell Fro Bot to do something from Discord" path
+
+**Carry-forward todos filed during this work:**
+
+- `010` (P2, `a-security`) — Gateway healthcheck shallow (TCP probe vs file presence)
+- `023` (P2, `d-runtime-extraction-followup`) — Runtime `retry.ts` lags action `retry.ts` (extraction was done in PR #541, before OpenCode terminal-completion hardening landed; gateway will need the newer shape when it starts driving OpenCode in Unit 6+)
+- `024` (P2, `d-gateway-architecture`) — Extract side-effect-free `program.ts` (so tests don't need to mock `Effect.runPromise`)
+
+These are non-blocking for Unit 5 start but should be picked up before Unit 6 (Discord-driven OpenCode execution).
+
+## Next: Unit 5 (channel-repo binding)
+
+With deploy-readiness complete, the gateway daemon can be stood up by an external operator. Unit 5 is the first user-facing feature: `/fro-bot add-project url:<git-url> [channel:<name>]` so operators can bind a repo to a Discord channel. This unlocks Unit 6 (the actual `@fro-bot` interaction loop), which requires a bound channel to know what repo to act against.
+
+Unit 5 introduces:
+- `apps/workspace-agent/` — the workspace HTTP service that gateway calls over `sandbox-net` to do git operations (clone, fetch, checkout) without mounting `/var/run/docker.sock` into the gateway container
+- `packages/gateway/src/bindings/store.ts` — S3-backed binding records
+- `packages/gateway/src/discord/commands/add-project.ts` — the slash command
+- `packages/gateway/src/discord/channels.ts` — Discord channel creation/discovery
+
+Estimated scope: bigger than any unit so far (introduces a new sub-app), but well-bounded by the binding schema and the slash command contract.
