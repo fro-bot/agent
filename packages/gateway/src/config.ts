@@ -26,6 +26,7 @@ export interface GatewayConfig {
   readonly githubAppId: string
   readonly githubAppPrivateKey: string
   readonly gatewayGitHubAppInstallUrl: string
+  readonly workspaceAgentUrl: string
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -313,6 +314,8 @@ export function loadGatewayConfig(): GatewayConfig {
   const gatewayGitHubAppInstallUrl =
     readOptionalSecret('GATEWAY_GITHUB_APP_INSTALL_URL') ?? 'https://github.com/apps/fro-bot/installations/new'
 
+  const workspaceAgentUrl = readOptionalSecret('WORKSPACE_AGENT_URL') ?? 'http://workspace:9100'
+
   return {
     discordToken,
     discordApplicationId,
@@ -324,5 +327,6 @@ export function loadGatewayConfig(): GatewayConfig {
     githubAppId,
     githubAppPrivateKey,
     gatewayGitHubAppInstallUrl,
+    workspaceAgentUrl,
   }
 }

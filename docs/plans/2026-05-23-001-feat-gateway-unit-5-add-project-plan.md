@@ -5,7 +5,7 @@ status: active
 date: 2026-05-23
 origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 parent_unit: Unit 5 of the Gateway v1 plan
-deepened: 2026-05-23 (coherence + feasibility + security review applied)
+deepened: 2026-05-24 (coherence + feasibility + security review applied)
 ---
 
 # feat: Gateway v1 Unit 5 — channel-repo binding + /fro-bot add-project
@@ -362,14 +362,16 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 **Dependencies:** PR A + PR B + PR C all merged.
 
 **Files:**
-- Create: `packages/gateway/src/workspace-api/types.ts` — must match PR C's exact handler shapes:
-  - `CloneRequest = {owner: string, repo: string, token: string}` (NO `repoPath`, NO `url` — agent derives path; agent constructs URL)
-  - `CloneResponse = {ok: true, sha: string} | {ok: false, error: string, code?: string}`
-- Create: `packages/gateway/src/workspace-api/client.ts` (`createWorkspaceClient({baseUrl})` returns `{clone}` — returns `Promise<Result<Response, WorkspaceError>>`)
-- Create: `packages/gateway/src/discord/channels.ts` (`findOrCreateChannel(guild, name)` — searches existing channels, creates if missing, returns `Result<{channel, created}, ChannelError>`; handles name collisions with `-2`, `-3` suffixes)
-- Create: `packages/gateway/src/discord/commands/add-project.ts` (`SlashCommand` with `data.name = 'add-project'`; `execute` orchestrates the 5-phase flow)
+- Create: `packages/gateway/src/workspace-api/types.ts` — MUST mirror PR C's shipped `apps/workspace-agent/src/types.ts` exactly:
+  - `CloneRequest = {readonly owner: string, readonly repo: string, readonly token: string}` (NO `repoPath`, NO `url`)
+  - `CloneSuccess = {readonly ok: true, readonly path: string, readonly commit: string}` (NOT `sha` — PR C ships `commit`, an HEAD SHA, plus `path` which is the absolute workspace-container path)
+  - `CloneFailure = {readonly ok: false, readonly error: CloneErrorCode, readonly code?: string}`
+  - `CloneErrorCode` union must include all of PR C's codes: `invalid-owner` `invalid-repo` `invalid-token-shape` `malformed-body` `body-too-large` `clone-failed` `clone-timeout` `clone-aborted` `git-not-available` `enospc` `disk-full` `permission-denied` `too-many-files` `repo-exists` `path-escaped-workspace` `head-resolution-failed` `overloaded`
+- Create: `packages/gateway/src/workspace-api/client.ts` (`createWorkspaceClient({baseUrl, timeoutMs?})` returns `{clone}` — returns `Promise<Result<CloneSuccess, WorkspaceError>>`). MUST NEVER log request body or response body, even on retry or error. All error paths return sanitized `WorkspaceError` variants with no token-bearing context.
+- Create: `packages/gateway/src/discord/channels.ts` (`findOrCreateChannel(guild, name, {maxSuffix?: number})` — searches existing channels, creates if missing, returns `Result<{channel, created}, ChannelError>`; handles name collisions with `-2`, `-3` suffixes up to `maxSuffix` (default 10), returns `{kind: 'collision-exhausted'}` error if the limit is hit)
+- Create: `packages/gateway/src/discord/commands/add-project.ts` (`SlashCommand` — see "Command shape" decision in Approach for whether top-level `/add-project` or nested `/fro-bot add-project`; `execute` orchestrates the 5-phase flow with durable state in S3)
 - Modify: `packages/gateway/src/discord/commands/index.ts` — register the new command in the registry
-- Modify: `packages/gateway/src/config.ts` — add `workspaceAgentUrl` (defaults to `http://workspace:9100`) and `gatewayGitHubAppInstallUrl` (defaults to `https://github.com/apps/fro-bot/installations/new`; overridable for testing)
+- Modify: `packages/gateway/src/config.ts` — add `workspaceAgentUrl` (defaults to `http://workspace:9100`); `gatewayGitHubAppInstallUrl` is already present from PR B and does not need re-adding
 - Test: `packages/gateway/src/workspace-api/client.test.ts`, `packages/gateway/src/discord/channels.test.ts`, `packages/gateway/src/discord/commands/add-project.test.ts`
 
 **Approach:**
@@ -377,8 +379,20 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 **workspace-api client:**
 - Single config: `WORKSPACE_AGENT_URL` env var (defaults to `http://workspace:9100`). Plumbed via `loadGatewayConfig`.
 - Use native `fetch` (Node 24+). No HTTP library dep needed.
-- `clone` method JSON-stringifies the request body, posts to `/clone`, parses the response, returns `Result<CloneResponse, WorkspaceError>`. Timeout: 5min for clone (large monorepos).
+- `clone` method JSON-stringifies the request body, posts to `/clone`, parses the response, returns `Result<CloneSuccess, WorkspaceError>`. Timeout enforced via `AbortSignal.timeout(300_000)` (5min for large monorepos; Node 24 native). On `AbortError`, returns `WorkspaceError {kind: 'timeout'}`.
 - Network errors, non-2xx responses, JSON parse failures all become `WorkspaceError` variants with discriminated `kind`.
+- **Response integrity check:** after parsing the success response, verify the request was actually fulfilled by re-checking `(owner, repo)` was the right one. PR C's response doesn't echo back the owner/repo; the simplest defense is to log the requested `(owner, repo)` alongside the returned `path` (path includes them as the last two segments) and assert `path` ends with `/{owner}/{repo}`. Mismatch → `WorkspaceError {kind: 'response-mismatch'}`.
+- **Secret-handling invariant (non-negotiable):** `client.ts` must NEVER log request body or response body, even on retry, error, or rethrow. No `console.log(requestInit)`. No `Error.cause = requestInit`. All thrown/returned errors carry only structured, scrubbed context. Captured-logger test required (mirroring PR B's pattern) to assert no IAT or PEM-shaped string appears in any log line across happy and error paths.
+
+**Trust model for sandbox-net (document under Cross-Cutting Security Requirements):**
+
+The plain-HTTP gateway↔workspace-agent contract is acceptable in v1 ONLY under these conditions:
+- `sandbox-net` is the internal Docker compose network with NO published ports
+- `workspace` service has no `ports:` block in `deploy/compose.yaml` (only internal connectivity)
+- Operator does not stand up additional containers on `sandbox-net` without auditing them
+- No mutual auth, mTLS, or HMAC is in scope for v1
+
+If any of these change, the workspace-api client MUST add HMAC request signing (shared secret in `deploy/secrets/`) before the change ships. Documented as a hard precondition.
 
 **Channel name derivation and normalization:**
 - If operator provides `channel:<name>` option: validate against Discord channel-name rules (lowercase, `[a-z0-9-]`, 1-100 chars, must start with letter/number). Reject anything else at slash-command argument validation.
@@ -390,7 +404,16 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 - `url` option description: `"GitHub repo URL (https://github.com/owner/repo)"`
 - `channel` option description: `"Optional Discord channel name (auto-derived from repo if omitted)"`
 
-**Command shape:** single top-level command `/add-project` (NOT a `/fro-bot add-project` subcommand). The parent Gateway v1 plan documents `/fro-bot` as a logical command family but the existing `/ping` is also a flat command — keep the pattern. The command lives in `packages/gateway/src/discord/commands/add-project.ts` with `data.name = 'add-project'`. Registration in `index.ts` adds it to the registry alongside `ping`.
+**Command shape (REVISED — feasibility found drift):** the existing command is actually `/fro-bot ping` (nested under `setName('fro-bot')` + subcommand `ping`), not flat. Two viable shapes:
+
+1. **Nest under `/fro-bot`** — `/fro-bot add-project` as a sibling subcommand to `ping`. Matches the existing pattern; requires editing the SubcommandBuilder in `packages/gateway/src/discord/commands/ping.ts` (or wherever the `/fro-bot` parent lives) to add the new subcommand.
+2. **Flat `/add-project`** — register as a separate top-level command. Requires the registry to handle two parent commands and the help/discoverability story to cover both.
+
+**Decision: nest under `/fro-bot` for consistency.** Subcommand structure is `/fro-bot add-project url:<string> [channel:<string>]`. Implementer locates the existing parent command builder and adds the `add-project` subcommand alongside `ping`. The `execute` handler lives in `packages/gateway/src/discord/commands/add-project.ts` and is wired into the parent dispatcher.
+
+**Slash command scope:** guild vs global is controlled by `config.discordGuildId` in `program.ts` — the existing pattern, not per-command. No changes needed.
+
+**Repo canonicalization (security requirement):** before any bindings store lookup or write, canonicalize `owner` and `repo` to lowercase. GitHub repo identity is case-insensitive, so `https://github.com/Owner/Repo` and `https://github.com/owner/repo` refer to the same repo and must produce the same binding key. Canonicalization happens in PRE_FLIGHT, right after URL parsing, before `getBindingByRepo`.
 
 **Slash command schema:** `/add-project url:<string> [channel:<string>]`. URL validated with regex `^https://github\.com/[^/]+/[^/]+(\.git)?$` at the slash-command argument validation layer (rejects bad URLs before any side effects). Channel name validated per the normalization rules above.
 
@@ -432,8 +455,9 @@ READY:
 
 **Welcome message content:**
 - Posted in the newly-bound channel
-- Plain text + embed format
-- Content (this exact wording):
+- Format: Discord embed only (single embed, no plain text content). Title: `Bound to {owner}/{repo}`. Description: the body text below. Embed color: success-green.
+- On welcome-message-post failure (e.g., bot lost permission immediately after channel creation): log the failure, edit the setup-thread message with "channel created and bound, but couldn't post welcome message — verify @-mention access". Do NOT undo the channel or binding; the binding is the source of truth.
+- Content (this exact wording in the embed description):
   ```
   This channel is bound to <repo-owner>/<repo-name>.
 
@@ -443,11 +467,30 @@ READY:
   ```
 - The "until then" sentence is critical — without it the operator sees `READY` and expects a working @-mention loop, which Unit 6 hasn't shipped yet.
 
-Setup thread lives in the source channel (where the operator ran `/add-project`). Not the new channel. Progress message edits, not new posts — keeps the thread tidy.
+Setup thread lives in the source channel (where the operator ran `/fro-bot add-project`). Not the new channel. Progress message edits, not new posts — keeps the thread tidy.
 
 Rate-limit handling: Discord 429 → exponential backoff (3 retries, 1s/2s/4s). discord.js handles this natively for most operations; the code just needs to catch and surface.
 
-Slash command deferReply with `ephemeral: false` (operator sees progress; non-ephemeral so it's preserved as a record).
+**Slash command visibility decision: ephemeral by default.** `deferReply({ephemeral: true})`. Reasoning: the source channel may be public; the setup thread reveals the workspace path, install URL, target repo identity, and structured error messages — all of which are operationally sensitive. Ephemeral progress means only the invoking operator sees the phase progression. The successful outcome (channel + welcome message in the new channel) is still publicly visible at the right scope. This deviates from the original plan's `ephemeral: false` "preserved as a record" rationale; the record is the welcome message in the new channel, not the setup thread in the source.
+
+**Permission re-check at CREATING_CHANNEL boundary:** PRE_FLIGHT verifies MANAGE_CHANNELS + SEND_MESSAGES at the start. Permissions CAN change between PRE_FLIGHT and CREATING_CHANNEL (operator demotes the bot mid-flow). Defensive re-check at CREATING_CHANNEL: if the bot lacks MANAGE_CHANNELS at that exact moment, edit the setup-thread message with the same "needs MANAGE_CHANNELS, visit invite URL" error and mark phase = FAILED. Clone is already done; no rollback of the clone (operator can retry after granting permission, and PR C's per-repo lock will serialize cleanly).
+
+**Channel collision suffix cap:** `findOrCreateChannel(guild, name, {maxSuffix: 10})`. After `name`, `name-2`, ..., `name-10` all exist, return `Result.err({kind: 'collision-exhausted'})`. Slash command surfaces "couldn't find an available channel name after 10 attempts; specify `channel:<name>` explicitly". Protects against DoS via channel-name enumeration.
+
+**Discord 15-minute interaction window:** `deferReply` extends the response window to 15 minutes total. If the orchestration takes longer (large monorepo clone + Discord rate-limit backoff + S3 binding write), the interaction expires and `editReply`/`followUp` start failing. Defensive handling: track elapsed time from interaction start; at 14 minutes, abort the orchestration cleanly (mark phase = FAILED, log "interaction window exhausted"). The clone and channel are NOT rolled back; they become orphaned state that the operator can manually clean up using the same paths as binding-write failures.
+
+**Orchestration durability — v1 acceptance:** for v1, the orchestration is in-memory only. Process crash mid-flow → orphaned state (channel created but no binding, clone done but no channel, etc.). The plan acknowledges this and provides operator-facing manual recovery instructions for each partial-failure shape:
+
+- Clone done, no channel: workspace path is `/workspace/repos/{owner}/{repo}`; remove with `rm -rf` if not wanted, or retry `/fro-bot add-project` (per-repo lock in PR C will detect the existing clone and return 409 `repo-exists`; operator must rm and retry).
+- Channel created, no binding: channel name is visible; binding S3 key is `bindings/{owner}/{repo}/repo.json`; operator must either retry the command (collision suffix logic will discover the existing channel and surface "channel exists but no binding — manual recovery required") or manually delete the channel and retry.
+- Binding created, no welcome message: rare; bot lost permission immediately after channel creation. Recovery: retry the command (PRE_FLIGHT finds the binding and aborts with "already bound" — informational, the operator can ignore).
+
+Persistent setup-state (resume-on-crash) is deferred to Unit 6 or later. Documented as an accepted v1 limitation in the operator README that PR D will update.
+
+**Observability contract:** every phase boundary emits a structured log line via the gateway's existing logger:
+- Fields: `correlationId` (interaction ID), `phase` (string), `owner`, `repo`, `channelName` (when known), `durationMs` (since phase start), `outcome` (`success`/`error`), `errorKind` (when error, the discriminated error variant).
+- IAT is NEVER logged. Captured-logger test asserts no `ghs_`-prefixed string appears in any log line.
+- The `correlationId` ties together: slash command invocation → App auth → workspace-agent call → S3 writes → Discord channel creation. Operator debugging a failed `/fro-bot add-project` can grep for the correlationId across all gateway logs.
 
 **Execution note:** Test-first for the partial-failure scenarios (channel created but binding write failed; clone succeeded but channel creation failed). These are the operator-facing failure modes that determine whether the command is recoverable.
 
@@ -472,10 +515,30 @@ Slash command deferReply with `ephemeral: false` (operator sees progress; non-ep
 - Error path — binding write fails after channel created (WRITING_BINDING): edit msg "channel #X created but binding failed; re-run the command or manually clean up". Pre-flight on retry sees existing channel and either reuses it (if name matches expected derived name) or surfaces collision.
 - Edge case — concurrent `/add-project` calls for the same repo: second call's PRE_FLIGHT sees the first call's binding (or its CLONING phase) and aborts cleanly.
 - Security check — token in the workspace-api request body is NOT included in any error message.
-- Happy path — `clone({owner, repo, token})` POSTs to `/clone` with the right body, returns `Result.ok({ok: true, sha})`.
+- Happy path — `clone({owner, repo, token})` POSTs to `/clone` with the right body, returns `Result.ok({ok: true, path, commit})` (note PR C ships `path`+`commit`, not `sha`).
+- Happy path — response `path` ends with `/{owner}/{repo}`; mismatch (e.g., server returns wrong repo's path) → `Result.err({kind: 'response-mismatch'})`.
 - Error path — workspace agent returns 500 → `Result.err({kind: 'http-error', status: 500})`.
+- Error path — workspace agent returns one of PR C's structured error codes (clone-timeout, head-resolution-failed, disk-full, overloaded, body-too-large, repo-exists, etc.) → preserved as `WorkspaceError {kind: 'clone-error', code: <CloneErrorCode>}`.
 - Error path — connection refused (workspace not running) → `Result.err({kind: 'network-error'})`.
 - Error path — timeout (clone took >5min) → `Result.err({kind: 'timeout'})`.
+- Error path — JSON parse failure on response body (truncated, malformed) → `Result.err({kind: 'parse-error'})`.
+- Security — captured-logger test: no `ghs_`-prefixed string appears in any log line across happy + all error paths.
+- Security — no `console.log(requestInit)` or equivalent body-logging code exists in `client.ts`.
+
+**Orchestration timing + crash + abuse failure paths:**
+
+- Timing — Discord interaction window hits 14 min while still in CLONING: orchestration aborts cleanly, phase = FAILED, structured "interaction window exhausted" log line, clone preserved (orphan), no channel/binding written.
+- Timing — IAT expires (~1 hour) between PRE_FLIGHT and WRITING_BINDING: workspace-agent rejects with 401 or similar; orchestration surfaces "auth token expired during operation; retry the command" and marks phase = FAILED. (Defensive: PR B's `authForRepo` returns a fresh IAT each call; PR D should NOT cache the IAT across phases — re-fetch if any phase needs it past the initial CLONING call.)
+- Timing — Discord API outage during CREATING_CHANNEL: rate-limit retries exhausted, structured "Discord API unreachable" error, clone preserved, phase = FAILED.
+- Concurrency — same user double-clicks `/fro-bot add-project` within a second: the second invocation's PRE_FLIGHT sees either the first's binding (if WRITING_BINDING completed) or the first's CLONING-phase workspace path (if PR C's per-repo lock is still held). Surface "this repo is currently being added; please wait" without errors.
+- Concurrency — different users invoke `/fro-bot add-project` for the same repo simultaneously: same as double-click; PR C's per-repo lock serializes; second caller sees `repo-exists` 409.
+- UX — operator deletes the setup-thread message mid-orchestration: `editReply` fails with Discord 404 or similar; log the failure, continue the orchestration silently to completion (binding + channel still landed), and DON'T attempt to recreate the deleted message.
+- Permission re-check — bot permissions revoked between PRE_FLIGHT and CREATING_CHANNEL: defensive re-check catches it, edits setup-thread message with revoke-and-reinvite instructions, phase = FAILED, clone preserved.
+- Abuse control — same user invokes `/fro-bot add-project` 10 times in 60 seconds: rate-limit per Discord user via simple in-memory bucket (5 invocations per 60s per user). 6th+ invocation gets ephemeral "rate-limited; try again in N seconds" without entering any phase. (v1 in-memory only; persistent rate-limiter deferred.)
+- Observability — every phase boundary emits a log line with `correlationId`, `phase`, `outcome`, `errorKind` when applicable; correlationId matches the Discord interaction ID; no `ghs_*` token appears anywhere in logs (captured-logger test).
+- Welcome message — post fails after channel + binding written: setup-thread edited with "channel + binding created, welcome message failed; verify bot has Send Messages in #channelName"; binding + channel NOT undone.
+- Channel collision — `name`, `name-2`, ..., `name-10` all exist: returns `collision-exhausted`; slash command surfaces "specify `channel:<name>` explicitly".
+- Canonicalization — `https://github.com/Owner/Repo` and `https://github.com/owner/repo` produce the same binding key (lowercase canonicalized in PRE_FLIGHT before lookup).
 
 **Verification:**
 - `pnpm --filter @fro-bot/gateway test` green

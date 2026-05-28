@@ -1,4 +1,4 @@
-import type {Message, TextChannel, ThreadChannel} from 'discord.js'
+import type {Message, TextChannel} from 'discord.js'
 import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 
@@ -23,7 +23,7 @@ function makeMessage(
     replyFn = vi.fn().mockResolvedValue(undefined),
   } = overrides
 
-  const startThread = startThreadFn ?? vi.fn().mockResolvedValue({send: sendFn} as unknown as ThreadChannel)
+  const startThread = startThreadFn ?? vi.fn().mockResolvedValue({send: sendFn})
 
   return {
     channel: {

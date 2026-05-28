@@ -1,13 +1,17 @@
-import type {ChatInputCommandInteraction, Client, GatewayIntentBits, Message} from 'discord.js'
+import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 
+import {createS3Adapter} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 
+import {createBindingsStore} from './bindings/store.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
+import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers} from './shutdown.js'
+import {createWorkspaceClient} from './workspace-api/client.js'
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — pino can replace this in a later unit.
@@ -80,8 +84,45 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     //     Must run BEFORE client.login() so the event cannot be missed.
     yield* Effect.sync(() => deps.setupReadinessFlag(client, logger))
 
-    // d. Build command registry
-    const registry = getCommandRegistry()
+    // d. Build command registry with runtime deps
+    const addProjectLogger = {
+      debug: (msg: string, meta?: Record<string, unknown>) => logger.debug(meta ?? {}, msg),
+      info: (msg: string, meta?: Record<string, unknown>) => logger.info(meta ?? {}, msg),
+      warn: (msg: string, meta?: Record<string, unknown>) => logger.warn(meta ?? {}, msg),
+      error: (msg: string, meta?: Record<string, unknown>) => logger.error(meta ?? {}, msg),
+    }
+
+    // Adapt GatewayLogger to the runtime Logger interface (uses 'warning' not 'warn')
+    const runtimeLogger = {
+      debug: (msg: string, ctx?: Record<string, unknown>) => logger.debug(ctx ?? {}, msg),
+      info: (msg: string, ctx?: Record<string, unknown>) => logger.info(ctx ?? {}, msg),
+      warning: (msg: string, ctx?: Record<string, unknown>) => logger.warn(ctx ?? {}, msg),
+      error: (msg: string, ctx?: Record<string, unknown>) => logger.error(ctx ?? {}, msg),
+    }
+
+    const s3Adapter = createS3Adapter(config.objectStore, runtimeLogger)
+    const bindingsStore = createBindingsStore({
+      adapter: s3Adapter,
+      storeConfig: config.objectStore,
+      identity: config.identity,
+    })
+    const appClient = createAppClient({
+      appId: config.githubAppId,
+      privateKey: config.githubAppPrivateKey,
+      installUrl: config.gatewayGitHubAppInstallUrl,
+      logger: addProjectLogger,
+    })
+    const workspaceClient = createWorkspaceClient({baseUrl: config.workspaceAgentUrl})
+
+    const commandDeps = {
+      bindingsStore,
+      appClient,
+      workspaceClient,
+      installUrl: config.gatewayGitHubAppInstallUrl,
+      logger: addProjectLogger,
+    }
+
+    const registry = getCommandRegistry(commandDeps)
 
     // e. Register slash commands
     yield* Effect.tryPromise({
@@ -94,7 +135,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     client.on('interactionCreate', interaction => {
       if (!interaction.isChatInputCommand()) return
       // isChatInputCommand() narrows to ChatInputCommandInteraction — cast is safe.
-      const cmd = interaction as unknown as ChatInputCommandInteraction
+      const cmd = interaction
       Effect.runPromise(dispatchCommand(cmd, registry)).catch((error: unknown) => {
         logger.error({err: error, commandName: cmd.commandName}, 'command dispatch failed')
       })
