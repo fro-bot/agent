@@ -44,9 +44,11 @@
     {
       matchDatasources: ['docker'],
       matchPackageNames: ['/^((docker[.]io/library/)?node|library/node)$/'],
-      matchUpdateTypes: ['digest'],
+      versioning: 'node',
+      versionCompatibility: '^(?<version>[^-]+)(?<compatibility>-.*)?$',
       commitMessageTopic: 'Node.js',
-      commitMessageExtra: 'to {{currentValue}}@{{newDigestShort}}',
+      commitMessageExtra: 'to {{newValue}}@{{newDigestShort}}',
+      changelogUrl: 'https://github.com/nodejs/node/releases/tag/v{{{replace "-.*$" "" newValue}}}',
     },
     {
       matchPackageNames: [
