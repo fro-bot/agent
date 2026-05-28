@@ -42,6 +42,13 @@
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
     {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
+      matchDatasources: ['docker'],
+      matchPackageNames: ['/^((docker[.]io/library/)?node|library/node)$/'],
+      matchUpdateTypes: ['digest'],
+      commitMessageTopic: 'Node.js',
+      commitMessageExtra: 'to {{currentValue}}@{{newDigestShort}}',
+    },
+    {
       matchPackageNames: [
         '@bfra.me/tsconfig',
         '@fro.bot/systematic',
