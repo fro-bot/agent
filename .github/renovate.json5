@@ -42,13 +42,16 @@
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
     {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
+      // Apply Node.js semver versioning to node Docker images so Renovate
+      // resolves major-alias tags (e.g. 24-alpine) to full semver patch tags
+      // (e.g. 24.15.0-alpine), includes semver in PR titles, and fetches
+      // release-note summaries from nodejs/node into the PR body.
       matchDatasources: ['docker'],
-      matchPackageNames: ['/^((docker[.]io/library/)?node|library/node)$/'],
+      matchPackageNames: ['/(?:^|/)node$/'],
       versioning: 'node',
       versionCompatibility: '^(?<version>[^-]+)(?<compatibility>-.*)?$',
+      sourceUrl: 'https://github.com/nodejs/node',
       commitMessageTopic: 'Node.js',
-      commitMessageExtra: 'to {{newValue}}@{{newDigestShort}}',
-      changelogUrl: 'https://github.com/nodejs/node/releases/tag/v{{{replace "-.*$" "" newValue}}}',
     },
     {
       matchPackageNames: [
