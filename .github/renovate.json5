@@ -44,6 +44,7 @@
     {
       matchDatasources: ['docker'],
       matchPackageNames: ['/^((docker[.]io/library/)?node|library/node)$/'],
+      matchUpdateTypes: ['digest', 'pinDigest'],
       versioning: 'node',
       versionCompatibility: '^(?<version>[^-]+)(?<compatibility>-.*)?$',
       commitMessageTopic: 'Node.js',
