@@ -24,6 +24,10 @@ export interface WorkspaceClient {
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
 
+// Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts.
+// Intentionally NOT imported from there: separate package/container boundary.
+const EXPECTED_WORKSPACE_ROOT = '/workspace/repos'
+
 /**
  * Create a workspace-agent HTTP client.
  *
@@ -86,9 +90,12 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
       return err({kind: 'clone-error', code: parsed.error})
     }
 
-    // Response integrity check: path must end with /{owner}/{repo} (case-insensitive).
-    const expectedSuffix = `/${owner.toLowerCase()}/${repo.toLowerCase()}`
-    if (!parsed.path.toLowerCase().endsWith(expectedSuffix)) {
+    // Strict full-path equality check (root + owner + repo).
+    // The prior suffix-only check accepted adversarial paths like /etc/passwd/owner/repo.
+    // owner/repo arrive already lowercased from add-project.ts; lowercasing the response
+    // path would let a case-variant root bypass validation.
+    const expectedPath = `${EXPECTED_WORKSPACE_ROOT}/${owner}/${repo}`
+    if (parsed.path !== expectedPath) {
       return err({kind: 'response-mismatch'})
     }
 

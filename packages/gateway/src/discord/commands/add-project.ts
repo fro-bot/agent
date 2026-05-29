@@ -10,7 +10,7 @@
  * - Owner/repo are canonicalized to lowercase before any lookup or write.
  */
 
-import type {ChatInputCommandInteraction, PermissionsBitField} from 'discord.js'
+import type {ChatInputCommandInteraction, Guild, PermissionsBitField} from 'discord.js'
 import type {BindingsStore} from '../../bindings/store.js'
 import type {AppClient} from '../../github/app-client.js'
 import type {WorkspaceClient} from '../../workspace-api/client.js'
@@ -143,6 +143,26 @@ function botHasRequiredPermissions(appPermissions: PermissionsBitField | null): 
   return appPermissions.has(PermissionFlagsBits.ManageChannels) && appPermissions.has(PermissionFlagsBits.SendMessages)
 }
 
+// Invoking-user authorization gate: prevents privilege amplification where a member coerces
+// the bot's broader ManageChannels permission to create channels they could not create themselves.
+// Uses guild-level base permissions (no channel overwrites) to prevent a user with a
+// channel-scoped ManageChannels overwrite from bypassing the gate.
+async function userIsAuthorized(guild: Guild, userId: string, logger: AddProjectDeps['logger']): Promise<boolean> {
+  try {
+    // guild.members.fetch() is a REST call — works without the privileged GuildMembers intent.
+    // Do NOT use guild.members.cache.get() — returns undefined without the intent.
+    const member = await guild.members.fetch(userId)
+    // member.permissions is the guild-level base permission set (no channel overwrites).
+    return member.permissions.has(PermissionFlagsBits.ManageChannels)
+  } catch (error) {
+    // Fail closed: if we cannot resolve the member's guild permissions, deny.
+    logger.warn('add-project: member permission resolution failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Interaction window guard (14-minute limit)
 // ---------------------------------------------------------------------------
@@ -204,10 +224,21 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   }
 
   // Check bot permissions
-  if (!botHasRequiredPermissions(interaction.appPermissions)) {
+  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
     logger.warn('add-project: missing bot permissions', {correlationId, phase})
     await interaction.editReply({
       content: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${installUrl}`,
+    })
+    return
+  }
+
+  // Runtime authorization check — invoking user must hold ManageChannels.
+  // setDefaultMemberPermissions is NOT used — it would gate the entire /fro-bot parent
+  // command (including /ping). This is a scoped runtime check per subcommand.
+  if ((await userIsAuthorized(guild, interaction.user.id, logger)) === false) {
+    logger.warn('add-project: unauthorized user', {correlationId, phase})
+    await interaction.editReply({
+      content: 'You need the **Manage Channels** permission to use this command.',
     })
     return
   }
@@ -320,9 +351,30 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
             'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
         })
       } else if (code === 'repo-exists') {
-        await interaction.editReply({
-          content: `The repo \`${owner}/${repo}\` already exists in the workspace. Remove it with \`rm -rf /workspace/repos/${owner}/${repo}\` and retry.`,
-        })
+        // Never emit deletion instructions. Re-read bindings to distinguish:
+        // (a) repo genuinely bound → redirect to the bound channel
+        // (b) clone in progress by another user → safe "please wait" message
+        // Either way, no rm -rf instruction: user B must not destroy user A's in-flight clone.
+        let repoExistsBinding: Awaited<ReturnType<typeof bindingsStore.getBindingByRepo>>
+        try {
+          repoExistsBinding = await bindingsStore.getBindingByRepo(owner, repo)
+        } catch {
+          // Network-level rejection: fall back to the safe "please wait" message.
+          await interaction.editReply({
+            content: `\`${owner}/${repo}\` is currently being added by another setup. Please wait a moment and try again.`,
+          })
+          return
+        }
+        if (repoExistsBinding.success === true && repoExistsBinding.data !== null) {
+          await interaction.editReply({
+            content: `\`${owner}/${repo}\` is already set up in <#${repoExistsBinding.data.channelId}>.`,
+          })
+        } else {
+          // Either binding lookup failed or no binding found — clone is in progress.
+          await interaction.editReply({
+            content: `\`${owner}/${repo}\` is currently being added by another setup. Please wait a moment and try again.`,
+          })
+        }
       } else {
         await interaction.editReply({
           content: `Clone failed (${code}). Check workspace-agent logs for details.`,
