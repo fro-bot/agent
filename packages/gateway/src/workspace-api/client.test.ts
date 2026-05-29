@@ -113,10 +113,10 @@ describe('createWorkspaceClient', () => {
       vi.unstubAllGlobals()
     })
 
-    it('accepts path match case-insensitively', async () => {
-      // #given
+    it('accepts lowercase owner/repo matching the response path', async () => {
+      // #given — owner/repo arrive already lowercased from the caller (add-project.ts canonicalizes)
       const client = makeClient()
-      const req = makeRequest({owner: 'TestOwner', repo: 'TestRepo'})
+      const req = makeRequest({owner: 'testowner', repo: 'testrepo'})
       const fetchMock = mockFetch({
         ok: true,
         json: async () => ({ok: true, path: '/workspace/repos/testowner/testrepo', commit: 'abc123'}),
@@ -128,6 +128,79 @@ describe('createWorkspaceClient', () => {
 
       // #then
       expect(result.success).toBe(true)
+      vi.unstubAllGlobals()
+    })
+
+    // Strict prefix validation — suffix-only check accepted adversarial paths.
+    it('rejects adversarial path /etc/passwd/testowner/testrepo', async () => {
+      // #given — suffix matches but path root is wrong (privilege escalation attempt)
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/etc/passwd/testowner/testrepo', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then — must reject: path doesn't start with /workspace/repos
+      expect(result).toEqual(err({kind: 'response-mismatch'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('accepts exactly /workspace/repos/{owner}/{repo}', async () => {
+      // #given — exact expected path
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/workspace/repos/testowner/testrepo', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then — must succeed
+      expect(result.success).toBe(true)
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects path with extra trailing segment /workspace/repos/testowner/testrepo/extra', async () => {
+      // #given — suffix matches but there's an extra path segment after owner/repo
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/workspace/repos/testowner/testrepo/extra', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then — exact equality rejects the extra segment
+      expect(result).toEqual(err({kind: 'response-mismatch'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects path with uppercase workspace root /WORKSPACE/repos/owner/repo', async () => {
+      // #given — case-variant root; lowercasing response path would bypass validation
+      const client = makeClient()
+      const req = makeRequest()
+      const fetchMock = mockFetch({
+        ok: true,
+        json: async () => ({ok: true, path: '/WORKSPACE/repos/testowner/testrepo', commit: 'abc123'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.clone(req)
+
+      // #then — exact comparison rejects the case-variant root
+      expect(result).toEqual(err({kind: 'response-mismatch'}))
       vi.unstubAllGlobals()
     })
   })

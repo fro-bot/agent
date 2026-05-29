@@ -41,6 +41,11 @@ function lastReplyContent(reply: ReturnType<typeof vi.fn>): string {
   return calls.at(-1)?.[0]?.content ?? ''
 }
 
+/** Collect all editReply content strings across every call. */
+function allEditReplies(editReply: ReturnType<typeof vi.fn>): string[] {
+  return (editReply.mock.calls as [{content?: string}][]).map(c => c[0]?.content ?? '')
+}
+
 interface MockChannel {
   readonly channel: TextChannel
   readonly send: ReturnType<typeof vi.fn>
@@ -62,7 +67,9 @@ function makeGuild(
     has: vi.fn().mockReturnValue(hasPermissions),
   }
   const member = {permissions}
-  const members = {cache: {get: vi.fn().mockReturnValue(member)}}
+  const members = {
+    fetch: vi.fn().mockResolvedValue(member),
+  }
 
   const channelCache = {
     find: (pred: (ch: TextChannel) => boolean) => channels.find(pred),
@@ -400,7 +407,6 @@ describe('executeAddProject', () => {
       {code: 'clone-failed', expectedFragment: 'clone-failed'},
       {code: 'disk-full', expectedFragment: 'out of space'},
       {code: 'enospc', expectedFragment: 'out of space'},
-      {code: 'repo-exists', expectedFragment: 'already exists'},
       {code: 'head-resolution-failed', expectedFragment: 'head-resolution-failed'},
       {code: 'clone-timeout', expectedFragment: 'clone-timeout'},
     ]
@@ -461,7 +467,10 @@ describe('executeAddProject', () => {
         filter: () => ({find: () => undefined, some: () => false}),
       }
       const create = vi.fn().mockResolvedValue(makeTextChannel().channel)
-      const guild = {channels: {cache: channelCache, create}} as unknown as Guild
+      const guild = {
+        members: {fetch: vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(true)}})},
+        channels: {cache: channelCache, create},
+      } as unknown as Guild
       const {interaction, editReply} = makeInteraction({guild, userId, appPermissions})
       const deps = makeDeps()
 
@@ -488,6 +497,7 @@ describe('executeAddProject', () => {
       const nameTakenError = Object.assign(new Error('Invalid Form Body'), {code: 50035})
       const create = vi.fn().mockRejectedValue(nameTakenError)
       const guild = {
+        members: {fetch: vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(true)}})},
         channels: {cache: channelCache, create},
       } as unknown as Guild
       const {interaction, editReply} = makeInteraction({guild, userId})
@@ -599,6 +609,202 @@ describe('executeAddProject', () => {
       const {interaction: staleInteraction, editReply: staleEditReply} = makeInteraction({guild, userId: staleUserId})
       await run(staleInteraction, deps)
       expect(lastEditReplyContent(staleEditReply)).toContain('Ready')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Invoking-user authorization gate
+  // -------------------------------------------------------------------------
+
+  describe('PRE_FLIGHT: user authorization', () => {
+    it('rejects user without guild-level ManageChannels and does not proceed to clone', async () => {
+      // #given — members.fetch resolves to a member whose guild-level permissions lack ManageChannels
+      const userId = uniqueUserId()
+      const clone = vi.fn()
+      const unauthorizedMember = {permissions: {has: vi.fn().mockReturnValue(false)}}
+      const guild = makeGuild('bot-user-id', true, [])
+      ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = vi
+        .fn()
+        .mockResolvedValue(unauthorizedMember)
+      const {interaction, editReply} = makeInteraction({userId, guild})
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — rejected with permission message; clone never invoked
+      expect(lastEditReplyContent(editReply)).toContain('Manage Channels')
+      expect(clone).not.toHaveBeenCalled()
+    })
+
+    it('denies a user whose ManageChannels comes only from a channel overwrite, not guild-level', async () => {
+      // #given — guild-level permissions.has returns false (no base guild ManageChannels),
+      // even though a channel-scoped overwrite might grant it in a real Discord server.
+      const userId = uniqueUserId()
+      const clone = vi.fn()
+      const channelOverwriteOnlyMember = {permissions: {has: vi.fn().mockReturnValue(false)}}
+      const guild = makeGuild('bot-user-id', true, [])
+      ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = vi
+        .fn()
+        .mockResolvedValue(channelOverwriteOnlyMember)
+      const {interaction, editReply} = makeInteraction({userId, guild})
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — rejected; channel-scoped overwrite does NOT bypass the guild-level gate
+      expect(lastEditReplyContent(editReply)).toContain('Manage Channels')
+      expect(clone).not.toHaveBeenCalled()
+    })
+
+    it('allows user WITH guild-level ManageChannels to proceed past the authorization gate', async () => {
+      // #given — members.fetch resolves to a member with guild-level ManageChannels
+      const userId = uniqueUserId()
+      const {PermissionFlagsBits} = await import('discord.js')
+      const authorizedMember = {
+        permissions: {has: vi.fn().mockImplementation((flag: bigint) => flag === PermissionFlagsBits.ManageChannels)},
+      }
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = vi
+        .fn()
+        .mockResolvedValue(authorizedMember)
+      const {interaction, editReply} = makeInteraction({userId, guild})
+      const deps = makeDeps()
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — proceeds through all phases and reaches READY
+      expect(lastEditReplyContent(editReply)).toContain('Ready')
+    })
+
+    it('fail-closed: members.fetch rejection denies access and does not throw', async () => {
+      // #given — members.fetch rejects (e.g. network error, member not in guild)
+      const userId = uniqueUserId()
+      const clone = vi.fn()
+      const guild = makeGuild('bot-user-id', true, [])
+      ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = vi
+        .fn()
+        .mockRejectedValue(new Error('Unknown Member'))
+      const {interaction, editReply} = makeInteraction({userId, guild})
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when — must resolve without throwing
+      await run(interaction, deps)
+
+      // #then — fail-closed: denied, clone never invoked
+      expect(lastEditReplyContent(editReply)).toContain('Manage Channels')
+      expect(clone).not.toHaveBeenCalled()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // repo-exists never emits deletion instructions
+  // -------------------------------------------------------------------------
+
+  describe('CLONING: repo-exists safe messaging', () => {
+    it('repo-exists + binding found → redirects to bound channel, no rm -rf', async () => {
+      // #given — clone fails with repo-exists; bindings store returns existing binding
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      const existingBinding = {
+        owner: 'testowner',
+        repo: 'testrepo',
+        channelId: 'ch-bound-456',
+        channelName: 'testrepo',
+        workspacePath: '/workspace/repos/testowner/testrepo',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        createdByDiscordId: 'user-original',
+      }
+      // getBindingByRepo is called twice: once in PRE_FLIGHT (returns null), once in repo-exists handler (returns binding)
+      const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockResolvedValue(ok(existingBinding))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — redirects to existing channel with exact mention token; NEVER instructs deletion
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('<#ch-bound-456>')
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('rm -rf')
+      }
+    })
+
+    it('repo-exists + no binding found → "currently being added" message, no rm -rf', async () => {
+      // #given — clone fails with repo-exists; binding store returns null (clone in progress)
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      // Both PRE_FLIGHT and repo-exists handler see no binding
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — "currently being added" safe message; NEVER instructs deletion
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('currently being added')
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('rm -rf')
+      }
+    })
+
+    it('repo-exists + binding store errors → falls back to "currently being added", no rm -rf', async () => {
+      // #given — clone fails with repo-exists; binding store returns error
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      const storeError = new Error('S3 timeout')
+      // PRE_FLIGHT call succeeds with null; second call (repo-exists handler) errors
+      const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockResolvedValue(err(storeError))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — safe fallback; NEVER instructs deletion
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('currently being added')
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('rm -rf')
+      }
+    })
+
+    it('repo-exists + getBindingByRepo REJECTS → falls back to "please wait", no rm -rf', async () => {
+      // #given — clone fails with repo-exists; getBindingByRepo throws (network-level rejection)
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      // PRE_FLIGHT call succeeds with null; second call rejects entirely
+      const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockRejectedValue(new Error('connection reset'))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+      })
+
+      // #when — must resolve without throwing even though getBindingByRepo rejects
+      await expect(run(interaction, deps)).resolves.toBeUndefined()
+
+      // #then — safe fallback sent; NEVER instructs deletion
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('currently being added')
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('rm -rf')
+      }
     })
   })
 
