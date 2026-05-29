@@ -74,6 +74,17 @@ Existing deployments that need the privileged set must set this on the next
 deploy. The allowlist is intentionally narrow — operators cannot enable
 arbitrary Discord intents via this knob.
 
+## Known limitations (v1)
+
+- **`add-project` is Discord-only.** The orchestration runs inside the slash
+  command handler and requires a `ChatInputCommandInteraction`; there is no
+  programmatic surface (HTTP endpoint, CLI, or agent tool) that triggers the same
+  outcome. An autonomous agent cannot bind a repo without going through Discord.
+  Recovery is via idempotent retry — re-running the command resumes a partial
+  setup — rather than agent-callable recovery primitives. Extracting a
+  Discord-independent `addProject(request, deps)` primitive is deferred until a
+  non-Discord caller exists.
+
 ## Build
 
 ```bash
