@@ -42,6 +42,18 @@
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
     {matchDatasources: ['docker'], semanticCommitType: 'build'},
     {
+      // versioning: node + versionCompatibility split "24.16.0-alpine" into
+      // version=24.16.0 / compatibility=-alpine so Renovate compares Node semver
+      // and rebuilds the tag on upgrades. sourceUrl inlines release-note
+      // summaries from nodejs/node into the PR body.
+      matchDatasources: ['docker'],
+      matchPackageNames: ['/(?:^|/)node$/'],
+      versioning: 'node',
+      versionCompatibility: '^(?<version>[^-]+)(?<compatibility>-.*)?$',
+      sourceUrl: 'https://github.com/nodejs/node',
+      commitMessageTopic: 'Node.js',
+    },
+    {
       matchPackageNames: [
         '@bfra.me/tsconfig',
         '@fro.bot/systematic',

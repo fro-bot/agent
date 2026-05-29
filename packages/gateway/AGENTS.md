@@ -50,6 +50,9 @@ Not used at this scope:
 - `src/config.ts` — env + secret reading. `readSecret(name)` checks `${NAME}_FILE` first, falls back to `process.env[name]`.
 - `src/runtime-effect.ts` — the Result<>→Effect boundary.
 - `src/discord/` — Discord.js integration. Client construction with safe `allowedMentions` defaults, command registry, mention handler.
+  - `src/discord/channels.ts` — channel creation helper used by the add-project flow. `createChannelWithCollisionSuffix` always creates a fresh channel; it never returns an existing one. Tries the exact name first, then `name-2` through `name-10`, skipping any candidate whose name is already taken.
+  - `src/discord/commands/add-project.ts` — `/fro-bot add-project` slash command. Orchestrates the 5-phase flow (PRE_FLIGHT → CLONING → CREATING_CHANNEL → WRITING_BINDING → READY). Depends on `channels.ts` for channel creation, `workspace-api/client.ts` for repo cloning, `bindings/store.ts` for durable binding persistence, and `github/app-client.ts` for GitHub App token acquisition.
+- `src/workspace-api/` — HTTP client for the workspace-agent sidecar service. `WorkspaceClient` wraps the `/clone` endpoint and maps HTTP error shapes to typed `Result<CloneSuccess, CloneError>` values. The client is injected into `add-project.ts` via `AddProjectDeps`.
 - `src/shutdown.ts` — SIGTERM handler with 25s drain.
 
 ## Configuration knobs
