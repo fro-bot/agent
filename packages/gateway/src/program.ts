@@ -10,7 +10,7 @@ import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
 import {createAppClient} from './github/app-client.js'
-import {installShutdownHandlers} from './shutdown.js'
+import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 
 // ---------------------------------------------------------------------------
@@ -120,6 +120,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       workspaceClient,
       installUrl: config.gatewayGitHubAppInstallUrl,
       logger: addProjectLogger,
+      isShuttingDown,
     }
 
     const registry = getCommandRegistry(commandDeps)

@@ -15,6 +15,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {AppNotInstalledError} from '../../github/app-client.js'
+import {__resetShuttingDownForTests} from '../../shutdown.js'
 import {executeAddProject} from './add-project.js'
 
 // ---------------------------------------------------------------------------
@@ -737,74 +738,299 @@ describe('executeAddProject', () => {
       }
     })
 
-    it('repo-exists + no binding found → "currently being added" message, no rm -rf', async () => {
-      // #given — clone fails with repo-exists; binding store returns null (clone in progress)
+    it('repo-exists + NO binding → RESUMES: proceeds to channel creation and binding write', async () => {
+      // #given — clone fails with repo-exists; bindings store returns null (no binding yet)
+      // This is the post-clone partial-failure recovery path.
       const userId = uniqueUserId()
       const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
-      // Both PRE_FLIGHT and repo-exists handler see no binding
+      // PRE_FLIGHT returns null; repo-exists handler also returns null (no binding written yet)
       const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
-      const {interaction, editReply} = makeInteraction({userId})
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const {channel, send} = makeTextChannel('owner-repo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild,
+        userId,
+      })
       const deps = makeDeps({
         workspaceClient: makeWorkspaceClient({clone}),
-        bindingsStore: makeBindingsStore({getBindingByRepo}),
+        bindingsStore: makeBindingsStore({getBindingByRepo, createBinding}),
       })
 
       // #when
       await run(interaction, deps)
 
-      // #then — "currently being added" safe message; NEVER instructs deletion
-      const reply = lastEditReplyContent(editReply)
-      expect(reply).toContain('currently being added')
+      // #then — channel was created (guild.channels.create was called)
+      const guildCreate = (guild.channels as unknown as {create: ReturnType<typeof vi.fn>}).create
+      expect(guildCreate).toHaveBeenCalled()
+      // #and — binding was written with the canonical workspace path
+      const bindingCall = (createBinding.mock.calls as [{workspacePath: string; owner: string; repo: string}][])[0]
+      expect(bindingCall?.[0]?.workspacePath).toBe('/workspace/repos/owner/repo')
+      expect(bindingCall?.[0]?.owner).toBe('owner')
+      expect(bindingCall?.[0]?.repo).toBe('repo')
+      // #and — READY reply reached
+      expect(lastEditReplyContent(editReply)).toContain('Ready')
+      // #and — welcome message sent
+      expect(send).toHaveBeenCalled()
+      // #and — clone was only called once (not re-run)
+      expect(clone).toHaveBeenCalledOnce()
+      // #and — no rm -rf in any reply
       for (const content of allEditReplies(editReply)) {
         expect(content).not.toContain('rm -rf')
       }
     })
 
-    it('repo-exists + binding store errors → falls back to "currently being added", no rm -rf', async () => {
-      // #given — clone fails with repo-exists; binding store returns error
+    it('repo-exists + binding store ERRORS (success=false) → internal-error reply, channel NOT created', async () => {
+      // #given — clone fails with repo-exists; second binding lookup returns an error result (store error)
+      // Store errors must NOT resume — resuming on a store outage risks orphan channels.
       const userId = uniqueUserId()
       const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
       const storeError = new Error('S3 timeout')
-      // PRE_FLIGHT call succeeds with null; second call (repo-exists handler) errors
+      // PRE_FLIGHT returns null (ok); repo-exists handler returns err (store failure Result)
       const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockResolvedValue(err(storeError))
-      const {interaction, editReply} = makeInteraction({userId})
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const {channel} = makeTextChannel('owner-repo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild,
+        userId,
+      })
       const deps = makeDeps({
         workspaceClient: makeWorkspaceClient({clone}),
-        bindingsStore: makeBindingsStore({getBindingByRepo}),
+        bindingsStore: makeBindingsStore({getBindingByRepo, createBinding}),
       })
 
       // #when
       await run(interaction, deps)
 
-      // #then — safe fallback; NEVER instructs deletion
-      const reply = lastEditReplyContent(editReply)
-      expect(reply).toContain('currently being added')
+      // #then — internal-error reply (not a resume)
+      expect(lastEditReplyContent(editReply)).toContain('Internal error checking existing bindings')
+      // #and — channel was NOT created (no resume on store error)
+      const guildCreate = (guild.channels as unknown as {create: ReturnType<typeof vi.fn>}).create
+      expect(guildCreate).not.toHaveBeenCalled()
+      // #and — createBinding was NOT called
+      expect(createBinding).not.toHaveBeenCalled()
+      // #and — no rm -rf in any reply
       for (const content of allEditReplies(editReply)) {
         expect(content).not.toContain('rm -rf')
       }
     })
 
-    it('repo-exists + getBindingByRepo REJECTS → falls back to "please wait", no rm -rf', async () => {
+    it('repo-exists + getBindingByRepo REJECTS → internal-error reply, channel NOT created', async () => {
       // #given — clone fails with repo-exists; getBindingByRepo throws (network-level rejection)
+      // A store rejection must NOT resume — we cannot confirm binding absence, so resuming risks orphan channels.
       const userId = uniqueUserId()
       const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
-      // PRE_FLIGHT call succeeds with null; second call rejects entirely
+      // PRE_FLIGHT returns null; repo-exists handler rejects entirely
       const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockRejectedValue(new Error('connection reset'))
-      const {interaction, editReply} = makeInteraction({userId})
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const {channel} = makeTextChannel('owner-repo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild,
+        userId,
+      })
       const deps = makeDeps({
         workspaceClient: makeWorkspaceClient({clone}),
-        bindingsStore: makeBindingsStore({getBindingByRepo}),
+        bindingsStore: makeBindingsStore({getBindingByRepo, createBinding}),
       })
 
       // #when — must resolve without throwing even though getBindingByRepo rejects
       await expect(run(interaction, deps)).resolves.toBeUndefined()
 
-      // #then — safe fallback sent; NEVER instructs deletion
-      const reply = lastEditReplyContent(editReply)
-      expect(reply).toContain('currently being added')
+      // #then — internal-error reply (not a resume)
+      expect(lastEditReplyContent(editReply)).toContain('Internal error checking existing bindings')
+      // #and — channel was NOT created (no resume on store rejection)
+      const guildCreate = (guild.channels as unknown as {create: ReturnType<typeof vi.fn>}).create
+      expect(guildCreate).not.toHaveBeenCalled()
+      // #and — createBinding was NOT called
+      expect(createBinding).not.toHaveBeenCalled()
+      // #and — no rm -rf in any reply
       for (const content of allEditReplies(editReply)) {
         expect(content).not.toContain('rm -rf')
       }
+    })
+
+    it('full retry-after-partial-failure: first invocation binding write fails, second invocation resumes successfully', async () => {
+      // #given — first invocation: clone succeeds, binding write fails
+      const userId1 = uniqueUserId()
+      const {channel: channel1, send: send1} = makeTextChannel('owner-repo')
+      const guild1 = makeGuild('bot-user-id', true, [], channel1)
+      const {interaction: interaction1, editReply: editReply1} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild: guild1,
+        userId: userId1,
+      })
+
+      const cloneFresh = vi
+        .fn()
+        .mockResolvedValue(ok({ok: true, path: '/workspace/repos/owner/repo', commit: 'abc123'}))
+      const bindingStoreError = new Error('S3 write failed')
+      const createBindingFail = vi.fn().mockResolvedValue(err(bindingStoreError))
+      const getBindingEmpty = vi.fn().mockResolvedValue(ok(null))
+
+      const deps1 = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone: cloneFresh}),
+        bindingsStore: makeBindingsStore({getBindingByRepo: getBindingEmpty, createBinding: createBindingFail}),
+      })
+
+      // #when — first invocation runs: clone succeeds but binding write fails
+      await run(interaction1, deps1)
+
+      // #then — first invocation fails with a binding error message
+      expect(lastEditReplyContent(editReply1)).toContain('Failed to write binding')
+
+      // #given — second invocation: workspace agent returns repo-exists (clone done), no binding in store
+      const userId2 = uniqueUserId()
+      const {channel: channel2, send: send2} = makeTextChannel('owner-repo')
+      const guild2 = makeGuild('bot-user-id', true, [], channel2)
+      const {interaction: interaction2, editReply: editReply2} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild: guild2,
+        userId: userId2,
+      })
+
+      const cloneRepoExists = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      const createBindingOk = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const getBindingStillEmpty = vi.fn().mockResolvedValue(ok(null))
+
+      const deps2 = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone: cloneRepoExists}),
+        bindingsStore: makeBindingsStore({getBindingByRepo: getBindingStillEmpty, createBinding: createBindingOk}),
+      })
+
+      // #when — second invocation runs: resumes from CREATING_CHANNEL
+      await run(interaction2, deps2)
+
+      // #then — second invocation reaches READY
+      expect(lastEditReplyContent(editReply2)).toContain('Ready')
+      // #and — binding was written with canonical path
+      const calls = (createBindingOk.mock.calls as [{workspacePath: string}][])[0]
+      expect(calls?.[0]?.workspacePath).toBe('/workspace/repos/owner/repo')
+      // #and — welcome message sent in second invocation
+      expect(send2).toHaveBeenCalled()
+      // #and — clone NOT re-run in second invocation (repo-exists path, not fresh clone)
+      expect(cloneRepoExists).toHaveBeenCalledOnce()
+      // send1 was never reached (binding failed in first invocation) — intentionally unused
+      expect(send1).not.toHaveBeenCalled()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Concurrent resume race coverage (FIX 2)
+  // -------------------------------------------------------------------------
+
+  describe('CLONING: concurrent resume — BINDING_EXISTS_ERROR loser path', () => {
+    it('second concurrent resume hits BINDING_EXISTS_ERROR → bounded error reply, no throw, no re-clone', async () => {
+      // #given — both invocations see repo-exists + no binding (clone done, no binding yet)
+      // First createBinding succeeds; second gets BINDING_EXISTS_ERROR (atomic IfNoneMatch write)
+      const userId1 = uniqueUserId()
+      const userId2 = uniqueUserId()
+
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
+
+      const bindingExistsError = Object.assign(new Error('binding already exists'), {code: 'BINDING_EXISTS_ERROR'})
+      let createBindingCallCount = 0
+      const createBinding = vi.fn().mockImplementation(async () => {
+        createBindingCallCount++
+        if (createBindingCallCount === 1) return ok({primaryEtag: 'e1', indexEtag: 'e2'})
+        return err(bindingExistsError)
+      })
+
+      const {channel: channel1} = makeTextChannel('owner-repo')
+      const guild1 = makeGuild('bot-user-id', true, [], channel1)
+      const {interaction: interaction1, editReply: editReply1} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild: guild1,
+        userId: userId1,
+      })
+
+      const {channel: channel2} = makeTextChannel('owner-repo')
+      const guild2 = makeGuild('bot-user-id', true, [], channel2)
+      const {interaction: interaction2, editReply: editReply2} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        guild: guild2,
+        userId: userId2,
+      })
+
+      const deps1 = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo, createBinding}),
+      })
+      const deps2 = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo, createBinding}),
+      })
+
+      // #when — first invocation wins the binding race
+      await expect(run(interaction1, deps1)).resolves.toBeUndefined()
+
+      // #when — second invocation loses: createBinding returns BINDING_EXISTS_ERROR
+      await expect(run(interaction2, deps2)).resolves.toBeUndefined()
+
+      // #then — winner reaches READY
+      expect(lastEditReplyContent(editReply1)).toContain('Ready')
+
+      // #then — loser gets the concurrent-bound message (not a throw, not a re-clone)
+      const loserReply = lastEditReplyContent(editReply2)
+      expect(loserReply).toContain('bound by a concurrent request')
+      expect(loserReply).toContain('manual cleanup may be needed')
+
+      // #and — clone was called twice (two independent resume invocations), not re-run internally
+      expect(clone).toHaveBeenCalledTimes(2)
+
+      // #and — createBinding was called twice (both invocations attempted the write)
+      expect(createBinding).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  describe('shutdown gate (Part 2)', () => {
+    afterEach(() => {
+      __resetShuttingDownForTests()
+    })
+
+    it('isShuttingDown returns true → replies "fro-bot is restarting" and does NOT call clone', async () => {
+      // #given — bot is draining shutdown
+      const userId = uniqueUserId()
+      const clone = vi.fn()
+      const {interaction, editReply} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        userId,
+      })
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        isShuttingDown: () => true,
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — user gets restart message
+      expect(lastEditReplyContent(editReply)).toContain('fro-bot is restarting')
+      // #and — clone was never called (no new work started)
+      expect(clone).not.toHaveBeenCalled()
+    })
+
+    it('isShuttingDown absent (default) → proceeds normally', async () => {
+      // #given — no isShuttingDown dep injected (optional field left absent)
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(ok({ok: true, path: '/workspace/repos/owner/repo', commit: 'abc123'}))
+      const {interaction} = makeInteraction({
+        url: 'https://github.com/owner/repo',
+        userId,
+      })
+      // makeDeps without isShuttingDown — the dep is optional; absence defaults to () => false
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — clone was called (command proceeded normally)
+      expect(clone).toHaveBeenCalled()
     })
   })
 

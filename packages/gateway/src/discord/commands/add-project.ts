@@ -19,6 +19,7 @@ import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
 
 import {AppNotInstalledError} from '../../github/app-client.js'
+import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,12 @@ export interface AddProjectDeps {
     readonly warn: (msg: string, meta?: Record<string, unknown>) => void
     readonly error: (msg: string, meta?: Record<string, unknown>) => void
   }
+  /**
+   * Optional. Defaults to `() => false` when absent so callers that don't inject it
+   * are unaffected. When present, returning `true` causes the command to bail early
+   * with a user-friendly restart message instead of starting work that will be hard-killed.
+   */
+  readonly isShuttingDown?: () => boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +224,16 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // Defer reply (ephemeral — setup thread is operationally sensitive)
   await interaction.deferReply({ephemeral: true})
 
+  // Shutdown gate — placed after deferReply so Discord gets its mandatory ack (<3s).
+  // Refuse new work during draining shutdown; resume (Part 1) heals any hard-killed run.
+  const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
+  if (shuttingDownCheck() === true) {
+    await interaction.editReply({
+      content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.',
+    })
+    return
+  }
+
   const guild = interaction.guild
   if (guild === null) {
     await interaction.editReply({content: 'This command can only be used in a server.'})
@@ -339,6 +356,12 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   }
 
   const cloneResult = await workspaceClient.clone({owner, repo, token})
+  // Intentionally uninitialized: TypeScript's definite-assignment analysis enforces that
+  // every path below either assigns workspacePath (fresh clone success, or repo-exists resume)
+  // or returns. A sentinel default would defeat that compile-time guard — if a future edit
+  // drops a return in an error branch, tsc errors here instead of passing an empty path to
+  // channel creation. Do not initialize.
+  let workspacePath: string
   if (cloneResult.success === false) {
     const errorKind = cloneResult.error.kind
     logger.warn('add-project: clone failed', {correlationId, phase, owner, repo, errorKind, outcome: 'error'})
@@ -350,59 +373,69 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           content:
             'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
         })
+        return
       } else if (code === 'repo-exists') {
-        // Never emit deletion instructions. Re-read bindings to distinguish:
-        // (a) repo genuinely bound → redirect to the bound channel
-        // (b) clone in progress by another user → safe "please wait" message
-        // Either way, no rm -rf instruction: user B must not destroy user A's in-flight clone.
-        let repoExistsBinding: Awaited<ReturnType<typeof bindingsStore.getBindingByRepo>>
+        // repo-exists means the workspace-agent completed the clone atomically (temp dir renamed
+        // to destPath). Decide: redirect (already bound), resume (clone exists, no binding), or
+        // error (store unavailable — do NOT resume; orphan risk).
+        //
+        // Never emit deletion instructions — we must never instruct the user to rm -rf.
+        let existing: Awaited<ReturnType<typeof bindingsStore.getBindingByRepo>>
         try {
-          repoExistsBinding = await bindingsStore.getBindingByRepo(owner, repo)
+          existing = await bindingsStore.getBindingByRepo(owner, repo)
         } catch {
-          // Network-level rejection: fall back to the safe "please wait" message.
+          await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+          return
+        }
+        if (existing.success === false) {
+          await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+          return
+        }
+        if (existing.data !== null) {
+          // Genuinely already bound — redirect to the bound channel. Nothing to resume.
           await interaction.editReply({
-            content: `\`${owner}/${repo}\` is currently being added by another setup. Please wait a moment and try again.`,
+            content: `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
           })
           return
         }
-        if (repoExistsBinding.success === true && repoExistsBinding.data !== null) {
-          await interaction.editReply({
-            content: `\`${owner}/${repo}\` is already set up in <#${repoExistsBinding.data.channelId}>.`,
-          })
-        } else {
-          // Either binding lookup failed or no binding found — clone is in progress.
-          await interaction.editReply({
-            content: `\`${owner}/${repo}\` is currently being added by another setup. Please wait a moment and try again.`,
-          })
-        }
+        // Clone exists but no binding — a prior run failed after CLONING. Resume from CREATING_CHANNEL.
+        // Concurrency: a racing invocation also resuming will have its createBinding rejected with
+        // BINDING_EXISTS_ERROR (atomic IfNoneMatch write), handled below (~line ~500). The losing run
+        // may leave an orphan channel — accepted v1 fallout (see docs/solutions orchestration-patterns).
+        workspacePath = workspaceRepoPath(owner, repo)
+        logger.info('add-project phase', {phase: 'CLONING', outcome: 'resumed', owner, repo, correlationId})
+        // fall through — do NOT return
       } else {
         await interaction.editReply({
           content: `Clone failed (${code}). Check workspace-agent logs for details.`,
         })
+        return
       }
     } else if (errorKind === 'timeout') {
       await interaction.editReply({content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'})
+      return
     } else if (errorKind === 'response-mismatch') {
       logger.error('add-project: response-mismatch from workspace agent', {correlationId, phase, owner, repo})
       await interaction.editReply({
         content: 'Internal error: workspace agent returned unexpected response. Contact operator.',
       })
+      return
     } else {
       await interaction.editReply({content: `Clone failed (${errorKind}). Check workspace-agent connectivity.`})
+      return
     }
-    return
+  } else {
+    workspacePath = cloneResult.data.path
+    logger.info('add-project phase', {
+      correlationId,
+      phase,
+      owner,
+      repo,
+      workspacePath,
+      outcome: 'success',
+      durationMs: Date.now() - startTime,
+    })
   }
-
-  const workspacePath = cloneResult.data.path
-  logger.info('add-project phase', {
-    correlationId,
-    phase,
-    owner,
-    repo,
-    workspacePath,
-    outcome: 'success',
-    durationMs: Date.now() - startTime,
-  })
 
   // ---------------------------------------------------------------------------
   // CREATING_CHANNEL

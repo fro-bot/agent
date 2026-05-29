@@ -128,21 +128,41 @@ for (const line of spy.lines) {
 }
 ```
 
-### 4. Multi-phase orchestration with documented partial-failure recovery
+### 4. Multi-phase orchestration with idempotent self-healing recovery
 
-The flow is a five-phase state machine: `PRE_FLIGHT → CLONING → CREATING_CHANNEL → WRITING_BINDING → READY`. For v1, the orchestration is intentionally **in-memory only** — a process crash mid-flow leaves orphaned state. Rather than building durable resume infrastructure prematurely, the accepted v1 contract is **documented manual recovery per partial-failure shape**, plus:
+The flow is a five-phase state machine: `PRE_FLIGHT → CLONING → CREATING_CHANNEL → WRITING_BINDING → READY`. The primary recovery path for the clone-exists/no-binding partial-failure shape is **re-running the command** — `/add-project` is idempotent for this case:
 
+- **Atomic clone guarantee**: the workspace-agent renames the temp dir to the final dest atomically. `repo-exists` from a clone call means the clone is fully complete — not partial.
+- **Resume keyed on confirmed absent binding**: when `repo-exists` is returned, the handler re-reads the bindings store. It only resumes (falls through to `CREATING_CHANNEL`) when the store confirms `data === null`. A store error (thrown or `success === false`) returns an internal-error reply and does **not** resume — resuming on an unreadable store would risk orphan channels if the binding write also fails.
 - **A defensive permission re-check at the side-effect boundary** (`CREATING_CHANNEL`) — permissions can change between `PRE_FLIGHT` and the first mutation.
-- **Preserve expensive prior work** — a failure after `CLONING` keeps the clone on disk; the recovery message names the path so the operator can retry or clean up.
+- **Preserve expensive prior work** — a failure after `CLONING` keeps the clone on disk; retrying the command will detect `repo-exists`, confirm no binding, and resume from `CREATING_CHANNEL`.
+
+Accepted v1 fallout and boundaries:
+
+- **Orphan channel on concurrent resume**: if two invocations both resume simultaneously, both create a channel, then both race to write the binding. The loser's `createBinding` is rejected with `BINDING_EXISTS_ERROR` (atomic IfNoneMatch write). The loser gets a "bound by a concurrent request / manual cleanup may be needed" reply. The orphan channel is a bounded, operator-visible artifact — not a silent data integrity issue.
+- **Shutdown gating**: new invocations are refused during drain (after `deferReply` so Discord gets its mandatory ack). In-flight runs that are hard-cut during a process restart are healed by the next retry via the resume path.
 
 ```ts
-// Defensive re-check before the first side effect:
-if (botHasRequiredPermissions(interaction.appPermissions) === false) {
-  await interaction.editReply({
-    content: `fro-bot lost **Manage Channels**. Clone preserved at \`${workspacePath}\`. Re-grant and retry.`,
-  })
+// Resume only on CONFIRMED absent binding — store errors do NOT resume:
+let existing: Awaited<ReturnType<typeof bindingsStore.getBindingByRepo>>
+try {
+  existing = await bindingsStore.getBindingByRepo(owner, repo)
+} catch {
+  await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
   return
 }
+if (existing.success === false) {
+  await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+  return
+}
+if (existing.data !== null) {
+  // Already bound — redirect.
+  await interaction.editReply({content: `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`})
+  return
+}
+// Confirmed absent binding — resume from CREATING_CHANNEL.
+workspacePath = workspaceRepoPath(owner, repo)
+// fall through — do NOT return
 
 // Partial-write recovery names both keys for manual cleanup:
 if (error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
