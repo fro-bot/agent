@@ -90,6 +90,8 @@ await Effect.runPromise(dispatchCommand(mockInteraction, registry))
 expect(mockDeps.workspaceClient.clone).toHaveBeenCalled()
 ```
 
+`getCommandRegistry` and `dispatchCommand` live in `packages/gateway/src/discord/commands/index.ts`; the factory and bootstrap wiring are in `commands/fro-bot.ts` and `program.ts` respectively.
+
 ### 3. Installation access token (IAT) handling across an HTTP boundary
 
 The IAT (`ghs_*`, ~1hr lifetime) flows from GitHub App auth into an HTTP request body to the workspace service. Three rules emerged:
@@ -108,11 +110,16 @@ const response = await fetch(`${baseUrl}/clone`, {
   signal: AbortSignal.timeout(timeoutMs),
 })
 
-const expectedSuffix = `/${owner.toLowerCase()}/${repo.toLowerCase()}`
-if (parsed.path.toLowerCase().endsWith(expectedSuffix) === false) {
+// Compare the full path, not just the suffix. owner/repo are already
+// lowercased upstream, so the expected path is canonical; do not lowercase
+// the response path or a case-variant root could slip through.
+const expectedPath = `${EXPECTED_WORKSPACE_ROOT}/${owner}/${repo}`
+if (parsed.path !== expectedPath) {
   return err({kind: 'response-mismatch'})
 }
 ```
+
+A suffix-only check is the weaker form to avoid — `parsed.path.endsWith('/owner/repo')` accepts adversarial prefixes like `/etc/passwd/owner/repo`, letting a misbehaving agent bind a repo to an arbitrary filesystem location. Validate against the full expected path rooted at the known workspace root.
 
 ```ts
 // Captured-logger security test — iterate ALL error paths:
@@ -120,8 +127,6 @@ for (const line of spy.lines) {
   expect(line).not.toContain('ghs_')
 }
 ```
-
-> Note: a stronger variant checks the **absolute** path prefix (`/workspace/repos/...`), not just the `owner/repo` suffix — a suffix-only check still accepts `/etc/passwd/owner/repo`. Tracked as a follow-up hardening item.
 
 ### 4. Multi-phase orchestration with documented partial-failure recovery
 
@@ -149,7 +154,7 @@ if (error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
 
 ### 5. Re-read live caches inside find-or-create collision loops
 
-Snapshotting `guild.channels.cache` once and iterating suffix candidates (`name`, `name-2`, …) against the frozen snapshot is a race. Two concurrent invocations see the same snapshot, both attempt to create the same name, and the loser's Discord 50035 (duplicate name) rejection gets silently swallowed as a "transient error" — the binding ends up pointing to the wrong suffixed channel with no operator-visible warning.
+Snapshotting `guild.channels.cache` once and iterating suffix candidates (`name`, `name-2`, …) against the frozen snapshot is a race. discord.js runs in a single Node process, so this is not OS-level concurrency — it's inter-await interleaving: between two `await` calls in the same event loop, the cache can be mutated by an incoming `channelCreate` gateway event or by another in-flight interaction. Two in-flight interactions interleaved across awaits can see the same snapshot, both attempt to create the same name, and the loser's Discord 50035 (duplicate name) rejection gets silently swallowed as a "transient error" — the binding ends up pointing to the wrong suffixed channel with no operator-visible warning.
 
 ```ts
 for (const candidate of candidates) {
