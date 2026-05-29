@@ -24,9 +24,20 @@ export interface WorkspaceClient {
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
 
-// Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts.
-// Intentionally NOT imported from there: separate package/container boundary.
+// Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
+// package/container boundary, so not imported). Module-private: callers use
+// workspaceRepoPath() rather than composing the root themselves.
 const EXPECTED_WORKSPACE_ROOT = '/workspace/repos'
+
+/**
+ * Returns the canonical workspace path for a given owner/repo pair.
+ * Single source of truth shared by the client validator and add-project resume logic.
+ *
+ * owner and repo MUST already be lowercased (canonical form) before calling this.
+ */
+export function workspaceRepoPath(owner: string, repo: string): string {
+  return `${EXPECTED_WORKSPACE_ROOT}/${owner}/${repo}`
+}
 
 /**
  * Create a workspace-agent HTTP client.
@@ -94,7 +105,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     // The prior suffix-only check accepted adversarial paths like /etc/passwd/owner/repo.
     // owner/repo arrive already lowercased from add-project.ts; lowercasing the response
     // path would let a case-variant root bypass validation.
-    const expectedPath = `${EXPECTED_WORKSPACE_ROOT}/${owner}/${repo}`
+    const expectedPath = workspaceRepoPath(owner, repo)
     if (parsed.path !== expectedPath) {
       return err({kind: 'response-mismatch'})
     }

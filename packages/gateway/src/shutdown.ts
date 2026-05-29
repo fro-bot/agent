@@ -33,6 +33,17 @@ export function __resetShuttingDownForTests(): void {
 }
 
 /**
+ * Returns true if a shutdown signal has been received and the gateway is draining.
+ * Intended for command handlers to check before starting long-running work.
+ *
+ * This is a pure getter — production code may call it; only `__resetShuttingDownForTests`
+ * is test-only.
+ */
+export function isShuttingDown(): boolean {
+  return shuttingDown
+}
+
+/**
  * Install SIGTERM and SIGINT handlers that gracefully drain the Discord client.
  *
  * On signal:
