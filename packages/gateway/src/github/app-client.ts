@@ -159,7 +159,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
           const response = await discoveryOctokit.request('GET /repos/{owner}/{repo}/installation', {owner, repo})
           installationData = {
             id: response.data.id,
-            permissions: (response.data.permissions ?? {}) as Record<string, string>,
+            permissions: response.data.permissions ?? {},
           }
         } catch (discoveryError) {
           if (isNotFoundError(discoveryError)) {

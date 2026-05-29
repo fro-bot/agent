@@ -1,8 +1,10 @@
 import type {ChatInputCommandInteraction, SlashCommandBuilder} from 'discord.js'
+import type {AddProjectDeps} from './add-project.js'
+
 import {REST, Routes} from 'discord.js'
 import {Effect} from 'effect'
 
-import pingCommand from './ping.js'
+import {createFroBotCommand} from './fro-bot.js'
 
 export interface SlashCommand {
   readonly data: SlashCommandBuilder
@@ -11,9 +13,11 @@ export interface SlashCommand {
 
 /**
  * Returns the full registry of registered slash commands.
+ *
+ * @param deps - Runtime dependencies injected into command handlers.
  */
-export function getCommandRegistry(): SlashCommand[] {
-  return [pingCommand]
+export function getCommandRegistry(deps: AddProjectDeps): SlashCommand[] {
+  return [createFroBotCommand(deps)]
 }
 
 /**

@@ -101,6 +101,7 @@ describe('makeGatewayProgram', () => {
       githubAppId: 'test-app-id',
       githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
       gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
+      workspaceAgentUrl: 'http://workspace:9100',
     }
 
     // Minimal fake client — just needs to satisfy the Client shape enough for

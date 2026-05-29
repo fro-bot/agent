@@ -1,9 +1,39 @@
 import type {ChatInputCommandInteraction} from 'discord.js'
+import type {AddProjectDeps} from './add-project.js'
+
 import {Routes} from 'discord.js'
 import {Effect} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {dispatchCommand, getCommandRegistry, registerSlashCommands, type SlashCommand} from './index.js'
+
+// ---------------------------------------------------------------------------
+// Minimal mock deps for getCommandRegistry
+// ---------------------------------------------------------------------------
+
+function makeMockDeps(): AddProjectDeps {
+  return {
+    bindingsStore: {
+      createBinding: vi.fn(),
+      getBindingByRepo: vi.fn(),
+      getBindingByChannelId: vi.fn(),
+      listBindings: vi.fn(),
+    },
+    appClient: {
+      authForRepo: vi.fn(),
+      invalidateCache: vi.fn(),
+    },
+    workspaceClient: {
+      clone: vi.fn(),
+    },
+    installUrl: 'https://github.com/apps/fro-bot/installations/new',
+    logger: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+  }
+}
 
 const restPutMock = vi.fn().mockResolvedValue(undefined)
 const restSetTokenMock = vi.fn().mockReturnThis()
@@ -38,13 +68,13 @@ beforeEach(() => {
 })
 
 describe('getCommandRegistry', () => {
-  it('includes the ping command', () => {
+  it('includes the fro-bot command', () => {
     // #given / #when
-    const registry = getCommandRegistry()
+    const registry = getCommandRegistry(makeMockDeps())
 
     // #then
-    const ping = registry.find(c => c.data.name === 'fro-bot')
-    expect(ping).toBeDefined()
+    const cmd = registry.find(c => c.data.name === 'fro-bot')
+    expect(cmd).toBeDefined()
   })
 })
 
@@ -70,7 +100,7 @@ describe('dispatchCommand', () => {
   it('returns Effect.fail on unknown command name with clear error message AND replies ephemerally', async () => {
     // #given a registry that does not contain the requested command
     const reply = vi.fn().mockResolvedValue(undefined)
-    const registry = getCommandRegistry()
+    const registry = getCommandRegistry(makeMockDeps())
     const interaction = {commandName: 'nonexistent', reply} as unknown as ChatInputCommandInteraction
 
     // #when
@@ -89,7 +119,7 @@ describe('dispatchCommand', () => {
   it('still fails with the original error when the ephemeral ack itself fails', async () => {
     // #given a reply() that rejects (e.g. interaction token already expired)
     const reply = vi.fn().mockRejectedValue(new Error('Interaction has already been acknowledged'))
-    const registry = getCommandRegistry()
+    const registry = getCommandRegistry(makeMockDeps())
     const interaction = {commandName: 'nonexistent', reply} as unknown as ChatInputCommandInteraction
 
     // #when
@@ -108,8 +138,9 @@ describe('dispatchCommand', () => {
     const interaction = {
       commandName: 'fro-bot',
       reply,
+      options: {getSubcommand: vi.fn().mockReturnValue('ping')},
     } as unknown as ChatInputCommandInteraction
-    const registry = getCommandRegistry()
+    const registry = getCommandRegistry(makeMockDeps())
 
     // #when
     await Effect.runPromise(dispatchCommand(interaction, registry))
@@ -123,7 +154,7 @@ describe('dispatchCommand', () => {
     const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     try {
       const reply = vi.fn().mockRejectedValue(new Error('Token expired'))
-      const registry = getCommandRegistry()
+      const registry = getCommandRegistry(makeMockDeps())
       const interaction = {commandName: 'nonexistent', reply} as unknown as ChatInputCommandInteraction
 
       // #when
@@ -143,6 +174,41 @@ describe('dispatchCommand', () => {
     } finally {
       consoleSpy.mockRestore()
     }
+  })
+
+  it('dispatches /fro-bot add-project to executeAddProject with injected deps', async () => {
+    // #given — registry built with mock deps; add-project will fail at rate-limit check
+    // because the interaction mock has no guild, but we just need to verify routing.
+    const deps = makeMockDeps()
+    const registry = getCommandRegistry(deps)
+
+    const deferReply = vi.fn().mockResolvedValue(undefined)
+    const editReply = vi.fn().mockResolvedValue(undefined)
+    const reply = vi.fn().mockResolvedValue(undefined)
+
+    const interaction = {
+      commandName: 'fro-bot',
+      id: 'test-interaction-id',
+      user: {id: 'user-dispatch-test'},
+      guild: null,
+      client: {user: {id: 'bot-user-id'}},
+      options: {
+        getSubcommand: vi.fn().mockReturnValue('add-project'),
+        getString: vi.fn().mockReturnValue('https://github.com/owner/repo'),
+      },
+      deferReply,
+      editReply,
+      reply,
+    } as unknown as ChatInputCommandInteraction
+
+    // #when — dispatch routes to add-project; it will fail at guild check (guild is null)
+    await Effect.runPromise(dispatchCommand(interaction, registry))
+
+    // #then — deferReply was called (PRE_FLIGHT started) and editReply was called with guild error
+    expect(deferReply).toHaveBeenCalledWith({ephemeral: true})
+    expect(editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: expect.stringContaining('server') as unknown as string}),
+    )
   })
 })
 
