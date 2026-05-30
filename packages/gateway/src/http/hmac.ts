@@ -73,7 +73,7 @@ export function checkTimestamp(
   const parsedMs = Date.parse(timestampHeader)
 
   // Date.parse returns NaN for unparseable strings
-  if (!Number.isFinite(parsedMs)) {
+  if (Number.isFinite(parsedMs) === false) {
     return {ok: false, reason: 'timestamp_expired'}
   }
 
