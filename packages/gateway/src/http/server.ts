@@ -21,6 +21,7 @@ import {Buffer} from 'node:buffer'
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
+import {bodyLimit} from 'hono/body-limit'
 import {ANNOUNCE_MAX_BODY_BYTES, handleAnnounce} from './announce-handler.js'
 import {createRateLimiter} from './rate-limit.js'
 import {createReplayCache} from './replay-cache.js'
@@ -68,53 +69,65 @@ export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceS
 
   const app = new Hono()
 
-  app.post('/v1/announce', async c => {
-    // Drain gate — refuse new requests during graceful shutdown
-    if (checkShuttingDown() === true) {
-      deps.logger.warn({reason: 'draining'}, 'announce rejected (shutting down)')
-      return c.json({error: 'unavailable'}, 503)
-    }
-
-    // Content-length pre-check (fast path — avoids reading the body if obviously too large)
-    const contentLengthHeader = c.req.header('content-length')
-    if (contentLengthHeader !== undefined && contentLengthHeader !== null) {
-      const contentLength = Number.parseInt(contentLengthHeader, 10)
-      if (Number.isNaN(contentLength) === false && contentLength > ANNOUNCE_MAX_BODY_BYTES) {
-        deps.logger.warn({reason: 'too_large'}, 'announce rejected (content-length precheck)')
-        return c.json({error: 'payload too large'}, 413)
+  // bodyLimit middleware enforces the size limit DURING streaming, before the handler allocates
+  // memory for the full body. This closes the pre-auth memory DoS: an unauthenticated caller
+  // cannot bypass the check via chunked transfer encoding or an omitted/understated Content-Length.
+  // The content-length fast-path below and the handler's byteLength guard remain for defense-in-depth.
+  // After bodyLimit runs, c.req.arrayBuffer() returns the already-buffered bytes (Hono caches once).
+  app.post(
+    '/v1/announce',
+    bodyLimit({
+      maxSize: ANNOUNCE_MAX_BODY_BYTES,
+      onError: c => c.json({error: 'payload too large'}, 413),
+    }),
+    async c => {
+      // Drain gate — refuse new requests during graceful shutdown
+      if (checkShuttingDown() === true) {
+        deps.logger.warn({reason: 'draining'}, 'announce rejected (shutting down)')
+        return c.json({error: 'unavailable'}, 503)
       }
-    }
 
-    // Read exact bytes for HMAC — do NOT use c.req.json()
-    const arrayBuffer = await c.req.arrayBuffer()
-    const rawBody = Buffer.from(arrayBuffer)
+      // Content-length pre-check (fast path — avoids reading the body if obviously too large)
+      const contentLengthHeader = c.req.header('content-length')
+      if (contentLengthHeader !== undefined && contentLengthHeader !== null) {
+        const contentLength = Number.parseInt(contentLengthHeader, 10)
+        if (Number.isNaN(contentLength) === false && contentLength > ANNOUNCE_MAX_BODY_BYTES) {
+          deps.logger.warn({reason: 'too_large'}, 'announce rejected (content-length precheck)')
+          return c.json({error: 'payload too large'}, 413)
+        }
+      }
 
-    // Derive rate-limit key from the actual TCP socket remote address.
-    // X-Forwarded-For is intentionally NOT used — it is caller-spoofable.
-    // Behind the ingress this keys on the proxy's connection, which is the
-    // correct trust boundary for v1.
-    const connInfo = getConnInfo(c)
-    const sourceKey = connInfo.remote.address ?? undefined
+      // Read exact bytes for HMAC — do NOT use c.req.json()
+      const arrayBuffer = await c.req.arrayBuffer()
+      const rawBody = Buffer.from(arrayBuffer)
 
-    const result: AnnounceHandlerResult = await handleAnnounce(
-      rawBody,
-      {
-        get: (name: string) => c.req.header(name) ?? null,
-      },
-      sourceKey,
-      {
-        client: deps.client,
-        logger: deps.logger,
-        webhookSecret: config.webhookSecret,
-        presenceChannelId: config.presenceChannelId,
-        rateLimiter,
-        replayCache,
-        clock: deps.clock,
-      },
-    )
+      // Derive rate-limit key from the actual TCP socket remote address.
+      // X-Forwarded-For is intentionally NOT used — it is caller-spoofable.
+      // Behind the ingress this keys on the proxy's connection, which is the
+      // correct trust boundary for v1.
+      const connInfo = getConnInfo(c)
+      const sourceKey = connInfo.remote.address ?? undefined
 
-    return c.json(result.body, result.status)
-  })
+      const result: AnnounceHandlerResult = await handleAnnounce(
+        rawBody,
+        {
+          get: (name: string) => c.req.header(name) ?? null,
+        },
+        sourceKey,
+        {
+          client: deps.client,
+          logger: deps.logger,
+          webhookSecret: config.webhookSecret,
+          presenceChannelId: config.presenceChannelId,
+          rateLimiter,
+          replayCache,
+          clock: deps.clock,
+        },
+      )
+
+      return c.json(result.body, result.status)
+    },
+  )
 
   app.notFound(c => c.json({error: 'not-found'}, 404))
 

@@ -143,5 +143,49 @@ describe('renderEmbed', () => {
       expect(embed.description).toBe('Bespoke survey summary')
       expect(embed.description).not.toContain('7')
     })
+
+    it('falls through to templated description when rendered_text is empty string', () => {
+      // #given — schema accepts empty string; renderer must not use it verbatim (Discord rejects empty embed descriptions)
+      const payload: AnnouncePayload = {
+        ...BASE,
+        event_type: 'survey_completed',
+        rendered_text: '',
+        context: {owner: 'org', repo: 'repo', slug: 'slug', wiki_pages_changed: 2},
+      }
+      // #when
+      const embed = renderEmbed(payload)
+      // #then — template description used, not the empty string
+      expect(embed.description.length).toBeGreaterThan(0)
+      expect(embed.description).toContain('org/repo')
+    })
+
+    it('falls through to templated description when rendered_text is whitespace-only', () => {
+      // #given
+      const payload: AnnouncePayload = {
+        ...BASE,
+        event_type: 'invitation_accepted',
+        rendered_text: '   ',
+        context: {count: 1, repos: [{owner: 'acme', name: 'proj'}]},
+      }
+      // #when
+      const embed = renderEmbed(payload)
+      // #then — template description used, not the whitespace string
+      expect(embed.description.trim().length).toBeGreaterThan(0)
+      expect(embed.description).toContain('acme/proj')
+    })
+
+    it('non-empty rendered_text is still used verbatim (regression guard)', () => {
+      // #given
+      const payload: AnnouncePayload = {
+        ...BASE,
+        event_type: 'survey_completed',
+        rendered_text: 'real text',
+        context: {owner: 'org', repo: 'repo', slug: 'slug', wiki_pages_changed: 99},
+      }
+      // #when
+      const embed = renderEmbed(payload)
+      // #then
+      expect(embed.description).toBe('real text')
+    })
   })
 })

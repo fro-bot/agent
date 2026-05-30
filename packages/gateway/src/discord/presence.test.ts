@@ -195,4 +195,44 @@ describe('postPresenceEmbed', () => {
       expect(callArg.allowedMentions).toEqual({parse: []})
     })
   })
+
+  describe('timeout', () => {
+    it('returns send-failed with "discord post timed out" when fetch never resolves', async () => {
+      // #given — a fetch that never resolves (simulates hung Discord API)
+      const neverResolving = new Promise<never>(() => {
+        /* intentionally never resolves */
+      })
+      const client = {
+        channels: {
+          fetch: vi.fn().mockReturnValue(neverResolving),
+        },
+      } as unknown as Client
+
+      // #when — use a tiny timeoutMs so the test is fast
+      const result = await postPresenceEmbed(client, CHANNEL_ID, EMBED, 10)
+
+      // #then — returns err with send-failed, does not hang
+      expect(result.success).toBe(false)
+      const error = expectErr(result)
+      expect(error.kind).toBe('send-failed')
+      if (error.kind !== 'send-failed') throw new Error('unreachable')
+      expect(error.message).toBe('discord post timed out')
+    })
+
+    it('happy path still resolves ok when Discord responds before timeout', async () => {
+      // #given — a fast-resolving text channel
+      const {channel, send} = makeTextChannel()
+      const client = makeClient(channel)
+
+      // #when — generous timeout, Discord resolves instantly
+      const result = await postPresenceEmbed(client, CHANNEL_ID, EMBED, 5_000)
+
+      // #then — success, send called exactly once
+      expect(result.success).toBe(true)
+      expect(send).toHaveBeenCalledExactlyOnceWith({
+        embeds: [EMBED],
+        allowedMentions: {parse: []},
+      })
+    })
+  })
 })

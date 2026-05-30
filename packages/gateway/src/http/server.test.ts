@@ -409,6 +409,48 @@ describe('POST /v1/announce — oversized body → 413', () => {
     }
   })
 
+  it('returns 413 for oversized body WITHOUT a truthful Content-Length (streaming-bypass coverage)', async () => {
+    // bodyLimit middleware enforces the limit during streaming, so a caller that omits Content-Length
+    // or uses chunked transfer encoding cannot bypass the check. This test simulates that case by
+    // sending the raw bytes via fetch without a content-length override — fetch omits it for Buffers
+    // when we do not set it manually, or uses transfer-encoding:chunked. Either way bodyLimit fires
+    // before the handler is reached, so the HMAC and Discord post are never attempted.
+    const port = await findFreePort()
+    const {client, sendMock} = makeDiscordClient(true)
+    const logger = makeLogger()
+
+    const server = createAnnounceServer(
+      {client, logger, clock: () => NOW_MS},
+      {webhookSecret: SECRET, presenceChannelId: CHANNEL_ID, httpPort: port},
+    )
+
+    // #given — body larger than limit, NO content-length header (simulates chunked / omitted CL)
+    const rawBody = Buffer.alloc(8193, 0x41)
+    const sig = makeSignature(rawBody, TIMESTAMP)
+
+    try {
+      // #when — send without content-length so the content-length precheck cannot fire
+      const res = await fetch(`http://127.0.0.1:${port}/v1/announce`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          // no content-length — forces bodyLimit middleware to be the enforcer
+          'x-gateway-signature': sig,
+          'x-gateway-timestamp': TIMESTAMP,
+        },
+        body: rawBody,
+      })
+      const body = await res.json()
+
+      // #then — 413 from bodyLimit middleware; Discord was never called
+      expect(res.status).toBe(413)
+      expect(body).toEqual({error: 'payload too large'})
+      expect(sendMock).not.toHaveBeenCalled()
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+
   it('returns 413 when actual body exceeds 8 KB', async () => {
     // #given — actually send > 8 KB
     const rawBody = Buffer.alloc(8193, 0x41)

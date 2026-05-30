@@ -63,8 +63,11 @@ const EMBED_DESCRIPTION_MAX_CHARS = 4096
 /**
  * Render an AnnouncePayload into a PresenceEmbed.
  *
- * If `payload.rendered_text` is non-null, it is used verbatim as the embed
- * description (forward-compat: v1 emits null; callers may supply overrides).
+ * If `payload.rendered_text` is non-null AND non-empty after trimming, it is
+ * used verbatim as the embed description (forward-compat: v1 emits null;
+ * callers may supply overrides). Empty or whitespace-only rendered_text falls
+ * through to the per-event template so Discord never receives an empty embed
+ * description (which it rejects, causing a 500 cascade).
  * The accent color is always set by event_type regardless of rendered_text.
  *
  * Description is truncated to EMBED_DESCRIPTION_MAX_CHARS (4096) with a '…'
@@ -74,7 +77,7 @@ export function renderEmbed(payload: AnnouncePayload): PresenceEmbed {
   const color = ACCENT[payload.event_type]
 
   let description: string
-  if (payload.rendered_text !== null) {
+  if (payload.rendered_text !== null && payload.rendered_text.trim().length > 0) {
     description = payload.rendered_text
   } else if (payload.event_type === 'invitation_accepted') {
     description = renderInvitationAccepted(payload.context)
