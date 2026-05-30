@@ -152,12 +152,18 @@ importers:
       '@fro-bot/runtime':
         specifier: workspace:*
         version: link:../runtime
+      '@hono/node-server':
+        specifier: 1.19.14
+        version: 1.19.14(hono@4.12.23)
       discord.js:
         specifier: 14.26.4
         version: 14.26.4
       effect:
         specifier: 3.21.2
         version: 3.21.2
+      hono:
+        specifier: 4.12.23
+        version: 4.12.23
 
   packages/runtime:
     dependencies:
