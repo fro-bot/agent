@@ -5,7 +5,7 @@ import process from 'node:process'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {__resetShuttingDownForTests, DEFAULT_DRAIN_MS, installShutdownHandlers} from './shutdown.js'
+import {__resetShuttingDownForTests, DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -206,5 +206,41 @@ describe('installShutdownHandlers', () => {
     const destroy1Count = (client1.destroy as ReturnType<typeof vi.fn>).mock.calls.length
     const destroy2Count = (client2.destroy as ReturnType<typeof vi.fn>).mock.calls.length
     expect(destroy1Count + destroy2Count).toBe(1)
+  })
+})
+
+describe('isShuttingDown', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    __resetShuttingDownForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    __resetShuttingDownForTests()
+  })
+
+  it('returns false before any signal is received', () => {
+    // #given — no signal fired, module freshly reset
+    // #when / #then
+    expect(isShuttingDown()).toBe(false)
+  })
+
+  it('returns true after SIGTERM handler fires', async () => {
+    // #given — install handlers with a slow destroy so we can observe state mid-shutdown
+    const {logger} = makeLogger()
+    const client = makeClient(100_000) // hangs
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never)
+    const cleanup = installShutdownHandlers(client, logger, 200_000)
+
+    // #when — emit SIGTERM
+    process.emit('SIGTERM')
+    await vi.advanceTimersByTimeAsync(1) // let the handler synchronously set shuttingDown
+
+    // #then
+    expect(isShuttingDown()).toBe(true)
+
+    cleanup()
+    exitSpy.mockRestore()
   })
 })
