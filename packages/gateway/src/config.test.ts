@@ -53,6 +53,12 @@ beforeEach(() => {
     'GITHUB_APP_PRIVATE_KEY',
     'GITHUB_APP_PRIVATE_KEY_FILE',
     'GATEWAY_GITHUB_APP_INSTALL_URL',
+    'GATEWAY_WEBHOOK_SECRET',
+    'GATEWAY_WEBHOOK_SECRET_FILE',
+    'GATEWAY_PRESENCE_CHANNEL_ID',
+    'GATEWAY_PRESENCE_CHANNEL_ID_FILE',
+    'GATEWAY_HTTP_PORT',
+    'WORKSPACE_AGENT_URL',
   ]) {
     delete process.env[key]
   }
@@ -397,6 +403,8 @@ function setRequiredEnv(): void {
   const keyFile = join(tmpDir, 'github-app-private-key-default')
   writeFileSync(keyFile, '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----', {mode: 0o600})
   process.env.GITHUB_APP_PRIVATE_KEY_FILE = keyFile
+  process.env.GATEWAY_WEBHOOK_SECRET = 'test-webhook-secret'
+  process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'test-presence-channel-id'
 }
 
 describe('loadGatewayConfig', () => {
@@ -933,5 +941,121 @@ describe('loadGatewayConfig — GitHub App credentials', () => {
 
     // #then
     expect(config.gatewayGitHubAppInstallUrl).toBe('https://github.com/apps/fro-bot/installations/new')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_WEBHOOK_SECRET, GATEWAY_PRESENCE_CHANNEL_ID, GATEWAY_HTTP_PORT
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — webhook secret, presence channel, http port', () => {
+  it('happy path: all three vars set → config reflects their values', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = '8080'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.webhookSecret).toBe('test-webhook-secret')
+    expect(config.presenceChannelId).toBe('test-presence-channel-id')
+    expect(config.httpPort).toBe(8080)
+  })
+
+  it('happy path: GATEWAY_HTTP_PORT unset → httpPort defaults to 3000', () => {
+    // #given
+    setRequiredEnv()
+    // GATEWAY_HTTP_PORT not set
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.httpPort).toBe(3000)
+  })
+
+  it('error: GATEWAY_WEBHOOK_SECRET missing → throws "Missing required secret"', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GATEWAY_WEBHOOK_SECRET
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_WEBHOOK_SECRET')
+  })
+
+  it('error: GATEWAY_PRESENCE_CHANNEL_ID missing → throws "Missing required secret"', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('edge: GATEWAY_HTTP_PORT = "0" → throws invalid port error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_HTTP_PORT value: "0"')
+  })
+
+  it('edge: GATEWAY_HTTP_PORT = "70000" → throws invalid port error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = '70000'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_HTTP_PORT value: "70000"')
+  })
+
+  it('edge: GATEWAY_HTTP_PORT = "abc" → throws invalid port error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = 'abc'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_HTTP_PORT value: "abc"')
+  })
+
+  it('edge: GATEWAY_HTTP_PORT = "1" → accepted (boundary, minimum port)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = '1'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.httpPort).toBe(1)
+  })
+
+  it('edge: GATEWAY_HTTP_PORT = "65535" → accepted (boundary, maximum port)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_HTTP_PORT = '65535'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.httpPort).toBe(65535)
+  })
+
+  it('edge: GATEWAY_WEBHOOK_SECRET_FILE with trailing newline → trimmed and accepted', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GATEWAY_WEBHOOK_SECRET
+    const secretFile = join(tmpDir, 'webhook-secret.txt')
+    writeFileSync(secretFile, 'file-webhook-secret\n', {mode: 0o600})
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = secretFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then trailing newline trimmed
+    expect(config.webhookSecret).toBe('file-webhook-secret')
   })
 })

@@ -1,6 +1,8 @@
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
+import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
+import type {CloseableServer} from './shutdown.js'
 
 import {createS3Adapter} from '@fro-bot/runtime'
 import {Effect} from 'effect'
@@ -64,6 +66,12 @@ export interface GatewayProgramDeps {
   readonly makeClient: (config: GatewayConfig, logger: GatewayLogger) => Client
   readonly setupReadinessFlag: (client: Client, logger: GatewayLogger) => void
   readonly login: (client: Client, token: string) => Promise<void>
+  /**
+   * Factory for the announce HTTP server.
+   * Receives the assembled deps + config so callers can inject fakes in tests.
+   * Returns a CloseableServer handle that will be passed to installShutdownHandlers.
+   */
+  readonly startAnnounceServer: (deps: AnnounceServerDeps, config: AnnounceServerConfig) => CloseableServer
 }
 
 // ---------------------------------------------------------------------------
@@ -151,16 +159,30 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       })
     })
 
-    // g. Install shutdown handlers
-    installShutdownHandlers(client, logger)
+    // g. Start announce HTTP server (before shutdown handlers so the handle is available)
+    const serverHandle = deps.startAnnounceServer(
+      {
+        client,
+        logger,
+        isShuttingDown,
+      },
+      {
+        webhookSecret: config.webhookSecret,
+        presenceChannelId: config.presenceChannelId,
+        httpPort: config.httpPort,
+      },
+    )
 
-    // h. Login
+    // h. Install shutdown handlers — pass server handle so it is closed on drain
+    installShutdownHandlers(client, logger, undefined, serverHandle)
+
+    // i. Login
     yield* Effect.tryPromise({
       try: async () => deps.login(client, config.discordToken),
       catch: error => (error instanceof Error ? error : new Error(String(error))),
     })
 
-    // i. Log startup
+    // j. Log startup
     logger.info({applicationId: config.discordApplicationId}, 'gateway started')
   })
 }
