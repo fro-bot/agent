@@ -6,12 +6,18 @@
  *
  * Uses fixed-window counting (not sliding window). Opportunistic eviction
  * of expired windows on each call.
+ *
+ * Hard cap: the store is bounded to MAX_KEYS entries. When the cap is reached,
+ * expired keys are evicted first; if still over, the incoming key is treated as
+ * rate-limited rather than growing the map unboundedly (memory-sink defence).
  */
 
 /** Default: 60 requests per minute. */
 const DEFAULT_LIMIT = 60
 /** Default window: 60 seconds. */
 const DEFAULT_WINDOW_MS = 60_000
+/** Maximum number of distinct source keys tracked at once. */
+const MAX_KEYS = 10_000
 
 export interface RateLimiter {
   /** Returns true if the request for the given key is within the limit. */
@@ -58,6 +64,13 @@ export function createRateLimiter(opts?: RateLimiterOptions): RateLimiter {
 
     const entry = store.get(key)
     if (entry === undefined) {
+      // New key — check cap before inserting
+      if (store.size >= MAX_KEYS) {
+        // Map is at capacity after eviction; treat as rate-limited rather
+        // than growing unboundedly. Legitimate traffic from this IP will
+        // succeed once expired windows clear on a subsequent call.
+        return false
+      }
       store.set(key, {windowStart: nowMs, count: 1})
       return true
     }

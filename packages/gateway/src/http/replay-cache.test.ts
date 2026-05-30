@@ -86,4 +86,93 @@ describe('createReplayCache', () => {
       expect(cache.check('sig-c')).toBe(true)
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // FIX 1: reserve / commit / release
+  // ---------------------------------------------------------------------------
+
+  describe('reserve → commit → reserve-again is blocked', () => {
+    it('a committed sig cannot be reserved again within TTL', () => {
+      // #given
+      const now = 1_000_000
+      const cache = createReplayCache({clock: () => now})
+      const sig = 'abcdef01'
+
+      // #when
+      const reserved = cache.reserve(sig)
+      cache.commit(sig, now)
+
+      // #then — committed entry blocks further reserve
+      expect(reserved).toBe(true)
+      expect(cache.reserve(sig)).toBe(false)
+    })
+  })
+
+  describe('reserve → release → reserve-again is allowed', () => {
+    it('a released sig can be reserved again', () => {
+      // #given
+      const now = 1_000_000
+      const cache = createReplayCache({clock: () => now})
+      const sig = 'abcdef02'
+
+      // #when
+      cache.reserve(sig)
+      cache.release(sig)
+      const reservedAgain = cache.reserve(sig)
+
+      // #then — released sig can be reserved once more
+      expect(reservedAgain).toBe(true)
+    })
+  })
+
+  describe('reserve blocks a concurrent reserve of the same sig', () => {
+    it('returns false for the second reserve attempt while first is reserved', () => {
+      // #given
+      const now = 1_000_000
+      const cache = createReplayCache({clock: () => now})
+      const sig = 'abcdef03'
+
+      // #when — first reserve succeeds
+      const first = cache.reserve(sig)
+      // second reserve of same sig (concurrent duplicate) — must fail
+      const second = cache.reserve(sig)
+
+      // #then
+      expect(first).toBe(true)
+      expect(second).toBe(false)
+    })
+  })
+
+  describe('committed entry expires after TTL', () => {
+    it('check returns false after window + buffer has elapsed', () => {
+      // #given — reserve and commit at t=0
+      let now = 0
+      const cache = createReplayCache({clock: () => now})
+      const sig = 'expirecommit'
+      cache.reserve(sig)
+      cache.commit(sig, now)
+      expect(cache.check(sig)).toBe(true)
+
+      // #when — advance past REPLAY_WINDOW_MS + buffer + 1ms
+      now = REPLAY_WINDOW_MS + 60_001
+
+      // #then — expired
+      expect(cache.check(sig)).toBe(false)
+    })
+  })
+
+  describe('release of a non-reserved sig is a safe no-op', () => {
+    it('does not throw and does not affect other entries', () => {
+      // #given
+      const now = 1_000_000
+      const cache = createReplayCache({clock: () => now})
+      cache.record('other-sig', now)
+
+      // #when — release a sig that was never reserved
+      expect(() => cache.release('never-reserved')).not.toThrow()
+
+      // #then — existing recorded sig unaffected
+      expect(cache.check('other-sig')).toBe(true)
+    })
+  })
 })

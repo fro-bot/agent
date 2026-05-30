@@ -14,22 +14,20 @@
 
 import type {ServerType} from '@hono/node-server'
 import type {Client} from 'discord.js'
-import type {AnnounceLogger} from './announce-handler.js'
+import type {AnnounceHandlerResult, AnnounceLogger} from './announce-handler.js'
 import type {RateLimiter} from './rate-limit.js'
 import type {ReplayCache} from './replay-cache.js'
 import {Buffer} from 'node:buffer'
 import {serve} from '@hono/node-server'
+import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
-import {handleAnnounce} from './announce-handler.js'
+import {ANNOUNCE_MAX_BODY_BYTES, handleAnnounce} from './announce-handler.js'
 import {createRateLimiter} from './rate-limit.js'
 import {createReplayCache} from './replay-cache.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/** Maximum allowed Content-Length before we even read the body. */
-const MAX_BODY_BYTES = 8 * 1024
 
 export interface AnnounceServerDeps {
   readonly client: Client
@@ -81,7 +79,7 @@ export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceS
     const contentLengthHeader = c.req.header('content-length')
     if (contentLengthHeader !== undefined && contentLengthHeader !== null) {
       const contentLength = Number.parseInt(contentLengthHeader, 10)
-      if (Number.isNaN(contentLength) === false && contentLength > MAX_BODY_BYTES) {
+      if (Number.isNaN(contentLength) === false && contentLength > ANNOUNCE_MAX_BODY_BYTES) {
         deps.logger.warn({reason: 'too_large'}, 'announce rejected (content-length precheck)')
         return c.json({error: 'payload too large'}, 413)
       }
@@ -91,11 +89,14 @@ export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceS
     const arrayBuffer = await c.req.arrayBuffer()
     const rawBody = Buffer.from(arrayBuffer)
 
-    // Derive source key from forwarded / remote IP headers
-    const forwarded = c.req.header('x-forwarded-for')
-    const sourceKey = forwarded !== undefined && forwarded !== null ? forwarded.split(',')[0]?.trim() : undefined
+    // Derive rate-limit key from the actual TCP socket remote address.
+    // X-Forwarded-For is intentionally NOT used — it is caller-spoofable.
+    // Behind the ingress this keys on the proxy's connection, which is the
+    // correct trust boundary for v1.
+    const connInfo = getConnInfo(c)
+    const sourceKey = connInfo.remote.address ?? undefined
 
-    const result = await handleAnnounce(
+    const result: AnnounceHandlerResult = await handleAnnounce(
       rawBody,
       {
         get: (name: string) => c.req.header(name) ?? null,
@@ -112,7 +113,7 @@ export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceS
       },
     )
 
-    return c.json(result.body, result.status as Parameters<typeof c.json>[1])
+    return c.json(result.body, result.status)
   })
 
   app.notFound(c => c.json({error: 'not-found'}, 404))

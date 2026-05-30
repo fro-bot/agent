@@ -88,4 +88,46 @@ describe('createRateLimiter', () => {
       expect(limiter.allow('key-b')).toBe(true)
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // FIX 2: MAX_KEYS cap — bounded map (memory-sink defence)
+  // ---------------------------------------------------------------------------
+
+  describe('MAX_KEYS cap — map does not grow unbounded', () => {
+    it('treats new keys as rate-limited once cap is reached (no evictions available)', () => {
+      // #given — fill the map to the cap with unique keys in a single window (no expiry)
+      // We use a limit high enough that we never hit per-key denial during seeding.
+      const MAX_KEYS = 10_000
+      const now = 1_000_000
+      const limiter = createRateLimiter({limit: MAX_KEYS + 1, windowMs: 60_000, clock: () => now})
+
+      // Seed exactly MAX_KEYS entries — all should be allowed
+      for (let i = 0; i < MAX_KEYS; i++) {
+        expect(limiter.allow(`key-${i}`)).toBe(true)
+      }
+
+      // #when — try to add one more distinct key beyond the cap
+      const overCapAllowed = limiter.allow('key-over-cap')
+
+      // #then — denied (map is at cap; no expired entries to evict)
+      expect(overCapAllowed).toBe(false)
+    })
+
+    it('allows new keys again once old entries expire and eviction frees space', () => {
+      // #given — fill the map to the cap at t=0
+      const MAX_KEYS = 10_000
+      let now = 0
+      const limiter = createRateLimiter({limit: MAX_KEYS + 1, windowMs: 60_000, clock: () => now})
+
+      for (let i = 0; i < MAX_KEYS; i++) {
+        limiter.allow(`key-${i}`)
+      }
+
+      // #when — advance past the window so all existing entries are expired
+      now = 60_001
+
+      // #then — a new key triggers eviction and is then accepted
+      expect(limiter.allow('fresh-key')).toBe(true)
+    })
+  })
 })

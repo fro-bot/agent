@@ -10,17 +10,19 @@
  *   3. Required headers present
  *   4. HMAC verification
  *   5. Timestamp window check
- *   6. Replay cache check
+ *   6. Replay cache reserve (atomic check-and-set — concurrent duplicates rejected here)
  *   7. JSON parse
  *   8. Timestamp cross-check (body fired_at === timestampHeader by exact string)
  *   9. Schema decode (unknown event_type → 400)
- *  10. Render embed + post to Discord (Discord failure → 5xx)
- *  11. Record in replay cache + return 200
+ *  10. Render embed + post to Discord (Discord failure → 5xx, release reservation)
+ *  11. Commit replay cache + return 200
  *
  * Security invariants:
  * - Steps 4–6 all return the SAME 401 body (no oracle for which check failed).
  * - Raw body, headers, signature, and rendered text are NEVER logged.
- * - Replay is recorded ONLY after a successful Discord post (step 11).
+ * - Replay is committed ONLY after a successful Discord post (step 11).
+ * - reservation is released on every post-reserve early-return so a legit retry
+ *   is never permanently blocked by a malformed or failed request.
  */
 
 import type {Buffer} from 'node:buffer'
@@ -39,8 +41,8 @@ import {renderEmbed} from './templates.js'
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Maximum allowed request body size in bytes. */
-const MAX_BODY_BYTES = 8 * 1024
+/** Maximum allowed request body size in bytes. Shared with server.ts. */
+export const ANNOUNCE_MAX_BODY_BYTES = 8 * 1024
 
 /** Fallback source key used when caller provides no IP. */
 const DEFAULT_SOURCE_KEY = '__unknown__'
@@ -70,12 +72,12 @@ export interface AnnounceHandlerDeps {
 
 /** Result returned by handleAnnounce — server.ts maps this to c.json(body, status). */
 export interface AnnounceHandlerResult {
-  readonly status: number
+  readonly status: 200 | 400 | 401 | 413 | 429 | 500 | 503
   readonly body: object
 }
 
 // Shared 401 body — intentionally generic so callers cannot distinguish
-// bad-sig from stale-timestamp from replay.
+// bad-sig from stale-timestamp from replay (or concurrent in-flight duplicate).
 const UNAUTHORIZED_BODY = {error: 'unauthorized'} as const
 
 // ---------------------------------------------------------------------------
@@ -88,7 +90,7 @@ const UNAUTHORIZED_BODY = {error: 'unauthorized'} as const
  * @param rawBody - The raw request body Buffer (exact bytes used for HMAC).
  * @param headers - Raw headers from the request (lowercased lookup expected).
  * @param headers.get - Look up a header by lowercased name.
- * @param sourceKey - Client identity for rate limiting (IP / forwarded header).
+ * @param sourceKey - Client identity for rate limiting (IP / connection remote address).
  * @param deps - Injected dependencies.
  */
 export async function handleAnnounce(
@@ -102,7 +104,7 @@ export async function handleAnnounce(
   const key = sourceKey ?? DEFAULT_SOURCE_KEY
 
   // ── Step 1: Body size ────────────────────────────────────────────────────
-  if (rawBody.byteLength > MAX_BODY_BYTES) {
+  if (rawBody.byteLength > ANNOUNCE_MAX_BODY_BYTES) {
     logger.warn({reason: 'too_large'}, 'announce rejected')
     return {status: 413, body: {error: 'payload too large'}}
   }
@@ -141,8 +143,10 @@ export async function handleAnnounce(
     return {status: 401, body: UNAUTHORIZED_BODY}
   }
 
-  // ── Step 6: Replay cache check ───────────────────────────────────────────
-  if (replayCache.check(signatureHex) === true) {
+  // ── Step 6: Replay cache reserve (atomic check-and-set) ─────────────────
+  // reserve() is synchronous — no await between check and set.
+  // A concurrent request with the same sig will hit this and get false.
+  if (replayCache.reserve(signatureHex) === false) {
     logger.warn({reason: 'replayed'}, 'announce rejected')
     return {status: 401, body: UNAUTHORIZED_BODY}
   }
@@ -153,6 +157,7 @@ export async function handleAnnounce(
     parsed = JSON.parse(rawBody.toString('utf8'))
   } catch {
     logger.warn({reason: 'malformed_body'}, 'announce rejected')
+    replayCache.release(signatureHex)
     return {status: 400, body: {error: 'bad request'}}
   }
 
@@ -161,10 +166,11 @@ export async function handleAnnounce(
   if (
     typeof parsed !== 'object' ||
     parsed === null ||
-    !('fired_at' in parsed) ||
+    'fired_at' in parsed === false ||
     (parsed as Record<string, unknown>).fired_at !== timestampHeader
   ) {
     logger.warn({reason: 'timestamp_mismatch'}, 'announce rejected')
+    replayCache.release(signatureHex)
     return {status: 400, body: {error: 'bad request'}}
   }
 
@@ -173,6 +179,7 @@ export async function handleAnnounce(
   if (Either.isLeft(decoded)) {
     const reason = decoded.left === 'unknown_event_type' ? 'unknown_event_type' : 'bad_request'
     logger.warn({reason}, 'announce rejected')
+    replayCache.release(signatureHex)
     return {status: 400, body: {error: 'bad request'}}
   }
 
@@ -184,12 +191,13 @@ export async function handleAnnounce(
 
   if (postResult.success === false) {
     logger.error({reason: 'discord_post_failed'}, 'announce discord post failed')
-    // Do NOT record replay on failure — control plane is allowed to retry
+    // Release reservation so the control-plane retry is not blocked
+    replayCache.release(signatureHex)
     return {status: 500, body: {error: 'internal error'}}
   }
 
-  // ── Step 11: Record replay + success ────────────────────────────────────
-  replayCache.record(signatureHex)
+  // ── Step 11: Commit replay cache + success ───────────────────────────────
+  replayCache.commit(signatureHex)
   logger.info({event_type: payload.event_type, fired_at: payload.fired_at, discordStatus: 'ok'}, 'announce accepted')
   return {status: 200, body: {ok: true}}
 }

@@ -22,6 +22,21 @@ import {createReplayCache} from './replay-cache.js'
 import {createAnnounceServer} from './server.js'
 
 // ---------------------------------------------------------------------------
+// Narrow client interface — exactly what postPresenceEmbed uses
+// ---------------------------------------------------------------------------
+
+interface FakeChannel {
+  readonly isTextBased: () => boolean
+  readonly send: ReturnType<typeof vi.fn>
+}
+
+interface FakeClient {
+  readonly channels: {
+    readonly fetch: ReturnType<typeof vi.fn>
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
@@ -46,20 +61,25 @@ function makeLogger(): AnnounceLogger {
   }
 }
 
-/** Make a mock discord.js Client. sendMock is returned for assertions. */
+/**
+ * Create a minimal typed mock Discord client — no double-cast.
+ * Returns FakeClient satisfying the structural surface the code uses.
+ */
 function makeDiscordClient(succeed = true): {client: Client; sendMock: ReturnType<typeof vi.fn>} {
   const sendMock = vi.fn()
-  if (succeed) {
+  if (succeed === true) {
     sendMock.mockResolvedValue(undefined)
   } else {
     sendMock.mockRejectedValue(new Error('Discord API error'))
   }
-  const fetchMock = vi.fn().mockResolvedValue({
+  const fakeChannel: FakeChannel = {
     isTextBased: () => true,
     send: sendMock,
-  })
-  const client = {channels: {fetch: fetchMock}} as unknown as Client
-  return {client, sendMock}
+  }
+  const fetchMock = vi.fn().mockResolvedValue(fakeChannel)
+  const fakeClient: FakeClient = {channels: {fetch: fetchMock}}
+  // FakeClient satisfies the structural surface; cast only here to satisfy deps typing.
+  return {client: fakeClient as unknown as Client, sendMock}
 }
 
 /** Find a free port by briefly opening a server. */
@@ -516,6 +536,61 @@ describe('POST /v1/announce — Discord failure → 5xx', () => {
       // #then
       expect(status).toBe(500)
       expect(body).toEqual({error: 'internal error'})
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX 2: Rate-limit key comes from connection info, NOT x-forwarded-for
+// ---------------------------------------------------------------------------
+
+describe('POST /v1/announce — rate limit keyed on connection (not XFF)', () => {
+  it('two requests with different x-forwarded-for but same connection share the same rate-limit bucket', async () => {
+    // #given — rate limiter capped at 1 request; both requests come from same TCP connection (127.0.0.1)
+    const rawBody1 = makeRawBody(validSurveyPayload)
+    const rawBody2 = makeRawBody({
+      ...validSurveyPayload,
+      context: {...validSurveyPayload.context, wiki_pages_changed: 5},
+    })
+    const sig1 = makeSignature(rawBody1, TIMESTAMP)
+    const sig2 = makeSignature(rawBody2, TIMESTAMP)
+    const rateLimiter = {
+      calls: 0,
+      allow(this: {calls: number}): boolean {
+        this.calls += 1
+        return this.calls <= 1
+      },
+    }
+
+    const port = await findFreePort()
+    const {client} = makeDiscordClient(true)
+    const logger = makeLogger()
+
+    const server = createAnnounceServer(
+      {client, logger, rateLimiter, clock: () => NOW_MS},
+      {webhookSecret: SECRET, presenceChannelId: CHANNEL_ID, httpPort: port},
+    )
+
+    try {
+      // #when — first request succeeds (rate limit not exhausted)
+      const res1 = await postAnnounce(port, rawBody1, {
+        'x-gateway-signature': sig1,
+        'x-gateway-timestamp': TIMESTAMP,
+        'x-forwarded-for': '10.0.0.1', // different XFF — should NOT get a fresh bucket
+      })
+
+      // #when — second request: different XFF but same real connection (127.0.0.1) → rate-limited
+      const res2 = await postAnnounce(port, rawBody2, {
+        'x-gateway-signature': sig2,
+        'x-gateway-timestamp': TIMESTAMP,
+        'x-forwarded-for': '10.0.0.2', // different XFF — should still be rate-limited
+      })
+
+      // #then — second is denied; they share the same connection-based bucket
+      expect(res1.status).toBe(200)
+      expect(res2.status).toBe(429)
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
     }

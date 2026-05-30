@@ -64,7 +64,7 @@ export async function postPresenceEmbed(
   }
 
   // #given — guard that the channel is text-sendable
-  if (!channel.isTextBased() || !('send' in channel)) {
+  if (channel.isTextBased() === false || 'send' in channel === false) {
     return err({kind: 'not-text-channel'})
   }
 

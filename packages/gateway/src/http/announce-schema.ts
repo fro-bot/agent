@@ -47,7 +47,7 @@ const SurveyCompleted = Schema.Struct({
   rendered_text: Schema.NullOr(Schema.String),
 })
 
-export const AnnouncePayloadSchema = Schema.Union(InvitationAccepted, SurveyCompleted)
+const AnnouncePayloadSchema = Schema.Union(InvitationAccepted, SurveyCompleted)
 
 export type AnnouncePayload = Schema.Schema.Type<typeof AnnouncePayloadSchema>
 
@@ -77,7 +77,6 @@ export function decodeAnnounce(input: unknown): Either.Either<AnnouncePayload, s
  * an array of property keys — no internal-shape casts required.
  *
  * If every issue points at 'event_type' → unknown_event_type.
- * If every issue points at 'v' (and not event_type) → unsupported_version.
  * Everything else → malformed_body.
  */
 function classifyParseError(error: ParseResult.ParseError): string {
@@ -85,13 +84,8 @@ function classifyParseError(error: ParseResult.ParseError): string {
     issue.path.length > 0 ? String(issue.path[0]) : '',
   )
 
-  if (topLevelKeys.length > 0) {
-    if (topLevelKeys.every(key => key === 'event_type')) {
-      return 'unknown_event_type'
-    }
-    if (topLevelKeys.every(key => key === 'v')) {
-      return 'unsupported_version'
-    }
+  if (topLevelKeys.length > 0 && topLevelKeys.every(key => key === 'event_type')) {
+    return 'unknown_event_type'
   }
 
   return 'malformed_body'

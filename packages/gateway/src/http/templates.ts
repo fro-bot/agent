@@ -50,6 +50,13 @@ function renderSurveyCompleted(context: SurveyCompletedContext): string {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Discord embed description hard limit (characters). */
+const EMBED_DESCRIPTION_MAX_CHARS = 4096
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -59,6 +66,9 @@ function renderSurveyCompleted(context: SurveyCompletedContext): string {
  * If `payload.rendered_text` is non-null, it is used verbatim as the embed
  * description (forward-compat: v1 emits null; callers may supply overrides).
  * The accent color is always set by event_type regardless of rendered_text.
+ *
+ * Description is truncated to EMBED_DESCRIPTION_MAX_CHARS (4096) with a '…'
+ * suffix so an oversized payload never causes channel.send to throw.
  */
 export function renderEmbed(payload: AnnouncePayload): PresenceEmbed {
   const color = ACCENT[payload.event_type]
@@ -70,6 +80,10 @@ export function renderEmbed(payload: AnnouncePayload): PresenceEmbed {
     description = renderInvitationAccepted(payload.context)
   } else {
     description = renderSurveyCompleted(payload.context)
+  }
+
+  if (description.length > EMBED_DESCRIPTION_MAX_CHARS) {
+    description = `${description.slice(0, EMBED_DESCRIPTION_MAX_CHARS - 1)}…`
   }
 
   return {description, color}
