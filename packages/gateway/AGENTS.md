@@ -31,13 +31,13 @@ Effect.tryPromise(() => runtimeFn(args)) // catches promise rejections
 
 All gateway code outside `runtime-effect.ts` works exclusively in Effect — `Effect.Effect<A, E, R>` everywhere. Subagents asked to add a new runtime call should add the wrapper to `runtime-effect.ts` first, never import directly from `@fro-bot/runtime` outside that adapter.
 
-### Effect surface used (Unit 4)
+### Effect surface used
 
 - **Core** (`Effect.Effect`, `pipe`, `Effect.tryPromise`, `Effect.flatMap`, `Effect.gen`, `Effect.runPromise`, `Effect.try`, `Effect.succeed`, `Effect.fail`, `Effect.either`, `Effect.void`, `Effect.catchAll`) — composing async error paths
+- **Schema** (`Schema.Struct`, `Schema.Union`, `Schema.Literal`, `Schema.NullOr`, `Schema.decodeUnknownEither`, `ParseResult.ArrayFormatter`) — announce webhook payload validation in `src/http/announce-schema.ts`. Decode errors are mapped to content-free reason strings via the typed formatter (no internal-shape casts).
 
-Not used in Unit 4 (planned for Unit 6+):
-- **Schedule** (`Schedule.exponential`, `Schedule.recurs`) — retry policies; not yet wired
-- **Schema** (`Schema.Struct`, `Schema.decodeUnknown`) — payload validation; not yet wired
+Not yet wired:
+- **Schedule** (`Schedule.exponential`, `Schedule.recurs`) — retry policies; not yet used
 
 Not used at this scope:
 - Effect runtime / Layer / Context (overkill for v1; revisit when DI complexity warrants)
@@ -52,8 +52,10 @@ Not used at this scope:
 - `src/discord/` — Discord.js integration. Client construction with safe `allowedMentions` defaults, command registry, mention handler.
   - `src/discord/channels.ts` — channel creation helper used by the add-project flow. `createChannelWithCollisionSuffix` always creates a fresh channel; it never returns an existing one. Tries the exact name first, then `name-2` through `name-10`, skipping any candidate whose name is already taken.
   - `src/discord/commands/add-project.ts` — `/fro-bot add-project` slash command. Orchestrates the 5-phase flow (PRE_FLIGHT → CLONING → CREATING_CHANNEL → WRITING_BINDING → READY). Depends on `channels.ts` for channel creation, `workspace-api/client.ts` for repo cloning, `bindings/store.ts` for durable binding persistence, and `github/app-client.ts` for GitHub App token acquisition.
+  - `src/discord/presence.ts` — resolves a channel by ID via `client.channels.fetch` and posts an embed with `allowedMentions: {parse: []}`. Used by the announce webhook to post control-plane presence messages as the Fro Bot user.
 - `src/workspace-api/` — HTTP client for the workspace-agent sidecar service. `WorkspaceClient` wraps the `/clone` endpoint and maps HTTP error shapes to typed `Result<CloneSuccess, CloneError>` values. The client is injected into `add-project.ts` via `AddProjectDeps`.
-- `src/shutdown.ts` — SIGTERM handler with 25s drain.
+- `src/http/` — the inbound announce webhook (`POST /v1/announce`), the gateway's only HTTP ingress. Hono server (`server.ts`) reads the raw body and maps the framework-agnostic handler (`announce-handler.ts`) result to a response. The handler runs an ordered fail-closed pipeline: 8 KB size cap → rate limit → required headers → HMAC verify → timestamp window → replay reserve → JSON parse → exact-string `fired_at` cross-check → schema decode → embed render → Discord post. Auth failures (`hmac_invalid` / `timestamp_expired` / `replayed`) return an identical generic 401 so the caller cannot tell which check failed. Supporting modules: `hmac.ts` (HMAC-SHA256 over `timestamp + "." + rawBody`, `timingSafeEqual`), `announce-schema.ts` (Effect Schema), `templates.ts` (event_type → embed), `replay-cache.ts` (atomic reserve/commit/release seen-signature cache), `rate-limit.ts` (socket-keyed token bucket, bounded key count). Config: `GATEWAY_WEBHOOK_SECRET`, `GATEWAY_PRESENCE_CHANNEL_ID`, `GATEWAY_HTTP_PORT`.
+- `src/shutdown.ts` — SIGTERM/SIGINT handler with a 25s drain. Races `client.destroy()` and the announce server's `close()` against the drain timer; a server-close failure is logged without masking client teardown. New announce requests are refused with 503 while draining.
 
 ## Configuration knobs
 
