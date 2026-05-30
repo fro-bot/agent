@@ -27,6 +27,9 @@ export interface GatewayConfig {
   readonly githubAppPrivateKey: string
   readonly gatewayGitHubAppInstallUrl: string
   readonly workspaceAgentUrl: string
+  readonly webhookSecret: string
+  readonly presenceChannelId: string
+  readonly httpPort: number
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -316,6 +319,15 @@ export function loadGatewayConfig(): GatewayConfig {
 
   const workspaceAgentUrl = readOptionalSecret('WORKSPACE_AGENT_URL') ?? 'http://workspace:9100'
 
+  const webhookSecret = readSecret('GATEWAY_WEBHOOK_SECRET')
+  const presenceChannelId = readSecret('GATEWAY_PRESENCE_CHANNEL_ID')
+
+  const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
+  const httpPort = Number.parseInt(rawHttpPort, 10)
+  if (Number.isFinite(httpPort) === false || Number.isInteger(httpPort) === false || httpPort < 1 || httpPort > 65535) {
+    throw new Error(`Invalid GATEWAY_HTTP_PORT value: "${rawHttpPort}" (must be an integer in the range 1–65535)`)
+  }
+
   return {
     discordToken,
     discordApplicationId,
@@ -328,5 +340,8 @@ export function loadGatewayConfig(): GatewayConfig {
     githubAppPrivateKey,
     gatewayGitHubAppInstallUrl,
     workspaceAgentUrl,
+    webhookSecret,
+    presenceChannelId,
+    httpPort,
   }
 }

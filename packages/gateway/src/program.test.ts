@@ -82,44 +82,63 @@ describe('makeDiscordClientFromConfig', () => {
 // makeGatewayProgram — startup ordering (Todo 018)
 // ---------------------------------------------------------------------------
 
+/** Minimal GatewayConfig for tests — fills required fields. */
+function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
+  return {
+    discordToken: 'test-token',
+    discordApplicationId: 'test-app-id',
+    discordGuildId: null,
+    identity: 'test-gateway',
+    logLevel: 'info',
+    privilegedIntents: [],
+    objectStore: {
+      enabled: true,
+      bucket: 'test-bucket',
+      region: 'us-east-1',
+      prefix: 'test-prefix',
+    },
+    githubAppId: 'test-app-id',
+    githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
+    gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
+    workspaceAgentUrl: 'http://workspace:9100',
+    webhookSecret: 'test-webhook-secret',
+    presenceChannelId: 'test-presence-channel-id',
+    httpPort: 3000,
+    ...overrides,
+  }
+}
+
+/** Minimal fake Discord client for program tests. */
+function makeFakeClient() {
+  return {
+    on: vi.fn().mockReturnThis(),
+    once: vi.fn().mockReturnThis(),
+    user: null,
+    login: vi.fn().mockResolvedValue('token'),
+  }
+}
+
+/** Fake server handle returned by startAnnounceServer stub. */
+function makeFakeServerHandle() {
+  return {close: vi.fn()}
+}
+
 describe('makeGatewayProgram', () => {
   it('calls setupReadinessFlag before login', async () => {
     // #given
-    const fakeConfig: GatewayConfig = {
-      discordToken: 'test-token',
-      discordApplicationId: 'test-app-id',
-      discordGuildId: null,
-      identity: 'test-gateway',
-      logLevel: 'info',
-      privilegedIntents: [],
-      objectStore: {
-        enabled: true,
-        bucket: 'test-bucket',
-        region: 'us-east-1',
-        prefix: 'test-prefix',
-      },
-      githubAppId: 'test-app-id',
-      githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
-      gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
-      workspaceAgentUrl: 'http://workspace:9100',
-    }
-
-    // Minimal fake client — just needs to satisfy the Client shape enough for
-    // setupReadinessFlag (on/once) and the event wiring in makeGatewayProgram.
-    const fakeClient = {
-      on: vi.fn().mockReturnThis(),
-      once: vi.fn().mockReturnThis(),
-      user: null,
-      login: vi.fn().mockResolvedValue('token'),
-    }
+    const fakeConfig = makeFakeConfig()
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
 
     const setupReadinessFlagSpy = vi.fn()
     const loginSpy = vi.fn().mockResolvedValue(undefined)
+    const startAnnounceServerSpy = vi.fn().mockReturnValue(fakeServerHandle)
 
     const deps = {
       makeClient: () => fakeClient as unknown as import('discord.js').Client,
       setupReadinessFlag: setupReadinessFlagSpy,
       login: loginSpy,
+      startAnnounceServer: startAnnounceServerSpy,
     }
 
     // #when — run the program with the real Effect runtime.
@@ -137,5 +156,68 @@ describe('makeGatewayProgram', () => {
       throw new Error('invocationCallOrder missing — toBeDefined() should have caught this')
     }
     expect(setupOrder).toBeLessThan(loginOrder)
+  })
+
+  it('calls startAnnounceServer with client, logger, and isShuttingDown', async () => {
+    // #given
+    const fakeConfig = makeFakeConfig()
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+
+    const startAnnounceServerSpy = vi.fn().mockReturnValue(fakeServerHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: startAnnounceServerSpy,
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — factory was called once
+    expect(startAnnounceServerSpy).toHaveBeenCalledOnce()
+
+    // #and — serverDeps includes the discord client
+    const [serverDeps, serverConfig] = startAnnounceServerSpy.mock.calls[0] as [
+      import('./http/server.js').AnnounceServerDeps,
+      import('./http/server.js').AnnounceServerConfig,
+    ]
+    expect(serverDeps.client).toBe(fakeClient)
+    expect(typeof serverDeps.isShuttingDown).toBe('function')
+
+    // #and — serverConfig is wired from GatewayConfig
+    expect(serverConfig.webhookSecret).toBe('test-webhook-secret')
+    expect(serverConfig.presenceChannelId).toBe('test-presence-channel-id')
+    expect(serverConfig.httpPort).toBe(3000)
+  })
+
+  it('startAnnounceServer is called before login (server starts before gateway accepts traffic)', async () => {
+    // #given
+    const fakeConfig = makeFakeConfig()
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+
+    const startAnnounceServerSpy = vi.fn().mockReturnValue(fakeServerHandle)
+    const loginSpy = vi.fn().mockResolvedValue(undefined)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: loginSpy,
+      startAnnounceServer: startAnnounceServerSpy,
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — server started before login
+    const serverOrder = startAnnounceServerSpy.mock.invocationCallOrder[0]
+    const loginOrder = loginSpy.mock.invocationCallOrder[0]
+    if (serverOrder === undefined || loginOrder === undefined) {
+      throw new Error('invocationCallOrder missing')
+    }
+    expect(serverOrder).toBeLessThan(loginOrder)
   })
 })
