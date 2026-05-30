@@ -43,15 +43,22 @@ export function isShuttingDown(): boolean {
   return shuttingDown
 }
 
+/** Minimal interface for a closeable server handle (e.g. @hono/node-server ServerType). */
+export interface CloseableServer {
+  readonly close: (cb?: (err?: Error) => void) => void
+}
+
 /**
- * Install SIGTERM and SIGINT handlers that gracefully drain the Discord client.
+ * Install SIGTERM and SIGINT handlers that gracefully drain the Discord client
+ * and (optionally) an HTTP server.
  *
  * On signal:
  * 1. Log 'shutdown initiated' at info.
- * 2. Race `client.destroy()` against a drain timer (default 25 s).
- * 3. If destroy wins → log 'shutdown clean', exit 0.
+ * 2. Race `client.destroy()` AND `server.close()` (if provided) against a drain timer (default 25 s).
+ * 3. If both win → log 'shutdown clean', exit 0.
  * 4. If timer wins → log 'shutdown timeout', exit 1.
  * 5. If destroy rejects → log 'shutdown failed', exit 1.
+ * 6. If server.close() fails → log a warning but do NOT prevent client teardown result.
  *
  * Returns a cleanup function that removes both signal listeners (useful in tests).
  *
@@ -62,6 +69,7 @@ export function installShutdownHandlers(
   client: Client,
   logger: GatewayLogger,
   drainMs: number = DEFAULT_DRAIN_MS,
+  server?: CloseableServer,
 ): () => void {
   const handler = (signal: string) => {
     if (shuttingDown) {
@@ -87,7 +95,21 @@ export function installShutdownHandlers(
         return 'failed' as const
       })
 
-    Promise.race([destroyPromise, drainTimeout])
+    // Close the HTTP server if one was provided. Failure is logged but must NOT
+    // prevent client teardown from determining the exit code.
+    const serverClosePromise: Promise<void> =
+      server === undefined
+        ? Promise.resolve()
+        : new Promise<void>(resolve => {
+            server.close(err => {
+              if (err !== undefined && err !== null) {
+                logger.warn({err}, 'server.close() failed during shutdown')
+              }
+              resolve()
+            })
+          })
+
+    Promise.race([Promise.all([destroyPromise, serverClosePromise]).then(([result]) => result), drainTimeout])
       .then(result => {
         if (drainTimer !== undefined) {
           clearTimeout(drainTimer)

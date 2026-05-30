@@ -457,6 +457,40 @@ describe('POST /v1/announce — rate limited → 429', () => {
   })
 })
 
+describe('POST /v1/announce — shutting down → 503', () => {
+  it('returns 503 {error:"unavailable"} when isShuttingDown() returns true, and does NOT post to Discord', async () => {
+    // #given
+    const rawBody = makeRawBody(validSurveyPayload)
+    const sig = makeSignature(rawBody, TIMESTAMP)
+
+    const port = await findFreePort()
+    const {client, sendMock} = makeDiscordClient(true)
+    const logger = makeLogger()
+
+    const server = createAnnounceServer(
+      {client, logger, clock: () => NOW_MS, isShuttingDown: () => true},
+      {webhookSecret: SECRET, presenceChannelId: CHANNEL_ID, httpPort: port},
+    )
+
+    try {
+      // #when
+      const {status, body} = await postAnnounce(port, rawBody, {
+        'x-gateway-signature': sig,
+        'x-gateway-timestamp': TIMESTAMP,
+      })
+
+      // #then
+      expect(status).toBe(503)
+      expect(body).toEqual({error: 'unavailable'})
+
+      // #and — Discord was never contacted
+      expect(sendMock).not.toHaveBeenCalled()
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+})
+
 describe('POST /v1/announce — Discord failure → 5xx', () => {
   it('returns 500 {error:"internal error"} when Discord post fails', async () => {
     // #given

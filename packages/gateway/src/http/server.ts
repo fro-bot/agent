@@ -40,6 +40,12 @@ export interface AnnounceServerDeps {
   readonly rateLimiter?: RateLimiter
   /** Injectable clock for testability. */
   readonly clock?: () => number
+  /**
+   * Returns true when the gateway is draining (SIGTERM/SIGINT received).
+   * Injected so the route can return 503 without importing shutdown.ts directly.
+   * Defaults to () => false if omitted (useful in tests that don't care about drain).
+   */
+  readonly isShuttingDown?: () => boolean
 }
 
 export interface AnnounceServerConfig {
@@ -60,10 +66,17 @@ export interface AnnounceServerConfig {
 export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceServerConfig): ServerType {
   const replayCache = deps.replayCache ?? createReplayCache({clock: deps.clock})
   const rateLimiter = deps.rateLimiter ?? createRateLimiter({clock: deps.clock})
+  const checkShuttingDown = deps.isShuttingDown ?? (() => false)
 
   const app = new Hono()
 
   app.post('/v1/announce', async c => {
+    // Drain gate — refuse new requests during graceful shutdown
+    if (checkShuttingDown() === true) {
+      deps.logger.warn({reason: 'draining'}, 'announce rejected (shutting down)')
+      return c.json({error: 'unavailable'}, 503)
+    }
+
     // Content-length pre-check (fast path — avoids reading the body if obviously too large)
     const contentLengthHeader = c.req.header('content-length')
     if (contentLengthHeader !== undefined && contentLengthHeader !== null) {

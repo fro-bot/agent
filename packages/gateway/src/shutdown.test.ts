@@ -1,5 +1,6 @@
 import type {Client} from 'discord.js'
 import type {GatewayLogger} from './discord/client.js'
+import type {CloseableServer} from './shutdown.js'
 
 import process from 'node:process'
 
@@ -26,6 +27,20 @@ function makeClient(destroyDelay = 0): Client {
   return {
     destroy: vi.fn().mockImplementation(async () => new Promise<void>(resolve => setTimeout(resolve, destroyDelay))),
   } as unknown as Client
+}
+
+/** Make a fake CloseableServer handle. */
+function makeFakeServer(closeDelay = 0, shouldError = false): CloseableServer & {closeSpy: ReturnType<typeof vi.fn>} {
+  const closeSpy = vi.fn().mockImplementation((cb?: (err?: Error) => void) => {
+    setTimeout(() => {
+      if (shouldError) {
+        cb?.(new Error('server.close() failed'))
+      } else {
+        cb?.()
+      }
+    }, closeDelay)
+  })
+  return {close: closeSpy, closeSpy}
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +221,49 @@ describe('installShutdownHandlers', () => {
     const destroy1Count = (client1.destroy as ReturnType<typeof vi.fn>).mock.calls.length
     const destroy2Count = (client2.destroy as ReturnType<typeof vi.fn>).mock.calls.length
     expect(destroy1Count + destroy2Count).toBe(1)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Server handle tests (Unit 7)
+  // ---------------------------------------------------------------------------
+
+  it('calls server.close() during shutdown when a server handle is provided', async () => {
+    // #given
+    const {logger} = makeLogger()
+    const client = makeClient(0)
+    const server = makeFakeServer(0)
+    const drainMs = 1_000
+    const cleanup = installShutdownHandlers(client, logger, drainMs, server)
+
+    // #when
+    process.emit('SIGTERM')
+    await vi.runAllTimersAsync()
+    cleanup()
+
+    // #then — server.close() was called exactly once
+    expect(server.closeSpy).toHaveBeenCalledOnce()
+    expect(exitCodes).toContain(0)
+  })
+
+  it('server.close() failure is logged and does NOT prevent client.destroy() exit code', async () => {
+    // #given
+    const {logger, calls} = makeLogger()
+    const client = makeClient(0) // destroy succeeds
+    const server = makeFakeServer(0, true) // close fails
+    const drainMs = 1_000
+    const cleanup = installShutdownHandlers(client, logger, drainMs, server)
+
+    // #when
+    process.emit('SIGTERM')
+    await vi.runAllTimersAsync()
+    cleanup()
+
+    // #then — server.close() failure is logged at warn
+    expect(calls.some(c => c.method === 'warn' && c.msg === 'server.close() failed during shutdown')).toBe(true)
+
+    // #and — client.destroy() succeeded so exit is 0 (not masked by server failure)
+    expect(exitCodes).toContain(0)
+    expect(exitCodes).not.toContain(1)
   })
 })
 

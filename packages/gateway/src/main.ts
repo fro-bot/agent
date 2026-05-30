@@ -3,6 +3,7 @@ import process from 'node:process'
 import {Effect} from 'effect'
 
 import {loadGatewayConfig} from './config.js'
+import {createAnnounceServer} from './http/server.js'
 import {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} from './program.js'
 import {setupReadinessFlag} from './readiness.js'
 
@@ -24,6 +25,7 @@ const program = Effect.gen(function* () {
       login: async (client, token) => {
         await client.login(token)
       },
+      startAnnounceServer: (serverDeps, serverConfig) => createAnnounceServer(serverDeps, serverConfig),
     },
     config,
   )
