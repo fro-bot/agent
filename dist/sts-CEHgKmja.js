@@ -1,1 +1,0 @@
-import{i as e,t}from"./sts-C5iilKLd.js";t();export{e as getDefaultRoleAssumer};
