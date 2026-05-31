@@ -576,9 +576,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           description: [
             `This channel is bound to ${owner}/${repo}.`,
             '',
-            "Once the interaction loop (Unit 6) ships, you'll be able to @-mention me here to ask questions or have me act on the repo.",
-            '',
-            'Until then, this channel is reserved for future use.',
+            '@-mention fro-bot in this channel to ask questions or have it act on the repo.',
           ].join('\n'),
           color: 0x57f287, // success-green
         },

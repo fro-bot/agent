@@ -54,11 +54,12 @@ export interface CloseableServer {
  *
  * On signal:
  * 1. Log 'shutdown initiated' at info.
- * 2. Race `client.destroy()` AND `server.close()` (if provided) against a drain timer (default 25 s).
- * 3. If both win → log 'shutdown clean', exit 0.
- * 4. If timer wins → log 'shutdown timeout', exit 1.
- * 5. If destroy rejects → log 'shutdown failed', exit 1.
- * 6. If server.close() fails → log a warning but do NOT prevent client teardown result.
+ * 2. Optionally await in-flight runs via `awaitInFlight` (bounded by the same drain timer).
+ * 3. Race `client.destroy()` AND `server.close()` (if provided) against a drain timer (default 25 s).
+ * 4. If both win → log 'shutdown clean', exit 0.
+ * 5. If timer wins → log 'shutdown timeout', exit 1.
+ * 6. If destroy rejects → log 'shutdown failed', exit 1.
+ * 7. If server.close() fails → log a warning but do NOT prevent client teardown result.
  *
  * Returns a cleanup function that removes both signal listeners (useful in tests).
  *
@@ -70,6 +71,7 @@ export function installShutdownHandlers(
   logger: GatewayLogger,
   drainMs: number = DEFAULT_DRAIN_MS,
   server?: CloseableServer,
+  awaitInFlight?: () => Promise<void>,
 ): () => void {
   const handler = (signal: string) => {
     if (shuttingDown) {
@@ -86,9 +88,12 @@ export function installShutdownHandlers(
       drainTimer = setTimeout(() => resolve('timeout'), drainMs)
     })
 
-    // Todo 007: return 'failed' on rejection instead of lying with 'clean'.
-    const destroyPromise = client
-      .destroy()
+    // Drain in-flight runs (if a drain function was provided) before destroying the client.
+    // Both steps are subject to the same drain timer — if the timer wins first, we proceed.
+    const inFlightDrain: Promise<void> = awaitInFlight === undefined ? Promise.resolve() : awaitInFlight()
+
+    const destroyPromise = inFlightDrain
+      .then(async () => client.destroy())
       .then(() => 'clean' as const)
       .catch((error: unknown) => {
         logger.warn({err: error}, 'client.destroy() rejected during shutdown')

@@ -224,7 +224,7 @@ describe('installShutdownHandlers', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Server handle tests (Unit 7)
+  // Server handle tests
   // ---------------------------------------------------------------------------
 
   it('calls server.close() during shutdown when a server handle is provided', async () => {
