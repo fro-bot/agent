@@ -4,13 +4,19 @@ import type {GatewayLogger} from './discord/client.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CloseableServer} from './shutdown.js'
 
-import {createS3Adapter} from '@fro-bot/runtime'
+import {
+  createS3Adapter,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_LOCK_TTL_SECONDS,
+  DEFAULT_STALE_THRESHOLD_MS,
+} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 
 import {createBindingsStore} from './bindings/store.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
+import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -109,6 +115,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     }
 
     const s3Adapter = createS3Adapter(config.objectStore, runtimeLogger)
+    const concurrencyRegistry = createConcurrencyRegistry(config.maxConcurrentRuns)
     const bindingsStore = createBindingsStore({
       adapter: s3Adapter,
       storeConfig: config.objectStore,
@@ -154,7 +161,28 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       if (message.author.bot) return
       if (client.user === null) return
       if (!message.mentions.has(client.user.id)) return
-      Effect.runPromise(handleMention(message, client.user.id)).catch((error: unknown) => {
+
+      const mentionDeps = {
+        bindingsStore,
+        triggerRoleId: config.triggerRoleId,
+        run: {
+          coordinationConfig: {
+            storeAdapter: s3Adapter,
+            storeConfig: config.objectStore,
+            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+          },
+          identity: config.identity,
+          concurrency: concurrencyRegistry,
+          attachUrl: config.workspaceOpencodeUrl,
+          attachToken: config.workspaceOpencodeToken,
+          logger,
+        },
+        logger,
+      }
+
+      Effect.runPromise(handleMention(message, client.user.id, mentionDeps)).catch((error: unknown) => {
         logger.error({err: error}, 'mention handler failed')
       })
     })

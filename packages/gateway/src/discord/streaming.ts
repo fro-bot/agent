@@ -10,6 +10,7 @@
  * - All sends go to the thread; never to the parent channel.
  */
 
+import type {MessageMentionTypes} from 'discord.js'
 import type {GatewayLogger} from './client.js'
 
 import {Buffer} from 'node:buffer'
@@ -44,7 +45,7 @@ export interface SinkThread {
 interface SendOptions {
   readonly content?: string
   readonly files?: AttachmentBuilder[]
-  readonly allowedMentions: {readonly parse: readonly string[]}
+  readonly allowedMentions: {readonly parse: readonly MessageMentionTypes[]}
 }
 
 /** Discriminated result of a flush attempt. */

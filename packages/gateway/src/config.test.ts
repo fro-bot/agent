@@ -59,6 +59,11 @@ beforeEach(() => {
     'GATEWAY_PRESENCE_CHANNEL_ID_FILE',
     'GATEWAY_HTTP_PORT',
     'WORKSPACE_AGENT_URL',
+    'WORKSPACE_OPENCODE_URL',
+    'WORKSPACE_OPENCODE_TOKEN',
+    'WORKSPACE_OPENCODE_TOKEN_FILE',
+    'GATEWAY_TRIGGER_ROLE_ID',
+    'GATEWAY_MAX_CONCURRENT_RUNS',
   ]) {
     delete process.env[key]
   }
@@ -405,6 +410,7 @@ function setRequiredEnv(): void {
   process.env.GITHUB_APP_PRIVATE_KEY_FILE = keyFile
   process.env.GATEWAY_WEBHOOK_SECRET = 'test-webhook-secret'
   process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'test-presence-channel-id'
+  process.env.WORKSPACE_OPENCODE_TOKEN = 'test-opencode-token'
 }
 
 describe('loadGatewayConfig', () => {
@@ -1042,6 +1048,118 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
 
     // #then
     expect(config.httpPort).toBe(65535)
+  })
+
+  // ---------------------------------------------------------------------------
+  // workspaceOpencodeUrl / workspaceOpencodeToken / triggerRoleId / maxConcurrentRuns
+  // ---------------------------------------------------------------------------
+
+  it('defaults workspaceOpencodeUrl to http://workspace:9101 when WORKSPACE_OPENCODE_URL is unset', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.workspaceOpencodeUrl).toBe('http://workspace:9101')
+  })
+
+  it('reads WORKSPACE_OPENCODE_URL from env', () => {
+    // #given
+    setRequiredEnv()
+    process.env.WORKSPACE_OPENCODE_URL = 'http://custom-workspace:9200'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.workspaceOpencodeUrl).toBe('http://custom-workspace:9200')
+  })
+
+  it('reads WORKSPACE_OPENCODE_TOKEN from env', () => {
+    // #given
+    setRequiredEnv()
+    process.env.WORKSPACE_OPENCODE_TOKEN = 'my-secret-token'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.workspaceOpencodeToken).toBe('my-secret-token')
+  })
+
+  it('throws when WORKSPACE_OPENCODE_TOKEN is missing', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.WORKSPACE_OPENCODE_TOKEN
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: WORKSPACE_OPENCODE_TOKEN')
+  })
+
+  it('defaults triggerRoleId to null when GATEWAY_TRIGGER_ROLE_ID is unset', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.triggerRoleId).toBeNull()
+  })
+
+  it('reads GATEWAY_TRIGGER_ROLE_ID from env', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_TRIGGER_ROLE_ID = '1234567890'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.triggerRoleId).toBe('1234567890')
+  })
+
+  it('defaults maxConcurrentRuns to 3 when GATEWAY_MAX_CONCURRENT_RUNS is unset', () => {
+    // #given
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.maxConcurrentRuns).toBe(3)
+  })
+
+  it('reads GATEWAY_MAX_CONCURRENT_RUNS from env', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_MAX_CONCURRENT_RUNS = '5'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.maxConcurrentRuns).toBe(5)
+  })
+
+  it('throws when GATEWAY_MAX_CONCURRENT_RUNS is not a positive integer', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_MAX_CONCURRENT_RUNS = 'banana'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_MAX_CONCURRENT_RUNS')
+  })
+
+  it('throws when GATEWAY_MAX_CONCURRENT_RUNS is 0 (below minimum)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_MAX_CONCURRENT_RUNS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_MAX_CONCURRENT_RUNS')
   })
 
   it('edge: GATEWAY_WEBHOOK_SECRET_FILE with trailing newline → trimmed and accepted', () => {

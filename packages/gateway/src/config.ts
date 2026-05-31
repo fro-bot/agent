@@ -27,6 +27,17 @@ export interface GatewayConfig {
   readonly githubAppPrivateKey: string
   readonly gatewayGitHubAppInstallUrl: string
   readonly workspaceAgentUrl: string
+  /** Full base URL of the workspace OpenCode proxy (e.g. `http://workspace:9101`). */
+  readonly workspaceOpencodeUrl: string
+  /** Bearer token for the workspace OpenCode proxy. Never logged. */
+  readonly workspaceOpencodeToken: string
+  /**
+   * Discord role ID that grants trigger authorization.
+   * `null` if unset — falls back to guild-level `ManageChannels`.
+   */
+  readonly triggerRoleId: string | null
+  /** Maximum number of simultaneous active runs across all channels. */
+  readonly maxConcurrentRuns: number
   readonly webhookSecret: string
   readonly presenceChannelId: string
   readonly httpPort: number
@@ -319,6 +330,20 @@ export function loadGatewayConfig(): GatewayConfig {
 
   const workspaceAgentUrl = readOptionalSecret('WORKSPACE_AGENT_URL') ?? 'http://workspace:9100'
 
+  const workspaceOpencodeUrl = readOptionalSecret('WORKSPACE_OPENCODE_URL') ?? 'http://workspace:9101'
+  const workspaceOpencodeToken = readSecret('WORKSPACE_OPENCODE_TOKEN')
+  const triggerRoleId = readOptionalSecret('GATEWAY_TRIGGER_ROLE_ID')
+
+  const rawMaxConcurrent = readOptionalSecret('GATEWAY_MAX_CONCURRENT_RUNS') ?? '3'
+  const maxConcurrentRuns = Number.parseInt(rawMaxConcurrent, 10)
+  if (
+    Number.isFinite(maxConcurrentRuns) === false ||
+    Number.isInteger(maxConcurrentRuns) === false ||
+    maxConcurrentRuns < 1
+  ) {
+    throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
+  }
+
   const webhookSecret = readSecret('GATEWAY_WEBHOOK_SECRET')
   const presenceChannelId = readSecret('GATEWAY_PRESENCE_CHANNEL_ID')
 
@@ -340,6 +365,10 @@ export function loadGatewayConfig(): GatewayConfig {
     githubAppPrivateKey,
     gatewayGitHubAppInstallUrl,
     workspaceAgentUrl,
+    workspaceOpencodeUrl,
+    workspaceOpencodeToken,
+    triggerRoleId,
+    maxConcurrentRuns,
     webhookSecret,
     presenceChannelId,
     httpPort,
