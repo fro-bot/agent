@@ -1,0 +1,405 @@
+import type {CoordinationConfig, RunPhase, RunState} from '@fro-bot/runtime'
+import type {BindingsStore} from '../bindings/store.js'
+import type {GatewayLogger} from '../discord/client.js'
+import type {SinkThread} from '../discord/streaming.js'
+import type {RecoverStaleRunsDeps} from './recovery.js'
+
+import * as runtimeModule from '@fro-bot/runtime'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
+
+import {recoverStaleRuns} from './recovery.js'
+// ---------------------------------------------------------------------------
+// Mock @fro-bot/runtime
+// ---------------------------------------------------------------------------
+
+vi.mock('@fro-bot/runtime', () => ({
+  buildObjectStoreKey: vi.fn(),
+  findStaleRuns: vi.fn(),
+  transitionRun: vi.fn(),
+  releaseLock: vi.fn(),
+}))
+
+// ---------------------------------------------------------------------------
+// Typed mock accessors
+// ---------------------------------------------------------------------------
+
+const mockBuildObjectStoreKey = vi.mocked(runtimeModule.buildObjectStoreKey)
+const mockFindStaleRuns = vi.mocked(runtimeModule.findStaleRuns)
+const mockTransitionRun = vi.mocked(runtimeModule.transitionRun)
+const mockReleaseLock = vi.mocked(runtimeModule.releaseLock)
+
+// ---------------------------------------------------------------------------
+// Test constants
+// ---------------------------------------------------------------------------
+
+const OWNER = 'acme'
+const REPO = 'widget'
+const REPO_SLUG = `${OWNER}/${REPO}`
+const RUN_ID = 'run-stale-001'
+const THREAD_ID = 'thread-123'
+const RUN_KEY = 'state/identity/acme/widget/runs/run-stale-001.json'
+const LOCK_KEY = 'state/coordination/acme/widget/locks/repo.json'
+const RUN_ETAG = 'etag-run-1'
+const LOCK_ETAG = 'etag-lock-1'
+const COORDINATION_IDENTITY = 'coordination'
+
+// ---------------------------------------------------------------------------
+// Factories
+// ---------------------------------------------------------------------------
+
+function makeLogger(): GatewayLogger {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+}
+
+function makeStaleRun(overrides: Partial<{run_id: string; thread_id: string; phase: RunPhase}> = {}): RunState {
+  return {
+    run_id: overrides.run_id ?? RUN_ID,
+    thread_id: overrides.thread_id ?? THREAD_ID,
+    entity_ref: REPO_SLUG,
+    surface: 'discord' as const,
+    phase: overrides.phase ?? 'EXECUTING',
+    started_at: new Date(Date.now() - 300_000).toISOString(),
+    last_heartbeat: new Date(Date.now() - 300_000).toISOString(),
+    holder_id: 'discord-gateway',
+    details: {},
+  }
+}
+
+function makeBinding() {
+  return {owner: OWNER, repo: REPO, channelId: 'ch-1', workspacePath: '/workspace/repos/acme/widget'}
+}
+
+function makeBindingsStore(overrides: {listBindings?: () => Promise<unknown>} = {}): BindingsStore {
+  return {
+    createBinding: vi.fn(),
+    getBindingByRepo: vi.fn(),
+    getBindingByChannelId: vi.fn(),
+    listBindings:
+      overrides.listBindings ??
+      (vi.fn().mockResolvedValue({success: true, data: [makeBinding()]}) as BindingsStore['listBindings']),
+  } as unknown as BindingsStore
+}
+
+function makeCoordinationConfig(): CoordinationConfig {
+  const getObject = vi.fn().mockImplementation(async (key: string) => {
+    if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
+    if (key === LOCK_KEY) return {success: true, data: {data: '{}', etag: LOCK_ETAG}}
+    return {success: false, error: new Error('not found')}
+  })
+
+  return {
+    storeAdapter: {
+      upload: vi.fn(),
+      download: vi.fn(),
+      list: vi.fn(),
+      getObject,
+    },
+    storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+    lockTtlSeconds: 900,
+    heartbeatIntervalMs: 30_000,
+    staleThresholdMs: 60_000,
+  }
+}
+
+function makeResolveThread(thread: SinkThread | null = null): (id: string) => Promise<SinkThread | null> {
+  return vi.fn().mockResolvedValue(thread)
+}
+
+function makeThread(): SinkThread {
+  return {send: vi.fn().mockResolvedValue(undefined)}
+}
+
+function makeDeps(overrides: Partial<RecoverStaleRunsDeps> = {}): RecoverStaleRunsDeps {
+  return {
+    coordinationConfig: overrides.coordinationConfig ?? makeCoordinationConfig(),
+    identity: overrides.identity ?? 'discord-gateway',
+    bindingsStore: overrides.bindingsStore ?? makeBindingsStore(),
+    resolveThread: overrides.resolveThread ?? makeResolveThread(),
+    logger: overrides.logger ?? makeLogger(),
+  }
+}
+
+// Helper to create a ValidationError-shaped object that satisfies the runtime type
+function makeValidationError(message: string): Error & {readonly code: 'VALIDATION_ERROR'} {
+  const error = new Error(message) as Error & {code: 'VALIDATION_ERROR'}
+  error.code = 'VALIDATION_ERROR'
+  return error
+}
+
+type BuildKeyResult = ReturnType<typeof runtimeModule.buildObjectStoreKey>
+
+function okKey(key: string): BuildKeyResult {
+  return {success: true, data: key}
+}
+
+function errKey(message: string): BuildKeyResult {
+  return {success: false, error: makeValidationError(message)} as unknown as BuildKeyResult
+}
+
+// ---------------------------------------------------------------------------
+// Default runtime mock wiring (success path)
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  vi.clearAllMocks()
+
+  mockBuildObjectStoreKey.mockImplementation((_config, _identity, _repo, _type, suffix) => {
+    if (suffix === `${RUN_ID}.json`) return okKey(RUN_KEY)
+    if (suffix === 'repo.json') return okKey(LOCK_KEY)
+    return errKey('unexpected key')
+  })
+
+  mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+  mockTransitionRun.mockResolvedValue({
+    success: true,
+    data: {etag: 'etag-run-2', state: makeStaleRun({phase: 'FAILED'})},
+  })
+  mockReleaseLock.mockResolvedValue({success: true, data: undefined})
+})
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('recoverStaleRuns', () => {
+  describe('no stale runs', () => {
+    it('is a clean no-op when there are no bindings', async () => {
+      // #given
+      const deps = makeDeps({
+        bindingsStore: makeBindingsStore({
+          listBindings: vi.fn().mockResolvedValue({success: true, data: []}),
+        }),
+      })
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then
+      expect(mockFindStaleRuns).not.toHaveBeenCalled()
+      expect(mockTransitionRun).not.toHaveBeenCalled()
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('is a clean no-op when findStaleRuns returns an empty list', async () => {
+      // #given
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const deps = makeDeps()
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then
+      expect(mockFindStaleRuns).toHaveBeenCalledOnce()
+      expect(mockTransitionRun).not.toHaveBeenCalled()
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('happy path — one stale run', () => {
+    it('transitions run to FAILED, releases lock, and posts thread note', async () => {
+      // #given
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+
+      const thread = makeThread()
+      const resolveThread = makeResolveThread(thread)
+      const deps = makeDeps({resolveThread})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
+      expect(resolveThread).toHaveBeenCalledWith(THREAD_ID)
+      expect(thread.send).toHaveBeenCalledWith(expect.objectContaining({allowedMentions: {parse: []}}))
+    })
+  })
+
+  describe('edge cases', () => {
+    it('skips thread note when thread_id cannot be resolved', async () => {
+      // #given
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+
+      const resolveThread = makeResolveThread(null) // thread not found
+      const deps = makeDeps({resolveThread})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — FAILED + lock release still run; just no thread note
+      expect(mockTransitionRun).toHaveBeenCalled()
+      expect(mockReleaseLock).toHaveBeenCalled()
+      const thread = {send: vi.fn()}
+      expect(thread.send).not.toHaveBeenCalled()
+    })
+
+    it('continues sweep when resolveThread throws', async () => {
+      // #given
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+
+      const resolveThread: (id: string) => Promise<SinkThread | null> = vi
+        .fn()
+        .mockRejectedValue(new Error('discord error'))
+      const logger = makeLogger()
+      const deps = makeDeps({resolveThread, logger})
+
+      // #when — must not throw
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then — still transitioned and released despite the throw
+      expect(mockTransitionRun).toHaveBeenCalled()
+      expect(mockReleaseLock).toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID}),
+        expect.stringContaining('thread note'),
+      )
+    })
+  })
+
+  describe('error paths', () => {
+    it('continues sweep when one run transition fails', async () => {
+      // #given
+      const run1 = makeStaleRun({run_id: 'run-001'})
+      const run2 = makeStaleRun({run_id: 'run-002'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [run1, run2]})
+
+      const RUN_KEY_2 = 'state/identity/acme/widget/runs/run-002.json'
+
+      mockBuildObjectStoreKey.mockImplementation((_config, identity, _repo, _type, suffix) => {
+        if (suffix === 'run-001.json') return okKey(RUN_KEY)
+        if (suffix === 'run-002.json') return okKey(RUN_KEY_2)
+        if (suffix === 'repo.json' && identity === COORDINATION_IDENTITY) return okKey(LOCK_KEY)
+        return errKey('unexpected')
+      })
+
+      // Make getObject return etags for both run keys — typed cast is test-only
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
+        if (key === RUN_KEY_2) return {success: true, data: {data: '{}', etag: 'etag-run-2'}}
+        if (key === LOCK_KEY) return {success: true, data: {data: '{}', etag: LOCK_ETAG}}
+        return {success: false, error: new Error('not found')}
+      })
+      const coordConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          ...makeCoordinationConfig().storeAdapter,
+          getObject: getObjectFn,
+        },
+      }
+
+      // run-001 transition fails; run-002 should still be processed
+      mockTransitionRun
+        .mockResolvedValueOnce({success: false, error: new Error('write conflict')})
+        .mockResolvedValueOnce({success: true, data: {etag: 'etag-r2', state: makeStaleRun({phase: 'FAILED'})}})
+
+      const logger = makeLogger()
+      const deps = makeDeps({coordinationConfig: coordConfig, logger})
+
+      // #when — must not throw
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then — both runs attempted; warning logged for run-001; run-002 still released
+      expect(mockTransitionRun).toHaveBeenCalledTimes(2)
+      expect(mockReleaseLock).toHaveBeenCalledTimes(2)
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({runId: 'run-001'}),
+        expect.stringContaining('transitionRun FAILED'),
+      )
+    })
+
+    it('continues sweep when one repo findStaleRuns fails', async () => {
+      // #given
+      const binding1 = {owner: 'acme', repo: 'widget', channelId: 'ch-1', workspacePath: '/w/widget'}
+      const binding2 = {owner: 'acme', repo: 'other', channelId: 'ch-2', workspacePath: '/w/other'}
+
+      const bindingsStore = makeBindingsStore({
+        listBindings: vi.fn().mockResolvedValue({success: true, data: [binding1, binding2]}),
+      })
+
+      // First repo fails; second succeeds with no stale runs
+      mockFindStaleRuns
+        .mockResolvedValueOnce({success: false, error: new Error('list failed')})
+        .mockResolvedValueOnce({success: true, data: []})
+
+      const logger = makeLogger()
+      const deps = makeDeps({bindingsStore, logger})
+
+      // #when
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockFindStaleRuns).toHaveBeenCalledTimes(2)
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({repo: 'acme/widget'}),
+        expect.stringContaining('findStaleRuns failed'),
+      )
+    })
+
+    it('logs an error and returns early when listBindings fails', async () => {
+      // #given
+      const bindingsStore = makeBindingsStore({
+        listBindings: vi.fn().mockResolvedValue({success: false, error: new Error('S3 error')}),
+      })
+      const logger = makeLogger()
+      const deps = makeDeps({bindingsStore, logger})
+
+      // #when
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockFindStaleRuns).not.toHaveBeenCalled()
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({err: 'S3 error'}),
+        expect.stringContaining('listBindings failed'),
+      )
+    })
+  })
+
+  describe('integration — boot with stale run and held lock', () => {
+    it('leaves run as FAILED and lock released so a new mention can proceed', async () => {
+      // #given — simulate a stale EXECUTING run with a held lock
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'new-etag', state: {...staleRun, phase: 'FAILED'}},
+      })
+      mockReleaseLock.mockResolvedValue({success: true, data: undefined})
+
+      const thread = makeThread()
+      const deps = makeDeps({resolveThread: makeResolveThread(thread)})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — state is FAILED, lock is released, thread notified
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
+      expect(thread.send).toHaveBeenCalledWith(expect.objectContaining({allowedMentions: {parse: []}}))
+    })
+  })
+})

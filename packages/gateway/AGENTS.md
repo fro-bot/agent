@@ -76,7 +76,66 @@ Existing deployments that need the privileged set must set this on the next
 deploy. The allowlist is intentionally narrow — operators cannot enable
 arbitrary Discord intents via this knob.
 
-## Known limitations (v1)
+## Mention-triggered execution loop
+
+When a guild member `@fro-bot`s in a channel, `discord/mentions.ts` handles the event:
+
+1. **Thread guard** — skips if the message is already inside a thread (avoids recursive loops).
+2. **Authorization gate** — fetches the member via REST (`guild.members.fetch()`; never via cache, which requires a privileged intent). If `GATEWAY_TRIGGER_ROLE_ID` is configured the member must hold that role; otherwise guild-level `ManageChannels` is required. Any resolution failure is fail-closed: access denied.
+3. **Binding lookup** — resolves the channel to a `RepoBinding` via the object-store index. If the channel has no binding the user is told to run `/fro-bot add-project` first.
+4. **`runMention`** (`execute/run.ts`) — manages the full execution lifecycle inside a `finally`-guarded resource block:
+   - Global concurrency cap + per-channel in-flight guard (in-memory, resets on restart; stale-run recovery handles crash-time stranding).
+   - Thread creation on the source message.
+   - Repo lock acquisition via S3-conditional-write (`coordination/lock.ts`).
+   - Run-state lifecycle: PENDING → ACKNOWLEDGED → EXECUTING, with a heartbeat that renews the lock lease every `HEARTBEAT_INTERVAL_MS`.
+   - OpenCode execution via `execute/opencode-attach.ts` + `execute/run-core.ts`; streaming output is flushed to the thread by `discord/streaming.ts`.
+   - On completion: run transitions to COMPLETED, heartbeat stops, lock is released.
+   - On failure: run transitions to FAILED; a coarse error message (no internal detail) is posted to the thread.
+
+### Authorization details
+
+The trigger authorization gate is the security boundary between Discord users and agent execution. It is deliberately strict:
+
+- Uses `guild.members.fetch()` (REST) — not `members.cache.get()` (which silently returns `undefined` without the `GuildMembers` privileged intent).
+- If `GATEWAY_TRIGGER_ROLE_ID` is set, only members with that role may trigger. Without it, only members with guild-level `ManageChannels` may trigger.
+- Any permission-resolution error → deny (fail closed). The error is logged; the user receives a generic "not authorized" reply.
+
+### Bearer-token attach path
+
+The gateway connects to OpenCode running inside the workspace container via the `WORKSPACE_OPENCODE_URL` endpoint (default `http://workspace:9101`). Every request to that endpoint is authenticated with a shared bearer token read from `WORKSPACE_OPENCODE_TOKEN`. The token is never logged or posted to Discord. The workspace container reverse-proxies OpenCode and validates the token before forwarding.
+
+### OpenCode server port model
+
+The workspace container runs two listening ports:
+
+| Port | Service | Access |
+| ---- | ------- | ------ |
+| 9100 | Workspace agent (clone/setup API) | Internal sandbox network only |
+| 9101 | OpenCode reverse proxy (bearer-authenticated) | Internal sandbox network only |
+
+Both ports are loopback-bound inside the sandbox network. The egress proxy (`mitmproxy`) only permits outbound traffic to the allowlisted hosts; inbound connections from outside the sandbox are not possible by network topology. The gateway reaches these ports via the Docker Compose service DNS name `workspace`.
+
+### Concurrent-run semantics
+
+There is no run queue. When capacity is exhausted or a channel already has an active run, the response is terminal:
+
+- **cap** — global `GATEWAY_MAX_CONCURRENT_RUNS` limit reached → "at capacity, try again shortly".
+- **busy** — this channel already has an active run → "task already running, wait for it to finish".
+- **waiting** — the repo lock is held by another run → "another task in progress for this repo, try again when it completes".
+
+Releasing is always done in a `finally` block so crashes leave the system in a recoverable state.
+
+### Startup stale-run recovery
+
+`execute/recovery.ts` (`recoverStaleRuns`) runs once after Discord login on every gateway startup. It scans all bound repos for runs that were left in the `EXECUTING` phase by a prior crash — the only phase that can be stranded with a held lock and lease (PENDING→ACKNOWLEDGED→EXECUTING all complete synchronously before any interruptible await). For each stranded run it:
+
+1. Transitions the run state to `FAILED` via a conditional-write against the current S3 object etag.
+2. Releases the repo lock so the next mention can proceed.
+3. Posts a brief "previous task interrupted on restart" note to the original thread (best-effort; skipped if the thread is unreachable).
+
+Per-run errors are logged and the sweep continues — one corrupted record does not block recovery for the rest.
+
+## Known limitations
 
 - **`add-project` is Discord-only.** The orchestration runs inside the slash
   command handler and requires a `ChatInputCommandInteraction`; there is no
@@ -86,6 +145,14 @@ arbitrary Discord intents via this knob.
   setup — rather than agent-callable recovery primitives. Extracting a
   Discord-independent `addProject(request, deps)` primitive is deferred until a
   non-Discord caller exists.
+
+- **No run queue.** Mentions that arrive while the concurrency cap or repo lock is held are rejected immediately. There is no persistent queue, no back-pressure mechanism, and no retry. Users must manually re-send their message when the system is free.
+
+- **No approval flow.** The authorization gate is a role check or permission check; there is no interactive approval step between an authorized mention and agent execution.
+
+- **Fresh session per mention.** Each mention starts a new OpenCode session from scratch. There is no conversational continuity across mentions (session persistence is planned but not yet wired into the Discord surface).
+
+- **In-memory concurrency state.** The concurrency registry is per-process and resets on gateway restart. Startup stale-run recovery handles lock/run-state cleanup, but the in-flight concurrency counter is not persisted.
 
 ## Build
 

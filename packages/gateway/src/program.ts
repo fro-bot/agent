@@ -1,9 +1,9 @@
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
+import type {SinkThread} from './discord/streaming.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CloseableServer} from './shutdown.js'
-
 import {
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -11,12 +11,12 @@ import {
   DEFAULT_STALE_THRESHOLD_MS,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
-
 import {createBindingsStore} from './bindings/store.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
+import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -210,7 +210,37 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       catch: error => (error instanceof Error ? error : new Error(String(error))),
     })
 
-    // j. Log startup
+    // j. Stale-run recovery — transition any runs left EXECUTING by a prior crash.
+    //    Called after login so the Discord client is available for best-effort thread notes.
+    //    Errors are logged internally; the startup sequence continues regardless.
+    yield* Effect.tryPromise({
+      try: async () =>
+        recoverStaleRuns({
+          coordinationConfig: {
+            storeAdapter: s3Adapter,
+            storeConfig: config.objectStore,
+            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+          },
+          identity: config.identity,
+          bindingsStore,
+          resolveThread: async (threadId: string): Promise<SinkThread | null> => {
+            try {
+              const channel = await client.channels.fetch(threadId)
+              if (channel === null) return null
+              if (!('send' in channel)) return null
+              return channel
+            } catch {
+              return null
+            }
+          },
+          logger,
+        }),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
+    // k. Log startup
     logger.info({applicationId: config.discordApplicationId}, 'gateway started')
   })
 }
