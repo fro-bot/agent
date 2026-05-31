@@ -1,0 +1,281 @@
+import type {SinkThread} from './streaming.js'
+import {AttachmentBuilder} from 'discord.js'
+import {describe, expect, it, vi} from 'vitest'
+
+import {createDiscordStreamSink} from './streaming.js'
+
+// ---------------------------------------------------------------------------
+// Test doubles
+// ---------------------------------------------------------------------------
+
+function makeThread(sendFn: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue(undefined)): SinkThread & {
+  readonly _send: ReturnType<typeof vi.fn>
+} {
+  return {
+    send: sendFn,
+    _send: sendFn,
+  } as unknown as SinkThread & {readonly _send: ReturnType<typeof vi.fn>}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Extract the first argument of the first call to a mock function. */
+function firstCallArg<T>(fn: ReturnType<typeof vi.fn>): T {
+  const call = fn.mock.calls[0]
+  if (call === undefined) throw new Error('Expected at least one call')
+  return call[0] as T
+}
+
+const SHORT_TEXT = 'Hello from the agent!'
+const LONG_TEXT = 'x'.repeat(2001)
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('createDiscordStreamSink', () => {
+  describe('happy path — short text (<= 2000 chars)', () => {
+    it('sends the buffered text in a single message', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(SHORT_TEXT)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then
+      expect(result.kind).toBe('sent')
+      expect(thread._send).toHaveBeenCalledOnce()
+    })
+
+    it('hardcodes allowedMentions:{parse:[]} on the send', async () => {
+      // #given — agent text contains @everyone, @here, and a role ping
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('@everyone @here <@&12345> come look at this!')
+
+      // #when
+      await sink.flush()
+
+      // #then — allowedMentions MUST be {parse:[]} so nothing pings
+      const call = firstCallArg<{allowedMentions: {parse: string[]}}>(thread._send)
+      expect(call.allowedMentions).toEqual({parse: []})
+    })
+
+    it('includes the buffered text as content', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('agent says hi')
+
+      // #when
+      await sink.flush()
+
+      // #then
+      const call = firstCallArg<{content: string}>(thread._send)
+      expect(call.content).toBe('agent says hi')
+    })
+
+    it('coalesces multiple appended deltas into one send', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('Hello ')
+      sink.append('world')
+      sink.append('!')
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — one send, full text
+      expect(result.kind).toBe('sent')
+      expect(thread._send).toHaveBeenCalledOnce()
+      const call = firstCallArg<{content: string}>(thread._send)
+      expect(call.content).toBe('Hello world!')
+    })
+  })
+
+  describe('happy path — long text (> 2000 chars)', () => {
+    it('posts summary + .md attachment instead of raw long text', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — attachment fallback
+      expect(result.kind).toBe('attachment')
+      expect(thread._send).toHaveBeenCalledOnce()
+
+      const call = firstCallArg<{content: string; files: AttachmentBuilder[]}>(thread._send)
+      expect(call.files).toHaveLength(1)
+      expect(call.files[0]).toBeInstanceOf(AttachmentBuilder)
+      // Must NOT contain the raw long text as a content string
+      expect(call.content).not.toBe(LONG_TEXT)
+    })
+
+    it('hardcodes allowedMentions:{parse:[]} on the attachment send', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+
+      // #when
+      await sink.flush()
+
+      // #then
+      const call = firstCallArg<{allowedMentions: {parse: string[]}}>(thread._send)
+      expect(call.allowedMentions).toEqual({parse: []})
+    })
+
+    it('does not send more than 2000 chars as content', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+
+      // #when
+      await sink.flush()
+
+      // #then — content must be a short summary, not the full 2001-char text
+      const call = firstCallArg<{content?: string}>(thread._send)
+      const contentLength = call.content?.length ?? 0
+      expect(contentLength).toBeLessThanOrEqual(2000)
+    })
+  })
+
+  describe('edge case — empty / whitespace output', () => {
+    it('sends a clear "no output" message when buffer is empty', async () => {
+      // #given — nothing appended
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then
+      expect(result.kind).toBe('empty')
+      expect(thread._send).toHaveBeenCalledOnce()
+      const call = firstCallArg<{content: string}>(thread._send)
+      expect(call.content.trim().length).toBeGreaterThan(0) // not an empty string
+    })
+
+    it('sends a clear "no output" message when buffer is only whitespace', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('   \n\t  ')
+
+      // #when
+      const result = await sink.flush()
+
+      // #then
+      expect(result.kind).toBe('empty')
+      const call = firstCallArg<{content: string}>(thread._send)
+      expect(call.content.trim().length).toBeGreaterThan(0)
+    })
+
+    it('hardcodes allowedMentions:{parse:[]} on the empty-output send', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when
+      await sink.flush()
+
+      // #then
+      const call = firstCallArg<{allowedMentions: {parse: string[]}}>(thread._send)
+      expect(call.allowedMentions).toEqual({parse: []})
+    })
+  })
+
+  describe('error path — thread.send rejects', () => {
+    it('returns {kind:"error"} on short-text send failure without throwing', async () => {
+      // #given
+      const sendFn = vi.fn().mockRejectedValue(new Error('Missing Permissions'))
+      const thread = makeThread(sendFn)
+      const sink = createDiscordStreamSink(thread)
+      sink.append('some text')
+
+      // #when / #then — must NOT throw
+      const result = await sink.flush()
+      expect(result.kind).toBe('error')
+    })
+
+    it('returns {kind:"error"} on attachment send failure without throwing', async () => {
+      // #given
+      const sendFn = vi.fn().mockRejectedValue(new Error('attachment upload failed'))
+      const thread = makeThread(sendFn)
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+
+      // #when / #then — must NOT throw
+      const result = await sink.flush()
+      expect(result.kind).toBe('error')
+    })
+
+    it('returns {kind:"error"} on empty-output send failure without throwing', async () => {
+      // #given
+      const sendFn = vi.fn().mockRejectedValue(new Error('rate limited'))
+      const thread = makeThread(sendFn)
+      const sink = createDiscordStreamSink(thread)
+
+      // #when / #then — must NOT throw
+      const result = await sink.flush()
+      expect(result.kind).toBe('error')
+    })
+  })
+
+  describe('allowedMentions invariant — asserted across all send paths', () => {
+    it('sHORT path: allowedMentions.parse is an empty array', async () => {
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('short text')
+      await sink.flush()
+      const call = firstCallArg<{allowedMentions: {parse: unknown[]}}>(thread._send)
+      expect(Array.isArray(call.allowedMentions.parse)).toBe(true)
+      expect(call.allowedMentions.parse).toHaveLength(0)
+    })
+
+    it('lONG path: allowedMentions.parse is an empty array', async () => {
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+      await sink.flush()
+      const call = firstCallArg<{allowedMentions: {parse: unknown[]}}>(thread._send)
+      expect(Array.isArray(call.allowedMentions.parse)).toBe(true)
+      expect(call.allowedMentions.parse).toHaveLength(0)
+    })
+
+    it('eMPTY path: allowedMentions.parse is an empty array', async () => {
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      await sink.flush()
+      const call = firstCallArg<{allowedMentions: {parse: unknown[]}}>(thread._send)
+      expect(Array.isArray(call.allowedMentions.parse)).toBe(true)
+      expect(call.allowedMentions.parse).toHaveLength(0)
+    })
+  })
+
+  describe('buffered()', () => {
+    it('returns the current accumulated buffer without side-effects', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('alpha')
+      sink.append(' beta')
+
+      // #when
+      const snapshot = sink.buffered()
+
+      // #then — read-only, no send triggered
+      expect(snapshot).toBe('alpha beta')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+  })
+})

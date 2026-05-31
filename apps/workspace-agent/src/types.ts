@@ -56,4 +56,6 @@ export type CloneErrorCode =
 /** GET /healthz response. */
 export interface HealthzResponse {
   readonly ok: true
+  /** OpenCode server readiness. Present when the server lifecycle is managed. */
+  readonly opencode?: 'ready' | 'starting' | 'down'
 }

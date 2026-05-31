@@ -1,148 +1,427 @@
-import type {Message, TextChannel} from 'discord.js'
+import type {Guild, GuildMember, Message, TextChannel} from 'discord.js'
+import type {BindingsStore} from '../bindings/store.js'
+import type {MentionDeps} from './mentions.js'
+
+import {PermissionsBitField} from 'discord.js'
 import {Effect} from 'effect'
-import {describe, expect, it, vi} from 'vitest'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
+
+// ---------------------------------------------------------------------------
+// Mock execute/run so mentions.test.ts does not need a full coordination stack
+// ---------------------------------------------------------------------------
+
+vi.mock('../execute/run.js', () => ({
+  runMention: vi.fn().mockResolvedValue(undefined),
+}))
 
 const BOT_USER_ID = 'bot-user-123'
+const CHANNEL_ID = 'ch-abc'
+const TRIGGER_ROLE_ID = 'role-xyz'
+
+// ---------------------------------------------------------------------------
+// Test doubles
+// ---------------------------------------------------------------------------
+
+function makeGuildMember(overrides: {hasRole?: boolean; hasManageChannels?: boolean} = {}): GuildMember {
+  const {hasRole = false, hasManageChannels = false} = overrides
+  const permissions = new PermissionsBitField(hasManageChannels ? PermissionsBitField.Flags.ManageChannels : 0n)
+  return {
+    roles: {
+      cache: {
+        has: (roleId: string) => hasRole && roleId === TRIGGER_ROLE_ID,
+      },
+    },
+    permissions,
+  } as unknown as GuildMember
+}
+
+function makeGuild(member: GuildMember | null | 'throw'): Guild {
+  return {
+    members: {
+      fetch: async (_userId: string): Promise<GuildMember> => {
+        if (member === 'throw') throw new Error('fetch failed')
+        if (member === null) throw new Error('unknown member')
+        return member
+      },
+    },
+  } as unknown as Guild
+}
+
+function makeReplyFn(): ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(undefined)
+}
 
 function makeMessage(
   overrides: Partial<{
     isThread: boolean
     mentionsBot: boolean
-    sendFn: ReturnType<typeof vi.fn>
-    startThreadFn: ReturnType<typeof vi.fn>
-    reactFn: ReturnType<typeof vi.fn>
+    guildMember: GuildMember | null | 'throw'
+    guild: Guild | null
     replyFn: ReturnType<typeof vi.fn>
-  }>,
+    startThreadFn: ReturnType<typeof vi.fn>
+    content: string
+  }> = {},
 ): Message {
   const {
     isThread = false,
     mentionsBot = true,
-    sendFn = vi.fn().mockResolvedValue(undefined),
-    startThreadFn,
-    reactFn = vi.fn().mockResolvedValue(undefined),
-    replyFn = vi.fn().mockResolvedValue(undefined),
+    guild: guildOverride,
+    guildMember = makeGuildMember({hasManageChannels: true}),
+    replyFn = makeReplyFn(),
+    startThreadFn = vi.fn().mockResolvedValue({id: 'thread-1', send: vi.fn().mockResolvedValue(undefined)}),
+    content = 'please do the thing',
   } = overrides
 
-  const startThread = startThreadFn ?? vi.fn().mockResolvedValue({send: sendFn})
+  const guild = guildOverride === undefined ? makeGuild(guildMember) : guildOverride
 
   return {
     channel: {
+      id: CHANNEL_ID,
       isThread: () => isThread,
     } as unknown as TextChannel,
     mentions: {
       has: (id: string) => mentionsBot && id === BOT_USER_ID,
     },
-    startThread,
-    react: reactFn,
+    author: {id: 'user-111', bot: false},
+    guild,
+    startThread: startThreadFn,
     reply: replyFn,
-    _startThread: startThread, // expose for assertions
+    content,
   } as unknown as Message
 }
 
+function makeBindingsStore(result: 'found' | 'not-found' | 'error'): BindingsStore {
+  const getBindingByChannelId = vi.fn(async (_channelId: string) => {
+    if (result === 'found') {
+      return {
+        success: true as const,
+        data: {
+          owner: 'acme',
+          repo: 'widget',
+          channelId: CHANNEL_ID,
+          channelName: 'widget-dev',
+          workspacePath: '/repo',
+          createdAt: '2026-01-01T00:00:00Z',
+          createdByDiscordId: 'user-1',
+        },
+      }
+    }
+    if (result === 'not-found') {
+      return {success: true as const, data: null}
+    }
+    // error
+    return {success: false as const, error: new Error('store connection error')}
+  })
+  return {getBindingByChannelId} as unknown as BindingsStore
+}
+
+function makeRunMentionDeps(): MentionDeps['run'] {
+  return {
+    coordinationConfig: {} as MentionDeps['run']['coordinationConfig'],
+    identity: 'discord-gateway',
+    concurrency: {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: vi.fn(),
+      activeCount: vi.fn().mockReturnValue(0),
+      max: 3,
+    },
+    attachUrl: 'http://workspace:9200',
+    attachToken: 'secret-token',
+    runTimeoutMs: 600_000,
+    botUserId: 'bot-user-id',
+    logger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+  }
+}
+
+function makeNoopLogger(): MentionDeps['logger'] {
+  return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+}
+
+function makeDeps(overrides: Partial<MentionDeps> = {}): MentionDeps {
+  return {
+    bindingsStore: overrides.bindingsStore ?? makeBindingsStore('found'),
+    triggerRoleId: overrides.triggerRoleId === undefined ? null : overrides.triggerRoleId,
+    run: overrides.run ?? makeRunMentionDeps(),
+    logger: overrides.logger ?? makeNoopLogger(),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 describe('handleMention', () => {
-  it('creates a thread and replies "pong" when bot is mentioned in a non-thread channel', async () => {
-    // #given
-    const {handleMention} = await import('./mentions.js')
-    const sendFn = vi.fn().mockResolvedValue(undefined)
-    const message = makeMessage({isThread: false, mentionsBot: true, sendFn})
+  let runMentionMock: ReturnType<typeof vi.fn>
 
-    // #when
-    await Effect.runPromise(handleMention(message, BOT_USER_ID))
-
-    // #then
-    expect((message as unknown as {_startThread: ReturnType<typeof vi.fn>})._startThread).toHaveBeenCalledWith({
-      name: 'fro-bot session',
-    })
-    expect(sendFn).toHaveBeenCalledWith('pong')
+  beforeEach(async () => {
+    const runModule = await import('../execute/run.js')
+    runMentionMock = vi.mocked(runModule.runMention)
+    runMentionMock.mockReset()
+    runMentionMock.mockResolvedValue(undefined)
   })
 
-  it('skips when message is already in a thread', async () => {
-    // #given
-    const {handleMention} = await import('./mentions.js')
-    const message = makeMessage({isThread: true, mentionsBot: true})
+  // ── Early guards ────────────────────────────────────────────────────────────
 
-    // #when
-    await Effect.runPromise(handleMention(message, BOT_USER_ID))
+  describe('early guards', () => {
+    it('skips (no-op) when message is already in a thread', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const replyFn0 = makeReplyFn()
+      const message = makeMessage({isThread: true, replyFn: replyFn0})
+      const deps = makeDeps()
 
-    // #then — no thread created
-    expect((message as unknown as {_startThread: ReturnType<typeof vi.fn>})._startThread).not.toHaveBeenCalled()
-  })
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
 
-  it('skips when bot is not actually mentioned (reply-chain only)', async () => {
-    // #given
-    const {handleMention} = await import('./mentions.js')
-    const message = makeMessage({isThread: false, mentionsBot: false})
-
-    // #when
-    await Effect.runPromise(handleMention(message, BOT_USER_ID))
-
-    // #then — no thread created
-    expect((message as unknown as {_startThread: ReturnType<typeof vi.fn>})._startThread).not.toHaveBeenCalled()
-  })
-
-  it('still attempts fallback reply when both startThread and react fail, then fails with the original error', async () => {
-    // #given startThread rejects AND react also rejects (e.g. global rate limit)
-    const {handleMention} = await import('./mentions.js')
-    const startThreadError = new Error('startThread rate limit')
-    const startThreadFn = vi.fn().mockRejectedValue(startThreadError)
-    const reactFn = vi.fn().mockRejectedValue(new Error('react also rate limited'))
-    const replyFn = vi.fn().mockResolvedValue(undefined)
-    const message = makeMessage({startThreadFn, reactFn, replyFn})
-
-    // #when
-    const result = await Effect.runPromise(Effect.either(handleMention(message, BOT_USER_ID)))
-
-    // #then — Effect still fails with the ORIGINAL startThread error
-    expect(result._tag).toBe('Left')
-    expect((result as {_tag: 'Left'; left: unknown}).left).toBeInstanceOf(Error)
-    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toContain('startThread rate limit')
-    // #and — react was attempted (and failed)
-    expect(reactFn).toHaveBeenCalledWith('❌')
-    // #and — fallback reply was still attempted despite react failing
-    expect(replyFn).toHaveBeenCalledOnce()
-  })
-
-  it('preserves the original startThread error when fallback reply also fails', async () => {
-    // #given startThread rejects, react succeeds, reply rejects
-    const {handleMention} = await import('./mentions.js')
-    const startThreadError = new Error('startThread permission denied')
-    const startThreadFn = vi.fn().mockRejectedValue(startThreadError)
-    const reactFn = vi.fn().mockResolvedValue(undefined)
-    const replyFn = vi.fn().mockRejectedValue(new Error('reply also failed'))
-    const message = makeMessage({startThreadFn, reactFn, replyFn})
-
-    // #when
-    const result = await Effect.runPromise(Effect.either(handleMention(message, BOT_USER_ID)))
-
-    // #then — Effect fails with the original startThread error, not the reply error
-    expect(result._tag).toBe('Left')
-    expect((result as {_tag: 'Left'; left: unknown}).left).toBeInstanceOf(Error)
-    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toContain('startThread permission denied')
-    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).not.toContain('reply also failed')
-  })
-
-  it('reacts ❌ and sends fallback reply when startThread fails, then fails with the original error', async () => {
-    // #given
-    const {handleMention} = await import('./mentions.js')
-    const threadError = new Error('Missing Permissions')
-    const startThreadFn = vi.fn().mockRejectedValue(threadError)
-    const reactFn = vi.fn().mockResolvedValue(undefined)
-    const replyFn = vi.fn().mockResolvedValue(undefined)
-    const message = makeMessage({isThread: false, mentionsBot: true, startThreadFn, reactFn, replyFn})
-
-    // #when
-    const result = await Effect.runPromise(Effect.either(handleMention(message, BOT_USER_ID)))
-
-    // #then — react was called with ❌
-    expect(reactFn).toHaveBeenCalledWith('❌')
-
-    // #and — fallback reply was sent with the expected content
-    expect(replyFn).toHaveBeenCalledWith({
-      content: 'Could not start a session here — please try again or check channel permissions.',
+      // #then — no reply, no runMention
+      expect(replyFn0).not.toHaveBeenCalled()
+      expect(runMentionMock).not.toHaveBeenCalled()
     })
 
-    // #and — the Effect still fails with the original startThread error
-    expect(result._tag).toBe('Left')
-    expect((result as {_tag: 'Left'; left: unknown}).left).toBe(threadError)
+    it('skips (no-op) when bot is not actually mentioned (reply-chain only)', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const replyFn1 = makeReplyFn()
+      const message = makeMessage({mentionsBot: false, replyFn: replyFn1})
+      const deps = makeDeps()
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then
+      expect(replyFn1).not.toHaveBeenCalled()
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── Authorization gate ──────────────────────────────────────────────────────
+
+  describe('authorization gate', () => {
+    it('denies with "not authorized" reply when member lacks triggerRoleId', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasRole: false, hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({triggerRoleId: TRIGGER_ROLE_ID})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then
+      expect(replyFn).toHaveBeenCalledOnce()
+      const reply0 = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
+      expect(reply0?.content).toContain('not authorized')
+      expect(reply0?.allowedMentions).toEqual({parse: []})
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+
+    it('allows when member has the triggerRoleId', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasRole: true})
+      const message = makeMessage({guildMember: member})
+      const deps = makeDeps({triggerRoleId: TRIGGER_ROLE_ID})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — runMention was called (not blocked)
+      expect(runMentionMock).toHaveBeenCalledOnce()
+    })
+
+    it('denies with "not authorized" reply when triggerRoleId is null and member lacks ManageChannels', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: false})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({triggerRoleId: null})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then
+      expect(replyFn).toHaveBeenCalledOnce()
+      const reply1 = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
+      expect(reply1?.content).toContain('not authorized')
+      expect(reply1?.allowedMentions).toEqual({parse: []})
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+
+    it('allows when triggerRoleId is null and member has ManageChannels', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const message = makeMessage({guildMember: member})
+      const deps = makeDeps({triggerRoleId: null})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — runMention called
+      expect(runMentionMock).toHaveBeenCalledOnce()
+    })
+
+    it('fails closed (denies) when guild.members.fetch throws', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: 'throw', replyFn})
+      const deps = makeDeps({triggerRoleId: null})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — fail-closed: deny, no execution
+      expect(replyFn).toHaveBeenCalledOnce()
+      const reply2 = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
+      expect(reply2?.content).toContain('not authorized')
+      expect(reply2?.allowedMentions).toEqual({parse: []})
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+
+    it('skips (no-op) when guild is null (DM context)', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guild: null, replyFn})
+      const deps = makeDeps()
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — no reply, no execution (silently skipped — DM with no guild)
+      expect(replyFn).not.toHaveBeenCalled()
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── Binding lookup ──────────────────────────────────────────────────────────
+
+  describe('binding lookup', () => {
+    it('replies with "not bound" when no binding exists for the channel', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({bindingsStore: makeBindingsStore('not-found'), triggerRoleId: null})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then
+      expect(replyFn).toHaveBeenCalledOnce()
+      const reply3 = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
+      expect(reply3?.content).toContain('not bound')
+      expect(reply3?.allowedMentions).toEqual({parse: []})
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+
+    it('replies with "try again" when binding store returns an error', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({bindingsStore: makeBindingsStore('error'), triggerRoleId: null})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — coarse message, no internal detail
+      expect(replyFn).toHaveBeenCalledOnce()
+      const call = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
+      expect(call?.allowedMentions).toEqual({parse: []})
+      // Must not leak the internal error message
+      expect(call?.content).not.toContain('store connection error')
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── Happy path ──────────────────────────────────────────────────────────────
+
+  describe('authorized happy path', () => {
+    it('calls runMention with the correct binding after auth + binding succeed', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const message = makeMessage({guildMember: member})
+      const runDeps = makeRunMentionDeps()
+      const deps = makeDeps({triggerRoleId: null, run: runDeps})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then — runMention called with the right binding
+      expect(runMentionMock).toHaveBeenCalledOnce()
+      const [calledMessage, calledBinding, calledDeps] = runMentionMock.mock.calls[0] as [Message, unknown, unknown]
+      const binding = calledBinding as {owner: string; repo: string}
+      expect(calledMessage).toBe(message)
+      expect(binding.owner).toBe('acme')
+      expect(binding.repo).toBe('widget')
+      expect(calledDeps).toBe(runDeps)
+    })
+
+    it('does not expose binding lookup result to binding store errors (no runMention call)', async () => {
+      // #given
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const message = makeMessage({guildMember: member})
+      const deps = makeDeps({bindingsStore: makeBindingsStore('error')})
+
+      // #when
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+
+      // #then
+      expect(runMentionMock).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── allowedMentions invariant ───────────────────────────────────────────────
+
+  describe('allowedMentions: {parse: []} invariant', () => {
+    const expectSafeReply = (replyFn: ReturnType<typeof vi.fn>) => {
+      for (const call of replyFn.mock.calls) {
+        const arg = call[0] as {allowedMentions?: unknown}
+        expect(arg.allowedMentions).toEqual({parse: []})
+      }
+    }
+
+    it('unauthorized reply uses allowedMentions: {parse: []}', async () => {
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: false})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({triggerRoleId: null})
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+      expectSafeReply(replyFn)
+    })
+
+    it('not-bound reply uses allowedMentions: {parse: []}', async () => {
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({bindingsStore: makeBindingsStore('not-found')})
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+      expectSafeReply(replyFn)
+    })
+
+    it('store-error reply uses allowedMentions: {parse: []}', async () => {
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+      const deps = makeDeps({bindingsStore: makeBindingsStore('error')})
+      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
+      expectSafeReply(replyFn)
+    })
   })
 })

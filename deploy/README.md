@@ -5,7 +5,7 @@ Docker Compose v2 stack for the fro-bot gateway. Runs three services:
 | Service     | Role                                                                              |
 | ----------- | --------------------------------------------------------------------------------- |
 | `gateway`   | Discord gateway daemon — connects to Discord, handles slash commands and mentions |
-| `workspace` | Workspace agent container (placeholder in v1; real agent wired in Unit 7)         |
+| `workspace` | Workspace agent container — sandboxed git + OpenCode execution                    |
 | `mitmproxy` | Egress proxy enforcing an allowlist of permitted outbound hosts                   |
 
 ## Prerequisites
@@ -75,6 +75,23 @@ touch deploy/secrets/discord-guild-id
 # the gateway after writing the new value.
 touch deploy/secrets/discord-privileged-intents
 # echo -n 'MessageContent,GuildMembers' > deploy/secrets/discord-privileged-intents
+
+# Workspace OpenCode bearer token (required for the OpenCode attach path).
+# The workspace proxy validates this token; the gateway presents the same
+# value when attaching. Generate a strong shared secret:
+openssl rand -hex 32 > deploy/secrets/workspace-opencode-token
+
+# Optional — override the workspace OpenCode proxy URL.
+# Default: http://workspace:9200 (internal Docker Compose service name).
+# Change only if the workspace container is not on the same Compose network.
+touch deploy/secrets/workspace-opencode-url
+# echo -n 'http://workspace:9200' > deploy/secrets/workspace-opencode-url
+
+# Optional — Discord role ID that grants trigger authorization.
+# If set, only members with this role may @-mention the bot to start an agent run.
+# If unset, falls back to guild-level ManageChannels permission.
+touch deploy/secrets/gateway-trigger-role-id
+# echo -n 'YOUR_ROLE_ID' > deploy/secrets/gateway-trigger-role-id
 
 # GitHub App credentials (required — see "GitHub App" section below)
 echo -n 'YOUR_GITHUB_APP_ID'          > deploy/secrets/github-app-id
@@ -162,6 +179,9 @@ Run the full `touch` block from [Create secrets](#2-create-secrets) on every upg
 | `deploy/secrets/aws-secret-access-key` | AWS secret key for explicit S3 authentication | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/aws-session-token` | AWS session token for STS temporary credentials | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/s3-endpoint` | Custom S3-compatible endpoint (e.g. Cloudflare R2) | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/workspace-opencode-token` | Shared bearer token for the workspace OpenCode reverse proxy (required for the OpenCode attach path) | OpenCode attach; existing deployments must create this file on upgrade |
+| `deploy/secrets/workspace-opencode-url` | Base URL of the workspace OpenCode proxy (default: `http://workspace:9200`). Override only when the workspace container is not on the same Compose network. | OpenCode attach; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/gateway-trigger-role-id` | Discord role ID that grants trigger authorization. If unset, falls back to guild-level `ManageChannels`. | Mention-loop trigger gate; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/github-app-id` | GitHub App ID (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 | `deploy/secrets/github-app-private-key` | GitHub App private key PEM (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 
@@ -208,6 +228,17 @@ The gateway auto-discovers the installation ID at runtime — you do not need to
 
 - **Under-privileged** (e.g. `contents: none`): the gateway returns an error at `/add-project` time with a message naming the missing permissions and a link to the installation settings page.
 - **Over-privileged** (e.g. `contents: write` when only `read` is required): the gateway logs a `WARN` entry listing the over-privileged scopes but does not block the request. Operators should review and reduce permissions to the minimum needed.
+
+## Workspace Port Model
+
+The workspace container exposes two internal ports, both accessible only within the Docker Compose sandbox network:
+
+| Port | Service | Purpose |
+| --- | --- | --- |
+| 9100 | Workspace agent (`workspace-api`) | Handles repo clone requests from the `/add-project` slash command |
+| 9200 | OpenCode reverse proxy | Bearer-authenticated endpoint the gateway uses when attaching to an OpenCode session. Validates `WORKSPACE_OPENCODE_TOKEN` before forwarding to the loopback-bound OpenCode process. |
+
+Neither port is exposed on the host. The egress proxy (`mitmproxy`) permits only outbound traffic to the allowlisted hosts; these ports are inbound-only from the gateway's perspective and not reachable from outside the sandbox network.
 
 ## Stopping the Stack
 

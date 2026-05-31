@@ -18,9 +18,19 @@ const MAX_BODY_BYTES = 4096
 /** Simplified clone executor signature for dependency injection. */
 export type CloneExecutorFn = (request: CloneRequest, deps?: CloneHandlerDeps) => Promise<CloneHandlerResult>
 
+/** OpenCode readiness state shared between the lifecycle and the server. */
+export type OpencodeStatus = 'starting' | 'ready' | 'down'
+
+export interface OpencodeStatusRef {
+  /** Current readiness. Updated by the lifecycle holder. */
+  status: OpencodeStatus
+}
+
 export interface ServerDeps {
   /** Injected clone executor for testability. */
   readonly cloneExecutor?: CloneExecutorFn
+  /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
+  readonly opencodeStatus?: OpencodeStatusRef
 }
 
 /**
@@ -29,12 +39,13 @@ export interface ServerDeps {
  * @param deps - Optional dependency overrides for testing.
  */
 export function createApp(deps: ServerDeps = {}): Hono {
-  const {cloneExecutor = executeClone} = deps
+  const {cloneExecutor = executeClone, opencodeStatus} = deps
   const app = new Hono()
 
   // GET /healthz — liveness probe
   app.get('/healthz', c => {
-    const body: HealthzResponse = {ok: true}
+    const body: HealthzResponse =
+      opencodeStatus === undefined ? {ok: true} : {ok: true, opencode: opencodeStatus.status}
     return c.json(body, 200)
   })
 
