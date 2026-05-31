@@ -334,15 +334,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 function isAuthError(response: {readonly error?: unknown}): boolean {
   if (response.error == null) return false
   const error = response.error
-  // Check numeric status field (SDK wraps HTTP responses as {status, message})
+  // Rely solely on the numeric status field (SDK wraps HTTP responses as {status, message}).
+  // String-substring matching on "401"/"unauthorized"/"forbidden" produced false positives
+  // when non-auth error messages contained those tokens.
   if (typeof error === 'object' && error !== null) {
     const statusLike = (error as Record<string, unknown>).status
     if (statusLike === 401 || statusLike === 403) return true
   }
-  const msg = String(
-    typeof error === 'object' && error !== null
-      ? ((error as Record<string, unknown>).message ?? JSON.stringify(error))
-      : error,
-  ).toLowerCase()
-  return msg.includes('401') || msg.includes('unauthorized') || msg.includes('forbidden')
+  return false
 }

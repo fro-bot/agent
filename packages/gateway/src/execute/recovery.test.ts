@@ -401,5 +401,48 @@ describe('recoverStaleRuns', () => {
       expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
       expect(thread.send).toHaveBeenCalledWith(expect.objectContaining({allowedMentions: {parse: []}}))
     })
+
+    it('skips lock release when fetchLockRecord returns runId: null (unparseable/missing run_id)', async () => {
+      // #given — stale run with lock content that has no parseable run_id
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'new-etag', state: {...staleRun, phase: 'FAILED'}},
+      })
+
+      // Build a coordination config where the lock content has no run_id field
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY) return {success: true, data: {etag: RUN_ETAG, data: JSON.stringify({phase: 'EXECUTING'})}}
+        if (key === LOCK_KEY) {
+          // Lock exists but has NO run_id — fetchLockRecord will return {etag, runId: null}
+          return {success: true, data: {etag: LOCK_ETAG, data: JSON.stringify({holder: 'some-unknown-holder'})}}
+        }
+        return {success: false, error: new Error('not found')}
+      })
+      const base = makeCoordinationConfig()
+      const coordConfig: CoordinationConfig = {
+        ...base,
+        storeAdapter: {...base.storeAdapter, getObject: getObjectFn},
+      }
+
+      const deps = makeDeps({coordinationConfig: coordConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — lock release is NOT called (ownership mismatch — runId: null !== stale RUN_ID)
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+      // #and — transition still happened
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+    })
   })
 })

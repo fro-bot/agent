@@ -498,6 +498,112 @@ describe('runMention', () => {
       const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
     })
+
+    it('flushes partial sink output on timeout path before posting error', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('partial output'),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush called on error path
+      expect(flushMock).toHaveBeenCalledOnce()
+      // #and — error message sent after flush
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toContain('timed out')
+    })
+
+    it('flushes partial sink output on stream-ended path before posting error', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('partial'),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then
+      expect(flushMock).toHaveBeenCalledOnce()
+    })
+
+    it('flushes partial sink output on session-error path before posting error', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('partial'),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then
+      expect(flushMock).toHaveBeenCalledOnce()
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toContain('failed')
+    })
+
+    it('does not flush when sink was never created (pre-EXECUTING error)', async () => {
+      // #given — transitionRun(EXECUTING) throws before sink is created
+      const {runMention} = await import('./run.js')
+      const flushMock = vi.fn()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue(''),
+      })
+      setupHappyPath()
+      // Make EXECUTING transition fail — error caught before sink is created
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'ack-etag', state: {} as unknown as import('@fro-bot/runtime').RunState},
+        }) // ACKNOWLEDGED
+        .mockRejectedValueOnce(new Error('EXECUTING transition threw')) // EXECUTING
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush NOT called because sink was never initialized
+      expect(flushMock).not.toHaveBeenCalled()
+    })
   })
 
   // ── Security invariants ──────────────────────────────────────────────────
@@ -546,6 +652,74 @@ describe('runMention', () => {
         const arg = call[0] as {allowedMentions?: unknown}
         expect(arg.allowedMentions).toEqual({parse: []})
       }
+    })
+  })
+
+  // ── Heartbeat stop failure ───────────────────────────────────────────────
+
+  describe('heartbeat stop failure', () => {
+    it('logs, proceeds with last-known etags, transitions to terminal state, releases lock — does not throw', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const stopError = new Error('heartbeat stop S3 error')
+      const stopMock = vi.fn().mockResolvedValue({success: false, error: stopError})
+      setupHappyPath({stop: stopMock})
+      // run-core throws so we reach the error catch with a stopped heartbeat
+      const {RunCoreError} = runCoreModule
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const deps = makeDeps({logger})
+      const thread = makeThread()
+      const message = makeMessage(thread)
+
+      // #when — must not throw
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — warning logged for heartbeat stop failure
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({err: stopError.message}),
+        expect.stringContaining('heartbeat stop failed'),
+      )
+
+      // #and — terminal FAILED transition still attempted
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('FAILED')
+
+      // #and — lock release still attempted in finally
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+
+      // #and — concurrency slot released
+      const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+
+    it('on success path: heartbeat.stop() failure logs warning and continues to COMPLETED', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const stopError = new Error('stop S3 timeout')
+      const stopMock = vi.fn().mockResolvedValue({success: false, error: stopError})
+      setupHappyPath({stop: stopMock})
+
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const deps = makeDeps({logger})
+      const message = makeMessage()
+
+      // #when
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — warning logged
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({err: stopError.message}),
+        expect.stringContaining('heartbeat stop failed'),
+      )
+
+      // #and — COMPLETED transition still attempted
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('COMPLETED')
+
+      // #and — lock released
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
     })
   })
 })

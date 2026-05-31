@@ -540,10 +540,10 @@ describe('runOpenCodeCore', () => {
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'auth'})
     })
 
-    it('throws RunCoreError with kind "auth" on "forbidden" proxy response', async () => {
-      // #given
+    it('throws RunCoreError with kind "auth" on 403 forbidden response', async () => {
+      // #given — 403 Forbidden with numeric status (after tightening isAuthError to numeric-only)
       const handle = makeHandle({
-        sessionCreate: async () => Promise.resolve({data: null, error: {message: 'Forbidden'}}),
+        sessionCreate: async () => Promise.resolve({data: null, error: {status: 403, message: 'Forbidden'}}),
       })
       const params = buildParams(handle)
 
@@ -610,6 +610,89 @@ describe('runOpenCodeCore', () => {
 
       // #then — no content was appended
       expect(sink._appended).toHaveLength(0)
+    })
+  })
+
+  describe('isAuthError classification', () => {
+    it('classifies numeric status 401 as auth error', async () => {
+      // #given — session.create returns an error with status 401
+      const handle = makeHandle({
+        sessionCreate: async () => ({
+          data: null,
+          error: {status: 401, message: 'Unauthorized'},
+        }),
+      })
+      const params = buildParams(handle)
+
+      // #when / #then — RunCoreError with kind 'auth'
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('auth')
+    })
+
+    it('classifies numeric status 403 as auth error', async () => {
+      // #given
+      const handle = makeHandle({
+        sessionCreate: async () => ({
+          data: null,
+          error: {status: 403, message: 'Forbidden'},
+        }),
+      })
+      const params = buildParams(handle)
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('auth')
+    })
+
+    it('does NOT classify as auth when message contains "401" but status is not 401/403', async () => {
+      // #given — error message happens to contain "401" but is not a real auth failure
+      const handle = makeHandle({
+        sessionCreate: async () => ({
+          data: null,
+          error: {status: 500, message: 'Internal error: connection pool 401-queue exhausted'},
+        }),
+      })
+      const params = buildParams(handle)
+
+      // #when / #then — should be 'unreachable', NOT 'auth'
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).not.toBe('auth')
+      expect((err as RunCoreError).kind).toBe('unreachable')
+    })
+
+    it('does NOT classify as auth when message contains "unauthorized" but has no numeric auth status', async () => {
+      // #given
+      const handle = makeHandle({
+        sessionCreate: async () => ({
+          data: null,
+          error: {message: 'The token is unauthorized for this operation', status: 500},
+        }),
+      })
+      const params = buildParams(handle)
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).not.toBe('auth')
+    })
+
+    it('does NOT classify as auth when error has no status field at all', async () => {
+      // #given — error object with no status (pure network failure)
+      const handle = makeHandle({
+        sessionCreate: async () => ({
+          data: null,
+          error: {message: 'ECONNREFUSED'},
+        }),
+      })
+      const params = buildParams(handle)
+
+      // #when / #then — falls through to 'unreachable'
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('unreachable')
     })
   })
 })

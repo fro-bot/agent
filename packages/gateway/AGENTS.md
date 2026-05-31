@@ -160,6 +160,10 @@ Per-run errors are logged and the sweep continues — one corrupted record does 
 
 - **In-memory concurrency state.** The concurrency registry is per-process and resets on gateway restart. Startup stale-run recovery handles lock/run-state cleanup, but the in-flight concurrency counter is not persisted.
 
+- **Output is posted at run completion, not streamed incrementally.** The sink accumulates the full agent response in memory and flushes it to the Discord thread when the run completes (or, on failure, best-effort partial output is flushed before the coarse error reply). Output is NOT streamed incrementally to Discord during execution.
+
+- **`heartbeat.stop()` failure can leave a run stuck.** If `heartbeat.stop()` returns an error, the gateway logs a warning and proceeds with last-known etags, but the run may remain in EXECUTING with the lock held until the lease expires. The next startup recovery sweep will detect and heal the stale run automatically.
+
 ## Build
 
 ```bash

@@ -50,6 +50,9 @@ export interface RecoverStaleRunsDeps {
 // ---------------------------------------------------------------------------
 
 /** Lock identity constant — matches the hardcoded value in coordination/lock.ts */
+// INVARIANT: must stay in sync with the private `COORDINATION_IDENTITY` constant in
+// `packages/runtime/src/coordination/lock.ts` (line 8). That constant is not exported —
+// if it is ever exported, import it here instead of maintaining a local copy.
 const COORDINATION_IDENTITY = 'coordination'
 
 /** Narrow logger adapter for runtime coordination functions. */

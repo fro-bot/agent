@@ -176,6 +176,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     heartbeat.start()
 
     let heartbeatStopped = false
+    let sink: ReturnType<typeof createDiscordStreamSink> | null = null
 
     try {
       const execResult = await transitionRun(
@@ -195,7 +196,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
       const handle = attachOpencode(attachUrl, attachToken)
-      const sink = createDiscordStreamSink(thread, {logger})
+      sink = createDiscordStreamSink(thread, {logger})
       const promptText = buildDiscordPrompt({
         messageText: message.content,
         owner: binding.owner,
@@ -266,6 +267,11 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         if (stopResult.success === true) {
           runEtag = stopResult.data.runEtag
           lockEtag = stopResult.data.lockEtag
+        } else {
+          logger.warn(
+            {repo, runId, err: stopResult.error.message},
+            'run: heartbeat stop failed; using last known etags',
+          )
         }
       }
 
@@ -281,6 +287,15 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       )
       if (failedResult.success === false) {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
+      }
+
+      // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
+      // Wrapped in its own try/catch so a flush failure does not mask the original error.
+      // Guard against double-post: sink is null when the error occurred before createDiscordStreamSink.
+      if (sink !== null) {
+        await sink.flush().catch((flushError: unknown) => {
+          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
+        })
       }
 
       // Coarse user message — no internal detail
