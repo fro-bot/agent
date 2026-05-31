@@ -102,7 +102,7 @@ The trigger authorization gate is the security boundary between Discord users an
 
 ### Bearer-token attach path
 
-The gateway connects to OpenCode running inside the workspace container via the `WORKSPACE_OPENCODE_URL` endpoint (default `http://workspace:9101`). Every request to that endpoint is authenticated with a shared bearer token read from `WORKSPACE_OPENCODE_TOKEN`. The token is never logged or posted to Discord. The workspace container reverse-proxies OpenCode and validates the token before forwarding.
+The gateway connects to OpenCode running inside the workspace container via the `WORKSPACE_OPENCODE_URL` endpoint (default `http://workspace:9200`). Every request to that endpoint is authenticated with a shared bearer token read from `WORKSPACE_OPENCODE_TOKEN`. The token is never logged or posted to Discord. The workspace container reverse-proxies OpenCode and validates the token before forwarding.
 
 ### OpenCode server port model
 
@@ -111,7 +111,7 @@ The workspace container runs two listening ports:
 | Port | Service | Access |
 | ---- | ------- | ------ |
 | 9100 | Workspace agent (clone/setup API) | Internal sandbox network only |
-| 9101 | OpenCode reverse proxy (bearer-authenticated) | Internal sandbox network only |
+| 9200 | OpenCode reverse proxy (bearer-authenticated) | Internal sandbox network only |
 
 Both ports are loopback-bound inside the sandbox network. The egress proxy (`mitmproxy`) only permits outbound traffic to the allowlisted hosts; inbound connections from outside the sandbox are not possible by network topology. The gateway reaches these ports via the Docker Compose service DNS name `workspace`.
 
@@ -144,6 +144,12 @@ Per-run errors are logged and the sweep continues — one corrupted record does 
   Recovery is via idempotent retry — re-running the command resumes a partial
   setup — rather than agent-callable recovery primitives. Extracting a
   Discord-independent `addProject(request, deps)` primitive is deferred until a
+  non-Discord caller exists.
+
+- **Mention-triggered execution is Discord-only.** A run starts only from an
+  authorized `@fro-bot` mention in a bound channel; there is no HTTP endpoint,
+  CLI, agent tool, or slash-command equivalent for starting a run. Extracting a
+  Discord-independent execution primitive and caller surface is deferred until a
   non-Discord caller exists.
 
 - **No run queue.** Mentions that arrive while the concurrency cap or repo lock is held are rejected immediately. There is no persistent queue, no back-pressure mechanism, and no retry. Users must manually re-send their message when the system is free.

@@ -6,8 +6,8 @@
  * 2. Per-channel in-flight guard — prevents two concurrent runs originating
  *    from the same source channel.
  *
- * MVP note: state is in-memory only; gateway restart resets it. Unit 5
- * stale-run recovery handles runs left EXECUTING at crash time.
+ * In-memory state is intentional — gateway restart resets it.
+ * Recovery sweeps handle runs left in EXECUTING at crash time.
  */
 
 /** Default maximum simultaneous active runs across all channels. */

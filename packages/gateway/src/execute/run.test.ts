@@ -127,13 +127,14 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     coordinationConfig: {} as CoordinationConfig,
     identity: 'discord-gateway',
     concurrency: overrides.concurrency ?? makeDefaultConcurrency(),
-    attachUrl: 'http://workspace:9101',
+    attachUrl: 'http://workspace:9200',
     attachToken: 'secret-bearer-token',
+    runTimeoutMs: overrides.runTimeoutMs ?? 600000,
+    botUserId: overrides.botUserId ?? 'bot-123',
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     ...overrides,
   }
 }
-
 /** Set up default happy-path returns for all runtime mocks. */
 function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; stop?: ReturnType<typeof vi.fn>}) {
   mockRuntime.acquireLock.mockResolvedValue({
@@ -166,7 +167,7 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
   })
   mockRunOpenCodeCore.mockResolvedValue(undefined)
   vi.mocked(attachModule.attachOpencode).mockReturnValue({
-    server: {url: 'http://workspace:9101'},
+    server: {url: 'http://workspace:9200'},
     session: {
       create: vi.fn(),
       prompt: vi.fn(),

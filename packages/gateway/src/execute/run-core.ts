@@ -5,11 +5,11 @@
  * - Owns: session creation, prompt send, event subscription, event → sink
  *   routing, resolution on `session.idle`.
  * - Does NOT own: lock, run-state lifecycle, heartbeat, mention routing,
- *   authorization gate. Those belong to Unit 4's `run.ts`.
+ *   authorization gate. Those live in `run.ts`.
  *
  * Error surface: throws `RunCoreError` on attach/connect failure, proxy 401,
- * session error, or prompt rejection. Unit 4 maps `kind` to coarse Discord
- * replies (no internal detail leaked).
+ * session error, prompt rejection, run timeout, or premature stream close.
+ * `run.ts` maps `kind` to coarse Discord replies (no internal detail leaked).
  *
  * Critical constraint (SSE-routing memory): BOTH `promptAsync` AND
  * `event.subscribe` must carry the workspace repo `directory` in their query
@@ -29,18 +29,20 @@ import type {DiscordStreamSink} from '../discord/streaming.js'
 // Typed error
 // ---------------------------------------------------------------------------
 
-/** Discriminant for `RunCoreError` — Unit 4 maps these to coarse Discord replies. */
+/** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 export type RunCoreErrorKind =
   | 'unreachable' // network error / server not reachable
   | 'auth' // proxy rejected the bearer token (401)
   | 'session-error' // OpenCode `session.error` event received
   | 'prompt-error' // `promptAsync` returned an error
+  | 'timeout' // run exceeded the configured wall-clock timeout
+  | 'stream-ended' // event stream closed before session.idle was received
 
 /**
  * Error thrown by `runOpenCodeCore` on any failure path.
  *
  * The `message` field is for internal logging only — never post it to Discord.
- * Unit 4 maps `kind` to coarse user-visible replies.
+ * `run.ts` maps `kind` to coarse user-visible replies.
  */
 export class RunCoreError extends Error {
   readonly kind: RunCoreErrorKind
@@ -74,7 +76,7 @@ export interface RunCoreParams {
   /**
    * Streaming sink that receives text deltas.
    * Caller is responsible for calling `sink.flush()` after `runOpenCodeCore`
-   * resolves (Unit 4 does this after transitioning to COMPLETED).
+   * resolves (`run.ts` does this after transitioning to COMPLETED).
    */
   readonly sink: DiscordStreamSink
   /** Abort signal — aborts event iteration when signalled. */
@@ -312,8 +314,16 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     }
   }
 
-  // Signal was aborted or stream ended without session.idle — resolve anyway.
-  logger.info({sessionId, aborted: signal.aborted}, 'run-core: event stream ended')
+  // Stream exhausted. Distinguish timeout (signal aborted) from premature close.
+  if (signal.aborted === true) {
+    logger.warn({sessionId}, 'run-core: stream ended due to timeout signal')
+    throw new RunCoreError('timeout', 'Run timed out: event stream aborted by timeout signal')
+  }
+
+  // Stream closed without session.idle and not aborted by us → OpenCode
+  // may still be working; mark as failed so the run is not silently completed.
+  logger.error({sessionId}, 'run-core: event stream closed before session.idle')
+  throw new RunCoreError('stream-ended', 'Event stream closed before session.idle was received')
 }
 
 // ---------------------------------------------------------------------------

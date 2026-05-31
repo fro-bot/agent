@@ -125,8 +125,10 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       activeCount: vi.fn().mockReturnValue(0),
       max: 3,
     },
-    attachUrl: 'http://workspace:9101',
+    attachUrl: 'http://workspace:9200',
     attachToken: 'secret-token',
+    runTimeoutMs: 600_000,
+    botUserId: 'bot-user-id',
     logger: {
       debug: vi.fn(),
       info: vi.fn(),

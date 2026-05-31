@@ -27,7 +27,7 @@ export interface GatewayConfig {
   readonly githubAppPrivateKey: string
   readonly gatewayGitHubAppInstallUrl: string
   readonly workspaceAgentUrl: string
-  /** Full base URL of the workspace OpenCode proxy (e.g. `http://workspace:9101`). */
+  /** Full base URL of the workspace OpenCode proxy (e.g. `http://workspace:9200`). */
   readonly workspaceOpencodeUrl: string
   /** Bearer token for the workspace OpenCode proxy. Never logged. */
   readonly workspaceOpencodeToken: string
@@ -38,6 +38,8 @@ export interface GatewayConfig {
   readonly triggerRoleId: string | null
   /** Maximum number of simultaneous active runs across all channels. */
   readonly maxConcurrentRuns: number
+  /** Maximum wall-clock milliseconds a single run may take before being aborted. */
+  readonly runTimeoutMs: number
   readonly webhookSecret: string
   readonly presenceChannelId: string
   readonly httpPort: number
@@ -330,11 +332,14 @@ export function loadGatewayConfig(): GatewayConfig {
 
   const workspaceAgentUrl = readOptionalSecret('WORKSPACE_AGENT_URL') ?? 'http://workspace:9100'
 
-  const workspaceOpencodeUrl = readOptionalSecret('WORKSPACE_OPENCODE_URL') ?? 'http://workspace:9101'
+  const workspaceOpencodeUrl = readOptionalSecret('WORKSPACE_OPENCODE_URL') ?? 'http://workspace:9200'
   const workspaceOpencodeToken = readSecret('WORKSPACE_OPENCODE_TOKEN')
   const triggerRoleId = readOptionalSecret('GATEWAY_TRIGGER_ROLE_ID')
 
   const rawMaxConcurrent = readOptionalSecret('GATEWAY_MAX_CONCURRENT_RUNS') ?? '3'
+  if (/^[1-9]\d*$/.test(rawMaxConcurrent) === false) {
+    throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
+  }
   const maxConcurrentRuns = Number.parseInt(rawMaxConcurrent, 10)
   if (
     Number.isFinite(maxConcurrentRuns) === false ||
@@ -342,6 +347,15 @@ export function loadGatewayConfig(): GatewayConfig {
     maxConcurrentRuns < 1
   ) {
     throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
+  }
+
+  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? '600000'
+  if (/^[1-9]\d*$/.test(rawRunTimeout) === false) {
+    throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
+  }
+  const runTimeoutMs = Number.parseInt(rawRunTimeout, 10)
+  if (Number.isFinite(runTimeoutMs) === false || Number.isInteger(runTimeoutMs) === false || runTimeoutMs < 1) {
+    throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }
 
   const webhookSecret = readSecret('GATEWAY_WEBHOOK_SECRET')
@@ -369,6 +383,7 @@ export function loadGatewayConfig(): GatewayConfig {
     workspaceOpencodeToken,
     triggerRoleId,
     maxConcurrentRuns,
+    runTimeoutMs,
     webhookSecret,
     presenceChannelId,
     httpPort,

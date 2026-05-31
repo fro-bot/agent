@@ -30,6 +30,13 @@ services:
       # GitHub App credentials (required for repository access)
       GITHUB_APP_ID_FILE: /run/secrets/github_app_id
       GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
+      # OpenCode bearer token — required; gateway will not start without this.
+      # The workspace container reverse-proxies OpenCode and validates this token.
+      WORKSPACE_OPENCODE_TOKEN_FILE: /run/secrets/workspace_opencode_token
+      # Optional — override the OpenCode proxy URL (default: http://workspace:9200)
+      WORKSPACE_OPENCODE_URL_FILE: /run/secrets/workspace_opencode_url
+      # Optional — Discord role ID that gates mention authorization
+      GATEWAY_TRIGGER_ROLE_ID_FILE: /run/secrets/gateway_trigger_role_id
       # Egress proxy (regular proxy mode — NOT transparent)
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
@@ -125,6 +132,29 @@ services:
           create_host_path: false
       # mitmproxy CA cert (written by mitmproxy on first start, read here for trust)
       - mitmproxy-certs:/etc/ssl/certs:ro
+      # OpenCode bearer token — required; must match workspace-opencode-token.
+      - type: bind
+        source: ./secrets/workspace-opencode-token
+        target: /run/secrets/workspace_opencode_token
+        read_only: true
+        bind:
+          create_host_path: false
+      # Optional — OpenCode proxy URL override (default: http://workspace:9200).
+      # Touch the file empty to use the default.
+      - type: bind
+        source: ./secrets/workspace-opencode-url
+        target: /run/secrets/workspace_opencode_url
+        read_only: true
+        bind:
+          create_host_path: false
+      # Optional — Discord role ID that gates mention authorization.
+      # Touch the file empty to fall back to guild-level ManageChannels.
+      - type: bind
+        source: ./secrets/gateway-trigger-role-id
+        target: /run/secrets/gateway_trigger_role_id
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - gateway-net
       - sandbox-net

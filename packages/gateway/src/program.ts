@@ -157,10 +157,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       })
     })
 
+    // Track in-flight mention run promises so SIGTERM can await them before tearing down.
+    const inFlightRuns = new Set<Promise<void>>()
+
     client.on('messageCreate', (message: Message) => {
       if (message.author.bot) return
       if (client.user === null) return
       if (!message.mentions.has(client.user.id)) return
+      // Stop accepting new mentions once shutdown has been requested.
+      if (isShuttingDown()) return
 
       const mentionDeps = {
         bindingsStore,
@@ -177,14 +182,26 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           concurrency: concurrencyRegistry,
           attachUrl: config.workspaceOpencodeUrl,
           attachToken: config.workspaceOpencodeToken,
+          runTimeoutMs: config.runTimeoutMs,
+          botUserId: client.user.id,
           logger,
         },
         logger,
       }
 
-      Effect.runPromise(handleMention(message, client.user.id, mentionDeps)).catch((error: unknown) => {
-        logger.error({err: error}, 'mention handler failed')
-      })
+      const runPromise: Promise<void> = Effect.runPromise(handleMention(message, client.user.id, mentionDeps)).catch(
+        (error: unknown) => {
+          logger.error({err: error}, 'mention handler failed')
+        },
+      )
+      inFlightRuns.add(runPromise)
+      runPromise
+        .finally(() => {
+          inFlightRuns.delete(runPromise)
+        })
+        .catch(() => {
+          // Errors are already handled in runPromise; finally() cannot throw here.
+        })
     })
 
     // g. Start announce HTTP server (before shutdown handlers so the handle is available)
@@ -201,8 +218,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       },
     )
 
-    // h. Install shutdown handlers — pass server handle so it is closed on drain
-    installShutdownHandlers(client, logger, undefined, serverHandle)
+    // h. Install shutdown handlers — drain in-flight mention runs before client.destroy()
+    installShutdownHandlers(client, logger, undefined, serverHandle, async () =>
+      Promise.all(inFlightRuns).then(() => {}),
+    )
 
     // i. Login
     yield* Effect.tryPromise({

@@ -88,7 +88,7 @@ function makeBindingsStore(overrides: {listBindings?: () => Promise<unknown>} = 
 function makeCoordinationConfig(): CoordinationConfig {
   const getObject = vi.fn().mockImplementation(async (key: string) => {
     if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
-    if (key === LOCK_KEY) return {success: true, data: {data: '{}', etag: LOCK_ETAG}}
+    if (key === LOCK_KEY) return {success: true, data: {data: JSON.stringify({run_id: RUN_ID}), etag: LOCK_ETAG}}
     return {success: false, error: new Error('not found')}
   })
 
@@ -292,7 +292,7 @@ describe('recoverStaleRuns', () => {
       const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
         if (key === RUN_KEY) return {success: true, data: {data: '{}', etag: RUN_ETAG}}
         if (key === RUN_KEY_2) return {success: true, data: {data: '{}', etag: 'etag-run-2'}}
-        if (key === LOCK_KEY) return {success: true, data: {data: '{}', etag: LOCK_ETAG}}
+        if (key === LOCK_KEY) return {success: true, data: {data: JSON.stringify({run_id: 'run-002'}), etag: LOCK_ETAG}}
         return {success: false, error: new Error('not found')}
       })
       const coordConfig: CoordinationConfig = {
@@ -314,9 +314,9 @@ describe('recoverStaleRuns', () => {
       // #when — must not throw
       await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
 
-      // #then — both runs attempted; warning logged for run-001; run-002 still released
+      // #then — both runs attempted; warning logged for run-001; only run-002 releases lock (it owns it)
       expect(mockTransitionRun).toHaveBeenCalledTimes(2)
-      expect(mockReleaseLock).toHaveBeenCalledTimes(2)
+      expect(mockReleaseLock).toHaveBeenCalledTimes(1)
       expect(logger.warn).toHaveBeenCalledWith(
         expect.objectContaining({runId: 'run-001'}),
         expect.stringContaining('transitionRun FAILED'),

@@ -160,7 +160,7 @@ function makeHandle(
 
   return {
     client,
-    server: {url: 'http://workspace:9101', close: vi.fn()},
+    server: {url: 'http://workspace:9200', close: vi.fn()},
     shutdown: vi.fn(),
   } as unknown as OpenCodeServerHandle
 }
@@ -594,8 +594,8 @@ describe('runOpenCodeCore', () => {
   })
 
   describe('abort signal', () => {
-    it('stops processing events when signal is already aborted', async () => {
-      // #given
+    it('throws RunCoreError with kind "timeout" when signal is already aborted', async () => {
+      // #given — signal pre-aborted simulates an expired AbortSignal.timeout()
       const controller = new AbortController()
       controller.abort()
 
@@ -605,10 +605,10 @@ describe('runOpenCodeCore', () => {
       })
       const params = {...buildParams(handle), sink, signal: controller.signal}
 
-      // #when — does not throw (just resolves without appending)
-      await runOpenCodeCore(params)
+      // #when — aborted signal → timeout kind thrown before any events processed
+      await expect(runOpenCodeCore(params)).rejects.toThrow(RunCoreError)
 
-      // #then
+      // #then — no content was appended
       expect(sink._appended).toHaveLength(0)
     })
   })

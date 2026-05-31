@@ -85,6 +85,49 @@ async function resolveEtag(
   return result.data.etag
 }
 
+interface LockFetchResult {
+  readonly etag: string
+  readonly runId: string | null
+}
+
+/**
+ * Fetch the current lock object and parse the `run_id` from its content.
+ *
+ * Returns `null` when the adapter does not support `getObject`, the key does
+ * not exist, or any other fetch error occurs. Returns a result with
+ * `runId: null` when the content cannot be parsed or lacks a `run_id` field.
+ */
+async function fetchLockRecord(
+  config: CoordinationConfig,
+  key: string,
+  logger: GatewayLogger,
+): Promise<LockFetchResult | null> {
+  if (config.storeAdapter.getObject == null) {
+    logger.warn({key}, 'recovery: store adapter does not support getObject — cannot verify lock ownership')
+    return null
+  }
+
+  const result = await config.storeAdapter.getObject(key)
+  if (result.success === false) {
+    logger.warn({key, err: result.error.message}, 'recovery: getObject failed — cannot verify lock ownership')
+    return null
+  }
+
+  const {etag, data: rawJson} = result.data
+
+  let runId: string | null = null
+  try {
+    const parsed: unknown = JSON.parse(rawJson)
+    if (parsed !== null && typeof parsed === 'object' && 'run_id' in parsed && typeof parsed.run_id === 'string') {
+      runId = parsed.run_id
+    }
+  } catch {
+    // Unparseable lock content — treat run_id as unknown.
+  }
+
+  return {etag, runId}
+}
+
 // ---------------------------------------------------------------------------
 // recoverStaleRuns
 // ---------------------------------------------------------------------------
@@ -210,18 +253,28 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
   if (lockKeyResult.success === false) {
     logger.warn({runId: run.run_id, repo, err: lockKeyResult.error.message}, 'recovery: could not build lock key')
   } else {
-    const lockEtag = await resolveEtag(coordinationConfig, lockKeyResult.data, 'lock', logger)
+    const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
 
-    if (lockEtag !== null) {
-      const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+    if (lockFetch !== null) {
+      // Only release the lock when it belongs to this stale run. If another run
+      // acquired the lock after the stale run's lease expired, releasing here would
+      // delete an active run's lock and allow concurrent execution.
+      if (lockFetch.runId === run.run_id) {
+        const releaseResult = await releaseLock(coordinationConfig, repo, lockFetch.etag, coordLogger)
 
-      if (releaseResult.success === false) {
-        logger.warn(
-          {runId: run.run_id, repo, err: releaseResult.error.message},
-          'recovery: releaseLock failed — continuing',
-        )
+        if (releaseResult.success === false) {
+          logger.warn(
+            {runId: run.run_id, repo, err: releaseResult.error.message},
+            'recovery: releaseLock failed — continuing',
+          )
+        } else {
+          logger.info({runId: run.run_id, repo}, 'recovery: lock released')
+        }
       } else {
-        logger.info({runId: run.run_id, repo}, 'recovery: lock released')
+        logger.warn(
+          {runId: run.run_id, repo, lockRunId: lockFetch.runId},
+          'recovery: lock.run_id does not match stale run — skipping release (lock belongs to a different run)',
+        )
       }
     }
   }

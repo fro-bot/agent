@@ -22,9 +22,16 @@ export interface RunMentionDeps {
   readonly concurrency: ConcurrencyRegistry
   readonly attachUrl: string
   readonly attachToken: string
+  /** Wall-clock milliseconds before an in-progress run is timed out. */
+  readonly runTimeoutMs: number
+  /**
+   * Discord user ID of the bot. Used to strip leading mention tokens from
+   * the message before building the agent prompt, so a bare `@bot` mention
+   * does not silently dispatch a no-op run.
+   */
+  readonly botUserId: string
   readonly logger: GatewayLogger
 }
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -59,23 +66,22 @@ function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context
 /**
  * Execute a mention-triggered OpenCode run with full lifecycle management.
  *
- * Called by `mentions.ts` AFTER authorization and binding lookup succeed.
+ * Called by `mentions.ts` after authorization and binding lookup succeed.
  * Owns: concurrency registry, thread creation, lock, run-state, heartbeat,
  * execution, and release of all resources in a `finally` block.
  *
- * Hard invariants (see plan Unit 4):
- * - "busy", "cap", "waiting" are TERMINAL — no queue, no retry.
- * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
+ * Hard invariants:
+ * - "busy", "cap", "waiting" are TERMINAL — no queue, no retry. * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
  *   raw errors) are logged but NEVER posted to Discord.
  * - Bearer token (`attachToken`) is never logged.
  * - Every Discord send uses `allowedMentions: {parse: []}`.
  */
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, logger} = deps
+  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, logger} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
-  // ── Step 4: Global concurrency cap + per-channel in-flight guard ──────────
+  // ── Concurrency cap + per-channel in-flight guard ──────────
 
   const slotResult = concurrency.tryAcquire(channelId)
 
@@ -91,14 +97,14 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
 
   // Slot acquired — MUST release in outer finally
   try {
-    // ── Step 6: Create thread ───────────────────────────────────────────────
+    // ── Create response thread ─────────────────────────────────────────────────────────────────
 
     const runId = crypto.randomUUID()
     const rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
     const threadId = rawThread.id
     const thread: SinkThread = rawThread
 
-    // ── Step 7: Acquire lock ────────────────────────────────────────────────
+    // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
     const coordLogger = toCoordLogger(logger)
     const lockResult = await acquireLock(coordinationConfig, repo, identity, 'discord', runId, coordLogger)
@@ -124,7 +130,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     }
     let lockEtag = lockResult.data.etag
 
-    // ── Steps 8a–8d: Run-state lifecycle + heartbeat ────────────────────────
+    // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
 
     const now = new Date().toISOString()
     const initialRunState = {
@@ -186,7 +192,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       }
       runEtag = execResult.data.etag
 
-      // ── Step 9: Execute ────────────────────────────────────────────────────
+      // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
       const handle = attachOpencode(attachUrl, attachToken)
       const sink = createDiscordStreamSink(thread, {logger})
@@ -194,19 +200,20 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         messageText: message.content,
         owner: binding.owner,
         repo: binding.repo,
+        botUserId,
       })
-      const abortController = new AbortController()
+      const timeoutSignal = AbortSignal.timeout(runTimeoutMs)
 
       await runOpenCodeCore({
         handle,
         directory: binding.workspacePath,
         promptText,
         sink,
-        signal: abortController.signal,
+        signal: timeoutSignal,
         logger,
       })
 
-      // ── Step 10: session.idle — COMPLETED ─────────────────────────────────
+      // ── session.idle received — transition to COMPLETED ──────────────────────────────────────
 
       const stopResult = await heartbeat.stop()
       heartbeatStopped = true
@@ -237,6 +244,8 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       // ── Error classification ───────────────────────────────────────────────
 
       const isCoreError = execError instanceof RunCoreError
+      const isTimeout = isCoreError && execError.kind === 'timeout'
+      const isStreamEnded = isCoreError && execError.kind === 'stream-ended'
       const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
       const isEmptyPrompt = execError instanceof EmptyPromptError
 
@@ -276,11 +285,15 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
 
       // Coarse user message — no internal detail
       const userMessage =
-        isReachability === true
-          ? 'The workspace is not reachable right now. Please try again later.'
-          : isEmptyPrompt === true
-            ? 'Nothing to do — please include a task in your message.'
-            : 'The task failed. Please try again.'
+        isTimeout === true
+          ? 'The task timed out. Please try again.'
+          : isReachability === true
+            ? 'The workspace is not reachable right now. Please try again later.'
+            : isEmptyPrompt === true
+              ? 'Nothing to do — please include a task in your message.'
+              : isStreamEnded === true
+                ? 'The task stream closed unexpectedly. Please try again.'
+                : 'The task failed. Please try again.'
 
       await safeSend(thread, userMessage).catch((error: unknown) => {
         logger.warn({repo, runId, err: String(error)}, 'run: failed to send error reply to thread')

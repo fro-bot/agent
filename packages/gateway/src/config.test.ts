@@ -1054,7 +1054,7 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
   // workspaceOpencodeUrl / workspaceOpencodeToken / triggerRoleId / maxConcurrentRuns
   // ---------------------------------------------------------------------------
 
-  it('defaults workspaceOpencodeUrl to http://workspace:9101 when WORKSPACE_OPENCODE_URL is unset', () => {
+  it('defaults workspaceOpencodeUrl to http://workspace:9200 when WORKSPACE_OPENCODE_URL is unset', () => {
     // #given
     setRequiredEnv()
 
@@ -1062,7 +1062,7 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.workspaceOpencodeUrl).toBe('http://workspace:9101')
+    expect(config.workspaceOpencodeUrl).toBe('http://workspace:9200')
   })
 
   it('reads WORKSPACE_OPENCODE_URL from env', () => {
