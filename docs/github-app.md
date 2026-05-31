@@ -49,8 +49,30 @@ Uninstalling immediately revokes the gateway's ability to read your repositories
 
 This app is only useful alongside a self-hosted gateway. To register your own app and wire credentials, see the [setup runbook](./github-app-setup.md).
 
-## Listing copy
+## GitHub App settings copy
 
-> **Tagline:** Read-only repo access for your self-hosted Fro Bot Discord gateway.
->
-> **Description (~150 chars):** Grants a self-hosted Fro Bot Discord gateway read-only access to repositories you choose. Read-only, no webhook, inert until you use it.
+These values go in the App's **Basic Information** settings page (`fro-bot` account → Settings → Developer settings → GitHub Apps → Fro Bot Agent).
+
+### Description (paste into "Basic Information → Description")
+
+This field is displayed to users on the App's public page and renders markdown:
+
+```markdown
+**Fro Bot Agent** gives a self-hosted [Fro Bot](https://github.com/fro-bot/agent) Discord gateway read-only access to repositories you choose, so you can drive Fro Bot against them from Discord.
+
+**Permission:** `contents: read` only — it can clone and read the repos you add, nothing else. No write access, no webhook.
+
+**Privacy:** inert until you pair it with a Fro Bot gateway in your own Discord server. No data is collected and no hosted service runs on your behalf; all credentials live in your own deployment.
+
+Add a repo from Discord with `/fro-bot add-project <repo-url>`.
+```
+
+### Adjacent fields
+
+- **Homepage URL:** `https://github.com/fro-bot/agent`
+- **Webhook → Active:** unchecked (the app needs no webhook)
+- **Badge background color:** `0D0216` (the Void brand color — frames the cyan token on near-black)
+
+### Short blurb (for any one-line listing)
+
+> Read-only repo access for your self-hosted Fro Bot Discord gateway — no webhook, inert until you use it.
