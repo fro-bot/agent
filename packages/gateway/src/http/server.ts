@@ -2,7 +2,7 @@
  * Hono HTTP server for the POST /v1/announce webhook.
  *
  * createAnnounceServer builds a Hono app, wires the announce handler, and
- * returns the @hono/node-server handle so the caller (program.ts / Unit 7)
+ * returns the @hono/node-server handle so the caller (program.ts)
  * can close it during graceful shutdown.
  *
  * Content-length pre-check is performed before reading the body to avoid

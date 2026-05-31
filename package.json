@@ -45,7 +45,7 @@
     "@actions/exec": "3.0.0",
     "@actions/github": "9.1.1",
     "@actions/tool-cache": "4.0.0",
-    "@aws-sdk/client-s3": "3.1045.0",
+    "@aws-sdk/client-s3": "3.1054.0",
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.2.0",
@@ -59,12 +59,12 @@
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
     "@types/node": "24.12.2",
-    "@vitest/eslint-plugin": "1.6.17",
+    "@vitest/eslint-plugin": "1.6.18",
     "conventional-changelog-conventionalcommits": "9.3.1",
     "eslint": "10.4.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
-    "generate-license-file": "4.1.1",
+    "generate-license-file": "4.2.1",
     "jiti": "2.7.0",
     "js-yaml": "4.1.1",
     "lint-staged": "16.4.0",
@@ -74,7 +74,7 @@
     "simple-git-hooks": "2.13.1",
     "tsdown": "0.22.0",
     "typescript": "6.0.3",
-    "vitest": "4.1.6"
+    "vitest": "4.1.7"
   },
   "packageManager": "pnpm@10.33.4"
 }

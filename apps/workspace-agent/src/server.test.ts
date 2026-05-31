@@ -28,7 +28,7 @@ async function postClone(
 }
 
 describe('GET /healthz', () => {
-  it('returns 200 with ok: true', async () => {
+  it('returns 200 with ok: true (no opencode status)', async () => {
     // #given
     const app = createApp()
 
@@ -39,6 +39,48 @@ describe('GET /healthz', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body).toEqual({ok: true})
+  })
+
+  it('returns {ok: true, opencode: "starting"} when server is still starting', async () => {
+    // #given
+    const opencodeStatus = {status: 'starting' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/healthz')
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ok: true, opencode: 'starting'})
+  })
+
+  it('returns {ok: true, opencode: "ready"} when opencode server is ready', async () => {
+    // #given
+    const opencodeStatus = {status: 'ready' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/healthz')
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ok: true, opencode: 'ready'})
+  })
+
+  it('returns {ok: true, opencode: "down"} when opencode server failed to start', async () => {
+    // #given
+    const opencodeStatus = {status: 'down' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/healthz')
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ok: true, opencode: 'down'})
   })
 })
 
