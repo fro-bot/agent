@@ -946,7 +946,7 @@ describe('loadGatewayConfig — GitHub App credentials', () => {
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.gatewayGitHubAppInstallUrl).toBe('https://github.com/apps/fro-bot/installations/new')
+    expect(config.gatewayGitHubAppInstallUrl).toBe('https://github.com/apps/fro-bot-agent/installations/new')
   })
 })
 

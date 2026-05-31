@@ -99,7 +99,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     },
     githubAppId: 'test-app-id',
     githubAppPrivateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
-    gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot/installations/new',
+    gatewayGitHubAppInstallUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     workspaceAgentUrl: 'http://workspace:9100',
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'test-opencode-token',

@@ -328,7 +328,7 @@ export function loadGatewayConfig(): GatewayConfig {
   const githubAppId = readSecret('GITHUB_APP_ID')
   const githubAppPrivateKey = readMultilineSecret('GITHUB_APP_PRIVATE_KEY')
   const gatewayGitHubAppInstallUrl =
-    readOptionalSecret('GATEWAY_GITHUB_APP_INSTALL_URL') ?? 'https://github.com/apps/fro-bot/installations/new'
+    readOptionalSecret('GATEWAY_GITHUB_APP_INSTALL_URL') ?? 'https://github.com/apps/fro-bot-agent/installations/new'
 
   const workspaceAgentUrl = readOptionalSecret('WORKSPACE_AGENT_URL') ?? 'http://workspace:9100'
 
