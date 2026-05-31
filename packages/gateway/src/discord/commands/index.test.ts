@@ -26,7 +26,7 @@ function makeMockDeps(): AddProjectDeps {
     workspaceClient: {
       clone: vi.fn(),
     },
-    installUrl: 'https://github.com/apps/fro-bot/installations/new',
+    installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: {
       info: vi.fn(),
       warn: vi.fn(),

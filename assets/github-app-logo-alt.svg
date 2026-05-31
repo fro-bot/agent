@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="100%" height="100%">
+  <defs>
+    <!-- Dark Radial Gradient for deep space feel -->
+    <radialGradient id="darkBg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1A0B2E" />
+      <stop offset="100%" stop-color="#0D0216" />
+    </radialGradient>
+    
+    <filter id="cyanGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Circular Mask/Token Base with glowing Cyber Cyan ring -->
+  <circle cx="128" cy="128" r="124" fill="url(#darkBg)" stroke="#00BCD4" stroke-width="4" filter="url(#cyanGlow)" />
+
+  <!-- Afro Base & Texture Bumps (Purple Mid for contrast on dark bg) -->
+  <circle cx="128" cy="108" r="88" fill="#2D1B4E" />
+  <circle cx="64" cy="140" r="32" fill="#2D1B4E" />
+  <circle cx="192" cy="140" r="32" fill="#2D1B4E" />
+
+  <!-- Faceplate (White with stroke matching the Afro) -->
+  <rect x="80" y="96" width="96" height="116" rx="48" fill="#FFFFFF" stroke="#2D1B4E" stroke-width="8" />
+
+  <!-- Visor Slot (Void) -->
+  <rect x="92" y="124" width="72" height="32" rx="16" fill="#0D0216" />
+
+  <!-- Optic Main (Cyber Cyan) -->
+  <rect x="102" y="132" width="32" height="16" rx="8" fill="#00BCD4" filter="url(#cyanGlow)" />
+  
+  <!-- Optic Secondary (Solar Amber) -->
+  <circle cx="146" cy="140" r="6" fill="#FFC107" filter="url(#cyanGlow)" />
+</svg>
