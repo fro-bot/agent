@@ -127,7 +127,7 @@ export interface AppClientOptions {
  * installation ID is cached in memory per (owner, repo) pair.
  */
 export function createAppClient(options: AppClientOptions): AppClient {
-  const {appId, privateKey, installUrl = 'https://github.com/apps/fro-bot/installations/new', logger} = options
+  const {appId, privateKey, installUrl = 'https://github.com/apps/fro-bot-agent/installations/new', logger} = options
 
   // In-memory cache: "owner/repo" → installationId
   const installationCache = new Map<string, number>()

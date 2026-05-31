@@ -24,7 +24,7 @@ vi.mock('@octokit/core', () => ({
 
 const APP_ID = '12345'
 const PRIVATE_KEY = '-----BEGIN RSA PRIVATE KEY-----\nfake-key\n-----END RSA PRIVATE KEY-----'
-const INSTALL_URL = 'https://github.com/apps/fro-bot/installations/new'
+const INSTALL_URL = 'https://github.com/apps/fro-bot-agent/installations/new'
 
 const INSTALLATION_RESPONSE = {
   data: {

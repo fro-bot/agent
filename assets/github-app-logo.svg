@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient: Cyber Cyan to Teal Accessible -->
+    <linearGradient id="bgGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#00BCD4" />
+      <stop offset="100%" stop-color="#00838F" />
+    </linearGradient>
+  </defs>
+
+  <!-- Circular Mask/Token Base -->
+  <circle cx="128" cy="128" r="128" fill="url(#bgGradient)" />
+
+  <!-- Afro Base & Texture Bumps (Deep Purple) -->
+  <circle cx="128" cy="108" r="88" fill="#1A0B2E" />
+  <circle cx="64" cy="140" r="32" fill="#1A0B2E" />
+  <circle cx="192" cy="140" r="32" fill="#1A0B2E" />
+
+  <!-- Faceplate (White with Cel-shaded stroke matching the Afro) -->
+  <rect x="80" y="96" width="96" height="116" rx="48" fill="#FFFFFF" stroke="#1A0B2E" stroke-width="8" />
+
+  <!-- Visor Slot (Void) -->
+  <rect x="92" y="124" width="72" height="32" rx="16" fill="#0D0216" />
+
+  <!-- Optic Main (Neon Magenta) -->
+  <rect x="102" y="130" width="28" height="20" rx="10" fill="#E91E63" />
+  
+  <!-- Optic Secondary (Solar Amber) -->
+  <circle cx="146" cy="140" r="8" fill="#FFC107" />
+</svg>

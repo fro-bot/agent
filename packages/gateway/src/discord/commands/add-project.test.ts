@@ -167,7 +167,7 @@ function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
     bindingsStore: makeBindingsStore(),
     appClient: makeAppClient(),
     workspaceClient: makeWorkspaceClient(),
-    installUrl: 'https://github.com/apps/fro-bot/installations/new',
+    installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: makeLogger(),
     ...overrides,
   }
@@ -268,7 +268,7 @@ describe('executeAddProject', () => {
       await run(interaction, deps)
 
       // #then
-      expect(lastEditReplyContent(editReply)).toContain('https://github.com/apps/fro-bot/installations/new')
+      expect(lastEditReplyContent(editReply)).toContain('https://github.com/apps/fro-bot-agent/installations/new')
     })
 
     it('aborts gracefully when appPermissions is null (DM interaction)', async () => {
@@ -281,7 +281,7 @@ describe('executeAddProject', () => {
       await run(interaction, deps)
 
       // #then — aborts with install URL (treated as missing permissions)
-      expect(lastEditReplyContent(editReply)).toContain('https://github.com/apps/fro-bot/installations/new')
+      expect(lastEditReplyContent(editReply)).toContain('https://github.com/apps/fro-bot-agent/installations/new')
     })
 
     it('aborts when bot has ManageChannels but not SendMessages', async () => {
@@ -390,7 +390,13 @@ describe('executeAddProject', () => {
       const authForRepo = vi
         .fn()
         .mockResolvedValue(
-          err(new AppNotInstalledError('testowner', 'testrepo', 'https://github.com/apps/fro-bot/installations/new')),
+          err(
+            new AppNotInstalledError(
+              'testowner',
+              'testrepo',
+              'https://github.com/apps/fro-bot-agent/installations/new',
+            ),
+          ),
         )
       const {interaction, editReply} = makeInteraction({userId})
       const deps = makeDeps({appClient: makeAppClient({authForRepo})})
