@@ -31,8 +31,6 @@ WORKDIR /app
 
 # Copy production node_modules from build stage
 COPY --from=build /workspace/node_modules ./node_modules
-COPY --from=build /workspace/packages/runtime/package.json ./packages/runtime/package.json
-COPY --from=build /workspace/packages/runtime/dist/ ./packages/runtime/dist/
 COPY --from=build /workspace/packages/gateway/package.json ./packages/gateway/package.json
 COPY --from=build /workspace/packages/gateway/dist/ ./packages/gateway/dist/
 
