@@ -228,6 +228,51 @@ jobs:
           echo "OpenCode state files:"
           ls -lA ~/.local/state/opencode || true
 
+  gateway-smoke:
+    if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
+    name: Gateway Image Smoke Test
+    needs: [setup]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+      - name: Build runtime
+        run: pnpm --filter @fro-bot/runtime build
+      - name: Build gateway
+        run: pnpm --filter @fro-bot/gateway build
+      - name: Assert no bare @fro-bot/runtime import in gateway bundle
+        run: |
+          if grep -q 'from "@fro-bot/runtime"' packages/gateway/dist/main.mjs; then
+            echo "REGRESSION: gateway dist has bare @fro-bot/runtime import"
+            exit 1
+          fi
+          echo "OK: no bare @fro-bot/runtime import found in gateway bundle"
+      - name: Build gateway Docker image
+        run: docker build -f deploy/gateway.Dockerfile -t fro-bot-gateway:smoke .
+      - name: Smoke-test gateway image (assert config load, not module crash)
+        run: |
+          set +e
+          output="$(timeout 60s docker run --rm fro-bot-gateway:smoke 2>&1)"
+          status=$?
+          set -e
+          echo "--- docker run output ---"
+          echo "$output"
+          echo "--- exit status: $status ---"
+          if [ "$status" -eq 124 ]; then
+            echo "REGRESSION: gateway image hung on boot (timed out)"
+            exit 1
+          fi
+          test "$status" -ne 0
+          echo "$output" | grep -q "Missing required secret: DISCORD_TOKEN"
+          if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
+            echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
+            exit 1
+          fi
+          echo "OK: gateway reached config loading (DISCORD_TOKEN check), no module-resolution crash"
+
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
     name: Dependency Review
