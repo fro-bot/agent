@@ -147,6 +147,23 @@ services:
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
       NO_PROXY: localhost,127.0.0.1,workspace
+      # Bearer token for the OpenCode reverse proxy.
+      # The gateway presents this token when attaching to the workspace OpenCode server.
+      WORKSPACE_OPENCODE_TOKEN_FILE: /run/secrets/workspace_opencode_token
+    volumes:
+      # workspace-opencode-token: shared secret for the bearer-token proxy.
+      # The gateway reads the same value from WORKSPACE_OPENCODE_TOKEN_FILE.
+      - type: bind
+        source: ./secrets/workspace-opencode-token
+        target: /run/secrets/workspace_opencode_token
+        read_only: true
+        bind:
+          create_host_path: false
+    # Port model:
+    #   9100 — Hono API (/healthz, /clone) — sandbox-net only, no host mapping
+    #   9200 — OpenCode bearer-token proxy — sandbox-net only, no host mapping
+    #   54321 — raw OpenCode SDK server — loopback (127.0.0.1) ONLY, not published
+    # No `ports:` entries: all access is container-to-container on sandbox-net.
     networks:
       - sandbox-net
     restart: unless-stopped

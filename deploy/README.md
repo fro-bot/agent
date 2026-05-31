@@ -5,7 +5,7 @@ Docker Compose v2 stack for the fro-bot gateway. Runs three services:
 | Service     | Role                                                                              |
 | ----------- | --------------------------------------------------------------------------------- |
 | `gateway`   | Discord gateway daemon — connects to Discord, handles slash commands and mentions |
-| `workspace` | Workspace agent container (placeholder in v1; real agent wired in Unit 7)         |
+| `workspace` | Workspace agent container — sandboxed git + OpenCode execution                    |
 | `mitmproxy` | Egress proxy enforcing an allowlist of permitted outbound hosts                   |
 
 ## Prerequisites
@@ -75,6 +75,11 @@ touch deploy/secrets/discord-guild-id
 # the gateway after writing the new value.
 touch deploy/secrets/discord-privileged-intents
 # echo -n 'MessageContent,GuildMembers' > deploy/secrets/discord-privileged-intents
+
+# Workspace OpenCode bearer token (required for the OpenCode attach path).
+# The workspace proxy validates this token; the gateway presents the same
+# value when attaching. Generate a strong shared secret:
+openssl rand -hex 32 > deploy/secrets/workspace-opencode-token
 
 # GitHub App credentials (required — see "GitHub App" section below)
 echo -n 'YOUR_GITHUB_APP_ID'          > deploy/secrets/github-app-id
@@ -162,6 +167,7 @@ Run the full `touch` block from [Create secrets](#2-create-secrets) on every upg
 | `deploy/secrets/aws-secret-access-key` | AWS secret key for explicit S3 authentication | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/aws-session-token` | AWS session token for STS temporary credentials | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/s3-endpoint` | Custom S3-compatible endpoint (e.g. Cloudflare R2) | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/workspace-opencode-token` | Shared bearer token for the workspace OpenCode reverse proxy (required for the OpenCode attach path) | OpenCode attach; existing deployments must create this file on upgrade |
 | `deploy/secrets/github-app-id` | GitHub App ID (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 | `deploy/secrets/github-app-private-key` | GitHub App private key PEM (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 
