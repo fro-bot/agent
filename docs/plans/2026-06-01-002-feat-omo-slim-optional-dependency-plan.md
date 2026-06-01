@@ -218,14 +218,11 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 - Modify: existing test suites as needed (`setup.test.ts`, `ci-config.test.ts`, `inputs.test.ts`)
 
 **Approach:**
-- CI introspection: assert slim mode (`default_agent == "orchestrator"`, `oh-my-opencode-slim` plugin present, exactly one `@fro.bot/systematic`, OMO absent) and disabled-mode Slim plugin/config-file absence. Parallel the existing oMo introspection block.
-- Add an explicit slim-mode execution path to `.github/workflows/ci.yaml` so the introspection can run: a **separate `test-action-omo-slim` job** (or matrix entry) that invokes `uses: ./` with `enable-omo-slim: true` + a preset, leaving the existing `test-action` (oMo-disabled, `default_agent == build`, file-absence) assertions untouched. Do not overload the existing step — it hardcodes disabled-mode checks. This new job is the mechanism Unit 5 depends on; define it here.
-
-**Patterns to follow:** the disabled-mode oMo introspection at `ci.yaml:172-220`.
+- Slim config assembly is covered by the Units 2-4 unit tests (`ci-config.test.ts` slim mode, `omo-slim.test.ts`, `setup.test.ts` slim cases): `default_agent == "orchestrator"`, `oh-my-opencode-slim` plugin present, exactly one `@fro.bot/systematic`, OMO absent, legacy `plugins` key stripped, dual-plugin and R19 guards.
+- No dedicated CI job: a `workflow_dispatch`-only job surfaces as a perpetually-skipped check on every PR. Slim mode can be exercised on demand via the existing `fro-bot.yaml` dispatch when a live install smoke is wanted.
 
 **Test scenarios:**
-- Covered by Units 2-4 unit tests; this unit adds the CI-level introspection assertions.
-- Test expectation: CI introspection is shell-assertion based, validated by a real Test GitHub Action run.
+- Covered by Units 2-4 unit tests.
 
 **Verification:** full suite green; `pnpm build` clean; `dist/` in sync; a Test GitHub Action run shows the slim introspection passing.
 
