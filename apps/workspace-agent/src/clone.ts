@@ -307,6 +307,16 @@ async function executeCloneInner(
       PATH: process.env.PATH ?? '/usr/bin:/bin',
     }
 
+    // Propagate egress-proxy settings so git reaches GitHub through mitmproxy.
+    // The workspace runs on an internal-only network; without these, clone has
+    // no route out. These are not secrets, so they do not break token isolation.
+    for (const proxyVar of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']) {
+      const value = process.env[proxyVar]
+      if (value !== undefined && value !== '') {
+        spawnEnv[proxyVar] = value
+      }
+    }
+
     // Atomic clone: clone into a temp dir in the same parent (so rename is atomic).
     const randomSuffix = Math.random().toString(36).slice(2, 10)
     tmpClonePath = join(reposRoot, owner, `.tmp-${repo}-${randomSuffix}`)

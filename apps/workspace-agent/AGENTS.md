@@ -77,6 +77,10 @@ pnpm --filter @fro-bot/workspace-agent lint
 pnpm --filter @fro-bot/workspace-agent check-types
 ```
 
+## Deployment
+
+`deploy/workspace.Dockerfile` builds this package and bakes the OpenCode CLI (musl build, pinned to `DEFAULT_OPENCODE_VERSION`) plus the `@fro.bot/systematic` plugin config. The container launches via `deploy/workspace-entrypoint.sh`, which installs the mitmproxy CA into the **system** trust store (`update-ca-certificates`) before `exec`-ing `node dist/main.mjs` — `git` and the `opencode` binary read the system CA bundle, so this step is required for egress through the proxy to work. The supervisor (`main.ts`) then runs the clone API (9100), the loopback OpenCode server (54321), and the bearer proxy (9200).
+
 ## Conventions
 
 - ESM-only: `.js` extensions required in all relative imports

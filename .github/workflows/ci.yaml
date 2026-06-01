@@ -278,6 +278,58 @@ jobs:
           fi
           echo "OK: gateway reached config loading (DISCORD_TOKEN check), no module-resolution crash"
 
+  workspace-smoke:
+    if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
+    name: Workspace Image Smoke Test
+    needs: [setup]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build workspace Docker image
+        run: docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .
+      - name: Smoke-test workspace image (clone API boots independently of OpenCode)
+        run: |
+          set -e
+          # No CA is mounted in CI, so the entrypoint skips proxy trust immediately
+          # (MITMPROXY_CA_WAIT_SECONDS=0). A dummy token keeps the supervisor alive
+          # (main.ts exits without it). NO_PROXY=* keeps the local health probe direct.
+          cid="$(docker run -d \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            fro-bot-workspace:smoke)"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          # The clone API (:9100) must come up independently of OpenCode readiness.
+          ok=false
+          for _ in $(seq 1 30); do
+            if docker exec "$cid" curl -fsS http://127.0.0.1:9100/healthz >/dev/null 2>&1; then
+              ok=true
+              break
+            fi
+            sleep 1
+          done
+
+          logs="$(docker logs "$cid" 2>&1)"
+          echo "--- workspace logs ---"
+          echo "$logs"
+
+          if [ "$ok" != "true" ]; then
+            echo "REGRESSION: /healthz did not return 200 within 30s"
+            exit 1
+          fi
+          echo "$logs" | grep -q "workspace-agent listening on 0.0.0.0:9100"
+          if echo "$logs" | grep -q "ERR_MODULE_NOT_FOUND"; then
+            echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
+            exit 1
+          fi
+          # Prove the opencode binary is on PATH and runs (musl compatibility).
+          docker exec "$cid" opencode --version
+          echo "OK: workspace clone API up on :9100, opencode binary present, no module-resolution crash"
+
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
     name: Dependency Review
