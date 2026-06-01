@@ -519,6 +519,28 @@ describe('buildCIConfig', () => {
       expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
     })
 
+    it('fix C: strips legacy plugins (plural) key in slim mode', () => {
+      // #given - opencodeConfig contains both plugin and plugins (plural) keys
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"plugins":["some-old-plugin"],"plugin":[]}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect('plugins' in result.config).toBe(false)
+    })
+
     it('includes opencode-go preset in slim plugin specifier', () => {
       // #given
       const logger = createLogger()

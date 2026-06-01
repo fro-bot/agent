@@ -1,5 +1,6 @@
 import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
+import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
   readonly config: Record<string, unknown>
@@ -21,7 +22,14 @@ const OMO_SLIM_PLUGIN_PREFIXES = ['oh-my-opencode-slim']
  * R19: Versions of oh-my-opencode-slim that are verified to register the orchestrator agent.
  * Updated deliberately when Renovate bumps the pinned version and the orchestrator is confirmed.
  */
-const OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS = ['1.1.1']
+export const OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS = ['1.1.1']
+
+/**
+ * Returns true if the given OMO Slim version is in the R19 verified allowlist.
+ */
+export function isOmoSlimVersionVerified(version: string): boolean {
+  return OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS.includes(version)
+}
 
 /**
  * Extract the package prefix from a plugin specifier.
@@ -99,7 +107,7 @@ export function buildCIConfig(
   logger: Logger,
 ): CIConfigResult {
   const enableOmoSlim = inputs.enableOmoSlim ?? false
-  const omoSlimVersion = inputs.omoSlimVersion ?? '1.1.1'
+  const omoSlimVersion = inputs.omoSlimVersion ?? DEFAULT_OMO_SLIM_VERSION
   const omoSlimPreset = inputs.omoSlimPreset ?? 'openai'
 
   const ciConfig: Record<string, unknown> = {autoupdate: false}
@@ -150,6 +158,10 @@ export function buildCIConfig(
     const {cleaned: withoutOmoSlim} = stripOmoSlimPlugins(withoutOmo)
     const slimPlugin = `oh-my-opencode-slim@${omoSlimVersion}`
     ciConfig.plugin = [...withoutOmoSlim, slimPlugin]
+    // Strip legacy 'plugins' (plural) key — mirrors disabled mode (PR #449 bug)
+    if ('plugins' in ciConfig) {
+      delete ciConfig.plugins
+    }
     // Pin default_agent to orchestrator unconditionally — load-bearing
     ciConfig.default_agent = 'orchestrator'
     // Do NOT call denyBuildExternalDirectoryPermission in slim mode

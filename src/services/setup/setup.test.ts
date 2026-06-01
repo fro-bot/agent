@@ -112,6 +112,11 @@ vi.mock('./bun.js', () => ({
   DEFAULT_BUN_VERSION: '1.3.5',
 }))
 
+// Mock omo-slim module
+vi.mock('./omo-slim.js', () => ({
+  installOmoSlim: vi.fn().mockResolvedValue({installed: true, version: '1.1.1', error: null}),
+}))
+
 describe('setup', () => {
   const originalEnv = process.env
 
@@ -997,6 +1002,110 @@ describe('setup', () => {
         expect(result).not.toBeNull()
         expect(core.setFailed).not.toHaveBeenCalled()
         expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('systematic-config write failed'))
+      })
+    })
+
+    describe('slim mode (enableOmoSlim: true)', () => {
+      beforeEach(async () => {
+        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+        vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+        vi.mocked(exec.exec).mockResolvedValue(0)
+        vi.mocked(fs.writeFile).mockResolvedValue()
+        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+        vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'tools-key'})
+        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+        vi.mocked(github.getOctokit).mockReturnValue({
+          rest: {
+            users: {
+              getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
+              getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
+            },
+          },
+        } as never)
+        // Re-apply module mocks cleared by vi.resetAllMocks()
+        const bunMod = await import('./bun.js')
+        vi.mocked(bunMod.installBun).mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true})
+        const omoSlimMod = await import('./omo-slim.js')
+        vi.mocked(omoSlimMod.installOmoSlim).mockResolvedValue({installed: true, version: '1.1.1', error: null})
+      })
+
+      it('slim install success: config has default_agent orchestrator and oh-my-opencode-slim plugin', async () => {
+        // #given - installOmoSlim returns {installed: true} (default mock)
+        const omoSlimModule = await import('./omo-slim.js')
+
+        // #when
+        const result = await runSetup(
+          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '1.1.1'}),
+          'ghs_test_token',
+        )
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(omoSlimModule.installOmoSlim).toHaveBeenCalled()
+        const configExportCall = vi
+          .mocked(core.exportVariable)
+          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
+        expect(configExportCall).toBeDefined()
+        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
+        expect(config.default_agent).toBe('orchestrator')
+        const plugins = config.plugin as string[]
+        expect(plugins.some(p => p.startsWith('oh-my-opencode-slim'))).toBe(true)
+      })
+
+      it('fix A: slim install failure → config falls back to disabled mode (default_agent: build, no slim plugin)', async () => {
+        // #given - installOmoSlim returns {installed: false}
+        const omoSlimModule = await import('./omo-slim.js')
+        vi.mocked(omoSlimModule.installOmoSlim).mockResolvedValueOnce({
+          installed: false,
+          version: null,
+          error: 'install failed',
+        })
+
+        // #when
+        const result = await runSetup(
+          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '1.1.1'}),
+          'ghs_test_token',
+        )
+
+        // #then - graceful degradation: action continues, config falls back to disabled mode
+        expect(result).not.toBeNull()
+        expect(result?.omoSlimStatus).toBe('failed')
+        expect(core.setFailed).not.toHaveBeenCalled()
+        const configExportCall = vi
+          .mocked(core.exportVariable)
+          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
+        expect(configExportCall).toBeDefined()
+        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
+        // Must NOT pin orchestrator when slim install failed
+        expect(config.default_agent).toBe('build')
+        // Must NOT include oh-my-opencode-slim plugin
+        const plugins = config.plugin as string[]
+        expect(plugins.every(p => !p.startsWith('oh-my-opencode-slim'))).toBe(true)
+      })
+
+      it('fix B: unverified omoSlimVersion → setFailed called before installOmoSlim/installBun', async () => {
+        // #given - unverified version
+        const omoSlimModule = await import('./omo-slim.js')
+        const bunModule = await import('./bun.js')
+        vi.mocked(omoSlimModule.installOmoSlim).mockClear()
+        vi.mocked(bunModule.installBun).mockClear()
+
+        // #when
+        const result = await runSetup(
+          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '9.9.9'}),
+          'ghs_test_token',
+        )
+
+        // #then - hard fail before installer
+        expect(result).toBeNull()
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('9.9.9'))
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('not verified'))
+        // installer MUST NOT have been called
+        expect(omoSlimModule.installOmoSlim).not.toHaveBeenCalled()
+        // Bun MUST NOT have been called (gate is before installBun)
+        expect(bunModule.installBun).not.toHaveBeenCalled()
       })
     })
   })
