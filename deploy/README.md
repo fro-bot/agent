@@ -22,7 +22,7 @@ For testing-only:
 
 - Put any plausible-looking values in `deploy/secrets/s3-bucket` and `deploy/secrets/s3-region` (e.g. `test-bucket` and `us-east-1`). Validation only checks they're non-empty.
 - Leave `OBJECT_STORE_HOSTS` unset in `deploy/.env`. The default fail-closed behaviour blocks all S3 traffic — fine for testing, since no S3 calls are made.
-- Use a real bucket and `OBJECT_STORE_HOSTS` value only when Units 5–7 ship the agent and workspace pieces that actually exercise S3.
+- Use a real bucket and `OBJECT_STORE_HOSTS` value once you exercise the workspace executor (repo clone via `/fro-bot add-project` and the OpenCode mention loop), which reaches S3-backed state and external hosts.
 
 ## One-Time Setup
 
@@ -239,6 +239,14 @@ The workspace container exposes two internal ports, both accessible only within 
 | 9200 | OpenCode reverse proxy | Bearer-authenticated endpoint the gateway uses when attaching to an OpenCode session. Validates `WORKSPACE_OPENCODE_TOKEN` before forwarding to the loopback-bound OpenCode process. |
 
 Neither port is exposed on the host. The egress proxy (`mitmproxy`) permits only outbound traffic to the allowlisted hosts; these ports are inbound-only from the gateway's perspective and not reachable from outside the sandbox network.
+
+The raw OpenCode SDK server binds to loopback (`127.0.0.1:54321`) only and is never reachable on the sandbox network — the gateway always attaches through the bearer-authenticated proxy on 9200.
+
+### Workspace executor image
+
+The workspace image builds the workspace agent and bakes the OpenCode CLI (pinned to match `DEFAULT_OPENCODE_VERSION`), so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
+
+Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
 
 ## Stopping the Stack
 

@@ -189,6 +189,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # mitmproxy CA cert (written by mitmproxy on first start). Mounted at a
+      # dedicated path — NOT over /etc/ssl/certs — so the entrypoint's
+      # update-ca-certificates can write the MERGED system bundle (base CAs +
+      # mitmproxy) without the mount making the destination read-only. The
+      # entrypoint trusts this for git/libcurl and the opencode binary, which
+      # read the system store (NODE_EXTRA_CA_CERTS does not cover them).
+      - mitmproxy-certs:/run/mitmproxy-certs:ro
     # Port model:
     #   9100 — Hono API (/healthz, /clone) — sandbox-net only, no host mapping
     #   9200 — OpenCode bearer-token proxy — sandbox-net only, no host mapping
@@ -202,6 +209,15 @@ services:
       options:
         max-size: 10m
         max-file: '3'
+    healthcheck:
+      # /healthz returns 200 once the Hono clone API is up, independently of
+      # OpenCode readiness (it reports opencode: ready|starting|down in the body).
+      # localhost is in NO_PROXY so this probe does not traverse mitmproxy.
+      test: [CMD-SHELL, 'curl -fsS http://127.0.0.1:9100/healthz || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 4
+      start_period: 45s
 
   mitmproxy:
     image: mitmproxy/mitmproxy:11.1.3@sha256:e0deb0df7edf9f909053f274a067cd1cacb90f5c17d74459e1693179c0b98d8f
