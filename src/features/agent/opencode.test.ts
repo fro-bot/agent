@@ -1295,6 +1295,9 @@ describe('ensureOpenCodeAvailable', () => {
       },
       opencodeConfig: null,
       systematicConfig: null,
+      enableOmoSlim: false,
+      omoSlimVersion: '1.1.1',
+      omoSlimPreset: 'openai',
     })
 
     // #then
@@ -1330,6 +1333,9 @@ describe('ensureOpenCodeAvailable', () => {
         },
         opencodeConfig: null,
         systematicConfig: null,
+        enableOmoSlim: false,
+        omoSlimVersion: '1.1.1',
+        omoSlimPreset: 'openai',
       })
     } catch {
       // Expected to fail since runSetup will fail in test environment

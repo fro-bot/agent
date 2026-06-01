@@ -1,4 +1,5 @@
 import type {Logger} from '../../shared/logger.js'
+import type {OmoSlimPreset} from '../../shared/types.js'
 import type {EnsureOpenCodeResult} from './types.js'
 import {
   bootstrapOpenCodeServer as bootstrapRuntimeOpenCodeServer,
@@ -31,6 +32,9 @@ export async function ensureOpenCodeAvailable(options: {
   }
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
+  readonly enableOmoSlim: boolean
+  readonly omoSlimVersion: string
+  readonly omoSlimPreset: OmoSlimPreset
 }): Promise<EnsureOpenCodeResult> {
   return ensureRuntimeOpenCodeAvailable(options, runtimeSetupAdapter)
 }

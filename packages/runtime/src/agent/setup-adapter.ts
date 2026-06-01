@@ -1,5 +1,5 @@
 import type {Logger} from '../shared/logger.js'
-import type {OmoProviders} from '../shared/types.js'
+import type {OmoProviders, OmoSlimPreset} from '../shared/types.js'
 
 /**
  * Setup action inputs needed by the runtime's auto-setup path.
@@ -17,6 +17,9 @@ export interface SetupInputs {
   readonly omoVersion: string
   readonly systematicVersion: string
   readonly omoProviders: OmoProviders
+  readonly enableOmoSlim: boolean
+  readonly omoSlimVersion: string
+  readonly omoSlimPreset: OmoSlimPreset
 }
 
 export interface SetupAdapter {

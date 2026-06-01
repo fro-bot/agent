@@ -17,6 +17,13 @@
     {
       customType: 'regex',
       managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
+      matchStrings: ["DEFAULT_OMO_SLIM_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: 'oh-my-opencode-slim',
+      datasourceTemplate: 'npm',
+    },
+    {
+      customType: 'regex',
+      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
       matchStrings: ["DEFAULT_OPENCODE_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
@@ -62,6 +69,7 @@
         'anomalyco/opencode',
         'conventional-changelog-conventionalcommits',
         'oh-my-openagent',
+        'oh-my-opencode-slim',
         'oven-sh/bun',
         'semantic-release',
         'tsdown',

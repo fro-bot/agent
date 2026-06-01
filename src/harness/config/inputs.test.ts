@@ -759,6 +759,64 @@ describe('parseActionInputs', () => {
     })
   })
 
+  describe('enable-omo-slim mode flag', () => {
+    it('defaults to false when enable-omo-slim is not provided', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmoSlim).toBe(false)
+    })
+
+    it('parses enable-omo-slim as true when set', () => {
+      mockInputs({'enable-omo-slim': 'true'})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.enableOmoSlim).toBe(true)
+    })
+
+    it('rejects enabling both enable-omo and enable-omo-slim', () => {
+      mockInputs({'enable-omo': 'true', 'enable-omo-slim': 'true'})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('mutually exclusive')
+    })
+  })
+
+  describe('omo-slim-preset parsing', () => {
+    it('defaults to openai when not provided', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.omoSlimPreset).toBe('openai')
+    })
+
+    it('parses a valid preset', () => {
+      mockInputs({'enable-omo-slim': 'true', 'omo-slim-preset': 'opencode-go'})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.omoSlimPreset).toBe('opencode-go')
+    })
+
+    it('rejects an invalid preset', () => {
+      mockInputs({'omo-slim-preset': 'not-a-preset'})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('Invalid omo-slim-preset')
+    })
+  })
+
   describe('agent parsing (no default)', () => {
     it('defaults to null when agent is not provided', () => {
       mockInputs({})

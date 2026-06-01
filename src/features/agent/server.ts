@@ -74,6 +74,9 @@ export interface EnsureOpenCodeOptions {
   readonly omoProviders: SetupInputs['omoProviders']
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
+  readonly enableOmoSlim: boolean
+  readonly omoSlimVersion: string
+  readonly omoSlimPreset: SetupInputs['omoSlimPreset']
 }
 
 export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): Promise<EnsureOpenCodeResult> {
@@ -98,6 +101,9 @@ export async function ensureOpenCodeAvailable(options: EnsureOpenCodeOptions): P
     omoVersion: options.omoVersion,
     systematicVersion: options.systematicVersion,
     omoProviders: options.omoProviders,
+    enableOmoSlim: options.enableOmoSlim,
+    omoSlimVersion: options.omoSlimVersion,
+    omoSlimPreset: options.omoSlimPreset,
   }
   const setupResult = await runSetup(setupInputs, options.githubToken)
   if (setupResult == null) {
