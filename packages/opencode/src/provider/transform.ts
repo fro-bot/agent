@@ -230,6 +230,17 @@ function normalizeMessages(
       const parts = msg.content
       const first = parts.findIndex((part) => part.type === "tool-call")
       if (first === -1) return [msg]
+      if (
+        parts
+          .slice(first)
+          .some(
+            (part) =>
+              part.type === "reasoning" &&
+              (part.providerOptions?.anthropic?.signature != null ||
+                part.providerOptions?.anthropic?.redactedData != null),
+          )
+      )
+        return [msg]
       if (!parts.slice(first).some((part) => part.type !== "tool-call")) return [msg]
       return [
         { ...msg, content: parts.filter((part) => part.type !== "tool-call") },

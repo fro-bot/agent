@@ -1680,6 +1680,25 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
     ])
   })
 
+  test("leaves signed anthropic reasoning after tool calls unchanged", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "First thought", providerOptions: { anthropic: { signature: "sig-1" } } },
+          { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
+          { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
+          { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
+        ],
+      },
+    ] as any[]
+
+    const result = ProviderTransform.message(msgs, anthropicModel, {}) as any[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].content).toMatchObject(msgs[0].content)
+  })
+
   test("splits vertex anthropic assistant messages when text trails tool calls", () => {
     const model = {
       ...anthropicModel,
