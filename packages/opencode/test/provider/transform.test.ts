@@ -1617,28 +1617,46 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
   test("places anthropic tool results before trailing text", () => {
     const msgs = [
       {
+        role: "user",
+        content: [{ type: "text", text: "Check my home directory for PDFs" }],
+      },
+      {
         role: "assistant",
         content: [
           { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
-          { type: "text", text: "I checked your home directory." },
+          { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
+          { type: "text", text: "I checked your home directory and looked for PDF files." },
         ],
       },
       {
         role: "tool",
         content: [
           { type: "tool-result", toolCallId: "toolu_1", toolName: "read", output: { type: "text", value: "ok" } },
+          {
+            type: "tool-result",
+            toolCallId: "toolu_2",
+            toolName: "glob",
+            output: { type: "text", value: "No files found" },
+          },
         ],
       },
     ] as any[]
 
     const result = ProviderTransform.message(msgs, anthropicModel, {}) as any[]
 
-    expect(result).toHaveLength(3)
-    expect(result).toMatchObject([
-      { role: "assistant", content: [{ type: "tool-call", toolCallId: "toolu_1" }] },
-      { role: "tool", content: [{ type: "tool-result", toolCallId: "toolu_1" }] },
-      { role: "assistant", content: [{ type: "text", text: "I checked your home directory." }] },
-    ])
+    expect(result).toHaveLength(4)
+    expect(result[1]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
+        { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
+      ],
+    })
+    expect(result[2]).toMatchObject({ role: "tool" })
+    expect(result[3]).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "I checked your home directory and looked for PDF files." }],
+    })
   })
 
   test("keeps anthropic signed reasoning in order around tool results", () => {
@@ -1759,6 +1777,52 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
     expect(result[2]).toMatchObject({
       role: "assistant",
       content: [{ type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } }],
+    })
+  })
+
+  test("places vertex anthropic tool results before trailing text", () => {
+    const model = {
+      ...anthropicModel,
+      providerID: "google-vertex-anthropic",
+      api: {
+        id: "claude-sonnet-4@20250514",
+        url: "https://us-central1-aiplatform.googleapis.com",
+        npm: "@ai-sdk/google-vertex/anthropic",
+      },
+    }
+
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
+          { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
+          { type: "text", text: "I checked your home directory and looked for PDF files." },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "toolu_1", toolName: "read", output: { type: "text", value: "ok" } },
+          { type: "tool-result", toolCallId: "toolu_2", toolName: "glob", output: { type: "text", value: "ok" } },
+        ],
+      },
+    ] as any[]
+
+    const result = ProviderTransform.message(msgs, model, {}) as any[]
+
+    expect(result).toHaveLength(3)
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
+        { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
+      ],
+    })
+    expect(result[1]).toMatchObject({ role: "tool" })
+    expect(result[2]).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "I checked your home directory and looked for PDF files." }],
     })
   })
 })
