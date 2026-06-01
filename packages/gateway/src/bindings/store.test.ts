@@ -391,6 +391,118 @@ describe('createBindingsStore', () => {
     expect(result.success === false ? result.error.code : '').toBe('BINDING_STORE_ERROR')
   })
 
+  // isNotFound — structured classification for AWS NoSuchKey errors
+  describe('getBindingByRepo isNotFound classification', () => {
+    const notFoundCases = [
+      {
+        label: 'real AWS NoSuchKey message with structured code and status',
+        error: Object.assign(new Error('Object store getObject failed: The specified key does not exist.'), {
+          code: 'OBJECT_STORE_OPERATION_ERROR',
+          errorCode: 'NoSuchKey',
+          httpStatusCode: 404,
+        }),
+      },
+      {
+        label: 'structured-only: generic message + errorCode NoSuchKey',
+        error: Object.assign(new Error('Object store getObject failed: some generic message'), {
+          code: 'OBJECT_STORE_OPERATION_ERROR',
+          errorCode: 'NoSuchKey',
+        }),
+      },
+      {
+        label: 'structured-only: errorCode NotFound + httpStatusCode 404 (R2/other compatible stores)',
+        error: Object.assign(new Error('Object store getObject failed: Not Found'), {
+          code: 'OBJECT_STORE_OPERATION_ERROR',
+          errorCode: 'NotFound',
+          httpStatusCode: 404,
+        }),
+      },
+      {
+        label: 'SDK v3 shape: errorName NoSuchKey only (no errorCode)',
+        error: Object.assign(new Error('Object store getObject failed: The specified key does not exist.'), {
+          code: 'OBJECT_STORE_OPERATION_ERROR',
+          errorName: 'NoSuchKey',
+        }),
+      },
+      {
+        label: 'R2/B2-style message-only: no such key (no structured fields)',
+        error: new Error('Object store getObject failed: no such key'),
+      },
+      {
+        label: 'legacy not found message (existing behavior)',
+        error: new Error('not found'),
+      },
+    ]
+
+    for (const {label, error} of notFoundCases) {
+      it(`returns ok(null) for: ${label}`, async () => {
+        // #given
+        const adapter = makeAdapter({
+          getObject: vi.fn(async () => err(error)),
+        })
+        const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+        // #when
+        const result = await store.getBindingByRepo('foo', 'bar')
+
+        // #then
+        expect(result).toEqual(ok(null))
+      })
+    }
+
+    it('returns err for a genuine fatal error (403 Access Denied)', async () => {
+      // #given
+      const fatalError = Object.assign(new Error('Object store getObject failed: Access Denied'), {
+        code: 'OBJECT_STORE_OPERATION_ERROR',
+        errorCode: 'AccessDenied',
+        httpStatusCode: 403,
+      })
+      const adapter = makeAdapter({
+        getObject: vi.fn(async () => err(fatalError)),
+      })
+      const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+      // #when
+      const result = await store.getBindingByRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+    })
+
+    // P1 regression: NoSuchBucket is a FATAL misconfiguration, not an absent key.
+    // It shares httpStatusCode 404 with NoSuchKey but must NOT be treated as not-found.
+    const fatal404Cases = [
+      {
+        label: 'NoSuchBucket structured (errorCode) — must return err, not ok(null)',
+        error: Object.assign(new Error('Object store getObject failed: The specified bucket does not exist.'), {
+          code: 'OBJECT_STORE_OPERATION_ERROR',
+          errorCode: 'NoSuchBucket',
+          httpStatusCode: 404,
+        }),
+      },
+      {
+        label: 'NoSuchBucket message-only — must return err, not ok(null)',
+        error: new Error('Object store getObject failed: The specified bucket does not exist.'),
+      },
+    ]
+
+    for (const {label, error} of fatal404Cases) {
+      it(`returns err (fatal) for: ${label}`, async () => {
+        // #given
+        const adapter = makeAdapter({
+          getObject: vi.fn(async () => err(error)),
+        })
+        const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+        // #when
+        const result = await store.getBindingByRepo('foo', 'bar')
+
+        // #then
+        expect(result.success).toBe(false)
+      })
+    }
+  })
+
   // Error path — primary succeeds, index fails, rollback also fails → PartialWriteError
   it('createBinding returns PartialWriteError when index write and rollback both fail', async () => {
     // #given
