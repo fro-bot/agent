@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-05-24"
-updated-by: "201b294"
+last-updated: "2026-05-31"
+updated-by: "3d6d1f5"
 sources:
   - src/main.ts
   - src/post.ts
@@ -10,8 +10,12 @@ sources:
   - packages/runtime/src/index.ts
   - packages/runtime/src/coordination/types.ts
   - packages/gateway/src/main.ts
+  - packages/gateway/src/execute/run.ts
+  - packages/gateway/src/http/server.ts
+  - packages/runtime/src/agent/remote-client.ts
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
+  - apps/workspace-agent/src/opencode-server.ts
   - AGENTS.md
   - action.yaml
   - pnpm-workspace.yaml
@@ -31,7 +35,7 @@ The project is organized as a pnpm workspace monorepo with two workspace areas:
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Consumed by both the Action and the Gateway. |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo coordination lock, and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
-| workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service that runs inside the Docker Compose deploy stack alongside the gateway. Provides a `POST /clone` endpoint for the gateway to checkout repositories in an isolated container, keeping git credentials off the gateway process. Also exposes `GET /healthz` for Docker Compose health checks. |
+| workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service that runs inside the Docker Compose deploy stack alongside the gateway. Provides a `POST /clone` endpoint to checkout repositories in an isolated container (keeping git credentials off the gateway), and hosts a loopback-bound OpenCode server fronted by a bearer-token proxy for the gateway to attach to. Also exposes `GET /healthz` for Docker Compose health checks. |
 
 The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support multiple surfaces (the Discord gateway and workspace-agent are now live) that share the runtime package but have their own entry points.
 
@@ -61,31 +65,33 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 ### Gateway Package (`packages/gateway/`)
 
-The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs. Key modules:
+The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs and executes those runs end-to-end against a remote OpenCode server. Key modules:
 
-**Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`), and mention handler (`mentions.ts`). The mention handler parses `@fro-bot` mentions from Discord messages and maps them to agent prompts.
+**Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`, including `/add-project` and `/fro-bot`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses.
 
-**Bindings** (`bindings/`) — Channel-to-repository binding store (`store.ts`, `types.ts`). Maps Discord channel IDs to the GitHub repository they operate on. Backed by S3 so bindings survive restarts.
+**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits, and `recovery.ts` handles interrupted runs.
+
+**HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
+
+**Workspace API** (`workspace-api/`) — Client for calling the workspace-agent's clone and OpenCode-proxy endpoints (`client.ts`, `types.ts`).
+
+**Bindings** (`bindings/`) — Channel-to-repository binding store. Maps Discord channel IDs to the GitHub repository they operate on. Backed by S3 so bindings survive restarts.
 
 **GitHub** (`github/`) — GitHub App authentication client (`app-client.ts`). Generates short-lived installation tokens for the bound repository so the agent can make authenticated GitHub API calls on behalf of the App.
 
-**Config** (`config.ts`) — Loads and validates gateway configuration (Discord token, guild ID, GitHub App credentials, S3/coordination settings) from environment variables or mounted secret files.
+**Config / Readiness / Program / Shutdown** — Configuration loading and validation (`config.ts`), readiness lifecycle (`readiness.ts`), the top-level Effect program (`program.ts`), and graceful SIGINT/SIGTERM handling (`shutdown.ts`).
 
-**Readiness** (`readiness.ts`) — Structured readiness lifecycle that checks Discord connectivity, S3 access, and workspace-agent health before the gateway begins accepting mentions.
+The gateway runs as a Docker container alongside sidecars: the workspace-agent, a mitmproxy allowlist proxy (egress control to Discord and GitHub hosts only), and a reverse proxy. See `deploy/` for the Compose stack definition.
 
-**Program** (`program.ts`) — The top-level Effect program that wires together the gateway components. Extracted from `main.ts` for testability.
+### Workspace-Agent (`apps/workspace-agent/`)
 
-**Shutdown** (`shutdown.ts`) — Installs SIGINT/SIGTERM handlers for graceful shutdown, ensuring the coordination lock is released and in-flight interactions complete.
-
-**Effect runtime** (`runtime-effect.ts`) — Bootstraps the Effect runtime used for typed error propagation and structured concurrency throughout the gateway.
-
-The gateway runs as a Docker container alongside three sidecars: the workspace-agent, a mitmproxy allowlist proxy (egress control to Discord and GitHub hosts only), and an nginx reverse proxy. See `deploy/` for the Compose stack definition.
+The workspace-agent is a sandboxed Hono HTTP service that runs as a sidecar to the gateway. It owns two responsibilities: cloning repositories into an isolated container (`POST /clone`, keeping git credentials off the gateway), and hosting a remote OpenCode server that the gateway attaches to for agent execution. The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-token proxy (`opencode-proxy.ts`) is the sole externally-reachable surface, ensuring the raw OpenCode port is never exposed on the sandbox network. The gateway attaches to this remote server via `createRemoteOpenCodeHandle()` in the runtime package — a handle whose `close`/`shutdown` are no-ops because the gateway does not own the remote server.
 
 ### Runtime Package (`packages/runtime/`)
 
 The runtime package exports five module groups:
 
-**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]).
+**Agent** (`agent/`) — Prompt construction, SDK execution, output-mode resolution, server bootstrapping, retry logic, and reference file management (see [[Prompt Architecture]]). Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 

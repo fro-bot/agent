@@ -1,6 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
-import type {ActionInputs, ModelConfig, OmoProviders, OutputMode} from '../../shared/types.js'
+import type {ActionInputs, ModelConfig, OmoProviders, OmoSlimPreset, OutputMode} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
@@ -16,7 +16,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   OMO_PROVIDERS_DISABLED,
 } from '../../shared/constants.js'
-import {err, ok} from '../../shared/types.js'
+import {DEFAULT_OMO_SLIM_PRESET, err, ok, VALID_OMO_SLIM_PRESETS} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
 
 // Known oMo-provided agent names for migration warnings
@@ -79,6 +79,13 @@ const VALID_OMO_PROVIDERS = [
 ] as const
 
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
+
+function parseOmoSlimPreset(input: string): OmoSlimPreset {
+  if (!VALID_OMO_SLIM_PRESETS.includes(input as OmoSlimPreset)) {
+    throw new Error(`Invalid omo-slim-preset value: "${input}". Valid values: ${VALID_OMO_SLIM_PRESETS.join(', ')}`)
+  }
+  return input as OmoSlimPreset
+}
 
 type OmoProviderInput = (typeof VALID_OMO_PROVIDERS)[number]
 
@@ -293,6 +300,15 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const enableOmoRaw = core.getInput('enable-omo').trim().toLowerCase()
     const enableOmo = enableOmoRaw === 'true'
 
+    const enableOmoSlimRaw = core.getInput('enable-omo-slim').trim().toLowerCase()
+    const enableOmoSlim = enableOmoSlimRaw === 'true'
+
+    // oMo and OMO Slim both own the OpenCode plugin/agent surface — running both
+    // is undefined. Fail fast rather than silently picking one.
+    if (enableOmo && enableOmoSlim) {
+      throw new Error('enable-omo and enable-omo-slim are mutually exclusive. Enable only one orchestration plugin.')
+    }
+
     const agentRaw = core.getInput('agent').trim()
     const agent = agentRaw.length > 0 ? agentRaw : null
 
@@ -319,6 +335,11 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const omoProviders = enableOmo
       ? parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
       : OMO_PROVIDERS_DISABLED
+
+    // Preset always validated when provided so an invalid value never reaches the
+    // installer argv; defaults to 'openai' when omo-slim is enabled without one.
+    const omoSlimPresetRaw = core.getInput('omo-slim-preset').trim()
+    const omoSlimPreset = omoSlimPresetRaw.length > 0 ? parseOmoSlimPreset(omoSlimPresetRaw) : DEFAULT_OMO_SLIM_PRESET
 
     const opencodeConfigRaw = core.getInput('opencode-config').trim()
     const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
@@ -378,11 +399,13 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       model,
       timeoutMs,
       enableOmo,
+      enableOmoSlim,
       opencodeVersion,
       skipCache,
       omoVersion,
       systematicVersion,
       omoProviders,
+      omoSlimPreset,
       opencodeConfig,
       systematicConfig,
       dedupWindow,

@@ -61,6 +61,10 @@ inputs:
     description: 'Enable Oh My OpenAgent (oMo) for extended provider and agent support. Default: false.'
     required: false
     default: 'false'
+  enable-omo-slim:
+    description: 'Enable OMO Slim (oh-my-opencode-slim) orchestration. Mutually exclusive with enable-omo. Default: false.'
+    required: false
+    default: 'false'
   model:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
@@ -86,6 +90,11 @@ inputs:
       Comma-separated list of oMo providers to enable. Values: claude, claude-max20,
       copilot, gemini, openai, opencode-zen, zai-coding-plan, kimi-for-coding.
       Default: empty (uses free OpenCode models)
+    required: false
+  omo-slim-preset:
+    description: >-
+      OMO Slim preset to install (single name). Values: openai, opencode-go.
+      Only applies when enable-omo-slim is true. Default: openai.
     required: false
   opencode-config:
     description: >-

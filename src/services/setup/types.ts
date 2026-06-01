@@ -1,7 +1,7 @@
 import type {Buffer} from 'node:buffer'
 
 import type {Logger} from '../../shared/logger.js'
-import type {OmoProviders} from '../../shared/types.js'
+import type {OmoProviders, OmoSlimPreset} from '../../shared/types.js'
 
 // Re-export Logger for convenience in setup modules
 export type {Logger}
@@ -20,6 +20,9 @@ export interface SetupInputs {
   readonly omoVersion: string
   readonly systematicVersion: string
   readonly omoProviders: OmoProviders
+  readonly enableOmoSlim: boolean
+  readonly omoSlimPreset: OmoSlimPreset
+  readonly omoSlimVersion: string
 }
 
 /**
@@ -31,6 +34,8 @@ export interface SetupResult {
   readonly ghAuthenticated: boolean
   readonly omoStatus: 'installed' | 'failed' | 'skipped'
   readonly omoError: string | null
+  readonly omoSlimStatus: 'installed' | 'failed' | 'skipped'
+  readonly omoSlimError: string | null
   readonly toolsCacheStatus: 'hit' | 'miss'
   readonly duration: number
 }
