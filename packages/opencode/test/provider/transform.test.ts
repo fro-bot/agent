@@ -1614,7 +1614,34 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
     expect(result[1].content).toHaveLength(1)
   })
 
-  test("preserves anthropic signed reasoning after tool calls", () => {
+  test("places anthropic tool results before trailing text", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
+          { type: "text", text: "I checked your home directory." },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "toolu_1", toolName: "read", output: { type: "text", value: "ok" } },
+        ],
+      },
+    ] as any[]
+
+    const result = ProviderTransform.message(msgs, anthropicModel, {}) as any[]
+
+    expect(result).toHaveLength(3)
+    expect(result).toMatchObject([
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "toolu_1" }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "toolu_1" }] },
+      { role: "assistant", content: [{ type: "text", text: "I checked your home directory." }] },
+    ])
+  })
+
+  test("keeps anthropic signed reasoning in order around tool results", () => {
     const msgs = [
       {
         role: "user",
@@ -1627,6 +1654,7 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
           { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
           { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
           { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
+          { type: "tool-call", toolCallId: "toolu_3", toolName: "bash", input: { command: "pwd" } },
         ],
       },
       {
@@ -1639,22 +1667,31 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
             toolName: "glob",
             output: { type: "text", value: "No files found" },
           },
+          { type: "tool-result", toolCallId: "toolu_3", toolName: "bash", output: { type: "text", value: "/root" } },
         ],
       },
     ] as any[]
 
     const result = ProviderTransform.message(msgs, anthropicModel, {}) as any[]
 
-    expect(result).toHaveLength(3)
+    expect(result).toHaveLength(5)
     expect(result[1]).toMatchObject({
       role: "assistant",
       content: [
         { type: "reasoning", text: "First thought", providerOptions: { anthropic: { signature: "sig-1" } } },
         { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
         { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
-        { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
       ],
     })
+    expect(result[2]).toMatchObject({ role: "tool" })
+    expect(result[3]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
+        { type: "tool-call", toolCallId: "toolu_3", toolName: "bash", input: { command: "pwd" } },
+      ],
+    })
+    expect(result[4]).toMatchObject({ role: "tool", content: [{ type: "tool-result", toolCallId: "toolu_3" }] })
   })
 
   test("leaves valid anthropic assistant tool ordering unchanged", () => {
@@ -1679,7 +1716,7 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
     ])
   })
 
-  test("preserves vertex anthropic signed reasoning after tool calls", () => {
+  test("keeps vertex anthropic signed reasoning in order around tool results", () => {
     const model = {
       ...anthropicModel,
       providerID: "google-vertex-anthropic",
@@ -1699,18 +1736,29 @@ describe("ProviderTransform.message - anthropic empty content filtering", () => 
           { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
         ],
       },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "toolu_1", toolName: "read", output: { type: "text", value: "ok" } },
+          { type: "tool-result", toolCallId: "toolu_2", toolName: "glob", output: { type: "text", value: "ok" } },
+        ],
+      },
     ] as any[]
 
     const result = ProviderTransform.message(msgs, model, {}) as any[]
 
-    expect(result).toHaveLength(1)
+    expect(result).toHaveLength(3)
     expect(result[0]).toMatchObject({
       role: "assistant",
       content: [
         { type: "tool-call", toolCallId: "toolu_1", toolName: "read", input: { filePath: "/root" } },
         { type: "tool-call", toolCallId: "toolu_2", toolName: "glob", input: { pattern: "**/*.pdf" } },
-        { type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } },
       ],
+    })
+    expect(result[1]).toMatchObject({ role: "tool" })
+    expect(result[2]).toMatchObject({
+      role: "assistant",
+      content: [{ type: "reasoning", text: "Second thought", providerOptions: { anthropic: { signature: "sig-2" } } }],
     })
   })
 })

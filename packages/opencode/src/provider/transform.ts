@@ -212,8 +212,68 @@ function normalizeMessages(
       return msg
     })
   }
-  // Do not reorder Anthropic assistant parts here. Reasoning blocks carry signatures,
-  // and relocating them causes Anthropic to reject replayed assistant messages.
+  if (["@ai-sdk/anthropic", "@ai-sdk/google-vertex/anthropic"].includes(model.api.npm)) {
+    // A tool result must immediately follow its tool call, but signed thinking must
+    // not move. Split merged steps around their matching tool results instead.
+    const result: ModelMessage[] = []
+    for (let i = 0; i < msgs.length; i++) {
+      const msg = msgs[i]
+      const next = msgs[i + 1]
+      if (msg.role !== "assistant" || !Array.isArray(msg.content) || next?.role !== "tool") {
+        result.push(msg)
+        continue
+      }
+
+      const clientToolIDs = new Set(
+        msg.content.flatMap((part) =>
+          part.type === "tool-call" && part.providerExecuted !== true ? [part.toolCallId] : [],
+        ),
+      )
+      if (clientToolIDs.size === 0) {
+        result.push(msg)
+        continue
+      }
+
+      const chunks = msg.content.reduce<Array<typeof msg.content>>(
+        (chunks, part) => {
+          const current = chunks.at(-1)!
+          const hasToolCall = current.some(
+            (item) => item.type === "tool-call" && clientToolIDs.has(item.toolCallId),
+          )
+          const isClientToolPart =
+            (part.type === "tool-call" || part.type === "tool-result") && clientToolIDs.has(part.toolCallId)
+          if (hasToolCall && !isClientToolPart) chunks.push([])
+          chunks.at(-1)!.push(part)
+          return chunks
+        },
+        [[]],
+      )
+      if (chunks.length === 1) {
+        result.push(msg)
+        continue
+      }
+
+      const used = new Set<string>()
+      for (const chunk of chunks) {
+        result.push({ ...msg, content: chunk })
+        const calls = new Set(
+          chunk.flatMap((part) =>
+            part.type === "tool-call" && clientToolIDs.has(part.toolCallId) ? [part.toolCallId] : [],
+          ),
+        )
+        if (calls.size === 0) continue
+        const output = next.content.filter((part) => part.type === "tool-result" && calls.has(part.toolCallId))
+        if (output.length === 0) continue
+        output.forEach((part) => used.add(part.toolCallId))
+        result.push({ ...next, content: output })
+      }
+
+      const remaining = next.content.filter((part) => part.type !== "tool-result" || !used.has(part.toolCallId))
+      if (remaining.length > 0) result.push({ ...next, content: remaining })
+      i++
+    }
+    msgs = result
+  }
   if (
     model.providerID === "mistral" ||
     model.api.id.toLowerCase().includes("mistral") ||
