@@ -64,8 +64,12 @@ RUN case "${TARGETARCH}" in \
     && chmod 755 /usr/local/bin/opencode \
     && opencode --version
 
-# Workspace OpenCode config: declare the Systematic plugin, disable autoupdate.
-# Only the mention-loop agent uses the plugin; the clone path does not depend on it.
+# Base workspace OpenCode config: declare the Systematic plugin and disable
+# autoupdate. The model and provider block are NOT baked — the entrypoint
+# overlays them at runtime from WORKSPACE_OPENCODE_MODEL and
+# WORKSPACE_OPENCODE_CONFIG so a deployer selects the provider/baseURL (e.g.
+# cliproxyapi) and model, mirroring the action's `model` + `opencode-config`
+# inputs. Only the mention-loop agent uses the plugin; clone does not.
 RUN mkdir -p /root/.config/opencode \
     && printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false,\n  "plugin": ["@fro.bot/systematic@%s"]\n}\n' "${SYSTEMATIC_VERSION}" \
       > /root/.config/opencode/opencode.json
