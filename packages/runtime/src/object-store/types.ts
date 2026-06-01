@@ -27,6 +27,11 @@ export interface PathTraversalError extends Error {
 
 export interface ObjectStoreOperationError extends Error {
   readonly code: 'OBJECT_STORE_OPERATION_ERROR'
+  readonly errorCode?: string
+  // errorName is the AWS SDK v3 field (error.name) — present when errorCode (error.Code) is absent.
+  // Both are threaded through logS3Error in s3-adapter.ts so isNotFound can use either.
+  readonly errorName?: string
+  readonly httpStatusCode?: number
 }
 
 export function createValidationError(message: string): ValidationError {
@@ -37,6 +42,16 @@ export function createPathTraversalError(message: string): PathTraversalError {
   return Object.assign(new Error(message), {code: 'OBJECT_STORE_PATH_TRAVERSAL_ERROR' as const})
 }
 
-export function createObjectStoreOperationError(message: string): ObjectStoreOperationError {
-  return Object.assign(new Error(message), {code: 'OBJECT_STORE_OPERATION_ERROR' as const})
+export function createObjectStoreOperationError(
+  message: string,
+  details?: {readonly errorCode?: string; readonly errorName?: string; readonly httpStatusCode?: number},
+): ObjectStoreOperationError {
+  // Attach each structured key only when defined so that 'errorCode' in error === false
+  // for single-arg callers (e.g. internal sanity checks without S3 context).
+  return Object.assign(new Error(message), {
+    code: 'OBJECT_STORE_OPERATION_ERROR' as const,
+    ...(details?.errorCode !== undefined && {errorCode: details.errorCode}),
+    ...(details?.errorName !== undefined && {errorName: details.errorName}),
+    ...(details?.httpStatusCode !== undefined && {httpStatusCode: details.httpStatusCode}),
+  })
 }
