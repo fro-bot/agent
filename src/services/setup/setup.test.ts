@@ -29,6 +29,9 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
       zaiCodingPlan: 'no',
       kimiForCoding: 'no',
     },
+    enableOmoSlim: false,
+    omoSlimPreset: 'openai' as const,
+    omoSlimVersion: '1.1.1',
     ...overrides,
   }
 }

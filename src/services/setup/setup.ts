@@ -14,6 +14,7 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {buildCIConfig, pluginPrefix} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
+import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
 import {writeSystematicConfig} from './systematic-config.js'
@@ -67,7 +68,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       opencodeVersion: version,
       omoVersion,
       systematicVersion,
-      cacheMode: inputs.enableOmo ? 'enabled' : 'disabled',
+      cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
       toolCachePath,
       bunCachePath,
       omoConfigPath: configDir,
@@ -79,6 +80,8 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     let opencodeResult: OpenCodeInstallResult | undefined
     let omoStatus: 'installed' | 'failed' | 'skipped' = 'skipped'
     let omoError: string | null = null
+    let omoSlimStatus: 'installed' | 'failed' | 'skipped' = 'skipped'
+    let omoSlimError: string | null = null
 
     if (toolsCacheResult.hit) {
       const cachedPath = toolCache.find('opencode', version)
@@ -134,6 +137,34 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         omoStatus = 'failed'
         omoError = 'Bun installation failed'
       }
+    } else if (inputs.enableOmoSlim) {
+      // Slim mode: Bun install (required for bunx), then OMO Slim install (no telemetry exports)
+      let bunInstalled = false
+      try {
+        await installBun(logger, toolCache, execAdapter, core.addPath, DEFAULT_BUN_VERSION)
+        bunInstalled = true
+      } catch (error) {
+        logger.warning('Bun installation failed, OMO Slim will be unavailable', {
+          error: toErrorMessage(error),
+        })
+      }
+
+      if (bunInstalled) {
+        const slimResult = await installOmoSlim(inputs.omoSlimVersion, {logger, execAdapter}, inputs.omoSlimPreset)
+        if (slimResult.installed) {
+          logger.info('OMO Slim installed', {version: slimResult.version})
+          omoSlimStatus = 'installed'
+        } else {
+          logger.warning('OMO Slim installation failed, continuing without OMO Slim', {
+            error: slimResult.error ?? 'unknown error',
+          })
+          omoSlimStatus = 'failed'
+        }
+        omoSlimError = slimResult.error
+      } else {
+        omoSlimStatus = 'failed'
+        omoSlimError = 'Bun installation failed'
+      }
     } else {
       logger.info('oMo disabled, skipping oMo install')
     }
@@ -148,7 +179,14 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     }
 
     const ciConfigResult = buildCIConfig(
-      {opencodeConfig: inputs.opencodeConfig, systematicVersion, enableOmo: inputs.enableOmo},
+      {
+        opencodeConfig: inputs.opencodeConfig,
+        systematicVersion,
+        enableOmo: inputs.enableOmo,
+        enableOmoSlim: inputs.enableOmoSlim,
+        omoSlimVersion: inputs.omoSlimVersion,
+        omoSlimPreset: inputs.omoSlimPreset,
+      },
       logger,
     )
     if (ciConfigResult.error != null) {
@@ -229,7 +267,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         opencodeVersion: version,
         omoVersion,
         systematicVersion,
-        cacheMode: inputs.enableOmo ? 'enabled' : 'disabled',
+        cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
         toolCachePath,
         bunCachePath,
         omoConfigPath: configDir,
@@ -267,6 +305,8 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       ghAuthenticated: ghResult.authenticated,
       omoStatus,
       omoError,
+      omoSlimStatus,
+      omoSlimError,
       toolsCacheStatus,
       duration,
     }
