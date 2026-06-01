@@ -1150,6 +1150,113 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("splits anthropic replay when text follows a completed tool call", async () => {
+    const anthropicModel: Provider.Model = {
+      ...model,
+      id: ProviderV2.ModelID.make("claude-opus-4-8"),
+      providerID: ProviderV2.ID.make("anthropic"),
+      api: { id: "claude-opus-4-8", url: "https://api.anthropic.com", npm: "@ai-sdk/anthropic" },
+    }
+    const assistantID = "m-assistant"
+
+    const result = await MessageV2.toModelMessages(
+      [
+        {
+          info: assistantInfo(assistantID, "m-parent", undefined, {
+            providerID: anthropicModel.providerID,
+            modelID: anthropicModel.id,
+          }),
+          parts: [
+            { ...basePart(assistantID, "p1"), type: "step-start" },
+            {
+              ...basePart(assistantID, "p2"),
+              type: "tool",
+              callID: "toolu_1",
+              tool: "read",
+              state: {
+                status: "completed",
+                input: { filePath: "/root" },
+                output: "ok",
+                title: "Read",
+                metadata: {},
+                time: { start: 0, end: 1 },
+              },
+            },
+            { ...basePart(assistantID, "p3"), type: "text", text: "done" },
+          ] as SessionLegacy.Part[],
+        },
+      ],
+      anthropicModel,
+    )
+
+    expect(result.map((message) => message.role)).toEqual(["assistant", "tool", "assistant"])
+    expect(result[0].content).toMatchObject([{ type: "tool-call", toolCallId: "toolu_1" }])
+    expect(result[2].content).toMatchObject([{ type: "text", text: "done" }])
+  })
+
+  test("splits anthropic replay without moving signed reasoning", async () => {
+    const anthropicModel: Provider.Model = {
+      ...model,
+      id: ProviderV2.ModelID.make("claude-opus-4-8"),
+      providerID: ProviderV2.ID.make("anthropic"),
+      api: { id: "claude-opus-4-8", url: "https://api.anthropic.com", npm: "@ai-sdk/anthropic" },
+    }
+    const assistantID = "m-assistant"
+    const tool = (id: string, callID: string) => ({
+      ...basePart(assistantID, id),
+      type: "tool" as const,
+      callID,
+      tool: "bash",
+      state: {
+        status: "completed" as const,
+        input: { command: "pwd" },
+        output: "ok",
+        title: "Bash",
+        metadata: {},
+        time: { start: 0, end: 1 },
+      },
+    })
+
+    const result = await MessageV2.toModelMessages(
+      [
+        {
+          info: assistantInfo(assistantID, "m-parent", undefined, {
+            providerID: anthropicModel.providerID,
+            modelID: anthropicModel.id,
+          }),
+          parts: [
+            { ...basePart(assistantID, "p1"), type: "step-start" },
+            {
+              ...basePart(assistantID, "p2"),
+              type: "reasoning",
+              text: "one",
+              metadata: { anthropic: { signature: "sig-1" } },
+            },
+            tool("p3", "toolu_1"),
+            {
+              ...basePart(assistantID, "p4"),
+              type: "reasoning",
+              text: "two",
+              metadata: { anthropic: { signature: "sig-2" } },
+            },
+            tool("p5", "toolu_2"),
+          ] as SessionLegacy.Part[],
+        },
+      ],
+      anthropicModel,
+    )
+
+    expect(result.map((message) => message.role)).toEqual(["assistant", "tool", "assistant", "tool"])
+    expect(result[0].content).toMatchObject([
+      { type: "reasoning", text: "one", providerOptions: { anthropic: { signature: "sig-1" } } },
+      { type: "tool-call", toolCallId: "toolu_1" },
+    ])
+    expect(result[2].content).toMatchObject([
+      { type: "reasoning", text: "two", providerOptions: { anthropic: { signature: "sig-2" } } },
+      { type: "tool-call", toolCallId: "toolu_2" },
+    ])
+  })
+
   test("drops messages that only contain step-start parts", async () => {
     const assistantID = "m-assistant"
 

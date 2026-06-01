@@ -285,7 +285,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         if (part.type !== "reasoning") return false
         return part.metadata?.anthropic?.signature != null
       })
+      const splitAnthropicSteps = ["@ai-sdk/anthropic", "@ai-sdk/google-vertex/anthropic"].includes(model.api.npm)
+      let hasClientToolCall = false
       for (const part of msg.parts) {
+        if (splitAnthropicSteps && hasClientToolCall && (part.type === "text" || part.type === "reasoning")) {
+          assistantMessage.parts.push({ type: "step-start" })
+          hasClientToolCall = false
+        }
         if (part.type === "text") {
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({
@@ -294,11 +300,14 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             ...(differentModel ? {} : { providerMetadata: part.metadata }),
           })
         }
-        if (part.type === "step-start")
+        if (part.type === "step-start") {
           assistantMessage.parts.push({
             type: "step-start",
           })
+          hasClientToolCall = false
+        }
         if (part.type === "tool") {
+          if (part.metadata?.providerExecuted !== true) hasClientToolCall = true
           toolNames.add(part.tool)
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted
