@@ -1,4 +1,4 @@
-import type {ObjectStoreAdapter, ObjectStoreConfig, Result} from '@fro-bot/runtime'
+import type {ObjectStoreAdapter, ObjectStoreConfig, ObjectStoreOperationError, Result} from '@fro-bot/runtime'
 
 import {buildObjectStoreKey, err, ok, sanitizeKeyComponent} from '@fro-bot/runtime'
 
@@ -40,8 +40,39 @@ function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/i.test(error.message)
 }
 
+function isObjectStoreOperationError(error: Error): error is ObjectStoreOperationError {
+  return 'code' in error && error.code === 'OBJECT_STORE_OPERATION_ERROR'
+}
+
+// 404 is shared between key-missing (recoverable) and bucket-missing (fatal misconfiguration).
+// Classify by explicit error code first; fall back to message inspection for non-AWS-SDK stores
+// (R2, B2, MinIO) that may not populate structured fields.
+// See s3-adapter.ts logS3Error for how errorCode and errorName are threaded through.
+const NOT_FOUND_CODES = new Set(['NoSuchKey', 'NotFound'])
+const FATAL_404_CODES = new Set(['NoSuchBucket'])
+
+// Matches bucket-not-found messages (wording used by AWS, R2, MinIO).
+const BUCKET_NOT_FOUND_RE = /no.?such.?bucket|bucket[^.]*?(?:does.?not.?exist|not.?found)/i
+// Matches key-not-found messages across AWS, R2, B2, and legacy adapters.
+const KEY_NOT_FOUND_RE = /not.?found|no.?such.?key|does.?not.?exist|404/i
+
 function isNotFound(error: Error): boolean {
-  return /not.?found|no.?such.?key|404/i.test(error.message)
+  if (isObjectStoreOperationError(error)) {
+    // Use errorCode (error.Code from AWS SDK v2/legacy) or errorName (error.name from SDK v3).
+    const code = error.errorCode ?? error.errorName
+
+    if (code !== undefined) {
+      if (FATAL_404_CODES.has(code)) return false
+      if (NOT_FOUND_CODES.has(code)) return true
+      // Unrecognized code — fall through to message check below.
+    }
+  }
+
+  // Message fallback for non-AWS-SDK-structured errors (R2/B2/MinIO).
+  // Guard against bucket-not-found first so "does not exist" in a bucket error
+  // doesn't trip the key-not-found pattern.
+  if (BUCKET_NOT_FOUND_RE.test(error.message)) return false
+  return KEY_NOT_FOUND_RE.test(error.message)
 }
 
 function buildPrimaryKey(

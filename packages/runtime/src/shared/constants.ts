@@ -29,6 +29,9 @@ export const DEFAULT_MODEL = {
 export const DEFAULT_OPENCODE_VERSION = '1.14.41'
 export const DEFAULT_BUN_VERSION = '1.3.14'
 export const DEFAULT_OMO_VERSION = '3.17.15'
+// OMO Slim (oh-my-opencode-slim) pinned version. Stable line only — the 2.0.0-beta
+// channel is not the default. Renovate tracks this via .github/renovate.json5.
+export const DEFAULT_OMO_SLIM_VERSION = '1.1.1'
 export const DEFAULT_OMO_PROVIDERS = ''
 export const DEFAULT_SYSTEMATIC_VERSION = '2.24.0'
 

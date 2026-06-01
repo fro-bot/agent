@@ -1513,8 +1513,9 @@ describe('getTriggerDirective', () => {
     expect(directive.directive).toContain(
       'Review this pull request for code quality, potential bugs, and improvements.',
     )
-    expect(directive.directive).toContain('If you are a requested reviewer, submit a review via')
-    expect(directive.directive).toContain('Include the Run Summary in the review body')
+    expect(directive.directive).toContain('`--approve` for a PASS verdict')
+    expect(directive.directive).toContain('`--request-changes` for a CONDITIONAL or REJECT verdict')
+    expect(directive.directive).toContain('comment-only review does NOT satisfy a requested review')
     expect(directive.directive).toContain('If the author is a collaborator, prioritize actionable feedback')
     expect(directive.appendMode).toBe(true)
   })
@@ -1889,6 +1890,10 @@ describe('output contract', () => {
     expect(prompt).toContain('## Output Contract')
     expect(prompt).toContain('Requested reviewer: yes')
     expect(prompt).toContain('Author association: MEMBER')
+    // Verdict→event mapping must be explicit; the old comment-only loophole is gone
+    expect(prompt).toContain('PASS → `gh pr review --approve`')
+    expect(prompt).toContain('CONDITIONAL or REJECT → `gh pr review --request-changes`')
+    expect(prompt).not.toContain('approve/request-changes if confident; otherwise comment-only')
   })
 
   it('shows requested reviewer as no when not requested', () => {

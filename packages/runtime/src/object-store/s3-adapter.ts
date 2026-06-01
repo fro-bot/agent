@@ -44,7 +44,11 @@ function logS3Error(logger: Logger, operation: string, error: unknown): Error {
     message,
   })
 
-  return createObjectStoreOperationError(`Object store ${operation} failed: ${message}`)
+  return createObjectStoreOperationError(`Object store ${operation} failed: ${message}`, {
+    errorCode,
+    errorName,
+    httpStatusCode,
+  })
 }
 
 async function readResponseBody(body: unknown): Promise<string> {

@@ -398,4 +398,240 @@ describe('buildCIConfig', () => {
       expect(stringResult.error).toBe('opencode-config must be a JSON object')
     })
   })
+
+  describe('slim mode (enableOmoSlim: true)', () => {
+    it('includes oh-my-opencode-slim plugin and systematic in plugin array', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const plugins = result.config.plugin as string[]
+      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
+      expect(plugins.filter(p => p.startsWith('@fro.bot/systematic'))).toHaveLength(1)
+    })
+
+    it('pins default_agent to orchestrator unconditionally', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"default_agent":"build"}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect(result.config.default_agent).toBe('orchestrator')
+    })
+
+    it('does NOT deny external_directory for build agent in slim mode', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      // external_directory deny should NOT be set in slim mode
+      const agent = result.config.agent as Record<string, unknown> | undefined
+      const build = (agent?.build ?? {}) as Record<string, unknown>
+      const permission = (build.permission ?? {}) as Record<string, unknown>
+      expect(permission.external_directory).not.toBe('deny')
+    })
+
+    it('does NOT include oh-my-openagent in slim mode', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const plugins = result.config.plugin as string[]
+      expect(plugins.every(p => !p.startsWith('oh-my-openagent'))).toBe(true)
+    })
+
+    it('strips pre-existing oh-my-openagent from opencodeConfig in slim mode (cache restore edge case)', () => {
+      // #given - config pre-seeded with OMO entry from cache restore
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"plugin":["oh-my-openagent@3.0.0"]}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const plugins = result.config.plugin as string[]
+      expect(plugins.every(p => !p.startsWith('oh-my-openagent'))).toBe(true)
+      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
+    })
+
+    it('fix C: strips legacy plugins (plural) key in slim mode', () => {
+      // #given - opencodeConfig contains both plugin and plugins (plural) keys
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"plugins":["some-old-plugin"],"plugin":[]}',
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      expect('plugins' in result.config).toBe(false)
+    })
+
+    it('includes opencode-go preset in slim plugin specifier', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when - preset doesn't affect the plugin specifier, but verifies we pass through
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'opencode-go',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+      const plugins = result.config.plugin as string[]
+      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
+      expect(result.config.default_agent).toBe('orchestrator')
+    })
+  })
+
+  describe('dual-plugin guard', () => {
+    it('returns error when both oh-my-openagent and oh-my-opencode-slim would be present', () => {
+      // #given - opencodeConfig has both OMO and slim
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: '{"plugin":["oh-my-openagent@3.0.0","oh-my-opencode-slim@1.1.1"]}',
+          systematicVersion: '2.1.0',
+          enableOmo: true,
+          enableOmoSlim: false,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBe('oMo and OMO Slim plugins cannot both be present')
+    })
+  })
+
+  describe('R19 version-gated allowlist', () => {
+    it('returns error for unverified omoSlimVersion in slim mode', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '9.9.9',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toContain('9.9.9')
+      expect(result.error).toContain('not verified')
+      expect(result.error).toContain('1.1.1')
+    })
+
+    it('succeeds for verified version 1.1.1', () => {
+      // #given
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {
+          opencodeConfig: null,
+          systematicVersion: '2.1.0',
+          enableOmo: false,
+          enableOmoSlim: true,
+          omoSlimVersion: '1.1.1',
+          omoSlimPreset: 'openai',
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.error).toBeNull()
+    })
+  })
 })

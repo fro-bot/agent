@@ -81,6 +81,8 @@ export interface ActionInputs {
   readonly timeoutMs: number
   // oMo mode flag (default: false)
   readonly enableOmo: boolean
+  // OMO Slim mode flag (default: false). Mutually exclusive with enableOmo.
+  readonly enableOmoSlim: boolean
   // Setup consolidation: auto-setup inputs
   readonly opencodeVersion: string
   readonly skipCache: boolean
@@ -88,12 +90,19 @@ export interface ActionInputs {
   readonly systematicVersion: string
   // oMo provider configuration
   readonly omoProviders: OmoProviders
+  // OMO Slim preset (single name). Only meaningful when enableOmoSlim is true.
+  readonly omoSlimPreset: OmoSlimPreset
   // OpenCode config to merge with baseline
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
   // Dedup execution: skip if agent already ran for this entity recently (0 = disabled)
   readonly dedupWindow: number
 }
+
+// OMO Slim presets (single-name selection, unlike oMo's provider list).
+export const VALID_OMO_SLIM_PRESETS = ['openai', 'opencode-go'] as const
+export type OmoSlimPreset = (typeof VALID_OMO_SLIM_PRESETS)[number]
+export const DEFAULT_OMO_SLIM_PRESET: OmoSlimPreset = 'openai'
 
 // oMo provider configuration for installer
 export interface OmoProviders {

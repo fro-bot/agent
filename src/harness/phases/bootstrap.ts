@@ -3,6 +3,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs} from '../../shared/types.js'
 import * as core from '@actions/core'
 import {ensureOpenCodeAvailable} from '../../features/agent/index.js'
+import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -46,6 +47,9 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     omoProviders: inputs.omoProviders,
     opencodeConfig: inputs.opencodeConfig,
     systematicConfig: inputs.systematicConfig,
+    enableOmoSlim: inputs.enableOmoSlim,
+    omoSlimVersion: DEFAULT_OMO_SLIM_VERSION,
+    omoSlimPreset: inputs.omoSlimPreset,
   })
 
   if (opencodeResult.didSetup) {
