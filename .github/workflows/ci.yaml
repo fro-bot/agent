@@ -159,6 +159,11 @@ jobs:
         ### Missing tests
         ### Risk assessment (LOW/MED/HIGH): likelihood of regression, security exposure, or blast radius
         If a section has no items, write "None" under the heading. Do not omit any heading.
+
+        Submit the review with the event matching your verdict: PASS must use
+        `gh pr review --approve`; CONDITIONAL or REJECT must use
+        `gh pr review --request-changes`. A comment-only review does not count
+        and leaves the PR blocked on review-required.
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
