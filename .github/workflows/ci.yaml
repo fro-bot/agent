@@ -228,6 +228,50 @@ jobs:
           echo "OpenCode state files:"
           ls -lA ~/.local/state/opencode || true
 
+  test-action-omo-slim:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Test GitHub Action (OMO Slim)
+    needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - name: Test main action (OMO Slim enabled)
+        uses: ./
+        with:
+          auth-json: ${{ secrets.AUTH_JSON }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
+          model: ${{ vars.FRO_BOT_MODEL }}
+          enable-omo-slim: 'true'
+          omo-slim-preset: openai
+          prompt: Reply with "omo-slim smoke ok" and take no other action.
+
+      - if: always()
+        name: Introspect OMO Slim action execution
+        run: |
+          echo "OPENCODE_CONFIG_CONTENT (slim mode: orchestrator default, slim plugin, no oMo):"
+          echo "$OPENCODE_CONFIG_CONTENT" | jq . 2>/dev/null || echo "$OPENCODE_CONFIG_CONTENT"
+
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '.default_agent == "orchestrator"'
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("oh-my-opencode-slim"))] | length == 1'
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("oh-my-openagent"))] | length == 0'
+          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("@fro.bot/systematic"))] | length == 1'
+
+          echo "OpenCode config files:"
+          [ ! -d ~/.config/opencode ] || find ~/.config/opencode -maxdepth 2 -type f | sort
+          [ -f ~/.config/opencode/opencode.json ] && cat ~/.config/opencode/opencode.json || true
+          [ -f ~/.config/opencode/oh-my-opencode-slim.json ] && cat ~/.config/opencode/oh-my-opencode-slim.json || true
+
+          echo "Check oMo (oh-my-openagent) config absence in slim mode:"
+          [ ! -f ~/.config/opencode/oh-my-openagent.json ]
+
   gateway-smoke:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
     name: Gateway Image Smoke Test

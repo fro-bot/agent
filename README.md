@@ -369,6 +369,8 @@ concurrency:
 | `prompt` | No | — | Custom prompt for the agent |
 | `agent` | No | — | Agent to use. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent. |
 | `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support. When `true`, installs Bun and oMo, and oMo configures Sisyphus as the default agent. |
+| `enable-omo-slim` | No | `false` | Enable [OMO Slim](https://github.com/alvinunreal/oh-my-opencode-slim) orchestration. Mutually exclusive with `enable-omo`. When `true`, installs Bun and OMO Slim and pins `orchestrator` as the default agent. |
+| `omo-slim-preset` | No | `openai` | OMO Slim preset to install. One of `openai`, `opencode-go`. Only applies when `enable-omo-slim: true`. |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | Execution timeout in milliseconds (0 = no limit) |
 | `opencode-version` | No | `1.2.24` | OpenCode CLI version for installation |
@@ -387,12 +389,13 @@ concurrency:
 | `systematic-config` | No | — | Custom Systematic configuration JSON (deep-merged) |
 | `opencode-config` | No | — | Custom OpenCode configuration JSON (deep-merged) |
 
-> [!IMPORTANT]
-> **Migration: oMo default change.** Previous versions of this action shipped with Oh My OpenAgent enabled by default. As of this release, oMo is opt-in. If your workflow relies on oMo-provided agents (such as Sisyphus), set `enable-omo: true`. When oMo is disabled (the default):
+> [!IMPORTANT] **Migration: oMo default change.** Previous versions of this action shipped with Oh My OpenAgent enabled by default. As of this release, oMo is opt-in. If your workflow relies on oMo-provided agents (such as Sisyphus), set `enable-omo: true`. When oMo is disabled (the default):
 >
 > - `default_agent` in the generated OpenCode config is forced to `"build"`.
 > - `oh-my-openagent` entries are stripped from both `plugin` and legacy `plugins` in any user-provided `opencode-config` (a warning names rewritten fields).
 > - Both behaviors are bypassed when `enable-omo: true` — oMo manages its own config and agent selection.
+
+> [!NOTE] **OMO Slim** is an alternative orchestration plugin to oMo and cannot run alongside it — enabling both `enable-omo` and `enable-omo-slim` fails fast. When `enable-omo-slim: true`, the action installs OMO Slim with the chosen `omo-slim-preset`, registers the `oh-my-opencode-slim` plugin, and pins `default_agent` to `"orchestrator"`. The gateway environment variable for OMO Slim presets in workspace containers is deferred until the workspace image runs OpenCode.
 
 ### Action Outputs
 
