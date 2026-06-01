@@ -448,6 +448,37 @@ describe('createS3Adapter', () => {
     expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
   })
 
+  // P2: verify adapter wiring — NoSuchKey SDK error threads errorCode AND errorName through
+  it('getObject on NoSuchKey SDK error returns structured errorCode and errorName', async () => {
+    // #given — AWS SDK v3 shape: .Code carries the XML code, .name carries the exception class name
+    sendMock.mockRejectedValue(
+      Object.assign(new Error('The specified key does not exist.'), {
+        Code: 'NoSuchKey',
+        name: 'NoSuchKey',
+        $metadata: {httpStatusCode: 404},
+      }),
+    )
+    const logger = createLogger()
+    const adapter = createS3Adapter(baseConfig, logger)
+    const getObject = adapter.getObject
+
+    if (getObject == null) {
+      throw new Error('Expected getObject to be defined')
+    }
+
+    // #when
+    const result = await getObject('fro-bot-state/github/owner/repo/runs/missing.json')
+
+    // #then
+    expect(result.success).toBe(false)
+    if (result.success === true) return
+    const error = result.error as {code?: string; errorCode?: string; errorName?: string; httpStatusCode?: number}
+    expect(error.code).toBe('OBJECT_STORE_OPERATION_ERROR')
+    expect(error.errorCode).toBe('NoSuchKey')
+    expect(error.errorName).toBe('NoSuchKey')
+    expect(error.httpStatusCode).toBe(404)
+  })
+
   it('passes credentials to S3Client when credentials are provided in config', () => {
     // #given
     const credentials = {
