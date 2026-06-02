@@ -12413,7 +12413,7 @@ programs and associated documentation files created by the
 Original Author, when distributed with the Software.
 
 
-brace-expansion@5.0.5
+brace-expansion@5.0.6
 MIT
 MIT License
 
