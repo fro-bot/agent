@@ -1,5 +1,6 @@
 import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
+import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
@@ -7,6 +8,8 @@ import type {ConcurrencyRegistry} from './concurrency.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
+import {createPermissionCoordinator} from '../approvals/coordinator.js'
+import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
@@ -31,6 +34,8 @@ export interface RunMentionDeps {
    */
   readonly botUserId: string
   readonly logger: GatewayLogger
+  /** Program-scoped approval registry shared with the button handler and shutdown drain. */
+  readonly approvalRegistry: ApprovalRegistry
 }
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -78,6 +83,7 @@ function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context
  */
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, logger} = deps
+  const {approvalRegistry} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
@@ -205,14 +211,115 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       })
       const timeoutSignal = AbortSignal.timeout(runTimeoutMs)
 
-      await runOpenCodeCore({
-        handle,
-        directory: binding.workspacePath,
-        promptText,
-        sink,
-        signal: timeoutSignal,
+      // ── Approval coordinator — per-run, wired to the program-scoped registry ──
+      //
+      // Deadline must fire before both the run timeout AND Discord's 15-min
+      // interaction-token expiry. Formula:
+      //   - at least 60s
+      //   - at most half the run timeout
+      //   - capped at runTimeoutMs - 30s (strict: fires before the hard timeout)
+      //   - capped at 13 min (Discord interaction-token guard)
+      const approvalDeadlineMs = Math.min(
+        Math.max(60_000, Math.floor(runTimeoutMs / 2)),
+        runTimeoutMs - 30_000,
+        13 * 60_000,
+      )
+
+      const coordinator = createPermissionCoordinator({
         logger,
+        deadlineMs: approvalDeadlineMs,
+        onPending: request => {
+          // Per-request closures — each captures its own sessionID and approval message reference.
+          const {requestID, sessionID} = request
+
+          // postReply: call the OpenCode SDK permission reply endpoint.
+          // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
+          const postReplyForRequest = async (
+            rID: string,
+            directory: string,
+            decision: import('../approvals/coordinator.js').PermissionReply,
+          ) => {
+            try {
+              const res = await handle.client.postSessionIdPermissionsPermissionId({
+                path: {id: sessionID, permissionID: rID},
+                body: {response: decision},
+                query: {directory},
+              })
+              const envelope = res as {error?: unknown} | undefined
+              if (envelope?.error != null) {
+                return {ok: false as const, error: String(envelope.error)}
+              }
+              return {ok: true as const}
+            } catch (error) {
+              return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
+            }
+          }
+
+          // Fire-and-forget: post the embed then register with the shared registry.
+          // rawThread has the full Discord.js API (embeds, components, edit).
+          // onPending must not throw (coordinator catches internally anyway).
+          // eslint-disable-next-line no-void
+          void rawThread
+            .send({
+              embeds: [buildApprovalEmbed(request)],
+              components: [buildApprovalButtons(requestID)],
+              allowedMentions: {parse: []},
+            })
+            .then(postedMessage => {
+              // renderSettled edits THIS specific posted message.
+              const renderSettledForRequest = async (
+                req: import('../approvals/coordinator.js').PermissionRequest,
+                decision: import('../approvals/coordinator.js').PermissionReply,
+                decidedBy: string | null,
+                reason: import('../approvals/coordinator.js').SettlementReason,
+              ) => {
+                try {
+                  await (postedMessage as {edit: (opts: unknown) => Promise<unknown>}).edit({
+                    embeds: [buildSettledEmbed(req, decision, {decidedBy: decidedBy ?? undefined, reason})],
+                    components: [],
+                  })
+                } catch (error) {
+                  logger.warn({requestID: req.requestID, err: String(error)}, 'run: failed to edit approval message')
+                }
+              }
+
+              approvalRegistry.register({
+                requestID,
+                sessionID,
+                channelID: rawThread.id,
+                directory: binding.workspacePath,
+                request,
+                effects: {
+                  postReply: postReplyForRequest,
+                  renderSettled: renderSettledForRequest,
+                },
+              })
+            })
+            .catch((error: unknown) => {
+              logger.warn({requestID: request.requestID, err: String(error)}, 'run: failed to post approval embed')
+            })
+        },
+        onSettled: (requestID, reply, reason) => {
+          // eslint-disable-next-line no-void
+          void approvalRegistry.applySettlement({requestID, decision: reply, reason})
+        },
       })
+
+      try {
+        await runOpenCodeCore({
+          handle,
+          directory: binding.workspacePath,
+          promptText,
+          sink,
+          signal: timeoutSignal,
+          logger,
+          coordinator,
+        })
+      } finally {
+        // Fail-closed: dispose any still-open coordinator entries so pending approvals
+        // don't hang if the run ended (normally or via error) before they were settled.
+        coordinator.dispose('run ended')
+      }
 
       // ── session.idle received — transition to COMPLETED ──────────────────────────────────────
 

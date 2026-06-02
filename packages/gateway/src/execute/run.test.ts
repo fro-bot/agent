@@ -1,10 +1,13 @@
 import type {CoordinationConfig, HeartbeatController} from '@fro-bot/runtime'
 import type {Message, ThreadChannel} from 'discord.js'
+import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {RunMentionDeps} from './run.js'
 
 import * as runtimeModule from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import * as coordinatorModule from '../approvals/coordinator.js'
+import * as discordApprovalsModule from '../discord/approvals.js'
 import * as streamingModule from '../discord/streaming.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
@@ -22,8 +25,34 @@ vi.mock('@fro-bot/runtime', () => ({
   createHeartbeatController: vi.fn(),
 }))
 
+vi.mock('../approvals/coordinator.js', () => ({
+  createPermissionCoordinator: vi.fn().mockReturnValue({
+    onPermissionAsked: vi.fn(),
+    onPermissionReplied: vi.fn(),
+    pending: vi.fn().mockReturnValue([]),
+    dispose: vi.fn(),
+  }),
+}))
+
+vi.mock('../discord/approvals.js', () => ({
+  buildApprovalEmbed: vi.fn().mockReturnValue({type: 'embed'}),
+  buildApprovalButtons: vi.fn().mockReturnValue({type: 'buttons'}),
+  buildSettledEmbed: vi.fn().mockReturnValue({type: 'settled-embed'}),
+  parseApprovalCustomId: vi.fn().mockReturnValue(null),
+  APPROVE_PREFIX: 'fb-approve:',
+  DENY_PREFIX: 'fb-deny:',
+}))
+
 vi.mock('./opencode-attach.js', () => ({
-  attachOpencode: vi.fn().mockReturnValue({promptAsync: vi.fn(), subscribe: vi.fn()}),
+  attachOpencode: vi.fn().mockReturnValue({
+    promptAsync: vi.fn(),
+    subscribe: vi.fn(),
+    client: {
+      permission: {
+        reply: vi.fn().mockResolvedValue({data: null, error: null}),
+      },
+    },
+  }),
 }))
 
 vi.mock('../discord/streaming.js', () => ({
@@ -63,6 +92,8 @@ vi.mock('./run-core.js', () => ({
 const mockRuntime = vi.mocked(runtimeModule)
 const mockRunOpenCodeCore = vi.mocked(runCoreModule.runOpenCodeCore)
 const mockCreateDiscordStreamSink = vi.mocked(streamingModule.createDiscordStreamSink)
+const mockCreatePermissionCoordinator = vi.mocked(coordinatorModule.createPermissionCoordinator)
+vi.mocked(discordApprovalsModule) // ensure module mock is applied
 
 // ---------------------------------------------------------------------------
 // Test doubles
@@ -113,6 +144,17 @@ function makeMessage(thread?: ReturnType<typeof makeThread>): Message & {
   }
 }
 
+function makeApprovalRegistry(): ApprovalRegistry {
+  return {
+    register: vi.fn(),
+    has: vi.fn().mockReturnValue(false),
+    pending: vi.fn().mockReturnValue([]),
+    handleButtonDecision: vi.fn().mockResolvedValue('ok'),
+    applySettlement: vi.fn().mockResolvedValue(undefined),
+    disposeAll: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
 function makeDefaultConcurrency() {
   return {
     tryAcquire: vi.fn().mockReturnValue('ok'),
@@ -132,6 +174,7 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     runTimeoutMs: overrides.runTimeoutMs ?? 600000,
     botUserId: overrides.botUserId ?? 'bot-123',
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
+    approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     ...overrides,
   }
 }
@@ -720,6 +763,252 @@ describe('runMention', () => {
 
       // #and — lock released
       expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    })
+  })
+
+  // ── Approval coordinator wiring ──────────────────────────────────────────
+
+  describe('approval coordinator wiring', () => {
+    it('no permission asked → registry.register and registry.applySettlement are never called', async () => {
+      // #given — runOpenCodeCore resolves without triggering any permission callbacks
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const approvalRegistry = makeApprovalRegistry()
+      const deps = makeDeps({approvalRegistry})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — no approval interactions
+      expect(approvalRegistry.register).not.toHaveBeenCalled()
+      expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
+    })
+
+    it('coordinator is created with a deadlineMs strictly less than runTimeoutMs and <= 13*60_000', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const runTimeoutMs = 600_000
+      const deps = makeDeps({runTimeoutMs})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — coordinator was created
+      expect(mockCreatePermissionCoordinator).toHaveBeenCalled()
+      const coordinatorDeps = mockCreatePermissionCoordinator.mock.calls[0]?.[0]
+      expect(coordinatorDeps?.deadlineMs).toBeDefined()
+      const deadlineMs = coordinatorDeps?.deadlineMs ?? 0
+
+      // Strictly less than runTimeoutMs
+      expect(deadlineMs).toBeLessThan(runTimeoutMs)
+      // At most 13 minutes (Discord interaction-token expiry guard)
+      expect(deadlineMs).toBeLessThanOrEqual(13 * 60_000)
+    })
+
+    it('deadline math: approvalDeadlineMs < runTimeoutMs for all reasonable timeout values', async () => {
+      // #given — test with a smaller runTimeoutMs
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const runTimeoutMs = 120_000 // 2 min
+      const deps = makeDeps({runTimeoutMs})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then
+      const coordinatorDeps = mockCreatePermissionCoordinator.mock.calls[0]?.[0]
+      const deadlineMs = coordinatorDeps?.deadlineMs ?? 0
+      expect(deadlineMs).toBeLessThan(runTimeoutMs)
+      expect(deadlineMs).toBeLessThanOrEqual(13 * 60_000)
+      expect(deadlineMs).toBeGreaterThan(0)
+    })
+
+    it('onPending: posts approval embed+buttons to thread and calls approvalRegistry.register', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const approvalRegistry = makeApprovalRegistry()
+      const thread = makeThread()
+      // Make thread.send return a message-like object
+      const fakeApprovalMessage = {id: 'msg-approval-1', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const deps = makeDeps({approvalRegistry})
+      const binding = makeBinding()
+
+      // Capture the onPending callback from coordinator factory
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // #when — run completes first so coordinator is created
+      await runMention(message, binding, deps)
+
+      expect(capturedOnPending).toBeDefined()
+
+      // Simulate a permission request arriving
+      const fakeRequest: import('../approvals/coordinator.js').PermissionRequest = {
+        requestID: 'req-abc-123',
+        sessionID: 'sess-xyz',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      }
+      if (capturedOnPending === undefined) throw new Error('onPending callback was not captured')
+      capturedOnPending(fakeRequest)
+
+      // Allow the async send().then() to settle
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // #then — approval embed posted to thread
+      expect(thread.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          embeds: expect.any(Array) as unknown,
+          components: expect.any(Array) as unknown,
+        }),
+      )
+
+      // #and — approvalRegistry.register called with correct params
+      expect(approvalRegistry.register).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestID: 'req-abc-123',
+          channelID: thread.id,
+          directory: binding.workspacePath,
+        }),
+      )
+    })
+
+    it('onSettled: calls approvalRegistry.applySettlement with decision and reason', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const approvalRegistry = makeApprovalRegistry()
+      const deps = makeDeps({approvalRegistry})
+      const message = makeMessage()
+
+      let capturedOnSettled:
+        | ((
+            requestID: string,
+            reply: import('../approvals/coordinator.js').PermissionReply,
+            reason: import('../approvals/coordinator.js').SettlementReason,
+          ) => void)
+        | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnSettled = coordinatorDeps.onSettled
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnSettled).toBeDefined()
+      if (capturedOnSettled === undefined) throw new Error('onSettled callback was not captured')
+      capturedOnSettled('req-abc-123', 'once', 'replied')
+
+      // Allow async applySettlement to fire
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // #then
+      expect(approvalRegistry.applySettlement).toHaveBeenCalledWith({
+        requestID: 'req-abc-123',
+        decision: 'once',
+        reason: 'replied',
+      })
+    })
+
+    it('coordinator.dispose is called in finally block after run completes', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const disposeFn = vi.fn()
+      mockCreatePermissionCoordinator.mockReturnValue({
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: disposeFn,
+      })
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — dispose called with 'run ended'
+      expect(disposeFn).toHaveBeenCalledWith('run ended')
+    })
+
+    it('coordinator.dispose is called even when run-core throws', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+
+      const disposeFn = vi.fn()
+      mockCreatePermissionCoordinator.mockReturnValue({
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: disposeFn,
+      })
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — dispose still called
+      expect(disposeFn).toHaveBeenCalledWith('run ended')
+    })
+
+    it('coordinator is passed into runOpenCodeCore as the coordinator param', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const fakeCoordinator = {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+      mockCreatePermissionCoordinator.mockReturnValue(fakeCoordinator)
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — runOpenCodeCore received the coordinator
+      expect(mockRunOpenCodeCore).toHaveBeenCalledWith(
+        expect.objectContaining({
+          coordinator: fakeCoordinator,
+        }),
+      )
     })
   })
 })
