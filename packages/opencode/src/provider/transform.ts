@@ -230,6 +230,7 @@ function normalizeMessages(
       const parts = msg.content
       const first = parts.findIndex((part) => part.type === "tool-call")
       if (first === -1) return [msg]
+      // Anthropic signs thinking blocks, so moving them during replay invalidates the request.
       if (
         parts
           .slice(first)
