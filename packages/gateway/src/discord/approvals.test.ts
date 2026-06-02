@@ -299,7 +299,7 @@ describe('buildSettledEmbed', () => {
 
   it('settle variants produce different descriptions', () => {
     // #given — all settlement reasons
-    const reasons: SettlementReason[] = ['replied', 'cascade', 'deadline', 'disposed']
+    const reasons: SettlementReason[] = ['replied', 'cascade', 'deadline', 'disposed', 'superseded']
     const texts = reasons.map(reason => JSON.stringify(buildSettledEmbed(baseRequest, deny, {reason}).toJSON()))
     // #then — each should be unique (not all the same string)
     const unique = new Set(texts)
