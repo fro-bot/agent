@@ -174,6 +174,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
               return
             }
 
+            // Defer immediately — acknowledgements the interaction within Discord's 3 s
+            // window. We'll editReply after the (potentially slow) postReply HTTP call.
+            await interaction.deferReply({ephemeral: true})
+
             const decision = parsed.action === 'approve' ? ('once' as const) : ('reject' as const)
             const outcome = await approvalRegistry.handleButtonDecision({
               requestID: parsed.requestID,
@@ -195,11 +199,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                       ? 'Already decided.'
                       : 'Failed to record decision, try again.'
 
-            await interaction.reply({content: ackContent, ephemeral: true})
+            await interaction.editReply({content: ackContent})
           } catch (error: unknown) {
             logger.error({err: String(error)}, 'button: unexpected error handling approval interaction')
-            // Best-effort ack — if this also throws Discord considers the interaction failed.
-            await interaction.reply({content: 'Failed to record decision, try again.', ephemeral: true}).catch(() => {})
+            // Best-effort edit — if this also throws Discord considers the interaction failed.
+            await interaction.editReply({content: 'Failed to record decision, try again.'}).catch(() => {})
           }
         })()
         return

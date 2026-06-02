@@ -141,6 +141,10 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       pending: vi.fn().mockReturnValue([]),
       handleButtonDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn(),
+      attachMessage: vi.fn(),
+      markMessagePostFailed: vi.fn(),
+      disposeRun: vi.fn(),
+      confirmReply: vi.fn(),
       disposeAll: vi.fn(),
     },
   }

@@ -32,6 +32,10 @@ vi.mock('./approvals/registry.js', () => ({
     pending: vi.fn().mockReturnValue([]),
     handleButtonDecision: vi.fn().mockResolvedValue('ok'),
     applySettlement: vi.fn().mockResolvedValue(undefined),
+    attachMessage: vi.fn(),
+    markMessagePostFailed: vi.fn(),
+    confirmReply: vi.fn(),
+    disposeRun: vi.fn(),
     disposeAll: vi.fn().mockResolvedValue(undefined),
   }),
 }))
@@ -274,6 +278,10 @@ describe('button interaction handler (approval flow)', () => {
       pending: vi.fn().mockReturnValue([]),
       handleButtonDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
+      attachMessage: vi.fn(),
+      markMessagePostFailed: vi.fn(),
+      confirmReply: vi.fn(),
+      disposeRun: vi.fn(),
       disposeAll: vi.fn().mockResolvedValue(undefined),
     })
     const {parseApprovalCustomId} = await import('./discord/approvals.js')
@@ -330,6 +338,8 @@ describe('button interaction handler (approval flow)', () => {
     } = {},
   ) {
     const replyFn = vi.fn().mockResolvedValue(undefined)
+    const deferReplyFn = vi.fn().mockResolvedValue(undefined)
+    const editReplyFn = vi.fn().mockResolvedValue(undefined)
     const guildMembers = {
       fetch: vi.fn().mockResolvedValue({
         roles: {cache: {has: vi.fn().mockReturnValue(overrides.isAuthorized ?? true)}},
@@ -350,6 +360,8 @@ describe('button interaction handler (approval flow)', () => {
       channelId: overrides.channelId ?? 'ch-test',
       guild,
       reply: replyFn,
+      deferReply: deferReplyFn,
+      editReply: editReplyFn,
     }
   }
 
@@ -395,8 +407,9 @@ describe('button interaction handler (approval flow)', () => {
       decidedBy: 'user-decider',
     })
 
-    // #and — ephemeral approved ack
-    expect(interaction.reply).toHaveBeenCalledWith({content: 'Approved.', ephemeral: true})
+    // #and — deferred then edited with approved ack
+    expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
+    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Approved.'})
   })
 
   it('unauthorized click → ephemeral Not authorized, handleButtonDecision NOT called', async () => {
@@ -440,8 +453,9 @@ describe('button interaction handler (approval flow)', () => {
     // #then — decision is reject
     expect(fakeRegistry.handleButtonDecision).toHaveBeenCalledWith(expect.objectContaining({decision: 'reject'}))
 
-    // #and — ephemeral denied ack
-    expect(interaction.reply).toHaveBeenCalledWith({content: 'Denied.', ephemeral: true})
+    // #and — deferred then edited with denied ack
+    expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
+    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Denied.'})
   })
 
   it('outcome channel-mismatch → ephemeral correct text', async () => {
@@ -461,9 +475,8 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then
-    expect(interaction.reply).toHaveBeenCalledWith({
+    expect(interaction.editReply).toHaveBeenCalledWith({
       content: 'This approval belongs to another channel.',
-      ephemeral: true,
     })
   })
 
@@ -484,9 +497,8 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then
-    expect(interaction.reply).toHaveBeenCalledWith({
+    expect(interaction.editReply).toHaveBeenCalledWith({
       content: 'This approval is no longer pending.',
-      ephemeral: true,
     })
   })
 
@@ -507,7 +519,7 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then
-    expect(interaction.reply).toHaveBeenCalledWith({content: 'Already decided.', ephemeral: true})
+    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Already decided.'})
   })
 
   it('outcome reply-failed → ephemeral correct text', async () => {
@@ -527,7 +539,7 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then
-    expect(interaction.reply).toHaveBeenCalledWith({content: 'Failed to record decision, try again.', ephemeral: true})
+    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Failed to record decision, try again.'})
   })
 
   it('shutdown → approvalRegistry.disposeAll called', async () => {

@@ -3,27 +3,28 @@
  *
  * Bridges OpenCode permission events to the Discord approval UI.
  * run-core registers a pending request on `permission.asked` and settles it on
- * `permission.replied` — the authoritative settlement signal, NOT the button
- * click alone.
+ * `permission.replied` — the authoritative settlement signal.
  *
  * Verified against the installed SDK @ 1.14.41:
  * - `permission.asked`   → `properties.id` IS the requestID; carries
  *   `sessionID`, `permission` (gate category), `patterns`, optional `metadata`.
  * - `permission.replied` → `properties.requestID` + `properties.reply`
  *   (`"once" | "always" | "reject"`).
- * - A `"reject"` reply CASCADES server-side: all other pending permissions in
- *   the SAME session are rejected. The coordinator mirrors that cascade so the
- *   sibling embeds are settled too.
  *
- * Ownership boundary:
- * - Owns: the in-memory registry (keyed by `requestID`), the pending promises,
- *   per-entry deadline timers, and same-session cascade reconciliation.
- * - Does NOT own: Discord rendering, the HTTP reply POST, S3, the lock, or
- *   run-state. The caller wires the embed renderer (`onPending`/`onSettled`) and
- *   posts the reply; run.ts owns run-abort on deadline.
+ * ### Ownership (post-refactor)
  *
- * A process restart abandons all entries — a controlled fail-closed (the
- * deadline / run teardown rejects pending tools), never a silent hang.
+ * The coordinator is now a **thin forwarder** with a minimal local promise map.
+ * ALL ownership of deadline timers, cascade, and settlement rendering has moved
+ * to the registry (`ApprovalRegistry`).
+ *
+ * - `onPermissionAsked`: stores a resolver; calls `onPending`; NO deadline timer.
+ * - `onPermissionReplied`: calls `onReplied` (wired to `registry.confirmReply`);
+ *   resolves the local promise; NO cascade here.
+ * - `dispose`: calls `onDispose` (wired to `registry.disposeRun`); resolves all
+ *   local promises to `'reject'`.
+ *
+ * A process restart abandons all entries — a controlled fail-closed, never a
+ * silent hang.
  */
 
 import type {GatewayLogger} from '../discord/client.js'
@@ -56,7 +57,7 @@ export interface PermissionReplyEvent {
   readonly reply: PermissionReply
 }
 
-/** Why a pending entry settled — surfaced to `onSettled` for embed updates. */
+/** Why a pending entry settled — surfaced to render functions for embed updates. */
 export type SettlementReason = 'replied' | 'cascade' | 'deadline' | 'disposed'
 
 /** Coordinator seam consumed by run-core and the run orchestrator. */
@@ -64,15 +65,15 @@ export interface PermissionCoordinator {
   /**
    * Register a pending request (called by run-core on `permission.asked`).
    * Returns a promise that resolves with the settled reply when
-   * `permission.replied` arrives, the deadline fires, or the run is disposed.
+   * `permission.replied` arrives or the run is disposed.
    * NEVER rejects — resolves `"reject"` on the fail-closed paths.
    * Idempotent: a duplicate requestID returns the existing pending promise.
    */
   onPermissionAsked: (request: PermissionRequest) => Promise<PermissionReply>
   /**
-   * Settle the matching entry (called by run-core on `permission.replied`).
-   * On a `"reject"` reply, cascade-settles every other open entry in the same
-   * session (the server already rejected them). No-op for unknown/settled IDs.
+   * Forward the authoritative reply (called by run-core on `permission.replied`).
+   * Calls `onReplied` (wired to `registry.confirmReply`). No cascade here —
+   * cascade is owned by the registry. No-op for unknown IDs.
    */
   onPermissionReplied: (event: PermissionReplyEvent) => void
   /** Open (unsettled) requestIDs — for SSE-drop reconciliation / debugging. */
@@ -86,20 +87,31 @@ export interface PermissionCoordinatorDeps {
   readonly logger: GatewayLogger
   /**
    * Invoked when a new request is registered. The caller renders the Discord
-   * approval embed here. Must not throw — wrapped defensively.
+   * approval embed here AND registers the entry in the approval registry
+   * (including deadlineMs — deadline ownership has moved to the registry).
+   * Must not throw — wrapped defensively.
    */
   readonly onPending?: (request: PermissionRequest) => void
   /**
-   * Invoked when an entry settles (any reason). The caller updates/withdraws the
-   * embed here. Must not throw — wrapped defensively.
+   * Invoked when `permission.replied` is received. The caller forwards this
+   * to `registry.confirmReply`. Must not throw — wrapped defensively.
+   * Replaces the old `onSettled` callback (settlement rendering is now in the
+   * registry's `confirmReply` path).
+   */
+  readonly onReplied?: (event: PermissionReplyEvent) => void
+  /**
+   * Invoked when `dispose` is called (run teardown). The caller should call
+   * `registry.disposeRun(sessionID, reason)` to fail-close registry entries.
+   * Must not throw — wrapped defensively.
+   */
+  readonly onDispose?: (sessionIDs: readonly string[]) => void
+  /**
+   * @deprecated Use `onReplied` instead. Kept for backward compatibility with
+   * existing call sites that pass `onSettled`. When present, called with
+   * (requestID, reply, reason) on `permission.replied` (reason is always
+   * 'replied' from the coordinator's perspective — cascade is in the registry).
    */
   readonly onSettled?: (requestID: string, reply: PermissionReply, reason: SettlementReason) => void
-  /**
-   * Optional per-request deadline (ms). On expiry the entry fail-closes to
-   * `"reject"`. Must be a sub-deadline of the run wall-clock; run.ts owns the
-   * actual run-abort. Omit to disable per-entry deadlines.
-   */
-  readonly deadlineMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -178,23 +190,24 @@ export function parsePermissionReply(payload: unknown): PermissionReplyEvent | n
 }
 
 // ---------------------------------------------------------------------------
-// Coordinator
+// Coordinator (thin forwarder)
 // ---------------------------------------------------------------------------
 
+/** Minimal local entry — just enough to satisfy the pending promise. */
 interface Entry {
   readonly request: PermissionRequest
-  readonly resolve: (reply: PermissionReply) => void
-  settled: boolean
-  timer: ReturnType<typeof setTimeout> | null
+  resolve: (reply: PermissionReply) => void
 }
 
 /**
- * Create a permission coordinator. One instance per run; its registry is
- * scoped to that run (single-process gateway — no cross-replica concern).
+ * Create a permission coordinator. One instance per run; its local promise map
+ * is scoped to that run. Deadline, cascade, and rendering are owned by the registry.
  */
 export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): PermissionCoordinator {
-  const {logger, onPending, onSettled, deadlineMs} = deps
-  const registry = new Map<string, Entry>()
+  const {logger, onPending, onReplied, onDispose, onSettled} = deps
+  const localMap = new Map<string, Entry>()
+  /** SessionIDs seen by this coordinator instance — used by onDispose. */
+  const ownedSessionIDs = new Set<string>()
 
   function notifyPending(request: PermissionRequest): void {
     if (onPending === undefined) return
@@ -208,58 +221,61 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     }
   }
 
-  function notifySettled(requestID: string, reply: PermissionReply, reason: SettlementReason): void {
-    if (onSettled === undefined) return
+  function notifyReplied(event: PermissionReplyEvent): void {
+    // Preferred path: onReplied (wired to registry.confirmReply)
+    if (onReplied !== undefined) {
+      try {
+        onReplied(event)
+      } catch (error) {
+        logger.error(
+          {requestID: event.requestID, detail: error instanceof Error ? error.message : String(error)},
+          'approvals: onReplied callback threw (ignored)',
+        )
+      }
+    }
+    // Legacy compat: onSettled (old API — reason is always 'replied' from coordinator's view)
+    if (onSettled !== undefined) {
+      try {
+        onSettled(event.requestID, event.reply, 'replied')
+      } catch (error) {
+        logger.error(
+          {requestID: event.requestID, detail: error instanceof Error ? error.message : String(error)},
+          'approvals: onSettled callback threw (ignored)',
+        )
+      }
+    }
+  }
+
+  function notifyDispose(): void {
+    if (onDispose === undefined) return
     try {
-      onSettled(requestID, reply, reason)
+      onDispose([...ownedSessionIDs])
     } catch (error) {
       logger.error(
-        {requestID, detail: error instanceof Error ? error.message : String(error)},
-        'approvals: onSettled callback threw (ignored)',
+        {detail: error instanceof Error ? error.message : String(error)},
+        'approvals: onDispose callback threw (ignored)',
       )
     }
   }
 
-  /** Resolve an entry exactly once and run its settlement side effects. */
-  function settle(entry: Entry, reply: PermissionReply, reason: SettlementReason): void {
-    if (entry.settled) return
-    entry.settled = true
-    if (entry.timer !== null) {
-      clearTimeout(entry.timer)
-    }
-    entry.resolve(reply)
-    notifySettled(entry.request.requestID, reply, reason)
-  }
-
   async function onPermissionAsked(request: PermissionRequest): Promise<PermissionReply> {
-    const existing = registry.get(request.requestID)
-    if (existing !== undefined && !existing.settled) {
-      // Duplicate asked for an open request — idempotent: reuse the pending
-      // promise rather than registering a second entry.
+    const existing = localMap.get(request.requestID)
+    if (existing !== undefined) {
+      // Duplicate asked for an open request — idempotent: chain onto the existing promise.
       logger.warn({requestID: request.requestID}, 'approvals: duplicate permission.asked for open request (ignored)')
       return new Promise<PermissionReply>(resolve => {
         const prior = existing.resolve
-        // Chain onto the prior resolver so both awaiters settle together.
-        Object.assign(existing, {
-          resolve: (reply: PermissionReply) => {
-            prior(reply)
-            resolve(reply)
-          },
-        })
+        existing.resolve = (reply: PermissionReply) => {
+          prior(reply)
+          resolve(reply)
+        }
       })
     }
 
     return new Promise<PermissionReply>(resolve => {
-      const entry: Entry = {request, resolve, settled: false, timer: null}
-      if (deadlineMs !== undefined && deadlineMs > 0) {
-        entry.timer = setTimeout(() => {
-          logger.warn({requestID: request.requestID, deadlineMs}, 'approvals: request deadline expired — fail-closed')
-          settle(entry, 'reject', 'deadline')
-        }, deadlineMs)
-        // Do not keep the event loop alive solely for an approval timer.
-        entry.timer.unref?.()
-      }
-      registry.set(request.requestID, entry)
+      const entry: Entry = {request, resolve}
+      localMap.set(request.requestID, entry)
+      ownedSessionIDs.add(request.sessionID)
       logger.info(
         {requestID: request.requestID, sessionID: request.sessionID, permission: request.permission},
         'approvals: permission requested',
@@ -269,46 +285,34 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
   }
 
   function onPermissionReplied(event: PermissionReplyEvent): void {
-    const entry = registry.get(event.requestID)
-    if (entry === undefined || entry.settled) {
-      logger.debug(
-        {requestID: event.requestID, reply: event.reply},
-        'approvals: reply for unknown/settled request (no-op)',
-      )
+    const entry = localMap.get(event.requestID)
+    if (entry === undefined) {
+      logger.debug({requestID: event.requestID, reply: event.reply}, 'approvals: reply for unknown request (no-op)')
       return
     }
-    settle(entry, event.reply, 'replied')
-
-    if (event.reply === 'reject') {
-      // Server cascade-rejects all other pending permissions in this session.
-      for (const sibling of registry.values()) {
-        if (!sibling.settled && sibling.request.sessionID === event.sessionID) {
-          logger.info(
-            {requestID: sibling.request.requestID, sessionID: event.sessionID},
-            'approvals: cascade-rejecting sibling permission',
-          )
-          settle(sibling, 'reject', 'cascade')
-        }
-      }
-    }
+    // Resolve local promise and remove from map.
+    localMap.delete(event.requestID)
+    entry.resolve(event.reply)
+    // Forward to registry (which owns rendering + cascade).
+    notifyReplied(event)
   }
 
   function pending(): readonly string[] {
-    const open: string[] = []
-    for (const [requestID, entry] of registry) {
-      if (!entry.settled) open.push(requestID)
-    }
-    return open
+    return Array.from(localMap.keys())
   }
 
   function dispose(reason: string): void {
-    const open = pending()
+    const open = Array.from(localMap.keys())
     if (open.length > 0) {
       logger.warn({reason, count: open.length}, 'approvals: disposing open permission requests — fail-closed')
     }
-    for (const entry of registry.values()) {
-      settle(entry, 'reject', 'disposed')
+    // Resolve all local promises fail-closed.
+    for (const entry of localMap.values()) {
+      entry.resolve('reject')
     }
+    localMap.clear()
+    // Notify registry to dispose its entries.
+    notifyDispose()
   }
 
   return {onPermissionAsked, onPermissionReplied, pending, dispose}

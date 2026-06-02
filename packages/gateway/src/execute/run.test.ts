@@ -151,6 +151,10 @@ function makeApprovalRegistry(): ApprovalRegistry {
     pending: vi.fn().mockReturnValue([]),
     handleButtonDecision: vi.fn().mockResolvedValue('ok'),
     applySettlement: vi.fn().mockResolvedValue(undefined),
+    attachMessage: vi.fn(),
+    markMessagePostFailed: vi.fn(),
+    confirmReply: vi.fn(),
+    disposeRun: vi.fn(),
     disposeAll: vi.fn().mockResolvedValue(undefined),
   }
 }
@@ -787,22 +791,11 @@ describe('runMention', () => {
     })
 
     it('coordinator is created with a deadlineMs strictly less than runTimeoutMs and <= 13*60_000', async () => {
-      // #given
-      const {runMention} = await import('./run.js')
-      setupHappyPath()
+      // #given — deadline is computed directly from runTimeoutMs
+      const {computeApprovalDeadlineMs} = await import('./run.js')
 
       const runTimeoutMs = 600_000
-      const deps = makeDeps({runTimeoutMs})
-      const message = makeMessage()
-
-      // #when
-      await runMention(message, makeBinding(), deps)
-
-      // #then — coordinator was created
-      expect(mockCreatePermissionCoordinator).toHaveBeenCalled()
-      const coordinatorDeps = mockCreatePermissionCoordinator.mock.calls[0]?.[0]
-      expect(coordinatorDeps?.deadlineMs).toBeDefined()
-      const deadlineMs = coordinatorDeps?.deadlineMs ?? 0
+      const deadlineMs = computeApprovalDeadlineMs(runTimeoutMs)
 
       // Strictly less than runTimeoutMs
       expect(deadlineMs).toBeLessThan(runTimeoutMs)
@@ -812,19 +805,10 @@ describe('runMention', () => {
 
     it('deadline math: approvalDeadlineMs < runTimeoutMs for all reasonable timeout values', async () => {
       // #given — test with a smaller runTimeoutMs
-      const {runMention} = await import('./run.js')
-      setupHappyPath()
+      const {computeApprovalDeadlineMs} = await import('./run.js')
 
       const runTimeoutMs = 120_000 // 2 min
-      const deps = makeDeps({runTimeoutMs})
-      const message = makeMessage()
-
-      // #when
-      await runMention(message, makeBinding(), deps)
-
-      // #then
-      const coordinatorDeps = mockCreatePermissionCoordinator.mock.calls[0]?.[0]
-      const deadlineMs = coordinatorDeps?.deadlineMs ?? 0
+      const deadlineMs = computeApprovalDeadlineMs(runTimeoutMs)
       expect(deadlineMs).toBeLessThan(runTimeoutMs)
       expect(deadlineMs).toBeLessThanOrEqual(13 * 60_000)
       expect(deadlineMs).toBeGreaterThan(0)
@@ -893,7 +877,7 @@ describe('runMention', () => {
       )
     })
 
-    it('onSettled: calls approvalRegistry.applySettlement with decision and reason', async () => {
+    it('onReplied: calls approvalRegistry.confirmReply when coordinator fires onReplied', async () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
@@ -902,15 +886,15 @@ describe('runMention', () => {
       const deps = makeDeps({approvalRegistry})
       const message = makeMessage()
 
-      let capturedOnSettled:
-        | ((
-            requestID: string,
-            reply: import('../approvals/coordinator.js').PermissionReply,
-            reason: import('../approvals/coordinator.js').SettlementReason,
-          ) => void)
+      let capturedOnReplied:
+        | ((event: {
+            requestID: string
+            sessionID: string
+            reply: import('../approvals/coordinator.js').PermissionReply
+          }) => void)
         | undefined
       mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
-        capturedOnSettled = coordinatorDeps.onSettled
+        capturedOnReplied = coordinatorDeps.onReplied
         return {
           onPermissionAsked: vi.fn(),
           onPermissionReplied: vi.fn(),
@@ -922,18 +906,18 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      expect(capturedOnSettled).toBeDefined()
-      if (capturedOnSettled === undefined) throw new Error('onSettled callback was not captured')
-      capturedOnSettled('req-abc-123', 'once', 'replied')
+      expect(capturedOnReplied).toBeDefined()
+      if (capturedOnReplied === undefined) throw new Error('onReplied callback was not captured')
+      capturedOnReplied({requestID: 'req-abc-123', sessionID: 'sess-1', reply: 'once'})
 
-      // Allow async applySettlement to fire
+      // Allow async confirmReply to fire
       await new Promise(resolve => setTimeout(resolve, 0))
 
       // #then
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledWith({
+      expect(approvalRegistry.confirmReply).toHaveBeenCalledWith({
         requestID: 'req-abc-123',
-        decision: 'once',
-        reason: 'replied',
+        sessionID: 'sess-1',
+        reply: 'once',
       })
     })
 

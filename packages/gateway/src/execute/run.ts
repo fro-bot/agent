@@ -65,6 +65,30 @@ function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context
 }
 
 // ---------------------------------------------------------------------------
+// computeApprovalDeadlineMs
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the per-approval deadline in ms.
+ *
+ * Returns `undefined` if `runTimeoutMs` is too short to add a meaningful
+ * deadline — specifically when there is less than 90 s of runway (we need at
+ * least 30 s of clearance before the hard run timeout for the coordinator to
+ * fire and the reply to POST).
+ *
+ * Otherwise the deadline is:
+ *   - at least 60 s
+ *   - at most half the run timeout
+ *   - capped at runTimeoutMs − 30 s (fires before the hard abort)
+ *   - capped at 13 min (Discord interaction-token guard)
+ */
+export function computeApprovalDeadlineMs(runTimeoutMs: number): number | undefined {
+  // Need at least 90 s to have a 60 s deadline + 30 s clearance.
+  if (runTimeoutMs <= 90_000) return undefined
+  return Math.min(Math.max(60_000, Math.floor(runTimeoutMs / 2)), runTimeoutMs - 30_000, 13 * 60_000)
+}
+
+// ---------------------------------------------------------------------------
 // runMention — the lifecycle wrapper
 // ---------------------------------------------------------------------------
 
@@ -214,36 +238,35 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
       //
       // Deadline must fire before both the run timeout AND Discord's 15-min
-      // interaction-token expiry. Formula:
-      //   - at least 60s
-      //   - at most half the run timeout
-      //   - capped at runTimeoutMs - 30s (strict: fires before the hard timeout)
-      //   - capped at 13 min (Discord interaction-token guard)
-      const approvalDeadlineMs = Math.min(
-        Math.max(60_000, Math.floor(runTimeoutMs / 2)),
-        runTimeoutMs - 30_000,
-        13 * 60_000,
-      )
+      // interaction-token expiry.
+      const approvalDeadlineMs = computeApprovalDeadlineMs(runTimeoutMs)
 
       const coordinator = createPermissionCoordinator({
         logger,
-        deadlineMs: approvalDeadlineMs,
         onPending: request => {
-          // Per-request closures — each captures its own sessionID and approval message reference.
+          // Per-request closures — each captures its own sessionID.
           const {requestID, sessionID} = request
 
           // postReply: call the OpenCode SDK permission reply endpoint.
           // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
+          // A 10 s AbortSignal.timeout ensures we never hang indefinitely.
           const postReplyForRequest = async (
             rID: string,
             directory: string,
             decision: import('../approvals/coordinator.js').PermissionReply,
           ) => {
+            // FIX 4: Use AbortSignal.timeout(10_000) passed directly to the SDK call.
+            // This avoids the dangling-timer leak from the old Promise.race approach
+            // (where the losing setTimeout would remain armed for 10 s after the SDK
+            // call resolved). AbortSignal.timeout is self-cleaning — no manual
+            // clearTimeout needed. The SDK's Config extends RequestInit which includes
+            // signal?: AbortSignal | null, so this is type-safe.
             try {
               const res = await handle.client.postSessionIdPermissionsPermissionId({
                 path: {id: sessionID, permissionID: rID},
                 body: {response: decision},
                 query: {directory},
+                signal: AbortSignal.timeout(10_000),
               })
               const envelope = res as {error?: unknown} | undefined
               if (envelope?.error != null) {
@@ -255,7 +278,21 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
             }
           }
 
-          // Fire-and-forget: post the embed then register with the shared registry.
+          // register-before-send: register the entry in the shared registry
+          // BEFORE attempting the Discord embed post. This ensures the button
+          // handler can look up the entry even if the send is still in-flight.
+          // Registry owns the deadline timer (single-owner rule).
+          approvalRegistry.register({
+            requestID,
+            sessionID,
+            channelID: rawThread.id,
+            directory: binding.workspacePath,
+            request,
+            effects: {postReply: postReplyForRequest},
+            deadlineMs: approvalDeadlineMs,
+          })
+
+          // Fire-and-forget: send the embed then attach the render function.
           // rawThread has the full Discord.js API (embeds, components, edit).
           // onPending must not throw (coordinator catches internally anyway).
           // eslint-disable-next-line no-void
@@ -266,42 +303,39 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
               allowedMentions: {parse: []},
             })
             .then(postedMessage => {
-              // renderSettled edits THIS specific posted message.
-              const renderSettledForRequest = async (
-                req: import('../approvals/coordinator.js').PermissionRequest,
-                decision: import('../approvals/coordinator.js').PermissionReply,
-                decidedBy: string | null,
-                reason: import('../approvals/coordinator.js').SettlementReason,
-              ) => {
-                try {
-                  await (postedMessage as {edit: (opts: unknown) => Promise<unknown>}).edit({
-                    embeds: [buildSettledEmbed(req, decision, {decidedBy: decidedBy ?? undefined, reason})],
-                    components: [],
-                  })
-                } catch (error) {
-                  logger.warn({requestID: req.requestID, err: String(error)}, 'run: failed to edit approval message')
-                }
-              }
-
-              approvalRegistry.register({
+              // Attach the render function now that we have a message reference.
+              approvalRegistry.attachMessage(
                 requestID,
-                sessionID,
-                channelID: rawThread.id,
-                directory: binding.workspacePath,
-                request,
-                effects: {
-                  postReply: postReplyForRequest,
-                  renderSettled: renderSettledForRequest,
+                async (
+                  req: import('../approvals/coordinator.js').PermissionRequest,
+                  decision: import('../approvals/coordinator.js').PermissionReply,
+                  decidedBy: string | null,
+                  reason: import('../approvals/coordinator.js').SettlementReason,
+                ) => {
+                  try {
+                    await (postedMessage as {edit: (opts: unknown) => Promise<unknown>}).edit({
+                      embeds: [buildSettledEmbed(req, decision, {decidedBy: decidedBy ?? undefined, reason})],
+                      components: [],
+                    })
+                  } catch (error) {
+                    logger.warn({requestID: req.requestID, err: String(error)}, 'run: failed to edit approval message')
+                  }
                 },
-              })
+              )
             })
             .catch((error: unknown) => {
-              logger.warn({requestID: request.requestID, err: String(error)}, 'run: failed to post approval embed')
+              logger.warn({requestID, err: String(error)}, 'run: failed to post approval embed')
+              approvalRegistry.markMessagePostFailed(requestID)
             })
         },
-        onSettled: (requestID, reply, reason) => {
+        onReplied: event => {
+          // Authoritative echo from OpenCode — let the registry render + cascade.
+          approvalRegistry.confirmReply(event)
+        },
+        onDispose: sessionIDs => {
+          // Coordinator is per-run; dispose only the sessions it owned — never other runs.
           // eslint-disable-next-line no-void
-          void approvalRegistry.applySettlement({requestID, decision: reply, reason})
+          void Promise.all(sessionIDs.map(async sid => approvalRegistry.disposeRun(sid, 'run ended')))
         },
       })
 

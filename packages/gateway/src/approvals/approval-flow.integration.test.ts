@@ -5,15 +5,22 @@
  * side-effects (captured calls, no Discord / HTTP) and drives them with
  * synthesised OpenCode events.
  *
+ * ### register-before-send pattern (new)
+ *
+ * `onPending` now:
+ *   1. Calls `registry.register(...)` immediately (before any Discord send).
+ *   2. "Sends" the embed (simulated here by immediately calling `attachMessage`).
+ *   3. Calls `registry.attachMessage(requestID, renderFn)` on success.
+ *
  * Fake effects:
  *   postReply    — records { requestID, directory, decision } per call
- *   renderSettled — records { request, decision, decidedBy, reason } per call
+ *   renderFn     — records { request, decision, decidedBy, reason } per call
  *
  * All timer-sensitive tests use `vi.useFakeTimers()` to control deadline firing.
  */
 
-import type {PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
-import type {RegisterParams} from './registry.js'
+import type {PermissionReply, PermissionReplyEvent, PermissionRequest} from './coordinator.js'
+import type {ApprovalSideEffects, RegisterParams} from './registry.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createPermissionCoordinator} from './coordinator.js'
@@ -33,7 +40,7 @@ interface PostReplyCall {
   decision: string
 }
 
-interface RenderSettledCall {
+interface RenderCall {
   request: PermissionRequest
   decision: string
   decidedBy: string | null
@@ -47,23 +54,27 @@ function makeLogger() {
 /** Build fake side-effects and return call-capture arrays + factory */
 function makeFakeEffects() {
   const postReplyCalls: PostReplyCall[] = []
-  const renderSettledCalls: RenderSettledCall[] = []
+  const renderCalls: RenderCall[] = []
 
-  function makeEffectsFor(_requestID: string) {
-    return {
-      postReply: vi.fn(async (requestID: string, directory: string, decision: string) => {
+  function makeEffectsFor(_requestID: string): {
+    effects: ApprovalSideEffects
+    renderFn: (request: PermissionRequest, decision: string, decidedBy: string | null, reason: string) => Promise<void>
+  } {
+    const effects: ApprovalSideEffects = {
+      postReply: vi.fn(async (requestID: string, directory: string, decision: PermissionReply) => {
         postReplyCalls.push({requestID, directory, decision})
         return {ok: true}
       }),
-      renderSettled: vi.fn(
-        async (request: PermissionRequest, decision: string, decidedBy: string | null, reason: string) => {
-          renderSettledCalls.push({request, decision, decidedBy, reason})
-        },
-      ),
     }
+    const renderFn = vi.fn(
+      async (request: PermissionRequest, decision: string, decidedBy: string | null, reason: string) => {
+        renderCalls.push({request, decision, decidedBy, reason})
+      },
+    )
+    return {effects, renderFn}
   }
 
-  return {postReplyCalls, renderSettledCalls, makeEffectsFor}
+  return {postReplyCalls, renderCalls, makeEffectsFor}
 }
 
 function makeRequest(id: string, sessionID: string = SESSION_A): PermissionRequest {
@@ -81,13 +92,18 @@ function makeReplyEvent(
 /** Wire coordinator + registry together, return both + fake-effects captures */
 function setup(deadlineMs?: number) {
   const logger = makeLogger()
-  const {postReplyCalls, renderSettledCalls, makeEffectsFor} = makeFakeEffects()
+  const {postReplyCalls, renderCalls, makeEffectsFor} = makeFakeEffects()
 
   const registry = createApprovalRegistry({logger})
 
-  /** Simulate what run.ts's onPending does */
+  /**
+   * Simulate what run.ts's onPending does with the register-before-send pattern:
+   * 1. register immediately (with deadlineMs — registry owns the timer)
+   * 2. "send" the embed (instant in test)
+   * 3. attachMessage with the renderFn
+   */
   function onPending(request: PermissionRequest) {
-    const effects = makeEffectsFor(request.requestID)
+    const {effects, renderFn} = makeEffectsFor(request.requestID)
     const params: RegisterParams = {
       requestID: request.requestID,
       sessionID: request.sessionID,
@@ -95,29 +111,29 @@ function setup(deadlineMs?: number) {
       directory: DIRECTORY,
       request,
       effects,
+      deadlineMs, // registry owns the deadline timer
     }
+    // Step 1: register before send
     registry.register(params)
-  }
-
-  /** Simulate what run.ts's onSettled does */
-  function onSettled(requestID: string, decision: string, reason: string) {
-    registry
-      .applySettlement({
-        requestID,
-        decision: decision as 'once' | 'always' | 'reject',
-        reason: reason as SettlementReason,
-      })
-      .catch(() => undefined)
+    // Step 2 & 3: simulate successful embed send → attachMessage
+    registry.attachMessage(request.requestID, renderFn)
   }
 
   const coordinator = createPermissionCoordinator({
     logger,
     onPending,
-    onSettled,
-    deadlineMs,
+    // New API: forward permission.replied to registry.confirmReply (owns rendering + cascade)
+    onReplied: event => {
+      registry.confirmReply(event)
+    },
+    // onDispose: fail-close registry entries for this run
+    onDispose: sessionIDs => {
+      // eslint-disable-next-line no-void
+      void Promise.all(sessionIDs.map(async sid => registry.disposeRun(sid, 'run ended')))
+    },
   })
 
-  return {coordinator, registry, postReplyCalls, renderSettledCalls}
+  return {coordinator, registry, postReplyCalls, renderCalls}
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +153,7 @@ describe('approval flow — cross-seam integration', () => {
 
   it('approve path: postReply called exactly once with query.directory; permission.replied settles without second postReply', async () => {
     // #given
-    const {coordinator, registry, postReplyCalls, renderSettledCalls} = setup()
+    const {coordinator, registry, postReplyCalls, renderCalls} = setup()
     const req = makeRequest('req-1')
 
     // #when — permission.asked → register into coordinator + registry
@@ -166,12 +182,12 @@ describe('approval flow — cross-seam integration', () => {
     await vi.runAllTimersAsync()
     await replyPromise
 
-    // #then — no second postReply (applySettlement skips postReply for 'replied' reason when entry is claimed)
+    // #then — no second postReply (applySettlement skips postReply since state is 'confirmed')
     expect(postReplyCalls).toHaveLength(1)
 
-    // renderSettled called once
-    expect(renderSettledCalls).toHaveLength(1)
-    expect(renderSettledCalls[0]).toMatchObject({decision: 'once', reason: 'replied'})
+    // renderFn called once
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'once', reason: 'replied'})
 
     // Entry is gone
     expect(registry.pending()).not.toContain('req-1')
@@ -182,7 +198,7 @@ describe('approval flow — cross-seam integration', () => {
 
   it('deny path: postReply once with "reject"; permission.replied{reject} settles once, no second postReply', async () => {
     // #given
-    const {coordinator, registry, postReplyCalls, renderSettledCalls} = setup()
+    const {coordinator, registry, postReplyCalls, renderCalls} = setup()
     const req = makeRequest('req-2')
 
     const replyPromise = coordinator.onPermissionAsked(req)
@@ -205,8 +221,8 @@ describe('approval flow — cross-seam integration', () => {
 
     // #then — no second postReply
     expect(postReplyCalls).toHaveLength(1)
-    expect(renderSettledCalls).toHaveLength(1)
-    expect(renderSettledCalls[0]).toMatchObject({decision: 'reject', reason: 'replied'})
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'reject', reason: 'replied'})
     expect(registry.pending()).not.toContain('req-2')
   })
 
@@ -249,18 +265,17 @@ describe('approval flow — cross-seam integration', () => {
 
     const p4 = coordinator.onPermissionAsked(req)
 
-    // Advance past deadline
+    // Advance past deadline — registry timer fires (not coordinator)
     await vi.advanceTimersByTimeAsync(200)
-
-    // Deadline fires: coordinator should have disposed / rejected
-    // Give any pending microtasks a chance to settle
     await vi.runAllTimersAsync()
-    await p4
 
-    // The deadline path posts a fail-closed reject via onSettled → applySettlement → postReply
-    // (only if entry is not already claimed)
-    // Let's check pending is now empty (entry removed after deadline settlement)
+    // Registry has handled the deadline (reject + render + delete)
     expect(registry.has('req-4')).toBe(false)
+
+    // Coordinator's promise is still pending (deadline is now in registry, not coordinator).
+    // Dispose to resolve it fail-closed (simulating run end).
+    coordinator.dispose('run ended after deadline')
+    await p4
 
     const postRepliesAfterDeadline = postReplyCalls.length
 
@@ -312,7 +327,7 @@ describe('approval flow — cross-seam integration', () => {
 
   it('reject cascade: two same-session asks → reject one → both entries settled, both embeds rendered', async () => {
     // #given
-    const {coordinator, registry, postReplyCalls, renderSettledCalls} = setup()
+    const {coordinator, registry, postReplyCalls, renderCalls} = setup()
     const req6a = makeRequest('req-6a', SESSION_A)
     const req6b = makeRequest('req-6b', SESSION_A)
 
@@ -323,8 +338,12 @@ describe('approval flow — cross-seam integration', () => {
     expect(registry.pending()).toContain('req-6b')
 
     // #when — permission.replied{reject} for req-6a
+    // Registry cascade settles req-6b (render + POST). Coordinator still has p6b pending.
+    // Simulate the server-side cascade reply for req-6b to resolve the coordinator promise.
     coordinator.onPermissionReplied(makeReplyEvent('req-6a', 'reject'))
     await vi.runAllTimersAsync()
+    // Simulate OpenCode's server-side cascade reply for req-6b (registry entry already gone → no-op in registry)
+    coordinator.onPermissionReplied(makeReplyEvent('req-6b', 'reject'))
     await Promise.all([p6a, p6b])
 
     // #then — both entries settled
@@ -332,14 +351,14 @@ describe('approval flow — cross-seam integration', () => {
     expect(registry.has('req-6b')).toBe(false)
     expect(registry.pending()).toHaveLength(0)
 
-    // renderSettled called for both — one 'replied', one 'cascade'
-    expect(renderSettledCalls).toHaveLength(2)
-    const reasons = renderSettledCalls.map(c => c.reason)
+    // renderFn called for both — one 'replied', one 'cascade'
+    expect(renderCalls).toHaveLength(2)
+    const reasons = renderCalls.map(c => c.reason)
     expect(reasons).toContain('replied')
     expect(reasons).toContain('cascade')
 
-    // postReply: req-6a was settled via 'replied' (claimed=false → best-effort postReply).
-    // req-6b: cascade also calls best-effort postReply (claimed=false).
+    // postReply: req-6a was settled via 'replied' (state=open → best-effort postReply).
+    // req-6b: cascade also calls best-effort postReply (state=open).
     // Both should be reject.
     expect(postReplyCalls.every(c => c.decision === 'reject')).toBe(true)
   })
@@ -357,6 +376,10 @@ describe('approval flow — cross-seam integration', () => {
     // #when — advance past deadline, no reply ever
     await vi.advanceTimersByTimeAsync(500)
     await vi.runAllTimersAsync()
+
+    // Registry deadline has fired and cleaned up the entry.
+    // Coordinator promise is still pending — dispose it (simulating run end/timeout).
+    coordinator.dispose('deadline elapsed, run ended')
     await p7
 
     // #then — pending() is empty (no hang)
@@ -376,23 +399,30 @@ describe('approval flow — cross-seam integration', () => {
     const logger = makeLogger()
     const reg = createApprovalRegistry({logger})
 
-    const {makeEffectsFor, postReplyCalls: postReplyDrain, renderSettledCalls: renderDrain} = makeFakeEffects()
+    const {makeEffectsFor, postReplyCalls: postReplyDrain, renderCalls: renderDrain} = makeFakeEffects()
+
+    const e8a = makeEffectsFor('req-8a')
+    const e8b = makeEffectsFor('req-8b')
+
     reg.register({
       requestID: 'req-8a',
       sessionID: SESSION_A,
       channelID: 'ch-test',
       directory: DIRECTORY,
       request: req8a,
-      effects: makeEffectsFor('req-8a'),
+      effects: e8a.effects,
     })
+    reg.attachMessage('req-8a', e8a.renderFn)
+
     reg.register({
       requestID: 'req-8b',
       sessionID: SESSION_B,
       channelID: 'ch-test',
       directory: DIRECTORY,
       request: req8b,
-      effects: makeEffectsFor('req-8b'),
+      effects: e8b.effects,
     })
+    reg.attachMessage('req-8b', e8b.renderFn)
 
     expect(reg.pending()).toHaveLength(2)
 
@@ -409,11 +439,233 @@ describe('approval flow — cross-seam integration', () => {
     expect(reg.has('req-8a')).toBe(false)
     expect(reg.has('req-8b')).toBe(false)
 
-    // renderSettled called for each entry (disposed reason)
+    // renderFn called for each entry (disposed reason)
     expect(renderDrain).toHaveLength(2)
     expect(renderDrain.every(c => c.reason === 'disposed')).toBe(true)
 
     // postReply called with reject for each (best-effort fail-closed)
     expect(postReplyDrain.every(c => c.decision === 'reject')).toBe(true)
+  })
+
+  // ── REQUIRED CROSS-OWNER RACE TESTS ─────────────────────────────────────────
+
+  // R1. Button approve in-flight → deadline fires → deadline LOSES
+  it('race: button approve in-flight when deadline fires → deadline is no-op; confirmReply renders APPROVED exactly once; reject POST never sent', async () => {
+    // #given — deadline wired into registry; postReply for approve is controllable
+    const logger = makeLogger()
+    const {renderCalls, makeEffectsFor} = makeFakeEffects()
+    const postReplyCalls: PostReplyCall[] = []
+
+    // Use a deferred postReply so we can hold the button approve in-flight
+    let resolvePostReply!: (v: {ok: boolean}) => void
+    const heldPostReply = new Promise<{ok: boolean}>(res => {
+      resolvePostReply = res
+    })
+
+    const registry = createApprovalRegistry({logger})
+
+    const req = makeRequest('req-r1')
+    const {renderFn} = makeEffectsFor('req-r1')
+
+    const heldEffects: ApprovalSideEffects = {
+      postReply: vi.fn(async (requestID: string, directory: string, decision: PermissionReply) => {
+        postReplyCalls.push({requestID, directory, decision})
+        return heldPostReply
+      }),
+    }
+
+    const DEADLINE_MS = 200
+    registry.register({
+      requestID: req.requestID,
+      sessionID: req.sessionID,
+      channelID: 'ch-test',
+      directory: DIRECTORY,
+      request: req,
+      effects: heldEffects,
+      deadlineMs: DEADLINE_MS,
+    })
+    registry.attachMessage(req.requestID, renderFn)
+
+    // #when — button approve claims the entry (postReply is in-flight, not yet resolved)
+    const buttonPromise = registry.handleButtonDecision({
+      requestID: req.requestID,
+      channelID: 'ch-test',
+      decision: 'once',
+      decidedBy: 'user-approved',
+    })
+
+    // Advance past the deadline while button POST is still in-flight
+    await vi.advanceTimersByTimeAsync(DEADLINE_MS + 100)
+
+    // #then — deadline does NOT render denied and does NOT delete entry
+    // (entry is still claimed by the button winner)
+    expect(renderCalls).toHaveLength(0)
+    expect(registry.has(req.requestID)).toBe(true)
+
+    // Reject POSTs: the deadline must not have called postReply (only the button did)
+    const rejectPosts = postReplyCalls.filter(c => c.decision === 'reject')
+    expect(rejectPosts).toHaveLength(0)
+
+    // Now resolve the approve POST — button click succeeds
+    resolvePostReply({ok: true})
+    await buttonPromise
+
+    // Deliver permission.replied('once') — OpenCode's authoritative echo
+    registry.confirmReply({requestID: req.requestID, sessionID: req.sessionID, reply: 'once'})
+    await vi.runAllTimersAsync()
+
+    // #then — renders APPROVED exactly once
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'once'})
+
+    // No reject POST ever sent
+    const finalRejectPosts = postReplyCalls.filter(c => c.decision === 'reject')
+    expect(finalRejectPosts).toHaveLength(0)
+
+    // Entry is cleaned up
+    expect(registry.has(req.requestID)).toBe(false)
+  })
+
+  // R2. Deadline fires on OPEN entry (no button) → renders denied + posts reject once
+  it('race: deadline fires on open entry → rejected via POST + rendered denied + entry deleted', async () => {
+    // #given
+    const logger = makeLogger()
+    const {postReplyCalls, renderCalls, makeEffectsFor} = makeFakeEffects()
+    const registry = createApprovalRegistry({logger})
+
+    const req = makeRequest('req-r2')
+    const {effects, renderFn} = makeEffectsFor('req-r2')
+
+    registry.register({
+      requestID: req.requestID,
+      sessionID: req.sessionID,
+      channelID: 'ch-test',
+      directory: DIRECTORY,
+      request: req,
+      effects,
+      deadlineMs: 100,
+    })
+    registry.attachMessage(req.requestID, renderFn)
+
+    // #when — advance past deadline, no button click
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.runAllTimersAsync()
+
+    // #then — reject POST + denied render + entry deleted
+    expect(postReplyCalls.some(c => c.decision === 'reject')).toBe(true)
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'reject'})
+    expect(registry.has(req.requestID)).toBe(false)
+  })
+
+  // R3. permission.replied swallow regression: deadline must not prevent a later confirmReply from rendering
+  it('swallow regression: after deadline no-ops on claimed entry, confirmReply still renders', async () => {
+    // #given — same as R1 but we just verify the render path after the race
+    const logger = makeLogger()
+    const {renderCalls, makeEffectsFor} = makeFakeEffects()
+    let resolvePost!: (v: {ok: boolean}) => void
+    const heldPost = new Promise<{ok: boolean}>(res => {
+      resolvePost = res
+    })
+    const registry = createApprovalRegistry({logger})
+    const req = makeRequest('req-r3')
+    const {renderFn} = makeEffectsFor('req-r3')
+
+    registry.register({
+      requestID: req.requestID,
+      sessionID: req.sessionID,
+      channelID: 'ch-test',
+      directory: DIRECTORY,
+      request: req,
+      effects: {postReply: vi.fn().mockReturnValue(heldPost)},
+      deadlineMs: 150,
+    })
+    registry.attachMessage(req.requestID, renderFn)
+
+    const buttonPromise = registry.handleButtonDecision({
+      requestID: req.requestID,
+      channelID: 'ch-test',
+      decision: 'once',
+      decidedBy: 'user-approved',
+    })
+
+    // Deadline fires while in-flight
+    await vi.advanceTimersByTimeAsync(300)
+
+    // Deadline must not have rendered
+    expect(renderCalls).toHaveLength(0)
+
+    // Resolve POST and deliver confirmReply
+    resolvePost({ok: true})
+    await buttonPromise
+
+    registry.confirmReply({requestID: req.requestID, sessionID: req.sessionID, reply: 'once'})
+    await vi.runAllTimersAsync()
+
+    // #then — exactly one render (approved), not swallowed
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'once'})
+    expect(registry.has(req.requestID)).toBe(false)
+  })
+
+  // 9. register-before-send: entry is immediately available in registry
+  //    even before the embed "send" completes (async attach)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it('register-before-send: entry visible in registry before attachMessage resolves', async () => {
+    // #given a registry + coordinator wired together
+    const logger = makeLogger()
+    const reg = createApprovalRegistry({logger})
+
+    // Capture registrations to assert ordering
+    const registeredBeforeAttach: string[] = []
+
+    const coordinator = createPermissionCoordinator({
+      logger,
+      onPending: request => {
+        const {effects, renderFn} = makeFakeEffects().makeEffectsFor(request.requestID)
+        // Step 1: register immediately — entry should be visible NOW
+        reg.register({
+          requestID: request.requestID,
+          sessionID: request.sessionID,
+          channelID: 'ch-test',
+          directory: DIRECTORY,
+          request,
+          effects,
+        })
+        // Capture state BEFORE attachMessage
+        registeredBeforeAttach.push(request.requestID)
+        expect(reg.has(request.requestID)).toBe(true)
+
+        // Step 2: attach message async (simulated as microtask)
+        Promise.resolve()
+          .then(() => {
+            reg.attachMessage(request.requestID, renderFn)
+          })
+          .catch(() => undefined)
+      },
+      onSettled: (requestID, decision, reason) => {
+        reg
+          .applySettlement({
+            requestID,
+            decision,
+            reason,
+          })
+          .catch(() => undefined)
+      },
+    })
+
+    const req = makeRequest('req-9')
+    // #when onPermissionAsked fires (onPending is invoked synchronously inside)
+    const replyPromise = coordinator.onPermissionAsked(req)
+
+    // #then — entry was registered before the async embed attach
+    expect(registeredBeforeAttach).toContain('req-9')
+    expect(reg.has('req-9')).toBe(true)
+
+    // Cleanup
+    coordinator.onPermissionReplied(makeReplyEvent('req-9', 'once'))
+    await vi.runAllTimersAsync()
+    await replyPromise
   })
 })

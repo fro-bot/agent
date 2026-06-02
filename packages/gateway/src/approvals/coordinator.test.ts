@@ -8,7 +8,7 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
 
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 
 import {createPermissionCoordinator, parsePermissionReply, parsePermissionRequest} from './coordinator.js'
 
@@ -140,20 +140,17 @@ describe('createPermissionCoordinator', () => {
     await expect(promise).resolves.toBe('reject')
   })
 
-  it('cascade-rejects sibling open requests in the same session on reject', async () => {
-    // #given two open requests in the same session and one in another
+  it('coordinator does NOT cascade siblings — cascade is owned by the registry', async () => {
+    // #given two open requests in the same session
     const coordinator = createPermissionCoordinator({logger: makeLogger()})
     const a = coordinator.onPermissionAsked(makeRequest({requestID: 'per_a', sessionID: 'ses_1'}))
-    const b = coordinator.onPermissionAsked(makeRequest({requestID: 'per_b', sessionID: 'ses_1'}))
-    const other = coordinator.onPermissionAsked(makeRequest({requestID: 'per_c', sessionID: 'ses_2'}))
-    // #when one of the same-session requests is rejected
+    // eslint-disable-next-line no-void
+    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_b', sessionID: 'ses_1'}))
+    // #when one is rejected
     coordinator.onPermissionReplied({sessionID: 'ses_1', requestID: 'per_a', reply: 'reject'})
-    // #then both same-session requests settle reject; the other session is untouched
     await expect(a).resolves.toBe('reject')
-    await expect(b).resolves.toBe('reject')
-    expect(coordinator.pending()).toEqual(['per_c'])
-    coordinator.onPermissionReplied({sessionID: 'ses_2', requestID: 'per_c', reply: 'once'})
-    await expect(other).resolves.toBe('once')
+    // #then the sibling remains open in the coordinator's local map (registry owns cascade)
+    expect(coordinator.pending()).toEqual(['per_b'])
   })
 
   it('does NOT cascade siblings on an "once" reply', async () => {
@@ -229,20 +226,99 @@ describe('createPermissionCoordinator', () => {
     expect(settled).toEqual([['per_1', 'once', 'replied']])
   })
 
-  it('reports "cascade" reason for siblings settled by a reject', async () => {
-    const settled: [string, PermissionReply, SettlementReason][] = []
-    const coordinator = createPermissionCoordinator({
-      logger: makeLogger(),
-      onSettled: (id, reply, reason) => settled.push([id, reply, reason]),
+  it('invokes onReplied (new API) when a request is replied', async () => {
+    const onReplied = vi.fn()
+    const coordinator = createPermissionCoordinator({logger: makeLogger(), onReplied})
+    const promise = coordinator.onPermissionAsked(makeRequest())
+    coordinator.onPermissionReplied({sessionID: 'ses_1', requestID: 'per_1', reply: 'once'})
+    await promise
+    expect(onReplied).toHaveBeenCalledExactlyOnceWith({sessionID: 'ses_1', requestID: 'per_1', reply: 'once'})
+  })
+
+  it('invokes onDispose with the collected sessionIDs when dispose is called', () => {
+    // #given a coordinator that has seen requests from two sessions
+    const onDispose = vi.fn()
+    const coordinator = createPermissionCoordinator({logger: makeLogger(), onDispose})
+    // eslint-disable-next-line no-void
+    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_a', sessionID: 'ses_A'}))
+    // eslint-disable-next-line no-void
+    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_b', sessionID: 'ses_B'}))
+    // #when disposed
+    coordinator.dispose('run ended')
+    // #then onDispose is called with the set of sessionIDs seen (NOT the reason string)
+    expect(onDispose).toHaveBeenCalledOnce()
+    const [sessionIDs] = onDispose.mock.calls[0] as [readonly string[]]
+    expect(sessionIDs).toHaveLength(2)
+    expect(sessionIDs).toContain('ses_A')
+    expect(sessionIDs).toContain('ses_B')
+  })
+
+  it('onDispose receives empty array when no requests were ever seen', () => {
+    // #given a coordinator that never saw any requests
+    const onDispose = vi.fn()
+    const coordinator = createPermissionCoordinator({logger: makeLogger(), onDispose})
+    // #when disposed with no prior requests
+    coordinator.dispose('run ended')
+    // #then onDispose is called with an empty array
+    expect(onDispose).toHaveBeenCalledExactlyOnceWith([])
+  })
+
+  it('concurrent-run isolation: disposing run A via coordinator+registry does NOT touch run B entries', async () => {
+    // #given a shared registry (program-scoped) with entries for two runs
+    const {createApprovalRegistry} = await import('./registry.js')
+
+    const logger = makeLogger()
+    const sharedRegistry = createApprovalRegistry({logger})
+
+    // Register run A's entry
+    const reqA: PermissionRequest = makeRequest({requestID: 'per_A', sessionID: 'ses_A'})
+    sharedRegistry.register({
+      requestID: 'per_A',
+      sessionID: 'ses_A',
+      channelID: 'chan_1',
+      directory: '/ws/a',
+      request: reqA,
+      effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
+    })
+    // Register run B's entry (different sessionID, same shared registry)
+    const reqB: PermissionRequest = makeRequest({requestID: 'per_B', sessionID: 'ses_B'})
+    sharedRegistry.register({
+      requestID: 'per_B',
+      sessionID: 'ses_B',
+      channelID: 'chan_2',
+      directory: '/ws/b',
+      request: reqB,
+      effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
+    })
+
+    expect(sharedRegistry.has('per_A')).toBe(true)
+    expect(sharedRegistry.has('per_B')).toBe(true)
+
+    // Build run A's coordinator wired to call disposeRun (the correct fix)
+    const coordinatorA = createPermissionCoordinator({
+      logger,
+      onDispose: sessionIDs => {
+        // eslint-disable-next-line no-void
+        void Promise.all(sessionIDs.map(async sid => sharedRegistry.disposeRun(sid, 'run ended')))
+      },
     })
     // eslint-disable-next-line no-void
-    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_a', sessionID: 'ses_1'}))
-    // eslint-disable-next-line no-void
-    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_b', sessionID: 'ses_1'}))
-    coordinator.onPermissionReplied({sessionID: 'ses_1', requestID: 'per_a', reply: 'reject'})
-    await Promise.resolve()
-    expect(settled).toContainEqual(['per_a', 'reject', 'replied'])
-    expect(settled).toContainEqual(['per_b', 'reject', 'cascade'])
+    void coordinatorA.onPermissionAsked(reqA) // coordinator sees ses_A
+
+    // #when run A ends and its coordinator disposes
+    coordinatorA.dispose('run ended')
+
+    // Allow the async disposeRun to complete
+    await new Promise(r => setTimeout(r, 0))
+
+    // #then run A's entry is settled and removed
+    expect(sharedRegistry.has('per_A')).toBe(false)
+    // #then run B's entry is NOT touched — isolation holds
+    expect(sharedRegistry.has('per_B')).toBe(true)
+
+    // Cleanup: disposeAll still settles everything (shutdown semantics)
+    await sharedRegistry.disposeAll('gateway shutdown')
+    expect(sharedRegistry.has('per_B')).toBe(false)
   })
 
   it('does not let a throwing onPending callback break registration', () => {
@@ -268,33 +344,5 @@ describe('createPermissionCoordinator', () => {
     await expect(a).resolves.toBe('reject')
     await expect(b).resolves.toBe('reject')
     expect(coordinator.pending()).toEqual([])
-  })
-
-  // ── deadline (fake timers) ───────────────────────────────────────────────
-
-  describe('with a per-request deadline', () => {
-    beforeEach(() => vi.useFakeTimers())
-    afterEach(() => vi.useRealTimers())
-
-    it('fail-closes to reject when the deadline expires', async () => {
-      const coordinator = createPermissionCoordinator({logger: makeLogger(), deadlineMs: 60_000})
-      const promise = coordinator.onPermissionAsked(makeRequest())
-      // #when the deadline elapses with no reply
-      await vi.advanceTimersByTimeAsync(60_000)
-      // #then the entry fail-closes to reject
-      await expect(promise).resolves.toBe('reject')
-      expect(coordinator.pending()).toEqual([])
-    })
-
-    it('a reply before the deadline wins and clears the timer', async () => {
-      const onSettled = vi.fn()
-      const coordinator = createPermissionCoordinator({logger: makeLogger(), deadlineMs: 60_000, onSettled})
-      const promise = coordinator.onPermissionAsked(makeRequest())
-      coordinator.onPermissionReplied({sessionID: 'ses_1', requestID: 'per_1', reply: 'once'})
-      await expect(promise).resolves.toBe('once')
-      // #when the deadline would have fired — no second settlement occurs
-      await vi.advanceTimersByTimeAsync(60_000)
-      expect(onSettled).toHaveBeenCalledTimes(1)
-    })
   })
 })
