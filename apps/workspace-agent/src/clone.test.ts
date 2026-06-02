@@ -140,6 +140,35 @@ describe('executeClone — happy path', () => {
     expect(cloneCallEnv.GIT_ASKPASS).toBe(FAKE_ASKPASS_PATH)
   })
 
+  it('propagates egress proxy env vars to the git clone subprocess', async () => {
+    // #given — a proxy is configured in the container env (sandbox network)
+    const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])
+    const priorHttps = process.env.HTTPS_PROXY
+    const priorNo = process.env.NO_PROXY
+    process.env.HTTPS_PROXY = 'http://mitmproxy:8080'
+    process.env.NO_PROXY = 'localhost,127.0.0.1'
+
+    try {
+      // #when
+      await executeClone(VALID_REQUEST, {
+        execFileFn,
+        reposRoot: TEST_REPOS_ROOT,
+        mkdtempFn: fakeMkdtempFn,
+        options: {timeoutMs: 500},
+      })
+
+      // #then — the clone subprocess inherits the proxy settings
+      const cloneCallEnv = (execFileFn.mock.calls[0]![2] as {env: Record<string, string>}).env
+      expect(cloneCallEnv.HTTPS_PROXY).toBe('http://mitmproxy:8080')
+      expect(cloneCallEnv.NO_PROXY).toBe('localhost,127.0.0.1')
+    } finally {
+      if (priorHttps === undefined) delete process.env.HTTPS_PROXY
+      else process.env.HTTPS_PROXY = priorHttps
+      if (priorNo === undefined) delete process.env.NO_PROXY
+      else process.env.NO_PROXY = priorNo
+    }
+  })
+
   it('passes token via GITHUB_TOKEN env var, not embedded in script body', async () => {
     // #given
     const execFileFn = makeExecFile([{stdout: ''}, {stdout: 'sha123\n'}])

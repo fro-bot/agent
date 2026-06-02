@@ -22,7 +22,7 @@ For testing-only:
 
 - Put any plausible-looking values in `deploy/secrets/s3-bucket` and `deploy/secrets/s3-region` (e.g. `test-bucket` and `us-east-1`). Validation only checks they're non-empty.
 - Leave `OBJECT_STORE_HOSTS` unset in `deploy/.env`. The default fail-closed behaviour blocks all S3 traffic — fine for testing, since no S3 calls are made.
-- Use a real bucket and `OBJECT_STORE_HOSTS` value only when Units 5–7 ship the agent and workspace pieces that actually exercise S3.
+- Use a real bucket and `OBJECT_STORE_HOSTS` value once you exercise the workspace executor (repo clone via `/fro-bot add-project` and the OpenCode mention loop), which reaches S3-backed state and external hosts.
 
 ## One-Time Setup
 
@@ -86,6 +86,13 @@ openssl rand -hex 32 > deploy/secrets/workspace-opencode-token
 # Change only if the workspace container is not on the same Compose network.
 touch deploy/secrets/workspace-opencode-url
 # echo -n 'http://workspace:9200' > deploy/secrets/workspace-opencode-url
+
+# OpenCode provider credentials for the @fro-bot mention loop (API-key auth.json
+# blob). Required for the mention loop; leave empty for clone-only deployments.
+# Use a least-privilege, rotatable provider key — the workspace runs cloned repo
+# code alongside this credential. Rotate by replacing the file and restarting.
+touch deploy/secrets/workspace-opencode-auth
+# echo -n '{"anthropic":{"type":"api","key":"sk-..."}}' > deploy/secrets/workspace-opencode-auth
 
 # Optional — Discord role ID that grants trigger authorization.
 # If set, only members with this role may @-mention the bot to start an agent run.
@@ -181,6 +188,7 @@ Run the full `touch` block from [Create secrets](#2-create-secrets) on every upg
 | `deploy/secrets/s3-endpoint` | Custom S3-compatible endpoint (e.g. Cloudflare R2) | Deploy-contract hardening; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/workspace-opencode-token` | Shared bearer token for the workspace OpenCode reverse proxy (required for the OpenCode attach path) | OpenCode attach; existing deployments must create this file on upgrade |
 | `deploy/secrets/workspace-opencode-url` | Base URL of the workspace OpenCode proxy (default: `http://workspace:9200`). Override only when the workspace container is not on the same Compose network. | OpenCode attach; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/workspace-opencode-auth` | OpenCode provider credentials as an API-key `auth.json` blob (e.g. `{"anthropic":{"type":"api","key":"sk-..."}}`). Required for the `@fro-bot` mention loop; leave empty for clone-only deployments. | Mention-loop auth; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/gateway-trigger-role-id` | Discord role ID that grants trigger authorization. If unset, falls back to guild-level `ManageChannels`. | Mention-loop trigger gate; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/github-app-id` | GitHub App ID (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 | `deploy/secrets/github-app-private-key` | GitHub App private key PEM (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
@@ -239,6 +247,40 @@ The workspace container exposes two internal ports, both accessible only within 
 | 9200 | OpenCode reverse proxy | Bearer-authenticated endpoint the gateway uses when attaching to an OpenCode session. Validates `WORKSPACE_OPENCODE_TOKEN` before forwarding to the loopback-bound OpenCode process. |
 
 Neither port is exposed on the host. The egress proxy (`mitmproxy`) permits only outbound traffic to the allowlisted hosts; these ports are inbound-only from the gateway's perspective and not reachable from outside the sandbox network.
+
+The raw OpenCode SDK server binds to loopback (`127.0.0.1:54321`) only and is never reachable on the sandbox network — the gateway always attaches through the bearer-authenticated proxy on 9200.
+
+### Workspace executor image
+
+The workspace image builds the workspace agent and bakes the OpenCode CLI (pinned to match `DEFAULT_OPENCODE_VERSION`), so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
+
+Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
+
+#### Model and provider configuration
+
+The mention-loop agent needs a model and a provider to talk to. These mirror the GitHub Action's `model` + `opencode-config` inputs and are supplied at deploy time via two environment variables on the `workspace` service (set them in `deploy/.env`):
+
+- `WORKSPACE_OPENCODE_MODEL` — the `provider/model` string (e.g. `anthropic/claude-sonnet-4-6`, `openai/gpt-5.4-mini`).
+- `WORKSPACE_OPENCODE_CONFIG` — a JSON object shallow-merged over the baked base config; supply the `provider` block that points OpenCode at your endpoint.
+
+The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
+
+To route Claude/OpenAI through a [cliproxyapi](https://github.com/router-for-me/CLIProxyAPI) proxy (the default in `marcusrbrown/infra`), point the stock `anthropic`/`openai` providers at the proxy's `/v1` base URL and set the model:
+
+```bash
+# deploy/.env
+WORKSPACE_OPENCODE_MODEL=anthropic/claude-sonnet-4-6
+WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}},"openai":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}
+```
+
+```bash
+# deploy/secrets/workspace-opencode-auth — the cliproxyapi bearer token, keyed per provider
+echo -n '{"anthropic":{"type":"api","key":"<cliproxy-token>"},"openai":{"type":"api","key":"<cliproxy-token>"}}' > deploy/secrets/workspace-opencode-auth
+```
+
+Add the proxy host to the egress allowlist (`OBJECT_STORE_HOSTS` is S3-only; provider hosts are covered by the static allowlist — add your cliproxyapi host there if it is not already permitted).
+
+Leave both variables unset for a clone-only deployment: the workspace boots and serves `/clone`, but the mention loop has no model until they are configured.
 
 ## Stopping the Stack
 
