@@ -282,6 +282,39 @@ Add the proxy host to the egress allowlist (`OBJECT_STORE_HOSTS` is S3-only; pro
 
 Leave both variables unset for a clone-only deployment: the workspace boots and serves `/clone`, but the mention loop has no model until they are configured.
 
+## Enabling tool approval prompts
+
+By default, all OpenCode tools run automatically and no approval prompts appear in Discord. To require a Discord Approve / Deny button-click before a specific tool executes, configure that tool's `permission` mode to `ask` in the workspace OpenCode config.
+
+The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. Add a `permission` block to that JSON:
+
+```env
+# deploy/.env — enable approval prompts for the Bash tool
+WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"default":"ask"}}}
+```
+
+### Permission modes
+
+| Mode | Behaviour |
+| ---- | --------- |
+| `allow` (default) | Tool runs immediately; no Discord prompt. |
+| `ask` | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
+| `deny` | Tool is always blocked; no prompt. |
+
+Set `"default":"ask"` inside the tool's permission block to ask for every invocation. More granular patterns (e.g. per-command) follow the OpenCode `permission` config schema.
+
+### Who can approve
+
+Approvers are gated by the same `userIsAuthorized` rule as trigger mentions: the user must hold the `GATEWAY_TRIGGER_ROLE_ID` role (if configured) or have guild-level `ManageChannels`. Anyone else who clicks the button is silently ignored; the prompt stays open.
+
+### Deadline behaviour (fail-closed)
+
+Each approval prompt has a deadline that is a sub-deadline of the overall run timeout, capped at 13 minutes (Discord interaction-token expiry). If no decision arrives before the deadline fires, the gateway automatically posts `reject` — the tool is blocked, the embed updates to show it was timed out, and the run continues or errors from the rejection. This is fail-closed: no tool runs silently when the gateway is unreachable.
+
+### Restart limitation
+
+A pending approval prompt is held in memory by the per-run coordinator. If the gateway or workspace container restarts while a prompt is open, the approval is abandoned. The run surfaces as interrupted in the thread. Re-mention to retry.
+
 ## Stopping the Stack
 
 ```bash

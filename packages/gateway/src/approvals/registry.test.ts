@@ -1,5 +1,5 @@
 /**
- * Tests for the program-scoped approval registry bridge (Unit 3b).
+ * Tests for the program-scoped approval registry bridge.
  *
  * Convention: `vi.fn()` for all injected side-effects. No real Discord.js or
  * SDK imports here — pure unit tests. BDD `// #given/#when/#then` per repo convention.

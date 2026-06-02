@@ -1,5 +1,5 @@
 /**
- * Discord approval UI primitives for gateway tool-approval (Unit 3a).
+ * Discord approval UI primitives for gateway tool-approval.
  *
  * Pure builders — ZERO side effects, no Discord client, no network.
  * Imports only discord.js builders and the coordinator types.

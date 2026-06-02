@@ -1,5 +1,5 @@
 /**
- * Program-scoped approval registry bridge (Unit 3b).
+ * Program-scoped approval registry bridge.
  *
  * Maps requestID → approval context across all in-flight runs so the Discord
  * button handler can: verify channel binding, claim exactly once

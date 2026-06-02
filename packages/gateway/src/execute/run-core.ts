@@ -87,7 +87,7 @@ export interface RunCoreParams {
   /** Injected logger. Internal details only — never leak session internals to Discord. */
   readonly logger: GatewayLogger
   /**
-   * Optional permission coordinator (Unit 2 integration).
+   * Optional permission coordinator.
    * When present, `permission.asked` and `permission.replied` events are routed
    * to it. When absent, those events are silently ignored (back-compat).
    */

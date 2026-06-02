@@ -984,6 +984,79 @@ describe('runMention', () => {
       expect(disposeFn).toHaveBeenCalledWith('run ended')
     })
 
+    it('postReply closure: calls handle.client.postSessionIdPermissionsPermissionId with query.directory — guards silent-no-op regression', async () => {
+      // Regression guard: the OpenCode V1 reply route silently no-ops when `query.directory` is
+      // absent (returns 200 but does not resolve the pending permission). This test pins that the
+      // closure wired into registry.register actually forwards the workspace directory.
+
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
+
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+        client: {postSessionIdPermissionsPermissionId},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+
+      const approvalRegistry = makeApprovalRegistry()
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-approval-999', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const binding = makeBinding() // workspacePath = '/workspace/acme/widget'
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      await runMention(message, binding, makeDeps({approvalRegistry}))
+
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      const fakeRequest: import('../approvals/coordinator.js').PermissionRequest = {
+        requestID: 'req-seam-999',
+        sessionID: 'sess-seam',
+        permission: 'bash',
+        patterns: ['ls'],
+        title: 'Run command: ls',
+      }
+
+      // #when — trigger onPending (fires send().then() → register)
+      capturedOnPending(fakeRequest)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // Extract the postReply closure from the register call
+      const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
+        | {effects: {postReply: (requestID: string, directory: string, decision: string) => Promise<{ok: boolean}>}}
+        | undefined
+      expect(registerCall).toBeDefined()
+      if (registerCall === undefined) throw new Error('registerCall not captured')
+
+      const capturedPostReply = registerCall.effects.postReply
+
+      // #when — invoke the postReply closure
+      await capturedPostReply('req-seam-999', binding.workspacePath, 'once')
+
+      // #then — SDK endpoint called with session + permissionID in path AND directory in query
+      expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          path: {id: fakeRequest.sessionID, permissionID: fakeRequest.requestID},
+          body: {response: 'once'},
+          query: {directory: binding.workspacePath},
+        }),
+      )
+    })
+
     it('coordinator is passed into runOpenCodeCore as the coordinator param', async () => {
       // #given
       const {runMention} = await import('./run.js')

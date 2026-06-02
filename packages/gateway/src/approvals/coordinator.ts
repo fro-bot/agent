@@ -1,12 +1,12 @@
 /**
  * Permission approval coordinator.
  *
- * Bridges OpenCode permission events to the Discord approval UI (Unit 3).
+ * Bridges OpenCode permission events to the Discord approval UI.
  * run-core registers a pending request on `permission.asked` and settles it on
  * `permission.replied` — the authoritative settlement signal, NOT the button
  * click alone.
  *
- * Verified against the installed SDK @ 1.14.41 (Unit 1 probe — memory 4367):
+ * Verified against the installed SDK @ 1.14.41:
  * - `permission.asked`   → `properties.id` IS the requestID; carries
  *   `sessionID`, `permission` (gate category), `patterns`, optional `metadata`.
  * - `permission.replied` → `properties.requestID` + `properties.reply`
@@ -19,7 +19,7 @@
  * - Owns: the in-memory registry (keyed by `requestID`), the pending promises,
  *   per-entry deadline timers, and same-session cascade reconciliation.
  * - Does NOT own: Discord rendering, the HTTP reply POST, S3, the lock, or
- *   run-state. Unit 3 wires the embed renderer (`onPending`/`onSettled`) and
+ *   run-state. The caller wires the embed renderer (`onPending`/`onSettled`) and
  *   posts the reply; run.ts owns run-abort on deadline.
  *
  * A process restart abandons all entries — a controlled fail-closed (the
@@ -59,7 +59,7 @@ export interface PermissionReplyEvent {
 /** Why a pending entry settled — surfaced to `onSettled` for embed updates. */
 export type SettlementReason = 'replied' | 'cascade' | 'deadline' | 'disposed'
 
-/** Coordinator seam consumed by run-core (Unit 2) and Unit 3. */
+/** Coordinator seam consumed by run-core and the run orchestrator. */
 export interface PermissionCoordinator {
   /**
    * Register a pending request (called by run-core on `permission.asked`).
@@ -85,12 +85,12 @@ export interface PermissionCoordinator {
 export interface PermissionCoordinatorDeps {
   readonly logger: GatewayLogger
   /**
-   * Invoked when a new request is registered. Unit 3 renders the Discord
+   * Invoked when a new request is registered. The caller renders the Discord
    * approval embed here. Must not throw — wrapped defensively.
    */
   readonly onPending?: (request: PermissionRequest) => void
   /**
-   * Invoked when an entry settles (any reason). Unit 3 updates/withdraws the
+   * Invoked when an entry settles (any reason). The caller updates/withdraws the
    * embed here. Must not throw — wrapped defensively.
    */
   readonly onSettled?: (requestID: string, reply: PermissionReply, reason: SettlementReason) => void

@@ -1,5 +1,5 @@
 /**
- * Tests for Discord approval UI primitives (gateway tool-approval Unit 3a).
+ * Tests for Discord approval UI primitives.
  *
  * These tests cover the pure builder functions and custom_id codec — no network,
  * no Discord client, no side effects.

@@ -259,7 +259,7 @@ describe('makeGatewayProgram', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Button interaction handler (approval flow) — Unit 3c
+// Button interaction handler (approval flow)
 // ---------------------------------------------------------------------------
 
 describe('button interaction handler (approval flow)', () => {
