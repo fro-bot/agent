@@ -100,3 +100,39 @@ test("plugin dedup: overlay adds duplicate systematic — deduped", () => {
   assert.equal(count, 1, "systematic plugin should appear exactly once")
   assert.ok(result.config.plugin.includes("other-plugin"))
 })
+
+test("model with spaces around slash normalized (anthropic / claude → anthropic/claude)", () => {
+  const result = mergeConfig(BASE, "", "anthropic / claude")
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.model, "anthropic/claude")
+})
+
+test("multi-slash model accepted (openai/gpt-4/turbo → provider=openai, model=gpt-4/turbo)", () => {
+  const result = mergeConfig(BASE, "", "openai/gpt-4/turbo")
+  assert.ok(result.ok, result.error)
+  assert.equal(result.config.model, "openai/gpt-4/turbo")
+})
+
+test("model rejected when no slash (claudewithnoslash)", () => {
+  const result = mergeConfig(BASE, "", "claudewithnoslash")
+  assert.equal(result.ok, false)
+  assert.ok(result.error.includes("provider/model form"), `got: ${result.error}`)
+})
+
+test("model rejected when leading slash only (/x) — providerID empty", () => {
+  const result = mergeConfig(BASE, "", "/x")
+  assert.equal(result.ok, false)
+  assert.ok(result.error.includes("provider/model form"), `got: ${result.error}`)
+})
+
+test("model rejected when trailing slash only (x/) — modelID empty", () => {
+  const result = mergeConfig(BASE, "", "x/")
+  assert.equal(result.ok, false)
+  assert.ok(result.error.includes("provider/model form"), `got: ${result.error}`)
+})
+
+test("model rejected when modelID contains control character", () => {
+  const result = mergeConfig(BASE, "", "anthropic/claude\u0001")
+  assert.equal(result.ok, false)
+  assert.ok(result.error.includes("control characters"), `got: ${result.error}`)
+})

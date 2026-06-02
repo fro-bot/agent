@@ -488,7 +488,7 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with model-only overlay"; exit 1; }
-          echo "$logs" | grep -q "provider-overlay=applied"
+          echo "$logs" | grep -q "provider-overlay=none"
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
           docker exec "$cid" sh -c '! grep -q "\"provider\"" /root/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'

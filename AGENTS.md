@@ -162,6 +162,7 @@ post.ts → harness/post.ts
 - **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
 - **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`
 - **Vitest**: Colocated `.test.ts` files; BDD comments (`// #given`, `// #when`, `// #then`)
+- **Exception**: `deploy/scripts/` uses plain Node ESM (`.mjs`) with the built-in `node --test` runner — not Vitest, not a workspace package, no build step; run in CI via the `workspace-smoke` job
 
 ## ANTI-PATTERNS (THIS PROJECT)
 

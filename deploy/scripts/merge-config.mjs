@@ -1,6 +1,8 @@
 // merge-config.mjs — OpenCode config merger for the workspace executor.
 // Pure ESM, no build step. Used by workspace-entrypoint.sh.
 
+import { fileURLToPath } from "node:url"
+
 /**
  * Merge an overlay and optional model into a base OpenCode config object.
  *
@@ -12,14 +14,28 @@
 export function mergeConfig(baseObj, overlayRaw, modelRaw) {
   const model = (modelRaw || "").trim()
 
-  // Model validation (before building merged).
+  // Model validation — mirrors src/harness/config/inputs.ts parseModelInput semantics.
+  let normalizedModel = ""
   if (model !== "") {
-    if (!/^[^/]+\/.+$/.test(model)) {
+    const slashIdx = model.indexOf("/")
+    if (slashIdx === -1) {
       return {
         ok: false,
         error: "WORKSPACE_OPENCODE_MODEL must be in provider/model form (e.g. anthropic/claude-sonnet-4-6)",
       }
     }
+    const providerID = model.substring(0, slashIdx).trim()
+    const modelID = model.substring(slashIdx + 1).trim()
+    if (providerID === "" || modelID === "") {
+      return {
+        ok: false,
+        error: "WORKSPACE_OPENCODE_MODEL must be in provider/model form (e.g. anthropic/claude-sonnet-4-6)",
+      }
+    }
+    if (/[\u0000-\u001f]/.test(providerID) || /[\u0000-\u001f]/.test(modelID)) {
+      return { ok: false, error: "WORKSPACE_OPENCODE_MODEL must not contain control characters" }
+    }
+    normalizedModel = providerID + "/" + modelID
   }
 
   let overlay = {}
@@ -45,13 +61,13 @@ export function mergeConfig(baseObj, overlayRaw, modelRaw) {
   merged.autoupdate = false
 
   // Model wins if non-empty.
-  if (model !== "") merged.model = model
+  if (normalizedModel !== "") merged.model = normalizedModel
 
   return { ok: true, config: merged }
 }
 
 // CLI main guard: node merge-config.mjs <config-file-path>
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const fs = await import("node:fs")
   const path = await import("node:path")
 
@@ -68,7 +84,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const modelRaw = process.env.WORKSPACE_OPENCODE_MODEL || ""
 
   const result = mergeConfig(base, overlayRaw, modelRaw)
-  if (!result.ok) {
+  if (result.ok === false) {
     process.stderr.write(result.error + "\n")
     process.exit(2)
   }
@@ -76,7 +92,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const output = JSON.stringify(result.config, null, 2) + "\n"
   const tmpPath = `${cfgPath}.tmp-${process.pid}`
   try {
-    fs.writeFileSync(tmpPath, output, { encoding: "utf8" })
+    fs.writeFileSync(tmpPath, output, { encoding: "utf8", flag: "wx" })
     fs.renameSync(tmpPath, cfgPath)
   } catch (e) {
     process.stderr.write(`cannot write opencode config: ${e.message}\n`)

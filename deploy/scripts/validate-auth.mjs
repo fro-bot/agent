@@ -1,6 +1,8 @@
 // validate-auth.mjs — Auth secret validator for the workspace executor.
 // Pure ESM, no build step. Used by workspace-entrypoint.sh.
 
+import { fileURLToPath } from "node:url"
+
 /**
  * Validate a raw auth secret string.
  * @param {string} raw - Raw file content of the auth secret.
@@ -43,7 +45,7 @@ export function validateAuth(raw) {
 }
 
 // CLI main guard: node validate-auth.mjs <auth-file-path>
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const { readFileSync } = await import("node:fs")
   const filePath = process.argv[2]
   let raw
@@ -54,7 +56,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(2)
   }
   const result = validateAuth(raw)
-  if (!result.ok) {
+  if (result.ok === false) {
     process.stderr.write(result.error + "\n")
     process.exit(2)
   }
