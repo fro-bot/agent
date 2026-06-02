@@ -18,6 +18,8 @@
 
 set -eu
 
+SCRIPTS_DIR="${WORKSPACE_SCRIPTS_DIR:-/usr/local/lib/workspace-scripts}"
+
 CA_SRC="${MITMPROXY_CA_PATH:-/run/mitmproxy-certs/mitmproxy-ca-cert.pem}"
 CA_DEST="/usr/local/share/ca-certificates/mitmproxy.crt"
 SYSTEM_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
@@ -84,26 +86,6 @@ AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-/run/secrets/workspace_opencode_auth}"
 OPENCODE_DATA_DIR="${XDG_DATA_HOME:-/root/.local/share}/opencode"
 AUTH_DEST="${OPENCODE_DATA_DIR}/auth.json"
 
-# v1 accepts API-key credentials only (a static blob cannot refresh OAuth).
-AUTH_VALIDATOR='
-const fs = require("fs")
-let raw
-try { raw = fs.readFileSync(process.argv[1], "utf8") } catch (e) { console.error("cannot read auth secret: " + e.message); process.exit(2) }
-let data
-try { data = JSON.parse(raw) } catch (e) { console.error("auth secret is not valid JSON"); process.exit(2) }
-if (typeof data !== "object" || data === null || Array.isArray(data)) { console.error("auth secret must be a JSON object of providerID -> {type,key}"); process.exit(2) }
-const ids = Object.keys(data)
-if (ids.length === 0) { console.error("auth secret has no provider entries"); process.exit(2) }
-for (const id of ids) {
-  if (!/^[A-Za-z0-9._-]+$/.test(id)) { console.error("provider id is invalid (allowed: letters, digits, . _ -)"); process.exit(2) }
-  const e = data[id]
-  if (typeof e !== "object" || e === null) { console.error("provider " + id + ": entry must be an object"); process.exit(2) }
-  if (e.type !== "api") { console.error("provider " + id + ": type must be \"api\" (v1 supports API-key credentials only)"); process.exit(2) }
-  if (typeof e.key !== "string" || e.key.trim() === "") { console.error("provider " + id + ": missing non-empty \"key\""); process.exit(2) }
-}
-process.exit(0)
-'
-
 provision_auth() {
   # 0 = provisioned, 1 = absent (fail-soft), 2 = invalid (fail-fast)
   [ -f "$AUTH_SRC" ] || return 1
@@ -115,7 +97,7 @@ provision_auth() {
   fi
   [ -n "$_auth_compact" ] || return 1
 
-  if ! node -e "$AUTH_VALIDATOR" "$AUTH_SRC"; then
+  if ! node "$SCRIPTS_DIR/validate-auth.mjs" "$AUTH_SRC"; then
     return 2
   fi
 
@@ -163,30 +145,7 @@ fi
 OPENCODE_CONFIG_FILE="${XDG_CONFIG_HOME:-/root/.config}/opencode/opencode.json"
 
 if [ -n "${WORKSPACE_OPENCODE_CONFIG:-}" ] || [ -n "${WORKSPACE_OPENCODE_MODEL:-}" ]; then
-  CONFIG_MERGER='
-const fs = require("fs")
-const cfgPath = process.argv[1]
-const overlayRaw = process.env.WORKSPACE_OPENCODE_CONFIG || ""
-const model = (process.env.WORKSPACE_OPENCODE_MODEL || "").trim()
-let base
-try { base = JSON.parse(fs.readFileSync(cfgPath, "utf8")) } catch (e) { console.error("cannot read base opencode config: " + e.message); process.exit(2) }
-let overlay = {}
-if (overlayRaw.trim() !== "") {
-  try { overlay = JSON.parse(overlayRaw) } catch (e) { console.error("WORKSPACE_OPENCODE_CONFIG is not valid JSON"); process.exit(2) }
-  if (typeof overlay !== "object" || overlay === null || Array.isArray(overlay)) { console.error("WORKSPACE_OPENCODE_CONFIG must be a JSON object"); process.exit(2) }
-}
-const merged = {...base, ...overlay}
-// Preserve the baked Systematic plugin (union, dedup, strings only) so an overlay cannot drop it.
-const basePlugins = Array.isArray(base.plugin) ? base.plugin : []
-const overlayPlugins = Array.isArray(overlay.plugin) ? overlay.plugin.filter(p => typeof p === "string") : []
-merged.plugin = Array.from(new Set([...basePlugins, ...overlayPlugins]))
-// The OpenCode version is pinned (baked musl binary); an overlay must never re-enable autoupdate.
-merged.autoupdate = false
-if (model !== "") merged.model = model
-fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2) + "\n")
-process.exit(0)
-'
-  if ! node -e "$CONFIG_MERGER" "$OPENCODE_CONFIG_FILE"; then
+  if ! node "$SCRIPTS_DIR/merge-config.mjs" "$OPENCODE_CONFIG_FILE"; then
     echo "workspace-entrypoint: opencode config overlay is invalid — refusing to start. Fix WORKSPACE_OPENCODE_CONFIG / WORKSPACE_OPENCODE_MODEL and restart." >&2
     exit 1
   fi

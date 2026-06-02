@@ -86,6 +86,9 @@ RUN mkdir -p /workspace/repos
 COPY deploy/workspace-entrypoint.sh /usr/local/bin/workspace-entrypoint.sh
 RUN chmod 755 /usr/local/bin/workspace-entrypoint.sh
 
+# Extracted validator/merger helpers (used by workspace-entrypoint.sh).
+COPY deploy/scripts/validate-auth.mjs deploy/scripts/merge-config.mjs /usr/local/lib/workspace-scripts/
+
 WORKDIR /app/apps/workspace-agent
 
 ENTRYPOINT ["/usr/local/bin/workspace-entrypoint.sh"]
