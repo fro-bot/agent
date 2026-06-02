@@ -180,6 +180,19 @@ services:
       # Bearer token for the OpenCode reverse proxy.
       # The gateway presents this token when attaching to the workspace OpenCode server.
       WORKSPACE_OPENCODE_TOKEN_FILE: /run/secrets/workspace_opencode_token
+      # OpenCode provider credentials (auth.json blob). Required for the @mention
+      # loop; optional for clone-only deployments. The entrypoint validates it and
+      # writes auth.json (0600) to OpenCode's data path — never exported as env.
+      WORKSPACE_OPENCODE_AUTH_FILE: /run/secrets/workspace_opencode_auth
+      # OpenCode model + provider config for the mention loop (operator config,
+      # not secrets — the provider key lives in the auth.json secret above).
+      # Mirrors the action's `model` + `opencode-config` inputs. Set both in
+      # deploy/.env to route Claude/OpenAI through cliproxyapi, e.g.:
+      #   WORKSPACE_OPENCODE_MODEL=anthropic/claude-sonnet-4-6
+      #   WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}
+      # The entrypoint overlays them onto the baked base config (plugin preserved).
+      WORKSPACE_OPENCODE_MODEL: ${WORKSPACE_OPENCODE_MODEL:-}
+      WORKSPACE_OPENCODE_CONFIG: ${WORKSPACE_OPENCODE_CONFIG:-}
     volumes:
       # workspace-opencode-token: shared secret for the bearer-token proxy.
       # The gateway reads the same value from WORKSPACE_OPENCODE_TOKEN_FILE.
@@ -189,6 +202,22 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # workspace-opencode-auth: OpenCode provider credentials (API-key auth.json
+      # blob, e.g. {"anthropic":{"type":"api","key":"sk-..."}}). Required for the
+      # mention loop; leave empty for clone-only deployments.
+      - type: bind
+        source: ./secrets/workspace-opencode-auth
+        target: /run/secrets/workspace_opencode_auth
+        read_only: true
+        bind:
+          create_host_path: false
+      # mitmproxy CA cert (written by mitmproxy on first start). Mounted at a
+      # dedicated path — NOT over /etc/ssl/certs — so the entrypoint's
+      # update-ca-certificates can write the MERGED system bundle (base CAs +
+      # mitmproxy) without the mount making the destination read-only. The
+      # entrypoint trusts this for git/libcurl and the opencode binary, which
+      # read the system store (NODE_EXTRA_CA_CERTS does not cover them).
+      - mitmproxy-certs:/run/mitmproxy-certs:ro
     # Port model:
     #   9100 — Hono API (/healthz, /clone) — sandbox-net only, no host mapping
     #   9200 — OpenCode bearer-token proxy — sandbox-net only, no host mapping
@@ -202,6 +231,15 @@ services:
       options:
         max-size: 10m
         max-file: '3'
+    healthcheck:
+      # /healthz returns 200 once the Hono clone API is up, independently of
+      # OpenCode readiness (it reports opencode: ready|starting|down in the body).
+      # localhost is in NO_PROXY so this probe does not traverse mitmproxy.
+      test: [CMD-SHELL, 'curl -fsS http://127.0.0.1:9100/healthz || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 4
+      start_period: 45s
 
   mitmproxy:
     image: mitmproxy/mitmproxy:11.1.3@sha256:e0deb0df7edf9f909053f274a067cd1cacb90f5c17d74459e1693179c0b98d8f
