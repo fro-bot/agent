@@ -9,6 +9,7 @@
  */
 
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
+import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
@@ -191,6 +192,42 @@ function buildParams(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/** Build a fake PermissionCoordinator with vi.fn() methods. */
+function makeCoordinator(): PermissionCoordinator {
+  return {
+    onPermissionAsked: vi.fn().mockResolvedValue('once'),
+    onPermissionReplied: vi.fn(),
+    pending: vi.fn().mockReturnValue([]),
+    dispose: vi.fn(),
+  }
+}
+
+/** `permission.asked` event for a given session. */
+function permissionAskedEvent(requestID: string, sessionID = 'sess-123', permission = 'bash'): object {
+  return {
+    type: 'permission.asked',
+    properties: {
+      id: requestID,
+      sessionID,
+      permission,
+      patterns: [],
+      tool: permission,
+    },
+  }
+}
+
+/** `permission.replied` event for a given session. */
+function permissionRepliedEvent(
+  requestID: string,
+  reply: 'once' | 'always' | 'reject' = 'once',
+  sessionID = 'sess-123',
+): object {
+  return {
+    type: 'permission.replied',
+    properties: {sessionID, requestID, reply},
+  }
+}
 
 describe('runOpenCodeCore', () => {
   describe('happy path — text deltas + session.idle', () => {
@@ -693,6 +730,126 @@ describe('runOpenCodeCore', () => {
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('unreachable')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Permission event routing
+  // ---------------------------------------------------------------------------
+
+  describe('permission events', () => {
+    it('calls coordinator.onPermissionAsked with parsed request on permission.asked for this session', async () => {
+      // #given
+      const coordinator = makeCoordinator()
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([permissionAskedEvent('req-1'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(coordinator.onPermissionAsked).toHaveBeenCalledOnce()
+      const calledWith = (coordinator.onPermissionAsked as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        requestID: string
+        sessionID: string
+      }
+      expect(calledWith.requestID).toBe('req-1')
+      expect(calledWith.sessionID).toBe('sess-123')
+    })
+
+    it('calls coordinator.onPermissionReplied with parsed event on permission.replied for this session', async () => {
+      // #given
+      const coordinator = makeCoordinator()
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([permissionRepliedEvent('req-42', 'always'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(coordinator.onPermissionReplied).toHaveBeenCalledOnce()
+      const calledWith = (coordinator.onPermissionReplied as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        requestID: string
+        sessionID: string
+        reply: string
+      }
+      expect(calledWith.requestID).toBe('req-42')
+      expect(calledWith.sessionID).toBe('sess-123')
+      expect(calledWith.reply).toBe('always')
+    })
+
+    it('does NOT call onPermissionAsked for permission.asked from a different session', async () => {
+      // #given
+      const coordinator = makeCoordinator()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([permissionAskedEvent('req-99', 'other-session'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
+    })
+
+    it('does NOT call onPermissionAsked for malformed permission.asked (missing id)', async () => {
+      // #given — missing `id` field makes parsePermissionRequest return null
+      const coordinator = makeCoordinator()
+      const malformedAsked = {
+        type: 'permission.asked',
+        properties: {sessionID: 'sess-123', permission: 'bash', patterns: [], tool: 'bash'},
+        // no `id`
+      }
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([malformedAsked, sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator}
+
+      // #when — must not throw
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then
+      expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
+    })
+
+    it('does NOT throw when coordinator is absent and permission.asked arrives', async () => {
+      // #given — no coordinator param (back-compat)
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([permissionAskedEvent('req-1'), sessionIdleEvent('sess-123')]),
+      })
+      const params = buildParams(handle) // no coordinator
+
+      // #when / #then — must resolve cleanly
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    it('invokes event.subscribe before promptAsync (subscribe-before-prompt ordering)', async () => {
+      // #given — track call order via a shared array
+      const callOrder: string[] = []
+
+      const handle = makeHandle({
+        promptAsync: async (_args: unknown) => {
+          callOrder.push('promptAsync')
+          return promptAsyncOk()
+        },
+        subscribe: async (_args: unknown) => {
+          callOrder.push('subscribe')
+          return subscribeOk([sessionIdleEvent('sess-123')])
+        },
+      })
+      const params = buildParams(handle)
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — subscribe fires before prompt
+      expect(callOrder).toEqual(['subscribe', 'promptAsync'])
     })
   })
 })
