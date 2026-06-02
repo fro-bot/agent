@@ -287,6 +287,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+      - name: Run deploy/scripts unit tests
+        run: node --test deploy/scripts/*.test.mjs
       - name: Build workspace Docker image
         run: docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .
       - name: Smoke-test workspace image (clone API boots independently of OpenCode)
@@ -435,6 +439,83 @@ jobs:
           [ "$status" -ne 0 ] || { echo "REGRESSION: malformed config overlay did not fail startup"; exit 1; }
           echo "$output" | grep -q "opencode config overlay is invalid"
           echo "OK: malformed config overlay rejected at startup"
+      - name: Smoke-test combined auth + model + provider overlay
+        run: |
+          set -e
+          printf '{"anthropic":{"type":"api","key":"sk-dummy-not-real"}}' > /tmp/auth.json
+          cid="$(docker run -d \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
+            -e 'WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
+            -v /tmp/auth.json:/run/secrets/workspace_opencode_auth:ro \
+            fro-bot-workspace:smoke)"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ok=false
+          for _ in $(seq 1 30); do
+            if docker exec "$cid" curl -fsS http://127.0.0.1:9100/healthz >/dev/null 2>&1; then ok=true; break; fi
+            sleep 1
+          done
+          logs="$(docker logs "$cid" 2>&1)"
+          echo "--- workspace logs ---"; echo "$logs"
+          [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with combined auth+model+overlay"; exit 1; }
+          echo "$logs" | grep -q "auth: provisioned"
+          echo "$logs" | grep -q "provider-overlay=applied"
+          docker exec "$cid" sh -c 'test "$(stat -c %a /root/.local/share/opencode/auth.json)" = "600"'
+          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /root/.config/opencode/opencode.json'
+          echo "OK: combined auth + model + provider overlay — all assertions passed"
+      - name: Smoke-test model-only overlay
+        run: |
+          set -e
+          cid="$(docker run -d \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
+            fro-bot-workspace:smoke)"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ok=false
+          for _ in $(seq 1 30); do
+            if docker exec "$cid" curl -fsS http://127.0.0.1:9100/healthz >/dev/null 2>&1; then ok=true; break; fi
+            sleep 1
+          done
+          logs="$(docker logs "$cid" 2>&1)"
+          echo "--- workspace logs ---"; echo "$logs"
+          [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with model-only overlay"; exit 1; }
+          echo "$logs" | grep -q "provider-overlay=applied"
+          docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c '! grep -q "\"provider\"" /root/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
+          echo "OK: model-only overlay — model present, no provider key, plugin preserved"
+      - name: Smoke-test empty auth file (whitespace → absent, clone-only boots)
+        run: |
+          set -e
+          printf '   \n  ' > /tmp/empty-auth.json
+          cid="$(docker run -d \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            -v /tmp/empty-auth.json:/run/secrets/workspace_opencode_auth:ro \
+            fro-bot-workspace:smoke)"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ok=false
+          for _ in $(seq 1 30); do
+            if docker exec "$cid" curl -fsS http://127.0.0.1:9100/healthz >/dev/null 2>&1; then ok=true; break; fi
+            sleep 1
+          done
+          logs="$(docker logs "$cid" 2>&1)"
+          echo "--- workspace logs ---"; echo "$logs"
+          [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with whitespace-only auth"; exit 1; }
+          echo "$logs" | grep -q "auth: absent"
+          docker exec "$cid" sh -c '! test -f /root/.local/share/opencode/auth.json'
+          echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
