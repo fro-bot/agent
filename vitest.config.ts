@@ -10,6 +10,8 @@ export default defineConfig({
       '**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*',
       // Cloned dependency source repos for inspection only — never run their tests.
       '**/.slim/**',
+      // deploy/scripts/*.test.mjs use the node:test runner, not vitest.
+      '**/deploy/**',
     ],
   },
 })

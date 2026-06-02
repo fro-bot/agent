@@ -69,7 +69,6 @@ export function mergeConfig(baseObj, overlayRaw, modelRaw) {
 // CLI main guard: node merge-config.mjs <config-file-path>
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const fs = await import("node:fs")
-  const path = await import("node:path")
 
   const cfgPath = process.argv[2]
   let base

@@ -87,3 +87,9 @@ test("missing key field rejected", () => {
   assert.equal(result.ok, false)
   assert.ok(result.error.includes('missing non-empty "key"'), `got: ${result.error}`)
 })
+
+test("array-valued provider entry rejected (array is object-like)", () => {
+  const result = validateAuth(JSON.stringify({ anthropic: [] }))
+  assert.equal(result.ok, false)
+  assert.ok(result.error.includes('type must be "api"'), `got: ${result.error}`)
+})

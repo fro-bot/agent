@@ -136,3 +136,11 @@ test("model rejected when modelID contains control character", () => {
   assert.equal(result.ok, false)
   assert.ok(result.error.includes("control characters"), `got: ${result.error}`)
 })
+
+test("non-array plugin overlay (string) cannot replace plugin array", () => {
+  const overlay = JSON.stringify({ plugin: "evil-plugin" })
+  const result = mergeConfig(BASE, overlay, "")
+  assert.equal(result.ok, true)
+  assert.ok(Array.isArray(result.config.plugin), "plugin must remain an array")
+  assert.deepEqual(result.config.plugin, ["@fro.bot/systematic@2.24.0"])
+})
