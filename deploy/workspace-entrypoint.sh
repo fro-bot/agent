@@ -68,5 +68,132 @@ else
   echo "workspace-entrypoint: continuing without proxy trust (no proxy configured or CA explicitly optional)" >&2
 fi
 
+# ---------------------------------------------------------------------------
+# OpenCode provider credentials (file-based, mirrors populateAuthJson).
+#
+# Written to OpenCode's data path as auth.json (0600), NOT exported as env —
+# a file has a smaller introspection surface than /proc/<pid>/environ, and the
+# clone subprocess (explicit env allowlist in clone.ts) never sees it.
+#
+# Auth-gating rule: clone-only deployments boot without credentials; the
+# mention-loop turn fails with OpenCode's own auth error when they are absent.
+# A malformed blob fails fast here rather than at turn time.
+# ---------------------------------------------------------------------------
+
+AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-/run/secrets/workspace_opencode_auth}"
+OPENCODE_DATA_DIR="${XDG_DATA_HOME:-/root/.local/share}/opencode"
+AUTH_DEST="${OPENCODE_DATA_DIR}/auth.json"
+
+# v1 accepts API-key credentials only (a static blob cannot refresh OAuth).
+AUTH_VALIDATOR='
+const fs = require("fs")
+let raw
+try { raw = fs.readFileSync(process.argv[1], "utf8") } catch (e) { console.error("cannot read auth secret: " + e.message); process.exit(2) }
+let data
+try { data = JSON.parse(raw) } catch (e) { console.error("auth secret is not valid JSON"); process.exit(2) }
+if (typeof data !== "object" || data === null || Array.isArray(data)) { console.error("auth secret must be a JSON object of providerID -> {type,key}"); process.exit(2) }
+const ids = Object.keys(data)
+if (ids.length === 0) { console.error("auth secret has no provider entries"); process.exit(2) }
+for (const id of ids) {
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) { console.error("provider id is invalid (allowed: letters, digits, . _ -)"); process.exit(2) }
+  const e = data[id]
+  if (typeof e !== "object" || e === null) { console.error("provider " + id + ": entry must be an object"); process.exit(2) }
+  if (e.type !== "api") { console.error("provider " + id + ": type must be \"api\" (v1 supports API-key credentials only)"); process.exit(2) }
+  if (typeof e.key !== "string" || e.key.trim() === "") { console.error("provider " + id + ": missing non-empty \"key\""); process.exit(2) }
+}
+process.exit(0)
+'
+
+provision_auth() {
+  # 0 = provisioned, 1 = absent (fail-soft), 2 = invalid (fail-fast)
+  [ -f "$AUTH_SRC" ] || return 1
+  # Whitespace-only file means "unset" (matches the readOptionalSecret convention).
+  # A read failure is a real error (return 2), not "absent".
+  if ! _auth_compact=$(tr -d '[:space:]' < "$AUTH_SRC" 2>/dev/null); then
+    echo "workspace-entrypoint: cannot read auth secret at $AUTH_SRC" >&2
+    return 2
+  fi
+  [ -n "$_auth_compact" ] || return 1
+
+  if ! node -e "$AUTH_VALIDATOR" "$AUTH_SRC"; then
+    return 2
+  fi
+
+  mkdir -p "$OPENCODE_DATA_DIR"
+  if ! (umask 077; cp "$AUTH_SRC" "$AUTH_DEST"); then
+    echo "workspace-entrypoint: failed to write $AUTH_DEST" >&2
+    return 2
+  fi
+  if ! chmod 600 "$AUTH_DEST"; then
+    echo "workspace-entrypoint: failed to chmod $AUTH_DEST" >&2
+    return 2
+  fi
+  return 0
+}
+
+# `if`-wrapped so a non-zero return (absent/invalid) does not trip `set -e`.
+if provision_auth; then
+  auth_rc=0
+else
+  auth_rc=$?
+fi
+if [ "$auth_rc" -eq 0 ]; then
+  echo "workspace-entrypoint: auth: provisioned" >&2
+elif [ "$auth_rc" -eq 2 ]; then
+  echo "workspace-entrypoint: auth secret is present but invalid — refusing to start. Fix the credential blob and restart." >&2
+  exit 1
+else
+  echo "workspace-entrypoint: auth: absent (mention loop will fail until configured; clone-only deployment is fine)" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# OpenCode model + provider config overlay (mirrors the action's `model` and
+# `opencode-config` inputs).
+#
+# WORKSPACE_OPENCODE_CONFIG is a JSON object shallow-merged over the baked base
+# config — the deployer supplies the `provider` block (e.g. cliproxyapi:
+# {"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}).
+# WORKSPACE_OPENCODE_MODEL is the `provider/model` string and always wins.
+# The baked Systematic plugin is preserved regardless of the overlay.
+#
+# Fail-soft: both unset → base config stands (clone-only boots; the mention-loop
+# turn picks OpenCode's own default/error). Malformed config → fail fast.
+# ---------------------------------------------------------------------------
+
+OPENCODE_CONFIG_FILE="${XDG_CONFIG_HOME:-/root/.config}/opencode/opencode.json"
+
+if [ -n "${WORKSPACE_OPENCODE_CONFIG:-}" ] || [ -n "${WORKSPACE_OPENCODE_MODEL:-}" ]; then
+  CONFIG_MERGER='
+const fs = require("fs")
+const cfgPath = process.argv[1]
+const overlayRaw = process.env.WORKSPACE_OPENCODE_CONFIG || ""
+const model = (process.env.WORKSPACE_OPENCODE_MODEL || "").trim()
+let base
+try { base = JSON.parse(fs.readFileSync(cfgPath, "utf8")) } catch (e) { console.error("cannot read base opencode config: " + e.message); process.exit(2) }
+let overlay = {}
+if (overlayRaw.trim() !== "") {
+  try { overlay = JSON.parse(overlayRaw) } catch (e) { console.error("WORKSPACE_OPENCODE_CONFIG is not valid JSON"); process.exit(2) }
+  if (typeof overlay !== "object" || overlay === null || Array.isArray(overlay)) { console.error("WORKSPACE_OPENCODE_CONFIG must be a JSON object"); process.exit(2) }
+}
+const merged = {...base, ...overlay}
+// Preserve the baked Systematic plugin (union, dedup, strings only) so an overlay cannot drop it.
+const basePlugins = Array.isArray(base.plugin) ? base.plugin : []
+const overlayPlugins = Array.isArray(overlay.plugin) ? overlay.plugin.filter(p => typeof p === "string") : []
+merged.plugin = Array.from(new Set([...basePlugins, ...overlayPlugins]))
+// The OpenCode version is pinned (baked musl binary); an overlay must never re-enable autoupdate.
+merged.autoupdate = false
+if (model !== "") merged.model = model
+fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2) + "\n")
+process.exit(0)
+'
+  if ! node -e "$CONFIG_MERGER" "$OPENCODE_CONFIG_FILE"; then
+    echo "workspace-entrypoint: opencode config overlay is invalid — refusing to start. Fix WORKSPACE_OPENCODE_CONFIG / WORKSPACE_OPENCODE_MODEL and restart." >&2
+    exit 1
+  fi
+  echo "workspace-entrypoint: opencode config: model=$([ -n "${WORKSPACE_OPENCODE_MODEL:-}" ] && echo set || echo default), provider-overlay=$([ -n "${WORKSPACE_OPENCODE_CONFIG:-}" ] && echo applied || echo none)" >&2
+else
+  echo "workspace-entrypoint: opencode config: model=default, provider-overlay=none (mention loop needs a model + provider to run)" >&2
+fi
+
 # Hand off to the supervisor as PID 1 so its SIGTERM drain works.
 exec node /app/apps/workspace-agent/dist/main.mjs

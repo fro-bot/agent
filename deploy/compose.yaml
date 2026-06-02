@@ -180,12 +180,34 @@ services:
       # Bearer token for the OpenCode reverse proxy.
       # The gateway presents this token when attaching to the workspace OpenCode server.
       WORKSPACE_OPENCODE_TOKEN_FILE: /run/secrets/workspace_opencode_token
+      # OpenCode provider credentials (auth.json blob). Required for the @mention
+      # loop; optional for clone-only deployments. The entrypoint validates it and
+      # writes auth.json (0600) to OpenCode's data path — never exported as env.
+      WORKSPACE_OPENCODE_AUTH_FILE: /run/secrets/workspace_opencode_auth
+      # OpenCode model + provider config for the mention loop (operator config,
+      # not secrets — the provider key lives in the auth.json secret above).
+      # Mirrors the action's `model` + `opencode-config` inputs. Set both in
+      # deploy/.env to route Claude/OpenAI through cliproxyapi, e.g.:
+      #   WORKSPACE_OPENCODE_MODEL=anthropic/claude-sonnet-4-6
+      #   WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}
+      # The entrypoint overlays them onto the baked base config (plugin preserved).
+      WORKSPACE_OPENCODE_MODEL: ${WORKSPACE_OPENCODE_MODEL:-}
+      WORKSPACE_OPENCODE_CONFIG: ${WORKSPACE_OPENCODE_CONFIG:-}
     volumes:
       # workspace-opencode-token: shared secret for the bearer-token proxy.
       # The gateway reads the same value from WORKSPACE_OPENCODE_TOKEN_FILE.
       - type: bind
         source: ./secrets/workspace-opencode-token
         target: /run/secrets/workspace_opencode_token
+        read_only: true
+        bind:
+          create_host_path: false
+      # workspace-opencode-auth: OpenCode provider credentials (API-key auth.json
+      # blob, e.g. {"anthropic":{"type":"api","key":"sk-..."}}). Required for the
+      # mention loop; leave empty for clone-only deployments.
+      - type: bind
+        source: ./secrets/workspace-opencode-auth
+        target: /run/secrets/workspace_opencode_auth
         read_only: true
         bind:
           create_host_path: false
