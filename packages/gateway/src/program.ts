@@ -162,21 +162,23 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         // eslint-disable-next-line no-void
         void (async () => {
           try {
+            // Defer FIRST — acks the interaction within Discord's 3 s window before
+            // any REST calls (guild.members.fetch inside userIsAuthorized can be slow).
+            // All subsequent responses must use editReply (not reply) since the
+            // interaction is now deferred.
+            await interaction.deferReply({ephemeral: true})
+
             // Auth: reuse the same authorization gate as the mention path.
             const guild = interaction.guild
             if (guild === null) {
-              await interaction.reply({content: 'Not authorized to approve.', ephemeral: true})
+              await interaction.editReply({content: 'Not authorized to approve.'})
               return
             }
             const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, logger)
             if (authorized === false) {
-              await interaction.reply({content: 'Not authorized to approve.', ephemeral: true})
+              await interaction.editReply({content: 'Not authorized to approve.'})
               return
             }
-
-            // Defer immediately — acknowledgements the interaction within Discord's 3 s
-            // window. We'll editReply after the (potentially slow) postReply HTTP call.
-            await interaction.deferReply({ephemeral: true})
 
             const decision = parsed.action === 'approve' ? ('once' as const) : ('reject' as const)
             const outcome = await approvalRegistry.handleButtonDecision({
@@ -283,6 +285,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     installShutdownHandlers(client, logger, undefined, serverHandle, async () => {
       // Dispose pending approvals before draining runs — ensures pending permissions
       // fail-closed so in-flight runs don't hang waiting for a button that will never come.
+      //
+      // NOTE: disposeAll is best-effort early fail-close, NOT a hard barrier. A run still
+      // draining SSE could call register() for a late approval after disposeAll clears the
+      // map; that late entry is fail-closed only by the run's own coordinator.dispose() in
+      // its finally block. The per-run coordinator.dispose() is the authoritative backstop
+      // for approvals registered after this global drain.
       await approvalRegistry.disposeAll('gateway shutdown')
       await Promise.all(inFlightRuns)
     })

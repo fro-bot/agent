@@ -58,7 +58,7 @@ export interface PermissionReplyEvent {
 }
 
 /** Why a pending entry settled — surfaced to render functions for embed updates. */
-export type SettlementReason = 'replied' | 'cascade' | 'deadline' | 'disposed'
+export type SettlementReason = 'replied' | 'cascade' | 'deadline' | 'disposed' | 'superseded'
 
 /** Coordinator seam consumed by run-core and the run orchestrator. */
 export interface PermissionCoordinator {

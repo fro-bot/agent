@@ -235,6 +235,12 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       const existing = entries.get(requestID)
       if (existing !== undefined) {
         clearTimer(existing)
+        // NBC4: best-effort render the old embed as superseded so its buttons
+        // become visibly inert. Wrapped so it never throws into register.
+        if (existing.renderFn !== null) {
+          // eslint-disable-next-line no-void
+          void existing.renderFn(existing.request, 'reject', null, 'superseded').catch(() => {})
+        }
       }
       logger.warn({requestID}, 'ApprovalRegistry: duplicate requestID — overwriting (re-ask)')
     }

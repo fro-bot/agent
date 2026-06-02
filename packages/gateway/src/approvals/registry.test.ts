@@ -841,6 +841,57 @@ describe('FIX 3 — stale timer cleared on duplicate register', () => {
 })
 
 // ---------------------------------------------------------------------------
+// NBC4: superseded render on duplicate register
+// ---------------------------------------------------------------------------
+
+describe('NBC4 — duplicate register renders old entry as superseded', () => {
+  it('calls old renderFn with reason superseded, clears old timer, new entry is active', async () => {
+    // #given a registry with an entry that has a renderFn attached
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects1 = makeEffects()
+    const renderFn1 = makeRenderFn()
+    const request1 = makeRequest({requestID: 'per_1', sessionID: 'ses_1'})
+    registry.register(makeParams({requestID: 'per_1', sessionID: 'ses_1', request: request1, effects: effects1}))
+    registry.attachMessage('per_1', renderFn1)
+
+    // #when the same requestID is re-registered (re-ask)
+    const effects2 = makeEffects()
+    const request2 = makeRequest({requestID: 'per_1', sessionID: 'ses_1'})
+    registry.register(makeParams({requestID: 'per_1', sessionID: 'ses_1', request: request2, effects: effects2}))
+
+    // Allow the best-effort superseded render to settle
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then old renderFn was called once with reason 'superseded'
+    expect(renderFn1).toHaveBeenCalledOnce()
+    const [, , , reason] = (renderFn1 as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, unknown, unknown, string]
+    expect(reason).toBe('superseded')
+
+    // #and new entry is the active one (still pending)
+    expect(registry.has('per_1')).toBe(true)
+    expect(registry.pending()).toContain('per_1')
+  })
+
+  it('does not call old renderFn if no message was attached before re-register', async () => {
+    // #given an entry with NO renderFn attached
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects1 = makeEffects()
+    registry.register(makeParams({requestID: 'per_1', effects: effects1}))
+    // No attachMessage call
+
+    // #when re-registered
+    const effects2 = makeEffects()
+    registry.register(makeParams({requestID: 'per_1', effects: effects2}))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then no crash; new entry is active
+    expect(registry.has('per_1')).toBe(true)
+    // effects1.postReply was NOT called (no superseded POST — render only)
+    expect(effects1.postReply).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // P2 bonus: confirmReply sessionID mismatch guard
 // ---------------------------------------------------------------------------
 

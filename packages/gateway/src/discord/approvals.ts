@@ -118,7 +118,10 @@ export function buildSettledEmbed(
   let title: string
   let color: number
 
-  if (reason === 'deadline') {
+  if (reason === 'superseded') {
+    title = '🔄 This approval request was superseded by a newer request.'
+    color = 0x99aab5 // grey — neutral, no approve/deny coloring
+  } else if (reason === 'deadline') {
     title = '⏱️ Approval timed out — denied'
     color = 0x99aab5 // grey
   } else if (reason === 'cascade') {

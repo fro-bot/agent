@@ -412,7 +412,37 @@ describe('button interaction handler (approval flow)', () => {
     expect(interaction.editReply).toHaveBeenCalledWith({content: 'Approved.'})
   })
 
-  it('unauthorized click → ephemeral Not authorized, handleButtonDecision NOT called', async () => {
+  it('deferReply is called BEFORE userIsAuthorized (call order)', async () => {
+    // #given
+    const {interactionHandler} = await runAndCaptureHandler()
+    const {parseApprovalCustomId} = await import('./discord/approvals.js')
+    vi.mocked(parseApprovalCustomId).mockReturnValueOnce({action: 'approve', requestID: 'req-abc'})
+
+    const {userIsAuthorized} = await import('./discord/mentions.js')
+    // Track invocation order via a shared call log
+    const callOrder: string[] = []
+    vi.mocked(userIsAuthorized).mockImplementationOnce(async () => {
+      callOrder.push('userIsAuthorized')
+      return true
+    })
+
+    const interaction = makeFakeButtonInteraction()
+    interaction.deferReply = vi.fn().mockImplementationOnce(async () => {
+      callOrder.push('deferReply')
+      return undefined
+    })
+
+    // #when
+    await interactionHandler(interaction)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then — deferReply must appear before userIsAuthorized in the call log
+    expect(callOrder).toContain('deferReply')
+    expect(callOrder).toContain('userIsAuthorized')
+    expect(callOrder.indexOf('deferReply')).toBeLessThan(callOrder.indexOf('userIsAuthorized'))
+  })
+
+  it('unauthorized click → deferReply first, then editReply (not reply) with Not authorized', async () => {
     // #given
     const {interactionHandler, fakeRegistry} = await runAndCaptureHandler()
     const {parseApprovalCustomId} = await import('./discord/approvals.js')
@@ -430,8 +460,12 @@ describe('button interaction handler (approval flow)', () => {
     // #then — no registry call
     expect(fakeRegistry.handleButtonDecision).not.toHaveBeenCalled()
 
-    // #and — ephemeral not authorized
-    expect(interaction.reply).toHaveBeenCalledWith({content: 'Not authorized to approve.', ephemeral: true})
+    // #and — deferReply was called first (interaction acked)
+    expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
+
+    // #and — editReply used (NOT reply) for the unauthorized message
+    expect(interaction.reply).not.toHaveBeenCalled()
+    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Not authorized to approve.'})
   })
 
   it('deny click → decision=reject, ephemeral Denied.', async () => {
