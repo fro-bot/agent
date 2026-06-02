@@ -95,6 +95,7 @@ if (typeof data !== "object" || data === null || Array.isArray(data)) { console.
 const ids = Object.keys(data)
 if (ids.length === 0) { console.error("auth secret has no provider entries"); process.exit(2) }
 for (const id of ids) {
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) { console.error("provider id is invalid (allowed: letters, digits, . _ -)"); process.exit(2) }
   const e = data[id]
   if (typeof e !== "object" || e === null) { console.error("provider " + id + ": entry must be an object"); process.exit(2) }
   if (e.type !== "api") { console.error("provider " + id + ": type must be \"api\" (v1 supports API-key credentials only)"); process.exit(2) }
@@ -107,7 +108,12 @@ provision_auth() {
   # 0 = provisioned, 1 = absent (fail-soft), 2 = invalid (fail-fast)
   [ -f "$AUTH_SRC" ] || return 1
   # Whitespace-only file means "unset" (matches the readOptionalSecret convention).
-  if [ -z "$(tr -d '[:space:]' < "$AUTH_SRC")" ]; then return 1; fi
+  # A read failure is a real error (return 2), not "absent".
+  if ! _auth_compact=$(tr -d '[:space:]' < "$AUTH_SRC" 2>/dev/null); then
+    echo "workspace-entrypoint: cannot read auth secret at $AUTH_SRC" >&2
+    return 2
+  fi
+  [ -n "$_auth_compact" ] || return 1
 
   if ! node -e "$AUTH_VALIDATOR" "$AUTH_SRC"; then
     return 2
@@ -118,7 +124,10 @@ provision_auth() {
     echo "workspace-entrypoint: failed to write $AUTH_DEST" >&2
     return 2
   fi
-  chmod 600 "$AUTH_DEST"
+  if ! chmod 600 "$AUTH_DEST"; then
+    echo "workspace-entrypoint: failed to chmod $AUTH_DEST" >&2
+    return 2
+  fi
   return 0
 }
 
@@ -167,10 +176,12 @@ if (overlayRaw.trim() !== "") {
   if (typeof overlay !== "object" || overlay === null || Array.isArray(overlay)) { console.error("WORKSPACE_OPENCODE_CONFIG must be a JSON object"); process.exit(2) }
 }
 const merged = {...base, ...overlay}
-// Preserve the baked Systematic plugin (union, dedup) so an overlay cannot drop it.
+// Preserve the baked Systematic plugin (union, dedup, strings only) so an overlay cannot drop it.
 const basePlugins = Array.isArray(base.plugin) ? base.plugin : []
-const overlayPlugins = Array.isArray(overlay.plugin) ? overlay.plugin : []
+const overlayPlugins = Array.isArray(overlay.plugin) ? overlay.plugin.filter(p => typeof p === "string") : []
 merged.plugin = Array.from(new Set([...basePlugins, ...overlayPlugins]))
+// The OpenCode version is pinned (baked musl binary); an overlay must never re-enable autoupdate.
+merged.autoupdate = false
 if (model !== "") merged.model = model
 fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2) + "\n")
 process.exit(0)

@@ -391,12 +391,15 @@ jobs:
           set -e
           # Mirrors the production deploy: a provider baseURL block + model string,
           # the same shape marcusrbrown/infra feeds the action for cliproxyapi.
+          # The overlay is deliberately HOSTILE — it also sets plugin:[] and
+          # autoupdate:true to prove the merger preserves the baked Systematic
+          # plugin and keeps the OpenCode version pin (autoupdate stays false).
           cid="$(docker run -d \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
             -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
-            -e 'WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
+            -e 'WORKSPACE_OPENCODE_CONFIG={"autoupdate":true,"plugin":[],"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -409,11 +412,13 @@ jobs:
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with config overlay"; exit 1; }
           echo "$logs" | grep -q "provider-overlay=applied"
-          # Effective config carries the overlaid model, the provider baseURL, AND the baked plugin.
+          # Effective config carries the overlaid model + provider baseURL, AND the
+          # hostile overlay could NOT drop the plugin or re-enable autoupdate.
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /root/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /root/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /root/.config/opencode/opencode.json'
-          echo "OK: model + provider overlay applied, Systematic plugin preserved"
+          docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /root/.config/opencode/opencode.json'
+          echo "OK: overlay applied; Systematic plugin preserved + autoupdate stays pinned despite hostile overlay"
       - name: Smoke-test config validation (malformed overlay → fail fast)
         run: |
           set -e
