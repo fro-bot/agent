@@ -256,7 +256,15 @@ jobs:
           fi
           echo "OK: no bare @fro-bot/runtime import found in gateway bundle"
       - name: Build gateway Docker image
-        run: docker build -f deploy/gateway.Dockerfile -t fro-bot-gateway:smoke .
+        run: |
+          for attempt in 1 2 3; do
+            if docker build -f deploy/gateway.Dockerfile -t fro-bot-gateway:smoke .; then
+              exit 0
+            fi
+            echo "::warning::docker build attempt ${attempt} failed"
+            [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
+            sleep $((attempt * 15))
+          done
       - name: Smoke-test gateway image (assert config load, not module crash)
         run: |
           set +e
@@ -292,7 +300,15 @@ jobs:
       - name: Run deploy/scripts unit tests
         run: node --test deploy/scripts/*.test.mjs
       - name: Build workspace Docker image
-        run: docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .
+        run: |
+          for attempt in 1 2 3; do
+            if docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .; then
+              exit 0
+            fi
+            echo "::warning::docker build attempt ${attempt} failed"
+            [ "${attempt}" -eq 3 ] && { echo "docker build failed after 3 attempts"; exit 1; }
+            sleep $((attempt * 15))
+          done
       - name: Smoke-test workspace image (clone API boots independently of OpenCode)
         run: |
           set -e
