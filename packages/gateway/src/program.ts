@@ -294,19 +294,28 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         })
     })
 
-    // g. Start announce HTTP server (before shutdown handlers so the handle is available)
-    const serverHandle = deps.startAnnounceServer(
-      {
-        client,
-        logger,
-        isShuttingDown,
-      },
-      {
-        webhookSecret: config.webhookSecret,
-        presenceChannelId: config.presenceChannelId,
-        httpPort: config.httpPort,
-      },
-    )
+    // g. Start announce HTTP server (before shutdown handlers so the handle is available).
+    //    Announce endpoint is opt-in: only started when both GATEWAY_WEBHOOK_SECRET and
+    //    GATEWAY_PRESENCE_CHANNEL_ID are configured. When absent, serverHandle is undefined
+    //    and installShutdownHandlers skips server close (server param is already optional).
+    let serverHandle: CloseableServer | undefined
+    if (config.announce === undefined) {
+      logger.info({}, 'announce endpoint disabled — no announce secrets configured')
+    } else {
+      serverHandle = deps.startAnnounceServer(
+        {
+          client,
+          logger,
+          isShuttingDown,
+        },
+        {
+          webhookSecret: config.announce.webhookSecret,
+          presenceChannelId: config.announce.presenceChannelId,
+          httpPort: config.httpPort,
+        },
+      )
+      logger.info({}, 'announce endpoint enabled — HTTP server started')
+    }
 
     // h. Install shutdown handlers — drain pending approvals fail-closed then await in-flight runs
     installShutdownHandlers(client, logger, undefined, serverHandle, async () => {
