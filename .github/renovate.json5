@@ -97,13 +97,14 @@
       semanticCommitType: 'build',
     },
     {
-      // Pin OpenCode to 1.14.41. Versions 1.14.42+ regressed the /event SSE
-      // stream so SyncEvent publishes (message.part.updated, message.updated,
-      // session.next.*) never reach bus.subscribeAll() subscribers, breaking
-      // visible tool-call output in the harness. Revisit when upstream fixes
-      // the bus delivery contract.
+      // Cap OpenCode at 1.15.13. The 1.14.42+ /event SSE SyncEvent regression
+      // (message.part.updated/message.updated/session.next.* not reaching
+      // bus.subscribeAll subscribers) was fixed upstream by #27959 and verified
+      // present in 1.15.13. The cap stays so version moves past the validated
+      // release remain a deliberate, reviewed bump (OpenCode ships breaking
+      // changes in patch releases). Raise it after validating a newer release.
       matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
-      allowedVersions: '<=1.14.41',
+      allowedVersions: '<=1.15.13',
     },
     {
       matchUpdateTypes: ['lockFileMaintenance'],

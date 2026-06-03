@@ -124,6 +124,35 @@ function toolSuccessEvent(callID: string, structured: object | null = null, sess
   }
 }
 
+/**
+ * `message.part.updated` with partType:'tool' — OpenCode 1.15.13 contract.
+ * The session ID is embedded in the part (mirrors streaming.ts:242 guard).
+ */
+function partUpdatedToolEvent(tool: string, status: string, state: object, sessionID = 'sess-123'): object {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {type: 'tool', tool, sessionID, state: {status, ...state}},
+    },
+  }
+}
+
+/**
+ * `message.part.updated` with partType:'text' — must NOT produce a 🔧 line.
+ * Text streaming is handled by `message.part.delta`; this guard test ensures
+ * the new branch never double-renders text parts.
+ */
+function partUpdatedTextEvent(text: string, sessionID = 'sess-123'): object {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {type: 'text', text, sessionID},
+    },
+  }
+}
+
 /** `session.idle` event for a given session. */
 function sessionIdleEvent(sessionID: string): object {
   return {type: 'session.idle', properties: {sessionID}}
@@ -484,6 +513,144 @@ describe('runOpenCodeCore', () => {
       await runOpenCodeCore(params)
 
       // #then — no progress line appended
+      expect(sink._appended).toHaveLength(0)
+    })
+  })
+
+  describe('tool call progress (message.part.updated — OpenCode 1.15.13 contract)', () => {
+    it('appends a progress line for a bash tool using state.title', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('bash', 'completed', {title: 'echo hi', input: {command: 'echo hi'}, output: ''}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      const combined = sink.buffered()
+      expect(combined).toContain('bash')
+      expect(combined).toContain('echo hi')
+    })
+
+    it('falls back to input.command when state.title is absent', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('bash', 'completed', {input: {command: 'pnpm test'}, output: ''}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(sink.buffered()).toContain('pnpm test')
+    })
+
+    it('falls back to input.cmd when command is absent', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('bash', 'completed', {input: {cmd: 'ls -la'}, output: ''}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(sink.buffered()).toContain('ls -la')
+    })
+
+    it('uses tool name as title for non-bash tools when state.title is absent', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('read_file', 'completed', {input: {path: '/foo/bar.ts'}, output: ''}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(sink.buffered()).toContain('read_file')
+    })
+
+    it('does NOT emit a tool line for partType text (no double-render)', async () => {
+      // #given — message.part.updated with type:'text' must not produce a 🔧 line
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([partUpdatedTextEvent('some text content'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — no 🔧 progress line; text part is handled by message.part.delta, not here
+      expect(sink._appended).toHaveLength(0)
+    })
+
+    it('ignores tool events from other sessions', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent(
+              'bash',
+              'completed',
+              {title: 'rm -rf /', input: {command: 'rm -rf /'}, output: ''},
+              'other-session',
+            ),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — no progress line appended
+      expect(sink._appended).toHaveLength(0)
+    })
+
+    it('ignores tool parts that are not yet completed (pending/running)', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('bash', 'running', {input: {command: 'sleep 1'}, output: ''}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — no progress line for non-completed state
       expect(sink._appended).toHaveLength(0)
     })
   })
