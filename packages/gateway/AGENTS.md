@@ -135,6 +135,21 @@ Releasing is always done in a `finally` block so crashes leave the system in a r
 
 Per-run errors are logged and the sweep continues — one corrupted record does not block recovery for the rest.
 
+### Tool approval
+
+When the workspace OpenCode config sets any tool to `ask` (rather than the default `allow`), OpenCode will pause execution and emit a `permission.asked` event before running that tool. The gateway intercepts these events and presents an interactive Discord approval prompt.
+
+**How it works:**
+
+- Each `permission.asked` event creates a Discord embed with Approve / Deny buttons in the run thread.
+- Approvers must pass the same `userIsAuthorized` gate as trigger mentions: either hold the `GATEWAY_TRIGGER_ROLE_ID` role or have guild-level `ManageChannels`.
+- The first valid button click wins (single-winner). A subsequent click on the same embed is a no-op.
+- While the prompt is open, the agent run is paused. OpenCode resumes only after the reply reaches the workspace.
+- If no decision is received within the approval deadline (a sub-deadline of the overall run timeout, capped at 13 minutes for Discord interaction-token expiry), the gateway fail-closes with `reject`: the tool is blocked, the embed is updated, and the run continues or errors from the rejection.
+- Multiple open approvals from the same session are handled independently; a `reject` decision cascades and closes all sibling prompts in that session.
+- **Default:** if no tool is set to `ask`, no approval prompts appear — all tools auto-run.
+- **Restart limitation:** a pending approval is in-memory only and does not survive a gateway or workspace restart. See [Known limitations](#known-limitations) below.
+
 ## Known limitations
 
 - **`add-project` is Discord-only.** The orchestration runs inside the slash
@@ -154,7 +169,7 @@ Per-run errors are logged and the sweep continues — one corrupted record does 
 
 - **No run queue.** Mentions that arrive while the concurrency cap or repo lock is held are rejected immediately. There is no persistent queue, no back-pressure mechanism, and no retry. Users must manually re-send their message when the system is free.
 
-- **No approval flow.** The authorization gate is a role check or permission check; there is no interactive approval step between an authorized mention and agent execution.
+- **Tool approval does not survive a restart.** A pending approval is held in memory by the per-run coordinator. If the gateway or workspace restarts while a permission prompt is in flight, the pending approval is abandoned: the coordinator's deadline fires (or the process exits fail-closed), the Discord embed is settled with `rejected`, and the run surfaces as interrupted. Re-mention to retry.
 
 - **Fresh session per mention.** Each mention starts a new OpenCode session from scratch. There is no conversational continuity across mentions (session persistence is planned but not yet wired into the Discord surface).
 

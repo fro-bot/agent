@@ -1,8 +1,10 @@
+import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
+import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import {
   createS3Adapter,
@@ -11,15 +13,33 @@ import {
   DEFAULT_STALE_THRESHOLD_MS,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
+import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
+import {parseApprovalCustomId} from './discord/approvals.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
-import {handleMention} from './discord/mentions.js'
+import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
+
+// ---------------------------------------------------------------------------
+// Pure helper — builds the coordination config from the shared S3 adapter and
+// gateway config. Extracted to avoid repeating the 5-field literal at every
+// call site (self-test, mention handler, stale-run recovery).
+// ---------------------------------------------------------------------------
+
+function makeCoordinationConfig(s3Adapter: ObjectStoreAdapter, config: GatewayConfig): CoordinationConfig {
+  return {
+    storeAdapter: s3Adapter,
+    storeConfig: config.objectStore,
+    lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+    staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — pino can replace this in a later unit.
@@ -78,6 +98,12 @@ export interface GatewayProgramDeps {
    * Returns a CloseableServer handle that will be passed to installShutdownHandlers.
    */
   readonly startAnnounceServer: (deps: AnnounceServerDeps, config: AnnounceServerConfig) => CloseableServer
+  /**
+   * Provider semantics self-test — validates that the S3-compatible store honors
+   * IfNoneMatch/IfMatch conditional write semantics required for safe coordination.
+   * Injected so tests can stub it without touching the real S3 adapter.
+   */
+  readonly runProviderSelfTest: (config: CoordinationConfig, logger: CoordinationLogger) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +141,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     }
 
     const s3Adapter = createS3Adapter(config.objectStore, runtimeLogger)
+
+    // Provider semantics self-test — fail-fast before serving so a provider that doesn't honor
+    // IfNoneMatch/IfMatch conditional writes can't silently corrupt the coordination lock.
+    const selfTestCoordConfig = makeCoordinationConfig(s3Adapter, config)
+    yield* Effect.tryPromise({
+      try: async () => deps.runProviderSelfTest(selfTestCoordConfig, runtimeLogger),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
     const concurrencyRegistry = createConcurrencyRegistry(config.maxConcurrentRuns)
     const bindingsStore = createBindingsStore({
       adapter: s3Adapter,
@@ -140,6 +175,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
     const registry = getCommandRegistry(commandDeps)
 
+    // Program-scoped approval registry — shared between the button handler and shutdown drain.
+    const approvalRegistry = createApprovalRegistry({logger})
+
     // e. Register slash commands
     yield* Effect.tryPromise({
       try: async () =>
@@ -148,7 +186,64 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     })
 
     // f. Wire client events
-    client.on('interactionCreate', interaction => {
+    client.on('interactionCreate', (interaction): void => {
+      // ── Button interactions: approval flow ────────────────────────────────
+      if (interaction.isButton()) {
+        const parsed = parseApprovalCustomId(interaction.customId)
+        if (parsed === null) return // not our button — ignore
+
+        // eslint-disable-next-line no-void
+        void (async () => {
+          try {
+            // Defer FIRST — acks the interaction within Discord's 3 s window before
+            // any REST calls (guild.members.fetch inside userIsAuthorized can be slow).
+            // All subsequent responses must use editReply (not reply) since the
+            // interaction is now deferred.
+            await interaction.deferReply({ephemeral: true})
+
+            // Auth: reuse the same authorization gate as the mention path.
+            const guild = interaction.guild
+            if (guild === null) {
+              await interaction.editReply({content: 'Not authorized to approve.'})
+              return
+            }
+            const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, logger)
+            if (authorized === false) {
+              await interaction.editReply({content: 'Not authorized to approve.'})
+              return
+            }
+
+            const decision = parsed.action === 'approve' ? ('once' as const) : ('reject' as const)
+            const outcome = await approvalRegistry.handleButtonDecision({
+              requestID: parsed.requestID,
+              channelID: interaction.channelId,
+              decision,
+              decidedBy: interaction.user.id,
+            })
+
+            const ackContent =
+              outcome === 'ok'
+                ? decision === 'once'
+                  ? 'Approved.'
+                  : 'Denied.'
+                : outcome === 'channel-mismatch'
+                  ? 'This approval belongs to another channel.'
+                  : outcome === 'not-found'
+                    ? 'This approval is no longer pending.'
+                    : outcome === 'already-claimed'
+                      ? 'Already decided.'
+                      : 'Failed to record decision, try again.'
+
+            await interaction.editReply({content: ackContent})
+          } catch (error: unknown) {
+            logger.error({err: String(error)}, 'button: unexpected error handling approval interaction')
+            // Best-effort edit — if this also throws Discord considers the interaction failed.
+            await interaction.editReply({content: 'Failed to record decision, try again.'}).catch(() => {})
+          }
+        })()
+        return
+      }
+
       if (!interaction.isChatInputCommand()) return
       // isChatInputCommand() narrows to ChatInputCommandInteraction — cast is safe.
       const cmd = interaction
@@ -171,13 +266,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         bindingsStore,
         triggerRoleId: config.triggerRoleId,
         run: {
-          coordinationConfig: {
-            storeAdapter: s3Adapter,
-            storeConfig: config.objectStore,
-            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-          },
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           concurrency: concurrencyRegistry,
           attachUrl: config.workspaceOpencodeUrl,
@@ -185,6 +274,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runTimeoutMs: config.runTimeoutMs,
           botUserId: client.user.id,
           logger,
+          approvalRegistry,
         },
         logger,
       }
@@ -204,24 +294,42 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         })
     })
 
-    // g. Start announce HTTP server (before shutdown handlers so the handle is available)
-    const serverHandle = deps.startAnnounceServer(
-      {
-        client,
-        logger,
-        isShuttingDown,
-      },
-      {
-        webhookSecret: config.webhookSecret,
-        presenceChannelId: config.presenceChannelId,
-        httpPort: config.httpPort,
-      },
-    )
+    // g. Start announce HTTP server (before shutdown handlers so the handle is available).
+    //    Announce endpoint is opt-in: only started when both GATEWAY_WEBHOOK_SECRET and
+    //    GATEWAY_PRESENCE_CHANNEL_ID are configured. When absent, serverHandle is undefined
+    //    and installShutdownHandlers skips server close (server param is already optional).
+    let serverHandle: CloseableServer | undefined
+    if (config.announce === undefined) {
+      logger.info({}, 'announce endpoint disabled — no announce secrets configured')
+    } else {
+      serverHandle = deps.startAnnounceServer(
+        {
+          client,
+          logger,
+          isShuttingDown,
+        },
+        {
+          webhookSecret: config.announce.webhookSecret,
+          presenceChannelId: config.announce.presenceChannelId,
+          httpPort: config.announce.httpPort,
+        },
+      )
+      logger.info({}, 'announce endpoint enabled — HTTP server started')
+    }
 
-    // h. Install shutdown handlers — drain in-flight mention runs before client.destroy()
-    installShutdownHandlers(client, logger, undefined, serverHandle, async () =>
-      Promise.all(inFlightRuns).then(() => {}),
-    )
+    // h. Install shutdown handlers — drain pending approvals fail-closed then await in-flight runs
+    installShutdownHandlers(client, logger, undefined, serverHandle, async () => {
+      // Dispose pending approvals before draining runs — ensures pending permissions
+      // fail-closed so in-flight runs don't hang waiting for a button that will never come.
+      //
+      // NOTE: disposeAll is best-effort early fail-close, NOT a hard barrier. A run still
+      // draining SSE could call register() for a late approval after disposeAll clears the
+      // map; that late entry is fail-closed only by the run's own coordinator.dispose() in
+      // its finally block. The per-run coordinator.dispose() is the authoritative backstop
+      // for approvals registered after this global drain.
+      await approvalRegistry.disposeAll('gateway shutdown')
+      await Promise.all(inFlightRuns)
+    })
 
     // i. Login
     yield* Effect.tryPromise({
@@ -235,13 +343,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     yield* Effect.tryPromise({
       try: async () =>
         recoverStaleRuns({
-          coordinationConfig: {
-            storeAdapter: s3Adapter,
-            storeConfig: config.objectStore,
-            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-          },
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           bindingsStore,
           resolveThread: async (threadId: string): Promise<SinkThread | null> => {

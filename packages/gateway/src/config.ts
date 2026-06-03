@@ -40,9 +40,16 @@ export interface GatewayConfig {
   readonly maxConcurrentRuns: number
   /** Maximum wall-clock milliseconds a single run may take before being aborted. */
   readonly runTimeoutMs: number
-  readonly webhookSecret: string
-  readonly presenceChannelId: string
-  readonly httpPort: number
+  /**
+   * Announce/presence endpoint configuration. Present only when both
+   * `GATEWAY_WEBHOOK_SECRET` and `GATEWAY_PRESENCE_CHANNEL_ID` are set.
+   * When absent, the announce HTTP server is not started.
+   */
+  readonly announce?: {
+    readonly webhookSecret: string
+    readonly presenceChannelId: string
+    readonly httpPort: number
+  }
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -358,13 +365,39 @@ export function loadGatewayConfig(): GatewayConfig {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }
 
-  const webhookSecret = readSecret('GATEWAY_WEBHOOK_SECRET')
-  const presenceChannelId = readSecret('GATEWAY_PRESENCE_CHANNEL_ID')
+  // Announce/presence endpoint — opt-in: both secrets must be set together, or neither.
+  // Mirrors the AWS credential pair-validation block above.
+  const gatewayWebhookSecret = readOptionalSecret('GATEWAY_WEBHOOK_SECRET')
+  const gatewayPresenceChannelId = readOptionalSecret('GATEWAY_PRESENCE_CHANNEL_ID')
 
-  const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
-  const httpPort = Number.parseInt(rawHttpPort, 10)
-  if (Number.isFinite(httpPort) === false || Number.isInteger(httpPort) === false || httpPort < 1 || httpPort > 65535) {
-    throw new Error(`Invalid GATEWAY_HTTP_PORT value: "${rawHttpPort}" (must be an integer in the range 1–65535)`)
+  if (gatewayWebhookSecret !== null && gatewayPresenceChannelId === null) {
+    throw new Error(
+      'Both GATEWAY_WEBHOOK_SECRET and GATEWAY_PRESENCE_CHANNEL_ID must be set together (received: GATEWAY_WEBHOOK_SECRET, missing: GATEWAY_PRESENCE_CHANNEL_ID). Set both to enable the announce endpoint, or set neither to disable it.',
+    )
+  }
+
+  if (gatewayPresenceChannelId !== null && gatewayWebhookSecret === null) {
+    throw new Error(
+      'Both GATEWAY_WEBHOOK_SECRET and GATEWAY_PRESENCE_CHANNEL_ID must be set together (received: GATEWAY_PRESENCE_CHANNEL_ID, missing: GATEWAY_WEBHOOK_SECRET). Set both to enable the announce endpoint, or set neither to disable it.',
+    )
+  }
+
+  let announce:
+    | {readonly webhookSecret: string; readonly presenceChannelId: string; readonly httpPort: number}
+    | undefined
+
+  if (gatewayWebhookSecret !== null && gatewayPresenceChannelId !== null) {
+    const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
+    const httpPort = Number.parseInt(rawHttpPort, 10)
+    if (
+      Number.isFinite(httpPort) === false ||
+      Number.isInteger(httpPort) === false ||
+      httpPort < 1 ||
+      httpPort > 65535
+    ) {
+      throw new Error(`Invalid GATEWAY_HTTP_PORT value: "${rawHttpPort}" (must be an integer in the range 1–65535)`)
+    }
+    announce = {webhookSecret: gatewayWebhookSecret, presenceChannelId: gatewayPresenceChannelId, httpPort}
   }
 
   return {
@@ -384,8 +417,6 @@ export function loadGatewayConfig(): GatewayConfig {
     triggerRoleId,
     maxConcurrentRuns,
     runTimeoutMs,
-    webhookSecret,
-    presenceChannelId,
-    httpPort,
+    ...(announce === undefined ? {} : {announce}),
   }
 }

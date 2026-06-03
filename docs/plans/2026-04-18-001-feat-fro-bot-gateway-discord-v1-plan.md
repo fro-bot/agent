@@ -5,8 +5,8 @@ status: active
 date: 2026-04-18
 origin: docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md
 reviewed: 2026-04-18
+revised: 2026-06-01 (Units 5-6 reconciled; remote-attach MVP) / 2026-05-20 (Units 1-4 shipped + deploy-readiness hardening)
 review_coverage: full (coherence + feasibility + scope-guardian, 3 reviewers)
-revised: 2026-05-20 (Units 1-4 shipped + deploy-readiness hardening; ready to start Unit 5)
 ---
 
 # feat: Fro Bot Gateway — Discord-first action-taking agent (v1)
@@ -33,7 +33,7 @@ Aligned with the brainstorm's R1-R11:
 
 - **R1-R2:** Action-taking agent reachable from Discord, with channel↔repo binding
 - **R3:** Session context shared across surfaces (read-only), resume is within-surface only, session content treated as untrusted input
-- **R4:** Local execution by default; cloud dispatch via `workflow_dispatch` when user requests
+- **R4:** Workspace-local execution by default via remote attach (OpenCode runs in the workspace container; gateway connects over HTTP/SSE); GitHub Action cloud dispatch via `workflow_dispatch` remains Unit 7.
 - **R5:** Middle-path sandbox containment (mitmproxy HTTP allowlist only; bind-mounted credentials as accepted-risk; no CoreDNS, no git-broker in v1)
 - **R6:** Role-based access via the `fro-bot` Discord role; `no-fro-bot` block role
 - **R7:** Self-hostable via `docker compose up`
@@ -69,9 +69,11 @@ v1 explicitly does NOT ship:
 - Full sachitv sandbox (CoreDNS + git-broker) — deferred to v1.1
 - Cross-surface session **resume** (only cross-surface **context access** via summaries bridge)
 
+**Shipped adjacent (not part of this plan's Unit 7 scope):** The announce webhook (`POST /v1/announce`, PR #697) shipped as adjacent gateway-daemon functionality. It is NOT part of the cloud-dispatch or summaries-bridge work planned in Unit 7.
+
 ### Deferred to Separate Tasks
 
-- **oMo / Systematic plugin installation path for the workspace container** — the workspace needs OpenCode + oMo + `@fro.bot/systematic` pre-installed or runtime-installed. v1 plan uses runtime install via the existing setup code; if that proves too slow, a subsequent PR can bake them into the image.
+- **oMo / Systematic plugin installation path for the workspace container** — the workspace needs OpenCode + oMo + `@fro.bot/systematic` pre-installed or runtime-installed. v1 plan uses runtime install via the existing setup code; if that proves too slow, a subsequent PR can bake them into the image. **RESOLVED:** the workspace executor image shipped in v0.50.0 (PR #725 image, #728 model/provider/auth provisioning, #730 tested helpers, #731 smoke-flake fix), baking OpenCode + Systematic with a CA-trust entrypoint. Runtime install fallback is no longer needed.
 - **Node.js version alignment between Action and gateway workspace** — Action already requires Node 24; workspace image uses Node 24. No divergence work needed in v1, but if the Action upgrades the gateway follows.
 - **RFC-018 agent-invokable delegated work tools** (in-process MCP tools for the OpenCode agent) — orthogonal; if shipped, integrates via the shared runtime package naturally.
 
@@ -679,7 +681,7 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [ ] **Unit 5: Channel-repo binding + `/fro-bot add-project`**
+- [x] **Unit 5: Channel-repo binding + `/fro-bot add-project`** (shipped across PR #672 bindings store, #673 GitHub App auth, #674 workspace-agent clone service, #676 `/fro-bot add-project` orchestration; hardened in PR #693/#695/#696, 2026-05-23→29)
 
 **Goal:** Implement S8 end-to-end. User runs `/fro-bot add-project url:<git-url> [channel:<name>]`, gateway authenticates to GitHub, clones into the workspace, creates (or reuses) a Discord channel, writes the binding record to S3. Handles partial failures cleanly (edge cases 2.1-2.4 from flow analysis).
 
@@ -742,13 +744,20 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 ---
 
-- [ ] **Unit 6: Local execution path + Discord UX (reactions, working message, queue, approval buttons)**
+- [x] **Unit 6: Mention execution loop MVP — remote-attach topology** (shipped in PR #705, 2026-05-30 — MVP uses remote-attach topology: OpenCode runs in the workspace container behind a bearer-token proxy, gateway connects over HTTP/SSE. The deployable workspace executor image landed separately in v0.50.0 via PR #725 image, #728 model/provider/auth provisioning, #730 tested helpers, #731 smoke-flake fix.)
 
-**Goal:** Connect the Discord surface to the runtime. `@fro-bot <message>` in a bound channel runs OpenCode against the local checkout, with full Discord UX: reactions, working-message heartbeat, tool-approval embeds, per-thread queue, within-surface session resume.
+**Goal** (original full scope — see the Unit 6 reconciliation block below for shipped vs. deferred): Connect the Discord surface to the runtime. `@fro-bot <message>` in a bound channel runs OpenCode against the local checkout, with full Discord UX: reactions, working-message heartbeat, tool-approval embeds, per-thread queue, within-surface session resume.
 
 **Requirements:** R1 (action-taking), R4 (local default), R9 (Discord-native UX), R11 (queue + lifecycle), S1-S6
 
 **Dependencies:** Unit 1 (runtime), Unit 2 (coordination), Unit 4 (gateway skeleton), Unit 5 (binding)
+
+**Unit 6 reconciliation (2026-06-01):**
+
+- **Shipped (MVP):** mention → thread creation → lock/run-state/heartbeat coordination → remote OpenCode attach (workspace container, bearer-token proxy, HTTP/SSE) → streamed Discord final output; trigger-role/ManageChannels authorization; failure-path partial-output flush.
+- **Not yet shipped (deferred from original Unit 6 scope):** tool-approval embeds/buttons + `permission.updated` handling (S5); reactions + working-message progress editor (R9); serial per-channel queue + `/clear-queue` (current behavior REJECTS concurrent same-channel runs rather than queueing, R11); `/review`, `/sessions`, `/resume`, `/approvals`, `/force-release-lock` commands (only `ping` + `add-project` are registered); reactions + working-message progress editor (R9).
+- **Dropped (won't-do):** `no-fro-bot` block role (R6) — redundant deny-list on top of the existing allow-list authorization model. The mention/approval gate already requires the trigger role or guild-level `ManageChannels`; excluding a user is done by not granting the trigger role, so a separate block role adds a second provisioning surface and a precedence question for no real gain.
+- **Shipped since:** tool-approval embeds/buttons + `permission.asked`/`permission.replied` handling (S5); gateway startup conditional-write self-test wiring (`validateProviderSemanticsEffect` now runs fail-fast at boot before `client.login`).
 
 **Files:**
 - Create: `packages/gateway/src/execute/local.ts` (orchestrates: acquire lock, create run-state, spawn OpenCode session in workspace, stream events → Discord)
@@ -817,6 +826,8 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 - Approval flow: trigger a tool that requires approval; click `Accept`; verify action executes. Click `Accept Always`; run again; verify no re-prompt. `/fro-bot approvals`; click revoke; run again; verify re-prompt
 
 ---
+
+> **Remaining open work (as of 2026-06-01):** Units 7 and 8 below are unstarted. Additionally, the deferred Unit 6 items listed in the reconciliation block above — approvals/reactions/queue/extra commands/block-role/self-test wiring — are open and should NOT be considered satisfied by the Unit 6 checkbox.
 
 - [ ] **Unit 7: Cloud dispatch + summaries bridge**
 

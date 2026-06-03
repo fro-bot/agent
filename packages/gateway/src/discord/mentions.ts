@@ -65,8 +65,10 @@ async function safeReply(message: Message, content: string): Promise<void> {
  * Uses `guild.members.fetch()` (REST call) — NOT `members.cache.get()` — to
  * guarantee correct resolution regardless of intent configuration.
  * Fails CLOSED: any resolution error returns `false`.
+ *
+ * Exported so program.ts can reuse the same auth gate for button interactions.
  */
-async function userIsAuthorized(
+export async function userIsAuthorized(
   guild: Guild,
   userId: string,
   triggerRoleId: string | null,
