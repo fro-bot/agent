@@ -36,7 +36,7 @@ FROM node:24.16.0-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-ARG OPENCODE_VERSION=1.14.41
+ARG OPENCODE_VERSION=1.15.13
 ARG SYSTEMATIC_VERSION=2.24.0
 
 # System packages:
