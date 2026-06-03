@@ -144,9 +144,11 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     triggerRoleId: null,
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
-    webhookSecret: 'test-webhook-secret',
-    presenceChannelId: 'test-presence-channel-id',
-    httpPort: 3000,
+    announce: {
+      webhookSecret: 'test-webhook-secret',
+      presenceChannelId: 'test-presence-channel-id',
+      httpPort: 3000,
+    },
     ...overrides,
   }
 }
@@ -324,6 +326,140 @@ describe('makeGatewayProgram', () => {
 
     // #then — login was NOT called (fail before connecting to Discord)
     expect(loginSpy).not.toHaveBeenCalled()
+  })
+
+  it('announce enabled: startAnnounceServer called once with announce secrets + httpPort', async () => {
+    // #given — config has announce present
+    const fakeConfig = makeFakeConfig({
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
+    })
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+    const startAnnounceServerSpy = vi.fn().mockReturnValue(fakeServerHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: startAnnounceServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — factory called exactly once
+    expect(startAnnounceServerSpy).toHaveBeenCalledOnce()
+
+    // #and — serverConfig carries the announce secrets and httpPort
+    const [, serverConfig] = startAnnounceServerSpy.mock.calls[0] as [
+      import('./http/server.js').AnnounceServerDeps,
+      import('./http/server.js').AnnounceServerConfig,
+    ]
+    expect(serverConfig.webhookSecret).toBe('test-webhook-secret')
+    expect(serverConfig.presenceChannelId).toBe('test-presence-channel-id')
+    expect(serverConfig.httpPort).toBe(3000)
+  })
+
+  it('announce enabled: logs "announce endpoint enabled" at boot', async () => {
+    // #given — config has announce present; spy on console.log (makeLogger writes JSON there)
+    const fakeConfig = makeFakeConfig({
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
+    })
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    try {
+      // #when
+      await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+      // #then — at least one console.log call contained the enabled message
+      const loggedMessages = consoleSpy.mock.calls.map(args => String(args[0]))
+      expect(loggedMessages.some(m => m.includes('announce endpoint enabled — HTTP server started'))).toBe(true)
+    } finally {
+      consoleSpy.mockRestore()
+    }
+  })
+
+  it('announce disabled: startAnnounceServer is NOT called when config.announce is undefined', async () => {
+    // #given — config has no announce block
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+    const startAnnounceServerSpy = vi.fn()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: startAnnounceServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — announce server was never started
+    expect(startAnnounceServerSpy).not.toHaveBeenCalled()
+  })
+
+  it('announce disabled: boot completes successfully and logs "announce endpoint disabled"', async () => {
+    // #given — config has no announce block; spy on console.log (makeLogger writes JSON there)
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    try {
+      // #when — must not throw
+      await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+      // #then — the disabled log line was emitted
+      const loggedMessages = consoleSpy.mock.calls.map(args => String(args[0]))
+      expect(loggedMessages.some(m => m.includes('announce endpoint disabled — no announce secrets configured'))).toBe(
+        true,
+      )
+    } finally {
+      consoleSpy.mockRestore()
+    }
+  })
+
+  it('announce disabled: client events (messageCreate/interactionCreate) are still wired', async () => {
+    // #given — config has no announce block
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — both Discord event handlers are registered regardless of announce state
+    const onCalls = (fakeClient.on as ReturnType<typeof vi.fn>).mock.calls as [string, unknown][]
+    const registeredEvents = onCalls.map(([event]) => event)
+    expect(registeredEvents).toContain('messageCreate')
+    expect(registeredEvents).toContain('interactionCreate')
   })
 })
 

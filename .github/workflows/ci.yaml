@@ -285,6 +285,53 @@ jobs:
             exit 1
           fi
           echo "OK: gateway reached config loading (DISCORD_TOKEN check), no module-resolution crash"
+      - name: Smoke-test gateway image — announce opt-out boots past config (issue # 738)
+        run: |
+          set +e
+          output="$(timeout 60s docker run --rm \
+            -e DISCORD_TOKEN=fake-token \
+            -e DISCORD_APPLICATION_ID=000000000000000000 \
+            -e S3_BUCKET=fake-bucket \
+            -e S3_REGION=us-east-1 \
+            -e GITHUB_APP_ID=000000 \
+            -e GITHUB_APP_PRIVATE_KEY=fake-key \
+            -e WORKSPACE_OPENCODE_TOKEN=fake-ws-token \
+            fro-bot-gateway:smoke 2>&1)"
+          status=$?
+          set -e
+          echo "--- docker run output ---"
+          echo "$output"
+          echo "--- exit status: $status ---"
+          if [ "$status" -eq 124 ]; then
+            echo "REGRESSION: gateway image hung on boot (timed out)"
+            exit 1
+          fi
+          # #738: with all core secrets present but announce secrets absent, config load
+          # must NOT fail on the announce secrets — the gateway must get PAST config load.
+          if echo "$output" | grep -q "Missing required secret: GATEWAY_WEBHOOK_SECRET"; then
+            echo "REGRESSION (#738): announce secret still required at config load"
+            exit 1
+          fi
+          if echo "$output" | grep -q "Missing required secret: GATEWAY_PRESENCE_CHANNEL_ID"; then
+            echo "REGRESSION (#738): announce secret still required at config load"
+            exit 1
+          fi
+          # Broader check: no required secret failed at all (catches any other required-secret regression)
+          if echo "$output" | grep -q "Missing required secret"; then
+            echo "FAIL: a required secret was missing — did not reach past config load"
+            exit 1
+          fi
+          if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
+            echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
+            exit 1
+          fi
+          # Positive proof: boot reached PAST config load — the provider self-test fires against
+          # the fake S3 and main.ts logs "gateway startup failed" then exits 1.
+          if ! echo "$output" | grep -q "gateway startup failed"; then
+            echo "FAIL: boot did not reach the expected post-config failure point (gateway startup failed not found)"
+            exit 1
+          fi
+          echo "OK: gateway booted PAST config load (announce disabled, #738 fixed) and reached the runtime self-test boundary"
 
   workspace-smoke:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
