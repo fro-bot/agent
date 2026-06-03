@@ -346,6 +346,10 @@ jobs:
         uses: ./.github/actions/setup
       - name: Run deploy/scripts unit tests
         run: node --test deploy/scripts/*.test.mjs
+      - name: Run mitmproxy allowlist tests
+        run: python3 deploy/mitmproxy/test_allowlist.py
+      - name: Check compose network topology invariants
+        run: bash deploy/validate-stack.sh --topology-only
       - name: Build workspace Docker image
         run: |
           for attempt in 1 2 3; do
