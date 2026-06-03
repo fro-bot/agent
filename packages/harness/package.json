@@ -1,0 +1,39 @@
+{
+  "name": "@fro.bot/harness",
+  "version": "0.0.0-development",
+  "description": "Published patched-OpenCode binary with orw-embedded LLM-merge integration — the default OpenCode for Fro Bot",
+  "keywords": [
+    "opencode",
+    "fro-bot",
+    "harness",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fro-bot/agent.git"
+  },
+  "license": "MIT",
+  "author": "Fro Bot <agent@fro.bot>",
+  "type": "module",
+  "bin": {
+    "harness": "./dist/cli.mjs"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/cli.ts --format esm --out-dir dist",
+    "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
+    "fix": "pnpm --dir ../.. exec eslint --fix packages/harness/src",
+    "lint": "pnpm --dir ../.. exec eslint packages/harness/src",
+    "test": "pnpm exec vitest run --passWithNoTests src"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
