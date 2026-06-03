@@ -1,4 +1,4 @@
-import type {CoordinationConfig} from '@fro-bot/runtime'
+import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
@@ -24,6 +24,22 @@ import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
+
+// ---------------------------------------------------------------------------
+// Pure helper — builds the coordination config from the shared S3 adapter and
+// gateway config. Extracted to avoid repeating the 5-field literal at every
+// call site (self-test, mention handler, stale-run recovery).
+// ---------------------------------------------------------------------------
+
+function makeCoordinationConfig(s3Adapter: ObjectStoreAdapter, config: GatewayConfig): CoordinationConfig {
+  return {
+    storeAdapter: s3Adapter,
+    storeConfig: config.objectStore,
+    lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+    staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — pino can replace this in a later unit.
@@ -128,13 +144,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
     // Provider semantics self-test — fail-fast before serving so a provider that doesn't honor
     // IfNoneMatch/IfMatch conditional writes can't silently corrupt the coordination lock.
-    const selfTestCoordConfig = {
-      storeAdapter: s3Adapter,
-      storeConfig: config.objectStore,
-      lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-      heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-      staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-    }
+    const selfTestCoordConfig = makeCoordinationConfig(s3Adapter, config)
     yield* Effect.tryPromise({
       try: async () => deps.runProviderSelfTest(selfTestCoordConfig, runtimeLogger),
       catch: error => (error instanceof Error ? error : new Error(String(error))),
@@ -256,13 +266,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         bindingsStore,
         triggerRoleId: config.triggerRoleId,
         run: {
-          coordinationConfig: {
-            storeAdapter: s3Adapter,
-            storeConfig: config.objectStore,
-            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-          },
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           concurrency: concurrencyRegistry,
           attachUrl: config.workspaceOpencodeUrl,
@@ -330,13 +334,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     yield* Effect.tryPromise({
       try: async () =>
         recoverStaleRuns({
-          coordinationConfig: {
-            storeAdapter: s3Adapter,
-            storeConfig: config.objectStore,
-            lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-            heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-            staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-          },
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           bindingsStore,
           resolveThread: async (threadId: string): Promise<SinkThread | null> => {
