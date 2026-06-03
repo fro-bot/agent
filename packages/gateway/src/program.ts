@@ -1,8 +1,10 @@
+import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
+import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import {
   createS3Adapter,
@@ -80,6 +82,12 @@ export interface GatewayProgramDeps {
    * Returns a CloseableServer handle that will be passed to installShutdownHandlers.
    */
   readonly startAnnounceServer: (deps: AnnounceServerDeps, config: AnnounceServerConfig) => CloseableServer
+  /**
+   * Provider semantics self-test — validates that the S3-compatible store honors
+   * IfNoneMatch/IfMatch conditional write semantics required for safe coordination.
+   * Injected so tests can stub it without touching the real S3 adapter.
+   */
+  readonly runProviderSelfTest: (config: CoordinationConfig, logger: CoordinationLogger) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +125,21 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     }
 
     const s3Adapter = createS3Adapter(config.objectStore, runtimeLogger)
+
+    // Provider semantics self-test — fail-fast before serving so a provider that doesn't honor
+    // IfNoneMatch/IfMatch conditional writes can't silently corrupt the coordination lock.
+    const selfTestCoordConfig = {
+      storeAdapter: s3Adapter,
+      storeConfig: config.objectStore,
+      lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+      heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+      staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+    }
+    yield* Effect.tryPromise({
+      try: async () => deps.runProviderSelfTest(selfTestCoordConfig, runtimeLogger),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
     const concurrencyRegistry = createConcurrencyRegistry(config.maxConcurrentRuns)
     const bindingsStore = createBindingsStore({
       adapter: s3Adapter,

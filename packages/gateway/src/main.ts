@@ -6,6 +6,7 @@ import {loadGatewayConfig} from './config.js'
 import {createAnnounceServer} from './http/server.js'
 import {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} from './program.js'
 import {setupReadinessFlag} from './readiness.js'
+import {validateProviderSemanticsEffect} from './runtime-effect.js'
 
 // ---------------------------------------------------------------------------
 // Main Effect program
@@ -26,6 +27,9 @@ const program = Effect.gen(function* () {
         await client.login(token)
       },
       startAnnounceServer: (serverDeps, serverConfig) => createAnnounceServer(serverDeps, serverConfig),
+      runProviderSelfTest: async (cc, lg) => {
+        await Effect.runPromise(validateProviderSemanticsEffect(cc, lg))
+      },
     },
     config,
   )
