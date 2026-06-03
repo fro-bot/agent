@@ -107,18 +107,6 @@
       allowedVersions: '<=1.15.13',
     },
     {
-      // Hold the workspace executor image's baked OpenCode at 1.14.41 until the
-      // gateway mention-loop tool-progress renderer (run-core.ts) migrates from
-      // session.next.tool.* to the 1.15.13 message.part.updated contract. The
-      // global cap above would otherwise let Renovate bump this ARG to 1.15.13
-      // and silently break gateway tool-progress rendering. Remove this rule as
-      // part of the gateway 1.15.13 cutover. Placed after the cap so it wins for
-      // this file.
-      matchPackageNames: ['anomalyco/opencode'],
-      matchFileNames: ['deploy/workspace.Dockerfile'],
-      allowedVersions: '<=1.14.41',
-    },
-    {
       matchUpdateTypes: ['lockFileMaintenance'],
       semanticCommitType: 'build',
     },

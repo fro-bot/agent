@@ -278,6 +278,33 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
         if (deltaText != null) sink.append(deltaText)
       }
+    } else if (eventType === 'message.part.updated') {
+      // OpenCode 1.15.13 contract: tool lifecycle arrives via message.part.updated
+      // (partType:'tool', state.status:'completed'). session.next.tool.called/success
+      // no longer fire on 1.15.13 — this branch handles the new contract.
+      const part = getObjectProperty(eventPayload, 'part')
+      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
+      if (eventSessionID === sessionId) {
+        const partType = getStringProperty(part, 'type')
+        if (partType === 'tool') {
+          // ONLY handle tool parts — text parts are streamed via message.part.delta.
+          const toolState = getObjectProperty(part, 'state')
+          if (getStringProperty(toolState, 'status') === 'completed') {
+            const tool = getStringProperty(part, 'tool') ?? ''
+            // Title resolution: state.title → input.title → bash command/cmd → tool name.
+            const stateTitle = getStringProperty(toolState, 'title')
+            const stateInput = getObjectProperty(toolState, 'input')
+            const title =
+              stateTitle ??
+              getStringProperty(stateInput, 'title') ??
+              (tool.toLowerCase() === 'bash'
+                ? String(getObjectProperty(stateInput, 'command') ?? getObjectProperty(stateInput, 'cmd') ?? tool)
+                : tool)
+            logger.debug({tool, title}, 'run-core: tool completed (message.part.updated)')
+            sink.append(`\n🔧 ${tool}: ${title}\n`)
+          }
+        }
+      }
     } else if (eventType === 'session.next.tool.called') {
       // V2 sync tool lifecycle: cache call info for correlation with success event.
       const eventSessionID = getEventSessionID(rawEvent)
