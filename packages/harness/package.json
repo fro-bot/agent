@@ -21,13 +21,15 @@
   "files": [
     "LICENSE",
     "README.md",
-    "dist"
+    "dist",
+    "provenance.json"
   ],
   "scripts": {
-    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/cli.ts --format esm --out-dir dist",
+    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown",
     "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
     "fix": "pnpm --dir ../.. exec eslint --fix packages/harness/src",
     "lint": "pnpm --dir ../.. exec eslint packages/harness/src",
+    "postinstall": "node dist/postinstall.mjs || true",
     "test": "pnpm exec vitest run --passWithNoTests src"
   },
   "engines": {
