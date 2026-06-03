@@ -964,8 +964,8 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.webhookSecret).toBe('test-webhook-secret')
-    expect(config.presenceChannelId).toBe('test-presence-channel-id')
+    expect(config.announce?.webhookSecret).toBe('test-webhook-secret')
+    expect(config.announce?.presenceChannelId).toBe('test-presence-channel-id')
     expect(config.httpPort).toBe(8080)
   })
 
@@ -981,22 +981,94 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     expect(config.httpPort).toBe(3000)
   })
 
-  it('error: GATEWAY_WEBHOOK_SECRET missing → throws "Missing required secret"', () => {
-    // #given
+  it('happy path (#738 regression): neither announce secret set → config.announce is undefined, no throw', () => {
+    // #given — announce secrets absent (the default deploy path that was crash-looping)
     setRequiredEnv()
     delete process.env.GATEWAY_WEBHOOK_SECRET
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
 
-    // #when / #then
-    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_WEBHOOK_SECRET')
+    // #when / #then — must NOT throw; announce is opt-in
+    let config: GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.announce).toBeUndefined()
   })
 
-  it('error: GATEWAY_PRESENCE_CHANNEL_ID missing → throws "Missing required secret"', () => {
+  it('happy path: both GATEWAY_WEBHOOK_SECRET and GATEWAY_PRESENCE_CHANNEL_ID set → config.announce has both values', () => {
     // #given
     setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = 'my-webhook-secret'
+    process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'my-channel-id'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.announce).toEqual({webhookSecret: 'my-webhook-secret', presenceChannelId: 'my-channel-id'})
+  })
+
+  it('error: only GATEWAY_WEBHOOK_SECRET set → throws both-or-neither error naming missing GATEWAY_PRESENCE_CHANNEL_ID', () => {
+    // #given — webhook present, presence absent
+    setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = 'my-webhook-secret'
     delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
 
     // #when / #then
-    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_PRESENCE_CHANNEL_ID')
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
+  })
+
+  it('error: only GATEWAY_PRESENCE_CHANNEL_ID set → throws both-or-neither error naming missing GATEWAY_WEBHOOK_SECRET', () => {
+    // #given — presence present, webhook absent
+    setRequiredEnv()
+    delete process.env.GATEWAY_WEBHOOK_SECRET
+    process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'my-channel-id'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('edge: empty GATEWAY_WEBHOOK_SECRET with valid GATEWAY_PRESENCE_CHANNEL_ID → both-or-neither error (empty = absent)', () => {
+    // #given — empty webhook secret is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = ''
+    process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'my-channel-id'
+
+    // #when / #then — empty secret cannot enable a half-configured announce endpoint
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('edge: whitespace-only GATEWAY_WEBHOOK_SECRET with valid GATEWAY_PRESENCE_CHANNEL_ID → both-or-neither error', () => {
+    // #given — whitespace-only is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = '   '
+    process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'my-channel-id'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('edge: _FILE variants honored — both via GATEWAY_WEBHOOK_SECRET_FILE / GATEWAY_PRESENCE_CHANNEL_ID_FILE → announce object built', () => {
+    // #given — both secrets provided via _FILE (the compose bind-mount pattern)
+    setRequiredEnv()
+    delete process.env.GATEWAY_WEBHOOK_SECRET
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
+    const webhookFile = join(tmpDir, 'webhook-secret-file.txt')
+    const channelFile = join(tmpDir, 'presence-channel-id-file.txt')
+    writeFileSync(webhookFile, 'file-webhook-secret\n', {mode: 0o600})
+    writeFileSync(channelFile, 'file-channel-id\n', {mode: 0o600})
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = webhookFile
+    process.env.GATEWAY_PRESENCE_CHANNEL_ID_FILE = channelFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — _FILE values are read and trimmed; announce object is built
+    expect(config.announce).toEqual({webhookSecret: 'file-webhook-secret', presenceChannelId: 'file-channel-id'})
   })
 
   it('edge: GATEWAY_HTTP_PORT = "0" → throws invalid port error', () => {
@@ -1163,7 +1235,7 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
   })
 
   it('edge: GATEWAY_WEBHOOK_SECRET_FILE with trailing newline → trimmed and accepted', () => {
-    // #given
+    // #given — webhook via _FILE, presence via env (both present → announce object built)
     setRequiredEnv()
     delete process.env.GATEWAY_WEBHOOK_SECRET
     const secretFile = join(tmpDir, 'webhook-secret.txt')
@@ -1173,7 +1245,8 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     // #when
     const config = loadGatewayConfig()
 
-    // #then trailing newline trimmed
-    expect(config.webhookSecret).toBe('file-webhook-secret')
+    // #then trailing newline trimmed; announce object built with both values
+    expect(config.announce?.webhookSecret).toBe('file-webhook-secret')
+    expect(config.announce?.presenceChannelId).toBe('test-presence-channel-id')
   })
 })
