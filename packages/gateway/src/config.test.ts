@@ -966,11 +966,11 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     // #then
     expect(config.announce?.webhookSecret).toBe('test-webhook-secret')
     expect(config.announce?.presenceChannelId).toBe('test-presence-channel-id')
-    expect(config.httpPort).toBe(8080)
+    expect(config.announce?.httpPort).toBe(8080)
   })
 
   it('happy path: GATEWAY_HTTP_PORT unset → httpPort defaults to 3000', () => {
-    // #given
+    // #given — announce secrets present so httpPort is read
     setRequiredEnv()
     // GATEWAY_HTTP_PORT not set
 
@@ -978,7 +978,7 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.httpPort).toBe(3000)
+    expect(config.announce?.httpPort).toBe(3000)
   })
 
   it('happy path (#738 regression): neither announce secret set → config.announce is undefined, no throw', () => {
@@ -1004,30 +1004,34 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     // #when
     const config = loadGatewayConfig()
 
-    // #then
-    expect(config.announce).toEqual({webhookSecret: 'my-webhook-secret', presenceChannelId: 'my-channel-id'})
+    // #then — announce includes httpPort (defaults to 3000 when GATEWAY_HTTP_PORT unset)
+    expect(config.announce).toEqual({
+      webhookSecret: 'my-webhook-secret',
+      presenceChannelId: 'my-channel-id',
+      httpPort: 3000,
+    })
   })
 
-  it('error: only GATEWAY_WEBHOOK_SECRET set → throws both-or-neither error naming missing GATEWAY_PRESENCE_CHANNEL_ID', () => {
+  it('error: only GATEWAY_WEBHOOK_SECRET set → throws both-or-neither error naming received and missing vars', () => {
     // #given — webhook present, presence absent
     setRequiredEnv()
     process.env.GATEWAY_WEBHOOK_SECRET = 'my-webhook-secret'
     delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
 
-    // #when / #then
-    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
-    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
+    // #when / #then — error must name the received var and the missing var directionally
+    expect(() => loadGatewayConfig()).toThrow('received: GATEWAY_WEBHOOK_SECRET')
+    expect(() => loadGatewayConfig()).toThrow('missing: GATEWAY_PRESENCE_CHANNEL_ID')
   })
 
-  it('error: only GATEWAY_PRESENCE_CHANNEL_ID set → throws both-or-neither error naming missing GATEWAY_WEBHOOK_SECRET', () => {
+  it('error: only GATEWAY_PRESENCE_CHANNEL_ID set → throws both-or-neither error naming received and missing vars', () => {
     // #given — presence present, webhook absent
     setRequiredEnv()
     delete process.env.GATEWAY_WEBHOOK_SECRET
     process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'my-channel-id'
 
-    // #when / #then
-    expect(() => loadGatewayConfig()).toThrow('GATEWAY_WEBHOOK_SECRET')
-    expect(() => loadGatewayConfig()).toThrow('GATEWAY_PRESENCE_CHANNEL_ID')
+    // #when / #then — error must name the received var and the missing var directionally
+    expect(() => loadGatewayConfig()).toThrow('received: GATEWAY_PRESENCE_CHANNEL_ID')
+    expect(() => loadGatewayConfig()).toThrow('missing: GATEWAY_WEBHOOK_SECRET')
   })
 
   it('edge: empty GATEWAY_WEBHOOK_SECRET with valid GATEWAY_PRESENCE_CHANNEL_ID → both-or-neither error (empty = absent)', () => {
@@ -1067,12 +1071,16 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     // #when
     const config = loadGatewayConfig()
 
-    // #then — _FILE values are read and trimmed; announce object is built
-    expect(config.announce).toEqual({webhookSecret: 'file-webhook-secret', presenceChannelId: 'file-channel-id'})
+    // #then — _FILE values are read and trimmed; announce object is built (httpPort defaults to 3000)
+    expect(config.announce).toEqual({
+      webhookSecret: 'file-webhook-secret',
+      presenceChannelId: 'file-channel-id',
+      httpPort: 3000,
+    })
   })
 
-  it('edge: GATEWAY_HTTP_PORT = "0" → throws invalid port error', () => {
-    // #given
+  it('edge: GATEWAY_HTTP_PORT = "0" → throws invalid port error (announce secrets set)', () => {
+    // #given — announce secrets must be set so httpPort is actually read+validated
     setRequiredEnv()
     process.env.GATEWAY_HTTP_PORT = '0'
 
@@ -1080,8 +1088,8 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_HTTP_PORT value: "0"')
   })
 
-  it('edge: GATEWAY_HTTP_PORT = "70000" → throws invalid port error', () => {
-    // #given
+  it('edge: GATEWAY_HTTP_PORT = "70000" → throws invalid port error (announce secrets set)', () => {
+    // #given — announce secrets must be set so httpPort is actually read+validated
     setRequiredEnv()
     process.env.GATEWAY_HTTP_PORT = '70000'
 
@@ -1089,8 +1097,8 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_HTTP_PORT value: "70000"')
   })
 
-  it('edge: GATEWAY_HTTP_PORT = "abc" → throws invalid port error', () => {
-    // #given
+  it('edge: GATEWAY_HTTP_PORT = "abc" → throws invalid port error (announce secrets set)', () => {
+    // #given — announce secrets must be set so httpPort is actually read+validated
     setRequiredEnv()
     process.env.GATEWAY_HTTP_PORT = 'abc'
 
@@ -1099,7 +1107,7 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
   })
 
   it('edge: GATEWAY_HTTP_PORT = "1" → accepted (boundary, minimum port)', () => {
-    // #given
+    // #given — announce secrets present so httpPort is read
     setRequiredEnv()
     process.env.GATEWAY_HTTP_PORT = '1'
 
@@ -1107,11 +1115,11 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.httpPort).toBe(1)
+    expect(config.announce?.httpPort).toBe(1)
   })
 
   it('edge: GATEWAY_HTTP_PORT = "65535" → accepted (boundary, maximum port)', () => {
-    // #given
+    // #given — announce secrets present so httpPort is read
     setRequiredEnv()
     process.env.GATEWAY_HTTP_PORT = '65535'
 
@@ -1119,7 +1127,22 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.httpPort).toBe(65535)
+    expect(config.announce?.httpPort).toBe(65535)
+  })
+
+  it('regression (#738-adjacent): announce secrets absent + invalid GATEWAY_HTTP_PORT → no throw, config.announce is undefined', () => {
+    // #given — no announce secrets; invalid port value that would have crashed boot before this fix
+    setRequiredEnv()
+    delete process.env.GATEWAY_WEBHOOK_SECRET
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
+    process.env.GATEWAY_HTTP_PORT = '999999'
+
+    // #when / #then — must NOT throw; httpPort is only read when announce is enabled
+    let config: GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.announce).toBeUndefined()
   })
 
   // ---------------------------------------------------------------------------

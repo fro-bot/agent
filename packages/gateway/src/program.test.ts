@@ -147,8 +147,8 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     announce: {
       webhookSecret: 'test-webhook-secret',
       presenceChannelId: 'test-presence-channel-id',
+      httpPort: 3000,
     },
-    httpPort: 3000,
     ...overrides,
   }
 }
@@ -331,7 +331,7 @@ describe('makeGatewayProgram', () => {
   it('announce enabled: startAnnounceServer called once with announce secrets + httpPort', async () => {
     // #given — config has announce present
     const fakeConfig = makeFakeConfig({
-      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id'},
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
     })
     const fakeClient = makeFakeClient()
     const fakeServerHandle = makeFakeServerHandle()
@@ -364,7 +364,7 @@ describe('makeGatewayProgram', () => {
   it('announce enabled: logs "announce endpoint enabled" at boot', async () => {
     // #given — config has announce present; spy on console.log (makeLogger writes JSON there)
     const fakeConfig = makeFakeConfig({
-      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id'},
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
     })
     const fakeClient = makeFakeClient()
     const fakeServerHandle = makeFakeServerHandle()

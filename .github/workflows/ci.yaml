@@ -316,11 +316,22 @@ jobs:
             echo "REGRESSION (#738): announce secret still required at config load"
             exit 1
           fi
+          # Broader check: no required secret failed at all (catches any other required-secret regression)
+          if echo "$output" | grep -q "Missing required secret"; then
+            echo "FAIL: a required secret was missing — did not reach past config load"
+            exit 1
+          fi
           if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
-          echo "OK: gateway booted past config load with announce disabled (#738 fixed)"
+          # Positive proof: boot reached PAST config load — the provider self-test fires against
+          # the fake S3 and main.ts logs "gateway startup failed" then exits 1.
+          if ! echo "$output" | grep -q "gateway startup failed"; then
+            echo "FAIL: boot did not reach the expected post-config failure point (gateway startup failed not found)"
+            exit 1
+          fi
+          echo "OK: gateway booted PAST config load (announce disabled, #738 fixed) and reached the runtime self-test boundary"
 
   workspace-smoke:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}

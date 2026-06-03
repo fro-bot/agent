@@ -48,8 +48,8 @@ export interface GatewayConfig {
   readonly announce?: {
     readonly webhookSecret: string
     readonly presenceChannelId: string
+    readonly httpPort: number
   }
-  readonly httpPort: number
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -382,15 +382,22 @@ export function loadGatewayConfig(): GatewayConfig {
     )
   }
 
-  const announce =
-    gatewayWebhookSecret !== null && gatewayPresenceChannelId !== null
-      ? {webhookSecret: gatewayWebhookSecret, presenceChannelId: gatewayPresenceChannelId}
-      : undefined
+  let announce:
+    | {readonly webhookSecret: string; readonly presenceChannelId: string; readonly httpPort: number}
+    | undefined
 
-  const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
-  const httpPort = Number.parseInt(rawHttpPort, 10)
-  if (Number.isFinite(httpPort) === false || Number.isInteger(httpPort) === false || httpPort < 1 || httpPort > 65535) {
-    throw new Error(`Invalid GATEWAY_HTTP_PORT value: "${rawHttpPort}" (must be an integer in the range 1–65535)`)
+  if (gatewayWebhookSecret !== null && gatewayPresenceChannelId !== null) {
+    const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
+    const httpPort = Number.parseInt(rawHttpPort, 10)
+    if (
+      Number.isFinite(httpPort) === false ||
+      Number.isInteger(httpPort) === false ||
+      httpPort < 1 ||
+      httpPort > 65535
+    ) {
+      throw new Error(`Invalid GATEWAY_HTTP_PORT value: "${rawHttpPort}" (must be an integer in the range 1–65535)`)
+    }
+    announce = {webhookSecret: gatewayWebhookSecret, presenceChannelId: gatewayPresenceChannelId, httpPort}
   }
 
   return {
@@ -411,6 +418,5 @@ export function loadGatewayConfig(): GatewayConfig {
     maxConcurrentRuns,
     runTimeoutMs,
     ...(announce === undefined ? {} : {announce}),
-    httpPort,
   }
 }

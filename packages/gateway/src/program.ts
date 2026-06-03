@@ -311,7 +311,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         {
           webhookSecret: config.announce.webhookSecret,
           presenceChannelId: config.announce.presenceChannelId,
-          httpPort: config.httpPort,
+          httpPort: config.announce.httpPort,
         },
       )
       logger.info({}, 'announce endpoint enabled — HTTP server started')
