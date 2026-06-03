@@ -276,6 +276,14 @@ services:
       # to the exact bucket host(s) your deployment uses. If unset or empty,
       # all S3/R2 traffic is blocked (fail-closed default).
       OBJECT_STORE_HOSTS: ${OBJECT_STORE_HOSTS:-}
+      # Comma-separated list of additional exact egress hosts to allow through
+      # the proxy (e.g. a self-hosted OpenCode proxy: "cliproxy.fro.bot").
+      # Use this as an escape hatch for explicitly-justified workspace egress
+      # hosts only — not as a general allowlist. If unset or empty, no extra
+      # hosts are added (fail-closed default). Hosts are validated at import
+      # time (wildcard/private-IP/port reject) and at connect time (DNS-rebinding
+      # resolved-IP check). A malformed value prevents proxy startup.
+      WORKSPACE_EGRESS_HOSTS: ${WORKSPACE_EGRESS_HOSTS:-}
     volumes:
       - ./mitmproxy/allowlist.py:/scripts/allowlist.py:ro
       # Named volume: mitmproxy writes CA here; gateway/workspace read it for trust

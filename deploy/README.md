@@ -287,7 +287,11 @@ WORKSPACE_OPENCODE_CONFIG={"provider":{"anthropic":{"options":{"baseURL":"https:
 echo -n '{"anthropic":{"type":"api","key":"<cliproxy-token>"},"openai":{"type":"api","key":"<cliproxy-token>"}}' > deploy/secrets/workspace-opencode-auth
 ```
 
-Add the proxy host to the egress allowlist (`OBJECT_STORE_HOSTS` is S3-only; provider hosts are covered by the static allowlist — add your cliproxyapi host there if it is not already permitted).
+Add the proxy host to the egress allowlist using `WORKSPACE_EGRESS_HOSTS` (see [Egress Allowlist](#egress-allowlist)):
+
+```env
+WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot
+```
 
 Leave both variables unset for a clone-only deployment: the workspace boots and serves `/clone`, but the mention loop has no model until they are configured.
 
@@ -376,3 +380,43 @@ OBJECT_STORE_HOSTS=my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.co
 If `OBJECT_STORE_HOSTS` is unset or empty, all S3/R2 traffic is blocked (fail-closed default). This prevents workspace processes from exfiltrating data to attacker-controlled buckets in those clouds.
 
 Set the variable in your `.env` file or `compose.override.yaml` (see `compose.override.example.yaml` for an example).
+
+### Additional workspace egress hosts
+
+`WORKSPACE_EGRESS_HOSTS` is an escape hatch for workspace egress hosts that are not covered by the static allowlist and are not object-store buckets. Use it for explicitly-justified hosts only — for example, a self-hosted OpenCode proxy:
+
+```
+WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot
+```
+
+Multiple hosts are comma-separated:
+
+```
+WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot,proxy2.example.com
+```
+
+**Validation rules** (same as `OBJECT_STORE_HOSTS`):
+
+- Wildcards (`*.example.com`) are rejected.
+- IP literals that are private, loopback, link-local, or otherwise reserved (`10.x`, `127.x`, `169.254.x`, `::1`, etc.) are rejected at import time.
+- Hosts with a port suffix (`host:443`) are rejected.
+- Invalid hostnames (leading/trailing/consecutive dots) are rejected.
+- At connect time, operator-supplied hosts are also resolved via DNS and rejected with 403 if any resolved address is private, loopback, link-local, or reserved (DNS-rebinding defense). Resolution failure is treated as a block (fail-closed).
+- A malformed value prevents proxy startup entirely (fail-closed).
+
+If `WORKSPACE_EGRESS_HOSTS` is unset or empty, no extra hosts are added (fail-closed default).
+
+**Do not use `WORKSPACE_EGRESS_HOSTS` as a general allowlist.** It is intended for a small number of explicitly-justified hosts (e.g. a self-hosted model proxy). Accumulating unrelated hosts here defeats the purpose of the allowlist. If a host is needed by all deployments, it belongs in the static `ALLOWLIST` in `deploy/mitmproxy/allowlist.py`.
+
+### Egress topology
+
+The containment model is:
+
+```
+workspace → sandbox-net (internal:true) → mitmproxy → egress-net → internet
+```
+
+- `sandbox-net` is `internal: true` — no container on this network has a host gateway or direct internet access.
+- The workspace is attached to `sandbox-net` only. It has zero direct egress.
+- mitmproxy is dual-homed: it receives workspace traffic on `sandbox-net` and dials allowlisted upstream hosts via `egress-net` (a dedicated non-internal network). Only mitmproxy joins `egress-net`.
+- The gateway is dual-homed on `gateway-net` (external) and `sandbox-net`; its Discord/S3 traffic does not route through mitmproxy.
