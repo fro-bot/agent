@@ -100,6 +100,15 @@ touch deploy/secrets/workspace-opencode-auth
 touch deploy/secrets/gateway-trigger-role-id
 # echo -n 'YOUR_ROLE_ID' > deploy/secrets/gateway-trigger-role-id
 
+# Optional — announce/presence endpoint (opt-in). The gateway exposes an
+# HMAC-verified POST /v1/announce presence webhook ONLY when BOTH of these are
+# set; set NEITHER to leave it disabled (the default). Setting exactly one
+# causes a fail-fast both-or-neither startup error. To enable, create both
+# secrets AND uncomment the matching env entries + bind-mounts in compose.yaml:
+#
+# openssl rand -hex 32 > deploy/secrets/gateway-webhook-secret
+# echo -n 'YOUR_PRESENCE_CHANNEL_ID' > deploy/secrets/gateway-presence-channel-id
+
 # GitHub App credentials (required — see "GitHub App" section below)
 echo -n 'YOUR_GITHUB_APP_ID'          > deploy/secrets/github-app-id
 cp ~/Downloads/your-app.private-key.pem deploy/secrets/github-app-private-key
@@ -296,7 +305,7 @@ WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"default":"ask
 ### Permission modes
 
 | Mode | Behaviour |
-| ---- | --------- |
+| --- | --- |
 | `allow` (default) | Tool runs immediately; no Discord prompt. |
 | `ask` | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
 | `deny` | Tool is always blocked; no prompt. |

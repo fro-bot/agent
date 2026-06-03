@@ -26,7 +26,7 @@ The maintainer decision (per triage) is to make the endpoint **optional** rather
 - R3. When exactly one of the two is present, the gateway fails fast at config load with a clear both-or-neither error (no half-configured announce server).
 - R4. When the announce endpoint is disabled, the gateway does not start the HTTP server and shutdown handling tolerates the absent server handle.
 - R5. `deploy/compose.yaml` and `deploy/README.md` document the two optional secrets and how to enable the announce endpoint, consistent with the existing optional-secret file pattern.
-- R6. CI proves the gateway image boots in **both** the no-announce-secrets (announce disabled) and with-announce-secrets (announce enabled, server starts) configurations, and still fails fast on a genuinely-missing core secret.
+- R6. CI proves (a) the no-secrets case still fails fast on a missing core secret, and (b) with core secrets present and announce absent, config load gets past the announce check (#738 fixed); the enabled announce path is covered by `packages/gateway/src/http/server.test.ts` integration tests.
 
 ## Scope Boundaries
 
@@ -162,24 +162,27 @@ The maintainer decision (per triage) is to make the endpoint **optional** rather
 
 **Approach:**
 - `deploy/compose.yaml`: document the two announce secrets as **opt-in** in the `gateway` service — add commented-out `GATEWAY_WEBHOOK_SECRET_FILE` / `GATEWAY_PRESENCE_CHANNEL_ID_FILE` env entries and commented-out bind-mounts mirroring the `GATEWAY_TRIGGER_ROLE_ID` pattern (`create_host_path: false`), with a comment that uncommenting both enables the announce endpoint. The default (commented) state must boot cleanly.
-- `deploy/README.md`: add an "Enabling the announce/presence endpoint (optional)" subsection — both secrets are required together if you enable it; show the `openssl rand -hex 32 > deploy/secrets/gateway-webhook-secret` and presence-channel-id creation steps and the uncomment instructions. Note the both-or-neither rule.
-- `.github/workflows/ci.yaml`: the existing `Gateway Image Smoke Test` (step "Smoke-test gateway image", ~line 268) runs `docker run` with **zero** env secrets and asserts `grep -q "Missing required secret: DISCORD_TOKEN"`. `DISCORD_TOKEN` is read first in `loadGatewayConfig`, so the gateway throws before it ever reaches the announce secrets — the existing assertion is **not** testing announce and stays **valid unchanged**. The change is **additive**: add two new smoke invocations (or steps):
-  1. **Boot-disabled case:** supply all required core secrets (every `readSecret` call in config.ts — `DISCORD_TOKEN`, `DISCORD_APPLICATION_ID`, `S3_BUCKET`, `S3_REGION`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `WORKSPACE_OPENCODE_TOKEN`) but **omit** `GATEWAY_WEBHOOK_SECRET` and `GATEWAY_PRESENCE_CHANNEL_ID` → assert the gateway reaches a healthy/running state with the announce endpoint disabled (assert the "announce disabled" boot log line). This is the #738 default-deploy proof.
-  2. **Boot-enabled case:** supply the core secrets **plus** `GATEWAY_WEBHOOK_SECRET` + `GATEWAY_PRESENCE_CHANNEL_ID` → assert the gateway boots AND the real announce server starts (assert the "announce enabled" / server-listening log line). This closes the adversarial + security gap that Unit 2 only mocks `startAnnounceServer` — the enabled path proves the real `createAnnounceServer` wiring survives the config reshape.
+- `deploy/README.md`: add an opt-in announce subsection in the "Create secrets" section — both secrets are required together if you enable it; show the `openssl rand -hex 32 > deploy/secrets/gateway-webhook-secret` and presence-channel-id creation steps and the uncomment instructions. Note the both-or-neither rule.
+- `.github/workflows/ci.yaml`: the existing `Gateway Image Smoke Test` (step "Smoke-test gateway image") runs `docker run` with **zero** env secrets and asserts `grep -q "Missing required secret: DISCORD_TOKEN"`. `DISCORD_TOKEN` is read first in `loadGatewayConfig`, so the gateway throws before it ever reaches the announce secrets — the existing assertion is **not** testing announce and stays **valid unchanged**. The change is **additive** (Option A — minimal Docker smoke):
+
+  **Implementation-time discovery:** The gateway boot order is: config-load → `runProviderSelfTest` (a real S3 conditional-write round-trip, added in PR #739) → `registerSlashCommands` → announce enabled/disabled log → login. A Docker container with core secrets but no reachable S3 dies at the self-test and never reaches the announce log. Therefore we CANNOT cheaply assert "announce boots" in the Docker smoke — the full boot-proof would need MinIO + a Discord stub, out of scope for this fix.
+
+  The enabled announce path (real `createAnnounceServer` + route + bad-signature→401 rejection) is already proven by the existing `packages/gateway/src/http/server.test.ts` vitest integration tests. The Docker smoke only needs to guard the literal #738 regression.
+
+  **Additive CI step (Option A):** Add ONE new step proving that with all core secrets present (fake values) but announce secrets absent, config load does NOT emit `"Missing required secret: GATEWAY_WEBHOOK_SECRET"` or `"Missing required secret: GATEWAY_PRESENCE_CHANNEL_ID"` — i.e. the gateway gets PAST config load. The container will subsequently die at the S3 self-test (expected), but config load itself succeeds.
 
 **Patterns to follow:**
 - `deploy/compose.yaml` `GATEWAY_TRIGGER_ROLE_ID` env + bind-mount + `create_host_path: false`.
-- `deploy/README.md` existing "When adding a new optional secret" migration section.
+- `deploy/README.md` existing optional-secret commented-bash-example style.
 - The existing `Gateway Image Smoke Test` job structure in `.github/workflows/ci.yaml`.
 
 **Test scenarios:**
 - Test expectation: none for compose/README (declarative deploy config + docs). CI smoke changes are the executable proof.
 - CI smoke — **no-secrets fail-fast (existing, unchanged):** zero env secrets → gateway throws `Missing required secret: DISCORD_TOKEN`.
-- CI smoke — **core-only boot-disabled (new):** all required core secrets supplied, announce secrets omitted → gateway reaches running/healthy state with announce endpoint disabled (assert the "announce disabled" boot log line).
-- CI smoke — **core+announce boot-enabled (new):** core secrets + `GATEWAY_WEBHOOK_SECRET` + `GATEWAY_PRESENCE_CHANNEL_ID` → gateway boots AND the real announce server starts (assert the "announce enabled" / server-listening log line).
+- CI smoke — **core-only config-load-passes (new, Option A):** all required core secrets supplied (fake values), announce secrets omitted → config load does NOT emit `Missing required secret: GATEWAY_WEBHOOK_SECRET` or `GATEWAY_PRESENCE_CHANNEL_ID`; the gateway gets past config load (the literal #738 regression guard). Container exits non-zero at the S3 self-test — that is expected and not asserted against.
 
 **Verification:**
-- `docker compose config` is valid; the documented default deploy path boots without announce secrets; the `Gateway Image Smoke Test` proves all three smoke states: no-secrets fail-fast, core-only boot-disabled, and core+announce boot-enabled.
+- `docker compose config` is valid; the documented default deploy path boots without announce secrets; the `Gateway Image Smoke Test` proves: (a) no-secrets fail-fast on a missing core secret, and (b) with core secrets present and announce absent, config load gets past the announce check (#738 fixed). The enabled announce path is covered by `packages/gateway/src/http/server.test.ts` integration tests.
 
 ## System-Wide Impact
 
