@@ -1,25 +1,82 @@
 /**
- * Provenance shape for the harness binary.
+ * Provenance manifest for the harness binary.
  *
- * baseVersion    — the upstream OpenCode release tag this binary is based on.
- * integrationRefs — ordered list of integration refs carried onto the base tag
- *                   (PR URLs, branch URLs, or local branch names).
- * integrationCommit — the frozen integration commit SHA produced by the LLM merge,
- *                     or null when running from a dev/unbuilt scaffold.
- * buildSha       — the git SHA of the harness build, or 'dev' in the scaffold.
+ * The manifest is the single source of truth written by the integration engine
+ * and read by the CLI commands (info, patches, doctor).
+ *
+ * baseVersion       — the upstream OpenCode release tag this binary is based on.
+ * integrationRefs   — ordered list of integration refs carried onto the base tag,
+ *                     each with the resolved commit SHA and optional metadata.
+ * integrationCommit — the frozen integration commit SHA produced by the LLM merge.
+ * buildSha          — the git SHA of the harness build, or 'dev' in the scaffold.
  */
+import {readFileSync} from 'node:fs'
+import path from 'node:path'
+import {fileURLToPath} from 'node:url'
+
+export interface IntegrationRefRecord {
+  readonly ref: string
+  readonly resolvedSha: string
+  readonly reason?: string
+  readonly upstreamStatus?: string
+}
+
 export interface Provenance {
   readonly baseVersion: string
-  readonly integrationRefs: readonly string[]
+  readonly integrationRefs: readonly IntegrationRefRecord[]
   readonly integrationCommit: string | null
   readonly buildSha: string
 }
 
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
 /**
- * Returns the placeholder dev provenance used before Unit 2/3 wire the real manifest.
- * Unit 2 replaces this with a manifest read from a generated provenance.json at build time.
+ * Returns the provenance for the current harness binary.
+ *
+ * Resolution order:
+ *   1. Bundled provenance.json (written by the integration engine at build time).
+ *   2. harness.config.json (dev scaffold — shows configured refs without a frozen commit).
+ *   3. Hardcoded dev placeholder (no config file present).
+ *
+ * Unit 3 generates a provenance.json at build time that this function reads,
+ * making the manifest available at runtime without filesystem reads in production.
  */
 export function getProvenance(): Provenance {
+  // 1. Try bundled provenance.json (written by the integration engine).
+  try {
+    const manifestPath = path.join(packageRoot, 'provenance.json')
+    const raw = readFileSync(manifestPath, 'utf8')
+    const manifest = JSON.parse(raw) as Provenance
+    if (manifest !== null && typeof manifest === 'object' && typeof manifest.baseVersion === 'string') {
+      return manifest
+    }
+  } catch {
+    // No bundled manifest — fall through.
+  }
+
+  // 2. Fall back to harness.config.json for the dev scaffold.
+  try {
+    const configPath = path.join(packageRoot, 'harness.config.json')
+    const raw = readFileSync(configPath, 'utf8')
+    const cfg = JSON.parse(raw) as {
+      base_version?: string
+      integrationRefs?: string[]
+    }
+    const baseVersion = cfg.base_version ?? '1.15.13'
+    const integrationRefs: IntegrationRefRecord[] = (cfg.integrationRefs ?? []).map(ref => ({
+      ref,
+      resolvedSha: 'dev',
+    }))
+    return {
+      baseVersion,
+      integrationRefs,
+      integrationCommit: null,
+      buildSha: 'dev',
+    }
+  } catch {
+    // No config file — return hardcoded placeholder.
+  }
+
   return {
     baseVersion: '1.15.13',
     integrationRefs: [],
@@ -40,8 +97,12 @@ export function formatProvenance(p: Provenance): string {
   ]
   if (p.integrationRefs.length > 0) {
     lines.push(`  integration refs:`)
-    for (const ref of p.integrationRefs) {
-      lines.push(`    - ${ref}`)
+    for (const r of p.integrationRefs) {
+      const meta = r.upstreamStatus === undefined ? '' : ` [${r.upstreamStatus}]`
+      lines.push(`    - ${r.ref}${meta}`)
+      if (r.reason !== undefined) {
+        lines.push(`      reason: ${r.reason}`)
+      }
     }
   } else {
     lines.push(`  integration refs:   (none — dev scaffold)`)

@@ -41,12 +41,16 @@ function cmdInfo(): void {
 function cmdPatches(): void {
   const p = getProvenance()
   if (p.integrationRefs.length === 0) {
-    console.log('No integration refs configured (dev scaffold — Unit 2 wires the real manifest).')
+    console.log('No integration refs configured (dev scaffold).')
     return
   }
   console.log('Integration refs:')
-  for (const ref of p.integrationRefs) {
-    console.log(`  - ${ref}`)
+  for (const r of p.integrationRefs) {
+    const status = r.upstreamStatus === undefined ? '' : ` [${r.upstreamStatus}]`
+    console.log(`  - ${r.ref}${status}`)
+    if (r.reason !== undefined) {
+      console.log(`    reason: ${r.reason}`)
+    }
   }
   if (p.integrationCommit !== null) {
     console.log(`\nFrozen integration commit: ${p.integrationCommit}`)

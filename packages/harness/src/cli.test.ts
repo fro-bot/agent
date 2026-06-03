@@ -1,3 +1,4 @@
+import type {Provenance} from './provenance.js'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 import {formatProvenance, getProvenance} from './provenance.js'
@@ -6,13 +7,13 @@ import {probeBinary, resolveBinary} from './resolve-binary.js'
 // #region provenance
 
 describe('getProvenance', () => {
-  it('returns a valid dev-scaffold provenance', () => {
+  it('returns a valid provenance with base version', () => {
     // #given / #when
     const p = getProvenance()
 
     // #then
     expect(p.baseVersion).toBe('1.15.13')
-    expect(p.integrationRefs).toEqual([])
+    expect(Array.isArray(p.integrationRefs)).toBe(true)
     expect(p.integrationCommit).toBeNull()
     expect(p.buildSha).toBe('dev')
   })
@@ -20,8 +21,13 @@ describe('getProvenance', () => {
 
 describe('formatProvenance', () => {
   it('includes base version and dev-scaffold markers', () => {
-    // #given
-    const p = getProvenance()
+    // #given — use a known provenance object, not the live config-reading one
+    const p: Provenance = {
+      baseVersion: '1.15.13',
+      integrationRefs: [],
+      integrationCommit: null,
+      buildSha: 'dev',
+    }
 
     // #when
     const output = formatProvenance(p)
@@ -37,7 +43,12 @@ describe('formatProvenance', () => {
     // #given
     const p = {
       baseVersion: '1.15.13',
-      integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+      integrationRefs: [
+        {
+          ref: 'https://github.com/anomalyco/opencode/pull/30182',
+          resolvedSha: 'deadbeef',
+        },
+      ],
       integrationCommit: 'abc1234',
       buildSha: 'def5678',
     }
