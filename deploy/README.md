@@ -419,4 +419,4 @@ workspace → sandbox-net (internal:true) → mitmproxy → egress-net → inter
 - `sandbox-net` is `internal: true` — no container on this network has a host gateway or direct internet access.
 - The workspace is attached to `sandbox-net` only. It has zero direct egress.
 - mitmproxy is dual-homed: it receives workspace traffic on `sandbox-net` and dials allowlisted upstream hosts via `egress-net` (a dedicated non-internal network). Only mitmproxy joins `egress-net`.
-- The gateway is dual-homed on `gateway-net` (external) and `sandbox-net`; its Discord/S3 traffic does not route through mitmproxy.
+- The gateway is dual-homed on `gateway-net` (external) and `sandbox-net`. Its own egress also routes through mitmproxy (`HTTPS_PROXY=http://mitmproxy:8080`), which is why Discord and the GitHub/object-store hosts it needs are in the static allowlist. The topology guard intentionally does not constrain the gateway's networks — only the workspace is held to sandbox-net-only.
