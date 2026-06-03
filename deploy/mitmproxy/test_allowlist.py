@@ -572,6 +572,345 @@ def test_object_store_hosts_rejects_documentation_ipv6():
 
 
 # ===========================================================================
+# WORKSPACE_EGRESS_HOSTS env-var merging (Unit 2)
+# ===========================================================================
+
+
+def test_workspace_egress_hosts_included_when_set():
+    """WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot → host in ALLOWLIST."""
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    assert "cliproxy.fro.bot" in mod.ALLOWLIST
+
+
+def test_workspace_egress_hosts_is_allowed():
+    """A host from WORKSPACE_EGRESS_HOSTS must pass _is_allowed."""
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    assert mod._is_allowed("cliproxy.fro.bot") is True
+
+
+def test_workspace_egress_hosts_comma_separated():
+    """Comma-separated WORKSPACE_EGRESS_HOSTS adds all entries."""
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot,proxy2.example.com"})
+    assert "cliproxy.fro.bot" in mod.ALLOWLIST
+    assert "proxy2.example.com" in mod.ALLOWLIST
+    assert mod._is_allowed("cliproxy.fro.bot") is True
+    assert mod._is_allowed("proxy2.example.com") is True
+
+
+def test_workspace_egress_hosts_unset_no_change():
+    """Unset WORKSPACE_EGRESS_HOSTS → no change to ALLOWLIST, no error."""
+    mod_without = _load_allowlist()
+    mod_with_empty = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": ""})
+    # Neither should raise; static list length should be the same
+    assert len(mod_without.ALLOWLIST) == len(mod_with_empty.ALLOWLIST)
+
+
+def test_workspace_egress_hosts_case_normalized():
+    """CliProxy.FRO.bot must be lowercased and matched case-insensitively."""
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "CliProxy.FRO.bot"})
+    assert "cliproxy.fro.bot" in mod.ALLOWLIST
+    assert mod._is_allowed("cliproxy.fro.bot") is True
+    assert mod._is_allowed("CliProxy.FRO.bot") is True  # _is_allowed lowercases
+
+
+def test_workspace_egress_hosts_rejects_wildcard():
+    """WORKSPACE_EGRESS_HOSTS='*.fro.bot' must raise ValueError naming the var."""
+    try:
+        _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "*.fro.bot"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "WORKSPACE_EGRESS_HOSTS" in msg, f"Expected var name in error: {e}"
+        assert "*.fro.bot" in msg, f"Expected wildcard entry in error: {e}"
+
+
+def test_workspace_egress_hosts_rejects_private_ip_10():
+    """WORKSPACE_EGRESS_HOSTS='10.0.0.5' must raise ValueError."""
+    try:
+        _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "10.0.0.5"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "private" in msg, f"Expected 'reserved' or 'private' in error: {e}"
+
+
+def test_workspace_egress_hosts_rejects_loopback_ip():
+    """WORKSPACE_EGRESS_HOSTS='127.0.0.1' must raise ValueError."""
+    try:
+        _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "127.0.0.1"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "loopback" in msg, f"Expected 'reserved' or 'loopback' in error: {e}"
+
+
+def test_workspace_egress_hosts_rejects_link_local_ip():
+    """WORKSPACE_EGRESS_HOSTS='169.254.169.254' must raise ValueError."""
+    try:
+        _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "169.254.169.254"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        msg = str(e).lower()
+        assert "reserved" in msg or "link-local" in msg, f"Expected 'reserved' or 'link-local' in error: {e}"
+
+
+def test_workspace_egress_hosts_rejects_port():
+    """WORKSPACE_EGRESS_HOSTS='cliproxy.fro.bot:443' must raise ValueError."""
+    try:
+        _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot:443"})
+        assert False, "Expected ValueError"
+    except ValueError as e:
+        assert "port" in str(e).lower(), f"Expected 'port' in error: {e}"
+
+
+def test_workspace_egress_hosts_rejects_invalid_hostname():
+    """WORKSPACE_EGRESS_HOSTS with leading/trailing/consecutive dots must raise ValueError."""
+    for bad in [".cliproxy.fro.bot", "cliproxy.fro.bot.", "cliproxy..fro.bot"]:
+        try:
+            _load_allowlist({"WORKSPACE_EGRESS_HOSTS": bad})
+            assert False, f"Expected ValueError for '{bad}'"
+        except ValueError as e:
+            assert bad in str(e) or "hostname" in str(e).lower(), (
+                f"Expected entry name or 'hostname' in error for '{bad}': {e}"
+            )
+
+
+def test_workspace_egress_hosts_and_object_store_hosts_both_present():
+    """Both OBJECT_STORE_HOSTS and WORKSPACE_EGRESS_HOSTS set → both in ALLOWLIST."""
+    mod = _load_allowlist({
+        "OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com",
+        "WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot",
+    })
+    assert "my-bucket.s3.amazonaws.com" in mod.ALLOWLIST
+    assert "cliproxy.fro.bot" in mod.ALLOWLIST
+    assert mod._is_allowed("my-bucket.s3.amazonaws.com") is True
+    assert mod._is_allowed("cliproxy.fro.bot") is True
+
+
+def test_workspace_egress_hosts_only_does_not_affect_object_store():
+    """Setting only WORKSPACE_EGRESS_HOSTS does not add object-store hosts."""
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    assert "my-bucket.s3.amazonaws.com" not in mod.ALLOWLIST
+    assert mod._is_allowed("attacker-bucket.s3.amazonaws.com") is False
+
+
+def test_object_store_hosts_only_does_not_affect_workspace_egress():
+    """Setting only OBJECT_STORE_HOSTS does not add workspace-egress hosts."""
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com"})
+    assert "cliproxy.fro.bot" not in mod.ALLOWLIST
+    assert mod._is_allowed("cliproxy.fro.bot") is False
+
+
+# ===========================================================================
+# DNS-rebinding defense — resolved-IP validation at enforcement time (Unit 3)
+# ===========================================================================
+
+
+def _load_allowlist_with_socket_mock(extra_env, getaddrinfo_side_effect):
+    """Load allowlist with env overrides and a mocked socket.getaddrinfo.
+
+    Returns (mod, socket_mock) so tests can inspect call counts.
+    """
+    import unittest.mock as mock
+
+    mod = _load_allowlist(extra_env)
+    socket_mock = mock.MagicMock()
+    socket_mock.getaddrinfo.side_effect = getaddrinfo_side_effect
+    mod.socket = socket_mock
+    return mod, socket_mock
+
+
+def _make_flow_with_response(host: str, peername: str = "10.0.0.1:12345"):
+    """Build a mock flow that properly tracks response assignment."""
+    flow = MagicMock()
+    flow.request.host = host
+    flow.client_conn.peername = peername
+    # Track response assignment via a real attribute
+    flow.response = None
+    return flow
+
+
+def test_dns_rebinding_operator_host_public_ip_allowed():
+    """Operator-supplied host resolving to a public IP is allowed through."""
+    import unittest.mock as mock
+
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    # getaddrinfo returns a public IP (8.8.8.8)
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("8.8.8.8", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    # Should NOT be blocked — response stays None
+    assert flow.response is None
+
+
+def test_dns_rebinding_operator_host_loopback_blocked():
+    """Operator-supplied host resolving to 127.0.0.1 is rejected with 403."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("127.0.0.1", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    mitmproxy_http_mock.Response.make.assert_called_once()
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_operator_host_private_10_blocked():
+    """Operator-supplied host resolving to 10.0.0.5 is rejected with 403."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("10.0.0.5", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_operator_host_link_local_blocked():
+    """Operator-supplied host resolving to 169.254.169.254 is rejected with 403."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("169.254.169.254", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_operator_host_ipv6_loopback_blocked():
+    """Operator-supplied host resolving to ::1 is rejected with 403."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("::1", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_any_private_record_blocks():
+    """Multiple A-records where ANY is private → rejected."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    # First record is public, second is private
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("8.8.8.8", 0)),
+        (None, None, None, None, ("10.0.0.5", 0)),
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_vendor_host_not_resolved():
+    """Vendor static-ALLOWLIST host (github.com) is NOT resolved-checked."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist()
+    socket_mock = mock.MagicMock()
+    mod.socket = socket_mock
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("github.com")
+    addon.http_connect(flow)
+    # github.com is in the static list, not operator-supplied → no getaddrinfo call
+    socket_mock.getaddrinfo.assert_not_called()
+    assert flow.response is None
+
+
+def test_dns_rebinding_resolution_failure_blocks():
+    """Resolution failure for an operator-supplied host → fail closed (403)."""
+    import unittest.mock as mock
+    import socket as real_socket
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.gaierror = real_socket.gaierror
+    mod.socket.getaddrinfo.side_effect = real_socket.gaierror("resolution failed")
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_object_store_host_also_checked():
+    """Operator-supplied OBJECT_STORE_HOSTS host resolving to private IP is blocked."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"OBJECT_STORE_HOSTS": "my-bucket.s3.amazonaws.com"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("10.0.0.5", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("my-bucket.s3.amazonaws.com")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_request_hook_also_enforced():
+    """DNS-rebinding check applies to the request hook (plain HTTP), not just http_connect."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("127.0.0.1", 0))
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.request(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+# ===========================================================================
 # Standalone runner (no pytest required)
 # ===========================================================================
 
