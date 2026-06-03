@@ -166,9 +166,8 @@ def _parse_egress_hosts(env_var_name: str, raw_value: str) -> list[str]:
             # 2. wildcard-reject
             raise ValueError(
                 f"{env_var_name} contains a wildcard entry '{_h}'. "
-                "Wildcards are not allowed in object-store hosts to prevent "
-                "re-introducing the over-broad-allowlist security gap. "
-                "Set exact bucket hostnames (e.g. 'my-bucket.s3.amazonaws.com')."
+                "Wildcards are not allowed (they re-introduce the over-broad-allowlist security gap). "
+                "Set exact hostnames (e.g. 'my-bucket.s3.amazonaws.com' or 'cliproxy.example.com')."
             )
         # 3. ip-literal-validate — fires before port-reject so bare IPv6 literals
         # (which contain colons) are handled correctly. Returns the entry if it is
@@ -269,7 +268,8 @@ def _is_allowed(host: str) -> bool:
 def _resolve_has_disallowed_ip(host: str) -> bool:
     """Resolve *host* and return True if ANY resolved address is disallowed.
 
-    Fails closed: if resolution raises, returns True (block the request).
+    Fails closed: if resolution raises (DNS error, timeout, or encoding
+    failure), returns True (block the request).
 
     Note: this check runs at the addon hook layer. mitmproxy performs its own
     independent resolution for the upstream dial (TOCTOU gap). This is
@@ -278,7 +278,7 @@ def _resolve_has_disallowed_ip(host: str) -> bool:
     """
     try:
         results = socket.getaddrinfo(host, None)
-    except socket.gaierror:
+    except (OSError, UnicodeError):
         return True  # fail closed — resolution failure blocks the request
     for _family, _type, _proto, _canonname, sockaddr in results:
         ip_str = sockaddr[0]

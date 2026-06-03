@@ -38,10 +38,11 @@ def _load_allowlist(extra_env: dict | None = None):
     """
     env_backup = os.environ.copy()
     try:
+        # Always clear both managed env vars first for hermetic isolation.
+        os.environ.pop("OBJECT_STORE_HOSTS", None)
+        os.environ.pop("WORKSPACE_EGRESS_HOSTS", None)
         if extra_env:
             os.environ.update(extra_env)
-        else:
-            os.environ.pop("OBJECT_STORE_HOSTS", None)
 
         # Remove cached module so import runs fresh.
         sys.modules.pop("allowlist", None)
@@ -301,7 +302,7 @@ def test_object_store_hosts_rejects_wildcard_apex():
         assert False, "Expected ValueError"
     except ValueError as e:
         msg = str(e)
-        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "Wildcards are not allowed" in msg, f"Expected 'Wildcards are not allowed' in error: {e}"
         assert "*.s3.amazonaws.com" in msg, f"Expected wildcard entry name in error: {e}"
 
 
@@ -312,7 +313,7 @@ def test_object_store_hosts_rejects_wildcard_subdomain():
         assert False, "Expected ValueError"
     except ValueError as e:
         msg = str(e)
-        assert "Set exact bucket hostnames" in msg, f"Expected 'Set exact bucket hostnames' in error: {e}"
+        assert "Wildcards are not allowed" in msg, f"Expected 'Wildcards are not allowed' in error: {e}"
         assert "*.example.com" in msg, f"Expected wildcard entry name in error: {e}"
 
 
@@ -572,7 +573,7 @@ def test_object_store_hosts_rejects_documentation_ipv6():
 
 
 # ===========================================================================
-# WORKSPACE_EGRESS_HOSTS env-var merging (Unit 2)
+# WORKSPACE_EGRESS_HOSTS env-var merging
 # ===========================================================================
 
 
@@ -702,7 +703,7 @@ def test_object_store_hosts_only_does_not_affect_workspace_egress():
 
 
 # ===========================================================================
-# DNS-rebinding defense — resolved-IP validation at enforcement time (Unit 3)
+# DNS-rebinding defense — resolved-IP validation at enforcement time
 # ===========================================================================
 
 
@@ -866,6 +867,39 @@ def test_dns_rebinding_resolution_failure_blocks():
     mod.socket = mock.MagicMock()
     mod.socket.gaierror = real_socket.gaierror
     mod.socket.getaddrinfo.side_effect = real_socket.gaierror("resolution failed")
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_timeout_blocks():
+    """socket.timeout during resolution for an operator-supplied host → fail closed (403)."""
+    import unittest.mock as mock
+    import socket as real_socket
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.side_effect = real_socket.timeout("timed out")
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    assert flow.response is not None
+    call_args = mitmproxy_http_mock.Response.make.call_args
+    assert call_args[0][0] == 403
+
+
+def test_dns_rebinding_oserror_blocks():
+    """Generic OSError during resolution for an operator-supplied host → fail closed (403)."""
+    import unittest.mock as mock
+
+    _reset_response_mock()
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.side_effect = OSError("network unreachable")
     addon = mod.AllowlistAddon()
     flow = _make_flow_with_response("cliproxy.fro.bot")
     addon.http_connect(flow)
