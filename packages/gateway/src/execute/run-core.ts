@@ -22,8 +22,11 @@
  */
 
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
+import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
+
+import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -83,6 +86,12 @@ export interface RunCoreParams {
   readonly signal: AbortSignal
   /** Injected logger. Internal details only — never leak session internals to Discord. */
   readonly logger: GatewayLogger
+  /**
+   * Optional permission coordinator.
+   * When present, `permission.asked` and `permission.replied` events are routed
+   * to it. When absent, those events are silently ignored (back-compat).
+   */
+  readonly coordinator?: PermissionCoordinator
 }
 
 // ---------------------------------------------------------------------------
@@ -153,13 +162,17 @@ interface ToolCallInfo {
  *
  * Flow:
  * 1. `session.create()`
- * 2. `session.promptAsync({..., query: {directory}})` — blocks until queued
- * 3. `event.subscribe({query: {directory}})` — SSE stream (directory REQUIRED)
+ * 2. `event.subscribe({query: {directory}})` — SSE stream (directory REQUIRED,
+ *    subscribe-before-prompt removes the race where permission.asked fires
+ *    before the SSE listener exists)
+ * 3. `session.promptAsync({..., query: {directory}})` — blocks until queued
  * 4. Iterate events:
  *    - `message.part.delta` (this session) → `sink.append(text)`
  *    - `session.next.text.delta` (this session) → `sink.append(text)`
  *    - `session.next.tool.called` (this session) → cache call info
  *    - `session.next.tool.success` (this session) → append progress line to sink
+ *    - `permission.asked` (this session, coordinator present) → fire-and-continue
+ *    - `permission.replied` (this session, coordinator present) → settle
  *    - `session.idle` for this session → resolve
  *    - `session.error` for this session → throw `RunCoreError('session-error')`
  * 5. Caller calls `sink.flush()` after this resolves.
@@ -168,7 +181,7 @@ interface ToolCallInfo {
  *   session error, or prompt rejection.
  */
 export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
-  const {handle, directory, promptText, sink, signal, logger} = params
+  const {handle, directory, promptText, sink, signal, logger, coordinator} = params
   const {client} = handle
 
   // ── 1. Create session ──────────────────────────────────────────────────────
@@ -195,7 +208,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError('unreachable', `Session create threw: ${message}`)
   }
 
-  // ── 2. Send prompt — directory threaded to query ───────────────────────────
+  // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
+  // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
+  // before the SSE listener exists.
+  let eventStream: AsyncIterable<unknown>
+  try {
+    const eventsResult = await client.event.subscribe({query: {directory}})
+    eventStream = eventsResult.stream as AsyncIterable<unknown>
+    logger.info({sessionId, directory}, 'run-core: event stream subscribed')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logger.error({sessionId, detail: message}, 'run-core: event.subscribe threw')
+    throw new RunCoreError('unreachable', `Event subscribe threw: ${message}`)
+  }
+
+  // ── 3. Send prompt — directory threaded to query ───────────────────────────
   try {
     const promptResponse = await client.session.promptAsync({
       path: {id: sessionId},
@@ -217,18 +244,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     const message = error instanceof Error ? error.message : String(error)
     logger.error({sessionId, detail: message}, 'run-core: promptAsync threw (server unreachable?)')
     throw new RunCoreError('unreachable', `PromptAsync threw: ${message}`)
-  }
-
-  // ── 3. Subscribe to events — directory threaded to query (SSE-routing) ─────
-  let eventStream: AsyncIterable<unknown>
-  try {
-    const eventsResult = await client.event.subscribe({query: {directory}})
-    eventStream = eventsResult.stream as AsyncIterable<unknown>
-    logger.info({sessionId, directory}, 'run-core: event stream subscribed')
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    logger.error({sessionId, detail: message}, 'run-core: event.subscribe threw')
-    throw new RunCoreError('unreachable', `Event subscribe threw: ${message}`)
   }
 
   // ── 4. Consume event stream ────────────────────────────────────────────────
@@ -295,6 +310,39 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 : tool)
             logger.debug({callID, tool, title}, 'run-core: tool success')
             sink.append(`\n🔧 ${tool}: ${title}\n`)
+          }
+        }
+      }
+    } else if (eventType === 'permission.asked') {
+      // Permission gate — only act when coordinator is wired in.
+      if (coordinator !== undefined) {
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const req = parsePermissionRequest(eventPayload)
+          if (req === null) {
+            logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
+          } else {
+            // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
+            // eslint-disable-next-line no-void
+            void coordinator.onPermissionAsked(req)
+            logger.info({requestID: req.requestID}, 'run-core: permission.asked forwarded to coordinator')
+          }
+        }
+      }
+    } else if (eventType === 'permission.replied') {
+      // Authoritative settlement — only act when coordinator is wired in.
+      if (coordinator !== undefined) {
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const ev = parsePermissionReply(eventPayload)
+          if (ev === null) {
+            logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
+          } else {
+            coordinator.onPermissionReplied(ev)
+            logger.info(
+              {requestID: ev.requestID, reply: ev.reply},
+              'run-core: permission.replied forwarded to coordinator',
+            )
           }
         }
       }

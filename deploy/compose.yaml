@@ -37,6 +37,11 @@ services:
       WORKSPACE_OPENCODE_URL_FILE: /run/secrets/workspace_opencode_url
       # Optional — Discord role ID that gates mention authorization
       GATEWAY_TRIGGER_ROLE_ID_FILE: /run/secrets/gateway_trigger_role_id
+      # Optional — announce/presence endpoint (opt-in). BOTH must be set together
+      # to enable the HMAC-verified POST /v1/announce presence webhook, or NEITHER
+      # (the endpoint stays disabled). Uncomment both lines AND both bind-mounts below.
+      # GATEWAY_WEBHOOK_SECRET_FILE: /run/secrets/gateway_webhook_secret
+      # GATEWAY_PRESENCE_CHANNEL_ID_FILE: /run/secrets/gateway_presence_channel_id
       # Egress proxy (regular proxy mode — NOT transparent)
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
@@ -155,6 +160,20 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # Optional — announce/presence endpoint secrets (opt-in, both-or-neither).
+      # Uncomment BOTH (and the two env entries above) to enable the announce endpoint.
+      # - type: bind
+      #   source: ./secrets/gateway-webhook-secret
+      #   target: /run/secrets/gateway_webhook_secret
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
+      # - type: bind
+      #   source: ./secrets/gateway-presence-channel-id
+      #   target: /run/secrets/gateway_presence_channel_id
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
     networks:
       - gateway-net
       - sandbox-net
