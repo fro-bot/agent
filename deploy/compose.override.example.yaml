@@ -29,6 +29,12 @@ services:
     #   Set it in your .env file or shell environment instead.
     #   Example: "my-bucket.s3.amazonaws.com,my-account.r2.cloudflarestorage.com"
     #   If unset or empty, all S3/R2 traffic is blocked (fail-closed default).
+    #
+    #   WORKSPACE_EGRESS_HOSTS is likewise omitted here; it falls through to
+    #   compose.yaml's interpolation: WORKSPACE_EGRESS_HOSTS: ${WORKSPACE_EGRESS_HOSTS:-}
+    #   Set it in your .env file for additional exact egress hosts (e.g. a
+    #   self-hosted OpenCode proxy). Example: "cliproxy.fro.bot"
+    #   If unset or empty, no extra hosts are added (fail-closed default).
 
   gateway:
     # Override the mitmproxy-certs volume path for dev if you want a local dir

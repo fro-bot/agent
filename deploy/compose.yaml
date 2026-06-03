@@ -276,12 +276,21 @@ services:
       # to the exact bucket host(s) your deployment uses. If unset or empty,
       # all S3/R2 traffic is blocked (fail-closed default).
       OBJECT_STORE_HOSTS: ${OBJECT_STORE_HOSTS:-}
+      # Comma-separated list of additional exact egress hosts to allow through
+      # the proxy (e.g. a self-hosted OpenCode proxy: "cliproxy.fro.bot").
+      # Use this as an escape hatch for explicitly-justified workspace egress
+      # hosts only — not as a general allowlist. If unset or empty, no extra
+      # hosts are added (fail-closed default). Hosts are validated at import
+      # time (wildcard/private-IP/port reject) and at connect time (DNS-rebinding
+      # resolved-IP check). A malformed value prevents proxy startup.
+      WORKSPACE_EGRESS_HOSTS: ${WORKSPACE_EGRESS_HOSTS:-}
     volumes:
       - ./mitmproxy/allowlist.py:/scripts/allowlist.py:ro
       # Named volume: mitmproxy writes CA here; gateway/workspace read it for trust
       - mitmproxy-certs:/home/mitmproxy/.mitmproxy
     networks:
-      - sandbox-net
+      - sandbox-net # receives workspace traffic (internal)
+      - egress-net # upstream leg: mitmproxy dials allowlisted hosts here
     restart: unless-stopped
     logging:
       driver: json-file
@@ -304,10 +313,16 @@ volumes:
   mitmproxy-certs:
 
 networks:
-  # External-facing network for gateway ↔ Discord
+  # External-facing network for gateway ↔ Discord/S3
   gateway-net:
     driver: bridge
-  # Internal sandbox network: workspace + mitmproxy; gateway bridges both
+  # Isolated sandbox: workspace + mitmproxy receive side only.
+  # internal:true — no host gateway, no direct internet egress for any
+  # container attached here. Workspace stays on this network exclusively.
   sandbox-net:
     driver: bridge
     internal: true
+  # mitmproxy's upstream leg only. No other service joins this network.
+  # Containment invariant: workspace → sandbox-net → mitmproxy → egress-net → internet.
+  egress-net:
+    driver: bridge
