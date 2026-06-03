@@ -11,10 +11,12 @@ import {
   DEFAULT_STALE_THRESHOLD_MS,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
+import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
+import {parseApprovalCustomId} from './discord/approvals.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
-import {handleMention} from './discord/mentions.js'
+import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
@@ -140,6 +142,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
     const registry = getCommandRegistry(commandDeps)
 
+    // Program-scoped approval registry — shared between the button handler and shutdown drain.
+    const approvalRegistry = createApprovalRegistry({logger})
+
     // e. Register slash commands
     yield* Effect.tryPromise({
       try: async () =>
@@ -148,7 +153,64 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     })
 
     // f. Wire client events
-    client.on('interactionCreate', interaction => {
+    client.on('interactionCreate', (interaction): void => {
+      // ── Button interactions: approval flow ────────────────────────────────
+      if (interaction.isButton()) {
+        const parsed = parseApprovalCustomId(interaction.customId)
+        if (parsed === null) return // not our button — ignore
+
+        // eslint-disable-next-line no-void
+        void (async () => {
+          try {
+            // Defer FIRST — acks the interaction within Discord's 3 s window before
+            // any REST calls (guild.members.fetch inside userIsAuthorized can be slow).
+            // All subsequent responses must use editReply (not reply) since the
+            // interaction is now deferred.
+            await interaction.deferReply({ephemeral: true})
+
+            // Auth: reuse the same authorization gate as the mention path.
+            const guild = interaction.guild
+            if (guild === null) {
+              await interaction.editReply({content: 'Not authorized to approve.'})
+              return
+            }
+            const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, logger)
+            if (authorized === false) {
+              await interaction.editReply({content: 'Not authorized to approve.'})
+              return
+            }
+
+            const decision = parsed.action === 'approve' ? ('once' as const) : ('reject' as const)
+            const outcome = await approvalRegistry.handleButtonDecision({
+              requestID: parsed.requestID,
+              channelID: interaction.channelId,
+              decision,
+              decidedBy: interaction.user.id,
+            })
+
+            const ackContent =
+              outcome === 'ok'
+                ? decision === 'once'
+                  ? 'Approved.'
+                  : 'Denied.'
+                : outcome === 'channel-mismatch'
+                  ? 'This approval belongs to another channel.'
+                  : outcome === 'not-found'
+                    ? 'This approval is no longer pending.'
+                    : outcome === 'already-claimed'
+                      ? 'Already decided.'
+                      : 'Failed to record decision, try again.'
+
+            await interaction.editReply({content: ackContent})
+          } catch (error: unknown) {
+            logger.error({err: String(error)}, 'button: unexpected error handling approval interaction')
+            // Best-effort edit — if this also throws Discord considers the interaction failed.
+            await interaction.editReply({content: 'Failed to record decision, try again.'}).catch(() => {})
+          }
+        })()
+        return
+      }
+
       if (!interaction.isChatInputCommand()) return
       // isChatInputCommand() narrows to ChatInputCommandInteraction — cast is safe.
       const cmd = interaction
@@ -185,6 +247,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runTimeoutMs: config.runTimeoutMs,
           botUserId: client.user.id,
           logger,
+          approvalRegistry,
         },
         logger,
       }
@@ -218,10 +281,19 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       },
     )
 
-    // h. Install shutdown handlers — drain in-flight mention runs before client.destroy()
-    installShutdownHandlers(client, logger, undefined, serverHandle, async () =>
-      Promise.all(inFlightRuns).then(() => {}),
-    )
+    // h. Install shutdown handlers — drain pending approvals fail-closed then await in-flight runs
+    installShutdownHandlers(client, logger, undefined, serverHandle, async () => {
+      // Dispose pending approvals before draining runs — ensures pending permissions
+      // fail-closed so in-flight runs don't hang waiting for a button that will never come.
+      //
+      // NOTE: disposeAll is best-effort early fail-close, NOT a hard barrier. A run still
+      // draining SSE could call register() for a late approval after disposeAll clears the
+      // map; that late entry is fail-closed only by the run's own coordinator.dispose() in
+      // its finally block. The per-run coordinator.dispose() is the authoritative backstop
+      // for approvals registered after this global drain.
+      await approvalRegistry.disposeAll('gateway shutdown')
+      await Promise.all(inFlightRuns)
+    })
 
     // i. Login
     yield* Effect.tryPromise({
