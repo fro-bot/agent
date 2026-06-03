@@ -29,7 +29,7 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write # Required for npm provenance attestation
+  id-token: write # Required for npm trusted publishing (OIDC) + automatic provenance
 
 # ---------------------------------------------------------------------------
 # Per-platform build matrix
@@ -136,11 +136,15 @@ jobs:
         with:
           bun-version: 1.3.13
 
-      - name: Setup Node.js (for npm publish with provenance)
+      - name: Setup Node.js (for npm trusted publishing via OIDC)
         uses: actions/setup-node@v4
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm to a trusted-publishing-capable version
+        # Trusted publishing (OIDC) requires npm >= 11.5.0; Node 24 ships an older npm.
+        run: npm install -g npm@latest
 
       - name: Install harness dependencies
         run: pnpm install --filter @fro.bot/harness --frozen-lockfile
@@ -247,10 +251,8 @@ jobs:
           echo "Assembly complete. Publish dir: ${PUBLISH_DIR}"
           ls -la "${PUBLISH_DIR}"
 
-      - name: Publish per-platform packages to npm (with provenance)
+      - name: Publish per-platform packages to npm (trusted publishing)
         if: steps.params.outputs.dry_run != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           BASE_VERSION="${{ steps.params.outputs.base_version }}"
@@ -260,14 +262,13 @@ jobs:
             for ARCH in x64 arm64; do
               PKG_DIR="${PUBLISH_DIR}/${PLATFORM}-${ARCH}"
               echo "Publishing @fro.bot/harness-${PLATFORM}-${ARCH}@${BASE_VERSION}..."
-              npm publish "${PKG_DIR}" --provenance --access public
+              # OIDC trusted publishing: no token, provenance is automatic.
+              npm publish "${PKG_DIR}"
             done
           done
 
-      - name: Publish main @fro.bot/harness package to npm (with provenance)
+      - name: Publish main @fro.bot/harness package to npm (trusted publishing)
         if: steps.params.outputs.dry_run != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           BASE_VERSION="${{ steps.params.outputs.base_version }}"
@@ -288,7 +289,8 @@ jobs:
             fs.writeFileSync('packages/harness/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
           echo "Publishing @fro.bot/harness@${BASE_VERSION}..."
-          npm publish packages/harness --provenance --access public
+          # OIDC trusted publishing: no token, provenance is automatic.
+          npm publish packages/harness
 
       - name: Dry run summary
         if: steps.params.outputs.dry_run == 'true'

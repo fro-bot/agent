@@ -25,18 +25,35 @@ Provenance = upstream release tag + ordered integration refs (each pinned by ups
 
 The LLM merge runs **once per release bump** in CI, is maintainer-reviewed as the bump PR, and is **frozen** — its SHA is pinned. Per-platform builds pin to the frozen integration commit. The action consumes the published, frozen, pre-built binary; the merge never runs during an action invocation.
 
-## Per-Platform Distribution (Unit 3 target)
+## Per-Platform Distribution
 
-The harness ships as a main `@fro.bot/harness` package + per-platform `optionalDependencies`:
+The harness ships as a main `@fro.bot/harness` package + per-platform packages:
 
 - `@fro.bot/harness-linux-x64`
 - `@fro.bot/harness-linux-arm64`
 - `@fro.bot/harness-darwin-x64`
 - `@fro.bot/harness-darwin-arm64`
 
-These packages do not exist yet (Unit 3 builds and publishes them). The `resolve-binary.ts` module will be extended in Unit 3 to select the host-platform binary from the installed optionalDependency package, verify its integrity, and return it. The current scaffold falls back to `opencode` on PATH.
+Each per-platform package contains only that platform's native binary. The main package's `bin` shim + `postinstall` resolver (`resolve-binary.ts` → `platform.ts`) select the host's binary by computed package name (`@fro.bot/harness-<os>-<arch>`) and verify it before exec; `OPENCODE_PATH` and a bare `opencode` on PATH are honored as fallbacks for local/unbuilt use.
 
-`optionalDependencies` is intentionally **empty** in the scaffold — the per-platform packages don't exist yet and adding them as real deps would break `pnpm install`. Unit 3 adds them once the packages are published.
+The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `pnpm-lock.yaml` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
+
+## Publishing
+
+The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write`, upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
+
+### One-time npmjs.com setup (per package)
+
+Trusted publishing trusts at the **package level**, so each of the five packages (`@fro.bot/harness` + the four `@fro.bot/harness-<os>-<arch>` packages) needs its own trusted-publisher configured once on npmjs.com → the package's Settings → Trusted publishing → GitHub Actions:
+
+- **Organization or user:** `fro-bot`
+- **Repository:** `agent`
+- **Workflow filename:** `harness-release.yaml`
+- **Environment:** (leave blank)
+
+### First-publish bootstrap
+
+npm trusted publishing requires a package to **already exist** before it will accept OIDC publishes — a brand-new, never-published package cannot be trust-published from scratch. So the very first release of these five packages needs a bootstrap publish (a one-time token-authenticated `npm publish`, or npm's pre-registered pending-publisher flow for new packages), after which the trusted-publisher config above governs all subsequent releases with no token.
 
 ## Carry Policy
 
