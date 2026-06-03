@@ -281,7 +281,8 @@ services:
       # Named volume: mitmproxy writes CA here; gateway/workspace read it for trust
       - mitmproxy-certs:/home/mitmproxy/.mitmproxy
     networks:
-      - sandbox-net
+      - sandbox-net # receives workspace traffic (internal)
+      - egress-net # upstream leg: mitmproxy dials allowlisted hosts here
     restart: unless-stopped
     logging:
       driver: json-file
@@ -304,10 +305,16 @@ volumes:
   mitmproxy-certs:
 
 networks:
-  # External-facing network for gateway ↔ Discord
+  # External-facing network for gateway ↔ Discord/S3
   gateway-net:
     driver: bridge
-  # Internal sandbox network: workspace + mitmproxy; gateway bridges both
+  # Isolated sandbox: workspace + mitmproxy receive side only.
+  # internal:true — no host gateway, no direct internet egress for any
+  # container attached here. Workspace stays on this network exclusively.
   sandbox-net:
     driver: bridge
     internal: true
+  # mitmproxy's upstream leg only. No other service joins this network.
+  # Containment invariant: workspace → sandbox-net → mitmproxy → egress-net → internet.
+  egress-net:
+    driver: bridge
