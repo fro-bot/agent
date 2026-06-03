@@ -841,6 +841,24 @@ def test_dns_rebinding_any_private_record_blocks():
     assert call_args[0][0] == 403
 
 
+def test_dns_rebinding_all_public_records_allowed():
+    """Multiple A-records where ALL are public → operator-supplied host is allowed through."""
+    import unittest.mock as mock
+
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    # Both records are public — no private address in the set
+    mod.socket.getaddrinfo.return_value = [
+        (None, None, None, None, ("8.8.8.8", 0)),
+        (None, None, None, None, ("1.1.1.1", 0)),
+    ]
+    addon = mod.AllowlistAddon()
+    flow = _make_flow_with_response("cliproxy.fro.bot")
+    addon.http_connect(flow)
+    # Should NOT be blocked — response stays None
+    assert flow.response is None
+
+
 def test_dns_rebinding_vendor_host_not_resolved():
     """Vendor static-ALLOWLIST host (github.com) is NOT resolved-checked."""
     import unittest.mock as mock

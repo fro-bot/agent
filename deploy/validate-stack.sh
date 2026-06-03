@@ -11,7 +11,7 @@
 #   bash deploy/validate-stack.sh --topology-only
 set -euo pipefail
 
-COMPOSE_FILE="deploy/compose.yaml"
+COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose.yaml}"
 
 # ---------------------------------------------------------------------------
 # check_compose_topology — static network-topology invariant assertion.
@@ -37,14 +37,17 @@ COMPOSE_FILE="deploy/compose.yaml"
 check_compose_topology() {
   echo "==> Checking compose network topology invariants..."
 
-  python3 - <<'PYEOF'
+  COMPOSE_FILE="${COMPOSE_FILE}" python3 - <<'PYEOF'
 import json
+import os
 import subprocess
 import sys
 
+compose_file = os.environ.get("COMPOSE_FILE", "deploy/compose.yaml")
+
 try:
     result = subprocess.run(
-        ["docker", "compose", "-f", "deploy/compose.yaml", "config", "--format", "json"],
+        ["docker", "compose", "-f", compose_file, "config", "--format", "json"],
         capture_output=True,
         text=True,
         check=True,
@@ -52,16 +55,21 @@ try:
     cfg = json.loads(result.stdout)
 except subprocess.CalledProcessError as e:
     # Fall back to YAML parse if --format json is not supported by this
-    # docker compose version.
+    # docker compose version, or if docker compose is unavailable.
     try:
         import yaml
-        result2 = subprocess.run(
-            ["docker", "compose", "-f", "deploy/compose.yaml", "config"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        cfg = yaml.safe_load(result2.stdout)
+        try:
+            result2 = subprocess.run(
+                ["docker", "compose", "-f", compose_file, "config"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            cfg = yaml.safe_load(result2.stdout)
+        except Exception:
+            # docker compose unavailable — parse the raw YAML file directly.
+            with open(compose_file) as fh:
+                cfg = yaml.safe_load(fh)
     except Exception as e2:
         print(f"ERROR: could not parse compose config: {e2}", file=sys.stderr)
         sys.exit(1)
