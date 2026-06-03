@@ -1,5 +1,8 @@
+import type {CoordinationConfig} from '@fro-bot/runtime'
+
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
+import type {CoordinationLogger} from './runtime-effect.js'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
@@ -179,6 +182,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: setupReadinessFlagSpy,
       login: loginSpy,
       startAnnounceServer: startAnnounceServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
     }
 
     // #when — run the program with the real Effect runtime.
@@ -211,6 +215,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: startAnnounceServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
     }
 
     // #when
@@ -247,6 +252,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: loginSpy,
       startAnnounceServer: startAnnounceServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
     }
 
     // #when
@@ -259,6 +265,65 @@ describe('makeGatewayProgram', () => {
       throw new Error('invocationCallOrder missing')
     }
     expect(serverOrder).toBeLessThan(loginOrder)
+  })
+
+  it('provider self-test runs during boot before login', async () => {
+    // #given
+    const fakeConfig = makeFakeConfig()
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+
+    const callOrder: string[] = []
+    const runProviderSelfTestSpy = vi.fn(async (_cc: CoordinationConfig, _lg: CoordinationLogger) => {
+      callOrder.push('runProviderSelfTest')
+    })
+    const loginSpy = vi.fn(async () => {
+      callOrder.push('login')
+    })
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: loginSpy,
+      startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      runProviderSelfTest: runProviderSelfTestSpy,
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — self-test was called exactly once
+    expect(runProviderSelfTestSpy).toHaveBeenCalledTimes(1)
+
+    // #and — self-test ran before login
+    expect(callOrder).toContain('runProviderSelfTest')
+    expect(callOrder).toContain('login')
+    expect(callOrder.indexOf('runProviderSelfTest')).toBeLessThan(callOrder.indexOf('login'))
+  })
+
+  it('boot fails fast when provider self-test rejects', async () => {
+    // #given
+    const fakeConfig = makeFakeConfig()
+    const fakeClient = makeFakeClient()
+    const fakeServerHandle = makeFakeServerHandle()
+
+    const loginSpy = vi.fn(async () => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: loginSpy,
+      startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      runProviderSelfTest: vi.fn(async () => {
+        throw new Error('IfNoneMatch not honored')
+      }),
+    }
+
+    // #when — boot must reject
+    await expect(Effect.runPromise(makeGatewayProgram(deps, fakeConfig))).rejects.toThrow('IfNoneMatch not honored')
+
+    // #then — login was NOT called (fail before connecting to Discord)
+    expect(loginSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -310,6 +375,7 @@ describe('button interaction handler (approval flow)', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      runProviderSelfTest: vi.fn(async () => {}),
     }
 
     await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
@@ -593,6 +659,7 @@ describe('button interaction handler (approval flow)', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      runProviderSelfTest: vi.fn(async () => {}),
     }
 
     await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))

@@ -38,7 +38,7 @@ Sensitive actions (file writes, bash, PR creation) currently run with no human g
 - Serial queue + `/clear-queue` (R11): separate plan.
 - `/review`, `/sessions`, `/resume` commands: separate plan.
 - Gateway startup self-test wiring (#7) and stand-alone safety-wins: can ship independently; not blocked by S5.
-- `no-fro-bot` block role (R6): separate small auth-only PR — touches `userIsAuthorized()` independently of S5.
+- `no-fro-bot` block role (R6): dropped (won't-do) — redundant deny-list on top of the existing allow-list auth model; exclude a user by not granting the trigger role.
 - `/fro-bot approvals` list/revoke management command: follow-up plan after S5 core lands.
 
 ## Context & Research
@@ -286,7 +286,7 @@ Unit 1 probe confirms the full round-trip at 1.14.41?
 
 - **Interaction graph:** introduces a Discord `interactionCreate` (button) handler alongside the existing slash-command dispatch; both route through `program.ts` event wiring. The run-core event loop gains `permission.asked` and `permission.replied` branches; the run orchestrator gains a blocking wait on the coordinator promise and a pending-run registry.
 - **Error propagation:** approval failures (deadline, Discord post failure, reply-endpoint non-2xx) must fail-closed (deny) and flush partial output, never silently drop a run or leave the concurrency slot wedged.
-- **Authorization surface:** approve/deny reuses `userIsAuthorized()` so the existing mention auth rules apply uniformly to approvals. The R6 block role is deferred to a separate PR.
+- **Authorization surface:** approve/deny reuses `userIsAuthorized()` so the existing mention auth rules apply uniformly to approvals. The R6 block role was dropped (won't-do) as redundant.
 - **Integration coverage:** the approve→reply→resume path crosses Discord → coordinator → OpenCode HTTP; unit mocks alone won't prove it — include a seam test that asserts the reply endpoint is hit exactly once per authorized decision.
 - **Unchanged invariants:** the mention loop's existing run path (no permission requested) is unaffected — when no `permission.asked` arrives, behavior is identical to today. The GitHub Action tier is untouched.
 
