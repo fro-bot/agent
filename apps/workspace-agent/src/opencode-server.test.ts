@@ -1030,6 +1030,451 @@ describe('process-group reaping (Unit 6) — group kill when pid is present', ()
   })
 })
 
+// ── Fix 1: pid guard — exclude pid 0 and 1 from negative-pid group kill ──────
+//
+// process.kill(-0, …) signals the supervisor's OWN process group.
+// process.kill(-1, …) broadcasts SIGTERM to every process the user can reach.
+// Both are catastrophic. The guard must be pid > 1 (not just isFinite).
+
+describe('killChildGroup — pid guard (Fix 1)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('calls process.kill(-pid, SIGTERM) for a normal pid like 12345', async () => {
+    // #given — child with pid 12345; timeout fires
+    const pid = 12345
+    const {child} = makeFakeChildWithPid(pid)
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires → killChildGroup called
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFnWithOpts(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — group kill via negative pid
+    expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
+  })
+
+  it('falls back to child.kill when pid === 1 (never calls process.kill with negative arg)', async () => {
+    // #given — child with pid 1 (init process — catastrophic to group-kill)
+    const pid = 1
+    const {child, killSpy} = makeFakeChildWithPid(pid)
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires → killChildGroup called
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFnWithOpts(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — fallback: child.kill called, NOT process.kill(-1, …)
+    expect(killSpy).toHaveBeenCalledWith('SIGTERM')
+    const negPidCalls = processKillSpy.mock.calls.filter(([p]) => typeof p === 'number' && p < 0)
+    expect(negPidCalls).toHaveLength(0)
+  })
+
+  it('falls back to child.kill when pid === 0 (never calls process.kill with negative arg)', async () => {
+    // #given — child with pid 0 (process.kill(-0) = own group — catastrophic)
+    const pid = 0
+    const {child, killSpy} = makeFakeChildWithPid(pid)
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires → killChildGroup called
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFnWithOpts(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — fallback: child.kill called, NOT process.kill(-0, …)
+    expect(killSpy).toHaveBeenCalledWith('SIGTERM')
+    const negPidCalls = processKillSpy.mock.calls.filter(([p]) => typeof p === 'number' && p <= 0)
+    expect(negPidCalls).toHaveLength(0)
+  })
+
+  it('falls back to child.kill when pid is undefined', async () => {
+    // #given — child WITHOUT pid (existing pattern)
+    const {child, killCalls} = makeFakeChild({})
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFn(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — fallback: child.kill called, NOT process.kill with negative pid
+    expect(killCalls).toContain('SIGTERM')
+    const negPidCalls = processKillSpy.mock.calls.filter(([p]) => typeof p === 'number' && p < 0)
+    expect(negPidCalls).toHaveLength(0)
+  })
+})
+
+// ── Fix 2: stable-ready reset — respawn budget resets after stable uptime ─────
+//
+// A child that stays ready for >= stableReadyResetMs before exiting is treated
+// as a healthy run. The attempt counter + backoff reset so only RAPID crash
+// loops consume the bounded budget.
+
+describe('runSupervisedOpencode — stable-ready reset (Fix 2)', () => {
+  it('does NOT go degraded after 4+ lifetime exits when each run was stable', async () => {
+    // #given — child becomes ready, stays ready >= stableReadyResetMs (50ms), exits.
+    // With 4 exits and maxAttempts=4, WITHOUT reset it would go degraded.
+    // WITH reset, each stable run resets the budget so it keeps respawning.
+    //
+    // We run 5 stable-exit cycles and assert it never goes degraded.
+    // After the 5th stable exit we abort the supervisor to stop it cleanly.
+    const stableReadyResetMs = 50 // tiny for test speed
+    const maxAttempts = 4
+
+    // Build 6 controllable children (5 stable exits + 1 that the abort kills)
+    const children = Array.from({length: 6}, () => makeControllableChild())
+    let childIdx = 0
+    const ac = new AbortController()
+    const spawnFn: SpawnFn = () => {
+      const c = children[childIdx]
+      if (c === undefined) throw new Error('ran out of children')
+      childIdx++
+      return c.child
+    }
+
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal: ac.signal,
+      spawnFn,
+      pollReadyFn: alwaysReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 5000,
+      maxAttempts,
+      initialBackoffMs: 0,
+      stableReadyResetMs,
+    })
+
+    // Cycle through 5 stable exits: wait for ready, wait stableReadyResetMs, exit
+    for (let i = 0; i < 5; i++) {
+      // Wait for status to become ready
+      await new Promise<void>(resolve => {
+        const check = (): void => {
+          if (statusRef.status === 'ready') {
+            resolve()
+          } else {
+            setImmediate(check)
+          }
+        }
+        setImmediate(check)
+      })
+
+      // Assert never degraded during stable cycles
+      expect(statusRef.status).toBe('ready')
+
+      // Wait for the stable period to elapse, then trigger exit
+      await new Promise<void>(r => setTimeout(r, stableReadyResetMs + 10))
+      children[i]?.triggerExit(0)
+    }
+
+    // After 5 stable exits the supervisor spawns the 6th child and waits for it
+    // to become ready. Wait for ready, then abort to stop the supervisor cleanly.
+    await new Promise<void>(resolve => {
+      const check = (): void => {
+        if (statusRef.status === 'ready') {
+          resolve()
+        } else {
+          setImmediate(check)
+        }
+      }
+      setImmediate(check)
+    })
+
+    // Abort — the supervisor's abort handler kills the 6th child's group and returns.
+    ac.abort()
+    // Also trigger exit on the 6th child so the post-ready wait resolves.
+    children[5]?.triggerExit(0)
+
+    await supervisorPromise
+
+    // #then — never went degraded despite 5+ lifetime exits (budget reset each time)
+    expect(statusRef.status).not.toBe('degraded')
+  })
+
+  it('goes degraded when child crashes RAPIDLY maxAttempts times (rapid crash-loop bounded)', async () => {
+    // #given — child crashes immediately (< stableReadyResetMs) on every spawn
+    // This must still exhaust the budget and go degraded.
+    const stableReadyResetMs = 200 // large enough that immediate crash is always "rapid"
+    const maxAttempts = 3
+
+    const children = Array.from({length: maxAttempts + 1}, () => makeFakeChild({exitImmediately: true, exitCode: 1}))
+    let childIdx = 0
+    const spawnFn: SpawnFn = () => {
+      const c = children[childIdx]
+      if (c === undefined) throw new Error('ran out of children')
+      childIdx++
+      return c.child
+    }
+
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    // #when — all children exit immediately before becoming ready
+    await runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      spawnFn,
+      pollReadyFn: neverReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 50,
+      maxAttempts,
+      initialBackoffMs: 0,
+      stableReadyResetMs,
+    })
+
+    // #then — degraded (rapid crash-loop still bounded)
+    expect(statusRef.status).toBe('degraded')
+    expect(childIdx).toBeLessThanOrEqual(maxAttempts)
+  })
+})
+
+// ── Fix 3: killChildGroup does not throw ─────────────────────────────────────
+//
+// process.kill(-pid) can throw ESRCH if the child exited between the state
+// check and the OS call. The exception must not escape the supervisor path.
+
+describe('killChildGroup — does not throw on ESRCH (Fix 3)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('supervisor proceeds (no rejection) when process.kill throws ESRCH', async () => {
+    // #given — child with pid; process.kill throws ESRCH (child already gone)
+    const pid = 55555
+    const {child} = makeFakeChildWithPid(pid)
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('ESRCH: no such process'), {code: 'ESRCH'})
+    })
+
+    // #when — timeout fires → killChildGroup called → process.kill throws
+    // The supervisor must NOT reject; it should resolve (or throw only the timeout error)
+    const result = await startOpencodeServer({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      spawnFn: makeSpawnFnWithOpts(child),
+      pollReadyFn: neverReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 1,
+    }).then(
+      () => 'resolved',
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+
+    // #then — the error is the timeout error, NOT an ESRCH propagation
+    expect(result).toMatch(/did not become ready within/)
+  })
+
+  it('supervisor proceeds when child.kill throws (fallback path)', async () => {
+    // #given — child WITHOUT pid; child.kill throws
+    const emitter = new EventEmitter()
+    const child = {
+      kill: (_sig?: string): boolean => {
+        throw new Error('kill failed')
+      },
+      on: (event: string | symbol, listener: (...args: unknown[]) => void): void => {
+        emitter.on(event, listener)
+      },
+    }
+
+    // #when — timeout fires → killChildGroup → child.kill throws
+    const result = await startOpencodeServer({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      spawnFn: () => child,
+      pollReadyFn: neverReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 1,
+    }).then(
+      () => 'resolved',
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+
+    // #then — timeout error propagates, kill error is swallowed
+    expect(result).toMatch(/did not become ready within/)
+  })
+})
+
+// ── Fix 4: abort signal wires through to supervisor + stops respawn ───────────
+//
+// With detached:true the child is in its OWN process group and does NOT inherit
+// SIGTERM from the parent. The AbortController must be used to explicitly reap
+// the child group and stop the supervisor from spawning further.
+
+describe('runSupervisedOpencode — abort signal wires through (Fix 4)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('kills child group via negative pid and does NOT spawn again after abort', async () => {
+    // #given — child with pid; abort fires while supervisor is polling for ready
+    const pid = 66666
+    const emitter = new EventEmitter()
+    let exited = false
+    const killSpy = vi.fn((_sig?: string): boolean => true)
+    const child = {
+      pid,
+      kill: killSpy,
+      on: (event: string | symbol, listener: (...args: unknown[]) => void): void => {
+        emitter.on(event, listener)
+      },
+    }
+
+    let spawnCount = 0
+    const processKillSpy = vi.spyOn(process, 'kill').mockImplementation((..._args) => {
+      if (exited === false) {
+        exited = true
+        setImmediate(() => emitter.emit('exit', null))
+      }
+      return true
+    })
+
+    const ac = new AbortController()
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal: ac.signal,
+      spawnFn: (_cmd, _args, _opts) => {
+        spawnCount++
+        return child
+      },
+      pollReadyFn: neverReady,
+      pollIntervalMs: 10,
+      readyTimeoutMs: 30_000,
+      maxAttempts: 4,
+      initialBackoffMs: 0,
+    })
+
+    // #when — abort while polling
+    ac.abort()
+    await supervisorPromise.catch(() => undefined)
+
+    // #then — group kill via negative pid
+    expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
+    // Only one spawn — no further attempts after abort
+    expect(spawnCount).toBe(1)
+  })
+
+  it('resolves promptly when abort fires during respawn backoff (no later spawn)', async () => {
+    // #given — first child exits immediately; abort fires during backoff sleep
+    const {child: child1} = makeFakeChild({exitImmediately: true, exitCode: 1})
+    const child2 = makeControllableChild()
+    let spawnCount = 0
+
+    const ac = new AbortController()
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal: ac.signal,
+      spawnFn: (_cmd, _args, _opts) => {
+        spawnCount++
+        return spawnCount === 1 ? child1 : child2.child
+      },
+      pollReadyFn: neverReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 50,
+      maxAttempts: 4,
+      initialBackoffMs: 500, // long enough that abort fires during backoff
+    })
+
+    // Abort after a short delay (during the backoff sleep)
+    await new Promise<void>(r => setTimeout(r, 20))
+    ac.abort()
+
+    // #then — resolves promptly (not after the full 500ms backoff)
+    const start = Date.now()
+    await supervisorPromise.catch(() => undefined)
+    const elapsed = Date.now() - start
+
+    // Should resolve well before the full backoff would have elapsed
+    expect(elapsed).toBeLessThan(400)
+    // Should NOT have spawned a second child
+    expect(spawnCount).toBe(1)
+  })
+
+  it('stops supervisor when signal.aborted is true during post-ready monitoring', async () => {
+    // #given — child becomes ready; abort fires while supervisor is in post-ready wait
+    const {child, triggerExit} = makeControllableChild()
+    let spawnCount = 0
+
+    const ac = new AbortController()
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal: ac.signal,
+      spawnFn: (_cmd, _args, _opts) => {
+        spawnCount++
+        return child
+      },
+      pollReadyFn: alwaysReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 5000,
+      maxAttempts: 4,
+      initialBackoffMs: 0,
+    })
+
+    // Wait for ready
+    await new Promise<void>(resolve => {
+      const check = (): void => {
+        if (statusRef.status === 'ready') resolve()
+        else setImmediate(check)
+      }
+      setImmediate(check)
+    })
+
+    // #when — abort while in post-ready monitoring, then trigger child exit
+    ac.abort()
+    triggerExit(0)
+
+    await supervisorPromise.catch(() => undefined)
+
+    // #then — only one spawn (no respawn after abort)
+    expect(spawnCount).toBe(1)
+  })
+})
+
 describe('process-group reaping (Unit 6) — supervised respawn group kill', () => {
   afterEach(() => {
     vi.restoreAllMocks()

@@ -95,18 +95,37 @@ export interface DefaultPollReadyOptions {
 /**
  * Kill the child's entire process group when a pid is available.
  *
- * When `child.pid` is a finite number, sends SIGTERM to the whole process
+ * When `child.pid` is a safe integer > 1, sends SIGTERM to the whole process
  * group (negative pid = pgid) so no orphaned grandchildren survive a
  * timeout/respawn/shutdown. Falls back to `child.kill('SIGTERM')` when the
- * pid is not a number (e.g. test fakes that don't expose a pid).
+ * pid is not a safe integer > 1 (e.g. test fakes that don't expose a pid).
  *
- * SECURITY INVARIANT: no token, secret, or env value is logged here.
+ * SECURITY INVARIANTS:
+ * - pid must be > 1: process.kill(-0, …) signals the supervisor's OWN process
+ *   group; process.kill(-1, …) broadcasts SIGTERM to every process the user
+ *   can reach — both are catastrophic and are explicitly excluded.
+ * - No token, secret, or env value is logged here.
+ * - Errors from process.kill or child.kill are swallowed (best-effort reap)
+ *   so an ESRCH race does not escape and break respawn/degraded handling.
  */
 function killChildGroup(child: ChildHandle): void {
-  if (typeof child.pid === 'number' && Number.isFinite(child.pid)) {
-    process.kill(-child.pid, 'SIGTERM')
+  if (Number.isSafeInteger(child.pid) && (child.pid as number) > 1) {
+    try {
+      process.kill(-(child.pid as number), 'SIGTERM')
+    } catch {
+      // Best-effort: ESRCH means the child already exited — safe to ignore.
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        // Swallow — child is already gone.
+      }
+    }
   } else {
-    child.kill('SIGTERM')
+    try {
+      child.kill('SIGTERM')
+    } catch {
+      // Best-effort: child already exited — safe to ignore.
+    }
   }
 }
 
@@ -281,6 +300,15 @@ export interface RunSupervisedOpencodeOptions {
    * Maximum backoff delay in ms. Default: 10000ms.
    */
   readonly maxBackoffMs?: number
+  /**
+   * Minimum uptime in ms after becoming ready before a post-ready exit is
+   * treated as a "stable run" and the attempt counter + backoff are reset.
+   * This prevents a child that crashes hours after becoming ready from
+   * consuming the bounded respawn budget — only RAPID crash loops (exit within
+   * stableReadyResetMs of becoming ready) consume the budget.
+   * Default: 60000ms.
+   */
+  readonly stableReadyResetMs?: number
   /** Injected spawn function for testing. Defaults to node:child_process.spawn. */
   readonly spawnFn?: SpawnFn
   /** Injected readiness poll function for testing. */
@@ -304,6 +332,8 @@ export interface RunSupervisedOpencodeOptions {
  * - Binds to 127.0.0.1 only.
  * - No token or credential is logged.
  * - Bounded retry: maxAttempts + per-attempt deadline prevent infinite respawn.
+ *   Rapid crash loops (exit within stableReadyResetMs of becoming ready) consume
+ *   the budget; stable runs (uptime >= stableReadyResetMs) reset it.
  */
 export async function runSupervisedOpencode(options: RunSupervisedOpencodeOptions): Promise<void> {
   const {
@@ -318,14 +348,22 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
     maxAttempts = 4,
     initialBackoffMs = 1_000,
     maxBackoffMs = 10_000,
+    stableReadyResetMs = 60_000,
     spawnFn = nodeSpawn,
     pollReadyFn = defaultPollReady,
   } = options
 
   const url = `http://${hostname}:${port}`
+  // Mutable attempt counter — can be reset after a stable run (Fix 2).
+  let attempt = 1
   let backoffMs = initialBackoffMs
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  while (attempt <= maxAttempts) {
+    // Fix 4: stop immediately if the signal was already aborted before this spawn.
+    if (signal !== undefined && signal.aborted) {
+      return
+    }
+
     // Fail-closed: status is 'starting' (not-ready) before each spawn attempt.
     // This ensures /readyz returns 503 during the kill→respawn transition.
     statusRef.status = 'starting'
@@ -370,7 +408,9 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
       logger.error('opencode-server: spawn error', {message, attempt})
     })
 
-    // Abort signal integration — reap the whole process group on external abort.
+    // Fix 4: Abort signal integration — reap the whole process group on external abort.
+    // With detached:true the child is in its OWN process group and does NOT inherit
+    // SIGTERM from the parent. We must explicitly reap it via killChildGroup.
     if (signal !== undefined) {
       signal.addEventListener('abort', () => {
         if (state.exited === false) {
@@ -382,8 +422,17 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
     // Per-attempt readiness loop with a fresh deadline.
     const deadline = Date.now() + readyTimeoutMs
     let becameReady = false
+    let readyAt = 0
 
     while (Date.now() < deadline) {
+      // Fix 4: abort check inside the readiness poll loop.
+      if (signal !== undefined && signal.aborted) {
+        if (state.exited === false) {
+          killChildGroup(child)
+        }
+        return
+      }
+
       if (state.exited === true) {
         // Process exited before becoming ready — break to respawn logic.
         break
@@ -392,6 +441,7 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
       const ready = await pollReadyFn(url, signal)
       if (ready === true) {
         becameReady = true
+        readyAt = Date.now()
         state.becameReady = true
         statusRef.status = 'ready'
         logger.info('opencode-server: ready', {url, attempt})
@@ -410,8 +460,34 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
           resolve()
           return
         }
+        // Fix 4: also resolve immediately if the signal aborts (abort handler
+        // already called killChildGroup; we just need to unblock the wait).
+        if (signal !== undefined) {
+          signal.addEventListener('abort', () => resolve())
+        }
         child.on('exit', () => resolve())
       })
+
+      // Fix 4: if we were aborted during post-ready monitoring, stop here.
+      if (signal !== undefined && signal.aborted) {
+        return
+      }
+
+      // Fix 2: compute uptime since the child became ready.
+      const uptime = Date.now() - readyAt
+      const wasStable = uptime >= stableReadyResetMs
+
+      if (wasStable) {
+        // Stable run: reset the attempt counter and backoff so only RAPID
+        // crash loops consume the bounded budget.
+        logger.info('opencode-server: stable run detected — resetting respawn budget', {
+          uptime,
+          stableReadyResetMs,
+          attempt,
+        })
+        attempt = 1
+        backoffMs = initialBackoffMs
+      }
 
       // Child has now exited. Decide whether to respawn.
       if (attempt < maxAttempts) {
@@ -422,12 +498,19 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
           attempt,
           nextAttempt: attempt + 1,
           maxAttempts,
+          wasStable,
         })
-        // Apply backoff before next attempt.
-        if (backoffMs > 0) {
-          await sleep(backoffMs)
+        // Apply backoff before next attempt (abortable — Fix 4).
+        if (backoffMs > 0 && (signal === undefined || !signal.aborted)) {
+          await sleep(backoffMs, undefined, {signal}).catch(() => {
+            // Abort during backoff — stop immediately.
+          })
+        }
+        if (signal !== undefined && signal.aborted) {
+          return
         }
         backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+        attempt++
         continue
       }
 
@@ -453,11 +536,17 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
         maxAttempts,
         backoffMs,
       })
-      // Apply backoff before next attempt.
-      if (backoffMs > 0) {
-        await sleep(backoffMs)
+      // Apply backoff before next attempt (abortable — Fix 4).
+      if (backoffMs > 0 && (signal === undefined || !signal.aborted)) {
+        await sleep(backoffMs, undefined, {signal}).catch(() => {
+          // Abort during backoff — stop immediately.
+        })
+      }
+      if (signal !== undefined && signal.aborted) {
+        return
       }
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+      attempt++
       continue
     }
 
@@ -468,5 +557,6 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
       attempt,
       maxAttempts,
     })
+    return
   }
 }

@@ -28,6 +28,12 @@ const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 // The supervisor (runSupervisedOpencode) writes all transitions here.
 const opencodeStatus = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
 
+// AbortController for the supervised OpenCode lifecycle.
+// Aborting this stops the supervisor and reaps the child's process group.
+// Required because detached:true puts the child in its OWN process group —
+// it does NOT inherit SIGTERM from the parent on container stop.
+const opencodeController = new AbortController()
+
 const app = createApp({opencodeStatus})
 
 const server = serve({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
@@ -51,6 +57,7 @@ const opencodeServerPromise = runSupervisedOpencode({
   rootDir: WORKSPACE_REPOS_ROOT,
   logger: opencodeLogger,
   statusRef: opencodeStatus,
+  signal: opencodeController.signal,
   hostname: OPENCODE_HOSTNAME,
   port: OPENCODE_PORT,
   readyTimeoutMs: opencodeReadyTimeoutMs,
@@ -96,9 +103,13 @@ function shutdown(signal: string): void {
     process.exit(1)
   }, DRAIN_MS)
 
+  // Abort the supervised OpenCode lifecycle — this stops the supervisor and
+  // reaps the child's process group via killChildGroup. The child does NOT
+  // inherit SIGTERM from the parent because detached:true puts it in its own
+  // process group; explicit abort is required to avoid orphaning it.
+  opencodeController.abort()
+
   // Close proxy, then the Hono server.
-  // Note: the OpenCode child process is managed by the supervisor (runSupervisedOpencode).
-  // On SIGTERM the container will be killed; the supervisor's child inherits the signal.
   const cleanupProxy = async (): Promise<void> => {
     if (proxy !== undefined) {
       return proxy.close().catch(() => {
