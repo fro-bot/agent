@@ -54,7 +54,7 @@ export interface StartOpencodeServerOptions {
   readonly hostname?: string
   /** Port to bind. Default: 54321 (OpenCode default). */
   readonly port?: number
-  /** How long to wait for the server to become ready. Default: 15000ms. */
+  /** How long to wait for the server to become ready. Default: 60000ms. */
   readonly readyTimeoutMs?: number
   /** Poll interval in ms. Default: 250ms. */
   readonly pollIntervalMs?: number
@@ -137,7 +137,7 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     signal,
     hostname = '127.0.0.1',
     port = 54321,
-    readyTimeoutMs = 15_000,
+    readyTimeoutMs = 60_000,
     pollIntervalMs = 250,
     spawnFn = nodeSpawn,
     pollReadyFn = defaultPollReady,
