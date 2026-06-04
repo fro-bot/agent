@@ -75,8 +75,8 @@ describe('assertIntegrationMarker', () => {
     expect(result.ok).toBe(true)
   })
 
-  it('marker present in probe output → ok', () => {
-    // #given
+  it('marker present on structured line → ok', () => {
+    // #given — output matches the "  integration commit: <sha>" format from formatProvenance
     const commit = 'cafebabe1234abcd'
     const probeOutput = `harness (patched OpenCode)\n  integration commit: ${commit}\n  build sha: abc`
 
@@ -102,10 +102,25 @@ describe('assertIntegrationMarker', () => {
     expect(result.message).toContain(commit)
   })
 
-  it('marker is a substring of probe output → ok', () => {
-    // #given — partial SHA match (first 8 chars) is sufficient for the probe
-    const commit = 'cafebabe'
-    const probeOutput = 'integration commit: cafebabe1234abcd'
+  it('marker only in unstructured position (not on dedicated line) → not ok', () => {
+    // #given — SHA appears in an error message, not in the structured "integration commit:" line.
+    // This is the wrong-binary-right-version case: a binary that prints the version but
+    // does NOT have the structured marker in the expected position.
+    const commit = 'cafebabe1234abcd'
+    const probeOutput = `1.15.13\nError: unknown commit cafebabe1234abcd referenced\n`
+
+    // #when
+    const result = assertIntegrationMarker(probeOutput, commit)
+
+    // #then — must fail: SHA in unstructured position is not sufficient
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('missing')
+  })
+
+  it('marker with leading/trailing whitespace on the structured line → ok', () => {
+    // #given — some whitespace variation is tolerated
+    const commit = 'cafebabe1234abcd'
+    const probeOutput = `harness (patched OpenCode)\n  integration commit:   ${commit}  \n  build sha: abc`
 
     // #when
     const result = assertIntegrationMarker(probeOutput, commit)
@@ -155,11 +170,11 @@ describe('assertExitZero', () => {
 
 describe('runVerifications', () => {
   it('all passing → ok with no failures', () => {
-    // #given / #when
+    // #given / #when — structured marker line as emitted by formatProvenance
     const result = runVerifications({
       versionOutput: '1.15.13',
       expectedVersion: '1.15.13',
-      probeOutput: 'integration commit: cafebabe1234',
+      probeOutput: 'harness (patched OpenCode)\n  integration commit: cafebabe1234\n  build sha: abc',
       integrationCommit: 'cafebabe1234',
       exitCode: 0,
     })
@@ -174,7 +189,7 @@ describe('runVerifications', () => {
     const result = runVerifications({
       versionOutput: '1.15.12',
       expectedVersion: '1.15.13',
-      probeOutput: 'integration commit: cafebabe1234',
+      probeOutput: 'harness (patched OpenCode)\n  integration commit: cafebabe1234\n  build sha: abc',
       integrationCommit: 'cafebabe1234',
       exitCode: 0,
     })
@@ -189,7 +204,7 @@ describe('runVerifications', () => {
     const result = runVerifications({
       versionOutput: '1.15.13',
       expectedVersion: '1.15.13',
-      probeOutput: 'integration commit: deadbeef',
+      probeOutput: 'harness (patched OpenCode)\n  integration commit: deadbeef\n  build sha: abc',
       integrationCommit: 'cafebabe1234',
       exitCode: 0,
     })
@@ -243,5 +258,21 @@ describe('runVerifications', () => {
     // #then
     expect(result.ok).toBe(true)
     expect(result.failures.length).toBe(0)
+  })
+
+  it('wrong-binary-right-version: version matches but structured marker absent → not ok', () => {
+    // #given — a stock opencode binary that prints the right version but has no harness provenance
+    const result = runVerifications({
+      versionOutput: '1.15.13',
+      expectedVersion: '1.15.13',
+      probeOutput: '1.15.13\n', // no "integration commit:" line
+      integrationCommit: 'cafebabe1234',
+      exitCode: 0,
+    })
+
+    // #then — version passes but marker check fails
+    expect(result.ok).toBe(false)
+    expect(result.failures.some(f => f.includes('missing'))).toBe(true)
+    expect(result.failures.some(f => f.includes('mismatch'))).toBe(false)
   })
 })

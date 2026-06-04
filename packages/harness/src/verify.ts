@@ -6,7 +6,11 @@
  *
  * Verification contract:
  *   1. --version output == expectedVersion (exact match, trimmed).
- *   2. Integration marker(s) present in --version or a dedicated probe output.
+ *   2. Integration marker present in a STRUCTURED position in the probe output.
+ *      The marker must appear on a dedicated line matching:
+ *        "  integration commit: <sha>"
+ *      This prevents a binary that merely mentions the SHA in unrelated output
+ *      from passing the check.
  *   3. Binary is executable (exit code 0 on --version).
  */
 
@@ -34,14 +38,17 @@ export function assertVersionMatch(actualVersion: string, expectedVersion: strin
 }
 
 /**
- * Asserts that the integration commit marker is present in the binary's output.
+ * Asserts that the integration commit marker is present in a STRUCTURED position
+ * in the binary's probe output.
  *
  * The integration marker is the frozen integration commit SHA embedded in the
- * binary's provenance. We probe it via `binary info` or a dedicated env var.
+ * binary's provenance. We probe it via `binary info` which outputs the harness
+ * provenance in a structured format. The marker must appear on a dedicated line:
  *
- * For the spike, we accept the marker in any of:
- *   - The --version output (if the binary embeds it there).
- *   - The probeOutput string (from `binary info` or similar).
+ *   "  integration commit: <sha>"
+ *
+ * This structured check prevents a binary that merely mentions the SHA in
+ * unrelated output (e.g. error messages, help text) from passing the check.
  *
  * An empty integrationCommit is treated as "no marker required" (dev scaffold).
  *
@@ -54,15 +61,25 @@ export function assertIntegrationMarker(probeOutput: string, integrationCommit: 
     return {ok: true, message: 'integration marker: not required (dev scaffold)'}
   }
 
-  // The marker must appear somewhere in the probe output.
-  if (probeOutput.includes(integrationCommit)) {
+  // The marker must appear on a dedicated structured line in the probe output.
+  // Format: "  integration commit: <sha>" (as emitted by `harness info` / formatProvenance).
+  // This prevents substring matches in unrelated output from passing.
+  const structuredMarkerPattern = new RegExp(
+    String.raw`^\s*integration commit:\s+${escapeRegex(integrationCommit)}\s*$`,
+    'm',
+  )
+  if (structuredMarkerPattern.test(probeOutput)) {
     return {ok: true, message: `integration marker present: ${integrationCommit}`}
   }
 
   return {
     ok: false,
-    message: `integration marker missing: '${integrationCommit}' not found in binary output`,
+    message: `integration marker missing: '${integrationCommit}' not found in structured position in binary output`,
   }
+}
+
+function escapeRegex(s: string): string {
+  return s.replaceAll(/[$()*+.?[\\\]^{|}]/g, String.raw`\$&`)
 }
 
 /**

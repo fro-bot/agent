@@ -27,8 +27,8 @@
   "scripts": {
     "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown",
     "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
-    "fix": "pnpm --dir ../.. exec eslint --fix packages/harness/src",
-    "lint": "pnpm --dir ../.. exec eslint packages/harness/src",
+    "fix": "pnpm --dir ../.. exec eslint --fix packages/harness/src packages/harness/scripts",
+    "lint": "pnpm --dir ../.. exec eslint packages/harness/src packages/harness/scripts",
     "postinstall": "node dist/postinstall.mjs || true",
     "test": "pnpm exec vitest run --passWithNoTests src"
   },

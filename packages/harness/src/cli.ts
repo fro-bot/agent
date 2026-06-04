@@ -16,8 +16,6 @@ import process from 'node:process'
 import {formatProvenance, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary} from './resolve-binary.js'
 
-const HARNESS_SUBCOMMANDS = new Set(['info', 'patches', 'doctor'])
-
 function printUsage(): void {
   console.log(`harness — patched OpenCode binary (Fro Bot integration)
 
@@ -58,7 +56,15 @@ function cmdPatches(): void {
 }
 
 function cmdDoctor(): number {
-  const binary = resolveBinary()
+  let binary
+  try {
+    binary = resolveBinary()
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    console.error(`\n[FAIL] ${msg}`)
+    return 1
+  }
+
   const p = getProvenance()
 
   console.log(`harness doctor`)
@@ -68,8 +74,12 @@ function cmdDoctor(): number {
   console.log(`  binary path:        ${binary.path}`)
   console.log(`  is built artifact:  ${binary.isBuilt}`)
 
-  if (!binary.resolved) {
-    console.error('\n[FAIL] No binary resolved. Install @fro.bot/harness or set OPENCODE_PATH.')
+  // In production (isBuilt: false with no dev escape hatch), fail with remediation.
+  if (!binary.isBuilt && process.env.HARNESS_ALLOW_PATH_FALLBACK !== '1' && process.env.OPENCODE_PATH === undefined) {
+    console.error('\n[FAIL] Binary is not a built harness artifact.')
+    console.error(
+      '       Install the platform package or set OPENCODE_PATH / HARNESS_ALLOW_PATH_FALLBACK=1 for dev use.',
+    )
     return 1
   }
 
@@ -81,15 +91,27 @@ function cmdDoctor(): number {
   }
 
   console.log(`  binary version:     ${version}`)
+
+  // Verify binary version matches provenance baseVersion when we have a built artifact.
+  if (binary.isBuilt && version !== p.baseVersion) {
+    console.error(
+      `\n[FAIL] Binary version mismatch: binary reports '${version}', provenance expects '${p.baseVersion}'.`,
+    )
+    console.error('       Reinstall @fro.bot/harness or check the platform package version.')
+    return 1
+  }
+
   console.log('\n[OK] Binary is present and runnable.')
   return 0
 }
 
 function cmdPassthrough(args: readonly string[]): number {
-  const binary = resolveBinary()
-
-  if (!binary.resolved) {
-    console.error('[harness] No binary resolved. Install @fro.bot/harness or set OPENCODE_PATH.')
+  let binary
+  try {
+    binary = resolveBinary()
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    console.error(`[harness] ${msg}`)
     return 1
   }
 
@@ -141,13 +163,6 @@ function main(): void {
 
   // Anything not in the reserved set passes through.
   // This includes no-args (which opencode handles as its own help/default).
-  if (subcommand !== undefined && HARNESS_SUBCOMMANDS.has(subcommand)) {
-    // Unreachable — all reserved subcommands handled above.
-    // Kept as a safety net to satisfy exhaustiveness.
-    console.error(`[harness] Unhandled reserved subcommand: ${subcommand}`)
-    process.exit(1)
-  }
-
   const code = cmdPassthrough(args)
   process.exit(code)
 }

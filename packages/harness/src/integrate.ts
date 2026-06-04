@@ -13,6 +13,8 @@
  * single source of truth — it is only written after all steps succeed (freeze).
  */
 
+// IntegrationRefRecord is the canonical type — defined once in provenance.ts.
+import type {IntegrationRefRecord} from './provenance.js'
 import type {IntegrationSource} from './sources.js'
 import {execFile} from 'node:child_process'
 import fs from 'node:fs/promises'
@@ -21,16 +23,12 @@ import process from 'node:process'
 import {promisify} from 'node:util'
 import {resolveSources} from './sources.js'
 
+// Re-export so callers that previously imported from integrate.ts still work.
+export type {IntegrationRefRecord} from './provenance.js'
+
 // ---------------------------------------------------------------------------
 // Provenance manifest types
 // ---------------------------------------------------------------------------
-
-export interface IntegrationRefRecord {
-  readonly ref: string
-  readonly resolvedSha: string
-  readonly reason?: string
-  readonly upstreamStatus?: string
-}
 
 export interface ProvenanceManifest {
   readonly baseVersion: string
@@ -253,7 +251,13 @@ export async function runIntegration(
   const branch = integrationBranch(baseVersion)
   const channel = 'latest'
 
-  const sources = resolveSources(integrationRefs, `https://github.com/${releaseRepo}.git`)
+  // Resolve sources — wrap in try/catch so invalid refs return {ok:false} instead of throwing.
+  let sources: IntegrationSource[]
+  try {
+    sources = resolveSources(integrationRefs, `https://github.com/${releaseRepo}.git`)
+  } catch (error) {
+    return {ok: false, error: `Resolve sources failed: ${errorMessage(error)}`}
+  }
 
   // Step 1: Clone the release repo.
   try {
@@ -324,14 +328,15 @@ export async function runIntegration(
   }
 
   // Step 9: Build the provenance manifest and freeze it.
+  // Per-ref SHA resolution is tracked separately; all refs share the integration commit for now.
   const manifest: ProvenanceManifest = {
     baseVersion,
     integrationRefs: sources.map((s, i) => ({
       ref: integrationRefs[i] ?? s.label,
-      resolvedSha: integrationCommit, // per-ref SHA resolution is a Unit 3 enhancement
+      resolvedSha: integrationCommit,
     })),
     integrationCommit,
-    buildSha: 'dev', // replaced by the per-platform build job in Unit 3
+    buildSha: 'dev', // replaced by the per-platform build job at publish time
   }
 
   try {

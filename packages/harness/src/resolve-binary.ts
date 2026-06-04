@@ -1,12 +1,16 @@
 /**
  * Resolves the patched OpenCode binary for the current host.
  *
- * Resolution order:
- *   0. OPENCODE_PATH env override (explicit override, always honoured).
+ * Resolution order (precedence, highest to lowest):
+ *   0. OPENCODE_PATH env override — always honoured; marks isBuilt: false.
  *   1. Host-platform optionalDependencies binary (the real harness-built artifact).
- *      Looks up the @fro.bot/harness-<os>-<arch> package installed alongside this
- *      package and integrity-verifies the binary before returning it.
- *   2. Dev/PATH fallback: `opencode` on PATH (dev scaffold, isBuilt: false).
+ *      Resolved via Node module resolution (createRequire) so pnpm/npm hoisting
+ *      is handled correctly — the platform package may be hoisted outside the
+ *      local node_modules tree.
+ *   2. PATH fallback (`opencode` on PATH) — ONLY when an explicit dev escape hatch
+ *      is active: HARNESS_ALLOW_PATH_FALLBACK=1 or OPENCODE_PATH is set.
+ *      In published/production use (no escape hatch), a missing platform binary
+ *      is a hard error with an actionable message.
  *
  * The integrity check in step 1 is a basic executable-probe (--version succeeds).
  * A full cryptographic integrity check (npm provenance) is enforced by the
@@ -15,10 +19,9 @@
  */
 
 import {execFileSync} from 'node:child_process'
-import {existsSync} from 'node:fs'
+import {createRequire} from 'node:module'
 import path from 'node:path'
 import process from 'node:process'
-import {fileURLToPath} from 'node:url'
 import {binaryPathInPackage, getHostPlatformInfo} from './platform.js'
 
 /**
@@ -35,42 +38,39 @@ export interface ResolvedBinary {
   readonly isBuilt: boolean
 }
 
-// The harness package root is two levels up from this compiled file (dist/resolve-binary.js → ../..)
-// At runtime (compiled), __dirname is packages/harness/dist.
-// At test time (ts-node/vitest), __dirname is packages/harness/src.
-// We resolve the package root by walking up to find package.json.
-function findPackageRoot(): string {
-  const here = path.dirname(fileURLToPath(import.meta.url))
-  // Walk up until we find a directory containing package.json for @fro.bot/harness.
-  // In practice: dist/ → packages/harness/ (one level up) or src/ → packages/harness/ (one level up).
-  const candidate = path.resolve(here, '..')
-  return candidate
-}
-
 /**
  * Attempts to resolve the host-platform binary from the installed
  * @fro.bot/harness-<os>-<arch> optionalDependencies package.
  *
+ * Uses Node module resolution (createRequire) to locate the package, which
+ * correctly handles pnpm/npm hoisting — the platform package may be installed
+ * outside the local node_modules tree.
+ *
  * Returns the binary path if found and executable, or null otherwise.
  */
 function resolveOptionalDepBinary(): string | null {
-  let info
+  const platformResult = getHostPlatformInfo()
+  if (!platformResult.ok) {
+    // Unsupported platform — no platform binary available.
+    return null
+  }
+
+  const info = platformResult.info
+
+  // Resolve the platform package via Node module resolution.
+  // This handles pnpm/npm hoisting correctly — the package may not be in
+  // a local node_modules directory.
+  const require = createRequire(import.meta.url)
+  let platformPkgRoot: string
   try {
-    info = getHostPlatformInfo()
+    const pkgJsonPath = require.resolve(`${info.packageName}/package.json`)
+    platformPkgRoot = path.dirname(pkgJsonPath)
   } catch {
-    // Unsupported platform or other error — fall through to dev scaffold.
+    // Platform package not installed (optional dependency absent).
     return null
   }
 
-  // The per-platform package is installed as a sibling of @fro.bot/harness in node_modules.
-  // Path: <packageRoot>/node_modules/@fro.bot/harness-<os>-<arch>/bin/opencode
-  const packageRoot = findPackageRoot()
-  const platformPkgRoot = path.join(packageRoot, 'node_modules', info.packageName)
   const binaryPath = binaryPathInPackage(platformPkgRoot, info)
-
-  if (!existsSync(binaryPath)) {
-    return null
-  }
 
   // Basic executable probe — confirm the binary runs before returning it.
   try {
@@ -86,12 +86,32 @@ function resolveOptionalDepBinary(): string | null {
 }
 
 /**
+ * Returns true when an explicit dev escape hatch is active.
+ *
+ * The escape hatch allows PATH fallback in local/dev/unbuilt environments.
+ * It is NEVER active in published/production use (no env set by default).
+ *
+ * Escape hatches:
+ *   - HARNESS_ALLOW_PATH_FALLBACK=1  — explicit opt-in for dev/CI without platform binary.
+ *   - OPENCODE_PATH set              — explicit override already provided; PATH fallback is moot.
+ */
+function isDevEscapeHatchActive(): boolean {
+  return (
+    process.env.HARNESS_ALLOW_PATH_FALLBACK === '1' ||
+    (process.env.OPENCODE_PATH !== undefined && process.env.OPENCODE_PATH.length > 0)
+  )
+}
+
+/**
  * Resolves the patched OpenCode binary for the current host.
  *
  * Resolution order:
  *   0. OPENCODE_PATH env override.
  *   1. Host-platform optionalDependencies binary (isBuilt: true).
- *   2. Dev/PATH fallback: `opencode` on PATH (isBuilt: false).
+ *   2. PATH fallback — ONLY when HARNESS_ALLOW_PATH_FALLBACK=1 (dev escape hatch).
+ *      In production (no escape hatch), missing platform binary → throws with remediation.
+ *
+ * @throws {Error} when no platform binary is found and no dev escape hatch is active.
  */
 export function resolveBinary(): ResolvedBinary {
   // 0. Explicit override — always wins.
@@ -106,8 +126,23 @@ export function resolveBinary(): ResolvedBinary {
     return {resolved: true, path: optionalBinary, isBuilt: true}
   }
 
-  // 2. Dev scaffold: fall back to `opencode` on PATH.
-  return {resolved: true, path: 'opencode', isBuilt: false}
+  // 2. No platform binary found.
+  //    In dev/unbuilt environments with an explicit escape hatch, fall back to PATH.
+  //    In production (no escape hatch), fail closed with an actionable error.
+  if (isDevEscapeHatchActive()) {
+    return {resolved: true, path: 'opencode', isBuilt: false}
+  }
+
+  // Determine which platform package was expected for the error message.
+  const platformResult = getHostPlatformInfo()
+  const expectedPkg = platformResult.ok ? platformResult.info.packageName : '@fro.bot/harness-<os>-<arch>'
+
+  throw new Error(
+    `[harness] Platform binary not found. Expected package: ${expectedPkg}\n` +
+      `  Remediation: ensure ${expectedPkg} is installed as an optionalDependency,\n` +
+      `  or set OPENCODE_PATH to an explicit binary path,\n` +
+      `  or set HARNESS_ALLOW_PATH_FALLBACK=1 to use opencode on PATH (dev only).`,
+  )
 }
 
 /**

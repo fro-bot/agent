@@ -2,17 +2,34 @@
 /**
  * build-platform.ts — per-platform native build of the integrated OpenCode.
  *
- * Given the frozen integration commit (from Unit 2's provenance manifest) and a
+ * Given the frozen integration commit (from the provenance manifest) and a
  * target platform, checks out the FULL upstream repo at that commit, runs upstream's
  * real build (packages/opencode/script/build.ts — the embedded-app + native-dep build)
  * with the release-identity env, and emits the native binary for that platform.
  *
- * Build-environment contract (from the plan):
+ * Build-environment contract:
  *   - Bun version is pinned to match upstream's packageManager (bun@1.3.13).
  *   - The full upstream repo is checked out at the frozen integration commit.
  *   - Native-dep install + embedded-app build happen under the UPSTREAM repo root.
- *   - Build runs with: OPENCODE_CHANNEL=latest OPENCODE_VERSION=<base> bun run build -- --single
- *   - Built binary --version is verified == base before emitting.
+ *   - Build runs with:
+ *       OPENCODE_CHANNEL=latest
+ *       OPENCODE_VERSION=<baseVersion>+harness.<integrationCommit[0..7]>
+ *     The version string embeds the integration commit short SHA so the binary
+ *     self-reports it. The upstream build bakes OPENCODE_VERSION into the binary
+ *     via the `define: { OPENCODE_VERSION: ... }` field in build.ts.
+ *   - Built binary --version is verified == OPENCODE_VERSION before emitting.
+ *   - provenance.json is written to packages/harness/ for the workflow assemble step.
+ *
+ * Integration commit embedding mechanism:
+ *   OpenCode's build.ts reads OPENCODE_VERSION from the environment (via the
+ *   @opencode-ai/script package's Script.version getter) and bakes it into the
+ *   binary as a compile-time define. We set OPENCODE_VERSION to
+ *   "<baseVersion>+harness.<shortSha>" so the binary's --version output includes
+ *   the integration commit. verify-binary.ts then probes `binary info` (which calls
+ *   formatProvenance) for the structured "integration commit: <sha>" line.
+ *
+ *   NOTE: The binary's --version output will be "<baseVersion>+harness.<shortSha>"
+ *   rather than the bare "<baseVersion>". The verify step uses the full version string.
  *
  * Usage:
  *   bun run packages/harness/scripts/build-platform.ts \
@@ -29,9 +46,11 @@
  */
 
 import {execFileSync, spawnSync} from 'node:child_process'
-import {cpSync, existsSync, mkdirSync} from 'node:fs'
+import {cpSync, mkdirSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
+import {fileURLToPath} from 'node:url'
+import {buildHarnessVersion} from '../src/version.js'
 
 // ---------------------------------------------------------------------------
 // Build-environment contract constants
@@ -108,8 +127,9 @@ Usage:
 Build-environment contract:
   - Bun ${REQUIRED_BUN_VERSION} required (matches upstream packageManager).
   - Full upstream repo checked out at the frozen integration commit.
-  - Build: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=<base> bun run build -- --single
-  - Built binary --version verified == base before emitting.
+  - Build: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=<base>+harness.<shortSha> bun run build -- --single
+  - Built binary --version verified == OPENCODE_VERSION before emitting.
+  - provenance.json written to packages/harness/ for the workflow assemble step.
   - Exits non-zero on any failure.
 `)
 }
@@ -155,7 +175,8 @@ function gitExec(args: string[], cwd?: string): void {
 }
 
 function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): void {
-  if (existsSync(workDir)) {
+  const workDirExists = spawnSync('test', ['-d', workDir]).status === 0
+  if (workDirExists) {
     console.log(`[build-platform] Work dir exists, fetching and resetting to ${commit}`)
     gitExec(['fetch', 'origin'], workDir)
     gitExec(['checkout', '--detach', commit], workDir)
@@ -171,10 +192,11 @@ function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): voi
 // Build invocation
 // ---------------------------------------------------------------------------
 
-function runUpstreamBuild(workDir: string, baseVersion: string): void {
+function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
   const opencodeDir = path.join(workDir, 'packages', 'opencode')
+  const opencodeVersion = buildHarnessVersion(baseVersion, integrationCommit)
   console.log(`[build-platform] Running upstream build in ${opencodeDir}`)
-  console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${baseVersion}`)
+  console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
 
   // Install native deps first (mirrors upstream build.ts skipInstall=false path).
   // The upstream build.ts does this internally, but we invoke it via `bun run build -- --single`
@@ -185,7 +207,7 @@ function runUpstreamBuild(workDir: string, baseVersion: string): void {
     env: {
       ...process.env,
       OPENCODE_CHANNEL,
-      OPENCODE_VERSION: baseVersion,
+      OPENCODE_VERSION: opencodeVersion,
     },
     timeout: 30 * 60 * 1000, // 30-minute hard timeout
   })
@@ -209,7 +231,8 @@ function resolveBuiltBinaryPath(workDir: string, platform: string, arch: string)
 function verifyBuiltBinary(binaryPath: string, expectedVersion: string): void {
   console.log(`[build-platform] Verifying binary: ${binaryPath} --version`)
 
-  if (!existsSync(binaryPath)) {
+  const binaryExists = spawnSync('test', ['-f', binaryPath]).status === 0
+  if (!binaryExists) {
     throw new Error(`Built binary not found at: ${binaryPath}`)
   }
 
@@ -256,6 +279,34 @@ function emitBinary(binaryPath: string, outDir: string, platform: string, arch: 
 }
 
 // ---------------------------------------------------------------------------
+// Provenance manifest emission
+// ---------------------------------------------------------------------------
+
+/**
+ * Writes provenance.json to packages/harness/ so the workflow assemble step
+ * can read it. This is the canonical provenance record for the build.
+ *
+ * The manifest records the integration commit, base version, and build SHA
+ * so the runtime getProvenance() function can serve it to `harness info`.
+ */
+function emitProvenanceManifest(
+  harnessPackageDir: string,
+  baseVersion: string,
+  integrationCommit: string,
+  buildSha: string,
+): void {
+  const manifest = {
+    baseVersion,
+    integrationRefs: [], // populated by the integration engine; preserved here as empty for build-only runs
+    integrationCommit,
+    buildSha,
+  }
+  const manifestPath = path.join(harnessPackageDir, 'provenance.json')
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+  console.log(`[build-platform] provenance.json written: ${manifestPath}`)
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -266,6 +317,9 @@ async function main(): Promise<void> {
   }
 
   const {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir} = args
+
+  // Derive the harness package directory (two levels up from this script).
+  const harnessPackageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
   console.log(`[build-platform] Starting build`)
   console.log(`  integration commit: ${integrationCommit}`)
@@ -287,17 +341,19 @@ async function main(): Promise<void> {
   }
 
   // 3. Run upstream's real build (embedded-app + native-dep build).
+  //    OPENCODE_VERSION embeds the integration commit short SHA for binary self-reporting.
   try {
-    runUpstreamBuild(workDir, baseVersion)
+    runUpstreamBuild(workDir, baseVersion, integrationCommit)
   } catch (error) {
     console.error(`[build-platform] Build failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
   }
 
-  // 4. Verify the built binary --version == base (build-environment contract).
+  // 4. Verify the built binary --version == OPENCODE_VERSION (build-environment contract).
   const binaryPath = resolveBuiltBinaryPath(workDir, platform, arch)
+  const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
   try {
-    verifyBuiltBinary(binaryPath, baseVersion)
+    verifyBuiltBinary(binaryPath, expectedVersion)
   } catch (error) {
     console.error(`[build-platform] Verification failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
@@ -308,6 +364,15 @@ async function main(): Promise<void> {
     emitBinary(binaryPath, outDir, platform, arch)
   } catch (error) {
     console.error(`[build-platform] Emit failed: ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  }
+
+  // 6. Write provenance.json for the workflow assemble step.
+  const buildSha = process.env.GITHUB_SHA ?? 'dev'
+  try {
+    emitProvenanceManifest(harnessPackageDir, baseVersion, integrationCommit, buildSha)
+  } catch (error) {
+    console.error(`[build-platform] Provenance emit failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
   }
 

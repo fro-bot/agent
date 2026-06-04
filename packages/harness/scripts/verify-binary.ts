@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * verify-binary.ts — spike: verify the built native binary before packaging.
+ * verify-binary.ts — verify the built native binary before packaging.
  *
  * Asserts:
  *   1. --version == base version (exact match).
@@ -25,6 +25,7 @@
 import {execFileSync} from 'node:child_process'
 import process from 'node:process'
 import {runVerifications} from '../src/verify.js'
+import {buildHarnessVersion} from '../src/version.js'
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -147,8 +148,17 @@ function main(): void {
 
   const {binaryPath, baseVersion, integrationCommit} = args
 
+  // Compute the full expected version string.
+  // When an integration commit is present, the binary self-reports the full
+  // harness version ("<baseVersion>+harness.<shortSha>") — not the bare base version.
+  // When absent (dev scaffold), the bare base version is used.
+  const expectedVersion =
+    integrationCommit !== null && integrationCommit.length > 0
+      ? buildHarnessVersion(baseVersion, integrationCommit)
+      : baseVersion
+
   console.log(`[verify-binary] Verifying binary: ${binaryPath}`)
-  console.log(`  expected version:   ${baseVersion}`)
+  console.log(`  expected version:   ${expectedVersion}`)
   console.log(`  integration commit: ${integrationCommit ?? '(none — dev scaffold)'}`)
 
   const probe = probeBinary(binaryPath)
@@ -158,7 +168,7 @@ function main(): void {
 
   const result = runVerifications({
     versionOutput: probe.versionOutput,
-    expectedVersion: baseVersion,
+    expectedVersion,
     probeOutput: probe.probeOutput,
     integrationCommit,
     exitCode: probe.exitCode,

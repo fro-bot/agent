@@ -33,7 +33,7 @@ export interface IntegrationSource {
  */
 export function parseSource(input: string, sourceRepo: string): IntegrationSource {
   const value = input.trim()
-  if (!value) throw new Error('Empty integration source in config branches')
+  if (value.length === 0) throw new Error('Empty integration source in config branches')
 
   if (!value.startsWith('https://github.com/')) {
     // Local branch name — fetch from the source repo.
