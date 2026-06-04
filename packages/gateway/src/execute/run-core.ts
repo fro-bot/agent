@@ -67,8 +67,8 @@ export interface RunCoreParams {
   readonly handle: OpenCodeServerHandle
   /**
    * Absolute path to the workspace repo checkout.
-   * Threaded to BOTH `promptAsync` and `event.subscribe` — required for SSE
-   * routing to deliver tool events.
+   * Threaded to `session.create`, `event.subscribe`, AND `promptAsync` — required
+   * for SSE routing to deliver tool events.
    */
   readonly directory: string
   /**
