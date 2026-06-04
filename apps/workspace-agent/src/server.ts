@@ -6,7 +6,7 @@
  */
 
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
-import type {CloneFailure, CloneRequest, HealthzResponse} from './types.js'
+import type {CloneFailure, CloneRequest, HealthzResponse, ReadyzResponse} from './types.js'
 
 import {Hono} from 'hono'
 import {executeClone, scrubCredentials} from './clone.js'
@@ -42,11 +42,22 @@ export function createApp(deps: ServerDeps = {}): Hono {
   const {cloneExecutor = executeClone, opencodeStatus} = deps
   const app = new Hono()
 
-  // GET /healthz — liveness probe
+  // GET /healthz — liveness probe (always 200; clone-only signal)
   app.get('/healthz', c => {
     const body: HealthzResponse =
       opencodeStatus === undefined ? {ok: true} : {ok: true, opencode: opencodeStatus.status}
     return c.json(body, 200)
+  })
+
+  // GET /readyz — readiness probe (200 only when OpenCode is ready; 503 otherwise)
+  app.get('/readyz', c => {
+    if (opencodeStatus === undefined) {
+      const body: ReadyzResponse = {ready: false, opencode: 'unknown'}
+      return c.json(body, 503)
+    }
+    const isReady = opencodeStatus.status === 'ready'
+    const body: ReadyzResponse = {ready: isReady, opencode: opencodeStatus.status}
+    return c.json(body, isReady ? 200 : 503)
   })
 
   // POST /clone — clone a GitHub repo into the workspace

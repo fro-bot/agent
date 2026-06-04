@@ -59,3 +59,10 @@ export interface HealthzResponse {
   /** OpenCode server readiness. Present when the server lifecycle is managed. */
   readonly opencode?: 'ready' | 'starting' | 'down'
 }
+
+/** GET /readyz response. */
+export interface ReadyzResponse {
+  readonly ready: boolean
+  /** OpenCode server readiness. 'unknown' when no status ref is available. */
+  readonly opencode: 'ready' | 'starting' | 'down' | 'unknown'
+}

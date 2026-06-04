@@ -410,3 +410,88 @@ describe('POST /clone — clone-timeout returns 504 (Fix #4)', () => {
     expect(body).toEqual({ok: false, error: 'clone-timeout'})
   })
 })
+
+describe('GET /readyz', () => {
+  it('returns 200 with ready: true when opencode status is "ready"', async () => {
+    // #given
+    const opencodeStatus = {status: 'ready' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/readyz')
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ready: true, opencode: 'ready'})
+  })
+
+  it('returns 503 with ready: false when opencode status is "starting"', async () => {
+    // #given
+    const opencodeStatus = {status: 'starting' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/readyz')
+
+    // #then
+    expect(res.status).toBe(503)
+    const body = await res.json()
+    expect(body).toEqual({ready: false, opencode: 'starting'})
+  })
+
+  it('returns 503 with ready: false when opencode status is "down"', async () => {
+    // #given
+    const opencodeStatus = {status: 'down' as const}
+    const app = createApp({opencodeStatus})
+
+    // #when
+    const res = await app.request('/readyz')
+
+    // #then
+    expect(res.status).toBe(503)
+    const body = await res.json()
+    expect(body).toEqual({ready: false, opencode: 'down'})
+  })
+
+  it('returns 503 (fail-closed) when no opencode status ref is provided', async () => {
+    // #given — createApp without opencodeStatus (clone-only mode)
+    const app = createApp()
+
+    // #when
+    const res = await app.request('/readyz')
+
+    // #then — unknown liveness → not ready
+    expect(res.status).toBe(503)
+    const body = await res.json()
+    expect(body).toEqual({ready: false, opencode: 'unknown'})
+  })
+
+  it('does not affect /healthz — always 200 regardless of opencode status', async () => {
+    // #given — test all three status values
+    const statuses = ['ready', 'starting', 'down'] as const
+    for (const status of statuses) {
+      const opencodeStatus = {status}
+      const app = createApp({opencodeStatus})
+
+      // #when
+      const res = await app.request('/healthz')
+
+      // #then — /healthz is always 200 (clone-only liveness invariant)
+      expect(res.status).toBe(200)
+    }
+  })
+
+  it('does not affect /healthz when no opencode status ref is provided', async () => {
+    // #given
+    const app = createApp()
+
+    // #when
+    const res = await app.request('/healthz')
+
+    // #then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ok: true})
+  })
+})
