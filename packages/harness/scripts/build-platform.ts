@@ -8,7 +8,7 @@
  * with the release-identity env, and emits the native binary for that platform.
  *
  * Build-environment contract:
- *   - Bun version is pinned to match upstream's packageManager (bun@1.3.13).
+ *   - Bun version is pinned to match upstream's packageManager (see HARNESS_BUN_VERSION).
  *   - The full upstream repo is checked out at the frozen integration commit.
  *   - Native-dep install + embedded-app build happen under the UPSTREAM repo root.
  *   - Build runs with:
@@ -50,14 +50,12 @@ import {cpSync, mkdirSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {HARNESS_BUN_VERSION as REQUIRED_BUN_VERSION} from '../src/bun-version.js'
 import {buildHarnessVersion} from '../src/version.js'
 
 // ---------------------------------------------------------------------------
 // Build-environment contract constants
 // ---------------------------------------------------------------------------
-
-/** Pinned Bun version — matches upstream anomalyco/opencode packageManager field. */
-const REQUIRED_BUN_VERSION = '1.3.13'
 
 /** The release channel used for the build identity env. */
 const OPENCODE_CHANNEL = 'latest'
