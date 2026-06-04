@@ -315,26 +315,6 @@ export interface RunSupervisedOpencodeOptions {
   readonly pollReadyFn?: PollReadyFn
 }
 
-/**
- * Supervised OpenCode lifecycle with bounded respawn and state machine.
- *
- * State transitions:
- *   starting → ready          (first or subsequent attempt succeeds)
- *   starting → starting       (set BEFORE killing child on respawn — fail-closed)
- *   ready    → starting       (post-ready exit detected; respawn if attempts remain)
- *   ready    → degraded       (post-ready exit, no attempts remain)
- *   starting → degraded       (all attempts exhausted without becoming ready)
- *
- * The supervisor writes all transitions to `statusRef.status`. The caller
- * (main.ts) shares this ref with the Hono app so /readyz reflects live state.
- *
- * SECURITY INVARIANTS preserved:
- * - Binds to 127.0.0.1 only.
- * - No token or credential is logged.
- * - Bounded retry: maxAttempts + per-attempt deadline prevent infinite respawn.
- *   Rapid crash loops (exit within stableReadyResetMs of becoming ready) consume
- *   the budget; stable runs (uptime >= stableReadyResetMs) reset it.
- */
 export async function runSupervisedOpencode(options: RunSupervisedOpencodeOptions): Promise<void> {
   const {
     rootDir,
@@ -358,147 +338,211 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
   let attempt = 1
   let backoffMs = initialBackoffMs
 
-  while (attempt <= maxAttempts) {
-    // Fix 4: stop immediately if the signal was already aborted before this spawn.
-    if (signal !== undefined && signal.aborted) {
-      return
+  // Memory-leak fix: register ONE abort handler outside the loop, referencing
+  // the current child via a mutable ref. This prevents O(N) listener accumulation
+  // on the shared AbortSignal across stable respawns (where attempt resets to 1).
+  // The handler is removed in the finally block when the supervisor returns.
+  //
+  // The same handler also resolves the post-ready wait (stored in postReadyResolve)
+  // so we never need a second listener on the signal for that purpose.
+  let currentChild: ChildHandle | null = null
+  let currentState: {exited: boolean} | null = null
+  let postReadyResolve: (() => void) | null = null
+
+  const onAbort = (): void => {
+    if (currentChild !== null && currentState !== null && currentState.exited === false) {
+      killChildGroup(currentChild)
     }
-
-    // Fail-closed: status is 'starting' (not-ready) before each spawn attempt.
-    // This ensures /readyz returns 503 during the kill→respawn transition.
-    statusRef.status = 'starting'
-
-    logger.info('opencode-server: supervisor spawning', {url, rootDir, attempt, maxAttempts})
-
-    // detached: true makes the child a process-group leader (pgid = pid) so
-    // killChildGroup can reap the whole group on timeout/abort/shutdown.
-    const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
-      cwd: rootDir,
-      env: process.env,
-      detached: true,
-    })
-
-    // Per-attempt mutable state.
-    const state: {exited: boolean; exitCode: number | null; becameReady: boolean} = {
-      exited: false,
-      exitCode: null,
-      becameReady: false,
+    // Unblock the post-ready wait if it's active.
+    if (postReadyResolve !== null) {
+      postReadyResolve()
     }
+  }
 
-    child.on('exit', (code: unknown) => {
-      state.exited = true
-      state.exitCode = typeof code === 'number' ? code : null
-      logger.info('opencode-server: process exited', {code: state.exitCode, attempt})
+  if (signal !== undefined) {
+    signal.addEventListener('abort', onAbort)
+  }
 
-      // POST-READY EXIT LATCH FIX: if the child exits after we marked it ready,
-      // flip status back to not-ready immediately. The outer loop will decide
-      // whether to respawn (if attempts remain) or go to degraded.
-      if (state.becameReady === true && statusRef.status === 'ready') {
-        logger.warn('opencode-server: process exited after becoming ready — flipping to starting', {
-          code: state.exitCode,
-          attempt,
-        })
-        statusRef.status = 'starting'
-      }
-    })
-
-    child.on('error', (err: unknown) => {
-      state.exited = true
-      const message = err instanceof Error ? err.message : String(err)
-      logger.error('opencode-server: spawn error', {message, attempt})
-    })
-
-    // Fix 4: Abort signal integration — reap the whole process group on external abort.
-    // With detached:true the child is in its OWN process group and does NOT inherit
-    // SIGTERM from the parent. We must explicitly reap it via killChildGroup.
-    if (signal !== undefined) {
-      signal.addEventListener('abort', () => {
-        if (state.exited === false) {
-          killChildGroup(child)
-        }
-      })
-    }
-
-    // Per-attempt readiness loop with a fresh deadline.
-    const deadline = Date.now() + readyTimeoutMs
-    let becameReady = false
-    let readyAt = 0
-
-    while (Date.now() < deadline) {
-      // Fix 4: abort check inside the readiness poll loop.
+  try {
+    while (attempt <= maxAttempts) {
+      // Fix 4: stop immediately if the signal was already aborted before this spawn.
       if (signal !== undefined && signal.aborted) {
-        if (state.exited === false) {
-          killChildGroup(child)
-        }
         return
       }
 
-      if (state.exited === true) {
-        // Process exited before becoming ready — break to respawn logic.
-        break
+      // Fail-closed: status is 'starting' (not-ready) before each spawn attempt.
+      // This ensures /readyz returns 503 during the kill→respawn transition.
+      statusRef.status = 'starting'
+
+      logger.info('opencode-server: supervisor spawning', {url, rootDir, attempt, maxAttempts})
+
+      // detached: true makes the child a process-group leader (pgid = pid) so
+      // killChildGroup can reap the whole group on timeout/abort/shutdown.
+      const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
+        cwd: rootDir,
+        env: process.env,
+        detached: true,
+      })
+
+      // Per-attempt mutable state.
+      const state: {exited: boolean; exitCode: number | null; becameReady: boolean} = {
+        exited: false,
+        exitCode: null,
+        becameReady: false,
       }
 
-      const ready = await pollReadyFn(url, signal)
-      if (ready === true) {
-        becameReady = true
-        readyAt = Date.now()
-        state.becameReady = true
-        statusRef.status = 'ready'
-        logger.info('opencode-server: ready', {url, attempt})
-        break
-      }
+      // Update the mutable refs so the single top-level onAbort handler targets
+      // the current child. This must happen before any await so the handler is
+      // always pointing at the live child when abort fires.
+      currentChild = child
+      currentState = state
 
-      await sleep(pollIntervalMs)
-    }
+      child.on('exit', (code: unknown) => {
+        state.exited = true
+        state.exitCode = typeof code === 'number' ? code : null
+        logger.info('opencode-server: process exited', {code: state.exitCode, attempt})
 
-    if (becameReady === true) {
-      // Server is ready. Now wait for it to exit (post-ready monitoring).
-      // This is the latch fix: we don't return immediately — we stay in the
-      // loop waiting for an unexpected exit so we can flip status and respawn.
-      await new Promise<void>(resolve => {
-        if (state.exited === true) {
-          resolve()
+        // POST-READY EXIT LATCH FIX: if the child exits after we marked it ready,
+        // flip status back to not-ready immediately. The outer loop will decide
+        // whether to respawn (if attempts remain) or go to degraded.
+        if (state.becameReady === true && statusRef.status === 'ready') {
+          logger.warn('opencode-server: process exited after becoming ready — flipping to starting', {
+            code: state.exitCode,
+            attempt,
+          })
+          statusRef.status = 'starting'
+        }
+      })
+
+      child.on('error', (err: unknown) => {
+        state.exited = true
+        const message = err instanceof Error ? err.message : String(err)
+        logger.error('opencode-server: spawn error', {message, attempt})
+      })
+
+      // Per-attempt readiness loop with a fresh deadline.
+      const deadline = Date.now() + readyTimeoutMs
+      let becameReady = false
+      let readyAt = 0
+
+      while (Date.now() < deadline) {
+        // Fix 4: abort check inside the readiness poll loop.
+        if (signal !== undefined && signal.aborted) {
+          if (state.exited === false) {
+            killChildGroup(child)
+          }
           return
         }
-        // Fix 4: also resolve immediately if the signal aborts (abort handler
-        // already called killChildGroup; we just need to unblock the wait).
-        if (signal !== undefined) {
-          signal.addEventListener('abort', () => resolve())
-        }
-        child.on('exit', () => resolve())
-      })
 
-      // Fix 4: if we were aborted during post-ready monitoring, stop here.
-      if (signal !== undefined && signal.aborted) {
+        if (state.exited === true) {
+          // Process exited before becoming ready — break to respawn logic.
+          break
+        }
+
+        const ready = await pollReadyFn(url, signal)
+        if (ready === true) {
+          becameReady = true
+          readyAt = Date.now()
+          state.becameReady = true
+          statusRef.status = 'ready'
+          logger.info('opencode-server: ready', {url, attempt})
+          break
+        }
+
+        await sleep(pollIntervalMs)
+      }
+
+      if (becameReady === true) {
+        // Server is ready. Now wait for it to exit (post-ready monitoring).
+        // This is the latch fix: we don't return immediately — we stay in the
+        // loop waiting for an unexpected exit so we can flip status and respawn.
+        //
+        // Memory-leak fix for the post-ready wait: we must NOT add another
+        // listener on the shared signal here. Instead, the top-level onAbort
+        // handler resolves the wait via the postReadyResolve ref — zero extra
+        // listeners on the signal.
+        await new Promise<void>(resolve => {
+          if (state.exited === true) {
+            resolve()
+            return
+          }
+          // Fix 4: also resolve immediately if the signal aborts (the top-level
+          // onAbort handler already called killChildGroup and will call
+          // postReadyResolve — we just need to register the resolver here).
+          postReadyResolve = resolve
+          child.on('exit', () => {
+            postReadyResolve = null
+            resolve()
+          })
+        })
+
+        // Fix 4: if we were aborted during post-ready monitoring, stop here.
+        if (signal !== undefined && signal.aborted) {
+          return
+        }
+
+        // Fix 2: compute uptime since the child became ready.
+        const uptime = Date.now() - readyAt
+        const wasStable = uptime >= stableReadyResetMs
+
+        if (wasStable) {
+          // Stable run: reset the attempt counter and backoff so only RAPID
+          // crash loops consume the bounded budget.
+          logger.info('opencode-server: stable run detected — resetting respawn budget', {
+            uptime,
+            stableReadyResetMs,
+            attempt,
+          })
+          attempt = 1
+          backoffMs = initialBackoffMs
+        }
+
+        // Child has now exited. Decide whether to respawn.
+        if (attempt < maxAttempts) {
+          // Respawn: set status to starting BEFORE killing (already exited, but
+          // the status flip is the load-bearing invariant).
+          statusRef.status = 'starting'
+          logger.warn('opencode-server: supervisor respawning after post-ready exit', {
+            attempt,
+            nextAttempt: attempt + 1,
+            maxAttempts,
+            wasStable,
+          })
+          // Apply backoff before next attempt (abortable — Fix 4).
+          if (backoffMs > 0 && (signal === undefined || !signal.aborted)) {
+            await sleep(backoffMs, undefined, {signal}).catch(() => {
+              // Abort during backoff — stop immediately.
+            })
+          }
+          if (signal !== undefined && signal.aborted) {
+            return
+          }
+          backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+          attempt++
+          continue
+        }
+
+        // No attempts remain — terminal degraded state.
+        statusRef.status = 'degraded'
+        logger.error('opencode-server: supervisor exhausted attempts after post-ready exit', {
+          attempt,
+          maxAttempts,
+        })
         return
       }
 
-      // Fix 2: compute uptime since the child became ready.
-      const uptime = Date.now() - readyAt
-      const wasStable = uptime >= stableReadyResetMs
-
-      if (wasStable) {
-        // Stable run: reset the attempt counter and backoff so only RAPID
-        // crash loops consume the bounded budget.
-        logger.info('opencode-server: stable run detected — resetting respawn budget', {
-          uptime,
-          stableReadyResetMs,
-          attempt,
-        })
-        attempt = 1
-        backoffMs = initialBackoffMs
+      // Did not become ready (timeout or early exit).
+      // Reap the whole process group (fail-closed: status is already 'starting').
+      if (state.exited === false) {
+        killChildGroup(child)
       }
 
-      // Child has now exited. Decide whether to respawn.
       if (attempt < maxAttempts) {
-        // Respawn: set status to starting BEFORE killing (already exited, but
-        // the status flip is the load-bearing invariant).
-        statusRef.status = 'starting'
-        logger.warn('opencode-server: supervisor respawning after post-ready exit', {
+        logger.warn('opencode-server: supervisor attempt failed, will respawn', {
           attempt,
           nextAttempt: attempt + 1,
           maxAttempts,
-          wasStable,
+          backoffMs,
         })
         // Apply backoff before next attempt (abortable — Fix 4).
         if (backoffMs > 0 && (signal === undefined || !signal.aborted)) {
@@ -514,49 +558,20 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
         continue
       }
 
-      // No attempts remain — terminal degraded state.
+      // All attempts exhausted — terminal degraded state.
+      // Clone API (:9100) stays alive; /readyz returns 503.
       statusRef.status = 'degraded'
-      logger.error('opencode-server: supervisor exhausted attempts after post-ready exit', {
+      logger.error('opencode-server: supervisor exhausted all attempts', {
         attempt,
         maxAttempts,
       })
       return
     }
-
-    // Did not become ready (timeout or early exit).
-    // Reap the whole process group (fail-closed: status is already 'starting').
-    if (state.exited === false) {
-      killChildGroup(child)
+  } finally {
+    // Memory-leak fix: always remove the top-level abort listener when the
+    // supervisor returns (whether normally, via abort, or via degraded state).
+    if (signal !== undefined) {
+      signal.removeEventListener('abort', onAbort)
     }
-
-    if (attempt < maxAttempts) {
-      logger.warn('opencode-server: supervisor attempt failed, will respawn', {
-        attempt,
-        nextAttempt: attempt + 1,
-        maxAttempts,
-        backoffMs,
-      })
-      // Apply backoff before next attempt (abortable — Fix 4).
-      if (backoffMs > 0 && (signal === undefined || !signal.aborted)) {
-        await sleep(backoffMs, undefined, {signal}).catch(() => {
-          // Abort during backoff — stop immediately.
-        })
-      }
-      if (signal !== undefined && signal.aborted) {
-        return
-      }
-      backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
-      attempt++
-      continue
-    }
-
-    // All attempts exhausted — terminal degraded state.
-    // Clone API (:9100) stays alive; /readyz returns 503.
-    statusRef.status = 'degraded'
-    logger.error('opencode-server: supervisor exhausted all attempts', {
-      attempt,
-      maxAttempts,
-    })
-    return
   }
 }

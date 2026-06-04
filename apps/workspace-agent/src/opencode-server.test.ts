@@ -1581,3 +1581,120 @@ describe('process-group reaping (Unit 6) — supervised respawn group kill', () 
     expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
   })
 })
+
+// ── Memory-leak regression: abort-listener retention across stable respawns ───
+//
+// Regression test for the bug where `signal.addEventListener('abort', …)` was
+// called TWICE per while-loop iteration and never removed. With the stable-ready
+// reset feature (`attempt = 1`), a long-lived workspace that crashes occasionally
+// respawns indefinitely — causing abort listeners to accumulate without bound on
+// the single shared AbortSignal, and each captured closure retaining its dead
+// child so children are never GC'd.
+//
+// Fix: register the abort handler ONCE outside the loop (register-once pattern)
+// and remove it in a finally block when the supervisor returns.
+//
+// This test drives N stable respawns and asserts that the NET number of 'abort'
+// listeners on the signal never exceeds 1 at any point during the run.
+
+describe('runSupervisedOpencode — abort-listener retention (memory-leak regression)', () => {
+  it('abort listener count stays ≤ 1 across multiple stable respawns (register-once)', async () => {
+    // #given — tiny stableReadyResetMs so each child quickly qualifies as stable
+    const stableReadyResetMs = 20
+    const maxAttempts = 4
+    const respawnCycles = 6 // more than maxAttempts to prove budget resets
+
+    // Track net addEventListener/removeEventListener calls on the signal
+    const ac = new AbortController()
+    const signal = ac.signal
+
+    let netListeners = 0
+    let maxObservedListeners = 0
+
+    const origAdd = signal.addEventListener.bind(signal)
+    const origRemove = signal.removeEventListener.bind(signal)
+
+    vi.spyOn(signal, 'addEventListener').mockImplementation((...args: Parameters<typeof signal.addEventListener>) => {
+      if (args[0] === 'abort') {
+        netListeners++
+        if (netListeners > maxObservedListeners) {
+          maxObservedListeners = netListeners
+        }
+      }
+      return origAdd(...args)
+    })
+
+    vi.spyOn(signal, 'removeEventListener').mockImplementation(
+      (...args: Parameters<typeof signal.removeEventListener>) => {
+        if (args[0] === 'abort') {
+          netListeners--
+        }
+        return origRemove(...args)
+      },
+    )
+
+    // Build respawnCycles+1 controllable children
+    const children = Array.from({length: respawnCycles + 1}, () => makeControllableChild())
+    let childIdx = 0
+    const spawnFn: SpawnFn = () => {
+      const c = children[childIdx]
+      if (c === undefined) throw new Error('ran out of children')
+      childIdx++
+      return c.child
+    }
+
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    // #when — run the supervisor through respawnCycles stable exits
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal,
+      spawnFn,
+      pollReadyFn: alwaysReady,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 5000,
+      maxAttempts,
+      initialBackoffMs: 0,
+      stableReadyResetMs,
+    })
+
+    for (let i = 0; i < respawnCycles; i++) {
+      // Wait for ready
+      await new Promise<void>(resolve => {
+        const check = (): void => {
+          if (statusRef.status === 'ready') resolve()
+          else setImmediate(check)
+        }
+        setImmediate(check)
+      })
+
+      // Wait past the stable threshold, then trigger exit to force a respawn
+      await new Promise<void>(r => setTimeout(r, stableReadyResetMs + 10))
+      children[i]?.triggerExit(0)
+    }
+
+    // Wait for the last child to become ready, then abort to stop the supervisor
+    await new Promise<void>(resolve => {
+      const check = (): void => {
+        if (statusRef.status === 'ready') resolve()
+        else setImmediate(check)
+      }
+      setImmediate(check)
+    })
+
+    ac.abort()
+    children[respawnCycles]?.triggerExit(0)
+
+    await supervisorPromise.catch(() => undefined)
+
+    // #then — the abort listener count must NEVER have exceeded 1 during the run.
+    // Before the fix: maxObservedListeners grows with each respawn (2 per iteration).
+    // After the fix: exactly 1 listener registered once, removed in finally.
+    expect(maxObservedListeners).toBeLessThanOrEqual(1)
+
+    // Net count must be 0 after the supervisor returns (finally cleanup ran).
+    expect(netListeners).toBe(0)
+  })
+})
