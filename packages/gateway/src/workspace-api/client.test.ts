@@ -222,6 +222,42 @@ describe('WorkspaceClient.readyz', () => {
       expect(result).toEqual(err({kind: 'parse-error'}))
       vi.unstubAllGlobals()
     })
+
+    it('503 response with ready:true body → returns err (status/body mismatch, fail-closed)', async () => {
+      // #given — a not-ready workspace lying about its status; must be rejected fail-closed
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: true, opencode: 'ready'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then — status↔body mismatch → parse-error (fail-closed, not treated as ready)
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('200 response with ready:false body → returns err (status/body mismatch)', async () => {
+      // #given — incoherent response: HTTP 200 but body says not ready
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ready: false, opencode: 'down'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then — status↔body mismatch → parse-error
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
   })
 })
 

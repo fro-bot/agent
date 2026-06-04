@@ -95,7 +95,17 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
       return err({kind: 'parse-error'})
     }
 
-    if (!isReadyzResponse(parsed)) {
+    if (isReadyzResponse(parsed) === false) {
+      return err({kind: 'parse-error'})
+    }
+
+    // Status↔body coherence check: HTTP status must agree with the body's ready field.
+    // A 503 + {ready:true} would be a fail-OPEN (not-ready workspace classified as ready).
+    // A 200 + {ready:false} is also incoherent. Both are treated as parse-error (fail-closed).
+    if (httpStatus === 200 && parsed.ready !== true) {
+      return err({kind: 'parse-error'})
+    }
+    if (httpStatus === 503 && parsed.ready !== false) {
       return err({kind: 'parse-error'})
     }
 

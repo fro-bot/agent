@@ -57,7 +57,7 @@ export function createApp(deps: ServerDeps = {}): Hono {
     }
     const isReady = opencodeStatus.status === 'ready'
     const body: ReadyzResponse = {ready: isReady, opencode: opencodeStatus.status}
-    return c.json(body, isReady ? 200 : 503)
+    return c.json(body, isReady === true ? 200 : 503)
   })
 
   // POST /clone — clone a GitHub repo into the workspace
