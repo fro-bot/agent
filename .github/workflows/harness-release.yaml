@@ -208,7 +208,7 @@ jobs:
       - name: Upgrade npm to a trusted-publishing-capable version
         # Trusted publishing (OIDC) requires npm >= 11.5.0; Node 24 ships an older npm.
         # Pinned to a reviewed version that supports trusted publishing.
-        run: npm install -g npm@11.5.1
+        run: npm install -g npm@11.16.0
 
       - name: Install harness dependencies
         run: pnpm install --filter @fro.bot/harness --frozen-lockfile
