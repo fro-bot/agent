@@ -196,9 +196,24 @@ function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommi
   console.log(`[build-platform] Running upstream build in ${opencodeDir}`)
   console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
 
-  // Install native deps first (mirrors upstream build.ts skipInstall=false path).
-  // The upstream build.ts does this internally, but we invoke it via `bun run build -- --single`
-  // which triggers the full build.ts including the bun install steps.
+  // Root workspace install — mirrors upstream's setup-bun action which runs `bun install`
+  // at the repo root (with --linker hoisted on Linux) before invoking build.ts.
+  // This wires workspace symlinks (e.g. @opencode-ai/script) into node_modules so
+  // packages/opencode/script/build.ts can resolve them at module load time.
+  // The --single build below compiles just this platform's binary.
+  console.log(`[build-platform] Installing workspace dependencies (bun install) in ${workDir}`)
+  const installArgs = process.platform === 'linux' ? ['install', '--linker', 'hoisted'] : ['install']
+  const installResult = spawnSync('bun', installArgs, {
+    cwd: workDir,
+    stdio: 'inherit',
+    env: {...process.env},
+    timeout: 20 * 60 * 1000, // 20-minute hard timeout
+  })
+
+  if (installResult.status !== 0) {
+    throw new Error(`Workspace install failed with exit code ${installResult.status ?? 'unknown'}`)
+  }
+
   const result = spawnSync('bun', ['run', 'build', '--', '--single'], {
     cwd: opencodeDir,
     stdio: 'inherit',
