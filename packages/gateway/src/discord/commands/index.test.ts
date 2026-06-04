@@ -25,6 +25,7 @@ function makeMockDeps(): AddProjectDeps {
     },
     workspaceClient: {
       clone: vi.fn(),
+      readyz: vi.fn().mockResolvedValue({success: true, data: {ready: true, opencode: 'ready'}}),
     },
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: {

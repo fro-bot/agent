@@ -6,6 +6,280 @@ import {describe, expect, it, vi} from 'vitest'
 import {createWorkspaceClient} from './client.js'
 
 // ---------------------------------------------------------------------------
+// readyz tests
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceClient.readyz', () => {
+  describe('200 response → ready', () => {
+    it('returns ready:true when server responds 200 with {ready:true, opencode:"ready"}', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ready: true, opencode: 'ready'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: true, opencode: 'ready'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('gETs /readyz on the same base URL as /clone', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ready: true, opencode: 'ready'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      await client.readyz()
+
+      // #then
+      expect(fetchMock).toHaveBeenCalledWith('http://workspace:9100/readyz', expect.objectContaining({method: 'GET'}))
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('503 response → not-ready', () => {
+    it('returns ready:false with opencode status when server responds 503', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: false, opencode: 'starting'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: false, opencode: 'starting'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns ready:false with opencode:"down" when server responds 503 with down status', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: false, opencode: 'down'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: false, opencode: 'down'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns ready:false with opencode:"degraded" when server responds 503 with degraded status', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: false, opencode: 'degraded'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: false, opencode: 'degraded'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns ready:false with opencode:"unknown" when server responds 503 with unknown status', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: false, opencode: 'unknown'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: false, opencode: 'unknown'}))
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('transport error / non-200-503 / timeout → error result', () => {
+    it('returns network-error on connection refused', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockRejectedValue(Object.assign(new Error('ECONNREFUSED'), {name: 'TypeError'}))
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'network-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns timeout on AbortSignal.timeout expiry (TimeoutError)', async () => {
+      // #given
+      const client = makeClient()
+      const timeoutErr = Object.assign(new Error('The operation was aborted due to timeout'), {name: 'TimeoutError'})
+      const fetchMock = vi.fn().mockRejectedValue(timeoutErr)
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns timeout on AbortError', async () => {
+      // #given
+      const client = makeClient()
+      const abortErr = Object.assign(new Error('The operation was aborted'), {name: 'AbortError'})
+      const fetchMock = vi.fn().mockRejectedValue(abortErr)
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'timeout'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error on unexpected non-200-non-503 status (e.g. 500)', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: async () => undefined,
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 500}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns http-error on 404 (unexpected status)', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => undefined,
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 404}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns parse-error when 200 body is not valid JSON', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError('Unexpected token')
+        },
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('returns parse-error when 200 body has wrong shape', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({unexpected: 'shape'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('503 response with ready:true body → returns err (status/body mismatch, fail-closed)', async () => {
+      // #given — a not-ready workspace lying about its status; must be rejected fail-closed
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: true, opencode: 'ready'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then — status↔body mismatch → parse-error (fail-closed, not treated as ready)
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('200 response with ready:false body → returns err (status/body mismatch)', async () => {
+      // #given — incoherent response: HTTP 200 but body says not ready
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ready: false, opencode: 'down'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then — status↔body mismatch → parse-error
+      expect(result).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

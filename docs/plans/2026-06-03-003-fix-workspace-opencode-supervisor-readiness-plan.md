@@ -494,8 +494,8 @@ at the top of `opencode-server.ts`.
   optionally set `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` if 60s is still tight). Note: PR 1 fixes supervisor startup only —
   until PR 2 ships there is no gateway liveness gate, so a genuinely-dead workspace (vs. merely slow) would still receive
   mention runs; until PR 3 ships a startup failure is still one-shot. End-to-end recovery requires all three.
-- File a tracking issue for the deferred hardening (gateway SDK call signals + proxy upstream timeout) and reference it
-  from this plan.
+- Deferred hardening (gateway SDK call signals + proxy upstream timeout + readiness depth + test gaps) is tracked in
+  issue #763.
 
 ## Sources & References
 
