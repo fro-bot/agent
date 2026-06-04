@@ -159,6 +159,7 @@ function makeWorkspaceClient(overrides?: {clone?: ReturnType<typeof vi.fn>}): Wo
     clone:
       overrides?.clone ??
       vi.fn().mockResolvedValue(ok({ok: true, path: '/workspace/repos/testowner/testrepo', commit: 'abc123'})),
+    readyz: vi.fn().mockResolvedValue(ok({ready: true, opencode: 'ready'})),
   } as unknown as WorkspaceClient
 }
 
