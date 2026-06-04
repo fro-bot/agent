@@ -8,7 +8,7 @@
 import type {SpawnFn} from './opencode-server.js'
 
 import {EventEmitter} from 'node:events'
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {defaultPollReady, runSupervisedOpencode, startOpencodeServer} from './opencode-server.js'
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -785,5 +785,354 @@ describe('runSupervisedOpencode — fail-closed transition (Unit 5)', () => {
     expect(statusAtKill.length).toBeGreaterThan(0)
     expect(statusAtKill[0]).toBe('starting')
     expect(wasReady).toBe(true)
+  })
+})
+
+// ── Unit 6: Process-group reaping tests ──────────────────────────────────────
+//
+// These tests verify that:
+// 1. When child.pid is a number, kill uses process.kill(-pid, 'SIGTERM') (group kill).
+// 2. When child.pid is undefined, falls back to child.kill('SIGTERM').
+// 3. spawnFn is called with detached: true.
+// 4. Security invariants: loopback bind unchanged, no secret/token logging on kill path.
+// 5. Abort path uses the group-kill helper when pid is present.
+//
+// Strategy for existing kill-assertion tests:
+// - makeFakeChild() and makeControllableChild() do NOT set a pid, so they use the
+//   fallback path (child.kill('SIGTERM')). Existing assertions remain valid.
+// - New tests use makeFakeChildWithPid() which sets pid, triggering the group-kill path.
+//   Those tests spy on process.kill and assert the negative-pid call.
+
+/**
+ * Create a fake child with a numeric pid. The kill spy is a vi.fn() so we can
+ * assert it was or was not called. process.kill is spied separately per test.
+ */
+function makeFakeChildWithPid(pid: number, opts: {exitImmediately?: boolean; exitCode?: number | null} = {}) {
+  const emitter = new EventEmitter()
+  let exited = false
+
+  if (opts.exitImmediately === true) {
+    setImmediate(() => {
+      exited = true
+      emitter.emit('exit', opts.exitCode ?? 1)
+    })
+  }
+
+  const killSpy = vi.fn((_sig?: string): boolean => {
+    if (exited === false) {
+      exited = true
+      setImmediate(() => emitter.emit('exit', 0))
+    }
+    return true
+  })
+
+  const child = {
+    pid,
+    kill: killSpy,
+    on: (event: string | symbol, listener: (...args: unknown[]) => void): void => {
+      emitter.on(event, listener)
+    },
+  }
+
+  return {child, killSpy}
+}
+
+/** Build a SpawnFn that records spawn options (including detached) in spawnOpts[]. */
+function makeSpawnFnWithOpts(
+  fakeChild: ReturnType<typeof makeFakeChildWithPid>['child'],
+  spawnOpts: {
+    command: string
+    args: readonly string[]
+    options: {readonly cwd?: string; readonly env?: NodeJS.ProcessEnv; readonly detached?: boolean}
+  }[] = [],
+): SpawnFn {
+  return (command, args, opts) => {
+    spawnOpts.push({command, args, options: opts})
+    return fakeChild
+  }
+}
+
+describe('process-group reaping (Unit 6) — group kill when pid is present', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('calls process.kill(-pid, SIGTERM) on timeout when child.pid is a number', async () => {
+    // #given — child with pid 12345; server never becomes ready → timeout kill
+    const pid = 12345
+    const {child} = makeFakeChildWithPid(pid)
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFnWithOpts(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1, // immediate timeout
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — group kill via negative pid
+    expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
+  })
+
+  it('falls back to child.kill(SIGTERM) on timeout when child.pid is undefined', async () => {
+    // #given — child WITHOUT pid (existing makeFakeChild pattern); server never ready
+    const {child, killCalls} = makeFakeChild({})
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — timeout fires
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFn(child),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — fallback: child.kill called, NOT process.kill(-pid)
+    expect(killCalls).toContain('SIGTERM')
+    // process.kill should NOT have been called with a negative pid
+    const negPidCalls = processKillSpy.mock.calls.filter(([p]) => typeof p === 'number' && p < 0)
+    expect(negPidCalls).toHaveLength(0)
+  })
+
+  it('spawns with detached: true', async () => {
+    // #given — capture spawn options
+    const pid = 99999
+    const {child} = makeFakeChildWithPid(pid)
+    const spawnOpts: {
+      command: string
+      args: readonly string[]
+      options: {readonly cwd?: string; readonly env?: NodeJS.ProcessEnv; readonly detached?: boolean}
+    }[] = []
+    vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    // #when — start server (will timeout, but we only care about spawn options)
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFnWithOpts(child, spawnOpts),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow()
+
+    // #then — detached: true was passed to spawnFn
+    expect(spawnOpts).toHaveLength(1)
+    expect(spawnOpts[0]?.options).toMatchObject({detached: true})
+  })
+
+  it('bind remains 127.0.0.1 and no secret/token is logged on the kill path', async () => {
+    // #given — capture log calls; child with pid
+    const pid = 11111
+    const {child} = makeFakeChildWithPid(pid)
+    vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    const loggedMeta: (Record<string, unknown> | undefined)[] = []
+    const logger = {
+      info: (_msg: string, meta?: Record<string, unknown>) => {
+        loggedMeta.push(meta)
+      },
+      warn: (_msg: string, meta?: Record<string, unknown>) => {
+        loggedMeta.push(meta)
+      },
+      error: (_msg: string, meta?: Record<string, unknown>) => {
+        loggedMeta.push(meta)
+      },
+    }
+
+    const spawnOpts: {command: string; args: readonly string[]; options: Record<string, unknown>}[] = []
+
+    // #when — timeout fires (triggers kill path)
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger,
+        hostname: '127.0.0.1',
+        port: 54321,
+        spawnFn: makeSpawnFnWithOpts(child, spawnOpts),
+        pollReadyFn: neverReady,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1,
+      }),
+    ).rejects.toThrow()
+
+    // #then — spawn args use loopback hostname
+    expect(spawnOpts[0]?.args).toContain('127.0.0.1')
+
+    // #then — no logged meta contains token/secret/env-like keys
+    const secretKeys = ['token', 'secret', 'password', 'credential', 'env', 'authorization']
+    for (const meta of loggedMeta) {
+      if (meta === undefined) continue
+      for (const key of Object.keys(meta)) {
+        expect(secretKeys.some(s => key.toLowerCase().includes(s))).toBe(false)
+      }
+    }
+  })
+
+  it('uses group kill on abort path when child.pid is present', async () => {
+    // #given — child with pid; abort fires while server is polling.
+    // The process.kill mock must also emit exit on the child so the polling
+    // loop terminates (otherwise the mocked kill is a no-op and the loop hangs).
+    const pid = 22222
+    const emitter = new EventEmitter()
+    let exited = false
+    const killSpy = vi.fn((_sig?: string): boolean => true)
+    const child = {
+      pid,
+      kill: killSpy,
+      on: (event: string | symbol, listener: (...args: unknown[]) => void): void => {
+        emitter.on(event, listener)
+      },
+    }
+
+    const processKillSpy = vi.spyOn(process, 'kill').mockImplementation((..._args) => {
+      // Simulate the OS killing the process group: emit exit on the child.
+      if (exited === false) {
+        exited = true
+        setImmediate(() => emitter.emit('exit', null))
+      }
+      return true
+    })
+
+    const ac = new AbortController()
+
+    const promise = startOpencodeServer({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      signal: ac.signal,
+      spawnFn: makeSpawnFnWithOpts(child),
+      pollReadyFn: neverReady,
+      pollIntervalMs: 10,
+      readyTimeoutMs: 30_000,
+    })
+
+    // #when — abort immediately
+    ac.abort()
+
+    // #then — wait for promise to settle
+    await promise.then(
+      h => h.close(),
+      () => undefined,
+    )
+
+    // group kill via negative pid should have been called
+    expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
+  })
+})
+
+describe('process-group reaping (Unit 6) — supervised respawn group kill', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('uses group kill on timeout/respawn kill when child.pid is a number', async () => {
+    // #given — first child has pid and times out; second child becomes ready then exits
+    const pid1 = 33333
+    const {child: child1} = makeFakeChildWithPid(pid1)
+    const processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+
+    const child2 = makeControllableChild()
+    let spawnCount = 0
+    const trackingSpawnFn: SpawnFn = (_cmd, _args, _opts) => {
+      spawnCount++
+      return spawnCount === 1 ? child1 : child2.child
+    }
+
+    const pollReadyFn = async (_url: string): Promise<boolean> => spawnCount >= 2
+
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    // #when — start supervisor; first attempt times out → group kill → second becomes ready
+    let wasReady = false
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      spawnFn: trackingSpawnFn,
+      pollReadyFn,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 10, // short timeout → first attempt times out
+      maxAttempts: 2,
+      initialBackoffMs: 0,
+    })
+
+    await new Promise<void>(resolve => {
+      const check = (): void => {
+        if (statusRef.status === 'ready') {
+          wasReady = true
+          child2.triggerExit(0)
+          resolve()
+        } else {
+          setImmediate(check)
+        }
+      }
+      setImmediate(check)
+    })
+
+    await supervisorPromise
+
+    // #then — group kill was used for the first child (negative pid)
+    expect(processKillSpy).toHaveBeenCalledWith(-pid1, 'SIGTERM')
+    expect(wasReady).toBe(true)
+  })
+
+  it('uses group kill on abort path in runSupervisedOpencode when child.pid is present', async () => {
+    // #given — child with pid; abort fires while supervisor is polling.
+    // The process.kill mock must also emit exit on the child so the supervisor
+    // loop terminates (otherwise the mocked kill is a no-op and the loop hangs).
+    const pid = 44444
+    const emitter = new EventEmitter()
+    let exited = false
+    const killSpy = vi.fn((_sig?: string): boolean => true)
+    const child = {
+      pid,
+      kill: killSpy,
+      on: (event: string | symbol, listener: (...args: unknown[]) => void): void => {
+        emitter.on(event, listener)
+      },
+    }
+
+    const processKillSpy = vi.spyOn(process, 'kill').mockImplementation((..._args) => {
+      // Simulate the OS killing the process group: emit exit on the child.
+      if (exited === false) {
+        exited = true
+        setImmediate(() => emitter.emit('exit', null))
+      }
+      return true
+    })
+
+    const ac = new AbortController()
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      signal: ac.signal,
+      spawnFn: (_cmd, _args, _opts) => child,
+      pollReadyFn: neverReady,
+      pollIntervalMs: 10,
+      readyTimeoutMs: 30_000,
+      maxAttempts: 1,
+      initialBackoffMs: 0,
+    })
+
+    // #when — abort immediately
+    ac.abort()
+
+    await supervisorPromise.catch(() => undefined)
+
+    // #then — group kill via negative pid on abort path
+    expect(processKillSpy).toHaveBeenCalledWith(-pid, 'SIGTERM')
   })
 })

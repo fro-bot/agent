@@ -12,7 +12,7 @@
  * 4. Bounded respawn: max attempts + total boot budget prevent infinite retry.
  */
 
-import {spawn as nodeSpawn} from 'node:child_process'
+import {spawn as nodeSpawnRaw} from 'node:child_process'
 import process from 'node:process'
 import {setTimeout as sleep} from 'node:timers/promises'
 
@@ -26,14 +26,25 @@ export interface Logger {
 export interface ChildHandle {
   readonly kill: (signal?: string) => boolean
   readonly on: (event: string | symbol, listener: (...args: unknown[]) => void) => void
+  /** Process ID — present on real child_process.ChildProcess; may be undefined on test fakes. */
+  readonly pid?: number
 }
 
 /** Simplified spawn signature for dependency injection. */
 export type SpawnFn = (
   command: string,
   args: readonly string[],
-  options: {readonly cwd?: string; readonly env?: NodeJS.ProcessEnv},
+  options: {readonly cwd?: string; readonly env?: NodeJS.ProcessEnv; readonly detached?: boolean},
 ) => ChildHandle
+
+/**
+ * Thin adapter that wraps node:child_process.spawn to satisfy SpawnFn.
+ * ChildProcessWithoutNullStreams has complex overloaded `on` signatures that
+ * don't structurally match our minimal ChildHandle.on — this cast is safe
+ * because we only use the `exit`, `error`, `kill`, and `pid` surface.
+ */
+const nodeSpawn: SpawnFn = (command, args, options) =>
+  nodeSpawnRaw(command, [...args], options) as unknown as ChildHandle
 
 /** Readiness probe — return true if the server is accepting connections. */
 export type PollReadyFn = (url: string, signal?: AbortSignal) => Promise<boolean>
@@ -79,6 +90,24 @@ export interface DefaultPollReadyOptions {
    * the outer deadline loop can retry. Default: 3000ms.
    */
   readonly probeTimeoutMs?: number
+}
+
+/**
+ * Kill the child's entire process group when a pid is available.
+ *
+ * When `child.pid` is a finite number, sends SIGTERM to the whole process
+ * group (negative pid = pgid) so no orphaned grandchildren survive a
+ * timeout/respawn/shutdown. Falls back to `child.kill('SIGTERM')` when the
+ * pid is not a number (e.g. test fakes that don't expose a pid).
+ *
+ * SECURITY INVARIANT: no token, secret, or env value is logged here.
+ */
+function killChildGroup(child: ChildHandle): void {
+  if (typeof child.pid === 'number' && Number.isFinite(child.pid)) {
+    process.kill(-child.pid, 'SIGTERM')
+  } else {
+    child.kill('SIGTERM')
+  }
 }
 
 /**
@@ -148,9 +177,12 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
 
   logger.info('opencode-server: spawning', {url, rootDir})
 
+  // detached: true makes the child a process-group leader (pgid = pid) so
+  // killChildGroup can reap the whole group on timeout/abort/close.
   const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
     cwd: rootDir,
     env: process.env,
+    detached: true,
   })
 
   // Use an object to hold mutable state — TypeScript does not narrow mutable
@@ -169,11 +201,11 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     logger.error('opencode-server: spawn error', {message})
   })
 
-  // Abort signal integration
+  // Abort signal integration — reap the whole process group on abort.
   if (signal !== undefined) {
     signal.addEventListener('abort', () => {
       if (state.exited === false) {
-        child.kill('SIGTERM')
+        killChildGroup(child)
       }
     })
   }
@@ -193,7 +225,7 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
         url,
         close(): void {
           if (state.exited === false) {
-            child.kill('SIGTERM')
+            killChildGroup(child)
           }
         },
       }
@@ -202,9 +234,8 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     await sleep(pollIntervalMs)
   }
 
-  // Timeout reached — kill and throw.
-  // Kill unconditionally (no-op if process already exited).
-  child.kill('SIGTERM')
+  // Timeout reached — reap the whole process group and throw.
+  killChildGroup(child)
   throw new Error(`opencode server did not become ready within ${readyTimeoutMs}ms`)
 }
 
@@ -301,9 +332,12 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
 
     logger.info('opencode-server: supervisor spawning', {url, rootDir, attempt, maxAttempts})
 
+    // detached: true makes the child a process-group leader (pgid = pid) so
+    // killChildGroup can reap the whole group on timeout/abort/shutdown.
     const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
       cwd: rootDir,
       env: process.env,
+      detached: true,
     })
 
     // Per-attempt mutable state.
@@ -336,11 +370,11 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
       logger.error('opencode-server: spawn error', {message, attempt})
     })
 
-    // Abort signal integration — kill child on external abort.
+    // Abort signal integration — reap the whole process group on external abort.
     if (signal !== undefined) {
       signal.addEventListener('abort', () => {
         if (state.exited === false) {
-          child.kill('SIGTERM')
+          killChildGroup(child)
         }
       })
     }
@@ -407,9 +441,9 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
     }
 
     // Did not become ready (timeout or early exit).
-    // Kill the child (fail-closed: status is already 'starting').
+    // Reap the whole process group (fail-closed: status is already 'starting').
     if (state.exited === false) {
-      child.kill('SIGTERM')
+      killChildGroup(child)
     }
 
     if (attempt < maxAttempts) {
