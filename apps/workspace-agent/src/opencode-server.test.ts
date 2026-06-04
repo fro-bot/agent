@@ -9,7 +9,7 @@ import type {SpawnFn} from './opencode-server.js'
 
 import {EventEmitter} from 'node:events'
 import {describe, expect, it, vi} from 'vitest'
-import {startOpencodeServer} from './opencode-server.js'
+import {defaultPollReady, startOpencodeServer} from './opencode-server.js'
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -246,5 +246,141 @@ describe('startOpencodeServer — abort signal', () => {
       () => undefined,
     )
     expect(killCalls).toContain('SIGTERM')
+  })
+})
+
+// ── defaultPollReady — per-probe timeout tests ────────────────────────────────
+//
+// These tests exercise the REAL defaultPollReady (exported for testing) with an
+// injected fetchFn so the AbortController composition logic is actually tested.
+// Real timers are used with tiny per-probe timeouts (5–20ms) for speed.
+
+describe('defaultPollReady — per-probe timeout', () => {
+  it('returns true immediately when fetch resolves with HTTP 200', async () => {
+    // #given — fetch resolves immediately with a 200 response
+    const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
+      return new Response(null, {status: 200})
+    }
+
+    // #when
+    const result = await defaultPollReady('http://127.0.0.1:54321', undefined, {
+      fetchFn: fakeFetch,
+      probeTimeoutMs: 3000,
+    })
+
+    // #then
+    expect(result).toBe(true)
+  })
+
+  it('returns false (not ready yet) when fetch hangs past the per-probe timeout', async () => {
+    // #given — fetch hangs until the signal aborts (simulates a hung connection)
+    const fakeFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'))
+        })
+      })
+    }
+
+    // #when — use a very short per-probe timeout so the test is fast
+    const result = await defaultPollReady('http://127.0.0.1:54321', undefined, {
+      fetchFn: fakeFetch,
+      probeTimeoutMs: 10, // 10ms — fires quickly
+    })
+
+    // #then — per-probe timeout treated as "not ready yet", not a fatal error
+    expect(result).toBe(false)
+  })
+
+  it('resolves ready when first probe hangs but second probe succeeds (loop unblocked)', async () => {
+    // #given — first fetch hangs until aborted, second resolves immediately
+    let callCount = 0
+    const fakeFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      callCount++
+      if (callCount === 1) {
+        // First call: hang until the per-probe signal fires
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'))
+          })
+        })
+      }
+      // Subsequent calls: resolve immediately
+      return new Response(null, {status: 200})
+    }
+
+    const {child} = makeFakeChild({})
+
+    // #when — use a tiny per-probe timeout so the hung first probe unblocks quickly
+    const handle = await startOpencodeServer({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      spawnFn: makeSpawnFn(child),
+      // Use the real defaultPollReady via pollReadyFn wrapper that injects our fakeFetch
+      pollReadyFn: async (url: string, signal?: AbortSignal) =>
+        defaultPollReady(url, signal, {fetchFn: fakeFetch, probeTimeoutMs: 10}),
+      pollIntervalMs: 0,
+      readyTimeoutMs: 5000, // generous outer deadline
+    })
+
+    // #then — resolved ready despite the first probe hanging
+    expect(handle.url).toContain('127.0.0.1')
+    expect(callCount).toBeGreaterThanOrEqual(2)
+    handle.close()
+  })
+
+  it('times out and kills the child when every probe hangs past the per-probe timeout', async () => {
+    // #given — every fetch hangs until aborted (simulates a permanently hung connection)
+    const fakeFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'))
+        })
+      })
+    }
+
+    const {child, killCalls} = makeFakeChild({})
+
+    // #when — tiny per-probe timeout + tiny outer deadline → must fail fast
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFn(child),
+        pollReadyFn: async (url: string, signal?: AbortSignal) =>
+          defaultPollReady(url, signal, {fetchFn: fakeFetch, probeTimeoutMs: 10}),
+        pollIntervalMs: 0,
+        readyTimeoutMs: 50, // outer deadline — must expire after a few hung probes
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — child was killed (no permanent 'starting' state)
+    expect(killCalls).toContain('SIGTERM')
+  })
+
+  it('propagates caller signal abort through the per-probe controller', async () => {
+    // #given — fetch hangs until the signal fires; caller aborts mid-probe
+    const fakeFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      return new Promise((_resolve, reject) => {
+        // Wire the abort signal so fetch rejects when aborted
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'))
+        })
+      })
+    }
+
+    const ac = new AbortController()
+
+    // #when — start a probe then abort the caller signal
+    const probePromise = defaultPollReady('http://127.0.0.1:54321', ac.signal, {
+      fetchFn: fakeFetch,
+      probeTimeoutMs: 5000, // long per-probe timeout — caller abort fires first
+    })
+
+    // Abort the caller signal after a short delay
+    setTimeout(() => ac.abort(), 5)
+
+    // #then — the probe rejects with an abort error (caller abort propagates)
+    await expect(probePromise).rejects.toThrow(/abort/i)
   })
 })
