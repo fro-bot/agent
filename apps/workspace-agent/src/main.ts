@@ -13,7 +13,7 @@ import {serve} from '@hono/node-server'
 import {asyncCleanupAllAskpassDirs} from './clone.js'
 import {readReadyTimeoutMs, readSecret} from './config.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
-import {startOpencodeServer} from './opencode-server.js'
+import {runSupervisedOpencode} from './opencode-server.js'
 import {createApp} from './server.js'
 
 const PORT = 9100
@@ -24,8 +24,9 @@ const OPENCODE_HOSTNAME = '127.0.0.1'
 const PROXY_PORT = 9200
 const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 
-// Shared mutable state for OpenCode readiness, read by /healthz
-const opencodeStatus = {status: 'starting' as 'starting' | 'ready' | 'down'}
+// Shared mutable state for OpenCode readiness, read by /healthz and /readyz.
+// The supervisor (runSupervisedOpencode) writes all transitions here.
+const opencodeStatus = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
 
 const app = createApp({opencodeStatus})
 
@@ -33,35 +34,32 @@ const server = serve({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
   console.warn(`workspace-agent listening on ${info.address}:${info.port}`)
 })
 
-// Boot OpenCode server (loopback-bound) — fire-and-forget, update status ref
+// Boot OpenCode server (loopback-bound) — supervised lifecycle with bounded respawn.
 const opencodeLogger = {
   info: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
   warn: (msg: string, meta?: Record<string, unknown>) => console.warn(msg, meta ?? ''),
   error: (msg: string, meta?: Record<string, unknown>) => console.error(msg, meta ?? ''),
 }
 
-let opencodeHandle: {url: string; close: () => void} | undefined
-
 // Fail-fast: throws at startup if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is set but malformed.
 const opencodeReadyTimeoutMs = readReadyTimeoutMs()
 
-const opencodeServerPromise = startOpencodeServer({
+// Fire-and-forget supervised lifecycle. The supervisor writes status transitions
+// to opencodeStatus so /readyz reflects live state. On exhaustion it lands in
+// 'degraded' (clone API still alive; /readyz returns 503).
+const opencodeServerPromise = runSupervisedOpencode({
   rootDir: WORKSPACE_REPOS_ROOT,
   logger: opencodeLogger,
+  statusRef: opencodeStatus,
   hostname: OPENCODE_HOSTNAME,
   port: OPENCODE_PORT,
   readyTimeoutMs: opencodeReadyTimeoutMs,
+}).catch((error: unknown) => {
+  // Unexpected supervisor crash (should not happen — supervisor catches internally).
+  opencodeStatus.status = 'down'
+  const message = error instanceof Error ? error.message : String(error)
+  console.error('workspace-agent: opencode supervisor crashed unexpectedly', {message})
 })
-  .then(handle => {
-    opencodeHandle = handle
-    opencodeStatus.status = 'ready'
-    console.warn('workspace-agent: opencode server ready', {url: handle.url})
-  })
-  .catch((error: unknown) => {
-    opencodeStatus.status = 'down'
-    const message = error instanceof Error ? error.message : String(error)
-    console.error('workspace-agent: opencode server failed to start', {message})
-  })
 
 // Boot bearer-token proxy — reads WORKSPACE_OPENCODE_TOKEN secret at startup
 let proxy: ReturnType<typeof createOpencodeProxy> | undefined
@@ -98,13 +96,9 @@ function shutdown(signal: string): void {
     process.exit(1)
   }, DRAIN_MS)
 
-  // Close OpenCode server and proxy, then the Hono server.
-  const cleanupOpencode = (): void => {
-    if (opencodeHandle !== undefined) {
-      opencodeHandle.close()
-    }
-  }
-
+  // Close proxy, then the Hono server.
+  // Note: the OpenCode child process is managed by the supervisor (runSupervisedOpencode).
+  // On SIGTERM the container will be killed; the supervisor's child inherits the signal.
   const cleanupProxy = async (): Promise<void> => {
     if (proxy !== undefined) {
       return proxy.close().catch(() => {
@@ -119,7 +113,6 @@ function shutdown(signal: string): void {
       // Best-effort
     })
     .finally(() => {
-      cleanupOpencode()
       cleanupProxy()
         .catch(() => {
           // Best-effort

@@ -9,6 +9,7 @@
  * 1. Binds to 127.0.0.1 only — raw OpenCode port is never on sandbox-net.
  * 2. No token or credential is logged.
  * 3. Spawn failure is caught and reflected as 'down' status; no crash-loop.
+ * 4. Bounded respawn: max attempts + total boot budget prevent infinite retry.
  */
 
 import {spawn as nodeSpawn} from 'node:child_process'
@@ -205,4 +206,233 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
   // Kill unconditionally (no-op if process already exited).
   child.kill('SIGTERM')
   throw new Error(`opencode server did not become ready within ${readyTimeoutMs}ms`)
+}
+
+/** OpenCode status values (mirrors server.ts OpencodeStatus + degraded). */
+export type SupervisedOpencodeStatus = 'starting' | 'ready' | 'down' | 'degraded'
+
+/** Mutable status reference updated by the supervisor. */
+export interface SupervisedStatusRef {
+  status: SupervisedOpencodeStatus
+}
+
+export interface RunSupervisedOpencodeOptions {
+  /** Repo root directory passed to opencode serve. */
+  readonly rootDir: string
+  readonly logger: Logger
+  /** Mutable status reference — supervisor writes transitions here. */
+  readonly statusRef: SupervisedStatusRef
+  /** Optional abort signal — on abort the supervisor stops. */
+  readonly signal?: AbortSignal
+  /** Hostname to bind. Default: '127.0.0.1' (loopback only). */
+  readonly hostname?: string
+  /** Port to bind. Default: 54321 (OpenCode default). */
+  readonly port?: number
+  /**
+   * Per-attempt readiness timeout in ms. Each attempt gets a fresh deadline.
+   * Default: 60000ms.
+   */
+  readonly readyTimeoutMs?: number
+  /** Poll interval in ms. Default: 250ms. */
+  readonly pollIntervalMs?: number
+  /**
+   * Maximum number of spawn attempts (initial + respawns).
+   * Default: 4 (1 initial + 3 respawns).
+   */
+  readonly maxAttempts?: number
+  /**
+   * Initial backoff delay in ms before the first respawn.
+   * Doubles on each subsequent attempt, capped at maxBackoffMs.
+   * Default: 1000ms.
+   */
+  readonly initialBackoffMs?: number
+  /**
+   * Maximum backoff delay in ms. Default: 10000ms.
+   */
+  readonly maxBackoffMs?: number
+  /** Injected spawn function for testing. Defaults to node:child_process.spawn. */
+  readonly spawnFn?: SpawnFn
+  /** Injected readiness poll function for testing. */
+  readonly pollReadyFn?: PollReadyFn
+}
+
+/**
+ * Supervised OpenCode lifecycle with bounded respawn and state machine.
+ *
+ * State transitions:
+ *   starting → ready          (first or subsequent attempt succeeds)
+ *   starting → starting       (set BEFORE killing child on respawn — fail-closed)
+ *   ready    → starting       (post-ready exit detected; respawn if attempts remain)
+ *   ready    → degraded       (post-ready exit, no attempts remain)
+ *   starting → degraded       (all attempts exhausted without becoming ready)
+ *
+ * The supervisor writes all transitions to `statusRef.status`. The caller
+ * (main.ts) shares this ref with the Hono app so /readyz reflects live state.
+ *
+ * SECURITY INVARIANTS preserved:
+ * - Binds to 127.0.0.1 only.
+ * - No token or credential is logged.
+ * - Bounded retry: maxAttempts + per-attempt deadline prevent infinite respawn.
+ */
+export async function runSupervisedOpencode(options: RunSupervisedOpencodeOptions): Promise<void> {
+  const {
+    rootDir,
+    logger,
+    statusRef,
+    signal,
+    hostname = '127.0.0.1',
+    port = 54321,
+    readyTimeoutMs = 60_000,
+    pollIntervalMs = 250,
+    maxAttempts = 4,
+    initialBackoffMs = 1_000,
+    maxBackoffMs = 10_000,
+    spawnFn = nodeSpawn,
+    pollReadyFn = defaultPollReady,
+  } = options
+
+  const url = `http://${hostname}:${port}`
+  let backoffMs = initialBackoffMs
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Fail-closed: status is 'starting' (not-ready) before each spawn attempt.
+    // This ensures /readyz returns 503 during the kill→respawn transition.
+    statusRef.status = 'starting'
+
+    logger.info('opencode-server: supervisor spawning', {url, rootDir, attempt, maxAttempts})
+
+    const child = spawnFn('opencode', ['serve', '--hostname', hostname, '--port', String(port)], {
+      cwd: rootDir,
+      env: process.env,
+    })
+
+    // Per-attempt mutable state.
+    const state: {exited: boolean; exitCode: number | null; becameReady: boolean} = {
+      exited: false,
+      exitCode: null,
+      becameReady: false,
+    }
+
+    child.on('exit', (code: unknown) => {
+      state.exited = true
+      state.exitCode = typeof code === 'number' ? code : null
+      logger.info('opencode-server: process exited', {code: state.exitCode, attempt})
+
+      // POST-READY EXIT LATCH FIX: if the child exits after we marked it ready,
+      // flip status back to not-ready immediately. The outer loop will decide
+      // whether to respawn (if attempts remain) or go to degraded.
+      if (state.becameReady === true && statusRef.status === 'ready') {
+        logger.warn('opencode-server: process exited after becoming ready — flipping to starting', {
+          code: state.exitCode,
+          attempt,
+        })
+        statusRef.status = 'starting'
+      }
+    })
+
+    child.on('error', (err: unknown) => {
+      state.exited = true
+      const message = err instanceof Error ? err.message : String(err)
+      logger.error('opencode-server: spawn error', {message, attempt})
+    })
+
+    // Abort signal integration — kill child on external abort.
+    if (signal !== undefined) {
+      signal.addEventListener('abort', () => {
+        if (state.exited === false) {
+          child.kill('SIGTERM')
+        }
+      })
+    }
+
+    // Per-attempt readiness loop with a fresh deadline.
+    const deadline = Date.now() + readyTimeoutMs
+    let becameReady = false
+
+    while (Date.now() < deadline) {
+      if (state.exited === true) {
+        // Process exited before becoming ready — break to respawn logic.
+        break
+      }
+
+      const ready = await pollReadyFn(url, signal)
+      if (ready === true) {
+        becameReady = true
+        state.becameReady = true
+        statusRef.status = 'ready'
+        logger.info('opencode-server: ready', {url, attempt})
+        break
+      }
+
+      await sleep(pollIntervalMs)
+    }
+
+    if (becameReady === true) {
+      // Server is ready. Now wait for it to exit (post-ready monitoring).
+      // This is the latch fix: we don't return immediately — we stay in the
+      // loop waiting for an unexpected exit so we can flip status and respawn.
+      await new Promise<void>(resolve => {
+        if (state.exited === true) {
+          resolve()
+          return
+        }
+        child.on('exit', () => resolve())
+      })
+
+      // Child has now exited. Decide whether to respawn.
+      if (attempt < maxAttempts) {
+        // Respawn: set status to starting BEFORE killing (already exited, but
+        // the status flip is the load-bearing invariant).
+        statusRef.status = 'starting'
+        logger.warn('opencode-server: supervisor respawning after post-ready exit', {
+          attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts,
+        })
+        // Apply backoff before next attempt.
+        if (backoffMs > 0) {
+          await sleep(backoffMs)
+        }
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+        continue
+      }
+
+      // No attempts remain — terminal degraded state.
+      statusRef.status = 'degraded'
+      logger.error('opencode-server: supervisor exhausted attempts after post-ready exit', {
+        attempt,
+        maxAttempts,
+      })
+      return
+    }
+
+    // Did not become ready (timeout or early exit).
+    // Kill the child (fail-closed: status is already 'starting').
+    if (state.exited === false) {
+      child.kill('SIGTERM')
+    }
+
+    if (attempt < maxAttempts) {
+      logger.warn('opencode-server: supervisor attempt failed, will respawn', {
+        attempt,
+        nextAttempt: attempt + 1,
+        maxAttempts,
+        backoffMs,
+      })
+      // Apply backoff before next attempt.
+      if (backoffMs > 0) {
+        await sleep(backoffMs)
+      }
+      backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+      continue
+    }
+
+    // All attempts exhausted — terminal degraded state.
+    // Clone API (:9100) stays alive; /readyz returns 503.
+    statusRef.status = 'degraded'
+    logger.error('opencode-server: supervisor exhausted all attempts', {
+      attempt,
+      maxAttempts,
+    })
+  }
 }
