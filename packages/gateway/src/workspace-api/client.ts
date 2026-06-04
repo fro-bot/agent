@@ -192,7 +192,7 @@ function isReadyzResponse(value: unknown): value is ReadyzResponse {
     return v.opencode === 'ready'
   }
   // ready === false
-  return v.opencode === 'starting' || v.opencode === 'down' || v.opencode === 'unknown'
+  return v.opencode === 'starting' || v.opencode === 'down' || v.opencode === 'degraded' || v.opencode === 'unknown'
 }
 
 function isCloneResponse(value: unknown): value is CloneSuccess | CloneFailure {

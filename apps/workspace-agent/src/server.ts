@@ -18,8 +18,14 @@ const MAX_BODY_BYTES = 4096
 /** Simplified clone executor signature for dependency injection. */
 export type CloneExecutorFn = (request: CloneRequest, deps?: CloneHandlerDeps) => Promise<CloneHandlerResult>
 
-/** OpenCode readiness state shared between the lifecycle and the server. */
-export type OpencodeStatus = 'starting' | 'ready' | 'down'
+/**
+ * OpenCode readiness state shared between the lifecycle and the server.
+ * - starting: not yet ready (initial boot or mid-respawn transition)
+ * - ready: OpenCode HTTP server is accepting connections
+ * - down: terminal failure (unmanaged / unexpected)
+ * - degraded: retries exhausted; clone API still alive, /readyz returns 503
+ */
+export type OpencodeStatus = 'starting' | 'ready' | 'down' | 'degraded'
 
 export interface OpencodeStatusRef {
   /** Current readiness. Updated by the lifecycle holder. */

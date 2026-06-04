@@ -69,7 +69,7 @@ export interface ReadyzReady {
  */
 export interface ReadyzNotReady {
   readonly ready: false
-  readonly opencode: 'starting' | 'down' | 'unknown'
+  readonly opencode: 'starting' | 'down' | 'degraded' | 'unknown'
 }
 
 /** Discriminated union of all /readyz response shapes. */

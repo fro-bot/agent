@@ -85,6 +85,24 @@ describe('WorkspaceClient.readyz', () => {
       vi.unstubAllGlobals()
     })
 
+    it('returns ready:false with opencode:"degraded" when server responds 503 with degraded status', async () => {
+      // #given
+      const client = makeClient()
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({ready: false, opencode: 'degraded'}),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: false, opencode: 'degraded'}))
+      vi.unstubAllGlobals()
+    })
+
     it('returns ready:false with opencode:"unknown" when server responds 503 with unknown status', async () => {
       // #given
       const client = makeClient()

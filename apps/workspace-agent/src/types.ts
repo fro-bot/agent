@@ -58,12 +58,15 @@ export type CloneErrorCode =
 export interface HealthzResponse {
   readonly ok: true
   /** OpenCode server readiness. Present when the server lifecycle is managed. */
-  readonly opencode?: 'ready' | 'starting' | 'down'
+  readonly opencode?: 'ready' | 'starting' | 'down' | 'degraded'
 }
 
 /** GET /readyz response. */
 export interface ReadyzResponse {
   readonly ready: boolean
-  /** OpenCode server readiness. 'unknown' when no status ref is available. */
-  readonly opencode: 'ready' | 'starting' | 'down' | 'unknown'
+  /**
+   * OpenCode server readiness. 'unknown' when no status ref is available.
+   * 'degraded' = retries exhausted, clone API still alive, /readyz returns 503.
+   */
+  readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
 }
