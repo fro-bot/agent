@@ -191,18 +191,18 @@ function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): voi
 // ---------------------------------------------------------------------------
 
 function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
-  const opencodeDir = path.join(workDir, 'packages', 'opencode')
   const opencodeVersion = buildHarnessVersion(baseVersion, integrationCommit)
-  console.log(`[build-platform] Running upstream build in ${opencodeDir}`)
+  console.log(`[build-platform] Running upstream build in ${workDir}`)
   console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
 
   // Root workspace install — mirrors upstream's setup-bun action which runs `bun install`
-  // at the repo root (with --linker hoisted on Linux) before invoking build.ts.
+  // at the repo root before invoking build.ts. Hoisted linker is used ONLY on Windows
+  // (matching upstream's setup-bun action); Linux/macOS use a plain install.
   // This wires workspace symlinks (e.g. @opencode-ai/script) into node_modules so
   // packages/opencode/script/build.ts can resolve them at module load time.
   // The --single build below compiles just this platform's binary.
   console.log(`[build-platform] Installing workspace dependencies (bun install) in ${workDir}`)
-  const installArgs = process.platform === 'linux' ? ['install', '--linker', 'hoisted'] : ['install']
+  const installArgs = process.platform === 'win32' ? ['install', '--linker', 'hoisted'] : ['install']
   const installResult = spawnSync('bun', installArgs, {
     cwd: workDir,
     stdio: 'inherit',
@@ -214,8 +214,8 @@ function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommi
     throw new Error(`Workspace install failed with exit code ${installResult.status ?? 'unknown'}`)
   }
 
-  const result = spawnSync('bun', ['run', 'build', '--', '--single'], {
-    cwd: opencodeDir,
+  const result = spawnSync('bun', ['./packages/opencode/script/build.ts', '--single'], {
+    cwd: workDir, // NOTE: workDir (repo root) — build.ts does its own process.chdir to packages/opencode
     stdio: 'inherit',
     env: {
       ...process.env,
