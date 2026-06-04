@@ -11,10 +11,10 @@
  * session error, prompt rejection, run timeout, or premature stream close.
  * `run.ts` maps `kind` to coarse Discord replies (no internal detail leaked).
  *
- * Critical constraint (SSE-routing memory): BOTH `promptAsync` AND
- * `event.subscribe` must carry the workspace repo `directory` in their query
- * params. Subscribing without `directory` splits the SSE listener from the
- * publisher — tool events never arrive.
+ * Critical constraint (SSE-routing memory): `session.create`, `event.subscribe`,
+ * AND `promptAsync` must all carry the workspace repo `directory` in their query
+ * params. Omitting `directory` from any of the three splits the SSE listener from
+ * the publisher — tool events never arrive.
  *
  * Event-stream semantics mirror `src/features/agent/streaming.ts` exactly.
  * Cannot import from that module (backwards-dependency ban); accessors are
@@ -67,8 +67,8 @@ export interface RunCoreParams {
   readonly handle: OpenCodeServerHandle
   /**
    * Absolute path to the workspace repo checkout.
-   * Threaded to BOTH `promptAsync` and `event.subscribe` — required for SSE
-   * routing to deliver tool events.
+   * Threaded to `session.create`, `event.subscribe`, AND `promptAsync` — required
+   * for SSE routing to deliver tool events.
    */
   readonly directory: string
   /**
@@ -187,7 +187,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // ── 1. Create session ──────────────────────────────────────────────────────
   let sessionId: string
   try {
-    const sessionResponse = await client.session.create()
+    const sessionResponse = await client.session.create({query: {directory}})
     if (sessionResponse.error != null) {
       const errMsg = String(sessionResponse.error)
       if (isAuthError(sessionResponse)) {

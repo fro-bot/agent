@@ -683,6 +683,22 @@ describe('runOpenCodeCore', () => {
       const callArgs = (event.subscribe.mock.calls[0] as [{query?: {directory?: string}}])[0]
       expect(callArgs.query?.directory).toBe('/repos/myrepo')
     })
+
+    it('threads directory to session.create query', async () => {
+      // #given
+      const handle = makeHandle()
+      const params = buildParams(handle, {directory: '/repos/myrepo'})
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — session.create must receive directory in query so the SSE
+      // publisher and subscriber are scoped to the same directory; without this
+      // the event stream never delivers events for the created session.
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      const callArgs = (session.create.mock.calls[0] as [{query?: {directory?: string}}])[0]
+      expect(callArgs.query?.directory).toBe('/repos/myrepo')
+    })
   })
 
   describe('error path — server unreachable', () => {
