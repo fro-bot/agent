@@ -53,7 +53,7 @@ Trusted publishing trusts at the **package level**, so each of the five packages
 
 ### First-publish bootstrap
 
-npm trusted publishing requires a package to **already exist** before it will accept OIDC publishes — a brand-new, never-published package cannot be trust-published from scratch. So the very first release of these five packages needs a bootstrap publish (a one-time token-authenticated `npm publish`, or npm's pre-registered pending-publisher flow for new packages), after which the trusted-publisher config above governs all subsequent releases with no token.
+npm trusted publishing requires a package to **already exist** before it will accept OIDC publishes — a brand-new, never-published package cannot be trust-published from scratch, and npm has no pending-publisher or pre-registration flow for packages that don't yet exist. So the very first release of these five packages requires a one-time token-authenticated `npm publish` to claim the names; after that, the trusted-publisher config above governs all subsequent releases with no token. See `BOOTSTRAP.md` for the full procedure.
 
 ## Carry Policy
 
