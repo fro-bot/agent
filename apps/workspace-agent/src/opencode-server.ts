@@ -54,7 +54,7 @@ export interface StartOpencodeServerOptions {
   readonly hostname?: string
   /** Port to bind. Default: 54321 (OpenCode default). */
   readonly port?: number
-  /** How long to wait for the server to become ready. Default: 15000ms. */
+  /** How long to wait for the server to become ready. Default: 60000ms. */
   readonly readyTimeoutMs?: number
   /** Poll interval in ms. Default: 250ms. */
   readonly pollIntervalMs?: number
@@ -64,14 +64,63 @@ export interface StartOpencodeServerOptions {
   readonly pollReadyFn?: PollReadyFn
 }
 
-/** Default readiness probe: fetch the URL, succeed on any HTTP response. */
-async function defaultPollReady(url: string, signal?: AbortSignal): Promise<boolean> {
+/** Options for the default readiness probe. */
+export interface DefaultPollReadyOptions {
+  /**
+   * Injected fetch function for testing. Defaults to global fetch.
+   * Receives the same signal that is passed to the underlying fetch call
+   * (the composed per-probe + caller signal).
+   */
+  readonly fetchFn?: (url: string, init?: RequestInit) => Promise<Response>
+  /**
+   * Per-probe timeout in milliseconds. Each attempt gets its own AbortController
+   * with this deadline. On timeout the attempt returns false (not ready yet) so
+   * the outer deadline loop can retry. Default: 3000ms.
+   */
+  readonly probeTimeoutMs?: number
+}
+
+/**
+ * Default readiness probe: fetch the URL, succeed on any HTTP response.
+ *
+ * Each attempt gets its own AbortController with a short per-probe deadline
+ * (default 3s) composed with any caller signal. This prevents a hung TCP
+ * connection from stalling the readiness loop forever.
+ *
+ * - Per-probe timeout fires → returns false (not ready yet; outer loop retries).
+ * - Caller signal aborts → re-throws the abort error (propagates to caller).
+ * - Any HTTP response (res.status > 0) → returns true (ready).
+ */
+export async function defaultPollReady(
+  url: string,
+  callerSignal?: AbortSignal,
+  options?: DefaultPollReadyOptions,
+): Promise<boolean> {
+  const {fetchFn = fetch, probeTimeoutMs = 3_000} = options ?? {}
+
+  // Per-probe AbortController with a short deadline.
+  const probeController = new AbortController()
+  const probeTimer = setTimeout(() => probeController.abort(), probeTimeoutMs)
+
+  // Compose the per-probe signal with the caller signal (if any) so that
+  // either an external abort or the per-probe timeout cancels the fetch.
+  const composedSignal =
+    callerSignal === undefined ? probeController.signal : AbortSignal.any([callerSignal, probeController.signal])
+
   try {
-    const res = await fetch(url, {signal})
+    const res = await fetchFn(url, {signal: composedSignal})
     // Any HTTP response means the server is up (even 404/500)
     return res.status > 0
-  } catch {
+  } catch (error) {
+    // Distinguish caller abort (propagate) from per-probe timeout (retry).
+    if (callerSignal?.aborted === true) {
+      // Caller explicitly aborted — propagate so the outer loop can surface it.
+      throw error
+    }
+    // Per-probe timeout or transient network error — treat as "not ready yet".
     return false
+  } finally {
+    clearTimeout(probeTimer)
   }
 }
 
@@ -88,7 +137,7 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     signal,
     hostname = '127.0.0.1',
     port = 54321,
-    readyTimeoutMs = 15_000,
+    readyTimeoutMs = 60_000,
     pollIntervalMs = 250,
     spawnFn = nodeSpawn,
     pollReadyFn = defaultPollReady,

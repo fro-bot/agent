@@ -125,3 +125,50 @@ export function readSecret(name: string): string {
   }
   return value
 }
+
+const READY_TIMEOUT_VAR = 'WORKSPACE_OPENCODE_READY_TIMEOUT_MS'
+const READY_TIMEOUT_DEFAULT = 60_000
+
+/**
+ * Read the OpenCode readiness timeout from the environment.
+ *
+ * - Absent or empty → returns 60000 (fail-soft default; realistic cold-boot behind egress proxy).
+ * - Valid positive integer string → returns that number.
+ * - Invalid (non-numeric, zero, negative, float, whitespace-only) → throws with an explicit
+ *   message naming the variable (fail-fast; prevents silent misconfiguration at startup).
+ *
+ * @param env - Environment object to read from. Defaults to `process.env`.
+ */
+export function readReadyTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[READY_TIMEOUT_VAR]
+
+  // Absent or empty → fail-soft default
+  if (raw === undefined || raw === '') {
+    return READY_TIMEOUT_DEFAULT
+  }
+
+  const trimmed = raw.trim()
+
+  // Whitespace-only → fail-fast
+  if (trimmed === '') {
+    throw new Error(
+      `${READY_TIMEOUT_VAR} must be a positive integer (got ${JSON.stringify(raw)}). ` +
+        `Remove the variable or set it to a positive integer number of milliseconds.`,
+    )
+  }
+
+  // Parse as integer — Number.parseInt stops at the first non-digit character,
+  // so we also verify the trimmed string is entirely digits (optionally preceded
+  // by a sign) by comparing the parsed value back to the trimmed input.
+  const parsed = Number.parseInt(trimmed, 10)
+
+  // Reject NaN, floats (trimmed !== String(parsed)), and non-positive values.
+  if (Number.isInteger(parsed) === false || String(parsed) !== trimmed || parsed <= 0) {
+    throw new Error(
+      `${READY_TIMEOUT_VAR} must be a positive integer (got ${JSON.stringify(raw)}). ` +
+        `Remove the variable or set it to a positive integer number of milliseconds.`,
+    )
+  }
+
+  return parsed
+}

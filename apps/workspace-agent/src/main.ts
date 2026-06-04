@@ -11,7 +11,7 @@ import process from 'node:process'
 import {serve} from '@hono/node-server'
 
 import {asyncCleanupAllAskpassDirs} from './clone.js'
-import {readSecret} from './config.js'
+import {readReadyTimeoutMs, readSecret} from './config.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
 import {startOpencodeServer} from './opencode-server.js'
 import {createApp} from './server.js'
@@ -42,11 +42,15 @@ const opencodeLogger = {
 
 let opencodeHandle: {url: string; close: () => void} | undefined
 
+// Fail-fast: throws at startup if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is set but malformed.
+const opencodeReadyTimeoutMs = readReadyTimeoutMs()
+
 const opencodeServerPromise = startOpencodeServer({
   rootDir: WORKSPACE_REPOS_ROOT,
   logger: opencodeLogger,
   hostname: OPENCODE_HOSTNAME,
   port: OPENCODE_PORT,
+  readyTimeoutMs: opencodeReadyTimeoutMs,
 })
   .then(handle => {
     opencodeHandle = handle

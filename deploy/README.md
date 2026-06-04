@@ -271,6 +271,7 @@ The mention-loop agent needs a model and a provider to talk to. These mirror the
 
 - `WORKSPACE_OPENCODE_MODEL` — the `provider/model` string (e.g. `anthropic/claude-sonnet-4-6`, `openai/gpt-5.4-mini`).
 - `WORKSPACE_OPENCODE_CONFIG` — a JSON object shallow-merged over the baked base config; supply the `provider` block that points OpenCode at your endpoint.
+- `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` — how long (in milliseconds) the workspace agent waits for the OpenCode server to become ready before marking it `down`. Default: `60000` (60 s — sized for a cold boot behind the egress proxy). Absent or empty → default applies (fail-soft). Set to a non-numeric value, zero, or a negative number → startup fails immediately with an explicit error (fail-fast).
 
 The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
 
