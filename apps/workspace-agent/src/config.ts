@@ -163,7 +163,7 @@ export function readReadyTimeoutMs(env: NodeJS.ProcessEnv = process.env): number
   const parsed = Number.parseInt(trimmed, 10)
 
   // Reject NaN, floats (trimmed !== String(parsed)), and non-positive values.
-  if (!Number.isInteger(parsed) || String(parsed) !== trimmed || parsed <= 0) {
+  if (Number.isInteger(parsed) === false || String(parsed) !== trimmed || parsed <= 0) {
     throw new Error(
       `${READY_TIMEOUT_VAR} must be a positive integer (got ${JSON.stringify(raw)}). ` +
         `Remove the variable or set it to a positive integer number of milliseconds.`,
