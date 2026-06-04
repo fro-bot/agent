@@ -277,6 +277,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           approvalRegistry,
         },
         logger,
+        // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
+        readyz: async () => workspaceClient.readyz(),
       }
 
       const runPromise: Promise<void> = Effect.runPromise(handleMention(message, client.user.id, mentionDeps)).catch(

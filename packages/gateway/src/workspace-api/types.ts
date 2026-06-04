@@ -53,6 +53,27 @@ export type CloneErrorCode =
   | 'overloaded'
 
 /**
+ * GET /readyz success response (HTTP 200).
+ * Mirrors `apps/workspace-agent/src/readyz.ts`.
+ */
+export interface ReadyzReady {
+  readonly ready: true
+  readonly opencode: 'ready'
+}
+
+/**
+ * GET /readyz not-ready response (HTTP 503).
+ * Mirrors `apps/workspace-agent/src/readyz.ts`.
+ */
+export interface ReadyzNotReady {
+  readonly ready: false
+  readonly opencode: 'starting' | 'down' | 'unknown'
+}
+
+/** Discriminated union of all /readyz response shapes. */
+export type ReadyzResponse = ReadyzReady | ReadyzNotReady
+
+/**
  * Client-side error discriminated union for workspace-api calls.
  * These are the errors the gateway's workspace client can return.
  */
