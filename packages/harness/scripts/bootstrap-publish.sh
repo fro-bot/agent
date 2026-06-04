@@ -45,17 +45,43 @@ echo "Using npm: $(npm --version) at $(command -v npm)"
 # Temp dir management — cleaned up on exit regardless of success/failure
 # ---------------------------------------------------------------------------
 WORK_DIR=""
+NPM_USERCONFIG_FLAG=()
 
 cleanup() {
   if [ -n "${WORK_DIR}" ] && [ -d "${WORK_DIR}" ]; then
+    # WORK_DIR contains the temp .npmrc (which holds the token) — remove it first.
     rm -rf "${WORK_DIR}"
   fi
+  # Always remind the operator to revoke the token, whether the script succeeded
+  # or failed mid-loop. A live write-scoped token must never be left un-revoked.
+  echo ""
+  echo "================================================================"
+  echo "IMPORTANT: REVOKE the npm token you used — go to:"
+  echo "  npmjs.com → Access Tokens → delete the token now."
+  echo "It has served its only purpose and must not remain active."
+  echo "================================================================"
 }
 
 trap cleanup EXIT
 
 WORK_DIR="$(mktemp -d)"
 echo "Working in temp dir: ${WORK_DIR}"
+
+# ---------------------------------------------------------------------------
+# Auth: write a temp .npmrc if NODE_AUTH_TOKEN is set, else use ambient auth
+# ---------------------------------------------------------------------------
+if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+  NPMRC_FILE="${WORK_DIR}/.npmrc"
+  printf '//registry.npmjs.org/:_authToken=%s\n' "${NODE_AUTH_TOKEN}" > "${NPMRC_FILE}"
+  chmod 600 "${NPMRC_FILE}"
+  NPM_USERCONFIG_FLAG=(--userconfig "${NPMRC_FILE}")
+  echo "NODE_AUTH_TOKEN is set — wrote temp .npmrc (chmod 600) for auth."
+else
+  echo "NODE_AUTH_TOKEN is not set — using ambient npm auth (npm login)."
+  echo "If you are not logged in, npm publish will fail with ENEEDAUTH."
+  echo "Either set NODE_AUTH_TOKEN or run \`npm login\` first."
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -80,20 +106,19 @@ for pkg in "${packages[@]}"; do
 }
 EOF
 
-  npm publish "${pkg_dir}"
+  npm publish "${NPM_USERCONFIG_FLAG[@]}" "${pkg_dir}"
   echo "Published: ${pkg}@0.0.0"
   echo ""
 done
 
 # ---------------------------------------------------------------------------
-# Done
+# Done — revoke reminder is printed by the EXIT trap (always, on success or failure)
 # ---------------------------------------------------------------------------
 echo "================================================================"
 echo "Bootstrap complete. All 5 package names are now claimed on npm."
 echo ""
 echo "NEXT STEPS:"
-echo "  1. REVOKE the npm token you used — go to npmjs.com → Access Tokens"
-echo "     and delete it now. It has served its only purpose."
+echo "  1. See the revoke reminder below (printed by the exit trap)."
 echo "  2. Configure trusted publishing for each package (see BOOTSTRAP.md Step 2)."
 echo "  3. Run the dry-run validation (see BOOTSTRAP.md Step 3)."
 echo "================================================================"

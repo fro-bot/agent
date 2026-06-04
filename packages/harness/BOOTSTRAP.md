@@ -37,7 +37,11 @@ export NODE_AUTH_TOKEN=<paste-token-here>
 bash packages/harness/scripts/bootstrap-publish.sh
 ```
 
-The script creates a minimal `package.json` stub for each name, publishes `0.0.0`, and cleans up. It prints a reminder to revoke the token when done.
+The script detects `NODE_AUTH_TOKEN` and writes a temporary `.npmrc` (chmod 600) inside its own temp work directory, passing it to every `npm publish` call via `--userconfig`. This means the `NODE_AUTH_TOKEN` path works on any machine — no pre-existing `.npmrc` or `actions/setup-node` required. The temp `.npmrc` (which contains the token) is inside the work directory and is removed by the script's `EXIT` trap on both success and failure.
+
+If you prefer not to use `NODE_AUTH_TOKEN`, run `npm login` first and omit the export — the script falls back to ambient npm auth.
+
+The script creates a minimal `package.json` stub for each name, publishes `0.0.0`, and cleans up. The revoke reminder prints via the `EXIT` trap regardless of whether the script succeeds or fails mid-loop.
 
 ### 1c. Revoke the token immediately
 
