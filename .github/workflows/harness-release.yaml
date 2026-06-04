@@ -53,7 +53,7 @@ jobs:
             runner: ubuntu-24.04-arm
           - platform: darwin
             arch: x64
-            runner: macos-13
+            runner: macos-15-intel
           - platform: darwin
             arch: arm64
             runner: macos-15
@@ -257,9 +257,11 @@ jobs:
             exit 1
           fi
 
-          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+          {
+            echo "integration_commit=${INTEGRATION_COMMIT}"
+            echo "base_version=${BASE_VERSION}"
+            echo "dry_run=${DRY_RUN}"
+          } >> "$GITHUB_OUTPUT"
 
       # Download all four platform binaries.
       - name: Download linux/x64 binary
@@ -306,8 +308,8 @@ jobs:
               chmod +x "${BIN_DIR}/opencode"
 
               # Write the per-platform package.json (mirrors OpenCode's model).
-              # BASE_VERSION and PKG_NAME are shell variables (not ${{ }} interpolation),
-              # so they are safe from injection — validated above.
+              # BASE_VERSION and PKG_NAME are shell variables (not workflow-expression
+              # interpolation), so they are safe from injection — validated above.
               cat > "${PKG_DIR}/package.json" <<EOF
           {
             "name": "${PKG_NAME}",
