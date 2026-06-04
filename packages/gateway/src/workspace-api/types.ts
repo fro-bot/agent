@@ -1,8 +1,10 @@
 /**
  * Request/response types for the workspace-agent HTTP service.
  *
- * These types MIRROR `apps/workspace-agent/src/types.ts` exactly.
- * The gateway MUST import from this file — never from the workspace-agent package directly.
+ * These types are wire-compatible with `apps/workspace-agent/src/types.ts`. Some are
+ * intentionally narrower (e.g. the `/readyz` shapes below are split into a discriminated
+ * union here for stricter consumer-side checking). The gateway MUST import from this file —
+ * never from the workspace-agent package directly.
  *
  * SECURITY: `repoPath` is NOT in CloneRequest. The agent derives the path internally.
  * The caller never controls where the repo is cloned.
@@ -54,7 +56,7 @@ export type CloneErrorCode =
 
 /**
  * GET /readyz success response (HTTP 200).
- * Mirrors `apps/workspace-agent/src/readyz.ts`.
+ * Narrows the flat `ReadyzResponse` emitted by `apps/workspace-agent/src/server.ts`.
  */
 export interface ReadyzReady {
   readonly ready: true
@@ -63,7 +65,7 @@ export interface ReadyzReady {
 
 /**
  * GET /readyz not-ready response (HTTP 503).
- * Mirrors `apps/workspace-agent/src/readyz.ts`.
+ * Narrows the flat `ReadyzResponse` emitted by `apps/workspace-agent/src/server.ts`.
  */
 export interface ReadyzNotReady {
   readonly ready: false

@@ -3,7 +3,8 @@
  *
  * These types define the contract between the gateway (PR D workspace-api client)
  * and the workspace-agent server. The gateway MUST import from
- * `packages/gateway/src/workspace-api/types.ts` which mirrors these shapes exactly.
+ * `packages/gateway/src/workspace-api/types.ts`, whose types are wire-compatible with these
+ * (some intentionally narrower for stricter consumer-side checking).
  *
  * SECURITY: `repoPath` is NOT in CloneRequest. The agent derives the path internally.
  * The caller never controls where the repo is cloned.
