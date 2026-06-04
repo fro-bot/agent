@@ -1,0 +1,34 @@
+You are working in a disposable automation clone at {{repo}}.
+
+Goal: integrate upstream release {{tag}} with the selected branches/PRs {{branches}} without pushing anything.
+
+Requirements:
+- Work only in this automation clone.
+- Do not open a PR.
+- Do not push.
+- Do NOT ask for final approval.
+- DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
+- Base the integration branch on the release tag {{tag}}, not on dev HEAD.
+- Name the branch {{branch}}.
+- Merge these refs in order: {{merges}}.
+- If there are merge conflicts, resolve them completely.
+- Build the host CLI.
+- The CLI must be compiled with stable release identity: OPENCODE_CHANNEL={{channel}} and OPENCODE_VERSION={{version}}.
+
+Exact tasks:
+1. Verify the repo is usable and fetch anything you need.
+2. Create or reset {{branch}} to refs/tags/{{tag}}.
+3. Merge {{merges}} into {{branch}}.
+4. Build the host CLI in `packages/opencode` with `OPENCODE_CHANNEL={{channel}} OPENCODE_VERSION={{version}} bun run build -- --single`.
+5. Ensure the built CLI binary exists at the expected path under `packages/opencode/dist/`.
+6. Run the built CLI with `--version` and verify the output is exactly `{{version}}`.
+7. Return a concise summary with the final branch name and artifact paths.
+
+Context:
+- Upstream repo: {{release_repo}}
+- Base branch: dev
+- Release URL: {{release_url}}
+- Integration refs:
+- {{sources}}
+
+If anything fails, fix it and continue until the branch is integrated and the configured build succeeds.

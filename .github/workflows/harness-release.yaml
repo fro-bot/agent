@@ -1,0 +1,406 @@
+name: harness-release
+
+# Fenced: manual dispatch or protected release tag only.
+# Never runs on PR or push to non-release branches.
+# Maintainer-gated: no auto-publish; the workflow is triggered deliberately.
+on:
+  workflow_dispatch:
+    inputs:
+      integration_commit:
+        description: Frozen integration commit SHA (from provenance manifest)
+        required: true
+        type: string
+      base_version:
+        description: Base release version (e.g. 1.15.13)
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run: build + verify but do NOT publish to npm'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'harness-v*'
+
+concurrency:
+  group: harness-release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Workflow-level: read-only. The build job runs untrusted LLM-merge + upstream
+# build code and must NOT have id-token access. id-token: write is scoped to
+# the publish job only (see below).
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------------
+# Per-platform build matrix
+# Mirrors upstream anomalyco/opencode publish.yml native-runner matrix.
+# Windows is out of scope (linux x64/arm64 + darwin x64/arm64 only).
+# ---------------------------------------------------------------------------
+jobs:
+  build:
+    name: build (${{ matrix.platform }}/${{ matrix.arch }})
+    strategy:
+      fail-fast: true # All-or-nothing: one failure blocks the whole publish.
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin
+            arch: x64
+            runner: macos-15-intel
+          - platform: darwin
+            arch: arm64
+            runner: macos-15
+
+    runs-on: ${{ matrix.runner }}
+
+    # Build job: read-only. No id-token — the untrusted LLM-merge + upstream
+    # build runs here and must not be able to publish or obtain OIDC tokens.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout harness repo
+        uses: actions/checkout@v4
+
+      - name: Install Bun (pinned to upstream packageManager version)
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned to match anomalyco/opencode packageManager: bun@1.3.13
+          bun-version: 1.3.13
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+        with:
+          install-dependencies: 'false'
+
+      - name: Install harness dependencies
+        run: pnpm install --filter @fro.bot/harness --frozen-lockfile
+
+      - name: Build harness package (for scripts/verify-binary.ts import)
+        run: pnpm --filter @fro.bot/harness build
+
+      - name: Resolve integration commit and base version
+        id: params
+        env:
+          INPUT_INTEGRATION_COMMIT: ${{ inputs.integration_commit }}
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_INTEGRATION_COMMIT}" ]; then
+            INTEGRATION_COMMIT="${INPUT_INTEGRATION_COMMIT}"
+            BASE_VERSION="${INPUT_BASE_VERSION}"
+          else
+            # Tag-triggered: parse harness-v<version> tag.
+            TAG="${GITHUB_REF_NAME}"
+            BASE_VERSION="${TAG#harness-v}"
+            # Read integration commit from the provenance manifest in the repo.
+            INTEGRATION_COMMIT=$(node -e "
+              const fs = require('fs');
+              const raw = fs.readFileSync('./packages/harness/provenance.json', 'utf8');
+              const m = JSON.parse(raw);
+              if (!m || typeof m.integrationCommit !== 'string') {
+                process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
+                process.exit(1);
+              }
+              process.stdout.write(m.integrationCommit);
+            ")
+          fi
+
+          # Validate base_version: must be a semver-ish string (digits and dots only, no shell metacharacters).
+          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
+            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
+            exit 1
+          fi
+
+          # Validate integration_commit: must be a hex SHA (7–40 chars).
+          if ! echo "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "ERROR: integration_commit '${INTEGRATION_COMMIT}' does not match expected SHA format" >&2
+            exit 1
+          fi
+
+          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
+        env:
+          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          bun run packages/harness/scripts/build-platform.ts \
+            --integration-commit "$INTEGRATION_COMMIT" \
+            --base-version "$BASE_VERSION" \
+            --platform "$MATRIX_PLATFORM" \
+            --arch "$MATRIX_ARCH" \
+            --repo-url "https://github.com/anomalyco/opencode.git" \
+            --work-dir "$RUNNER_TEMP/harness-build-work" \
+            --out-dir "$RUNNER_TEMP/harness-build-out"
+
+      - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
+        env:
+          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          bun run packages/harness/scripts/verify-binary.ts \
+            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH/bin/opencode" \
+            --base-version "$BASE_VERSION" \
+            --integration-commit "$INTEGRATION_COMMIT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}/bin/opencode
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Assemble + publish — all-or-nothing across the matrix.
+  # Runs only after ALL platform builds succeed (fail-fast: true above).
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish (all-or-nothing)
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: npm-publish # Maintainer-gated environment with required reviewers.
+
+    # id-token: write is scoped to the publish job ONLY.
+    # The build job (which runs untrusted LLM-merge + upstream build code) must
+    # NOT have id-token access. This prevents a compromised build from obtaining
+    # an OIDC token and publishing arbitrary packages.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout harness repo
+        uses: actions/checkout@v4
+
+      - name: Install Bun (pinned)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+        with:
+          install-dependencies: 'false'
+
+      - name: Setup Node.js (for npm trusted publishing via OIDC)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm to a trusted-publishing-capable version
+        # Trusted publishing (OIDC) requires npm >= 11.5.0; Node 24 ships an older npm.
+        # Pinned to a reviewed version that supports trusted publishing.
+        run: npm install -g npm@11.5.1
+
+      - name: Install harness dependencies
+        run: pnpm install --filter @fro.bot/harness --frozen-lockfile
+
+      - name: Build harness package
+        run: pnpm --filter @fro.bot/harness build
+
+      - name: Resolve params
+        id: params
+        env:
+          INPUT_INTEGRATION_COMMIT: ${{ inputs.integration_commit }}
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_INTEGRATION_COMMIT}" ]; then
+            INTEGRATION_COMMIT="${INPUT_INTEGRATION_COMMIT}"
+            BASE_VERSION="${INPUT_BASE_VERSION}"
+            DRY_RUN="${INPUT_DRY_RUN}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            BASE_VERSION="${TAG#harness-v}"
+            INTEGRATION_COMMIT=$(node -e "
+              const fs = require('fs');
+              const raw = fs.readFileSync('./packages/harness/provenance.json', 'utf8');
+              const m = JSON.parse(raw);
+              if (!m || typeof m.integrationCommit !== 'string') {
+                process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
+                process.exit(1);
+              }
+              process.stdout.write(m.integrationCommit);
+            ")
+            DRY_RUN="false"
+          fi
+
+          # Validate base_version: must be a semver-ish string (no shell metacharacters).
+          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
+            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
+            exit 1
+          fi
+
+          # Validate integration_commit: must be a hex SHA (7–40 chars).
+          if ! echo "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "ERROR: integration_commit '${INTEGRATION_COMMIT}' does not match expected SHA format" >&2
+            exit 1
+          fi
+
+          {
+            echo "integration_commit=${INTEGRATION_COMMIT}"
+            echo "base_version=${BASE_VERSION}"
+            echo "dry_run=${DRY_RUN}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Download all four platform binaries.
+      - name: Download linux/x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-binary-linux-x64
+          path: /tmp/harness-binaries/linux-x64
+
+      - name: Download linux/arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-binary-linux-arm64
+          path: /tmp/harness-binaries/linux-arm64
+
+      - name: Download darwin/x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-binary-darwin-x64
+          path: /tmp/harness-binaries/darwin-x64
+
+      - name: Download darwin/arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-binary-darwin-arm64
+          path: /tmp/harness-binaries/darwin-arm64
+
+      - name: Assemble per-platform packages
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+        run: |
+          set -euo pipefail
+          PUBLISH_DIR="/tmp/harness-publish"
+
+          for PLATFORM in linux darwin; do
+            for ARCH in x64 arm64; do
+              PKG_NAME="@fro.bot/harness-${PLATFORM}-${ARCH}"
+              PKG_DIR="${PUBLISH_DIR}/${PLATFORM}-${ARCH}"
+              BIN_DIR="${PKG_DIR}/bin"
+              mkdir -p "${BIN_DIR}"
+
+              # Copy the binary.
+              cp "/tmp/harness-binaries/${PLATFORM}-${ARCH}/opencode" "${BIN_DIR}/opencode"
+              chmod +x "${BIN_DIR}/opencode"
+
+              # Write the per-platform package.json (mirrors OpenCode's model).
+              # BASE_VERSION and PKG_NAME are shell variables (not workflow-expression
+              # interpolation), so they are safe from injection — validated above.
+              cat > "${PKG_DIR}/package.json" <<EOF
+          {
+            "name": "${PKG_NAME}",
+            "version": "${BASE_VERSION}",
+            "description": "Native binary for @fro.bot/harness on ${PLATFORM}/${ARCH}",
+            "license": "MIT",
+            "os": ["${PLATFORM}"],
+            "cpu": ["${ARCH}"],
+            "files": ["bin"],
+            "publishConfig": {
+              "access": "public"
+            }
+          }
+          EOF
+
+              # Copy LICENSE.
+              cp packages/harness/LICENSE "${PKG_DIR}/LICENSE"
+
+              echo "Assembled: ${PKG_NAME}@${BASE_VERSION}"
+            done
+          done
+
+          # Write the provenance manifest into the main package for runtime use.
+          # Values are passed via environment variables (not interpolated into the script body).
+          node -e "
+            const fs = require('fs');
+            const baseVersion = process.env.BASE_VERSION;
+            const integrationCommit = process.env.INTEGRATION_COMMIT;
+            const buildSha = process.env.GITHUB_SHA || 'unknown';
+            let existing = {};
+            try { existing = JSON.parse(fs.readFileSync('packages/harness/provenance.json', 'utf8')); } catch {}
+            const manifest = { ...existing, baseVersion, integrationCommit, buildSha };
+            fs.writeFileSync('packages/harness/provenance.json', JSON.stringify(manifest, null, 2) + '\n');
+            console.log('provenance.json updated:', manifest);
+          "
+
+          echo "Assembly complete. Publish dir: ${PUBLISH_DIR}"
+          ls -la "${PUBLISH_DIR}"
+
+      - name: Publish per-platform packages to npm (trusted publishing)
+        if: steps.params.outputs.dry_run != 'true'
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          PUBLISH_DIR="/tmp/harness-publish"
+
+          for PLATFORM in linux darwin; do
+            for ARCH in x64 arm64; do
+              PKG_DIR="${PUBLISH_DIR}/${PLATFORM}-${ARCH}"
+              echo "Publishing @fro.bot/harness-${PLATFORM}-${ARCH}@${BASE_VERSION}..."
+              # OIDC trusted publishing: no token, provenance is automatic.
+              npm publish "${PKG_DIR}"
+            done
+          done
+
+      - name: Publish main @fro.bot/harness package to npm (trusted publishing)
+        if: steps.params.outputs.dry_run != 'true'
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          # Inject version + optionalDependencies before publish.
+          # Source package.json intentionally omits optionalDependencies so the
+          # workspace pnpm-lock.yaml stays clean (packages don't exist on npm yet).
+          # We inject them here so the PUBLISHED package.json has them.
+          # BASE_VERSION is passed via env (not interpolated into the script body).
+          node -e "
+            const fs = require('fs');
+            const baseVersion = process.env.BASE_VERSION;
+            const pkg = JSON.parse(fs.readFileSync('packages/harness/package.json', 'utf8'));
+            pkg.version = baseVersion;
+            pkg.optionalDependencies = {
+              '@fro.bot/harness-linux-x64': baseVersion,
+              '@fro.bot/harness-linux-arm64': baseVersion,
+              '@fro.bot/harness-darwin-x64': baseVersion,
+              '@fro.bot/harness-darwin-arm64': baseVersion,
+            };
+            fs.writeFileSync('packages/harness/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "Publishing @fro.bot/harness@${BASE_VERSION}..."
+          # OIDC trusted publishing: no token, provenance is automatic.
+          npm publish packages/harness
+
+      - name: Dry run summary
+        if: steps.params.outputs.dry_run == 'true'
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+        run: |
+          echo "DRY RUN: build + verify passed for all platforms."
+          echo "  base version:       ${BASE_VERSION}"
+          echo "  integration commit: ${INTEGRATION_COMMIT}"
+          echo "  No packages were published to npm."
