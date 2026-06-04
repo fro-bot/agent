@@ -9,20 +9,35 @@
 
 import type {Result} from '@fro-bot/runtime'
 
-import type {CloneErrorCode, CloneFailure, CloneRequest, CloneSuccess, WorkspaceError} from './types.js'
+import type {CloneErrorCode, CloneFailure, CloneRequest, CloneSuccess, ReadyzResponse, WorkspaceError} from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
 
 export interface WorkspaceClientOptions {
   readonly baseUrl: string
   readonly timeoutMs?: number
+  /** Timeout for /readyz checks. Defaults to 5 seconds — much shorter than clone. */
+  readonly readyzTimeoutMs?: number
 }
 
 export interface WorkspaceClient {
   readonly clone: (request: CloneRequest) => Promise<Result<CloneSuccess, WorkspaceError>>
+  /**
+   * Check workspace readiness via GET /readyz.
+   *
+   * Returns:
+   * - `ok({ready: true, opencode: 'ready'})` on HTTP 200
+   * - `ok({ready: false, opencode: ...})` on HTTP 503 (workspace not ready)
+   * - `err({kind: 'http-error', status})` on unexpected HTTP status
+   * - `err({kind: 'timeout'})` on AbortSignal.timeout expiry
+   * - `err({kind: 'network-error'})` on connection failure
+   * - `err({kind: 'parse-error'})` on malformed response body
+   */
+  readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
+const DEFAULT_READYZ_TIMEOUT_MS = 5_000 // 5 seconds — fast gate check
 
 // Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
 // package/container boundary, so not imported). Module-private: callers use
@@ -46,7 +61,56 @@ export function workspaceRepoPath(owner: string, repo: string): string {
  * Never logs request or response bodies.
  */
 export function createWorkspaceClient(options: WorkspaceClientOptions): WorkspaceClient {
-  const {baseUrl, timeoutMs = DEFAULT_TIMEOUT_MS} = options
+  const {baseUrl, timeoutMs = DEFAULT_TIMEOUT_MS, readyzTimeoutMs = DEFAULT_READYZ_TIMEOUT_MS} = options
+
+  async function readyz(): Promise<Result<ReadyzResponse, WorkspaceError>> {
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/readyz`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(readyzTimeoutMs),
+      })
+    } catch (fetchError) {
+      if (fetchError instanceof Error && fetchError.name === 'TimeoutError') {
+        return err({kind: 'timeout'})
+      }
+      if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+        return err({kind: 'timeout'})
+      }
+      return err({kind: 'network-error'})
+    }
+
+    const httpStatus = response.status
+
+    // Only 200 (ready) and 503 (not-ready) are expected.
+    // Any other status is an unexpected error.
+    if (httpStatus !== 200 && httpStatus !== 503) {
+      return err({kind: 'http-error', status: httpStatus})
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return err({kind: 'parse-error'})
+    }
+
+    if (isReadyzResponse(parsed) === false) {
+      return err({kind: 'parse-error'})
+    }
+
+    // Status↔body coherence check: HTTP status must agree with the body's ready field.
+    // A 503 + {ready:true} would be a fail-OPEN (not-ready workspace classified as ready).
+    // A 200 + {ready:false} is also incoherent. Both are treated as parse-error (fail-closed).
+    if (httpStatus === 200 && parsed.ready !== true) {
+      return err({kind: 'parse-error'})
+    }
+    if (httpStatus === 503 && parsed.ready !== false) {
+      return err({kind: 'parse-error'})
+    }
+
+    return ok(parsed)
+  }
 
   async function clone(request: CloneRequest): Promise<Result<CloneSuccess, WorkspaceError>> {
     const {owner, repo} = request
@@ -113,12 +177,23 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     return ok(parsed)
   }
 
-  return {clone}
+  return {clone, readyz}
 }
 
 // ---------------------------------------------------------------------------
 // Type guards
 // ---------------------------------------------------------------------------
+
+function isReadyzResponse(value: unknown): value is ReadyzResponse {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.ready !== 'boolean') return false
+  if (v.ready === true) {
+    return v.opencode === 'ready'
+  }
+  // ready === false
+  return v.opencode === 'starting' || v.opencode === 'down' || v.opencode === 'degraded' || v.opencode === 'unknown'
+}
 
 function isCloneResponse(value: unknown): value is CloneSuccess | CloneFailure {
   if (typeof value !== 'object' || value === null) return false
