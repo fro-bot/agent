@@ -118,6 +118,7 @@ eslint-typegen.d.ts
 # Workspace package build output
 packages/runtime/dist/
 packages/gateway/dist/
+packages/harness/dist/
 apps/action/dist/
 apps/workspace-agent/dist/
 

@@ -21,12 +21,12 @@
   ],
   "scripts": {
     "bootstrap": "SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
-    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build",
-    "check-types": "pnpm --filter @fro-bot/runtime check-types && pnpm --filter @fro-bot/action check-types",
-    "fix": "pnpm --filter @fro-bot/runtime fix && pnpm --filter @fro-bot/action fix",
+    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build && pnpm --filter @fro.bot/harness build",
+    "check-types": "pnpm --filter @fro-bot/runtime check-types && pnpm --filter @fro-bot/action check-types && pnpm --filter @fro.bot/harness check-types",
+    "fix": "pnpm --filter @fro-bot/runtime fix && pnpm --filter @fro-bot/action fix && pnpm --filter @fro.bot/harness fix",
     "postinstall": "simple-git-hooks",
-    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint",
-    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test"
+    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint && pnpm --filter @fro.bot/harness lint",
+    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test && pnpm --filter @fro.bot/harness test"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",
