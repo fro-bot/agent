@@ -1,0 +1,9 @@
+{
+  "release_repo": "anomalyco/opencode",
+  "source_repo": "https://github.com/anomalyco/opencode.git",
+  "base_version": "1.15.13",
+  "integrationRefs": ["https://github.com/anomalyco/opencode/pull/30182"],
+  "agent": "build",
+  "model": "anthropic/claude-sonnet-4-6",
+  "opencode_bin": "opencode"
+}
