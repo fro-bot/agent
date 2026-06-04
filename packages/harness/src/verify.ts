@@ -5,13 +5,17 @@
  * The actual exec calls live in scripts/verify-binary.ts.
  *
  * Verification contract:
- *   1. --version output == expectedVersion (exact match, trimmed).
- *   2. Integration marker present in a STRUCTURED position in the probe output.
- *      The marker must appear on a dedicated line matching:
- *        "  integration commit: <sha>"
- *      This prevents a binary that merely mentions the SHA in unrelated output
- *      from passing the check.
- *   3. Binary is executable (exit code 0 on --version).
+ *   1. Binary is executable (exit code 0 on --version).
+ *   2. --version output == expectedVersion (exact match, trimmed).
+ *      For a harness build, expectedVersion is "<base>+harness.<short8>" (from
+ *      buildHarnessVersion). A stock upstream binary reports bare "<base>", which
+ *      fails this check — proving the binary is a harness build for this exact
+ *      base+commit. Full provenance (full SHA, refs) lives in the package's
+ *      provenance.json manifest; npm provenance attestation is the cryptographic gate.
+ *   3. Integration marker: when an integrationCommit is supplied, the --version output
+ *      must contain "+harness.<short8>" where short8 is the first 8 chars of the commit.
+ *      This is defense-in-depth on top of the exact version match — it explicitly
+ *      confirms the harness segment encodes the expected integration commit.
  */
 
 /** Result of a single verification assertion. */
@@ -21,10 +25,14 @@ export interface VerifyResult {
 }
 
 /**
- * Asserts that the binary's reported version matches the expected base version.
+ * Asserts that the binary's reported version matches the expected version string.
+ *
+ * For a harness build with an integration commit, expectedVersion is
+ * "<base>+harness.<short8>" (as produced by buildHarnessVersion). A stock upstream
+ * binary reports bare "<base>", which fails this check.
  *
  * @param actualVersion   - The trimmed stdout from `binary --version`.
- * @param expectedVersion - The base release version (e.g. '1.15.13').
+ * @param expectedVersion - The full expected version string (e.g. '1.15.13+harness.cafebabe').
  */
 export function assertVersionMatch(actualVersion: string, expectedVersion: string): VerifyResult {
   const trimmed = actualVersion.trim()
@@ -38,48 +46,38 @@ export function assertVersionMatch(actualVersion: string, expectedVersion: strin
 }
 
 /**
- * Asserts that the integration commit marker is present in a STRUCTURED position
- * in the binary's probe output.
+ * Asserts that the binary's --version output contains the "+harness.<short8>" marker,
+ * where short8 is the first 8 characters of the integration commit.
  *
- * The integration marker is the frozen integration commit SHA embedded in the
- * binary's provenance. We probe it via `binary info` which outputs the harness
- * provenance in a structured format. The marker must appear on a dedicated line:
+ * This is defense-in-depth on top of assertVersionMatch: it explicitly confirms the
+ * harness segment encodes the expected integration commit, catching any case where
+ * the version string has the right format but the wrong commit embedded.
  *
- *   "  integration commit: <sha>"
+ * A stock upstream binary reports bare "<base>" with no "+harness." segment — it fails.
+ * A harness build of a DIFFERENT commit reports "+harness.<other8>" — it also fails.
  *
- * This structured check prevents a binary that merely mentions the SHA in
- * unrelated output (e.g. error messages, help text) from passing the check.
+ * An empty or null integrationCommit is treated as "no marker required" (dev scaffold).
  *
- * An empty integrationCommit is treated as "no marker required" (dev scaffold).
- *
- * @param probeOutput       - Combined output from the binary probe (--version + info).
- * @param integrationCommit - The frozen integration commit SHA to look for, or null/empty.
+ * @param versionOutput     - The trimmed stdout from `binary --version`.
+ * @param integrationCommit - The frozen integration commit SHA to derive short8 from, or null/empty.
  */
-export function assertIntegrationMarker(probeOutput: string, integrationCommit: string | null): VerifyResult {
+export function assertIntegrationMarker(versionOutput: string, integrationCommit: string | null): VerifyResult {
   if (integrationCommit === null || integrationCommit.length === 0) {
     // Dev scaffold — no marker required.
     return {ok: true, message: 'integration marker: not required (dev scaffold)'}
   }
 
-  // The marker must appear on a dedicated structured line in the probe output.
-  // Format: "  integration commit: <sha>" (as emitted by `harness info` / formatProvenance).
-  // This prevents substring matches in unrelated output from passing.
-  const structuredMarkerPattern = new RegExp(
-    String.raw`^\s*integration commit:\s+${escapeRegex(integrationCommit)}\s*$`,
-    'm',
-  )
-  if (structuredMarkerPattern.test(probeOutput)) {
-    return {ok: true, message: `integration marker present: ${integrationCommit}`}
+  const short8 = integrationCommit.slice(0, 8)
+  const marker = `+harness.${short8}`
+
+  if (versionOutput.includes(marker)) {
+    return {ok: true, message: `integration marker present: ${marker}`}
   }
 
   return {
     ok: false,
-    message: `integration marker missing: '${integrationCommit}' not found in structured position in binary output`,
+    message: `integration marker missing: '${marker}' not found in --version output '${versionOutput}'`,
   }
-}
-
-function escapeRegex(s: string): string {
-  return s.replaceAll(/[$()*+.?[\\\]^{|}]/g, String.raw`\$&`)
 }
 
 /**
@@ -101,26 +99,28 @@ export function assertExitZero(exitCode: number, probe: string): VerifyResult {
 /**
  * Runs all verification assertions and returns a combined result.
  *
+ * The binary self-reports its version via --version. For a harness build, this is
+ * "<base>+harness.<short8>". A stock upstream binary reports bare "<base>", which
+ * fails the version match. Full provenance lives in the package's provenance.json.
+ *
  * @param params - Verification inputs.
  * @param params.versionOutput      - Trimmed stdout from `binary --version`.
- * @param params.expectedVersion    - The base release version to assert.
- * @param params.probeOutput        - Combined probe output for marker check.
+ * @param params.expectedVersion    - The full expected version string to assert.
  * @param params.integrationCommit  - Frozen integration commit SHA, or null.
  * @param params.exitCode           - Exit code from the --version probe.
  */
 export function runVerifications(params: {
   readonly versionOutput: string
   readonly expectedVersion: string
-  readonly probeOutput: string
   readonly integrationCommit: string | null
   readonly exitCode: number
 }): {readonly ok: boolean; readonly failures: readonly string[]} {
-  const {versionOutput, expectedVersion, probeOutput, integrationCommit, exitCode} = params
+  const {versionOutput, expectedVersion, integrationCommit, exitCode} = params
 
   const results: VerifyResult[] = [
     assertExitZero(exitCode, '--version'),
     assertVersionMatch(versionOutput, expectedVersion),
-    assertIntegrationMarker(probeOutput, integrationCommit),
+    assertIntegrationMarker(versionOutput, integrationCommit),
   ]
 
   const failures = results.filter(r => !r.ok).map(r => r.message)

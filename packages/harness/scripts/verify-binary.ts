@@ -3,9 +3,15 @@
  * verify-binary.ts — verify the built native binary before packaging.
  *
  * Asserts:
- *   1. --version == base version (exact match).
- *   2. Integration marker (frozen integration commit SHA) present in binary output.
- *   3. Minimal boot smoke: binary exits 0 on --version.
+ *   1. Binary exits 0 on --version.
+ *   2. --version == expected version (exact match, trimmed).
+ *      For a harness build, the expected version is "<base>+harness.<short8>" (from
+ *      buildHarnessVersion). A stock upstream binary reports bare "<base>", which
+ *      fails this check — proving the binary is a harness build for this exact
+ *      base+commit. Full provenance lives in the package's provenance.json manifest;
+ *      npm provenance attestation is the cryptographic gate.
+ *   3. Integration marker: when --integration-commit is supplied, the --version output
+ *      must contain "+harness.<short8>" (defense-in-depth on top of the exact match).
  *
  * Exits non-zero on any mismatch — this gates the publish step.
  *
@@ -19,7 +25,8 @@
  *     [--integration-commit <sha>]
  *
  * The --integration-commit is optional: when absent (dev scaffold), the marker
- * check is skipped. When present, the marker must appear in the binary's output.
+ * check is skipped. When present, the binary's --version must contain
+ * "+harness.<short8>" where short8 is the first 8 chars of the commit.
  */
 
 import {execFileSync} from 'node:child_process'
@@ -60,7 +67,7 @@ function parseArgs(argv: string[]): VerifyArgs | null {
     console.error('[verify-binary] Missing required arguments.')
     console.error('  Required: --binary, --base-version')
     printHelp()
-    process.exit(1)
+    return null
   }
 
   return {binaryPath, baseVersion, integrationCommit}
@@ -74,13 +81,18 @@ Usage:
   bun run packages/harness/scripts/verify-binary.ts \
     --binary <path>                     Path to the built native binary
     --base-version <version>            Expected base version (e.g. 1.15.13)
-    [--integration-commit <sha>]        Frozen integration commit SHA to assert as marker
+    [--integration-commit <sha>]        Frozen integration commit SHA; when supplied,
+                                        the binary's --version must contain
+                                        "+harness.<short8>" (first 8 chars of the SHA)
     [--help]                            Print this help
 
 Assertions:
   1. Binary exits 0 on --version.
-  2. --version output == base-version (exact match, trimmed).
-  3. Integration commit SHA present in binary output (when --integration-commit provided).
+  2. --version output == expected version (exact match, trimmed).
+     For a harness build: "<base>+harness.<short8>". A stock binary reports bare
+     "<base>" and fails — proving this is a harness build for the expected commit.
+  3. Integration marker "+harness.<short8>" present in --version (when --integration-commit
+     supplied). Defense-in-depth on top of the exact version match.
 
 Exits non-zero on any assertion failure.
 `)
@@ -93,15 +105,14 @@ Exits non-zero on any assertion failure.
 interface ProbeResult {
   readonly exitCode: number
   readonly versionOutput: string
-  readonly probeOutput: string
 }
 
 function probeBinary(binaryPath: string): ProbeResult {
   let exitCode = 0
   let versionOutput = ''
-  let probeOutput = ''
 
-  // Probe 1: --version
+  // Probe: --version (the binary self-reports its version, including the
+  // "+harness.<short8>" segment for harness builds).
   try {
     const out = execFileSync(binaryPath, ['--version'], {
       encoding: 'utf8',
@@ -109,7 +120,6 @@ function probeBinary(binaryPath: string): ProbeResult {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     versionOutput = out.trim()
-    probeOutput += out
   } catch (error: unknown) {
     // Capture the exit code from the error if available.
     const spawnErr = error as {status?: number; message?: string}
@@ -117,23 +127,7 @@ function probeBinary(binaryPath: string): ProbeResult {
     console.error(`[verify-binary] --version probe failed: ${spawnErr.message ?? String(error)}`)
   }
 
-  // Probe 2: info (for integration marker — harness-own subcommand)
-  // Only attempt if the --version probe succeeded.
-  if (exitCode === 0) {
-    try {
-      const infoOut = execFileSync(binaryPath, ['info'], {
-        encoding: 'utf8',
-        timeout: 30_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      probeOutput += `\n${infoOut}`
-    } catch {
-      // info subcommand may not be available on a stock opencode binary.
-      // Not a fatal error — the marker check will fail if the commit is required.
-    }
-  }
-
-  return {exitCode, versionOutput, probeOutput}
+  return {exitCode, versionOutput}
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +143,8 @@ function main(): void {
   const {binaryPath, baseVersion, integrationCommit} = args
 
   // Compute the full expected version string.
-  // When an integration commit is present, the binary self-reports the full
-  // harness version ("<baseVersion>+harness.<shortSha>") — not the bare base version.
-  // When absent (dev scaffold), the bare base version is used.
+  // For a harness build, the binary self-reports "<base>+harness.<short8>".
+  // For dev scaffold (no integration commit), the bare base version is used.
   const expectedVersion =
     integrationCommit !== null && integrationCommit.length > 0
       ? buildHarnessVersion(baseVersion, integrationCommit)
@@ -169,7 +162,6 @@ function main(): void {
   const result = runVerifications({
     versionOutput: probe.versionOutput,
     expectedVersion,
-    probeOutput: probe.probeOutput,
     integrationCommit,
     exitCode: probe.exitCode,
   })

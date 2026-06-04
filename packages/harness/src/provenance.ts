@@ -34,7 +34,7 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
  * Type guard: validates that an unknown value has the shape of a Provenance manifest.
  * Treats malformed JSON as an explicit error rather than silently returning partial data.
  */
-function isValidProvenance(value: unknown): value is Provenance {
+export function isValidProvenance(value: unknown): value is Provenance {
   if (value === null || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   if (typeof v.baseVersion !== 'string' || v.baseVersion.length === 0) return false

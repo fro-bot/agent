@@ -99,14 +99,33 @@ export async function writeProvenanceManifest(dir: string, manifest: ProvenanceM
 }
 
 /**
+ * Type guard: validates that an unknown value has the shape of a ProvenanceManifest.
+ * Treats malformed/partial JSON as invalid rather than silently returning partial data.
+ */
+function isValidProvenanceManifest(value: unknown): value is ProvenanceManifest {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  if (typeof v.baseVersion !== 'string' || v.baseVersion.length === 0) return false
+  if (!Array.isArray(v.integrationRefs)) return false
+  if (typeof v.integrationCommit !== 'string' || v.integrationCommit.length === 0) return false
+  if (typeof v.buildSha !== 'string') return false
+  return true
+}
+
+/**
  * Reads the provenance manifest from the given directory.
- * Returns null if the manifest does not exist.
+ * Returns null if the manifest does not exist or has an invalid shape.
+ * Uses isValidProvenanceManifest to guard against malformed/partial manifests.
  */
 export async function readProvenanceManifest(dir: string): Promise<ProvenanceManifest | null> {
   const manifestPath = path.join(dir, MANIFEST_FILENAME)
   try {
     const raw = await fs.readFile(manifestPath, 'utf8')
-    return JSON.parse(raw) as ProvenanceManifest
+    const parsed: unknown = JSON.parse(raw)
+    if (!isValidProvenanceManifest(parsed)) {
+      return null
+    }
+    return parsed
   } catch {
     return null
   }

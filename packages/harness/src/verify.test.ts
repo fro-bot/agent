@@ -51,6 +51,14 @@ describe('assertVersionMatch', () => {
     expect(result.ok).toBe(false)
     expect(result.message).toContain('mismatch')
   })
+
+  it('harness version string exact match → ok', () => {
+    // #given / #when — harness build self-reports "<base>+harness.<short8>"
+    const result = assertVersionMatch('1.15.13+harness.cafebabe', '1.15.13+harness.cafebabe')
+
+    // #then
+    expect(result.ok).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -60,7 +68,7 @@ describe('assertVersionMatch', () => {
 describe('assertIntegrationMarker', () => {
   it('null integrationCommit → ok (dev scaffold, no marker required)', () => {
     // #given / #when
-    const result = assertIntegrationMarker('some binary output', null)
+    const result = assertIntegrationMarker('1.15.13', null)
 
     // #then
     expect(result.ok).toBe(true)
@@ -69,64 +77,65 @@ describe('assertIntegrationMarker', () => {
 
   it('empty integrationCommit → ok (dev scaffold)', () => {
     // #given / #when
-    const result = assertIntegrationMarker('some binary output', '')
+    const result = assertIntegrationMarker('1.15.13', '')
 
     // #then
     expect(result.ok).toBe(true)
   })
 
-  it('marker present on structured line → ok', () => {
-    // #given — output matches the "  integration commit: <sha>" format from formatProvenance
+  it('correct harness build: +harness.<short8> present in --version → ok', () => {
+    // #given — harness build self-reports "<base>+harness.<short8>" via --version
     const commit = 'cafebabe1234abcd'
-    const probeOutput = `harness (patched OpenCode)\n  integration commit: ${commit}\n  build sha: abc`
+    const versionOutput = `1.15.13+harness.${commit.slice(0, 8)}`
 
     // #when
-    const result = assertIntegrationMarker(probeOutput, commit)
+    const result = assertIntegrationMarker(versionOutput, commit)
 
     // #then
     expect(result.ok).toBe(true)
-    expect(result.message).toContain(commit)
+    expect(result.message).toContain(`+harness.${commit.slice(0, 8)}`)
   })
 
-  it('marker absent from probe output → not ok', () => {
-    // #given
+  it('stock binary: bare base version, no +harness. segment → not ok', () => {
+    // #given — a stock upstream binary reports bare "<base>", no harness marker
     const commit = 'cafebabe1234abcd'
-    const probeOutput = 'harness (patched OpenCode)\n  integration commit: deadbeef\n'
+    const versionOutput = '1.15.13'
 
     // #when
-    const result = assertIntegrationMarker(probeOutput, commit)
+    const result = assertIntegrationMarker(versionOutput, commit)
 
     // #then
     expect(result.ok).toBe(false)
     expect(result.message).toContain('missing')
-    expect(result.message).toContain(commit)
+    expect(result.message).toContain(`+harness.${commit.slice(0, 8)}`)
   })
 
-  it('marker only in unstructured position (not on dedicated line) → not ok', () => {
-    // #given — SHA appears in an error message, not in the structured "integration commit:" line.
-    // This is the wrong-binary-right-version case: a binary that prints the version but
-    // does NOT have the structured marker in the expected position.
-    const commit = 'cafebabe1234abcd'
-    const probeOutput = `1.15.13\nError: unknown commit cafebabe1234abcd referenced\n`
+  it('harness build with DIFFERENT commit short8 → not ok', () => {
+    // #given — a harness build of a different commit; short8 does not match
+    const expectedCommit = 'cafebabe1234abcd'
+    const otherCommit = 'deadbeef99887766'
+    const versionOutput = `1.15.13+harness.${otherCommit.slice(0, 8)}`
 
     // #when
-    const result = assertIntegrationMarker(probeOutput, commit)
-
-    // #then — must fail: SHA in unstructured position is not sufficient
-    expect(result.ok).toBe(false)
-    expect(result.message).toContain('missing')
-  })
-
-  it('marker with leading/trailing whitespace on the structured line → ok', () => {
-    // #given — some whitespace variation is tolerated
-    const commit = 'cafebabe1234abcd'
-    const probeOutput = `harness (patched OpenCode)\n  integration commit:   ${commit}  \n  build sha: abc`
-
-    // #when
-    const result = assertIntegrationMarker(probeOutput, commit)
+    const result = assertIntegrationMarker(versionOutput, expectedCommit)
 
     // #then
-    expect(result.ok).toBe(true)
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('missing')
+    expect(result.message).toContain(`+harness.${expectedCommit.slice(0, 8)}`)
+  })
+
+  it('marker only as substring in unrelated text (not the +harness. format) → not ok', () => {
+    // #given — SHA appears in output but not as "+harness.<short8>"
+    const commit = 'cafebabe1234abcd'
+    const versionOutput = `1.15.13\nError: unknown commit cafebabe1234abcd referenced\n`
+
+    // #when
+    const result = assertIntegrationMarker(versionOutput, commit)
+
+    // #then — must fail: SHA in unstructured position is not the harness marker
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('missing')
   })
 })
 
@@ -169,13 +178,13 @@ describe('assertExitZero', () => {
 // ---------------------------------------------------------------------------
 
 describe('runVerifications', () => {
-  it('all passing → ok with no failures', () => {
-    // #given / #when — structured marker line as emitted by formatProvenance
+  it('correct harness build: all passing → ok with no failures', () => {
+    // #given / #when — harness build self-reports "<base>+harness.<short8>"
+    const commit = 'cafebabe1234abcd'
     const result = runVerifications({
-      versionOutput: '1.15.13',
-      expectedVersion: '1.15.13',
-      probeOutput: 'harness (patched OpenCode)\n  integration commit: cafebabe1234\n  build sha: abc',
-      integrationCommit: 'cafebabe1234',
+      versionOutput: `1.15.13+harness.${commit.slice(0, 8)}`,
+      expectedVersion: `1.15.13+harness.${commit.slice(0, 8)}`,
+      integrationCommit: commit,
       exitCode: 0,
     })
 
@@ -186,11 +195,11 @@ describe('runVerifications', () => {
 
   it('wrong version → not ok, failures list contains version mismatch', () => {
     // #given / #when
+    const commit = 'cafebabe1234abcd'
     const result = runVerifications({
       versionOutput: '1.15.12',
-      expectedVersion: '1.15.13',
-      probeOutput: 'harness (patched OpenCode)\n  integration commit: cafebabe1234\n  build sha: abc',
-      integrationCommit: 'cafebabe1234',
+      expectedVersion: `1.15.13+harness.${commit.slice(0, 8)}`,
+      integrationCommit: commit,
       exitCode: 0,
     })
 
@@ -199,19 +208,51 @@ describe('runVerifications', () => {
     expect(result.failures.some(f => f.includes('mismatch'))).toBe(true)
   })
 
-  it('missing integration marker → not ok, failures list contains marker missing', () => {
-    // #given / #when
+  it('stock binary (bare base version) with integration commit required → not ok', () => {
+    // #given — a stock upstream binary reports bare "<base>"; expected is "<base>+harness.<short8>"
+    const commit = 'cafebabe1234abcd'
+    const result = runVerifications({
+      versionOutput: '1.15.13',
+      expectedVersion: `1.15.13+harness.${commit.slice(0, 8)}`,
+      integrationCommit: commit,
+      exitCode: 0,
+    })
+
+    // #then — version mismatch AND marker missing both fail
+    expect(result.ok).toBe(false)
+    expect(result.failures.some(f => f.includes('mismatch'))).toBe(true)
+    expect(result.failures.some(f => f.includes('missing'))).toBe(true)
+  })
+
+  it('harness build with wrong commit short8 → not ok (marker fails)', () => {
+    // #given — binary has +harness.<other8>, not the expected commit's short8
+    const expectedCommit = 'cafebabe1234abcd'
+    const otherCommit = 'deadbeef99887766'
+    const result = runVerifications({
+      versionOutput: `1.15.13+harness.${otherCommit.slice(0, 8)}`,
+      expectedVersion: `1.15.13+harness.${expectedCommit.slice(0, 8)}`,
+      integrationCommit: expectedCommit,
+      exitCode: 0,
+    })
+
+    // #then — version mismatch AND marker missing both fail
+    expect(result.ok).toBe(false)
+    expect(result.failures.some(f => f.includes('mismatch'))).toBe(true)
+    expect(result.failures.some(f => f.includes('missing'))).toBe(true)
+  })
+
+  it('dev scaffold (null integrationCommit) → ok when version + exit match', () => {
+    // #given / #when — dev scaffold: no integration commit, bare base version
     const result = runVerifications({
       versionOutput: '1.15.13',
       expectedVersion: '1.15.13',
-      probeOutput: 'harness (patched OpenCode)\n  integration commit: deadbeef\n  build sha: abc',
-      integrationCommit: 'cafebabe1234',
+      integrationCommit: null,
       exitCode: 0,
     })
 
     // #then
-    expect(result.ok).toBe(false)
-    expect(result.failures.some(f => f.includes('missing'))).toBe(true)
+    expect(result.ok).toBe(true)
+    expect(result.failures.length).toBe(0)
   })
 
   it('non-zero exit code → not ok, failures list contains exit code', () => {
@@ -219,7 +260,6 @@ describe('runVerifications', () => {
     const result = runVerifications({
       versionOutput: '',
       expectedVersion: '1.15.13',
-      probeOutput: '',
       integrationCommit: null,
       exitCode: 1,
     })
@@ -231,11 +271,11 @@ describe('runVerifications', () => {
 
   it('multiple failures → all reported', () => {
     // #given / #when
+    const commit = 'cafebabe1234abcd'
     const result = runVerifications({
       versionOutput: '1.15.12',
-      expectedVersion: '1.15.13',
-      probeOutput: 'no marker here',
-      integrationCommit: 'cafebabe1234',
+      expectedVersion: `1.15.13+harness.${commit.slice(0, 8)}`,
+      integrationCommit: commit,
       exitCode: 1,
     })
 
@@ -243,36 +283,5 @@ describe('runVerifications', () => {
     expect(result.ok).toBe(false)
     // All three assertions failed
     expect(result.failures.length).toBe(3)
-  })
-
-  it('dev scaffold (null integrationCommit) → ok when version + exit match', () => {
-    // #given / #when
-    const result = runVerifications({
-      versionOutput: '1.15.13',
-      expectedVersion: '1.15.13',
-      probeOutput: 'some output without a commit sha',
-      integrationCommit: null,
-      exitCode: 0,
-    })
-
-    // #then
-    expect(result.ok).toBe(true)
-    expect(result.failures.length).toBe(0)
-  })
-
-  it('wrong-binary-right-version: version matches but structured marker absent → not ok', () => {
-    // #given — a stock opencode binary that prints the right version but has no harness provenance
-    const result = runVerifications({
-      versionOutput: '1.15.13',
-      expectedVersion: '1.15.13',
-      probeOutput: '1.15.13\n', // no "integration commit:" line
-      integrationCommit: 'cafebabe1234',
-      exitCode: 0,
-    })
-
-    // #then — version passes but marker check fails
-    expect(result.ok).toBe(false)
-    expect(result.failures.some(f => f.includes('missing'))).toBe(true)
-    expect(result.failures.some(f => f.includes('mismatch'))).toBe(false)
   })
 })

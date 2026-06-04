@@ -103,7 +103,7 @@ function parseArgs(argv: string[]): BuildArgs | null {
     console.error('[build-platform] Missing required arguments.')
     console.error('  Required: --integration-commit, --base-version, --platform, --arch')
     printHelp()
-    process.exit(1)
+    return null
   }
 
   return {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir}

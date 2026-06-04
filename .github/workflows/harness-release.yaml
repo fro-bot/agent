@@ -75,6 +75,11 @@ jobs:
           # Pinned to match anomalyco/opencode packageManager: bun@1.3.13
           bun-version: 1.3.13
 
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+        with:
+          install-dependencies: 'false'
+
       - name: Install harness dependencies
         run: pnpm install --filter @fro.bot/harness --frozen-lockfile
 
@@ -188,6 +193,11 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+        with:
+          install-dependencies: 'false'
 
       - name: Setup Node.js (for npm trusted publishing via OIDC)
         uses: actions/setup-node@v4
