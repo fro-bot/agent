@@ -92,9 +92,11 @@ jobs:
           WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
 
           # Parse each integration ref into label and merge ref (mirrors parseSource).
-          BRANCHES=""
-          MERGES=""
-          SOURCES=""
+          # When INTEGRATION_REFS is empty, the loop body never executes and the
+          # sentinel values below are used — the prompt reads "no patches to merge".
+          BRANCHES="(none)"
+          MERGES="(none — build the release tag as-is)"
+          SOURCES="(none)"
           while IFS= read -r REF; do
             [ -z "${REF}" ] && continue
             if echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/pull/([0-9]+)'; then
@@ -115,9 +117,16 @@ jobs:
               LABEL="${REF}"
               MERGE_REF="refs/remotes/watch/local/${REF}"
             fi
-            BRANCHES="${BRANCHES:+${BRANCHES}, }${LABEL}"
-            MERGES="${MERGES:+${MERGES}, then }${MERGE_REF}"
-            SOURCES="${SOURCES:+${SOURCES}\n- }${LABEL} -> ${MERGE_REF}"
+            # First real ref: overwrite the sentinels.
+            if [ "${BRANCHES}" = "(none)" ]; then
+              BRANCHES="${LABEL}"
+              MERGES="${MERGE_REF}"
+              SOURCES="${LABEL} -> ${MERGE_REF}"
+            else
+              BRANCHES="${BRANCHES}, ${LABEL}"
+              MERGES="${MERGES}, then ${MERGE_REF}"
+              SOURCES="${SOURCES}\n- ${LABEL} -> ${MERGE_REF}"
+            fi
           done <<< "${INTEGRATION_REFS}"
 
           # --- Render the prompt template ---
@@ -451,14 +460,22 @@ jobs:
 
           # Write the provenance manifest into the main package for runtime use.
           # Values are passed via environment variables (not interpolated into the script body).
+          # integrationRefs is read from harness.config.json so the manifest is complete
+          # and isValidProvenance() accepts it (requires Array.isArray(v.integrationRefs)).
+          # INTEGRATION_COMMIT is the same SHA the build job resolved and verified — no
+          # split-brain between the binary's baked commit and the published manifest.
           node -e "
             const fs = require('fs');
             const baseVersion = process.env.BASE_VERSION;
             const integrationCommit = process.env.INTEGRATION_COMMIT;
             const buildSha = process.env.GITHUB_SHA || 'unknown';
-            let existing = {};
-            try { existing = JSON.parse(fs.readFileSync('packages/harness/provenance.json', 'utf8')); } catch {}
-            const manifest = { ...existing, baseVersion, integrationCommit, buildSha };
+            const config = JSON.parse(fs.readFileSync('packages/harness/harness.config.json', 'utf8'));
+            if (config.integrationRefs !== undefined && !Array.isArray(config.integrationRefs)) {
+              console.error('harness.config.json integrationRefs must be an array (got ' + typeof config.integrationRefs + ')');
+              process.exit(1);
+            }
+            const integrationRefs = (config.integrationRefs ?? []).map(ref => ({ ref, resolvedSha: integrationCommit }));
+            const manifest = { baseVersion, integrationRefs, integrationCommit, buildSha };
             fs.writeFileSync('packages/harness/provenance.json', JSON.stringify(manifest, null, 2) + '\n');
             console.log('provenance.json updated:', manifest);
           "
