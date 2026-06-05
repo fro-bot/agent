@@ -53,6 +53,7 @@ export type FlushResult =
   | {readonly kind: 'sent'; readonly charCount: number}
   | {readonly kind: 'attachment'; readonly charCount: number}
   | {readonly kind: 'empty'}
+  | {readonly kind: 'skipped-visible'}
   | {readonly kind: 'error'; readonly message: string}
 
 /** Dependencies injected into the sink factory. */
@@ -100,12 +101,21 @@ export interface DiscordStreamSink {
    * Flush the current buffer to the Discord thread.
    * - Short text (≤2000 chars): single message send.
    * - Long text (>2000 chars): summary line + `.md` attachment.
-   * - Empty/whitespace: "no output" message.
+   * - Empty/whitespace AND no visible output already sent: "no output" message.
+   * - Empty/whitespace AND visible output already sent (e.g. approval status): `{kind:'skipped-visible'}`, no send.
    * - On `thread.send` rejection: returns `{kind:'error'}` (does not throw).
    */
   readonly flush: () => Promise<FlushResult>
   /** Read the current buffered text without flushing. */
   readonly buffered: () => string
+  /**
+   * Mark that visible output has already been sent to the thread outside the
+   * buffer (e.g. an approval waiting status). When set, `flush()` will NOT
+   * post `_(no output)_` for an empty buffer — it returns `{kind:'skipped-visible'}`.
+   *
+   * Has no effect when the buffer contains non-whitespace text (text always flushes normally).
+   */
+  readonly markVisibleOutputSent: () => void
 }
 
 /**
@@ -117,6 +127,7 @@ export interface DiscordStreamSink {
 export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps = {}): DiscordStreamSink {
   const {logger} = deps
   let buffer = ''
+  let visibleOutputSent = false
 
   const append = (text: string): void => {
     buffer += text
@@ -124,11 +135,20 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
 
   const buffered = (): string => buffer
 
+  const markVisibleOutputSent = (): void => {
+    visibleOutputSent = true
+  }
+
   const flush = async (): Promise<FlushResult> => {
     const text = buffer
 
-    // Empty / whitespace → post a clear "no output" message
+    // Empty / whitespace — check if visible output was already sent outside the buffer
     if (text.trim().length === 0) {
+      // Visible output already sent (e.g. approval waiting status) → skip _(no output)_
+      if (visibleOutputSent) {
+        return {kind: 'skipped-visible'}
+      }
+      // Genuinely empty run → post the "no output" fallback
       try {
         await safeSend(thread, {content: EMPTY_OUTPUT_MESSAGE})
         return {kind: 'empty'}
@@ -163,5 +183,5 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
     }
   }
 
-  return {append, flush, buffered}
+  return {append, flush, buffered, markVisibleOutputSent}
 }

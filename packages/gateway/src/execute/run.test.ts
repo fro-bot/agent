@@ -60,6 +60,7 @@ vi.mock('../discord/streaming.js', () => ({
     append: vi.fn(),
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 10}),
     buffered: vi.fn().mockReturnValue(''),
+    markVisibleOutputSent: vi.fn(),
   }),
 }))
 
@@ -179,6 +180,7 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     botUserId: overrides.botUserId ?? 'bot-123',
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
+    approvalMode: overrides.approvalMode ?? 'approval-required',
     ...overrides,
   }
 }
@@ -211,6 +213,7 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
     append: vi.fn(),
     flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
     buffered: vi.fn().mockReturnValue(''),
+    markVisibleOutputSent: vi.fn(),
   })
   mockRunOpenCodeCore.mockResolvedValue(undefined)
   vi.mocked(attachModule.attachOpencode).mockReturnValue({
@@ -390,6 +393,7 @@ describe('runMention', () => {
         append: vi.fn(),
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
       })
 
       const deps = makeDeps()
@@ -556,6 +560,7 @@ describe('runMention', () => {
         append: vi.fn(),
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial output'),
+        markVisibleOutputSent: vi.fn(),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
@@ -583,6 +588,7 @@ describe('runMention', () => {
         append: vi.fn(),
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
 
@@ -607,6 +613,7 @@ describe('runMention', () => {
         append: vi.fn(),
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
 
@@ -631,6 +638,7 @@ describe('runMention', () => {
         append: vi.fn(),
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
       })
       setupHappyPath()
       // Make EXECUTING transition fail — error caught before sink is created
@@ -767,6 +775,27 @@ describe('runMention', () => {
 
       // #and — lock released
       expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    })
+  })
+
+  // ── Approval mode propagation (Unit 2) ──────────────────────────────────
+
+  describe('approval mode propagation', () => {
+    it('approval-required: runOpenCodeCore is called with approvalMode === "approval-required"', async () => {
+      // #given — default approval-required mode
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const deps = makeDeps({approvalMode: 'approval-required'})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — runOpenCodeCore called with approvalMode exactly 'approval-required'
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {approvalMode?: string}
+      expect(coreParams.approvalMode).toBe('approval-required')
     })
   })
 
@@ -1066,6 +1095,323 @@ describe('runMention', () => {
           coordinator: fakeCoordinator,
         }),
       )
+    })
+  })
+
+  // ── Unit 4: Approval wait and timeout UX ────────────────────────────────
+
+  describe('approval wait and timeout UX (Unit 4)', () => {
+    it('computeApprovalDeadlineMs: uses remainingBudgetMs (not raw runTimeoutMs) — shorter budget yields shorter deadline', async () => {
+      // #given — the function should accept remainingBudgetMs
+      const {computeApprovalDeadlineMs} = await import('./run.js')
+
+      const fullBudget = 600_000
+      const halfBudget = 300_000
+
+      const deadlineFull = computeApprovalDeadlineMs(fullBudget)
+      const deadlineHalf = computeApprovalDeadlineMs(halfBudget)
+
+      // Both should be defined and less than their respective budgets
+      expect(deadlineFull).toBeDefined()
+      expect(deadlineHalf).toBeDefined()
+      // Shorter remaining budget → shorter or equal deadline
+      // Use nullish coalescing to avoid conditional expect
+      expect(deadlineHalf ?? 0).toBeLessThanOrEqual(deadlineFull ?? Infinity)
+    })
+
+    it('computeApprovalDeadlineMs: returns undefined when remaining budget is too short (< 90s)', async () => {
+      // #given — very short remaining budget
+      const {computeApprovalDeadlineMs} = await import('./run.js')
+
+      // #then — undefined when budget is too short
+      expect(computeApprovalDeadlineMs(80_000)).toBeUndefined()
+      expect(computeApprovalDeadlineMs(90_000)).toBeUndefined()
+      expect(computeApprovalDeadlineMs(91_000)).toBeDefined()
+    })
+
+    it('onPending: posts visible waiting-for-approval status to thread with allowedMentions:{parse:[]}', async () => {
+      // Regression guard: a run blocked on approval must not end with only _(no output)_
+      // because the user needs to see the run is waiting.
+
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-approval-1', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // #when — run completes, then simulate permission ask
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnPending).toBeDefined()
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      const fakeRequest: import('../approvals/coordinator.js').PermissionRequest = {
+        requestID: 'req-wait-1',
+        sessionID: 'sess-wait',
+        permission: 'bash',
+        patterns: ['ls'],
+        title: 'Run command: ls',
+      }
+      capturedOnPending(fakeRequest)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // #then — a waiting-for-approval status message was sent to the thread
+      // (separate from the approval embed — this is a plain text status)
+      const allSends = thread.send.mock.calls.map(
+        c => c[0] as {content?: string; allowedMentions?: unknown; embeds?: unknown},
+      )
+      const statusSend = allSends.find(
+        s => typeof s.content === 'string' && s.content.length > 0 && s.embeds === undefined,
+      )
+      expect(statusSend).toBeDefined()
+      expect(statusSend?.allowedMentions).toEqual({parse: []})
+      // Content must contain the approval-waiting wording
+      expect(statusSend?.content).toContain('Waiting for tool approval')
+    })
+
+    it('onPending: sink.markVisibleOutputSent() is called so flush cannot add _(no output)_ after approval status', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const markVisibleOutputSentFn = vi.fn()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: markVisibleOutputSentFn,
+      })
+
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-approval-2', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnPending).toBeDefined()
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      capturedOnPending({
+        requestID: 'req-mark-1',
+        sessionID: 'sess-mark',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // #then — markVisibleOutputSent was called on the sink
+      expect(markVisibleOutputSentFn).toHaveBeenCalled()
+    })
+
+    it('deadline settlement: posts visible timed-out/denied status to thread with allowedMentions:{parse:[]}', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-approval-3', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const approvalRegistry = makeApprovalRegistry()
+      const deps = makeDeps({approvalRegistry})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnPending).toBeDefined()
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      capturedOnPending({
+        requestID: 'req-deadline-1',
+        sessionID: 'sess-deadline',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // Extract the onDeadlineSettled callback from the register call
+      const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
+        | {onDeadlineSettled?: () => void | Promise<void>}
+        | undefined
+      expect(registerCall).toBeDefined()
+      expect(registerCall?.onDeadlineSettled).toBeDefined()
+
+      // #when — simulate deadline firing
+      if (registerCall?.onDeadlineSettled !== undefined) {
+        await registerCall.onDeadlineSettled()
+      }
+
+      // #then — a timed-out/denied status was sent to the thread
+      const allSends = thread.send.mock.calls.map(
+        c => c[0] as {content?: string; allowedMentions?: unknown; embeds?: unknown},
+      )
+      // There should be at least one plain-text status (waiting + timeout)
+      const plainTextSends = allSends.filter(
+        s => typeof s.content === 'string' && s.content.length > 0 && s.embeds === undefined,
+      )
+      expect(plainTextSends.length).toBeGreaterThanOrEqual(2) // waiting + timeout
+      // All plain-text sends must have allowedMentions:{parse:[]}
+      for (const s of plainTextSends) {
+        expect(s.allowedMentions).toEqual({parse: []})
+      }
+      // The timeout message must contain approval timeout / could-not-continue semantics
+      const timeoutSend = plainTextSends.find(
+        s =>
+          typeof s.content === 'string' &&
+          (s.content.includes('timed out') || s.content.includes('could not continue')),
+      )
+      expect(timeoutSend).toBeDefined()
+      expect(timeoutSend?.content).toMatch(/timed out|could not continue/i)
+    })
+
+    it('approval deadline uses remaining budget (elapsed time subtracted from runTimeoutMs)', async () => {
+      // #given — simulate elapsed setup time so remainingBudgetMs differs from runTimeoutMs.
+      // The registered deadlineMs must equal computeApprovalDeadlineMs(runTimeoutMs - elapsedMs).
+      const {runMention, computeApprovalDeadlineMs} = await import('./run.js')
+      setupHappyPath()
+
+      const SIMULATED_ELAPSED_MS = 5_000 // 5 s of simulated setup time
+      const runTimeoutMs = 600_000
+      let callCount = 0
+      const originalDateNow = Date.now.bind(Date)
+      const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+        // First call: runStartMs capture at run entry → return base time
+        // Subsequent calls: simulate elapsed setup time
+        callCount++
+        return callCount === 1 ? originalDateNow() : originalDateNow() + SIMULATED_ELAPSED_MS
+      })
+
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-approval-4', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const approvalRegistry = makeApprovalRegistry()
+      const deps = makeDeps({approvalRegistry, runTimeoutMs})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      await runMention(message, makeBinding(), deps)
+      dateNowSpy.mockRestore()
+
+      expect(capturedOnPending).toBeDefined()
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      capturedOnPending({
+        requestID: 'req-budget-1',
+        sessionID: 'sess-budget',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // Extract the deadlineMs from the register call
+      const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
+        | {deadlineMs?: number}
+        | undefined
+      expect(registerCall).toBeDefined()
+
+      // The deadline must equal computeApprovalDeadlineMs(runTimeoutMs - elapsedMs).
+      // With SIMULATED_ELAPSED_MS = 5_000, remainingBudgetMs = 595_000.
+      const expectedDeadlineMs = computeApprovalDeadlineMs(runTimeoutMs - SIMULATED_ELAPSED_MS)
+      expect(registerCall?.deadlineMs).toBe(expectedDeadlineMs)
+      // Sanity: must be strictly less than runTimeoutMs
+      expect(registerCall?.deadlineMs ?? runTimeoutMs).toBeLessThan(runTimeoutMs)
+      expect(registerCall?.deadlineMs ?? 0).toBeLessThanOrEqual(13 * 60_000)
+    })
+
+    it('hard abort signal and approval deadline both use remaining budget from the same origin — not raw runTimeoutMs', async () => {
+      // Regression guard: AbortSignal.timeout() passed to runOpenCodeCore must use
+      // remainingBudgetMs (runTimeoutMs − elapsed), not the raw configured runTimeoutMs.
+      // We simulate elapsed setup time by controlling Date.now() so the two values differ.
+
+      // #given — spy on AbortSignal.timeout to capture the argument it receives
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const SIMULATED_ELAPSED_MS = 5_000 // 5 s of simulated setup time
+      const runTimeoutMs = 600_000
+      let callCount = 0
+      const originalDateNow = Date.now.bind(Date)
+      const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+        // First call: runStartMs capture at run entry → return base time
+        // Subsequent calls: simulate elapsed setup time
+        callCount++
+        return callCount === 1 ? originalDateNow() : originalDateNow() + SIMULATED_ELAPSED_MS
+      })
+
+      const abortTimeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+
+      const deps = makeDeps({runTimeoutMs})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // Capture calls before restoring spies
+      const capturedCalls = abortTimeoutSpy.mock.calls.slice()
+      dateNowSpy.mockRestore()
+      abortTimeoutSpy.mockRestore()
+
+      // #then — AbortSignal.timeout was called with remainingBudgetMs, not raw runTimeoutMs
+      // Find the call that is NOT the 10_000 ms postReply guard (which is a fixed constant)
+      const runBudgetCall = capturedCalls.find(([ms]) => ms !== 10_000)
+      expect(runBudgetCall).toBeDefined()
+      const signalBudgetMs = runBudgetCall?.[0]
+      // Must be strictly less than runTimeoutMs (elapsed time was subtracted)
+      expect(signalBudgetMs).toBeLessThan(runTimeoutMs)
+      // Must be approximately runTimeoutMs − SIMULATED_ELAPSED_MS
+      expect(signalBudgetMs).toBeLessThanOrEqual(runTimeoutMs - SIMULATED_ELAPSED_MS + 100) // +100ms tolerance
+      expect(signalBudgetMs).toBeGreaterThan(0)
     })
   })
 })
