@@ -96,7 +96,7 @@ jobs:
 
       - name: Provision OpenCode model auth (file-based, never logged)
         env:
-          HARNESS_OPENCODE_AUTH_JSON: ${{ secrets.HARNESS_OPENCODE_AUTH_JSON }}
+          HARNESS_OPENCODE_AUTH_JSON: ${{ secrets.AUTH_JSON }}
         run: |
           set -euo pipefail
           AUTH_DIR="${HOME}/.local/share/opencode"
