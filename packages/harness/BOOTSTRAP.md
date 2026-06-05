@@ -103,19 +103,17 @@ A green dry run means the build infrastructure is solid and the real `1.15.13` p
 
 ## Dispatching a real patched release
 
-The dry run above uses a stock OpenCode commit with no LLM-merge patch. A real patched release (the actual point of this package) requires the `HARNESS_OPENCODE_AUTH_JSON` secret to be configured in the repository, because the `integrate` job runs an LLM merge via `opencode run` and needs model credentials.
+The dry run above uses a stock OpenCode commit with no LLM-merge patch. A real patched release (the actual point of this package) requires the `AUTH_JSON` secret to be configured in the repository, because the `integrate` job runs an LLM merge via `opencode run` and needs model credentials.
 
-### Required secret: `HARNESS_OPENCODE_AUTH_JSON`
+### Required secret: `AUTH_JSON`
 
-Add this secret to the `fro-bot/agent` repository (Settings → Secrets and variables → Actions → New repository secret):
+The `integrate` job reuses the repository's existing `AUTH_JSON` secret — the same model credential the action uses — so no separate secret needs to be created. Its value is a JSON object mapping provider name to auth config, e.g.:
 
-- **Name:** `HARNESS_OPENCODE_AUTH_JSON`
-- **Value:** A JSON object mapping provider name to auth config, e.g.:
-  ```json
-  {"anthropic":{"type":"api","key":"sk-ant-..."}}
-  ```
+```json
+{"anthropic":{"type":"api","key":"sk-ant-..."}}
+```
 
-The integrate job writes this to a 0600 temp file and passes it to OpenCode as a file-based credential. The secret value is never echoed to logs.
+The integrate job maps `AUTH_JSON` to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The secret value is never echoed to logs.
 
 ### How a patched release works
 
@@ -150,4 +148,4 @@ gh run watch --repo fro-bot/agent
 
 ## After bootstrap
 
-Every subsequent release is triggered by dispatching `harness-release.yaml` with the appropriate `base_version` (and `dry_run=true` to skip publish). The `integrate` job derives the integration commit from the LLM merge; the `build` matrix consumes the resulting artifact. The `publish` job obtains an OIDC token from GitHub and publishes to npm with automatic provenance — no npm token, no secrets to rotate beyond `HARNESS_OPENCODE_AUTH_JSON`.
+Every subsequent release is triggered by dispatching `harness-release.yaml` with the appropriate `base_version` (and `dry_run=true` to skip publish). The `integrate` job derives the integration commit from the LLM merge; the `build` matrix consumes the resulting artifact. The `publish` job obtains an OIDC token from GitHub and publishes to npm with automatic provenance — no npm token, no secrets to rotate beyond `AUTH_JSON`.

@@ -73,17 +73,17 @@ The `--source-tree` flag is explicit and fail-closed: if the directory is missin
 - `provenance.json` in the artifact records the exact upstream inputs (base tag + each ref + resolved SHA) for audit before publish.
 - The artifact is SHA-bound by construction (`git archive <integration_commit>`); the explicit digest check in the build matrix makes this fail-closed.
 
-### `HARNESS_OPENCODE_AUTH_JSON` secret
+### `AUTH_JSON` secret
 
-Required for any release that runs an LLM merge (i.e. any release with integration refs configured). Configure in repository Settings → Secrets and variables → Actions:
+Required for any release that runs an LLM merge (i.e. any release with integration refs configured). The integrate job reuses the repository's existing `AUTH_JSON` secret (the same model credential the action uses), so no separate secret is needed:
 
-- **Name:** `HARNESS_OPENCODE_AUTH_JSON`
+- **Name:** `AUTH_JSON`
 - **Value:** JSON mapping provider to auth config:
   ```json
   {"anthropic":{"type":"api","key":"sk-ant-..."}}
   ```
 
-The integrate job writes this to a 0600 temp file and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
+The integrate job maps it to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
 
 ### Dispatching a release
 
