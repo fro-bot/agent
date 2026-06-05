@@ -9,17 +9,14 @@ import {
   HttpServerResponse,
 } from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Account } from "@/account/account"
 import { Agent } from "@/agent/agent"
 import { Auth } from "@/auth"
-import { Bus } from "@/bus"
 import { Config } from "@/config/config"
 import { Command } from "@/command"
 import * as Observability from "@opencode-ai/core/effect/observability"
-import { File } from "@/file"
-import { FileWatcher } from "@/file/watcher"
-import { Ripgrep } from "@/file/ripgrep"
+import { Ripgrep } from "@opencode-ai/core/filesystem/ripgrep"
 import { Format } from "@/format"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LSP } from "@/lsp/lsp"
@@ -46,9 +43,9 @@ import { Todo } from "@/session/todo"
 import { SessionShare } from "@/share/session"
 import { ShareNext } from "@/share/share-next"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Database } from "@opencode-ai/core/database/database"
 import { Skill } from "@/skill"
 import { Snapshot } from "@/snapshot"
-import { SyncEvent } from "@/sync"
 import { ToolRegistry } from "@/tool/registry"
 import { lazy } from "@/util/lazy"
 import { Vcs } from "@/project/vcs"
@@ -167,7 +164,7 @@ const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effe
 
 const uiRoute = HttpRouter.use((router) =>
   Effect.gen(function* () {
-    const fs = yield* AppFileSystem.Service
+    const fs = yield* FSUtil.Service
     const client = yield* HttpClient.HttpClient
     const flags = yield* RuntimeFlags.Service
     yield* router.add("*", "/*", (request) =>
@@ -191,15 +188,14 @@ export function createRoutes(
       errorLayer,
       compressionLayer,
       corsVaryFix,
-      fenceLayer,
+      fenceLayer.pipe(Layer.provide(Database.defaultLayer)),
       cors(corsOptions),
+      Database.defaultLayer,
       Account.defaultLayer,
       Agent.defaultLayer,
       Auth.defaultLayer,
       Command.defaultLayer,
       Config.defaultLayer,
-      File.defaultLayer,
-      FileWatcher.defaultLayer,
       Format.defaultLayer,
       LSP.defaultLayer,
       Installation.defaultLayer,
@@ -225,7 +221,6 @@ export function createRoutes(
       SessionSummary.defaultLayer,
       ShareNext.defaultLayer,
       Snapshot.defaultLayer,
-      SyncEvent.defaultLayer,
       EventV2Bridge.defaultLayer,
       Skill.defaultLayer,
       Todo.defaultLayer,
@@ -233,8 +228,7 @@ export function createRoutes(
       Vcs.defaultLayer,
       Workspace.defaultLayer,
       Worktree.appLayer,
-      Bus.layer,
-      AppFileSystem.defaultLayer,
+      FSUtil.defaultLayer,
       FetchHttpClient.layer,
       HttpServer.layerServices,
     ]),

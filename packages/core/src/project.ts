@@ -1,9 +1,10 @@
+export * as ProjectV2 from "./project"
 export * as Project from "./project"
 
 import { Context, Effect, Layer, Schema } from "effect"
 import path from "path"
 import { AbsolutePath, withStatics } from "./schema"
-import { AppFileSystem } from "./filesystem"
+import { FSUtil } from "./fs-util"
 import { Git } from "./git"
 import { Hash } from "./util/hash"
 
@@ -54,7 +55,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pr
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const fs = yield* AppFileSystem.Service
+    const fs = yield* FSUtil.Service
     const git = yield* Git.Service
 
     const cached = Effect.fnUntraced(function* (dir: string) {
@@ -125,4 +126,4 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(AppFileSystem.defaultLayer), Layer.provide(Git.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(FSUtil.defaultLayer), Layer.provide(Git.defaultLayer))
