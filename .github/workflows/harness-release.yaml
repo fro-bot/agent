@@ -85,15 +85,6 @@ jobs:
           RELEASE_REPO=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).release_repo)")
           INTEGRATION_REFS=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).integrationRefs.join('\n'))")
 
-          # --- Emit has_refs: true iff the trimmed ref list is non-empty ---
-          if [ -n "$(echo "${INTEGRATION_REFS}" | tr -d '[:space:]')" ]; then
-            HAS_REFS="true"
-          else
-            HAS_REFS="false"
-          fi
-          echo "has_refs=${HAS_REFS}" >> "$GITHUB_OUTPUT"
-          echo "has_refs: ${HAS_REFS}"
-
           # --- Compute template variables (mirrors renderPrompt in integrate.ts) ---
           TAG="v${BASE_VERSION}"
           BRANCH="integrate/v${BASE_VERSION}"
@@ -101,8 +92,12 @@ jobs:
           RELEASE_URL="https://github.com/${RELEASE_REPO}/releases/tag/${TAG}"
           WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
 
-          # Parse each integration ref into label and merge ref (mirrors parseSource).
+          # Parse each integration ref into label, fetch URL, fetchRef, and local merge ref
+          # (mirrors parseSource in packages/harness/src/sources.ts).
           # When INTEGRATION_REFS is empty, the loop body never executes.
+          # HAS_REFS is derived from the parsed merge list AFTER the loop so that
+          # whitespace-only or malformed-only entries that produce no real merge ref
+          # correctly yield has_refs=false rather than a bogus prompt.
           BRANCHES=""
           MERGES=""
           SOURCES=""
@@ -114,29 +109,46 @@ jobs:
               PR_NUM=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\3|')
               SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
               LABEL="${OWNER}/${REPO_NAME}#${PR_NUM}"
-              MERGE_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/pull/${PR_NUM}/head"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
             elif echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/tree/(.+)'; then
               OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\1|')
               REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\2|')
               BRANCH_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\3|')
               SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
               LABEL="${OWNER}/${REPO_NAME}:${BRANCH_NAME}"
-              MERGE_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/heads/${BRANCH_NAME}"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
             else
               LABEL="${REF}"
-              MERGE_REF="refs/remotes/watch/local/${REF}"
+              FETCH_URL="https://github.com/${RELEASE_REPO}.git"
+              FETCH_REF="refs/heads/${REF}"
+              LOCAL_REF="refs/remotes/watch/local/${REF}"
             fi
             # First real ref: set the values; subsequent refs: append.
             if [ -z "${BRANCHES}" ]; then
               BRANCHES="${LABEL}"
-              MERGES="${MERGE_REF}"
-              SOURCES="${LABEL} -> ${MERGE_REF}"
+              MERGES="${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
             else
               BRANCHES="${BRANCHES}, ${LABEL}"
-              MERGES="${MERGES}, then ${MERGE_REF}"
-              SOURCES="${SOURCES}\n- ${LABEL} -> ${MERGE_REF}"
+              MERGES="${MERGES}; ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${SOURCES}\n- ${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
             fi
           done <<< "${INTEGRATION_REFS}"
+
+          # --- Emit has_refs: true iff at least one valid ref was parsed into the merge list ---
+          # Derived from the parsed MERGES list (not the raw string) so whitespace-only or
+          # malformed-only entries that produce no real merge ref yield has_refs=false.
+          if [ -n "${MERGES}" ]; then
+            HAS_REFS="true"
+          else
+            HAS_REFS="false"
+          fi
+          echo "has_refs=${HAS_REFS}" >> "$GITHUB_OUTPUT"
+          echo "has_refs: ${HAS_REFS}"
 
           # --- Render the prompt template ---
           PROMPT_TPL=$(cat packages/harness/prompt.txt)
@@ -190,10 +202,12 @@ jobs:
   build:
     name: build (${{ matrix.platform }}/${{ matrix.arch }})
     needs: [prepare-integrate, integrate]
-    # Run when prepare-integrate succeeded, regardless of whether integrate was
-    # skipped (empty carry set) or completed (non-empty carry set).
+    # Run when prepare-integrate succeeded AND integrate did not fail.
+    # integrate.result is 'skipped' for empty carry → build runs.
+    # integrate.result is 'success' for non-empty carry → build runs.
+    # integrate.result is 'failure' or 'cancelled' → build is blocked.
     # !cancelled() prevents running if the workflow was manually cancelled.
-    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' }}
+    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && needs.integrate.result != 'failure' }}
     strategy:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
@@ -332,9 +346,11 @@ jobs:
   publish:
     name: publish (all-or-nothing)
     needs: [prepare-integrate, integrate, build]
-    # Run when build succeeded, regardless of whether integrate was skipped.
+    # Run when build succeeded and integrate did not fail (defense-in-depth).
+    # build success already implies integrate didn't fail (build wouldn't have run),
+    # but the explicit check makes the gate clear and guards against future refactors.
     # !cancelled() prevents running if the workflow was manually cancelled.
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.integrate.result != 'failure' }}
     runs-on: ubuntu-24.04
     environment: npm-publish # Maintainer-gated environment with required reviewers.
 

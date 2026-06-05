@@ -30,21 +30,20 @@ git checkout -b {{branch}} refs/tags/{{tag}}
 
 2. Fetch and merge the listed refs into {{branch}} IN ORDER.
 
-   Sources: {{sources}}
-   Merge refs: {{merges}}
+   Sources and merge instructions:
+   {{sources}}
 
-   For each merge ref in the list above, run:
-   - `git fetch https://github.com/{{release_repo}}.git <that-merge-ref>`
-   - `git merge --no-ff FETCH_HEAD -m "Merge <label> into {{branch}}"`
-
+   For each source listed above, run the fetch and merge commands exactly as shown.
+   Use the local ref name (the part after the colon in the fetch command) as the merge target.
    If there are merge conflicts, resolve them completely before proceeding.
 
-3. Build the host CLI in `packages/opencode`:
+3. Build the host CLI. Run from the repo root ({{repo}}) — build.ts does its own chdir into packages/opencode:
 
-```bash
-cd {{repo}}
-OPENCODE_CHANNEL=latest OPENCODE_VERSION={{version}} bun run build -- --single
-```
+   First install workspace dependencies:
+   bun install
+
+   Then run the upstream build script with release identity:
+   OPENCODE_CHANNEL=latest OPENCODE_VERSION={{version}} bun ./packages/opencode/script/build.ts --single
 
 4. Verify the built binary exists and reports the correct version:
 
