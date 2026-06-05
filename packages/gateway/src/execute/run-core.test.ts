@@ -33,6 +33,7 @@ function makeSink(): DiscordStreamSink & {readonly _appended: string[]} {
     },
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: buffer.length}),
     buffered: () => buffer,
+    markVisibleOutputSent: vi.fn(),
   }
 }
 
@@ -166,17 +167,24 @@ function sessionErrorEvent(sessionID: string, error = 'LLM error'): object {
 /**
  * Build a minimal `OpenCodeServerHandle` test double.
  * All SDK methods are vi.fn() by default; callers override what they need.
+ *
+ * `postPermissionReply` overrides `postSessionIdPermissionsPermissionId` — the
+ * endpoint run-core calls to reject a permission ask in autonomous-low-risk mode.
+ * Defaults to a resolved `{error: null}` response so tests that don't care about
+ * it don't need to set it up.
  */
 function makeHandle(
   overrides: {
     readonly sessionCreate?: () => Promise<unknown>
     readonly promptAsync?: (args: unknown) => Promise<unknown>
     readonly subscribe?: (args: unknown) => Promise<unknown>
+    readonly postPermissionReply?: (args: unknown) => Promise<unknown>
   } = {},
 ): OpenCodeServerHandle {
   const sessionCreate = overrides.sessionCreate ?? (async () => sessionCreateOk())
   const promptAsync = overrides.promptAsync ?? (async () => promptAsyncOk())
   const subscribe = overrides.subscribe ?? (async () => subscribeOk([sessionIdleEvent('sess-123')]))
+  const postPermissionReply = overrides.postPermissionReply ?? (async () => ({error: null}))
 
   const client = {
     session: {
@@ -186,6 +194,7 @@ function makeHandle(
     event: {
       subscribe: vi.fn().mockImplementation(subscribe),
     },
+    postSessionIdPermissionsPermissionId: vi.fn().mockImplementation(postPermissionReply),
   }
 
   return {
@@ -206,7 +215,7 @@ const BASE_PARAMS = {
 
 function buildParams(
   handle: OpenCodeServerHandle,
-  overrides: Partial<typeof BASE_PARAMS> = {},
+  overrides: Partial<typeof BASE_PARAMS & {approvalMode: 'approval-required'}> = {},
 ): Parameters<typeof runOpenCodeCore>[0] {
   return {
     handle,
@@ -215,6 +224,7 @@ function buildParams(
     sink: makeSink(),
     signal: new AbortController().signal,
     logger: makeLogger(),
+    ...(overrides.approvalMode === undefined ? {} : {approvalMode: overrides.approvalMode}),
   }
 }
 
@@ -261,9 +271,9 @@ function permissionRepliedEvent(
 describe('runOpenCodeCore', () => {
   describe('happy path — text deltas + session.idle', () => {
     it('resolves without throwing when session.idle is received', async () => {
-      // #given
+      // #given — coordinator required (approval-required is the only supported mode)
       const handle = makeHandle()
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
@@ -276,7 +286,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           subscribeOk([partDeltaObjectEvent('Hello'), partDeltaObjectEvent(' world'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -293,7 +303,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           subscribeOk([partDeltaStringEvent('Hi'), partDeltaStringEvent(' there'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -313,7 +323,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -328,7 +338,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         subscribe: async () => subscribeOk([nextTextDeltaObjectEvent('Gamma'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -344,7 +354,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           subscribeOk([partDeltaObjectEvent('ignored', 'other-session'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -360,7 +370,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           subscribeOk([nextTextDeltaStringEvent('ignored', 'other-session'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -378,7 +388,7 @@ describe('runOpenCodeCore', () => {
         sessionIdleEvent('sess-123'),
       ]
       const handle = makeHandle({subscribe: async () => subscribeOk(events)})
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       const p = runOpenCodeCore(params).then(() => {
@@ -403,7 +413,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -425,7 +435,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -445,7 +455,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -467,7 +477,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -487,7 +497,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -507,7 +517,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -528,7 +538,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -549,7 +559,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -568,7 +578,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -587,7 +597,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -602,7 +612,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         subscribe: async () => subscribeOk([partUpdatedTextEvent('some text content'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -626,7 +636,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -645,7 +655,7 @@ describe('runOpenCodeCore', () => {
             sessionIdleEvent('sess-123'),
           ]),
       })
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -659,7 +669,7 @@ describe('runOpenCodeCore', () => {
     it('threads directory to promptAsync query', async () => {
       // #given
       const handle = makeHandle()
-      const params = buildParams(handle, {directory: '/repos/myrepo'})
+      const params = {...buildParams(handle, {directory: '/repos/myrepo'}), coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -673,7 +683,7 @@ describe('runOpenCodeCore', () => {
     it('threads directory to event.subscribe query', async () => {
       // #given
       const handle = makeHandle()
-      const params = buildParams(handle, {directory: '/repos/myrepo'})
+      const params = {...buildParams(handle, {directory: '/repos/myrepo'}), coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -687,7 +697,7 @@ describe('runOpenCodeCore', () => {
     it('threads directory to session.create query', async () => {
       // #given
       const handle = makeHandle()
-      const params = buildParams(handle, {directory: '/repos/myrepo'})
+      const params = {...buildParams(handle, {directory: '/repos/myrepo'}), coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -701,13 +711,77 @@ describe('runOpenCodeCore', () => {
     })
   })
 
+  describe('abort signal threading — SDK calls receive the timeout signal', () => {
+    it('passes the AbortSignal to session.create', async () => {
+      // #given — use a real AbortController so we can inspect the signal identity
+      const controller = new AbortController()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — session.create must have received the same signal object
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      const callArgs = (session.create.mock.calls[0] as [{signal?: AbortSignal}])[0]
+      expect(callArgs.signal).toBe(controller.signal)
+    })
+
+    it('passes the AbortSignal to event.subscribe', async () => {
+      // #given
+      const controller = new AbortController()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — event.subscribe must have received the same signal object
+      const {event} = handle.client as unknown as {event: {subscribe: ReturnType<typeof vi.fn>}}
+      const callArgs = (event.subscribe.mock.calls[0] as [{signal?: AbortSignal}])[0]
+      expect(callArgs.signal).toBe(controller.signal)
+    })
+
+    it('passes the AbortSignal to session.promptAsync', async () => {
+      // #given
+      const controller = new AbortController()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — promptAsync must have received the same signal object
+      const {session} = handle.client as unknown as {session: {promptAsync: ReturnType<typeof vi.fn>}}
+      const callArgs = (session.promptAsync.mock.calls[0] as [{signal?: AbortSignal}])[0]
+      expect(callArgs.signal).toBe(controller.signal)
+    })
+
+    it('does NOT call session.create when signal is already aborted (signal not passed to a dead call)', async () => {
+      // #given — pre-aborted signal; session.create must be skipped entirely
+      const controller = new AbortController()
+      controller.abort()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params).catch(() => {
+        /* expected timeout error */
+      })
+
+      // #then — session.create was never called, so signal was never passed to it
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      expect(session.create).not.toHaveBeenCalled()
+    })
+  })
+
   describe('error path — server unreachable', () => {
     it('throws RunCoreError with kind "unreachable" when session.create throws', async () => {
       // #given
       const handle = makeHandle({
         sessionCreate: async () => Promise.reject(new TypeError('fetch failed')),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toThrow(RunCoreError)
@@ -719,7 +793,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         sessionCreate: async () => Promise.resolve({data: null, error: {message: 'ECONNREFUSED'}}),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'unreachable'})
@@ -730,7 +804,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         promptAsync: async () => Promise.reject(new TypeError('fetch failed')),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'unreachable'})
@@ -743,7 +817,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         sessionCreate: async () => Promise.resolve({data: null, error: {status: 401, message: '401 Unauthorized'}}),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'auth'})
@@ -754,7 +828,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         promptAsync: async () => Promise.resolve({data: null, error: {status: 401, message: '401 Unauthorized'}}),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'auth'})
@@ -765,7 +839,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         sessionCreate: async () => Promise.resolve({data: null, error: {status: 403, message: 'Forbidden'}}),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'auth'})
@@ -778,7 +852,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         subscribe: async () => subscribeOk([sessionErrorEvent('sess-123', 'LLM quota exceeded')]),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'session-error'})
@@ -789,7 +863,7 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         subscribe: async () => subscribeOk([sessionErrorEvent('sess-123')]),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       await expect(runOpenCodeCore(params)).rejects.toBeInstanceOf(RunCoreError)
@@ -803,7 +877,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () => subscribeOk([partDeltaObjectEvent('Done!'), sessionIdleEvent('sess-123')]),
       })
       const sink = makeSink()
-      const params = {...buildParams(handle), sink}
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
@@ -823,13 +897,102 @@ describe('runOpenCodeCore', () => {
       const handle = makeHandle({
         subscribe: async () => subscribeOk([partDeltaObjectEvent('should not appear'), sessionIdleEvent('sess-123')]),
       })
-      const params = {...buildParams(handle), sink, signal: controller.signal}
+      const params = {...buildParams(handle), sink, signal: controller.signal, coordinator: makeCoordinator()}
 
       // #when — aborted signal → timeout kind thrown before any events processed
       await expect(runOpenCodeCore(params)).rejects.toThrow(RunCoreError)
 
       // #then — no content was appended
       expect(sink._appended).toHaveLength(0)
+    })
+
+    it('throws RunCoreError(timeout) before session.create when signal is already aborted', async () => {
+      // #given — signal pre-aborted; session.create must NOT be called
+      const controller = new AbortController()
+      controller.abort()
+
+      const handle = makeHandle()
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+
+      // session.create must NOT have been called
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      expect(session.create).not.toHaveBeenCalled()
+    })
+
+    it('throws RunCoreError(timeout) when signal aborts after session.create but before subscribe', async () => {
+      // #given — signal aborts synchronously after session.create resolves
+      const controller = new AbortController()
+      const handle = makeHandle({
+        sessionCreate: async () => {
+          // Abort the signal as part of session creation completing
+          controller.abort()
+          return sessionCreateOk()
+        },
+      })
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+
+      // event.subscribe must NOT have been called
+      const {event} = handle.client as unknown as {event: {subscribe: ReturnType<typeof vi.fn>}}
+      expect(event.subscribe).not.toHaveBeenCalled()
+    })
+
+    it('throws RunCoreError(timeout) when signal aborts after subscribe but before promptAsync', async () => {
+      // #given — signal aborts synchronously after subscribe resolves
+      const controller = new AbortController()
+      const handle = makeHandle({
+        subscribe: async () => {
+          controller.abort()
+          return subscribeOk([sessionIdleEvent('sess-123')])
+        },
+      })
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+
+      // promptAsync must NOT have been called
+      const {session} = handle.client as unknown as {session: {promptAsync: ReturnType<typeof vi.fn>}}
+      expect(session.promptAsync).not.toHaveBeenCalled()
+    })
+
+    it('throws RunCoreError(timeout) when signal aborts after promptAsync but before first event', async () => {
+      // #given — signal aborts synchronously after promptAsync resolves; stream is silent
+      const controller = new AbortController()
+      const handle = makeHandle({
+        promptAsync: async () => {
+          controller.abort()
+          return promptAsyncOk()
+        },
+        // Silent stream — never yields an event
+        subscribe: async () => {
+          return Promise.resolve({
+            stream: (async function* () {
+              // Yield nothing — simulates a silent/hanging stream
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          })
+        },
+      })
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when / #then — must not hang; abortable stream exits promptly
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
     })
   })
 
@@ -842,7 +1005,7 @@ describe('runOpenCodeCore', () => {
           error: {status: 401, message: 'Unauthorized'},
         }),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then — RunCoreError with kind 'auth'
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
@@ -858,7 +1021,7 @@ describe('runOpenCodeCore', () => {
           error: {status: 403, message: 'Forbidden'},
         }),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
@@ -874,7 +1037,7 @@ describe('runOpenCodeCore', () => {
           error: {status: 500, message: 'Internal error: connection pool 401-queue exhausted'},
         }),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then — should be 'unreachable', NOT 'auth'
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
@@ -891,7 +1054,7 @@ describe('runOpenCodeCore', () => {
           error: {message: 'The token is unauthorized for this operation', status: 500},
         }),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
@@ -907,12 +1070,33 @@ describe('runOpenCodeCore', () => {
           error: {message: 'ECONNREFUSED'},
         }),
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when / #then — falls through to 'unreachable'
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('unreachable')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Session creation — no body.permission injection (autonomous-low-risk deferred)
+  // ---------------------------------------------------------------------------
+
+  describe('session creation', () => {
+    it('session.create is called WITHOUT a body.permission field (approval-required mode)', async () => {
+      // #given — approval-required mode (the only supported mode)
+      const handle = makeHandle()
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — session.create must NOT receive a body with permission rules
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      const callArgs = (session.create.mock.calls[0] as [{query?: unknown; body?: unknown}])[0]
+      // body should be absent (no session permission override in approval-required mode)
+      expect(callArgs.body).toBeUndefined()
     })
   })
 
@@ -1001,17 +1185,6 @@ describe('runOpenCodeCore', () => {
       expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
     })
 
-    it('does NOT throw when coordinator is absent and permission.asked arrives', async () => {
-      // #given — no coordinator param (back-compat)
-      const handle = makeHandle({
-        subscribe: async () => subscribeOk([permissionAskedEvent('req-1'), sessionIdleEvent('sess-123')]),
-      })
-      const params = buildParams(handle) // no coordinator
-
-      // #when / #then — must resolve cleanly
-      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
-    })
-
     it('invokes event.subscribe before promptAsync (subscribe-before-prompt ordering)', async () => {
       // #given — track call order via a shared array
       const callOrder: string[] = []
@@ -1026,13 +1199,68 @@ describe('runOpenCodeCore', () => {
           return subscribeOk([sessionIdleEvent('sess-123')])
         },
       })
-      const params = buildParams(handle)
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
 
       // #when
       await runOpenCodeCore(params)
 
       // #then — subscribe fires before prompt
       expect(callOrder).toEqual(['subscribe', 'promptAsync'])
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Coordinator required — fail-closed before session creation
+  // ---------------------------------------------------------------------------
+
+  describe('coordinator required — fail-closed before session creation', () => {
+    it('throws RunCoreError with kind "missing-coordinator" when no coordinator is provided', async () => {
+      // #given — no coordinator (coordinator is required unconditionally)
+      const handle = makeHandle()
+      const params = buildParams(handle) // no coordinator
+
+      // #when / #then — must fail closed before session.create
+      await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'missing-coordinator'})
+    })
+
+    it('throws RunCoreError(missing-coordinator) BEFORE session.create is called', async () => {
+      // #given — no coordinator
+      const handle = makeHandle()
+      const params = buildParams(handle)
+
+      // #when
+      await runOpenCodeCore(params).catch(() => {
+        /* expected */
+      })
+
+      // #then — session.create must NOT have been called
+      const {session} = handle.client as unknown as {session: {create: ReturnType<typeof vi.fn>}}
+      expect(session.create).not.toHaveBeenCalled()
+    })
+
+    it('throws RunCoreError(missing-coordinator) BEFORE promptAsync is called', async () => {
+      // #given — no coordinator
+      const handle = makeHandle()
+      const params = buildParams(handle)
+
+      // #when
+      await runOpenCodeCore(params).catch(() => {
+        /* expected */
+      })
+
+      // #then — promptAsync must NOT have been called
+      const {session} = handle.client as unknown as {session: {promptAsync: ReturnType<typeof vi.fn>}}
+      expect(session.promptAsync).not.toHaveBeenCalled()
+    })
+
+    it('coordinator present proceeds normally', async () => {
+      // #given — coordinator present
+      const coordinator = makeCoordinator()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), coordinator}
+
+      // #when / #then — must resolve cleanly
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
     })
   })
 })

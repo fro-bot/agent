@@ -40,6 +40,7 @@ export type RunCoreErrorKind =
   | 'prompt-error' // `promptAsync` returned an error
   | 'timeout' // run exceeded the configured wall-clock timeout
   | 'stream-ended' // event stream closed before session.idle was received
+  | 'missing-coordinator' // approval-required mode but no coordinator provided (fail-closed)
 
 /**
  * Error thrown by `runOpenCodeCore` on any failure path.
@@ -87,9 +88,14 @@ export interface RunCoreParams {
   /** Injected logger. Internal details only — never leak session internals to Discord. */
   readonly logger: GatewayLogger
   /**
-   * Optional permission coordinator.
-   * When present, `permission.asked` and `permission.replied` events are routed
-   * to it. When absent, those events are silently ignored (back-compat).
+   * Gateway approval mode. Currently only `approval-required` is supported.
+   * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
+   * When present, must be `approval-required`; when absent, defaults to `approval-required`.
+   */
+  readonly approvalMode?: 'approval-required'
+  /**
+   * Permission coordinator. Required when `approvalMode` is `approval-required` (the only
+   * supported mode). Fail-closed: if absent, `runOpenCodeCore` throws before session creation.
    */
   readonly coordinator?: PermissionCoordinator
 }
@@ -156,38 +162,39 @@ interface ToolCallInfo {
 // Core
 // ---------------------------------------------------------------------------
 
-/**
- * Execute a single OpenCode prompt against a remote server and pipe text
- * events to the provided `DiscordStreamSink`.
- *
- * Flow:
- * 1. `session.create()`
- * 2. `event.subscribe({query: {directory}})` — SSE stream (directory REQUIRED,
- *    subscribe-before-prompt removes the race where permission.asked fires
- *    before the SSE listener exists)
- * 3. `session.promptAsync({..., query: {directory}})` — blocks until queued
- * 4. Iterate events:
- *    - `message.part.delta` (this session) → `sink.append(text)`
- *    - `session.next.text.delta` (this session) → `sink.append(text)`
- *    - `session.next.tool.called` (this session) → cache call info
- *    - `session.next.tool.success` (this session) → append progress line to sink
- *    - `permission.asked` (this session, coordinator present) → fire-and-continue
- *    - `permission.replied` (this session, coordinator present) → settle
- *    - `session.idle` for this session → resolve
- *    - `session.error` for this session → throw `RunCoreError('session-error')`
- * 5. Caller calls `sink.flush()` after this resolves.
- *
- * @throws {RunCoreError} on unreachable server, 401 auth rejection,
- *   session error, or prompt rejection.
- */
 export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
-  const {handle, directory, promptText, sink, signal, logger, coordinator} = params
+  const {handle, directory, promptText, sink, signal, logger, coordinator, approvalMode} = params
   const {client} = handle
+
+  // ── 0. Mode/coordinator pre-flight ────────────────────────────────────────
+  // Coordinator is required unconditionally: approval-required is the only supported mode
+  // and it requires a coordinator before any session or prompt operations.
+  // Fail closed here so no session is created without approval wiring.
+  if (coordinator === undefined) {
+    logger.error({approvalMode}, 'run-core: coordinator required — failing closed before session creation')
+    throw new RunCoreError(
+      'missing-coordinator',
+      'approval-required mode requires a PermissionCoordinator — none was provided',
+    )
+  }
+
+  // ── 0b. Pre-flight abort check ─────────────────────────────────────────────
+  // Check before any external call so an already-expired signal (e.g. AbortSignal.timeout
+  // that fired during setup) is caught immediately rather than after a blocking SDK call.
+  if (signal.aborted) {
+    logger.warn({}, 'run-core: signal already aborted before session creation')
+    throw new RunCoreError('timeout', 'Run timed out: signal was already aborted before session creation')
+  }
 
   // ── 1. Create session ──────────────────────────────────────────────────────
   let sessionId: string
   try {
-    const sessionResponse = await client.session.create({query: {directory}})
+    // approval-required mode (the only supported mode): no session permission override.
+    // Discord approval UI handles permission asks via the coordinator.
+    const sessionResponse = await client.session.create({
+      query: {directory},
+      signal,
+    })
     if (sessionResponse.error != null) {
       const errMsg = String(sessionResponse.error)
       if (isAuthError(sessionResponse)) {
@@ -208,12 +215,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError('unreachable', `Session create threw: ${message}`)
   }
 
+  // ── 1b. Post-create abort check ────────────────────────────────────────────
+  if (signal.aborted) {
+    logger.warn({sessionId}, 'run-core: signal aborted after session creation')
+    throw new RunCoreError('timeout', 'Run timed out: signal aborted after session creation')
+  }
+
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
   // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
   // before the SSE listener exists.
   let eventStream: AsyncIterable<unknown>
   try {
-    const eventsResult = await client.event.subscribe({query: {directory}})
+    const eventsResult = await client.event.subscribe({query: {directory}, signal})
     eventStream = eventsResult.stream as AsyncIterable<unknown>
     logger.info({sessionId, directory}, 'run-core: event stream subscribed')
   } catch (error) {
@@ -222,12 +235,19 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError('unreachable', `Event subscribe threw: ${message}`)
   }
 
+  // ── 2b. Post-subscribe abort check ────────────────────────────────────────
+  if (signal.aborted) {
+    logger.warn({sessionId}, 'run-core: signal aborted after event subscribe')
+    throw new RunCoreError('timeout', 'Run timed out: signal aborted after event subscribe')
+  }
+
   // ── 3. Send prompt — directory threaded to query ───────────────────────────
   try {
     const promptResponse = await client.session.promptAsync({
       path: {id: sessionId},
       body: {parts: [{type: 'text', text: promptText}]},
       query: {directory},
+      signal,
     })
     if (promptResponse.error != null) {
       const errMsg = String(promptResponse.error)
@@ -246,11 +266,25 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError('unreachable', `PromptAsync threw: ${message}`)
   }
 
+  // ── 3b. Post-prompt abort check ────────────────────────────────────────────
+  if (signal.aborted) {
+    logger.warn({sessionId}, 'run-core: signal aborted after prompt send')
+    throw new RunCoreError('timeout', 'Run timed out: signal aborted after prompt send')
+  }
+
   // ── 4. Consume event stream ────────────────────────────────────────────────
   // V2 sync tool lifecycle: correlate called→success by callID.
   const pendingToolCalls = new Map<string, ToolCallInfo>()
 
-  for await (const rawEvent of eventStream) {
+  // Wrap the raw event stream in an abort-aware iterator so we do not block
+  // indefinitely waiting for the next event when the signal fires mid-stream.
+  // The inner generator races each `next()` call against the abort signal so
+  // the loop exits promptly even when the SSE server is silent.
+  const abortableStream = makeAbortableStream(eventStream, signal)
+
+  for await (const rawEvent of abortableStream) {
+    // Check abort at the top of each iteration so we exit as soon as the signal
+    // fires, even if the stream itself keeps yielding events.
     if (signal.aborted) break
 
     const eventType = getEventKind(rawEvent)
@@ -341,36 +375,34 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }
       }
     } else if (eventType === 'permission.asked') {
-      // Permission gate — only act when coordinator is wired in.
-      if (coordinator !== undefined) {
-        const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
-          const req = parsePermissionRequest(eventPayload)
-          if (req === null) {
-            logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
-          } else {
-            // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
-            // eslint-disable-next-line no-void
-            void coordinator.onPermissionAsked(req)
-            logger.info({requestID: req.requestID}, 'run-core: permission.asked forwarded to coordinator')
-          }
+      const eventSessionID = getEventSessionID(rawEvent)
+      if (eventSessionID === sessionId) {
+        // approval-required mode: route to coordinator.
+        // Coordinator is guaranteed non-null here (pre-flight check above).
+        const req = parsePermissionRequest(eventPayload)
+        if (req === null) {
+          logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
+        } else {
+          // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
+          // eslint-disable-next-line no-void
+          void coordinator.onPermissionAsked(req)
+          logger.info({requestID: req.requestID}, 'run-core: permission.asked forwarded to coordinator')
         }
       }
     } else if (eventType === 'permission.replied') {
-      // Authoritative settlement — only act when coordinator is wired in.
-      if (coordinator !== undefined) {
-        const eventSessionID = getEventSessionID(rawEvent)
-        if (eventSessionID === sessionId) {
-          const ev = parsePermissionReply(eventPayload)
-          if (ev === null) {
-            logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
-          } else {
-            coordinator.onPermissionReplied(ev)
-            logger.info(
-              {requestID: ev.requestID, reply: ev.reply},
-              'run-core: permission.replied forwarded to coordinator',
-            )
-          }
+      // Authoritative settlement — route to coordinator.
+      // Coordinator is guaranteed non-null here (pre-flight check above).
+      const eventSessionID = getEventSessionID(rawEvent)
+      if (eventSessionID === sessionId) {
+        const ev = parsePermissionReply(eventPayload)
+        if (ev === null) {
+          logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
+        } else {
+          coordinator.onPermissionReplied(ev)
+          logger.info(
+            {requestID: ev.requestID, reply: ev.reply},
+            'run-core: permission.replied forwarded to coordinator',
+          )
         }
       }
     } else if (eventType === 'session.idle') {
@@ -390,7 +422,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // Stream exhausted. Distinguish timeout (signal aborted) from premature close.
-  if (signal.aborted === true) {
+  if (signal.aborted) {
     logger.warn({sessionId}, 'run-core: stream ended due to timeout signal')
     throw new RunCoreError('timeout', 'Run timed out: event stream aborted by timeout signal')
   }
@@ -404,6 +436,63 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Wrap an async iterable so that each `next()` call races against the abort
+ * signal. When the signal fires while the stream is blocked waiting for the
+ * next event, the generator terminates immediately rather than hanging until
+ * the server sends another event.
+ *
+ * This is the key fix for the "silent stream" reliability issue: without this
+ * wrapper the `for await` loop only checks `signal.aborted` AFTER an event
+ * arrives, meaning a timed-out run can block indefinitely on a quiet stream.
+ */
+async function* makeAbortableStream(stream: AsyncIterable<unknown>, signal: AbortSignal): AsyncGenerator<unknown> {
+  const iterator = stream[Symbol.asyncIterator]()
+
+  try {
+    while (true) {
+      // Race the next event against the abort signal.
+      const nextPromise = iterator.next()
+
+      // Build an abort promise that resolves (not rejects) so Promise.race
+      // returns cleanly rather than throwing an AbortError.
+      const abortPromise = new Promise<{done: true; value: undefined}>(resolve => {
+        if (signal.aborted === true) {
+          resolve({done: true, value: undefined})
+          return
+        }
+        const onAbort = () => {
+          resolve({done: true, value: undefined})
+        }
+        signal.addEventListener('abort', onAbort, {once: true})
+        // Clean up the listener when the next event arrives first (resolve or reject).
+        // Using .then(cleanup, cleanup) instead of .finally() to avoid creating an
+        // additional microtask chain and to handle both resolve and reject paths
+        // without swallowing the rejection (nextPromise rejection propagates normally
+        // through Promise.race — we only need the side-effect of removing the listener).
+        // eslint-disable-next-line no-void
+        void nextPromise.then(
+          () => {
+            signal.removeEventListener('abort', onAbort)
+          },
+          () => {
+            signal.removeEventListener('abort', onAbort)
+          },
+        )
+      })
+
+      const result = await Promise.race([nextPromise, abortPromise])
+
+      if (result.done === true) return
+
+      yield result.value
+    }
+  } finally {
+    // Best-effort: return the underlying iterator if it supports it.
+    await iterator.return?.()
+  }
+}
 
 /** Detect a proxy/server 401 response in an SDK response envelope. */
 function isAuthError(response: {readonly error?: unknown}): boolean {

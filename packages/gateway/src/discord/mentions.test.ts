@@ -150,6 +150,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       confirmReply: vi.fn(),
       disposeAll: vi.fn(),
     },
+    approvalMode: 'approval-required' as const,
   }
 }
 
