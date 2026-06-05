@@ -92,9 +92,11 @@ jobs:
           WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
 
           # Parse each integration ref into label and merge ref (mirrors parseSource).
-          BRANCHES=""
-          MERGES=""
-          SOURCES=""
+          # When INTEGRATION_REFS is empty, the loop body never executes and the
+          # sentinel values below are used — the prompt reads "no patches to merge".
+          BRANCHES="(none)"
+          MERGES="(none — build the release tag as-is)"
+          SOURCES="(none)"
           while IFS= read -r REF; do
             [ -z "${REF}" ] && continue
             if echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/pull/([0-9]+)'; then
@@ -115,9 +117,16 @@ jobs:
               LABEL="${REF}"
               MERGE_REF="refs/remotes/watch/local/${REF}"
             fi
-            BRANCHES="${BRANCHES:+${BRANCHES}, }${LABEL}"
-            MERGES="${MERGES:+${MERGES}, then }${MERGE_REF}"
-            SOURCES="${SOURCES:+${SOURCES}\n- }${LABEL} -> ${MERGE_REF}"
+            # First real ref: overwrite the sentinels.
+            if [ "${BRANCHES}" = "(none)" ]; then
+              BRANCHES="${LABEL}"
+              MERGES="${MERGE_REF}"
+              SOURCES="${LABEL} -> ${MERGE_REF}"
+            else
+              BRANCHES="${BRANCHES}, ${LABEL}"
+              MERGES="${MERGES}, then ${MERGE_REF}"
+              SOURCES="${SOURCES}\n- ${LABEL} -> ${MERGE_REF}"
+            fi
           done <<< "${INTEGRATION_REFS}"
 
           # --- Render the prompt template ---
