@@ -470,7 +470,11 @@ jobs:
             const integrationCommit = process.env.INTEGRATION_COMMIT;
             const buildSha = process.env.GITHUB_SHA || 'unknown';
             const config = JSON.parse(fs.readFileSync('packages/harness/harness.config.json', 'utf8'));
-            const integrationRefs = config.integrationRefs.map(ref => ({ ref, resolvedSha: integrationCommit }));
+            if (config.integrationRefs !== undefined && !Array.isArray(config.integrationRefs)) {
+              console.error('harness.config.json integrationRefs must be an array (got ' + typeof config.integrationRefs + ')');
+              process.exit(1);
+            }
+            const integrationRefs = (config.integrationRefs ?? []).map(ref => ({ ref, resolvedSha: integrationCommit }));
             const manifest = { baseVersion, integrationRefs, integrationCommit, buildSha };
             fs.writeFileSync('packages/harness/provenance.json', JSON.stringify(manifest, null, 2) + '\n');
             console.log('provenance.json updated:', manifest);
