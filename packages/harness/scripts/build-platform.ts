@@ -8,7 +8,7 @@
  * with the release-identity env, and emits the native binary for that platform.
  *
  * Build-environment contract:
- *   - Bun version is pinned to match upstream's packageManager (bun@1.3.13).
+ *   - Bun version is pinned to match upstream's packageManager (see HARNESS_BUN_VERSION).
  *   - The full upstream repo is checked out at the frozen integration commit.
  *   - Native-dep install + embedded-app build happen under the UPSTREAM repo root.
  *   - Build runs with:
@@ -50,14 +50,12 @@ import {cpSync, mkdirSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {HARNESS_BUN_VERSION as REQUIRED_BUN_VERSION} from '../src/bun-version.js'
 import {buildHarnessVersion} from '../src/version.js'
 
 // ---------------------------------------------------------------------------
 // Build-environment contract constants
 // ---------------------------------------------------------------------------
-
-/** Pinned Bun version — matches upstream anomalyco/opencode packageManager field. */
-const REQUIRED_BUN_VERSION = '1.3.13'
 
 /** The release channel used for the build identity env. */
 const OPENCODE_CHANNEL = 'latest'
@@ -138,7 +136,7 @@ Build-environment contract:
 // Bun version enforcement
 // ---------------------------------------------------------------------------
 
-function enforceBunVersion(): void {
+export function enforceBunVersion(): void {
   let actual: string
   try {
     const result = execFileSync('bun', ['--version'], {encoding: 'utf8', timeout: 10_000})
@@ -193,16 +191,33 @@ function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): voi
 // ---------------------------------------------------------------------------
 
 function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
-  const opencodeDir = path.join(workDir, 'packages', 'opencode')
   const opencodeVersion = buildHarnessVersion(baseVersion, integrationCommit)
-  console.log(`[build-platform] Running upstream build in ${opencodeDir}`)
+  console.log(`[build-platform] Running upstream build in ${workDir}`)
   console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
 
-  // Install native deps first (mirrors upstream build.ts skipInstall=false path).
-  // The upstream build.ts does this internally, but we invoke it via `bun run build -- --single`
-  // which triggers the full build.ts including the bun install steps.
-  const result = spawnSync('bun', ['run', 'build', '--', '--single'], {
-    cwd: opencodeDir,
+  // Root workspace install — mirrors upstream's setup-bun action which runs `bun install`
+  // at the repo root before invoking build.ts. Hoisted linker is used ONLY on Windows
+  // (matching upstream's setup-bun action); Linux/macOS use a plain install.
+  // This wires workspace symlinks (e.g. @opencode-ai/script) into node_modules so
+  // packages/opencode/script/build.ts can resolve them at module load time.
+  // The --single build below compiles just this platform's binary.
+  console.log(`[build-platform] Installing workspace dependencies (bun install) in ${workDir}`)
+  // The win32 branch is intentionally inert for this repo's linux/darwin-only matrix;
+  // it exists to faithfully mirror upstream's setup-bun action behavior on Windows.
+  const installArgs = process.platform === 'win32' ? ['install', '--linker', 'hoisted'] : ['install']
+  const installResult = spawnSync('bun', installArgs, {
+    cwd: workDir,
+    stdio: 'inherit',
+    env: {...process.env},
+    timeout: 20 * 60 * 1000, // 20-minute hard timeout
+  })
+
+  if (installResult.status !== 0) {
+    throw new Error(`Workspace install failed with exit code ${installResult.status ?? 'unknown'}`)
+  }
+
+  const result = spawnSync('bun', ['./packages/opencode/script/build.ts', '--single'], {
+    cwd: workDir, // NOTE: workDir (repo root) — build.ts does its own process.chdir to packages/opencode
     stdio: 'inherit',
     env: {
       ...process.env,
@@ -379,4 +394,7 @@ async function main(): Promise<void> {
   console.log(`[build-platform] Done. Binary ready at: ${outDir}/opencode-${platform}-${arch}/bin/opencode`)
 }
 
-await main()
+// Only run when executed directly (not when imported by tests or other modules).
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await main()
+}
