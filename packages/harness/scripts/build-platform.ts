@@ -46,7 +46,7 @@
  */
 
 import {execFileSync, spawnSync} from 'node:child_process'
-import {cpSync, mkdirSync, writeFileSync} from 'node:fs'
+import {cpSync, mkdirSync, readdirSync, statSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
@@ -64,7 +64,7 @@ const OPENCODE_CHANNEL = 'latest'
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
-interface BuildArgs {
+export interface BuildArgs {
   readonly integrationCommit: string
   readonly baseVersion: string
   readonly platform: string
@@ -72,9 +72,10 @@ interface BuildArgs {
   readonly repoUrl: string
   readonly workDir: string
   readonly outDir: string
+  readonly sourceTree: string | null
 }
 
-function parseArgs(argv: string[]): BuildArgs | null {
+export function parseArgs(argv: string[]): BuildArgs | null {
   const args = argv.slice(2)
 
   if (args.includes('--help') || args.includes('-h')) {
@@ -96,6 +97,7 @@ function parseArgs(argv: string[]): BuildArgs | null {
   const repoUrl = flag('--repo-url') ?? 'https://github.com/anomalyco/opencode.git'
   const workDir = flag('--work-dir') ?? path.join(process.cwd(), '.harness-build-work')
   const outDir = flag('--out-dir') ?? path.join(process.cwd(), '.harness-build-out')
+  const sourceTree = flag('--source-tree') ?? null
 
   if (integrationCommit === null || baseVersion === null || platform === null || arch === null) {
     console.error('[build-platform] Missing required arguments.')
@@ -104,7 +106,7 @@ function parseArgs(argv: string[]): BuildArgs | null {
     return null
   }
 
-  return {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir}
+  return {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree}
 }
 
 function printHelp(): void {
@@ -120,6 +122,7 @@ Usage:
     [--repo-url <url>]                  Upstream repo URL (default: anomalyco/opencode)
     [--work-dir <path>]                 Working directory for the clone (default: .harness-build-work)
     [--out-dir <path>]                  Output directory for the native binary (default: .harness-build-out)
+    [--source-tree <path>]              Pre-extracted merged source tree (bypasses clone; fail-closed if missing/empty)
     [--help]                            Print this help
 
 Build-environment contract:
@@ -172,7 +175,7 @@ function gitExec(args: string[], cwd?: string): void {
   }
 }
 
-function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): void {
+export function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): void {
   const workDirExists = spawnSync('test', ['-d', workDir]).status === 0
   if (workDirExists) {
     console.log(`[build-platform] Work dir exists, fetching and resetting to ${commit}`)
@@ -190,7 +193,7 @@ function cloneAndCheckout(repoUrl: string, workDir: string, commit: string): voi
 // Build invocation
 // ---------------------------------------------------------------------------
 
-function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
+export function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
   const opencodeVersion = buildHarnessVersion(baseVersion, integrationCommit)
   console.log(`[build-platform] Running upstream build in ${workDir}`)
   console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
@@ -325,13 +328,13 @@ function emitProvenanceManifest(
 // Main
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const args = parseArgs(process.argv)
   if (args === null) {
     process.exit(1)
   }
 
-  const {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir} = args
+  const {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree} = args
 
   // Derive the harness package directory (two levels up from this script).
   const harnessPackageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -340,32 +343,75 @@ async function main(): Promise<void> {
   console.log(`  integration commit: ${integrationCommit}`)
   console.log(`  base version:       ${baseVersion}`)
   console.log(`  platform:           ${platform}/${arch}`)
-  console.log(`  repo:               ${repoUrl}`)
-  console.log(`  work dir:           ${workDir}`)
+  if (sourceTree === null) {
+    console.log(`  repo:               ${repoUrl}`)
+    console.log(`  work dir:           ${workDir}`)
+  } else {
+    console.log(`  source tree:        ${sourceTree} (artifact-extract mode; clone bypassed)`)
+  }
   console.log(`  out dir:            ${outDir}`)
 
   // 1. Enforce Bun version (build-environment contract).
   enforceBunVersion()
 
-  // 2. Clone/checkout the full upstream repo at the frozen integration commit.
-  try {
-    cloneAndCheckout(repoUrl, workDir, integrationCommit)
-  } catch (error) {
-    console.error(`[build-platform] Clone/checkout failed: ${error instanceof Error ? error.message : String(error)}`)
-    process.exit(1)
+  // 2. Resolve the source directory: either a pre-extracted merged source tree
+  //    (--source-tree mode, used by the CI artifact-handoff path) or a fresh
+  //    clone/checkout of the upstream repo (standalone/local path).
+  let buildSourceDir: string
+  if (sourceTree === null) {
+    // Standalone/local mode: clone or reuse the upstream repo at the frozen commit.
+    try {
+      cloneAndCheckout(repoUrl, workDir, integrationCommit)
+    } catch (error) {
+      console.error(`[build-platform] Clone/checkout failed: ${error instanceof Error ? error.message : String(error)}`)
+      process.exit(1)
+    }
+    buildSourceDir = workDir
+  } else {
+    // Artifact-extract mode: fail CLOSED if the supplied dir is missing or empty.
+    // Never silently fall back to cloning — a missing/empty source tree means the
+    // artifact handoff failed and we must not build from an unknown source.
+    let entries: string[]
+    try {
+      const stat = statSync(sourceTree)
+      if (!stat.isDirectory()) {
+        console.error(`[build-platform] --source-tree '${sourceTree}' exists but is not a directory.`)
+        process.exit(1)
+      }
+      entries = readdirSync(sourceTree)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        console.error(`[build-platform] --source-tree '${sourceTree}' does not exist. Refusing to fall back to clone.`)
+      } else {
+        console.error(
+          `[build-platform] --source-tree '${sourceTree}' could not be read: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+      process.exit(1)
+    }
+    if (entries.length === 0) {
+      console.error(`[build-platform] --source-tree '${sourceTree}' is empty. Refusing to fall back to clone.`)
+      process.exit(1)
+    }
+    console.log(`[build-platform] Using pre-extracted source tree: ${sourceTree} (${entries.length} entries)`)
+    buildSourceDir = sourceTree
   }
 
   // 3. Run upstream's real build (embedded-app + native-dep build).
   //    OPENCODE_VERSION embeds the integration commit short SHA for binary self-reporting.
+  //    Version derivation is pure-from-arg (buildHarnessVersion uses --integration-commit
+  //    directly; no git rev-parse is invoked — works with no .git present).
   try {
-    runUpstreamBuild(workDir, baseVersion, integrationCommit)
+    runUpstreamBuild(buildSourceDir, baseVersion, integrationCommit)
   } catch (error) {
     console.error(`[build-platform] Build failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
   }
 
   // 4. Verify the built binary --version == OPENCODE_VERSION (build-environment contract).
-  const binaryPath = resolveBuiltBinaryPath(workDir, platform, arch)
+  const binaryPath = resolveBuiltBinaryPath(buildSourceDir, platform, arch)
   const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
   try {
     verifyBuiltBinary(binaryPath, expectedVersion)
