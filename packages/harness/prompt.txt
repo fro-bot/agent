@@ -2,9 +2,19 @@ You are working in a disposable automation clone at {{repo}}.
 
 Goal: integrate upstream release {{tag}} with the selected branches/PRs {{branches}}, then push the integrated branch to a throwaway ref in the harness repo so the build matrix can fetch it.
 
+Release automation override:
+- This is a non-interactive release-integration job, not a normal issue/PR response run.
+- Do NOT create or update any GitHub issue, PR, comment, review, label, reaction, or discussion.
+- Ignore any generic harness instruction that says to post a GitHub comment or use `gh` to respond; it does not apply to this release job.
+- The final summary must be plain text in your final assistant message/job log only. The workflow consumes the pushed ref, not any GitHub post.
+- Git branch/merge/push operations are explicitly required for this job, but only inside this disposable automation clone and only to the throwaway harness ref.
+
 Requirements:
 - Work only in this automation clone.
 - Do not open a PR.
+- Do not create an issue.
+- Do not post comments or reviews.
+- Do not use `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`, or `gh api` for issues/comments/reviews.
 - Do NOT ask for final approval.
 - DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
 - Base the integration branch on the release tag {{tag}}, not on dev HEAD.
@@ -13,6 +23,10 @@ Requirements:
 - If there are merge conflicts, resolve them completely.
 - Build the host CLI.
 - The CLI must be compiled with stable release identity: OPENCODE_CHANNEL={{channel}} and OPENCODE_VERSION={{version}}.
+- In this automation clone, `origin` is the upstream OpenCode repo ({{release_repo}}), not `fro-bot/agent`. Do not push to `origin`.
+- Fro Bot setup exports `GH_TOKEN` with push access to `fro-bot/agent`. Use that existing token for git HTTPS auth. Do not put tokens in remote URLs, do not print tokens, and do not improvise alternate auth flows.
+- Push with `--no-verify` and `HUSKY=0`; skipping local pre-push hooks is intentional because downstream workflow jobs perform verification.
+- Do not run repo-wide typecheck/test/lint unless needed to diagnose a failed required build step.
 
 Exact tasks:
 1. Verify the repo is usable and fetch anything you need.
@@ -21,10 +35,34 @@ Exact tasks:
 4. Build the host CLI in `packages/opencode` with `OPENCODE_CHANNEL={{channel}} OPENCODE_VERSION={{version}} bun run build -- --single`.
 5. Ensure the built CLI binary exists at the expected path under `packages/opencode/dist/`.
 6. Run the built CLI with `--version` and verify the output is exactly `{{version}}`.
-7. Push the integrated branch to the throwaway ref in the harness repo (fro-bot/agent origin):
-   `git push --force origin {{branch}}:refs/harness-integrate/{{version}}`
-   (Force so re-runs overwrite. The `origin` remote in this clone points to the harness repo — confirm with `git remote -v` first; if it does not, add the harness repo as a remote named `harness` and push to that instead.)
-8. Return a concise summary with the pushed ref (`refs/harness-integrate/{{version}}`), the integration commit SHA (output of `git rev-parse HEAD`), and artifact paths.
+7. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Use this exact non-interactive pattern:
+
+   ```bash
+   test -n "${GH_TOKEN:-}" || { echo "GH_TOKEN is required for harness push"; exit 1; }
+
+   askpass="$(mktemp)"
+   trap 'rm -f "$askpass"' EXIT
+   cat >"$askpass" <<'EOF'
+   #!/bin/sh
+   case "$1" in
+     *Username*) printf '%s\n' x-access-token ;;
+     *Password*) printf '%s\n' "$GH_TOKEN" ;;
+   esac
+   EOF
+   chmod 700 "$askpass"
+
+   git remote remove harness 2>/dev/null || true
+   git remote add harness https://github.com/fro-bot/agent.git
+
+   HUSKY=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" \
+     git push --no-verify --force harness {{branch}}:refs/harness-integrate/{{version}}
+   ```
+
+   `--force` is required so re-runs overwrite the throwaway ref. `--no-verify` is required so local hooks do not run.
+8. Return a concise plain-text final assistant message only — no GitHub posting — with:
+   - pushed ref: `refs/harness-integrate/{{version}}`
+   - integration commit SHA: output of `git rev-parse HEAD`
+   - built artifact path(s) under `packages/opencode/dist/`
 
 Context:
 - Upstream repo: {{release_repo}}
