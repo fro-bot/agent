@@ -1,11 +1,10 @@
 You are working in a disposable automation clone at {{repo}}.
 
-Goal: integrate upstream release {{tag}} with the selected branches/PRs {{branches}} without pushing anything.
+Goal: integrate upstream release {{tag}} with the selected branches/PRs {{branches}}, then push the integrated branch to a throwaway ref in the harness repo so the build matrix can fetch it.
 
 Requirements:
 - Work only in this automation clone.
 - Do not open a PR.
-- Do not push.
 - Do NOT ask for final approval.
 - DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
 - Base the integration branch on the release tag {{tag}}, not on dev HEAD.
@@ -22,7 +21,10 @@ Exact tasks:
 4. Build the host CLI in `packages/opencode` with `OPENCODE_CHANNEL={{channel}} OPENCODE_VERSION={{version}} bun run build -- --single`.
 5. Ensure the built CLI binary exists at the expected path under `packages/opencode/dist/`.
 6. Run the built CLI with `--version` and verify the output is exactly `{{version}}`.
-7. Return a concise summary with the final branch name and artifact paths.
+7. Push the integrated branch to the throwaway ref in the harness repo (fro-bot/agent origin):
+   `git push --force origin {{branch}}:refs/harness-integrate/{{version}}`
+   (Force so re-runs overwrite. The `origin` remote in this clone points to the harness repo — confirm with `git remote -v` first; if it does not, add the harness repo as a remote named `harness` and push to that instead.)
+8. Return a concise summary with the pushed ref (`refs/harness-integrate/{{version}}`), the integration commit SHA (output of `git rev-parse HEAD`), and artifact paths.
 
 Context:
 - Upstream repo: {{release_repo}}
@@ -31,4 +33,4 @@ Context:
 - Integration refs:
 - {{sources}}
 
-If anything fails, fix it and continue until the branch is integrated and the configured build succeeds.
+If anything fails, fix it and continue until the branch is integrated, the configured build succeeds, and the ref is pushed.

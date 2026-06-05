@@ -35,19 +35,21 @@ permissions:
 # Read-only: no id-token, no push, no write token.
 # ---------------------------------------------------------------------------
 jobs:
-  integrate:
-    name: integrate (LLM merge + artifact)
+  # ---------------------------------------------------------------------------
+  # Prepare job — resolves base_version and renders the integration prompt
+  # from packages/harness/prompt.txt + packages/harness/harness.config.json.
+  # Outputs the rendered prompt as a job output for the integrate job below.
+  # ---------------------------------------------------------------------------
+  prepare-integrate:
+    name: prepare-integrate (render prompt)
     runs-on: ubuntu-24.04
 
-    # Read-only: no id-token. The LLM merge runs here and must not be able to
-    # publish or obtain OIDC tokens.
     permissions:
       contents: read
 
     outputs:
-      integration_commit: ${{ steps.emit.outputs.integration_commit }}
-      artifact_digest: ${{ steps.emit.outputs.artifact_digest }}
-      base_version: ${{ steps.resolve-base-version.outputs.base_version }}
+      base_version: ${{ steps.render.outputs.base_version }}
+      rendered_prompt: ${{ steps.render.outputs.rendered_prompt }}
 
     steps:
       - name: Checkout harness repo
@@ -55,16 +57,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Resolve base_version (dispatch input or tag)
-        id: resolve-base-version
+      - name: Resolve base_version and render integration prompt
+        id: render
         env:
           INPUT_BASE_VERSION: ${{ inputs.base_version }}
         run: |
           set -euo pipefail
+
+          # --- Resolve base_version (dispatch input or tag) ---
           if [ -n "${INPUT_BASE_VERSION:-}" ]; then
             BASE_VERSION="${INPUT_BASE_VERSION}"
           else
-            # Tag-triggered path: parse harness-v<version> from the tag name.
             TAG="${GITHUB_REF_NAME}"
             BASE_VERSION="${TAG#harness-v}"
           fi
@@ -76,114 +79,87 @@ jobs:
           echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved base_version: ${BASE_VERSION}"
 
-      - name: Install Bun (pinned to upstream packageManager version)
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          # Pinned to match anomalyco/opencode packageManager: bun@1.3.14
-          # Keep in step with HARNESS_BUN_VERSION in packages/harness/src/bun-version.ts
-          bun-version: 1.3.14
+          # --- Read harness.config.json ---
+          CONFIG="packages/harness/harness.config.json"
+          RELEASE_REPO=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).release_repo)")
+          INTEGRATION_REFS=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).integrationRefs.join('\n'))")
 
-      - name: Setup Node.js and pnpm
-        uses: ./.github/actions/setup
-        with:
-          install-dependencies: 'false'
-
-      - name: Install harness dependencies
-        run: pnpm install --filter @fro.bot/harness --frozen-lockfile
-
-      - name: Build harness package (so cli.ts imports resolve)
-        run: pnpm --filter @fro.bot/harness build
-
-      - name: Provision OpenCode model auth (file-based, never logged)
-        env:
-          HARNESS_OPENCODE_AUTH_JSON: ${{ secrets.AUTH_JSON }}
-        run: |
-          set -euo pipefail
-          AUTH_DIR="${HOME}/.local/share/opencode"
-          AUTH_FILE="${AUTH_DIR}/auth.json"
-          mkdir -p "${AUTH_DIR}"
-          # Write the secret to the auth file with 0600 perms.
-          # The secret value is never echoed — it is written via printf to avoid
-          # shell expansion and never appears in the step log.
-          (umask 077; printf '%s' "${HARNESS_OPENCODE_AUTH_JSON}" > "${AUTH_FILE}")
-          chmod 600 "${AUTH_FILE}"
-          # Sanity-check: file must be non-empty and valid JSON object.
-          if [ ! -s "${AUTH_FILE}" ]; then
-            echo "ERROR: AUTH_JSON secret is empty or missing" >&2
-            exit 1
-          fi
-          node -e "
-            const fs = require('fs');
-            const raw = fs.readFileSync('${AUTH_FILE}', 'utf8');
-            let parsed;
-            try { parsed = JSON.parse(raw); } catch (e) {
-              process.stderr.write('ERROR: AUTH_JSON secret is not valid JSON\n');
-              process.exit(1);
-            }
-            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-              process.stderr.write('ERROR: AUTH_JSON secret must be a JSON object\n');
-              process.exit(1);
-            }
-            process.stdout.write('auth: provisioned\n');
-          "
-
-      - name: Run harness integrate (LLM merge + artifact packaging)
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
+          # --- Compute template variables (mirrors renderPrompt in integrate.ts) ---
+          TAG="v${BASE_VERSION}"
+          BRANCH="integrate/v${BASE_VERSION}"
+          CHANNEL="latest"
+          RELEASE_URL="https://github.com/${RELEASE_REPO}/releases/tag/${TAG}"
           WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
-          ARTIFACT_PATH="${RUNNER_TEMP}/integration-tree.tar"
-          PROMPT_PATH="packages/harness/prompt.txt"
-          mkdir -p "${WORK_DIR}"
-          bun run packages/harness/src/cli.ts integrate \
-            --work-dir "${WORK_DIR}" \
-            --prompt-path "${PROMPT_PATH}" \
-            --out "${ARTIFACT_PATH}"
 
-      - name: Emit integration_commit and artifact_digest outputs
-        id: emit
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
-          ARTIFACT_PATH="${RUNNER_TEMP}/integration-tree.tar"
+          # Parse each integration ref into label and merge ref (mirrors parseSource).
+          BRANCHES=""
+          MERGES=""
+          SOURCES=""
+          while IFS= read -r REF; do
+            [ -z "${REF}" ] && continue
+            if echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/pull/([0-9]+)'; then
+              OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\1|')
+              REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\2|')
+              PR_NUM=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\3|')
+              SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
+              LABEL="${OWNER}/${REPO_NAME}#${PR_NUM}"
+              MERGE_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
+            elif echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/tree/(.+)'; then
+              OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\1|')
+              REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\2|')
+              BRANCH_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\3|')
+              SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
+              LABEL="${OWNER}/${REPO_NAME}:${BRANCH_NAME}"
+              MERGE_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
+            else
+              LABEL="${REF}"
+              MERGE_REF="refs/remotes/watch/local/${REF}"
+            fi
+            BRANCHES="${BRANCHES:+${BRANCHES}, }${LABEL}"
+            MERGES="${MERGES:+${MERGES}, then }${MERGE_REF}"
+            SOURCES="${SOURCES:+${SOURCES}\n- }${LABEL} -> ${MERGE_REF}"
+          done <<< "${INTEGRATION_REFS}"
 
-          # Read the integration commit from provenance.json written by runIntegration.
-          INTEGRATION_COMMIT=$(node -e "
-            const fs = require('fs');
-            const raw = fs.readFileSync('${WORK_DIR}/provenance.json', 'utf8');
-            const m = JSON.parse(raw);
-            if (!m || typeof m.integrationCommit !== 'string' || m.integrationCommit.length === 0) {
-              process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
-              process.exit(1);
-            }
-            process.stdout.write(m.integrationCommit);
+          # --- Render the prompt template ---
+          PROMPT_TPL=$(cat packages/harness/prompt.txt)
+          RENDERED=$(printf '%s' "${PROMPT_TPL}" \
+            | sed "s|{{repo}}|${WORK_DIR}|g" \
+            | sed "s|{{tag}}|${TAG}|g" \
+            | sed "s|{{version}}|${BASE_VERSION}|g" \
+            | sed "s|{{channel}}|${CHANNEL}|g" \
+            | sed "s|{{branches}}|${BRANCHES}|g" \
+            | sed "s|{{branch}}|${BRANCH}|g" \
+            | sed "s|{{merges}}|${MERGES}|g" \
+            | sed "s|{{release_repo}}|${RELEASE_REPO}|g" \
+            | sed "s|{{release_url}}|${RELEASE_URL}|g")
+          # sources may contain newlines — use node for the final substitution
+          RENDERED=$(RENDERED="${RENDERED}" SOURCES_VAL="${SOURCES}" node -e "
+            let text = process.env.RENDERED;
+            const sources = process.env.SOURCES_VAL;
+            process.stdout.write(text.replaceAll('{{sources}}', sources));
           ")
 
-          # Validate: must be a hex SHA (7–40 chars).
-          if ! echo "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
-            echo "ERROR: integrationCommit '${INTEGRATION_COMMIT}' does not match expected SHA format" >&2
-            exit 1
-          fi
+          # --- Write rendered_prompt to GITHUB_OUTPUT via heredoc ---
+          DELIM="EOF_RENDERED_PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "rendered_prompt<<${DELIM}"
+            printf '%s\n' "${RENDERED}"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
 
-          # Compute the artifact digest (sha256) — portable across Linux and macOS.
-          ARTIFACT_DIGEST=$(shasum -a 256 "${ARTIFACT_PATH}" | awk '{print $1}')
-
-          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "artifact_digest=${ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
-
-          echo "integration_commit: ${INTEGRATION_COMMIT}"
-          echo "artifact_digest:    ${ARTIFACT_DIGEST}"
-
-      - name: Upload integration-tree artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: integration-tree
-          path: ${{ runner.temp }}/integration-tree.tar
-          if-no-files-found: error
-          retention-days: 1
+  # ---------------------------------------------------------------------------
+  # Integrate job — calls fro-bot.yaml as a reusable workflow.
+  # Fro Bot installs opencode, provisions auth, and runs the LLM merge.
+  # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-4-6 in repo vars.
+  # ---------------------------------------------------------------------------
+  integrate:
+    name: integrate (LLM merge via Fro Bot)
+    needs: prepare-integrate
+    uses: ./.github/workflows/fro-bot.yaml
+    secrets: inherit
+    with:
+      model: ${{ vars.HARNESS_MODEL }}
+      prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
 
   # ---------------------------------------------------------------------------
   # Per-platform build matrix
@@ -192,7 +168,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: build (${{ matrix.platform }}/${{ matrix.arch }})
-    needs: integrate
+    needs: [prepare-integrate, integrate]
     strategy:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
@@ -241,41 +217,33 @@ jobs:
       - name: Build harness package (for scripts/verify-binary.ts import)
         run: pnpm --filter @fro.bot/harness build
 
-      - name: Download integration-tree artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: integration-tree
-          path: ${{ runner.temp }}/integration-tree-dl
-
-      - name: Verify artifact digest and extract source tree (R8)
+      - name: Fetch integration ref and resolve commit SHA
+        id: fetch-integrate
         env:
-          EXPECTED_DIGEST: ${{ needs.integrate.outputs.artifact_digest }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          ARTIFACT_PATH="${RUNNER_TEMP}/integration-tree-dl/integration-tree.tar"
+          INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
           EXTRACT_DIR="${RUNNER_TEMP}/integration-src"
 
-          # Verify the downloaded artifact matches the declared digest before
-          # extracting. Fail-closed: any mismatch aborts the build (R8).
-          ACTUAL_DIGEST=$(shasum -a 256 "${ARTIFACT_PATH}" | awk '{print $1}')
-          if [ "${ACTUAL_DIGEST}" != "${EXPECTED_DIGEST}" ]; then
-            echo "ERROR: artifact digest mismatch" >&2
-            echo "  expected: ${EXPECTED_DIGEST}" >&2
-            echo "  actual:   ${ACTUAL_DIGEST}" >&2
-            exit 1
-          fi
-          echo "Digest verified: ${ACTUAL_DIGEST}"
+          # Fetch the throwaway ref pushed by Fro Bot into fro-bot/agent.
+          git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
 
-          # Extract the clean merged source tree.
+          # Resolve the integration commit SHA from the fetched ref tip.
+          INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
+          echo "Integration commit: ${INTEGRATION_COMMIT}"
+          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
+
+          # Check out the integrated source tree into a clean directory.
           mkdir -p "${EXTRACT_DIR}"
-          tar xf "${ARTIFACT_PATH}" -C "${EXTRACT_DIR}"
-          echo "Extracted to: ${EXTRACT_DIR}"
+          git --work-tree="${EXTRACT_DIR}" checkout "${INTEGRATE_REF}" -- .
+          echo "Checked out integration tree to: ${EXTRACT_DIR}"
 
       - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
         env:
-          INTEGRATION_COMMIT: ${{ needs.integrate.outputs.integration_commit }}
-          BASE_VERSION: ${{ needs.integrate.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -291,8 +259,8 @@ jobs:
 
       - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
         env:
-          INTEGRATION_COMMIT: ${{ needs.integrate.outputs.integration_commit }}
-          BASE_VERSION: ${{ needs.integrate.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -316,7 +284,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     name: publish (all-or-nothing)
-    needs: [integrate, build]
+    needs: [prepare-integrate, integrate, build]
     runs-on: ubuntu-24.04
     environment: npm-publish # Maintainer-gated environment with required reviewers.
 
@@ -364,34 +332,27 @@ jobs:
       - name: Resolve params
         id: params
         env:
-          INTEGRATE_COMMIT: ${{ needs.integrate.outputs.integration_commit }}
           INPUT_BASE_VERSION: ${{ inputs.base_version }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          PREPARE_BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
         run: |
           set -euo pipefail
 
-          if [ -n "${INTEGRATE_COMMIT}" ]; then
-            # workflow_dispatch path: integrate job produced the commit.
-            INTEGRATION_COMMIT="${INTEGRATE_COMMIT}"
-            BASE_VERSION="${INPUT_BASE_VERSION}"
+          if [ -n "${PREPARE_BASE_VERSION}" ]; then
+            # workflow_dispatch path: prepare-integrate resolved the version.
+            BASE_VERSION="${PREPARE_BASE_VERSION}"
             DRY_RUN="${INPUT_DRY_RUN}"
           else
-            # Tag-triggered path: parse harness-v<version> tag; read commit from
-            # the provenance manifest committed in the repo.
+            # Tag-triggered path: parse harness-v<version> tag.
             TAG="${GITHUB_REF_NAME}"
             BASE_VERSION="${TAG#harness-v}"
-            INTEGRATION_COMMIT=$(node -e "
-              const fs = require('fs');
-              const raw = fs.readFileSync('./packages/harness/provenance.json', 'utf8');
-              const m = JSON.parse(raw);
-              if (!m || typeof m.integrationCommit !== 'string') {
-                process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
-                process.exit(1);
-              }
-              process.stdout.write(m.integrationCommit);
-            ")
             DRY_RUN="false"
           fi
+
+          # Fetch the throwaway ref pushed by Fro Bot and resolve the integration commit.
+          INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
+          git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
+          INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
 
           # Validate base_version: must be a semver-ish string (no shell metacharacters).
           if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
