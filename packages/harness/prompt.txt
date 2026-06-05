@@ -1,6 +1,12 @@
-You are working in a disposable automation clone at {{repo}}.
+You are working in a disposable automation clone. This is a merge-integration job: you will clone the upstream release, merge the listed patches, build the CLI, and push the result to a throwaway ref.
 
-Goal: integrate upstream release {{tag}} with the selected branches/PRs ({{branches}}), then push the integrated branch to a throwaway ref in the harness repo so the build matrix can fetch it. If the merge set is "(none — build the release tag as-is)", there are no patches to carry — skip merging and build the stock release tag directly.
+<constants>
+tag={{tag}}
+version={{version}}
+branch={{branch}}
+workdir={{repo}}
+release_repo={{release_repo}}
+</constants>
 
 Release automation override:
 - This is a non-interactive release-integration job, not a normal issue/PR response run.
@@ -9,33 +15,48 @@ Release automation override:
 - The final summary must be plain text in your final assistant message/job log only. The workflow consumes the pushed ref, not any GitHub post.
 - Git branch/merge/push operations are explicitly required for this job, but only inside this disposable automation clone and only to the throwaway harness ref.
 
-Requirements:
-- Work only in this automation clone.
-- Do not open a PR.
-- Do not create an issue.
-- Do not post comments or reviews.
-- Do not use `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`, or `gh api` for issues/comments/reviews.
-- Do NOT ask for final approval.
-- DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
-- Base the integration branch on the release tag {{tag}}, not on dev HEAD.
-- Name the branch {{branch}}.
-- If there are refs to merge ({{merges}}), merge them into {{branch}} in order; if the merge set is "(none — build the release tag as-is)", skip merging — the branch is the release tag as-is.
-- If there are merge conflicts, resolve them completely.
-- Build the host CLI.
-- The CLI must be compiled with stable release identity: OPENCODE_CHANNEL={{channel}} and OPENCODE_VERSION={{version}}.
-- In this automation clone, `origin` is the upstream OpenCode repo ({{release_repo}}), not `fro-bot/agent`. Do not push to `origin`.
-- Fro Bot setup exports `GH_TOKEN` with push access to `fro-bot/agent`. Use that existing token for git HTTPS auth. Do not put tokens in remote URLs, do not print tokens, and do not improvise alternate auth flows.
-- Push with `--no-verify` and `HUSKY=0`; skipping local pre-push hooks is intentional because downstream workflow jobs perform verification.
-- Do not run repo-wide typecheck/test/lint unless needed to diagnose a failed required build step.
+Do not read package.json, build scripts, action.yaml, or workflow files to understand the task. Run the exact commands below. Inspect files only to diagnose a FAILED required command.
 
-Exact tasks:
-1. Verify the repo is usable and fetch anything you need.
-2. Create or reset {{branch}} to refs/tags/{{tag}}.
-3. If there are refs to merge ({{merges}}), merge them into {{branch}} in order. If the merge set is "(none — build the release tag as-is)", skip this step — the branch is already the release tag.
-4. Build the host CLI in `packages/opencode` with `OPENCODE_CHANNEL={{channel}} OPENCODE_VERSION={{version}} bun run build -- --single`.
-5. Ensure the built CLI binary exists at the expected path under `packages/opencode/dist/`.
-6. Run the built CLI with `--version` and verify the output is exactly `{{version}}`.
-7. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Run this exact non-interactive pattern (the heredoc terminator and the helper body must stay at column 0):
+- DO NOT USE BASH with background: true. This will cause this non-interactive tool to exit before the job is done. If bash gets auto-promoted to background, poll bash_status even when the tool says otherwise. This is IMPORTANT because you are running in non-interactive mode — if you end your response, you will not get the notification.
+
+<procedure>
+1. Clone {{release_repo}} at {{tag}} into {{repo}} and create branch {{branch}}:
+
+```bash
+git clone --depth 1 --branch {{tag}} https://github.com/{{release_repo}}.git {{repo}}
+cd {{repo}}
+git checkout -b {{branch}} refs/tags/{{tag}}
+```
+
+2. Fetch and merge the listed refs into {{branch}} IN ORDER.
+
+   Sources: {{sources}}
+   Merge refs: {{merges}}
+
+   For each merge ref in the list above, run:
+   - `git fetch https://github.com/{{release_repo}}.git <that-merge-ref>`
+   - `git merge --no-ff FETCH_HEAD -m "Merge <label> into {{branch}}"`
+
+   If there are merge conflicts, resolve them completely before proceeding.
+
+3. Build the host CLI in `packages/opencode`:
+
+```bash
+cd {{repo}}
+OPENCODE_CHANNEL=latest OPENCODE_VERSION={{version}} bun run build -- --single
+```
+
+4. Verify the built binary exists and reports the correct version:
+
+```bash
+artifact="$(find packages/opencode/dist -path '*/bin/opencode' -type f -print -quit)"
+test -n "$artifact" || { echo "ERROR: built binary not found under packages/opencode/dist"; exit 1; }
+"$artifact" --version
+```
+
+   The `--version` output must be exactly `{{version}}`.
+
+5. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Run this exact non-interactive pattern (the heredoc terminator and the helper body must stay at column 0):
 
 ```bash
 test -n "${GH_TOKEN:-}" || { echo "GH_TOKEN is required for harness push"; exit 1; }
@@ -59,15 +80,35 @@ HUSKY=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" \
 ```
 
    `--force` is required so re-runs overwrite the throwaway ref. `--no-verify` is required so local hooks do not run.
-8. Return a concise plain-text final assistant message only — no GitHub posting — with:
+
+6. Return a concise plain-text final assistant message only — no GitHub posting — with:
    - pushed ref: `refs/harness-integrate/{{version}}`
    - integration commit SHA: output of `git rev-parse HEAD`
    - built artifact path(s) under `packages/opencode/dist/`
+</procedure>
 
 Context:
 - Upstream repo: {{release_repo}}
 - Base branch: dev
 - Release URL: {{release_url}}
 - Integration refs: {{sources}}
+
+Requirements:
+- Work only in this automation clone.
+- Do not open a PR.
+- Do not create an issue.
+- Do not post comments or reviews.
+- Do not use `gh issue create`, `gh pr create`, `gh issue comment`, `gh pr comment`, or `gh api` for issues/comments/reviews.
+- Do NOT ask for final approval.
+- Base the integration branch on the release tag {{tag}}, not on dev HEAD.
+- Name the branch {{branch}}.
+- Merge refs {{merges}} into {{branch}} in order.
+- If there are merge conflicts, resolve them completely.
+- Build the host CLI.
+- The CLI must be compiled with stable release identity: OPENCODE_CHANNEL=latest and OPENCODE_VERSION={{version}}.
+- In this automation clone, `origin` is the upstream OpenCode repo ({{release_repo}}), not `fro-bot/agent`. Do not push to `origin`.
+- Fro Bot setup exports `GH_TOKEN` with push access to `fro-bot/agent`. Use that existing token for git HTTPS auth. Do not put tokens in remote URLs, do not print tokens, and do not improvise alternate auth flows.
+- Push with `--no-verify` and `HUSKY=0`; skipping local pre-push hooks is intentional because downstream workflow jobs perform verification.
+- Do not run repo-wide typecheck/test/lint unless needed to diagnose a failed required build step.
 
 If anything fails, fix it and continue until the branch is integrated, the configured build succeeds, and the ref is pushed.
