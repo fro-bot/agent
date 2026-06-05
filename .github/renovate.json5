@@ -49,11 +49,23 @@
     },
     {
       // Tracks the harness native-build Bun pin in packages/harness/src/bun-version.ts.
-      // Must match anomalyco/opencode's packageManager field at the harness base version
-      // and the bun-version input in harness-release.yaml.
+      // Must match anomalyco/opencode's packageManager field at the harness base version.
+      // The workflow's setup-bun input is tracked separately by the manager below.
       customType: 'regex',
       managerFilePatterns: ['/packages\\/harness\\/src\\/bun-version\\.ts/'],
       matchStrings: ["HARNESS_BUN_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
+    {
+      // Tracks the bun-version input in .github/workflows/harness-release.yaml.
+      // Keeps the workflow's setup-bun pin in lockstep with HARNESS_BUN_VERSION
+      // in packages/harness/src/bun-version.ts. Matches both occurrences (build
+      // job and publish job) — Renovate applies matchStrings globally per file.
+      customType: 'regex',
+      managerFilePatterns: ['/\\.github\\/workflows\\/harness-release\\.yaml/'],
+      matchStrings: ['bun-version: (?<currentValue>\\d+\\.\\d+\\.\\d+)'],
       depNameTemplate: 'oven-sh/bun',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^bun-v(?<version>.*)$',
@@ -126,6 +138,14 @@
       // changes in patch releases). Raise it after validating a newer release.
       matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
       allowedVersions: '<=1.15.13',
+    },
+    {
+      // Cap Bun at 1.3.14. The build gate requires an exact match with upstream
+      // anomalyco/opencode's packageManager field at the harness base version.
+      // Bun must not outrun the validated release; raise after verifying a newer
+      // upstream packageManager declaration and updating HARNESS_BUN_VERSION.
+      matchPackageNames: ['oven-sh/bun'],
+      allowedVersions: '<=1.3.14',
     },
     {
       matchUpdateTypes: ['lockFileMaintenance'],

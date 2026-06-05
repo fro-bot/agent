@@ -136,7 +136,7 @@ Build-environment contract:
 // Bun version enforcement
 // ---------------------------------------------------------------------------
 
-function enforceBunVersion(): void {
+export function enforceBunVersion(): void {
   let actual: string
   try {
     const result = execFileSync('bun', ['--version'], {encoding: 'utf8', timeout: 10_000})
@@ -202,6 +202,8 @@ function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommi
   // packages/opencode/script/build.ts can resolve them at module load time.
   // The --single build below compiles just this platform's binary.
   console.log(`[build-platform] Installing workspace dependencies (bun install) in ${workDir}`)
+  // The win32 branch is intentionally inert for this repo's linux/darwin-only matrix;
+  // it exists to faithfully mirror upstream's setup-bun action behavior on Windows.
   const installArgs = process.platform === 'win32' ? ['install', '--linker', 'hoisted'] : ['install']
   const installResult = spawnSync('bun', installArgs, {
     cwd: workDir,
@@ -392,4 +394,7 @@ async function main(): Promise<void> {
   console.log(`[build-platform] Done. Binary ready at: ${outDir}/opencode-${platform}-${arch}/bin/opencode`)
 }
 
-await main()
+// Only run when executed directly (not when imported by tests or other modules).
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await main()
+}
