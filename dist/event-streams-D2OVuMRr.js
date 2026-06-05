@@ -1,1 +1,0 @@
-import{n as e,r as t}from"./event-streams-DvSvAN0f.js";e();export{t as EventStreamSerde};
