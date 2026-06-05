@@ -1,6 +1,13 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
-import type {ActionInputs, ModelConfig, OmoProviders, OmoSlimPreset, OutputMode} from '../../shared/types.js'
+import type {
+  ActionInputs,
+  ModelConfig,
+  OmoProviders,
+  OmoSlimPreset,
+  OutputMode,
+  ResponseMode,
+} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
@@ -79,6 +86,7 @@ const VALID_OMO_PROVIDERS = [
 ] as const
 
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
+const VALID_RESPONSE_MODES = ['github', 'none'] as const
 
 function parseOmoSlimPreset(input: string): OmoSlimPreset {
   if (!VALID_OMO_SLIM_PRESETS.includes(input as OmoSlimPreset)) {
@@ -222,6 +230,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
 
     const outputModeRaw = core.getInput('output-mode').trim().toLowerCase()
     const outputMode: OutputMode = outputModeRaw.length > 0 ? parseOutputMode(outputModeRaw) : 'auto'
+
+    const responseModeRaw = core.getInput('response-mode').trim().toLowerCase()
+    const responseMode: ResponseMode = responseModeRaw.length > 0 ? parseResponseMode(responseModeRaw) : 'github'
 
     // Optional numeric input with default
     const sessionRetentionRaw = core.getInput('session-retention').trim()
@@ -393,6 +404,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       authJson,
       prompt,
       outputMode,
+      responseMode,
       sessionRetention,
       storeConfig,
       agent,
@@ -423,5 +435,15 @@ function parseOutputMode(input: string): OutputMode {
       return input
     default:
       throw new Error(`Invalid output-mode value: "${input}". Valid values: ${VALID_OUTPUT_MODES.join(', ')}`)
+  }
+}
+
+export function parseResponseMode(input: string): ResponseMode {
+  switch (input) {
+    case 'github':
+    case 'none':
+      return input
+    default:
+      throw new Error(`Invalid response-mode value: "${input}". Valid values: ${VALID_RESPONSE_MODES.join(', ')}`)
   }
 }

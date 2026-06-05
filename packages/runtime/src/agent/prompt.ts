@@ -149,9 +149,14 @@ export function buildTaskSection(
   return lines.join('\n')
 }
 
-function buildAgentContextSection(context: AgentContext, cacheStatus: string, sessionId: string | undefined): string {
+function buildAgentContextSection(
+  context: AgentContext,
+  cacheStatus: string,
+  sessionId: string | undefined,
+  responseMode: 'github' | 'none',
+): string {
   const issueNum = context.issueNumber ?? '<number>'
-  const hasResponseProtocol = context.issueNumber != null
+  const hasResponseProtocol = context.issueNumber != null && responseMode !== 'none'
 
   const lines: string[] = [
     '## Agent Context',
@@ -160,8 +165,22 @@ function buildAgentContextSection(context: AgentContext, cacheStatus: string, se
     '### Operating Environment',
     '- **This is NOT an interactive session.** There is no human reading your assistant messages in real time.',
     '- Your assistant messages are logged to the GitHub Actions job output. Use them only for diagnostic information (e.g., files read, decisions made, errors encountered) that helps troubleshoot issues in CI logs.',
-    '- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.',
-    '- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.',
+  ]
+
+  if (responseMode === 'none') {
+    lines.push(
+      '- **Response surface:** Your final assistant message and the GitHub Actions job log are the only output surfaces for this run.',
+      '- **Do NOT create GitHub comments, reviews, issues, discussions, reactions, or labels.** This run is non-posting automation.',
+      '- Git and GitHub operations (branch, commit, push, PR open/update) are permitted only when the task explicitly requires them.',
+    )
+  } else {
+    lines.push(
+      '- The human who invoked you will ONLY see what you post as a GitHub comment or review. Your assistant messages are invisible to them.',
+      '- You MUST post your response using the gh CLI (see Response Protocol below). Do not rely on assistant message output to communicate with the user.',
+    )
+  }
+
+  lines.push(
     '',
     '### Session Management (REQUIRED)',
     'Before investigating any issue:',
@@ -173,9 +192,9 @@ function buildAgentContextSection(context: AgentContext, cacheStatus: string, se
     '1. Ensure your session contains a summary of work done',
     '2. Include key decisions, findings, and outcomes',
     '3. This summary will be searchable in future agent runs',
-  ]
+  )
 
-  if (context.issueNumber != null) {
+  if (hasResponseProtocol) {
     lines.push('', buildResponseProtocolSection(context, cacheStatus, sessionId))
   }
 
@@ -377,7 +396,12 @@ ${trimmedCustomPrompt}`,
     }
   }
 
-  parts.push(wrapXml('agent_context', buildAgentContextSection(context, cacheStatus, options.sessionId)))
+  parts.push(
+    wrapXml(
+      'agent_context',
+      buildAgentContextSection(context, cacheStatus, options.sessionId, options.responseMode ?? 'github'),
+    ),
+  )
 
   const prompt = parts.map(p => p.trim()).join('\n\n')
   logger.debug('Built agent prompt', {

@@ -147,6 +147,48 @@ describe('parseActionInputs', () => {
       expect(result.success && result.data.outputMode).toBe('branch-pr')
     })
 
+    it('parses response-mode default value as github when input is empty', () => {
+      mockInputs({})
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.responseMode).toBe('github')
+    })
+
+    it('parses response-mode=none', () => {
+      mockInputs({
+        'response-mode': 'none',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.responseMode).toBe('none')
+    })
+
+    it('parses response-mode=github explicitly', () => {
+      mockInputs({
+        'response-mode': 'github',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.responseMode).toBe('github')
+    })
+
+    it('parses response-mode case-insensitively (e.g., NONE)', () => {
+      mockInputs({
+        'response-mode': 'NONE',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.responseMode).toBe('none')
+    })
+
     it('parses all S3 inputs into storeConfig', () => {
       mockInputs({
         's3-backup': 'true',
@@ -326,6 +368,18 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('Invalid output-mode value')
       expect(!result.success && result.error.message).toContain('auto, working-dir, branch-pr')
+    })
+
+    it('returns error for invalid response-mode value listing valid values', () => {
+      mockInputs({
+        'response-mode': 'post-to-slack',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('Invalid response-mode value')
+      expect(!result.success && result.error.message).toContain('github, none')
     })
 
     it('returns error for invalid session-retention (negative)', () => {

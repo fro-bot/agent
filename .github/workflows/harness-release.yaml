@@ -6,10 +6,6 @@ name: harness-release
 on:
   workflow_dispatch:
     inputs:
-      integration_commit:
-        description: Frozen integration commit SHA (from provenance manifest)
-        required: true
-        type: string
       base_version:
         description: Base release version (e.g. 1.15.13)
         required: true
@@ -34,13 +30,184 @@ permissions:
   contents: read
 
 # ---------------------------------------------------------------------------
-# Per-platform build matrix
-# Mirrors upstream anomalyco/opencode publish.yml native-runner matrix.
-# Windows is out of scope (linux x64/arm64 + darwin x64/arm64 only).
+# Integrate producer job — runs the LLM merge once, packages the clean merged
+# source snapshot, and emits the integration commit SHA + artifact digest.
+# Read-only: no id-token, no push, no write token.
 # ---------------------------------------------------------------------------
 jobs:
+  # ---------------------------------------------------------------------------
+  # Prepare job — resolves base_version and renders the integration prompt
+  # from packages/harness/prompt.txt + packages/harness/harness.config.json.
+  # Outputs the rendered prompt as a job output for the integrate job below.
+  # ---------------------------------------------------------------------------
+  prepare-integrate:
+    name: prepare-integrate (render prompt)
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    outputs:
+      base_version: ${{ steps.render.outputs.base_version }}
+      rendered_prompt: ${{ steps.render.outputs.rendered_prompt }}
+      has_refs: ${{ steps.render.outputs.has_refs }}
+
+    steps:
+      - name: Checkout harness repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve base_version and render integration prompt
+        id: render
+        env:
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          set -euo pipefail
+
+          # --- Resolve base_version (dispatch input or tag) ---
+          if [ -n "${INPUT_BASE_VERSION:-}" ]; then
+            BASE_VERSION="${INPUT_BASE_VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            BASE_VERSION="${TAG#harness-v}"
+          fi
+          # Validate: must be semver-ish (no shell metacharacters).
+          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
+            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
+            exit 1
+          fi
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved base_version: ${BASE_VERSION}"
+
+          # --- Read harness.config.json ---
+          CONFIG="packages/harness/harness.config.json"
+          RELEASE_REPO=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).release_repo)")
+          INTEGRATION_REFS=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).integrationRefs.join('\n'))")
+
+          # --- Compute template variables (mirrors renderPrompt in integrate.ts) ---
+          TAG="v${BASE_VERSION}"
+          BRANCH="integrate/v${BASE_VERSION}"
+          CHANNEL="latest"
+          RELEASE_URL="https://github.com/${RELEASE_REPO}/releases/tag/${TAG}"
+          WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
+
+          # Parse each integration ref into label, fetch URL, fetchRef, and local merge ref
+          # (mirrors parseSource in packages/harness/src/sources.ts).
+          # When INTEGRATION_REFS is empty, the loop body never executes.
+          # HAS_REFS is derived from the parsed merge list AFTER the loop so that
+          # whitespace-only or malformed-only entries that produce no real merge ref
+          # correctly yield has_refs=false rather than a bogus prompt.
+          BRANCHES=""
+          MERGES=""
+          SOURCES=""
+          while IFS= read -r REF; do
+            [ -z "${REF}" ] && continue
+            if echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/pull/([0-9]+)'; then
+              OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\1|')
+              REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\2|')
+              PR_NUM=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\3|')
+              SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
+              LABEL="${OWNER}/${REPO_NAME}#${PR_NUM}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/pull/${PR_NUM}/head"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
+            elif echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/tree/(.+)'; then
+              OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\1|')
+              REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\2|')
+              BRANCH_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\3|')
+              SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
+              LABEL="${OWNER}/${REPO_NAME}:${BRANCH_NAME}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/heads/${BRANCH_NAME}"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
+            else
+              LABEL="${REF}"
+              FETCH_URL="https://github.com/${RELEASE_REPO}.git"
+              FETCH_REF="refs/heads/${REF}"
+              LOCAL_REF="refs/remotes/watch/local/${REF}"
+            fi
+            # First real ref: set the values; subsequent refs: append.
+            if [ -z "${BRANCHES}" ]; then
+              BRANCHES="${LABEL}"
+              MERGES="${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
+            else
+              BRANCHES="${BRANCHES}, ${LABEL}"
+              MERGES="${MERGES}; ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${SOURCES}\n- ${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
+            fi
+          done <<< "${INTEGRATION_REFS}"
+
+          # --- Emit has_refs: true iff at least one valid ref was parsed into the merge list ---
+          # Derived from the parsed MERGES list (not the raw string) so whitespace-only or
+          # malformed-only entries that produce no real merge ref yield has_refs=false.
+          if [ -n "${MERGES}" ]; then
+            HAS_REFS="true"
+          else
+            HAS_REFS="false"
+          fi
+          echo "has_refs=${HAS_REFS}" >> "$GITHUB_OUTPUT"
+          echo "has_refs: ${HAS_REFS}"
+
+          # --- Render the prompt template ---
+          PROMPT_TPL=$(cat packages/harness/prompt.txt)
+          RENDERED=$(printf '%s' "${PROMPT_TPL}" \
+            | sed "s|{{repo}}|${WORK_DIR}|g" \
+            | sed "s|{{tag}}|${TAG}|g" \
+            | sed "s|{{version}}|${BASE_VERSION}|g" \
+            | sed "s|{{channel}}|${CHANNEL}|g" \
+            | sed "s|{{branches}}|${BRANCHES}|g" \
+            | sed "s|{{branch}}|${BRANCH}|g" \
+            | sed "s|{{merges}}|${MERGES}|g" \
+            | sed "s|{{release_repo}}|${RELEASE_REPO}|g" \
+            | sed "s|{{release_url}}|${RELEASE_URL}|g")
+          # sources may contain newlines — use node for the final substitution
+          RENDERED=$(RENDERED="${RENDERED}" SOURCES_VAL="${SOURCES}" node -e "
+            let text = process.env.RENDERED;
+            const sources = process.env.SOURCES_VAL;
+            process.stdout.write(text.replaceAll('{{sources}}', sources));
+          ")
+
+          # --- Write rendered_prompt to GITHUB_OUTPUT via heredoc ---
+          DELIM="EOF_RENDERED_PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "rendered_prompt<<${DELIM}"
+            printf '%s\n' "${RENDERED}"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Integrate job — calls fro-bot.yaml as a reusable workflow.
+  # Fro Bot installs opencode, provisions auth, and runs the LLM merge.
+  # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-4-6 in repo vars.
+  # Skipped when the carry set is empty (has_refs == 'false').
+  # ---------------------------------------------------------------------------
+  integrate:
+    name: integrate (LLM merge via Fro Bot)
+    needs: prepare-integrate
+    if: ${{ needs.prepare-integrate.outputs.has_refs == 'true' }}
+    uses: ./.github/workflows/fro-bot.yaml
+    secrets: inherit
+    with:
+      model: ${{ vars.HARNESS_MODEL }}
+      prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
+      response-mode: none
+
+  # ---------------------------------------------------------------------------
+  # Per-platform build matrix
+  # Mirrors upstream anomalyco/opencode publish.yml native-runner matrix.
+  # Windows is out of scope (linux x64/arm64 + darwin x64/arm64 only).
+  # ---------------------------------------------------------------------------
   build:
     name: build (${{ matrix.platform }}/${{ matrix.arch }})
+    needs: [prepare-integrate, integrate]
+    # Run when prepare-integrate succeeded AND integrate did not fail.
+    # integrate.result is 'skipped' for empty carry → build runs.
+    # integrate.result is 'success' for non-empty carry → build runs.
+    # integrate.result is 'failure' or 'cancelled' → build is blocked.
+    # !cancelled() prevents running if the workflow was manually cancelled.
+    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     strategy:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
@@ -60,6 +227,9 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
 
+    outputs:
+      integration_commit: ${{ steps.fetch-integrate.outputs.integration_commit }}
+
     # Build job: read-only. No id-token — the untrusted LLM-merge + upstream
     # build runs here and must not be able to publish or obtain OIDC tokens.
     permissions:
@@ -68,6 +238,8 @@ jobs:
     steps:
       - name: Checkout harness repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun (pinned to upstream packageManager version)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -87,53 +259,52 @@ jobs:
       - name: Build harness package (for scripts/verify-binary.ts import)
         run: pnpm --filter @fro.bot/harness build
 
-      - name: Resolve integration commit and base version
-        id: params
+      - name: Fetch integration ref and resolve commit SHA
+        id: fetch-integrate
         env:
-          INPUT_INTEGRATION_COMMIT: ${{ inputs.integration_commit }}
-          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+          HAS_REFS: ${{ needs.prepare-integrate.outputs.has_refs }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          EXTRACT_DIR="${RUNNER_TEMP}/integration-src"
+          mkdir -p "${EXTRACT_DIR}"
 
-          if [ -n "${INPUT_INTEGRATION_COMMIT}" ]; then
-            INTEGRATION_COMMIT="${INPUT_INTEGRATION_COMMIT}"
-            BASE_VERSION="${INPUT_BASE_VERSION}"
+          if [ "${HAS_REFS}" = "true" ]; then
+            # Non-empty carry set: fetch the throwaway ref pushed by Fro Bot.
+            INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
+
+            # Fetch the throwaway ref pushed by Fro Bot into fro-bot/agent.
+            git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
+
+            # Resolve the integration commit SHA from the fetched ref tip.
+            INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
+            echo "Integration commit (from harness-integrate ref): ${INTEGRATION_COMMIT}"
+
+            # Check out the integrated source tree into a clean directory.
+            git --work-tree="${EXTRACT_DIR}" checkout "${INTEGRATE_REF}" -- .
+            echo "Checked out integration tree to: ${EXTRACT_DIR}"
           else
-            # Tag-triggered: parse harness-v<version> tag.
-            TAG="${GITHUB_REF_NAME}"
-            BASE_VERSION="${TAG#harness-v}"
-            # Read integration commit from the provenance manifest in the repo.
-            INTEGRATION_COMMIT=$(node -e "
-              const fs = require('fs');
-              const raw = fs.readFileSync('./packages/harness/provenance.json', 'utf8');
-              const m = JSON.parse(raw);
-              if (!m || typeof m.integrationCommit !== 'string') {
-                process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
-                process.exit(1);
-              }
-              process.stdout.write(m.integrationCommit);
-            ")
-          fi
+            # Empty carry set: clone the stock release tag directly.
+            # No agent ran; the stock tag IS the integration source.
+            CONFIG="packages/harness/harness.config.json"
+            RELEASE_REPO=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).release_repo)")
+            TAG="v${BASE_VERSION}"
 
-          # Validate base_version: must be a semver-ish string (digits and dots only, no shell metacharacters).
-          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
-            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
-            exit 1
-          fi
+            echo "Empty carry set — cloning stock tag ${TAG} from ${RELEASE_REPO}"
+            git clone --depth 1 --branch "${TAG}" "https://github.com/${RELEASE_REPO}.git" "${EXTRACT_DIR}"
 
-          # Validate integration_commit: must be a hex SHA (7–40 chars).
-          if ! echo "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
-            echo "ERROR: integration_commit '${INTEGRATION_COMMIT}' does not match expected SHA format" >&2
-            exit 1
+            # Resolve the tag commit SHA from the cloned HEAD.
+            INTEGRATION_COMMIT=$(git -C "${EXTRACT_DIR}" rev-parse HEAD)
+            echo "Integration commit (from stock tag clone): ${INTEGRATION_COMMIT}"
           fi
 
           echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
         env:
-          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
-          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -143,14 +314,14 @@ jobs:
             --base-version "$BASE_VERSION" \
             --platform "$MATRIX_PLATFORM" \
             --arch "$MATRIX_ARCH" \
-            --repo-url "https://github.com/anomalyco/opencode.git" \
+            --source-tree "$RUNNER_TEMP/integration-src" \
             --work-dir "$RUNNER_TEMP/harness-build-work" \
             --out-dir "$RUNNER_TEMP/harness-build-out"
 
       - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
         env:
-          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
-          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -174,7 +345,12 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     name: publish (all-or-nothing)
-    needs: build
+    needs: [prepare-integrate, integrate, build]
+    # Run when build succeeded and integrate did not fail (defense-in-depth).
+    # build success already implies integrate didn't fail (build wouldn't have run),
+    # but the explicit check makes the gate clear and guards against future refactors.
+    # !cancelled() prevents running if the workflow was manually cancelled.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     runs-on: ubuntu-24.04
     environment: npm-publish # Maintainer-gated environment with required reviewers.
 
@@ -189,6 +365,8 @@ jobs:
     steps:
       - name: Checkout harness repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun (pinned)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -220,31 +398,27 @@ jobs:
       - name: Resolve params
         id: params
         env:
-          INPUT_INTEGRATION_COMMIT: ${{ inputs.integration_commit }}
           INPUT_BASE_VERSION: ${{ inputs.base_version }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          PREPARE_BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
         run: |
           set -euo pipefail
 
-          if [ -n "${INPUT_INTEGRATION_COMMIT}" ]; then
-            INTEGRATION_COMMIT="${INPUT_INTEGRATION_COMMIT}"
-            BASE_VERSION="${INPUT_BASE_VERSION}"
+          if [ -n "${PREPARE_BASE_VERSION}" ]; then
+            # workflow_dispatch path: prepare-integrate resolved the version.
+            BASE_VERSION="${PREPARE_BASE_VERSION}"
             DRY_RUN="${INPUT_DRY_RUN}"
           else
+            # Tag-triggered path: parse harness-v<version> tag.
             TAG="${GITHUB_REF_NAME}"
             BASE_VERSION="${TAG#harness-v}"
-            INTEGRATION_COMMIT=$(node -e "
-              const fs = require('fs');
-              const raw = fs.readFileSync('./packages/harness/provenance.json', 'utf8');
-              const m = JSON.parse(raw);
-              if (!m || typeof m.integrationCommit !== 'string') {
-                process.stderr.write('ERROR: provenance.json missing or invalid integrationCommit\n');
-                process.exit(1);
-              }
-              process.stdout.write(m.integrationCommit);
-            ")
             DRY_RUN="false"
           fi
+
+          # Integration commit is resolved once by the build job and passed via job output.
+          # This avoids a TOCTOU race where a force-push between build and publish could
+          # cause publish to use a different commit than build verified.
+          INTEGRATION_COMMIT="${{ needs.build.outputs.integration_commit }}"
 
           # Validate base_version: must be a semver-ish string (no shell metacharacters).
           if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
@@ -317,6 +491,10 @@ jobs:
             "version": "${BASE_VERSION}",
             "description": "Native binary for @fro.bot/harness on ${PLATFORM}/${ARCH}",
             "license": "MIT",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/fro-bot/agent.git"
+            },
             "os": ["${PLATFORM}"],
             "cpu": ["${ARCH}"],
             "files": ["bin"],
@@ -335,14 +513,22 @@ jobs:
 
           # Write the provenance manifest into the main package for runtime use.
           # Values are passed via environment variables (not interpolated into the script body).
+          # integrationRefs is read from harness.config.json so the manifest is complete
+          # and isValidProvenance() accepts it (requires Array.isArray(v.integrationRefs)).
+          # INTEGRATION_COMMIT is the same SHA the build job resolved and verified — no
+          # split-brain between the binary's baked commit and the published manifest.
           node -e "
             const fs = require('fs');
             const baseVersion = process.env.BASE_VERSION;
             const integrationCommit = process.env.INTEGRATION_COMMIT;
             const buildSha = process.env.GITHUB_SHA || 'unknown';
-            let existing = {};
-            try { existing = JSON.parse(fs.readFileSync('packages/harness/provenance.json', 'utf8')); } catch {}
-            const manifest = { ...existing, baseVersion, integrationCommit, buildSha };
+            const config = JSON.parse(fs.readFileSync('packages/harness/harness.config.json', 'utf8'));
+            if (config.integrationRefs !== undefined && !Array.isArray(config.integrationRefs)) {
+              console.error('harness.config.json integrationRefs must be an array (got ' + typeof config.integrationRefs + ')');
+              process.exit(1);
+            }
+            const integrationRefs = (config.integrationRefs ?? []).map(ref => ({ ref, resolvedSha: integrationCommit }));
+            const manifest = { baseVersion, integrationRefs, integrationCommit, buildSha };
             fs.writeFileSync('packages/harness/provenance.json', JSON.stringify(manifest, null, 2) + '\n');
             console.log('provenance.json updated:', manifest);
           "
@@ -361,7 +547,12 @@ jobs:
           for PLATFORM in linux darwin; do
             for ARCH in x64 arm64; do
               PKG_DIR="${PUBLISH_DIR}/${PLATFORM}-${ARCH}"
-              echo "Publishing @fro.bot/harness-${PLATFORM}-${ARCH}@${BASE_VERSION}..."
+              PKG_NAME="@fro.bot/harness-${PLATFORM}-${ARCH}"
+              if npm view "${PKG_NAME}@${BASE_VERSION}" version >/dev/null 2>&1; then
+                echo "Already published: ${PKG_NAME}@${BASE_VERSION}; skipping"
+                continue
+              fi
+              echo "Publishing ${PKG_NAME}@${BASE_VERSION}..."
               # OIDC trusted publishing: no token, provenance is automatic.
               npm publish "${PKG_DIR}"
             done
@@ -391,9 +582,15 @@ jobs:
             };
             fs.writeFileSync('packages/harness/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
-          echo "Publishing @fro.bot/harness@${BASE_VERSION}..."
-          # OIDC trusted publishing: no token, provenance is automatic.
-          npm publish packages/harness
+          if npm view "@fro.bot/harness@${BASE_VERSION}" version >/dev/null 2>&1; then
+            echo "Already published: @fro.bot/harness@${BASE_VERSION}; skipping"
+          else
+            echo "Publishing @fro.bot/harness@${BASE_VERSION}..."
+            # OIDC trusted publishing: no token, provenance is automatic.
+            # Use a directory-anchored publish so npm does not parse the path as a
+            # github: package spec (npm publish <path> needs ./ or cd into the dir).
+            (cd packages/harness && npm publish .)
+          fi
 
       - name: Dry run summary
         if: steps.params.outputs.dry_run == 'true'

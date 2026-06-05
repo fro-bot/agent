@@ -38,9 +38,81 @@ Each per-platform package contains only that platform's native binary. The main 
 
 The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `pnpm-lock.yaml` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
+## Integrate→Build Bridge
+
+The release workflow connects the LLM merge to the per-platform build matrix via a **pushed git ref**. The merge runs through the Fro Bot workflow (which already installs OpenCode and provisions auth); the merged tree is pushed to a throwaway ref the build matrix fetches.
+
+### `prepare-integrate` job
+
+Resolves the base version (dispatch input or tag) and renders the merge prompt from `packages/harness/prompt.txt` using values from `harness.config.json` (base version, release repo, integration refs). Emits `base_version`, `rendered_prompt`, and `has_refs` as job outputs.
+
+`has_refs` is derived from the **parsed merge list** after the ref-parsing loop — not from the raw `integrationRefs` string. Whitespace-only or malformed-only entries that produce no real merge ref correctly yield `has_refs=false`.
+
+### `integrate` job (merge via Fro Bot)
+
+Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/fro-bot.yaml` with `secrets: inherit`, passing `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. The Fro Bot agent:
+
+1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
+2. Builds and verifies the host CLI as a correctness gate.
+3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using the workflow's inherited push credentials (`GH_TOKEN`, never echoed). It posts nothing to GitHub — the summary is plain text in the job log only.
+
+The merge runs with `output-mode: working-dir` so branch/PR delivery semantics do not apply; the prompt itself owns the push to the throwaway ref.
+
+### `build` matrix (consumer)
+
+Each platform job (`needs: [prepare-integrate, integrate]`) runs when `prepare-integrate` succeeded **and** `integrate` did not fail. This means:
+
+- **Empty carry set** (`has_refs=false`): `integrate` is skipped → `integrate.result == 'skipped'` → build runs. The fetch-integrate step clones the stock release tag directly instead of fetching `refs/harness-integrate/<version>`.
+- **Non-empty carry set** (`has_refs=true`): `integrate` runs → if it succeeds, build runs; if it fails or is cancelled, build is blocked.
+
+Each platform job:
+
+1. Fetches `refs/harness-integrate/<version>` (non-empty carry) or clones the stock tag (empty carry) and resolves the tip SHA as the integration commit.
+2. Checks out the fetched tree and runs `build-platform.ts --source-tree <tree> --integration-commit <sha>`, which builds from the supplied merged source tree. Each platform job runs its own clean install + build.
+3. Emits the resolved `integration_commit` as a job output so `publish` consumes the same commit rather than re-resolving the force-pushed ref.
+
+The `--source-tree` flag is explicit and fail-closed: if the directory is missing or empty, the build fails rather than silently falling back to a clone.
+
+### Supply-chain controls
+
+- Merged refs come **only** from the `harness.config.json` carry-policy allowlist — no arbitrary ref can be injected at dispatch time.
+- The release is maintainer-gated `workflow_dispatch`.
+- `build` and `publish` are commit-pinned to a single resolved `integration_commit` (resolved once in `build`, consumed by `publish`).
+
+### `AUTH_JSON` secret
+
+Required for any release that runs an LLM merge (i.e. any release with integration refs configured). The integrate job reuses the repository's existing `AUTH_JSON` secret (the same model credential the action uses), so no separate secret is needed:
+
+- **Name:** `AUTH_JSON`
+- **Value:** JSON mapping provider to auth config:
+  ```json
+  {"anthropic":{"type":"api","key":"sk-ant-..."}}
+  ```
+
+The integrate job maps it to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
+
+### Dispatching a release
+
+**Dry run** (validate build infrastructure, skip publish):
+```bash
+gh workflow run harness-release.yaml \
+  --repo fro-bot/agent \
+  --field base_version=1.15.13 \
+  --field dry_run=true
+```
+
+**Real patched release** (the merge runs through Fro Bot, which uses the inherited `AUTH_JSON` model credential):
+```bash
+gh workflow run harness-release.yaml \
+  --repo fro-bot/agent \
+  --field base_version=1.15.13
+```
+
+The publish job is additionally gated by the `npm-publish` GitHub environment (required reviewers).
+
 ## Publishing
 
-The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write`, upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
+The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write` scoped to the `publish` job only; the `integrate` and `build` jobs run with `contents: read` and no `id-token`. The workflow upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
 
 ### One-time npmjs.com setup (per package)
 

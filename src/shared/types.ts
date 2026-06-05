@@ -24,6 +24,7 @@ export type {
   ParseResult,
   PruningConfig,
   ResolvedOutputMode,
+  ResponseMode,
   Result,
   RunContext,
   RunSummary,

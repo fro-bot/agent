@@ -71,6 +71,8 @@ export interface IntegrationAdapters {
   buildCli: (workDir: string, version: string, channel: string) => Promise<void>
   /** Verify the built CLI --version matches the expected version. */
   verifyVersion: (workDir: string, expectedVersion: string) => Promise<void>
+  /** Commit the integrated working tree (after LLM merge) so HEAD contains the merge. */
+  commitIntegration: (workDir: string, message: string) => Promise<void>
   /** Get the current HEAD commit SHA of the work repo. */
   getCommitSha: (workDir: string) => Promise<string>
 }
@@ -233,6 +235,35 @@ export function makeRealAdapters(): IntegrationAdapters {
       }
     },
 
+    commitIntegration: async (workDir, message) => {
+      // Stage all changes (new, modified, deleted) from the LLM merge.
+      await gitExec(
+        [
+          '-c',
+          'user.name=fro-bot harness integrate',
+          '-c',
+          'user.email=github-actions[bot]@users.noreply.github.com',
+          'add',
+          '-A',
+        ],
+        workDir,
+      )
+      // Commit with --no-verify to skip any hooks in the cloned upstream repo.
+      await gitExec(
+        [
+          '-c',
+          'user.name=fro-bot harness integrate',
+          '-c',
+          'user.email=github-actions[bot]@users.noreply.github.com',
+          'commit',
+          '--no-verify',
+          '-m',
+          message,
+        ],
+        workDir,
+      )
+    },
+
     getCommitSha: async workDir => {
       return gitExec(['rev-parse', 'HEAD'], workDir)
     },
@@ -321,6 +352,15 @@ export async function runIntegration(
       await adapters.runMerge(workDir, opencodeBin, agent, model, prompt)
     } catch (error) {
       return {ok: false, error: `LLM merge failed: ${errorMessage(error)}`}
+    }
+
+    // Step 5.5: Commit the integrated working tree so HEAD contains the merge.
+    // Without this, getCommitSha (Step 8) returns the bare tag SHA and
+    // git archive would ship the pre-merge tree.
+    try {
+      await adapters.commitIntegration(workDir, `integrate: apply LLM merge onto v${baseVersion}`)
+    } catch (error) {
+      return {ok: false, error: `Commit integration failed: ${errorMessage(error)}`}
     }
 
     // Step 6: Build the native CLI.

@@ -1,9 +1,9 @@
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
-import type {ModelConfig, OmoProviders, ResolvedOutputMode, TokenUsage} from '../shared/types.js'
+import type {ModelConfig, OmoProviders, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
 
 export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
-export type {OutputMode, ResolvedOutputMode} from '../shared/types.js'
+export type {OutputMode, ResolvedOutputMode, ResponseMode} from '../shared/types.js'
 
 export const EVENT_TYPES = [
   'discussion_comment',
@@ -259,6 +259,7 @@ export interface PromptOptions {
   readonly triggerContext?: TriggerContext
   readonly resolvedOutputMode?: ResolvedOutputMode | null
   readonly fileParts?: readonly FilePartInput[]
+  readonly responseMode?: ResponseMode
 }
 
 export interface ReferenceFile {
