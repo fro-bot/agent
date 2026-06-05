@@ -109,7 +109,7 @@ jobs:
           chmod 600 "${AUTH_FILE}"
           # Sanity-check: file must be non-empty and valid JSON object.
           if [ ! -s "${AUTH_FILE}" ]; then
-            echo "ERROR: HARNESS_OPENCODE_AUTH_JSON secret is empty or missing" >&2
+            echo "ERROR: AUTH_JSON secret is empty or missing" >&2
             exit 1
           fi
           node -e "
@@ -117,11 +117,11 @@ jobs:
             const raw = fs.readFileSync('${AUTH_FILE}', 'utf8');
             let parsed;
             try { parsed = JSON.parse(raw); } catch (e) {
-              process.stderr.write('ERROR: HARNESS_OPENCODE_AUTH_JSON is not valid JSON\n');
+              process.stderr.write('ERROR: AUTH_JSON secret is not valid JSON\n');
               process.exit(1);
             }
             if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-              process.stderr.write('ERROR: HARNESS_OPENCODE_AUTH_JSON must be a JSON object\n');
+              process.stderr.write('ERROR: AUTH_JSON secret must be a JSON object\n');
               process.exit(1);
             }
             process.stdout.write('auth: provisioned\n');
