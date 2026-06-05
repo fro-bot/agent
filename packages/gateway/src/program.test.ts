@@ -43,12 +43,15 @@ vi.mock('./approvals/registry.js', () => ({
   }),
 }))
 
-// Stub userIsAuthorized from mentions
+// Stub userIsAuthorized and handleMention from mentions.
+// handleMention is stubbed so we can capture the deps it receives without
+// running the real execution path (which requires live S3/Discord/workspace).
 vi.mock('./discord/mentions.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./discord/mentions.js')>()
   return {
     ...actual,
     userIsAuthorized: vi.fn().mockResolvedValue(true),
+    handleMention: vi.fn().mockReturnValue(Effect.void),
   }
 })
 
@@ -144,6 +147,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     triggerRoleId: null,
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
+    approvalMode: 'approval-required',
     announce: {
       webhookSecret: 'test-webhook-secret',
       presenceChannelId: 'test-presence-channel-id',
@@ -168,7 +172,76 @@ function makeFakeServerHandle() {
   return {close: vi.fn()}
 }
 
+/**
+ * Build a fake Discord message that passes all messageCreate guards:
+ * - not a bot author
+ * - client.user is non-null and is mentioned
+ * - not shutting down
+ */
+function makeFakeMentionMessage(botUserId: string) {
+  return {
+    author: {id: 'user-111', bot: false},
+    content: 'do the thing',
+    channel: {id: 'ch-test', isThread: () => false},
+    guild: null,
+    mentions: {has: (id: string) => id === botUserId},
+    startThread: vi.fn().mockResolvedValue({id: 'thread-1', send: vi.fn()}),
+    reply: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
+/**
+ * Run the program, capture the messageCreate handler, fire it with a fake
+ * mention message, and return the deps passed to handleMention.
+ */
+async function runAndCaptureMentionDeps(
+  approvalMode: 'approval-required',
+): Promise<import('./discord/mentions.js').MentionDeps> {
+  const {handleMention} = await import('./discord/mentions.js')
+  const handleMentionMock = vi.mocked(handleMention)
+
+  const fakeConfig = makeFakeConfig({approvalMode, announce: undefined})
+  const botUserId = 'bot-user-id'
+
+  // Build a fake client whose .user is set so the messageCreate guard passes.
+  const fakeClient = {
+    ...makeFakeClient(),
+    user: {id: botUserId},
+  }
+
+  const deps = {
+    makeClient: () => fakeClient as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+
+  await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+  // Find and fire the messageCreate handler
+  const onCalls = (fakeClient.on as ReturnType<typeof vi.fn>).mock.calls as [string, (msg: unknown) => void][]
+  const messageCreateHandler = onCalls.find(([event]) => event === 'messageCreate')?.[1]
+  if (messageCreateHandler === undefined) throw new Error('messageCreate handler not registered')
+
+  const fakeMessage = makeFakeMentionMessage(botUserId)
+  messageCreateHandler(fakeMessage)
+
+  // handleMention is fire-and-forget (Effect.runPromise inside the handler);
+  // wait one microtask tick for the synchronous Effect.void to settle.
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  expect(handleMentionMock).toHaveBeenCalledOnce()
+  const capturedDeps = handleMentionMock.mock.calls[0]?.[2] as import('./discord/mentions.js').MentionDeps
+  if (capturedDeps === undefined) throw new Error('handleMention was not called with deps')
+  return capturedDeps
+}
+
 describe('makeGatewayProgram', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
   it('calls setupReadinessFlag before login', async () => {
     // #given
     const fakeConfig = makeFakeConfig()
@@ -437,6 +510,20 @@ describe('makeGatewayProgram', () => {
     } finally {
       consoleSpy.mockRestore()
     }
+  })
+
+  // ── Approval mode propagation (Unit 2) ──────────────────────────────────
+  //
+  // These tests fire the messageCreate handler with a fake mention message and
+  // assert that handleMention receives deps.run.approvalMode matching the config.
+  // handleMention is mocked above so we can capture its args without a live workspace.
+
+  it('approval-required: handleMention receives deps.run.approvalMode === "approval-required"', async () => {
+    // #given / #when
+    const capturedDeps = await runAndCaptureMentionDeps('approval-required')
+
+    // #then — approvalMode is threaded from GatewayConfig into the mention run deps
+    expect(capturedDeps.run.approvalMode).toBe('approval-required')
   })
 
   it('announce disabled: client events (messageCreate/interactionCreate) are still wired', async () => {

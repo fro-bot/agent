@@ -33,6 +33,18 @@ export default defineConfig(
     },
   },
   {
+    name: 'deploy/scripts plain-Node-ESM overrides',
+    files: ['deploy/scripts/**/*.mjs'],
+    rules: {
+      // deploy/scripts uses node --test runner, not vitest
+      'vitest/no-import-node-test': 'off',
+      // plain Node ESM scripts use process directly without importing it
+      'node/prefer-global/process': 'off',
+      // import ordering is not enforced in plain-Node-ESM scripts
+      'perfectionist/sort-imports': 'off',
+    },
+  },
+  {
     name: 'vitest overrides',
     files: ['**/*.test.ts', '**/*.spec.ts'],
     rules: {

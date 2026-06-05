@@ -85,6 +85,15 @@ export interface RegisterParams {
    * button's postReply subsequently fails, the reset path fail-closes immediately.
    */
   readonly deadlineMs?: number
+  /**
+   * Optional callback invoked when the deadline fires on an `open` entry (i.e.
+   * the deadline wins — no button click arrived in time). Called after the
+   * reject POST and render have been dispatched. Use this to post a visible
+   * "approval timed out" status to the run thread.
+   *
+   * NOT called when the button wins before the deadline, or on dispose.
+   */
+  readonly onDeadlineSettled?: () => void | Promise<void>
 }
 
 export type DecisionOutcome = 'ok' | 'not-found' | 'channel-mismatch' | 'already-claimed' | 'reply-failed'
@@ -163,6 +172,11 @@ interface RegistryEntry {
    * fail-closes instead of leaving the entry open with a dead timer.
    */
   deadlineExpired: boolean
+  /**
+   * Optional callback invoked when the deadline fires on an `open` entry.
+   * Stored from RegisterParams.onDeadlineSettled.
+   */
+  readonly onDeadlineSettled: (() => void | Promise<void>) | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +242,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   // -------------------------------------------------------------------------
 
   function register(params: RegisterParams): void {
-    const {requestID, sessionID, channelID, directory, request, effects, deadlineMs} = params
+    const {requestID, sessionID, channelID, directory, request, effects, deadlineMs, onDeadlineSettled} = params
     if (entries.has(requestID)) {
       // FIX 3: clear the existing entry's timer before overwriting so the old
       // setTimeout cannot fire settleByDeadline on the replacement entry.
@@ -255,6 +269,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       renderFn: null,
       timer: null,
       deadlineExpired: false,
+      onDeadlineSettled,
     }
     entries.set(requestID, entry)
 
@@ -294,6 +309,9 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     entry.state = 'claimed'
     entry.timer = null
 
+    // Capture the callback before the entry is deleted.
+    const {onDeadlineSettled} = entry
+
     // Best-effort POST reject then render.
     const doDeadline = async () => {
       try {
@@ -309,6 +327,15 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
       }
       await runRender(entry, requestID, 'reject', 'deadline')
       entries.delete(requestID)
+
+      // Notify the run thread that approval timed out (best-effort).
+      if (onDeadlineSettled !== undefined) {
+        try {
+          await onDeadlineSettled()
+        } catch (error) {
+          logger.warn({requestID, err: error}, 'ApprovalRegistry: onDeadlineSettled threw — continuing')
+        }
+      }
     }
 
     // eslint-disable-next-line no-void
