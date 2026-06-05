@@ -188,6 +188,9 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
 
+    outputs:
+      integration_commit: ${{ steps.fetch-integrate.outputs.integration_commit }}
+
     # Build job: read-only. No id-token — the untrusted LLM-merge + upstream
     # build runs here and must not be able to publish or obtain OIDC tokens.
     permissions:
@@ -349,10 +352,10 @@ jobs:
             DRY_RUN="false"
           fi
 
-          # Fetch the throwaway ref pushed by Fro Bot and resolve the integration commit.
-          INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
-          git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
-          INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
+          # Integration commit is resolved once by the build job and passed via job output.
+          # This avoids a TOCTOU race where a force-push between build and publish could
+          # cause publish to use a different commit than build verified.
+          INTEGRATION_COMMIT="${{ needs.build.outputs.integration_commit }}"
 
           # Validate base_version: must be a semver-ish string (no shell metacharacters).
           if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
