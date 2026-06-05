@@ -15,7 +15,7 @@
  */
 
 import type {IntegrationConfig} from './integrate.js'
-import {execFileSync} from 'node:child_process'
+import {execFileSync, execSync} from 'node:child_process'
 import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -41,6 +41,7 @@ function isValidHarnessConfig(value: unknown): value is HarnessConfig {
   if (typeof v.release_repo !== 'string' || v.release_repo.length === 0) return false
   if (typeof v.base_version !== 'string' || v.base_version.length === 0) return false
   if (!Array.isArray(v.integrationRefs)) return false
+  if (!v.integrationRefs.every((el: unknown) => typeof el === 'string' && el.length > 0)) return false
   if (typeof v.agent !== 'string' || v.agent.length === 0) return false
   if (typeof v.model !== 'string' || v.model.length === 0) return false
   if (v.opencode_bin !== undefined && typeof v.opencode_bin !== 'string') return false
@@ -64,21 +65,26 @@ interface ParsedFlags {
   readonly out: string | undefined
 }
 
-function parseFlags(argv: readonly string[]): ParsedFlags {
+function parseFlags(argv: readonly string[]): ParsedFlags | null {
   let workDir: string | undefined
   let promptPath: string | undefined
   let out: string | undefined
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    if (arg === '--work-dir' && i + 1 < argv.length) {
-      workDir = argv[i + 1]
-      i++
-    } else if (arg === '--prompt-path' && i + 1 < argv.length) {
-      promptPath = argv[i + 1]
-      i++
-    } else if (arg === '--out' && i + 1 < argv.length) {
-      out = argv[i + 1]
+    if (arg === '--work-dir' || arg === '--prompt-path' || arg === '--out') {
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) {
+        console.error(`[integrate] ${arg} requires a value`)
+        return null
+      }
+      if (arg === '--work-dir') {
+        workDir = next
+      } else if (arg === '--prompt-path') {
+        promptPath = next
+      } else {
+        out = next
+      }
       i++
     }
   }
@@ -110,6 +116,19 @@ function parseFlags(argv: readonly string[]): ParsedFlags {
  * @param outPath           - Destination path for the final artifact tar.
  */
 export async function packageArtifact(workDir: string, integrationCommit: string, outPath: string): Promise<void> {
+  // Belt-and-suspenders guard: fail loudly if the working tree has uncommitted tracked changes.
+  // After FIX 1 commits the merge, tracked changes should always be committed.
+  // Untracked files (e.g. provenance.json written by the harness) are intentionally excluded
+  // from this check — they are copied into the artifact separately.
+  // `git status --porcelain` lines starting with '??' are untracked; we only care about the rest.
+  const statusOutput = execSync('git status --porcelain', {cwd: workDir, encoding: 'utf8'})
+  const trackedDirtyLines = statusOutput.split('\n').filter(line => line.length > 0 && !line.startsWith('??'))
+  if (trackedDirtyLines.length > 0) {
+    throw new Error(
+      `[integrate] Working tree has uncommitted tracked changes before git archive — these would be excluded from the artifact:\n${trackedDirtyLines.join('\n')}`,
+    )
+  }
+
   const tmpStaging = mkdtempSync(path.join(os.tmpdir(), 'harness-artifact-'))
   try {
     const sourceTar = path.join(tmpStaging, 'source.tar')
@@ -168,6 +187,7 @@ export async function cmdIntegrate(
 ): Promise<number> {
   // Parse flags.
   const flags = parseFlags(argv)
+  if (flags === null) return 1
 
   // Validate required flags.
   if (flags.workDir === undefined) {

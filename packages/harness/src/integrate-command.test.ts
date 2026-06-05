@@ -399,6 +399,114 @@ describe('cmdIntegrate — config sourcing', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FIX 3: Flag parser rejects another flag token as a flag's value
+// ---------------------------------------------------------------------------
+
+describe('cmdIntegrate — FIX 3: flag value cannot be another flag', () => {
+  it('returns non-zero when --work-dir is followed by another flag', async () => {
+    // #given / #when
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const code = await cmdIntegrate(['--work-dir', '--prompt-path', promptPath, '--out', outPath], configPath)
+
+    // #then
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+    const [errorLine] = errorSpy.mock.calls[0] as [string]
+    expect(errorLine).toContain('--work-dir')
+    expect(errorLine).toContain('requires a value')
+
+    errorSpy.mockRestore()
+  })
+
+  it('returns non-zero when --prompt-path is followed by another flag', async () => {
+    // #given / #when
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const code = await cmdIntegrate(['--work-dir', workDir, '--prompt-path', '--out', outPath], configPath)
+
+    // #then
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+    const [errorLine] = errorSpy.mock.calls[0] as [string]
+    expect(errorLine).toContain('--prompt-path')
+    expect(errorLine).toContain('requires a value')
+
+    errorSpy.mockRestore()
+  })
+
+  it('returns non-zero when --out is followed by another flag', async () => {
+    // #given / #when
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const code = await cmdIntegrate(
+      ['--work-dir', workDir, '--prompt-path', promptPath, '--out', '--dry-run'],
+      configPath,
+    )
+
+    // #then
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+    const [errorLine] = errorSpy.mock.calls[0] as [string]
+    expect(errorLine).toContain('--out')
+    expect(errorLine).toContain('requires a value')
+
+    errorSpy.mockRestore()
+  })
+
+  it('returns non-zero when --work-dir has no following value at all', async () => {
+    // #given / #when
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const code = await cmdIntegrate(['--work-dir'], configPath)
+
+    // #then
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+
+    errorSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX 7: integrationRefs element-type validation
+// ---------------------------------------------------------------------------
+
+describe('cmdIntegrate — FIX 7: integrationRefs element validation', () => {
+  it('returns non-zero when integrationRefs contains a non-string element', async () => {
+    // #given — config with a non-string element in integrationRefs
+    const badConfigPath = await writeHarnessConfig(tmpDir, {integrationRefs: ['valid-ref', 42, null]})
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // #when
+    const code = await cmdIntegrate(
+      ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+      badConfigPath,
+    )
+
+    // #then — config rejected before runIntegration is called
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+
+    errorSpy.mockRestore()
+  })
+
+  it('returns non-zero when integrationRefs contains an empty string', async () => {
+    // #given — config with an empty string element
+    const badConfigPath = await writeHarnessConfig(tmpDir, {integrationRefs: ['valid-ref', '']})
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // #when
+    const code = await cmdIntegrate(
+      ['--work-dir', workDir, '--prompt-path', promptPath, '--out', outPath],
+      badConfigPath,
+    )
+
+    // #then
+    expect(code).not.toBe(0)
+    expect(runIntegration).not.toHaveBeenCalled()
+
+    errorSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // packageArtifact — unit tests (direct, no command layer)
 // ---------------------------------------------------------------------------
 
@@ -423,7 +531,10 @@ async function makeGitRepo(dir: string): Promise<{repoDir: string; commit: strin
   // Get the commit SHA.
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], {cwd: repoDir, encoding: 'utf8'}).trim()
 
-  // Write provenance.json to the repo dir (simulating what runIntegration does).
+  // Write provenance.json to the repo dir as an UNTRACKED file.
+  // This mirrors the real flow: runIntegration writes provenance.json after getCommitSha,
+  // so it is never committed to git. packageArtifact copies it into the artifact separately.
+  // The FIX 5 dirty-tree guard only checks TRACKED changes (not untracked '??' files).
   const provenanceContent = JSON.stringify(
     {baseVersion: '1.15.13', integrationRefs: [], integrationCommit: commit, buildSha: 'dev'},
     null,
@@ -451,21 +562,19 @@ describe('packageArtifact', () => {
     expect(listOutput).toContain('provenance.json')
   })
 
-  it('archives against integrationCommit (not the dirty working tree)', async () => {
-    // #given — create a repo, get the commit, then add an untracked dirty file
+  it('rejects a dirty working tree before git archive (FIX 5 guard)', async () => {
+    // #given — create a repo, then stage a tracked change without committing
+    // The guard only catches TRACKED uncommitted changes (not untracked '??' files).
     const {repoDir, commit} = await makeGitRepo(tmpDir)
-    // Add a dirty file that is NOT committed
-    await fs.writeFile(path.join(repoDir, 'dirty.txt'), 'should not appear\n', 'utf8')
+    // Modify a tracked file and stage it (tracked dirty change)
+    await fs.writeFile(path.join(repoDir, 'README.md'), '# modified\n', 'utf8')
+    execFileSync('git', ['add', 'README.md'], {cwd: repoDir, stdio: 'pipe'})
     const artifactPath = path.join(tmpDir, 'artifact.tar')
 
-    // #when
-    await packageArtifact(repoDir, commit, artifactPath)
-
-    // #then — dirty.txt must NOT be in the archive (git archive uses the commit, not the worktree)
-    const listOutput = execFileSync('tar', ['tf', artifactPath], {encoding: 'utf8'})
-    expect(listOutput).not.toContain('dirty.txt')
-    // README.md (tracked at commit) must be present
-    expect(listOutput).toContain('README.md')
+    // #when / #then — FIX 5: uncommitted tracked changes must be rejected
+    await expect(packageArtifact(repoDir, commit, artifactPath)).rejects.toThrow(/uncommitted/i)
+    // Artifact must NOT be created
+    expect(existsSync(artifactPath)).toBe(false)
   })
 
   it('does NOT leave an artifact at outPath when git archive fails (atomic staging)', async () => {
@@ -477,6 +586,20 @@ describe('packageArtifact', () => {
     // #when / #then
     await expect(packageArtifact(repoDir, badCommit, artifactPath)).rejects.toThrow()
     // Atomic: outPath must NOT exist after the failure
+    expect(existsSync(artifactPath)).toBe(false)
+  })
+
+  it('fIX 5: throws when working tree has uncommitted tracked changes before git archive', async () => {
+    // #given — create a repo with a commit, then stage a tracked change without committing
+    const {repoDir, commit} = await makeGitRepo(tmpDir)
+    // Modify a tracked file and stage it (tracked dirty change, not untracked)
+    await fs.writeFile(path.join(repoDir, 'README.md'), '# modified\n', 'utf8')
+    execFileSync('git', ['add', 'README.md'], {cwd: repoDir, stdio: 'pipe'})
+    const artifactPath = path.join(tmpDir, 'should-not-exist.tar')
+
+    // #when / #then — must throw because tracked changes are uncommitted
+    await expect(packageArtifact(repoDir, commit, artifactPath)).rejects.toThrow(/uncommitted/i)
+    // Artifact must NOT be created
     expect(existsSync(artifactPath)).toBe(false)
   })
 

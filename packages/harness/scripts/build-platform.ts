@@ -54,6 +54,19 @@ import {HARNESS_BUN_VERSION as REQUIRED_BUN_VERSION} from '../src/bun-version.js
 import {buildHarnessVersion} from '../src/version.js'
 
 // ---------------------------------------------------------------------------
+// Type guard utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Type-safe error code check — no `as` assertion.
+ * After `typeof e === 'object' && e !== null && 'code' in e`, TypeScript narrows
+ * `e` to `object & Record<'code', unknown>`, making `e.code` accessible.
+ */
+function hasErrorCode(e: unknown, code: string): boolean {
+  return typeof e === 'object' && e !== null && 'code' in e && e.code === code
+}
+
+// ---------------------------------------------------------------------------
 // Build-environment contract constants
 // ---------------------------------------------------------------------------
 
@@ -97,7 +110,17 @@ export function parseArgs(argv: string[]): BuildArgs | null {
   const repoUrl = flag('--repo-url') ?? 'https://github.com/anomalyco/opencode.git'
   const workDir = flag('--work-dir') ?? path.join(process.cwd(), '.harness-build-work')
   const outDir = flag('--out-dir') ?? path.join(process.cwd(), '.harness-build-out')
-  const sourceTree = flag('--source-tree') ?? null
+
+  // FIX 4: Track --source-tree PRESENCE separately from value.
+  // If --source-tree is present but has no value (or next token is another flag),
+  // fail-closed rather than silently falling back to clone.
+  const sourceTreePresent = args.includes('--source-tree')
+  const sourceTreeValue = flag('--source-tree')
+  if (sourceTreePresent && sourceTreeValue === null) {
+    console.error('[build-platform] --source-tree requires a value')
+    return null
+  }
+  const sourceTree = sourceTreeValue
 
   if (integrationCommit === null || baseVersion === null || platform === null || arch === null) {
     console.error('[build-platform] Missing required arguments.')
@@ -380,7 +403,7 @@ export async function main(): Promise<void> {
       }
       entries = readdirSync(sourceTree)
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (hasErrorCode(error, 'ENOENT')) {
         console.error(`[build-platform] --source-tree '${sourceTree}' does not exist. Refusing to fall back to clone.`)
       } else {
         console.error(

@@ -196,6 +196,28 @@ describe('parseArgs: --source-tree flag', () => {
     expect(result).toBeNull()
   })
 
+  it('fIX 4: returns null when --source-tree is present but has no value (last arg)', () => {
+    // #given — --source-tree is the last arg with no following value
+    const argv = [...BASE_ARGV, '--source-tree']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail-closed, not fall back to clone
+    expect(result).toBeNull()
+  })
+
+  it('fIX 4: returns null when --source-tree is followed by another flag token', () => {
+    // #given — --source-tree is followed by another flag (no value)
+    const argv = [...BASE_ARGV, '--source-tree', '--out-dir', '/some/out']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail-closed
+    expect(result).toBeNull()
+  })
+
   it('includes all other fields correctly when --source-tree is present', () => {
     // #given
     const argv = [...BASE_ARGV, '--source-tree', '/some/tree', '--out-dir', '/some/out']

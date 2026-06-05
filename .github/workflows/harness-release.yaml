@@ -47,10 +47,34 @@ jobs:
     outputs:
       integration_commit: ${{ steps.emit.outputs.integration_commit }}
       artifact_digest: ${{ steps.emit.outputs.artifact_digest }}
+      base_version: ${{ steps.resolve-base-version.outputs.base_version }}
 
     steps:
       - name: Checkout harness repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve base_version (dispatch input or tag)
+        id: resolve-base-version
+        env:
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_BASE_VERSION:-}" ]; then
+            BASE_VERSION="${INPUT_BASE_VERSION}"
+          else
+            # Tag-triggered path: parse harness-v<version> from the tag name.
+            TAG="${GITHUB_REF_NAME}"
+            BASE_VERSION="${TAG#harness-v}"
+          fi
+          # Validate: must be semver-ish (no shell metacharacters).
+          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
+            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
+            exit 1
+          fi
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved base_version: ${BASE_VERSION}"
 
       - name: Install Bun (pinned to upstream packageManager version)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -144,8 +168,8 @@ jobs:
             exit 1
           fi
 
-          # Compute the artifact digest (sha256).
-          ARTIFACT_DIGEST=$(sha256sum "${ARTIFACT_PATH}" | awk '{print $1}')
+          # Compute the artifact digest (sha256) — portable across Linux and macOS.
+          ARTIFACT_DIGEST=$(shasum -a 256 "${ARTIFACT_PATH}" | awk '{print $1}')
 
           echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "artifact_digest=${ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
@@ -196,6 +220,8 @@ jobs:
     steps:
       - name: Checkout harness repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun (pinned to upstream packageManager version)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -232,7 +258,7 @@ jobs:
 
           # Verify the downloaded artifact matches the declared digest before
           # extracting. Fail-closed: any mismatch aborts the build (R8).
-          ACTUAL_DIGEST=$(sha256sum "${ARTIFACT_PATH}" | awk '{print $1}')
+          ACTUAL_DIGEST=$(shasum -a 256 "${ARTIFACT_PATH}" | awk '{print $1}')
           if [ "${ACTUAL_DIGEST}" != "${EXPECTED_DIGEST}" ]; then
             echo "ERROR: artifact digest mismatch" >&2
             echo "  expected: ${EXPECTED_DIGEST}" >&2
@@ -249,7 +275,7 @@ jobs:
       - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
         env:
           INTEGRATION_COMMIT: ${{ needs.integrate.outputs.integration_commit }}
-          BASE_VERSION: ${{ inputs.base_version }}
+          BASE_VERSION: ${{ needs.integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -266,7 +292,7 @@ jobs:
       - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
         env:
           INTEGRATION_COMMIT: ${{ needs.integrate.outputs.integration_commit }}
-          BASE_VERSION: ${{ inputs.base_version }}
+          BASE_VERSION: ${{ needs.integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
@@ -305,6 +331,8 @@ jobs:
     steps:
       - name: Checkout harness repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun (pinned)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
