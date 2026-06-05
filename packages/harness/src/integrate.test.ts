@@ -20,6 +20,7 @@ function makeAdapters(overrides: Partial<IntegrationAdapters> = {}): Integration
     fetchRef: async () => {},
     createBranch: async () => {},
     runMerge: async () => {},
+    commitIntegration: async () => {},
     buildCli: async () => {},
     verifyVersion: async () => {},
     getCommitSha: async () => 'abc1234deadbeef',
@@ -341,6 +342,135 @@ describe('runIntegration', () => {
       // Manifest is persisted
       const persisted = await readProvenanceManifest(dir)
       expect(persisted).toEqual(result.manifest)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // FIX 1: commitIntegration called after runMerge and before getCommitSha
+  // ---------------------------------------------------------------------------
+
+  it('fIX 1: commitIntegration is called after runMerge and before getCommitSha when sources exist', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    try {
+      await fs.writeFile(
+        path.join(dir, 'prompt.txt'),
+        'dummy {{tag}} {{branch}} {{merges}} {{sources}} {{repo}} {{version}} {{channel}} {{base}} {{release_repo}} {{release_url}} {{branches}}',
+      )
+      const callOrder: string[] = []
+      const adapters = makeAdapters({
+        runMerge: async () => {
+          callOrder.push('runMerge')
+        },
+        commitIntegration: async () => {
+          callOrder.push('commitIntegration')
+        },
+        getCommitSha: async () => {
+          callOrder.push('getCommitSha')
+          return 'cafebabe5678'
+        },
+      })
+
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          agent: 'build',
+          model: 'anthropic/claude-sonnet-4-6',
+          opencodeBin: 'opencode',
+          workDir: dir,
+          promptPath: path.join(dir, 'prompt.txt'),
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(true)
+      // commitIntegration must come after runMerge and before getCommitSha
+      const mergeIdx = callOrder.indexOf('runMerge')
+      const commitIdx = callOrder.indexOf('commitIntegration')
+      const shaIdx = callOrder.indexOf('getCommitSha')
+      expect(mergeIdx).toBeGreaterThanOrEqual(0)
+      expect(commitIdx).toBeGreaterThan(mergeIdx)
+      expect(shaIdx).toBeGreaterThan(commitIdx)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('fIX 1: commitIntegration is NOT called when sources is empty', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    let commitCalled = false
+    try {
+      const adapters = makeAdapters({
+        commitIntegration: async () => {
+          commitCalled = true
+        },
+      })
+
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: [],
+          agent: 'build',
+          model: 'anthropic/claude-sonnet-4-6',
+          opencodeBin: 'opencode',
+          workDir: dir,
+          promptPath: path.join(dir, 'prompt.txt'),
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(true)
+      expect(commitCalled).toBe(false)
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('fIX 1: fail-hard when commitIntegration fails', async () => {
+    // #given
+    const dir = await makeTmpDir()
+    try {
+      await fs.writeFile(
+        path.join(dir, 'prompt.txt'),
+        'dummy {{tag}} {{branch}} {{merges}} {{sources}} {{repo}} {{version}} {{channel}} {{base}} {{release_repo}} {{release_url}} {{branches}}',
+      )
+      const adapters = makeAdapters({
+        commitIntegration: async () => {
+          throw new Error('git commit failed: nothing to commit')
+        },
+      })
+
+      // #when
+      const result = await runIntegration(
+        {
+          baseVersion: '1.15.13',
+          releaseRepo: 'anomalyco/opencode',
+          integrationRefs: ['https://github.com/anomalyco/opencode/pull/30182'],
+          agent: 'build',
+          model: 'anthropic/claude-sonnet-4-6',
+          opencodeBin: 'opencode',
+          workDir: dir,
+          promptPath: path.join(dir, 'prompt.txt'),
+        },
+        adapters,
+      )
+
+      // #then
+      expect(result.ok).toBe(false)
+      const manifest = await readProvenanceManifest(dir)
+      expect(manifest).toBeNull()
+      if (result.ok) throw new Error('expected failure result')
+      expect(result.error).toMatch(/commit/i)
     } finally {
       await fs.rm(dir, {recursive: true, force: true})
     }

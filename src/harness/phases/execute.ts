@@ -56,6 +56,7 @@ export async function runExecute(
     triggerContext: routing.triggerResult.context,
     resolvedOutputMode,
     fileParts: sessionPrep.attachmentResult?.fileParts,
+    responseMode: bootstrap.inputs.responseMode,
   }
 
   const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'

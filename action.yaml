@@ -113,6 +113,15 @@ inputs:
       concurrency groups to prevent overlapping same-entity runs.
     required: false
     default: '600000'
+  response-mode:
+    description: >-
+      Controls whether the agent posts GitHub comments/reviews. Values: github, none.
+      'github' (default): agent posts exactly one comment or review per run via the gh CLI.
+      'none': agent does not post any GitHub comments, reviews, issues, discussions,
+      reactions, or labels; the final assistant message and job log are the response surface.
+      Use 'none' for non-posting automation runs (e.g., LLM merge, code generation).
+    required: false
+    default: github
 
 outputs:
   session-id:

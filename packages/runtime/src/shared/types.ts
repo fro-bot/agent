@@ -66,6 +66,7 @@ export interface ModelConfig {
 
 export type OutputMode = 'auto' | 'working-dir' | 'branch-pr'
 export type ResolvedOutputMode = 'working-dir' | 'branch-pr'
+export type ResponseMode = 'github' | 'none'
 
 // Action inputs (parsed and validated) - per RFC-001, RFC-013
 export interface ActionInputs {
@@ -97,6 +98,8 @@ export interface ActionInputs {
   readonly systematicConfig: string | null
   // Dedup execution: skip if agent already ran for this entity recently (0 = disabled)
   readonly dedupWindow: number
+  // Response mode: controls whether the agent posts GitHub comments/reviews (default: 'github')
+  readonly responseMode: ResponseMode
 }
 
 // OMO Slim presets (single-name selection, unlike oMo's provider list).

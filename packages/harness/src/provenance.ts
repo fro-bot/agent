@@ -90,7 +90,7 @@ export function getProvenance(): Provenance {
       // Malformed config — fall through to hardcoded placeholder.
       throw new Error('Invalid harness.config.json shape')
     }
-    const baseVersion = parsed.base_version ?? '1.15.13'
+    const baseVersion = parsed.base_version ?? '1.16.0'
     const integrationRefs: IntegrationRefRecord[] = (parsed.integrationRefs ?? []).map(ref => ({
       ref,
       resolvedSha: 'dev',
@@ -106,7 +106,7 @@ export function getProvenance(): Provenance {
   }
 
   return {
-    baseVersion: '1.15.13',
+    baseVersion: '1.16.0',
     integrationRefs: [],
     integrationCommit: null,
     buildSha: 'dev',

@@ -13,6 +13,7 @@
 
 import {spawnSync} from 'node:child_process'
 import process from 'node:process'
+import {cmdIntegrate} from './integrate-command.js'
 import {formatProvenance, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary} from './resolve-binary.js'
 
@@ -24,10 +25,14 @@ Usage:
   harness info                 Print provenance (base version, integration refs, build sha)
   harness patches              List configured integration refs
   harness doctor               Check the resolved binary is present and runnable
+  harness integrate            Run the LLM merge integration pipeline
+                                 --work-dir <dir>     (required) Working directory for the clone
+                                 --prompt-path <path> (required) Path to the merge prompt template
+                                 --out <path>         (required) Artifact output path
   harness --version            Print harness provenance version
   harness --help               Print this help
 
-Reserved subcommands (info, patches, doctor) are handled by harness itself.
+Reserved subcommands (info, patches, doctor, integrate) are handled by harness itself.
 All other arguments are forwarded to the patched OpenCode binary.`)
 }
 
@@ -128,7 +133,7 @@ function cmdPassthrough(args: readonly string[]): number {
   return result.status ?? 1
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2)
 
   // --help: harness-own
@@ -161,10 +166,19 @@ function main(): void {
     process.exit(code)
   }
 
+  if (subcommand === 'integrate') {
+    const code = await cmdIntegrate(args.slice(1))
+    process.exit(code)
+  }
+
   // Anything not in the reserved set passes through.
   // This includes no-args (which opencode handles as its own help/default).
   const code = cmdPassthrough(args)
   process.exit(code)
 }
 
-main()
+main().catch(error => {
+  const msg = error instanceof Error ? error.message : String(error)
+  console.error(`[harness] Unexpected error: ${msg}`)
+  process.exit(1)
+})
