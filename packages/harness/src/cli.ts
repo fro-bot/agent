@@ -28,7 +28,7 @@ Usage:
   harness integrate            Run the LLM merge integration pipeline
                                  --work-dir <dir>     (required) Working directory for the clone
                                  --prompt-path <path> (required) Path to the merge prompt template
-                                 --out <path>         (optional) Artifact output path (Unit 2)
+                                 --out <path>         (required) Artifact output path
   harness --version            Print harness provenance version
   harness --help               Print this help
 
