@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: Checkout harness repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
@@ -237,7 +237,7 @@ jobs:
 
     steps:
       - name: Checkout harness repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
@@ -332,7 +332,7 @@ jobs:
             --integration-commit "$INTEGRATION_COMMIT"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}/bin/opencode
@@ -364,7 +364,7 @@ jobs:
 
     steps:
       - name: Checkout harness repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
@@ -379,7 +379,7 @@ jobs:
           install-dependencies: 'false'
 
       - name: Setup Node.js (for npm trusted publishing via OIDC)
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -440,25 +440,25 @@ jobs:
 
       # Download all four platform binaries.
       - name: Download linux/x64 binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: harness-binary-linux-x64
           path: /tmp/harness-binaries/linux-x64
 
       - name: Download linux/arm64 binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: harness-binary-linux-arm64
           path: /tmp/harness-binaries/linux-arm64
 
       - name: Download darwin/x64 binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: harness-binary-darwin-x64
           path: /tmp/harness-binaries/darwin-x64
 
       - name: Download darwin/arm64 binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: harness-binary-darwin-arm64
           path: /tmp/harness-binaries/darwin-arm64
