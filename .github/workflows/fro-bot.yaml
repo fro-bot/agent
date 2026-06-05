@@ -26,6 +26,21 @@ on:
         description: Run with the built-in Wiki update prompt
         type: boolean
         default: false
+  # Called by other workflows (e.g. harness-release) to run Fro Bot with a
+  # specific model and/or prompt. Secrets are inherited from the caller via
+  # `secrets: inherit` — no secret passthrough inputs needed.
+  # NOTE: when called, github.event_name reflects the CALLER's triggering event
+  # (e.g. 'workflow_dispatch' or 'push'), not 'workflow_call'.
+  workflow_call:
+    inputs:
+      model:
+        description: Override the model (e.g. anthropic/claude-sonnet-4-6). Falls back to vars.FRO_BOT_MODEL when omitted.
+        type: string
+        required: false
+      prompt:
+        description: The prompt text to run. When set, takes highest priority over all other prompt sources.
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -148,6 +163,7 @@ jobs:
         )
       ) &&
       (
+        inputs.prompt != '' ||
         (
           github.event_name == 'issues' &&
           !endsWith(github.event.issue.user.login || '', '[bot]') &&
@@ -188,7 +204,8 @@ jobs:
           OPENCODE_PROMPT_ARTIFACT: 'true'
           PROMPT: >-
             ${{
-              (github.event_name == 'workflow_dispatch' && github.event.inputs.prompt != '' && github.event.inputs.prompt)
+              (inputs.prompt != '' && inputs.prompt)
+              || (github.event_name == 'workflow_dispatch' && github.event.inputs.prompt != '' && github.event.inputs.prompt)
               || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && env.WIKI_PROMPT)
               || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-schedule-prompt == 'true' && env.SCHEDULE_PROMPT)
               || (github.event_name == 'schedule' && github.event.schedule == '0 20 * * 0' && env.WIKI_PROMPT)
@@ -198,7 +215,7 @@ jobs:
         with:
           auth-json: ${{ secrets.AUTH_JSON }}
           github-token: ${{ secrets.FRO_BOT_PAT }}
-          model: ${{ vars.FRO_BOT_MODEL }}
+          model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
           enable-omo: true
           omo-providers: ${{ secrets.OMO_PROVIDERS }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
@@ -209,7 +226,8 @@ jobs:
           # See docs/plans/2026-04-17-001-fix-manual-delivery-mode-plan.md.
           output-mode: >-
             ${{
-              (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && 'branch-pr')
+              (inputs.prompt != '' && 'working-dir')
+              || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && 'branch-pr')
               || (github.event_name == 'schedule' && github.event.schedule == '0 20 * * 0' && 'branch-pr')
               || 'auto'
             }}
