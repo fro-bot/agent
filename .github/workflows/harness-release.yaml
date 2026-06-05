@@ -160,6 +160,7 @@ jobs:
     with:
       model: ${{ vars.HARNESS_MODEL }}
       prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
+      response-mode: none
 
   # ---------------------------------------------------------------------------
   # Per-platform build matrix

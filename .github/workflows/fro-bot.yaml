@@ -41,6 +41,13 @@ on:
         description: The prompt text to run. When set, takes highest priority over all other prompt sources.
         type: string
         required: false
+      response-mode:
+        description: >-
+          Controls whether the agent posts GitHub comments/reviews. Values: github, none.
+          'github' (default): agent posts exactly one comment or review per run.
+          'none': non-posting automation; final assistant message and job log are the response surface.
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -232,4 +239,5 @@ jobs:
               || 'auto'
             }}
           prompt: ${{ env.PROMPT }}
+          response-mode: ${{ inputs.response-mode || 'github' }}
           timeout: 0
