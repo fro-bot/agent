@@ -428,6 +428,10 @@ jobs:
             "version": "${BASE_VERSION}",
             "description": "Native binary for @fro.bot/harness on ${PLATFORM}/${ARCH}",
             "license": "MIT",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/fro-bot/agent.git"
+            },
             "os": ["${PLATFORM}"],
             "cpu": ["${ARCH}"],
             "files": ["bin"],
