@@ -1,7 +1,7 @@
 ---
 title: "feat: Harness integrate→build bridge via CI artifact handoff"
 type: feat
-status: active
+status: completed
 date: 2026-06-05
 ---
 
@@ -117,7 +117,7 @@ Fail-hard: integrate `{ok:false}` → no artifact + job fails → `build` never 
 
 ## Implementation Units
 
-- [ ] **Unit 1: `harness integrate` CLI subcommand (runnable entry point)**
+- [x] **Unit 1: `harness integrate` CLI subcommand (runnable entry point)**
 
 **Goal:** Give `runIntegration` a runnable entry point so CI (and a maintainer locally) can drive the merge.
 
@@ -148,7 +148,7 @@ Fail-hard: integrate `{ok:false}` → no artifact + job fails → `build` never 
 
 **Verification:** `harness integrate --help` documents the command; unit tests prove config assembly + exit-code mapping with stubbed adapters; no real merge runs in tests.
 
-- [ ] **Unit 2: Artifact packaging (clean merged source snapshot + provenance)**
+- [x] **Unit 2: Artifact packaging (clean merged source snapshot + provenance)**
 
 **Goal:** After a successful integrate, extract a clean merged source snapshot from the integration commit and package it with `provenance.json` into a single artifact-ready output. The artifact must not contain build products or `.git`.
 
@@ -176,7 +176,7 @@ Fail-hard: integrate `{ok:false}` → no artifact + job fails → `build` never 
 
 **Verification:** packaging only fires on success; artifact contents verified in tests; `.git` and build products excluded; partial/failed packaging leaves no usable artifact.
 
-- [ ] **Unit 3: `build-platform.ts` artifact-extract source path**
+- [x] **Unit 3: `build-platform.ts` artifact-extract source path**
 
 **Goal:** Let the build matrix build from an extracted merged source tree instead of cloning upstream.
 
@@ -204,7 +204,7 @@ Fail-hard: integrate `{ok:false}` → no artifact + job fails → `build` never 
 
 **Verification:** both source modes covered by tests; absent `--source-tree` is byte-identical to current behavior; version correctness without `.git` verified.
 
-- [ ] **Unit 4: `harness-release.yaml` integrate producer job + matrix consumption**
+- [x] **Unit 4: `harness-release.yaml` integrate producer job + matrix consumption**
 
 **Goal:** Add the producer `integrate` job and rewire the matrix to consume its artifact + SHA.
 
@@ -230,7 +230,7 @@ Fail-hard: integrate `{ok:false}` → no artifact + job fails → `build` never 
 
 **Verification:** `actionlint` clean; a `dry_run` dispatch carrying a real integration ref completes integrate→build→assemble green across all four platforms with the artifact handoff; digest check fires before any build.
 
-- [ ] **Unit 5: Docs + runbook update**
+- [x] **Unit 5: Docs + runbook update**
 
 **Goal:** Document the bridge and the new OpenCode-auth secret for operators.
 
