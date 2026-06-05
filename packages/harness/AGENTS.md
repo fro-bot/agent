@@ -38,9 +38,75 @@ Each per-platform package contains only that platform's native binary. The main 
 
 The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `pnpm-lock.yaml` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
+## Integrate→Build Bridge
+
+The release workflow connects the LLM merge engine to the per-platform build matrix via a **CI artifact handoff**:
+
+### `integrate` job (producer)
+
+Runs first. Permissions: `contents: read`, no `id-token`. Steps:
+
+1. Runs `harness integrate --work-dir W --prompt-path P --out integration-tree.tar`, which calls `runIntegration()`: clones `anomalyco/opencode` at the configured base version tag, fetches the integration refs from `harness.config.json`, runs an LLM merge via `opencode run`, builds and verifies the result as a pre-flight correctness gate, then captures the frozen integration commit SHA.
+2. Extracts a **clean merged source snapshot** from the integration commit via `git archive` — no `.git`, no build products from the pre-flight build.
+3. Packages the clean source tree + `provenance.json` into the artifact and uploads it as `integration-tree`.
+4. Emits `integration_commit` (the frozen SHA) and `artifact_digest` as job outputs.
+
+The integrate job is read-only against upstream. OpenCode model credentials come from the `HARNESS_OPENCODE_AUTH_JSON` secret (see below) — written to a 0600 temp file, never logged.
+
+Fail-hard: if `runIntegration()` returns `{ok: false}`, no artifact is written and the job fails. The build matrix never starts against a missing or partial artifact.
+
+### `build` matrix (consumer)
+
+Each platform job (`needs: integrate`):
+
+1. Downloads the `integration-tree` artifact.
+2. Verifies the artifact digest against `needs.integrate.outputs.artifact_digest` before extracting — fail-closed on mismatch.
+3. Extracts the merged source tree.
+4. Runs `build-platform.ts --source-tree <extracted> --integration-commit <sha>`, which bypasses `cloneAndCheckout` and builds from the supplied merged source tree. Each platform job runs its own clean install + build from that tree.
+
+The `--source-tree` flag is explicit and fail-closed: if the directory is missing or empty, the build fails rather than silently falling back to a clone.
+
+### Supply-chain controls
+
+- Merged refs come **only** from the `harness.config.json` carry-policy allowlist — no arbitrary ref can be injected at dispatch time.
+- The release is maintainer-gated `workflow_dispatch`.
+- `provenance.json` in the artifact records the exact upstream inputs (base tag + each ref + resolved SHA) for audit before publish.
+- The artifact is SHA-bound by construction (`git archive <integration_commit>`); the explicit digest check in the build matrix makes this fail-closed.
+
+### `HARNESS_OPENCODE_AUTH_JSON` secret
+
+Required for any release that runs an LLM merge (i.e. any release with integration refs configured). Configure in repository Settings → Secrets and variables → Actions:
+
+- **Name:** `HARNESS_OPENCODE_AUTH_JSON`
+- **Value:** JSON mapping provider to auth config:
+  ```json
+  {"anthropic":{"type":"api","key":"sk-ant-..."}}
+  ```
+
+The integrate job writes this to a 0600 temp file and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
+
+### Dispatching a release
+
+**Dry run** (validate build infrastructure, skip publish):
+```bash
+gh workflow run harness-release.yaml \
+  --repo fro-bot/agent \
+  --field base_version=1.15.13 \
+  --field dry_run=true
+```
+
+**Real patched release** (requires `HARNESS_OPENCODE_AUTH_JSON` configured):
+```bash
+gh workflow run harness-release.yaml \
+  --repo fro-bot/agent \
+  --field base_version=1.15.13
+```
+
+The publish job is additionally gated by the `npm-publish` GitHub environment (required reviewers). Review `provenance.json` from the artifact before approving.
+
 ## Publishing
 
-The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write`, upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
+The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write` scoped to the `publish` job only; the `integrate` and `build` jobs run with `contents: read` and no `id-token`. The workflow upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
 
 ### One-time npmjs.com setup (per package)
 

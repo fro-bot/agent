@@ -78,19 +78,18 @@ Repeat for each package:
 
 ---
 
-## Step 3 — Validate the pipeline with a dry run (no LLM merge, no token)
+## Step 3 — Validate the pipeline with a dry run (no publish credentials needed)
 
-Before doing any real release, validate that the native-build matrix, binary verification, and package assembly all work end-to-end. This dry run uses a real upstream OpenCode commit (no LLM-merge patch applied) so `build-platform.ts` can clone it directly from `anomalyco/opencode`.
+Before doing any real release, validate that the integrate job, native-build matrix, binary verification, and package assembly all work end-to-end. A dry run with no integration refs configured (stock OpenCode, no LLM-merge patch) does not require `HARNESS_OPENCODE_AUTH_JSON`.
 
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
-  --field integration_commit=385cb694419f98103af0e8fc6187ddcbcbb6eecb \
   --field base_version=1.15.13 \
   --field dry_run=true
 ```
 
-This triggers the full build matrix across all four platforms (linux/x64, linux/arm64, darwin/x64, darwin/arm64), runs `verify-binary.ts` on each output, assembles the per-platform packages, and then **skips the npm publish step** (`dry_run=true`). The publish job is also gated by the `npm-publish` GitHub environment (required reviewers), so even without `dry_run=true`, a human must approve before anything reaches npm.
+This triggers the `integrate` job (which produces the merged source artifact), then the full build matrix across all four platforms (linux/x64, linux/arm64, darwin/x64, darwin/arm64), runs `verify-binary.ts` on each output, assembles the per-platform packages, and then **skips the npm publish step** (`dry_run=true`). The publish job is also gated by the `npm-publish` GitHub environment (required reviewers), so even without `dry_run=true`, a human must approve before anything reaches npm.
 
 Watch the run:
 
@@ -102,18 +101,53 @@ A green dry run means the build infrastructure is solid and the real `1.15.13` p
 
 ---
 
-## What's still blocked — a real patched release
+## Dispatching a real patched release
 
-The dry run above uses a stock OpenCode commit with no LLM-merge patch. A real patched release (the actual point of this package) needs an **integrate→build bridge** that doesn't exist yet:
+The dry run above uses a stock OpenCode commit with no LLM-merge patch. A real patched release (the actual point of this package) requires the `HARNESS_OPENCODE_AUTH_JSON` secret to be configured in the repository, because the `integrate` job runs an LLM merge via `opencode run` and needs model credentials.
 
-- `packages/harness/scripts/build-platform.ts` clones `anomalyco/opencode` and checks out the integration commit.
-- The LLM-merge integration commit only exists locally after `harness integrate` runs — it is never pushed anywhere `build-platform.ts` can reach.
-- The fix is a `fro-bot/opencode` mirror repo wired into the workflow: the integrate runner pushes the frozen integration commit there, and `build-platform.ts` clones from `fro-bot/opencode` instead of `anomalyco/opencode`.
+### Required secret: `HARNESS_OPENCODE_AUTH_JSON`
 
-This is separate, larger work. Until that bridge exists, the workflow can build and publish stock OpenCode at any upstream tag, but cannot publish a patched build.
+Add this secret to the `fro-bot/agent` repository (Settings → Secrets and variables → Actions → New repository secret):
+
+- **Name:** `HARNESS_OPENCODE_AUTH_JSON`
+- **Value:** A JSON object mapping provider name to auth config, e.g.:
+  ```json
+  {"anthropic":{"type":"api","key":"sk-ant-..."}}
+  ```
+
+The integrate job writes this to a 0600 temp file and passes it to OpenCode as a file-based credential. The secret value is never echoed to logs.
+
+### How a patched release works
+
+When `harness-release.yaml` is dispatched, the workflow runs in two stages:
+
+1. **`integrate` job** — runs `harness integrate`, which clones `anomalyco/opencode` at the configured base version tag, fetches the integration refs listed in `harness.config.json`, and runs an LLM merge to carry those refs onto the tag. On success it extracts a clean merged source snapshot (via `git archive`) — no `.git`, no build products — packages it with `provenance.json`, and uploads the result as the `integration-tree` workflow artifact. The integration commit SHA and artifact digest are emitted as job outputs.
+
+2. **`build` matrix** — each platform job downloads the `integration-tree` artifact, verifies its digest against the declared value, extracts the merged source tree, and builds the native binary from that tree using `build-platform.ts --source-tree <extracted>`. No upstream clone happens in the build matrix; all four platforms build from the same frozen merged source snapshot.
+
+The `publish` job runs after the matrix and is gated by the `npm-publish` GitHub environment (required reviewers). It obtains an OIDC token and publishes to npm with automatic provenance — no npm token.
+
+Merged refs come exclusively from the `harness.config.json` carry-policy allowlist. No arbitrary ref can be injected at dispatch time. The `provenance.json` included in the artifact records the exact upstream inputs (base tag + each ref + resolved SHA) and should be reviewed before approving the publish gate.
+
+### Dry run (no publish credentials needed)
+
+A dry run still works without `HARNESS_OPENCODE_AUTH_JSON` **only if no integration refs are configured** (i.e. a stock OpenCode build). For a patched dry run the secret is still required — the integrate job runs the LLM merge regardless of `dry_run`. The `dry_run=true` flag skips the publish step only; integrate and build always run.
+
+```bash
+gh workflow run harness-release.yaml \
+  --repo fro-bot/agent \
+  --field base_version=1.15.13 \
+  --field dry_run=true
+```
+
+Watch the run:
+
+```bash
+gh run watch --repo fro-bot/agent
+```
 
 ---
 
 ## After bootstrap
 
-Every subsequent release is triggered by dispatching `harness-release.yaml` (or pushing a `harness-v*` tag) with the appropriate `integration_commit` and `base_version`. The publish job obtains an OIDC token from GitHub and publishes to npm with automatic provenance — no npm token, no secrets to rotate.
+Every subsequent release is triggered by dispatching `harness-release.yaml` with the appropriate `base_version` (and `dry_run=true` to skip publish). The `integrate` job derives the integration commit from the LLM merge; the `build` matrix consumes the resulting artifact. The `publish` job obtains an OIDC token from GitHub and publishes to npm with automatic provenance — no npm token, no secrets to rotate beyond `HARNESS_OPENCODE_AUTH_JSON`.

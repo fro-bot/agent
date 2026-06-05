@@ -180,10 +180,10 @@ describe('probeBinary', () => {
 // #region CLI subcommand disambiguation
 
 describe('subcommand disambiguation', () => {
-  it('reserved subcommands set contains exactly info, patches, doctor', () => {
-    // This test documents the contract: only these three are harness-own.
+  it('reserved subcommands set contains exactly info, patches, doctor, integrate', () => {
+    // This test documents the contract: only these four are harness-own.
     // Anything else passes through to the patched binary.
-    const reserved = ['info', 'patches', 'doctor']
+    const reserved = ['info', 'patches', 'doctor', 'integrate']
     for (const cmd of reserved) {
       // Verify they are in the set by checking the module exports don't
       // accidentally expose them as passthrough — we test the logic indirectly
