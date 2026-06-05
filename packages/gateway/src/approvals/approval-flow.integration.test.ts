@@ -608,6 +608,77 @@ describe('approval flow — cross-seam integration', () => {
     expect(registry.has(req.requestID)).toBe(false)
   })
 
+  // ── Unit 4: onDeadlineSettled callback ──────────────────────────────────
+
+  it('unit 4: onDeadlineSettled callback is invoked when deadline fires on open entry', async () => {
+    // #given — registry with a short deadline and an onDeadlineSettled callback
+    const logger = makeLogger()
+    const registry = createApprovalRegistry({logger})
+    const {effects, renderFn} = makeFakeEffects().makeEffectsFor('req-ds-1')
+
+    const deadlineSettledCalls: string[] = []
+    const onDeadlineSettled = vi.fn(async () => {
+      deadlineSettledCalls.push('req-ds-1')
+    })
+
+    registry.register({
+      requestID: 'req-ds-1',
+      sessionID: SESSION_A,
+      channelID: 'ch-test',
+      directory: DIRECTORY,
+      request: makeRequest('req-ds-1'),
+      effects,
+      deadlineMs: 100,
+      onDeadlineSettled,
+    })
+    registry.attachMessage('req-ds-1', renderFn)
+
+    // #when — advance past deadline
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.runAllTimersAsync()
+
+    // #then — onDeadlineSettled was called
+    expect(onDeadlineSettled).toHaveBeenCalledOnce()
+    expect(deadlineSettledCalls).toContain('req-ds-1')
+    // Entry is gone
+    expect(registry.has('req-ds-1')).toBe(false)
+  })
+
+  it('unit 4: onDeadlineSettled is NOT called when button wins before deadline', async () => {
+    // #given — deadline wired but button wins first
+    const logger = makeLogger()
+    const registry = createApprovalRegistry({logger})
+    const {effects, renderFn} = makeFakeEffects().makeEffectsFor('req-ds-2')
+
+    const onDeadlineSettled = vi.fn()
+
+    registry.register({
+      requestID: 'req-ds-2',
+      sessionID: SESSION_A,
+      channelID: 'ch-test',
+      directory: DIRECTORY,
+      request: makeRequest('req-ds-2'),
+      effects,
+      deadlineMs: 500,
+      onDeadlineSettled,
+    })
+    registry.attachMessage('req-ds-2', renderFn)
+
+    // #when — button wins before deadline
+    await registry.handleButtonDecision({
+      requestID: 'req-ds-2',
+      channelID: 'ch-test',
+      decision: 'once',
+      decidedBy: 'user-approved',
+    })
+    registry.confirmReply({requestID: 'req-ds-2', sessionID: SESSION_A, reply: 'once'})
+    await vi.runAllTimersAsync()
+
+    // #then — onDeadlineSettled NOT called (button won)
+    expect(onDeadlineSettled).not.toHaveBeenCalled()
+    expect(registry.has('req-ds-2')).toBe(false)
+  })
+
   // 9. register-before-send: entry is immediately available in registry
   //    even before the embed "send" completes (async attach)
   // ─────────────────────────────────────────────────────────────────────────

@@ -278,4 +278,67 @@ describe('createDiscordStreamSink', () => {
       expect(thread._send).not.toHaveBeenCalled()
     })
   })
+
+  // ── Unit 4: markVisibleOutputSent — approval status prevents _(no output)_ ──
+
+  describe('markVisibleOutputSent()', () => {
+    it('flush returns {kind:"skipped-visible"} instead of posting _(no output)_ when visible output was already sent', async () => {
+      // #given — nothing appended to buffer, but visible output was already posted (e.g. approval status)
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — no send, kind is skipped-visible (not empty)
+      expect(result.kind).toBe('skipped-visible')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+
+    it('flush sends buffered text normally even after markVisibleOutputSent (text takes precedence)', async () => {
+      // #given — text was appended AND visible output was marked
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('agent output here')
+      sink.markVisibleOutputSent()
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — text is sent normally (not suppressed)
+      expect(result.kind).toBe('sent')
+      expect(thread._send).toHaveBeenCalledOnce()
+      const call = firstCallArg<{content: string}>(thread._send)
+      expect(call.content).toBe('agent output here')
+    })
+
+    it('flush sends _(no output)_ when buffer is empty and markVisibleOutputSent was NOT called', async () => {
+      // #given — nothing appended, no visible output marked
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — existing _(no output)_ behavior preserved
+      expect(result.kind).toBe('empty')
+      expect(thread._send).toHaveBeenCalledOnce()
+    })
+
+    it('markVisibleOutputSent is idempotent — calling twice still suppresses _(no output)_', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+      sink.markVisibleOutputSent()
+
+      // #when
+      const result = await sink.flush()
+
+      // #then
+      expect(result.kind).toBe('skipped-visible')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+  })
 })

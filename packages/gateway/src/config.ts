@@ -10,6 +10,14 @@ const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
 const DEFAULT_LOG_LEVEL = 'info' as const
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 
+const DEFAULT_APPROVAL_MODE = 'approval-required' as const
+// autonomous-low-risk is deferred: OpenCode evaluates session rules before persisted project
+// 'approved' rules, and last-match-wins means persisted 'always' approvals can override session
+// denies. No permission.asked fires in that case, so gateway autonomous reject cannot save it.
+// Keep the env var so operators get a clear error instead of silent fallback if they set it.
+const VALID_APPROVAL_MODES = ['approval-required'] as const
+const DEFERRED_APPROVAL_MODES = ['autonomous-low-risk'] as const
+
 const ALLOWED_PRIVILEGED_INTENTS = {
   MessageContent: GatewayIntentBits.MessageContent,
   GuildMembers: GatewayIntentBits.GuildMembers,
@@ -40,6 +48,14 @@ export interface GatewayConfig {
   readonly maxConcurrentRuns: number
   /** Maximum wall-clock milliseconds a single run may take before being aborted. */
   readonly runTimeoutMs: number
+  /**
+   * Approval mode for tool permission requests during mention runs.
+   * - `approval-required` (default): routes permission asks to Discord approval UI.
+   *
+   * Note: `autonomous-low-risk` is deferred and explicitly rejected at startup. See config.ts for
+   * the rationale (OpenCode last-match-wins evaluation makes session-scoped denies unsafe).
+   */
+  readonly approvalMode: 'approval-required'
   /**
    * Announce/presence endpoint configuration. Present only when both
    * `GATEWAY_WEBHOOK_SECRET` and `GATEWAY_PRESENCE_CHANNEL_ID` are set.
@@ -265,6 +281,19 @@ export function loadGatewayConfig(): GatewayConfig {
   }
   const logLevel = rawLogLevel as GatewayConfig['logLevel']
 
+  const rawApprovalMode = readOptionalSecret('GATEWAY_APPROVAL_MODE') ?? DEFAULT_APPROVAL_MODE
+  if ((DEFERRED_APPROVAL_MODES as readonly string[]).includes(rawApprovalMode)) {
+    throw new Error(
+      `GATEWAY_APPROVAL_MODE value "${rawApprovalMode}" is not supported: autonomous-low-risk is deferred because OpenCode evaluates session rules before persisted project 'approved' rules, and last-match-wins means persisted 'always' approvals can override session denies. Use "approval-required" (the default).`,
+    )
+  }
+  if (!(VALID_APPROVAL_MODES as readonly string[]).includes(rawApprovalMode)) {
+    throw new Error(
+      `Invalid GATEWAY_APPROVAL_MODE value: "${rawApprovalMode}" (valid values: ${VALID_APPROVAL_MODES.join(', ')})`,
+    )
+  }
+  const approvalMode = rawApprovalMode as GatewayConfig['approvalMode']
+
   const rawIntents = readOptionalSecret('DISCORD_PRIVILEGED_INTENTS')
   const privilegedIntents: GatewayIntentBits[] = []
   if (rawIntents !== null) {
@@ -408,6 +437,7 @@ export function loadGatewayConfig(): GatewayConfig {
     identity,
     logLevel,
     privilegedIntents,
+    approvalMode,
     githubAppId,
     githubAppPrivateKey,
     gatewayGitHubAppInstallUrl,

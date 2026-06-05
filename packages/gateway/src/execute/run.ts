@@ -36,6 +36,12 @@ export interface RunMentionDeps {
   readonly logger: GatewayLogger
   /** Program-scoped approval registry shared with the button handler and shutdown drain. */
   readonly approvalRegistry: ApprovalRegistry
+  /**
+   * Gateway approval mode. Propagated from `GatewayConfig.approvalMode`.
+   * Currently only `approval-required` is supported.
+   * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
+   */
+  readonly approvalMode: 'approval-required'
 }
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -69,23 +75,27 @@ function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context
 // ---------------------------------------------------------------------------
 
 /**
- * Compute the per-approval deadline in ms.
+ * Compute the per-approval deadline in ms from the **remaining** run budget.
  *
- * Returns `undefined` if `runTimeoutMs` is too short to add a meaningful
+ * Pass `remainingBudgetMs` — the time left after setup, lock, and thread
+ * creation — not the raw configured `runTimeoutMs`. This ensures the approval
+ * deadline and the hard abort are aligned to the same budget origin.
+ *
+ * Returns `undefined` if `remainingBudgetMs` is too short to add a meaningful
  * deadline — specifically when there is less than 90 s of runway (we need at
  * least 30 s of clearance before the hard run timeout for the coordinator to
  * fire and the reply to POST).
  *
  * Otherwise the deadline is:
  *   - at least 60 s
- *   - at most half the run timeout
- *   - capped at runTimeoutMs − 30 s (fires before the hard abort)
+ *   - at most half the remaining budget
+ *   - capped at remainingBudgetMs − 30 s (fires before the hard abort)
  *   - capped at 13 min (Discord interaction-token guard)
  */
-export function computeApprovalDeadlineMs(runTimeoutMs: number): number | undefined {
+export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | undefined {
   // Need at least 90 s to have a 60 s deadline + 30 s clearance.
-  if (runTimeoutMs <= 90_000) return undefined
-  return Math.min(Math.max(60_000, Math.floor(runTimeoutMs / 2)), runTimeoutMs - 30_000, 13 * 60_000)
+  if (remainingBudgetMs <= 90_000) return undefined
+  return Math.min(Math.max(60_000, Math.floor(remainingBudgetMs / 2)), remainingBudgetMs - 30_000, 13 * 60_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +117,14 @@ export function computeApprovalDeadlineMs(runTimeoutMs: number): number | undefi
  */
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, logger} = deps
-  const {approvalRegistry} = deps
+  const {approvalRegistry, approvalMode} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
+
+  // ── Budget origin — single source of truth for hard abort and approval deadline ──
+  // Captured once at run entry so both the AbortSignal.timeout and the approval
+  // deadline clearance are computed from the same wall-clock reference.
+  const runStartMs = Date.now()
 
   // ── Concurrency cap + per-channel in-flight guard ──────────
 
@@ -233,13 +248,18 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         repo: binding.repo,
         botUserId,
       })
-      const timeoutSignal = AbortSignal.timeout(runTimeoutMs)
+
+      // ── Remaining budget — single origin for hard abort AND approval deadline ──
+      //
+      // Both the AbortSignal.timeout (hard abort) and the approval deadline are
+      // computed from the same wall-clock reference (runStartMs) so they are
+      // aligned: the approval deadline always fires before the hard abort.
+      const elapsedMs = Date.now() - runStartMs
+      const remainingBudgetMs = Math.max(0, runTimeoutMs - elapsedMs)
+      const timeoutSignal = AbortSignal.timeout(remainingBudgetMs)
 
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
-      //
-      // Deadline must fire before both the run timeout AND Discord's 15-min
-      // interaction-token expiry.
-      const approvalDeadlineMs = computeApprovalDeadlineMs(runTimeoutMs)
+      const approvalDeadlineMs = computeApprovalDeadlineMs(remainingBudgetMs)
 
       const coordinator = createPermissionCoordinator({
         logger,
@@ -282,6 +302,9 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
           // BEFORE attempting the Discord embed post. This ensures the button
           // handler can look up the entry even if the send is still in-flight.
           // Registry owns the deadline timer (single-owner rule).
+          //
+          // onDeadlineSettled: post a visible timed-out status to the run thread
+          // and mark the sink so flush() does not add a misleading _(no output)_.
           approvalRegistry.register({
             requestID,
             sessionID,
@@ -290,7 +313,26 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
             request,
             effects: {postReply: postReplyForRequest},
             deadlineMs: approvalDeadlineMs,
+            onDeadlineSettled: async () => {
+              // markVisibleOutputSent AFTER the send succeeds so flush() still
+              // adds _(no output)_ if the send fails (user needs the fallback).
+              await safeSend(rawThread, 'Approval timed out — the task could not continue.')
+              sink?.markVisibleOutputSent()
+            },
           })
+
+          // Post a visible waiting-for-approval status BEFORE the embed so the
+          // user sees the run is blocked even if the embed send is slow.
+          // Fire-and-forget: status is best-effort; must not block onPending.
+          // .catch() prevents an unhandled rejection if the Discord send fails.
+          // eslint-disable-next-line no-void
+          void safeSend(rawThread, 'Waiting for tool approval…')
+            .then(() => {
+              sink?.markVisibleOutputSent()
+            })
+            .catch((error: unknown) => {
+              logger.warn({requestID, err: String(error)}, 'run: failed to post waiting-for-approval status')
+            })
 
           // Fire-and-forget: send the embed then attach the render function.
           // rawThread has the full Discord.js API (embeds, components, edit).
@@ -303,6 +345,9 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
               allowedMentions: {parse: []},
             })
             .then(postedMessage => {
+              // Embed send succeeded — mark sink visible so flush() does not add
+              // a misleading _(no output)_ even if the waiting-status send failed.
+              sink?.markVisibleOutputSent()
               // Attach the render function now that we have a message reference.
               approvalRegistry.attachMessage(
                 requestID,
@@ -348,6 +393,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
           signal: timeoutSignal,
           logger,
           coordinator,
+          approvalMode,
         })
       } finally {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals

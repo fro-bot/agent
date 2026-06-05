@@ -64,6 +64,8 @@ beforeEach(() => {
     'WORKSPACE_OPENCODE_TOKEN_FILE',
     'GATEWAY_TRIGGER_ROLE_ID',
     'GATEWAY_MAX_CONCURRENT_RUNS',
+    'GATEWAY_APPROVAL_MODE',
+    'GATEWAY_APPROVAL_MODE_FILE',
   ]) {
     delete process.env[key]
   }
@@ -1271,5 +1273,130 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
     // #then trailing newline trimmed; announce object built with both values
     expect(config.announce?.webhookSecret).toBe('file-webhook-secret')
     expect(config.announce?.presenceChannelId).toBe('test-presence-channel-id')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_APPROVAL_MODE
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GATEWAY_APPROVAL_MODE', () => {
+  it('happy path: unset GATEWAY_APPROVAL_MODE → approvalMode defaults to "approval-required"', () => {
+    // #given — GATEWAY_APPROVAL_MODE not set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('happy path: GATEWAY_APPROVAL_MODE=approval-required → approvalMode is "approval-required"', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_APPROVAL_MODE = 'approval-required'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('error path: GATEWAY_APPROVAL_MODE=autonomous-low-risk → explicitly rejected with deferred error', () => {
+    // #given — autonomous-low-risk is deferred (unsafe due to OpenCode last-match-wins evaluation)
+    setRequiredEnv()
+    process.env.GATEWAY_APPROVAL_MODE = 'autonomous-low-risk'
+
+    // #when / #then — must throw with a clear explanation, not silently fall back
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_APPROVAL_MODE value "autonomous-low-risk" is not supported')
+  })
+
+  it('error path: unknown GATEWAY_APPROVAL_MODE value → throws with clear config error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_APPROVAL_MODE = 'auto-approve-everything'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Invalid GATEWAY_APPROVAL_MODE value: "auto-approve-everything" (valid values: approval-required)',
+    )
+  })
+
+  it('edge case: empty GATEWAY_APPROVAL_MODE → treated as unset, defaults to "approval-required"', () => {
+    // #given — empty string is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_APPROVAL_MODE = ''
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('edge case: whitespace-only GATEWAY_APPROVAL_MODE → treated as unset, defaults to "approval-required"', () => {
+    // #given — whitespace-only is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_APPROVAL_MODE = '   '
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('edge case: GATEWAY_APPROVAL_MODE_FILE with approval-required value → reads from file', () => {
+    // #given — value provided via _FILE (the compose bind-mount pattern)
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'approval-mode.txt')
+    writeFileSync(modeFile, 'approval-required\n', {mode: 0o600})
+    process.env.GATEWAY_APPROVAL_MODE_FILE = modeFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — trailing newline stripped; value parsed correctly
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('edge case: GATEWAY_APPROVAL_MODE_FILE with autonomous-low-risk → explicitly rejected', () => {
+    // #given — deferred mode via file
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'approval-mode-deferred.txt')
+    writeFileSync(modeFile, 'autonomous-low-risk\n', {mode: 0o600})
+    process.env.GATEWAY_APPROVAL_MODE_FILE = modeFile
+
+    // #when / #then — must throw with deferred error
+    expect(() => loadGatewayConfig()).toThrow('GATEWAY_APPROVAL_MODE value "autonomous-low-risk" is not supported')
+  })
+
+  it('edge case: GATEWAY_APPROVAL_MODE_FILE with empty file → defaults to "approval-required"', () => {
+    // #given — empty file is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'approval-mode-empty.txt')
+    writeFileSync(modeFile, '', {mode: 0o600})
+    process.env.GATEWAY_APPROVAL_MODE_FILE = modeFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.approvalMode).toBe('approval-required')
+  })
+
+  it('error path: GATEWAY_APPROVAL_MODE_FILE with unknown value → throws with clear config error', () => {
+    // #given
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'approval-mode-bad.txt')
+    writeFileSync(modeFile, 'full-auto\n', {mode: 0o600})
+    process.env.GATEWAY_APPROVAL_MODE_FILE = modeFile
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Invalid GATEWAY_APPROVAL_MODE value: "full-auto" (valid values: approval-required)',
+    )
   })
 })

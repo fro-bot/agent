@@ -275,6 +275,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           botUserId: client.user.id,
           logger,
           approvalRegistry,
+          approvalMode: config.approvalMode,
         },
         logger,
         // Workspace readiness gate — uses the same :9100 base as the clone endpoint.

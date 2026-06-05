@@ -296,14 +296,16 @@ WORKSPACE_EGRESS_HOSTS=cliproxy.fro.bot
 
 Leave both variables unset for a clone-only deployment: the workspace boots and serves `/clone`, but the mention loop has no model until they are configured.
 
-## Enabling tool approval prompts
+## Tool approval prompts
 
-By default, all OpenCode tools run automatically and no approval prompts appear in Discord. To require a Discord Approve / Deny button-click before a specific tool executes, configure that tool's `permission` mode to `ask` in the workspace OpenCode config.
+The gateway runs in **`approval-required` mode by default**: when OpenCode requests permission to use a tool, the gateway posts an Approve / Deny embed in the run thread and the run pauses until a Discord button-click is received or the approval deadline fires. This is the only supported mode — there is no global auto-approve path.
 
-The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. Add a `permission` block to that JSON:
+> **Warning:** Do not add global `allow` rules for high-risk tools (`bash`, `edit`, `task`, `external_directory`) to the workspace OpenCode config. Doing so bypasses the gateway approval boundary and allows those tools to run without any Discord prompt, regardless of the gateway's approval mode.
+
+The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. You can configure per-tool permission defaults there:
 
 ```env
-# deploy/.env — enable approval prompts for the Bash tool
+# deploy/.env — set bash to always ask (already the gateway default for all tools)
 WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"default":"ask"}}}
 ```
 
@@ -311,8 +313,8 @@ WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"default":"ask
 
 | Mode | Behaviour |
 | --- | --- |
-| `allow` (default) | Tool runs immediately; no Discord prompt. |
-| `ask` | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
+| `ask` (gateway default) | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
+| `allow` | Tool runs immediately; no Discord prompt. Use only for low-risk, non-mutating tools. |
 | `deny` | Tool is always blocked; no prompt. |
 
 Set `"default":"ask"` inside the tool's permission block to ask for every invocation. More granular patterns (e.g. per-command) follow the OpenCode `permission` config schema.
