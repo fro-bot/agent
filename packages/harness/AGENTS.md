@@ -44,11 +44,13 @@ The release workflow connects the LLM merge to the per-platform build matrix via
 
 ### `prepare-integrate` job
 
-Resolves the base version (dispatch input or tag) and renders the merge prompt from `packages/harness/prompt.txt` using values from `harness.config.json` (base version, release repo, integration refs). Emits `base_version` and `rendered_prompt` as job outputs.
+Resolves the base version (dispatch input or tag) and renders the merge prompt from `packages/harness/prompt.txt` using values from `harness.config.json` (base version, release repo, integration refs). Emits `base_version`, `rendered_prompt`, and `has_refs` as job outputs.
+
+`has_refs` is derived from the **parsed merge list** after the ref-parsing loop — not from the raw `integrationRefs` string. Whitespace-only or malformed-only entries that produce no real merge ref correctly yield `has_refs=false`.
 
 ### `integrate` job (merge via Fro Bot)
 
-`uses: ./.github/workflows/fro-bot.yaml` with `secrets: inherit`, passing `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. The Fro Bot agent:
+Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/fro-bot.yaml` with `secrets: inherit`, passing `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. The Fro Bot agent:
 
 1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
 2. Builds and verifies the host CLI as a correctness gate.
@@ -58,9 +60,14 @@ The merge runs with `output-mode: working-dir` so branch/PR delivery semantics d
 
 ### `build` matrix (consumer)
 
-Each platform job (`needs: [prepare-integrate, integrate]`):
+Each platform job (`needs: [prepare-integrate, integrate]`) runs when `prepare-integrate` succeeded **and** `integrate` did not fail. This means:
 
-1. Fetches `refs/harness-integrate/<version>` and resolves its tip — that SHA is the integration commit.
+- **Empty carry set** (`has_refs=false`): `integrate` is skipped → `integrate.result == 'skipped'` → build runs. The fetch-integrate step clones the stock release tag directly instead of fetching `refs/harness-integrate/<version>`.
+- **Non-empty carry set** (`has_refs=true`): `integrate` runs → if it succeeds, build runs; if it fails or is cancelled, build is blocked.
+
+Each platform job:
+
+1. Fetches `refs/harness-integrate/<version>` (non-empty carry) or clones the stock tag (empty carry) and resolves the tip SHA as the integration commit.
 2. Checks out the fetched tree and runs `build-platform.ts --source-tree <tree> --integration-commit <sha>`, which builds from the supplied merged source tree. Each platform job runs its own clean install + build.
 3. Emits the resolved `integration_commit` as a job output so `publish` consumes the same commit rather than re-resolving the force-pushed ref.
 

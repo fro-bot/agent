@@ -50,6 +50,7 @@ jobs:
     outputs:
       base_version: ${{ steps.render.outputs.base_version }}
       rendered_prompt: ${{ steps.render.outputs.rendered_prompt }}
+      has_refs: ${{ steps.render.outputs.has_refs }}
 
     steps:
       - name: Checkout harness repo
@@ -91,12 +92,15 @@ jobs:
           RELEASE_URL="https://github.com/${RELEASE_REPO}/releases/tag/${TAG}"
           WORK_DIR="${RUNNER_TEMP}/harness-integrate-work"
 
-          # Parse each integration ref into label and merge ref (mirrors parseSource).
-          # When INTEGRATION_REFS is empty, the loop body never executes and the
-          # sentinel values below are used — the prompt reads "no patches to merge".
-          BRANCHES="(none)"
-          MERGES="(none — build the release tag as-is)"
-          SOURCES="(none)"
+          # Parse each integration ref into label, fetch URL, fetchRef, and local merge ref
+          # (mirrors parseSource in packages/harness/src/sources.ts).
+          # When INTEGRATION_REFS is empty, the loop body never executes.
+          # HAS_REFS is derived from the parsed merge list AFTER the loop so that
+          # whitespace-only or malformed-only entries that produce no real merge ref
+          # correctly yield has_refs=false rather than a bogus prompt.
+          BRANCHES=""
+          MERGES=""
+          SOURCES=""
           while IFS= read -r REF; do
             [ -z "${REF}" ] && continue
             if echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/pull/([0-9]+)'; then
@@ -105,29 +109,46 @@ jobs:
               PR_NUM=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+).*|\3|')
               SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
               LABEL="${OWNER}/${REPO_NAME}#${PR_NUM}"
-              MERGE_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/pull/${PR_NUM}/head"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/pr-${PR_NUM}"
             elif echo "${REF}" | grep -qE 'github\.com/([^/]+)/([^/]+)/tree/(.+)'; then
               OWNER=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\1|')
               REPO_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\2|')
               BRANCH_NAME=$(echo "${REF}" | sed -E 's|https://github.com/([^/]+)/([^/]+)/tree/(.+)|\3|')
               SLUG=$(echo "${OWNER}-${REPO_NAME}" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/-$//')
               LABEL="${OWNER}/${REPO_NAME}:${BRANCH_NAME}"
-              MERGE_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
+              FETCH_URL="https://github.com/${OWNER}/${REPO_NAME}.git"
+              FETCH_REF="refs/heads/${BRANCH_NAME}"
+              LOCAL_REF="refs/remotes/watch/${SLUG}/${BRANCH_NAME}"
             else
               LABEL="${REF}"
-              MERGE_REF="refs/remotes/watch/local/${REF}"
+              FETCH_URL="https://github.com/${RELEASE_REPO}.git"
+              FETCH_REF="refs/heads/${REF}"
+              LOCAL_REF="refs/remotes/watch/local/${REF}"
             fi
-            # First real ref: overwrite the sentinels.
-            if [ "${BRANCHES}" = "(none)" ]; then
+            # First real ref: set the values; subsequent refs: append.
+            if [ -z "${BRANCHES}" ]; then
               BRANCHES="${LABEL}"
-              MERGES="${MERGE_REF}"
-              SOURCES="${LABEL} -> ${MERGE_REF}"
+              MERGES="${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
             else
               BRANCHES="${BRANCHES}, ${LABEL}"
-              MERGES="${MERGES}, then ${MERGE_REF}"
-              SOURCES="${SOURCES}\n- ${LABEL} -> ${MERGE_REF}"
+              MERGES="${MERGES}; ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}"
+              SOURCES="${SOURCES}\n- ${LABEL}: git fetch ${FETCH_URL} ${FETCH_REF}:${LOCAL_REF}, then git merge --no-ff ${LOCAL_REF}"
             fi
           done <<< "${INTEGRATION_REFS}"
+
+          # --- Emit has_refs: true iff at least one valid ref was parsed into the merge list ---
+          # Derived from the parsed MERGES list (not the raw string) so whitespace-only or
+          # malformed-only entries that produce no real merge ref yield has_refs=false.
+          if [ -n "${MERGES}" ]; then
+            HAS_REFS="true"
+          else
+            HAS_REFS="false"
+          fi
+          echo "has_refs=${HAS_REFS}" >> "$GITHUB_OUTPUT"
+          echo "has_refs: ${HAS_REFS}"
 
           # --- Render the prompt template ---
           PROMPT_TPL=$(cat packages/harness/prompt.txt)
@@ -160,10 +181,12 @@ jobs:
   # Integrate job — calls fro-bot.yaml as a reusable workflow.
   # Fro Bot installs opencode, provisions auth, and runs the LLM merge.
   # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-4-6 in repo vars.
+  # Skipped when the carry set is empty (has_refs == 'false').
   # ---------------------------------------------------------------------------
   integrate:
     name: integrate (LLM merge via Fro Bot)
     needs: prepare-integrate
+    if: ${{ needs.prepare-integrate.outputs.has_refs == 'true' }}
     uses: ./.github/workflows/fro-bot.yaml
     secrets: inherit
     with:
@@ -179,6 +202,12 @@ jobs:
   build:
     name: build (${{ matrix.platform }}/${{ matrix.arch }})
     needs: [prepare-integrate, integrate]
+    # Run when prepare-integrate succeeded AND integrate did not fail.
+    # integrate.result is 'skipped' for empty carry → build runs.
+    # integrate.result is 'success' for non-empty carry → build runs.
+    # integrate.result is 'failure' or 'cancelled' → build is blocked.
+    # !cancelled() prevents running if the workflow was manually cancelled.
+    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     strategy:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
@@ -234,24 +263,43 @@ jobs:
         id: fetch-integrate
         env:
           BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+          HAS_REFS: ${{ needs.prepare-integrate.outputs.has_refs }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
           EXTRACT_DIR="${RUNNER_TEMP}/integration-src"
-
-          # Fetch the throwaway ref pushed by Fro Bot into fro-bot/agent.
-          git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
-
-          # Resolve the integration commit SHA from the fetched ref tip.
-          INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
-          echo "Integration commit: ${INTEGRATION_COMMIT}"
-          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
-
-          # Check out the integrated source tree into a clean directory.
           mkdir -p "${EXTRACT_DIR}"
-          git --work-tree="${EXTRACT_DIR}" checkout "${INTEGRATE_REF}" -- .
-          echo "Checked out integration tree to: ${EXTRACT_DIR}"
+
+          if [ "${HAS_REFS}" = "true" ]; then
+            # Non-empty carry set: fetch the throwaway ref pushed by Fro Bot.
+            INTEGRATE_REF="refs/harness-integrate/${BASE_VERSION}"
+
+            # Fetch the throwaway ref pushed by Fro Bot into fro-bot/agent.
+            git fetch origin "+${INTEGRATE_REF}:${INTEGRATE_REF}"
+
+            # Resolve the integration commit SHA from the fetched ref tip.
+            INTEGRATION_COMMIT=$(git rev-parse "${INTEGRATE_REF}")
+            echo "Integration commit (from harness-integrate ref): ${INTEGRATION_COMMIT}"
+
+            # Check out the integrated source tree into a clean directory.
+            git --work-tree="${EXTRACT_DIR}" checkout "${INTEGRATE_REF}" -- .
+            echo "Checked out integration tree to: ${EXTRACT_DIR}"
+          else
+            # Empty carry set: clone the stock release tag directly.
+            # No agent ran; the stock tag IS the integration source.
+            CONFIG="packages/harness/harness.config.json"
+            RELEASE_REPO=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('${CONFIG}','utf8')).release_repo)")
+            TAG="v${BASE_VERSION}"
+
+            echo "Empty carry set — cloning stock tag ${TAG} from ${RELEASE_REPO}"
+            git clone --depth 1 --branch "${TAG}" "https://github.com/${RELEASE_REPO}.git" "${EXTRACT_DIR}"
+
+            # Resolve the tag commit SHA from the cloned HEAD.
+            INTEGRATION_COMMIT=$(git -C "${EXTRACT_DIR}" rev-parse HEAD)
+            echo "Integration commit (from stock tag clone): ${INTEGRATION_COMMIT}"
+          fi
+
+          echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
         env:
@@ -298,6 +346,11 @@ jobs:
   publish:
     name: publish (all-or-nothing)
     needs: [prepare-integrate, integrate, build]
+    # Run when build succeeded and integrate did not fail (defense-in-depth).
+    # build success already implies integrate didn't fail (build wouldn't have run),
+    # but the explicit check makes the gate clear and guards against future refactors.
+    # !cancelled() prevents running if the workflow was manually cancelled.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     runs-on: ubuntu-24.04
     environment: npm-publish # Maintainer-gated environment with required reviewers.
 
