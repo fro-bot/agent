@@ -35,28 +35,28 @@ Exact tasks:
 4. Build the host CLI in `packages/opencode` with `OPENCODE_CHANNEL={{channel}} OPENCODE_VERSION={{version}} bun run build -- --single`.
 5. Ensure the built CLI binary exists at the expected path under `packages/opencode/dist/`.
 6. Run the built CLI with `--version` and verify the output is exactly `{{version}}`.
-7. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Use this exact non-interactive pattern:
+7. Push the integrated branch to the throwaway ref in the harness repo. Do not push to `origin`; `origin` is upstream OpenCode. Run this exact non-interactive pattern (the heredoc terminator and the helper body must stay at column 0):
 
-   ```bash
-   test -n "${GH_TOKEN:-}" || { echo "GH_TOKEN is required for harness push"; exit 1; }
+```bash
+test -n "${GH_TOKEN:-}" || { echo "GH_TOKEN is required for harness push"; exit 1; }
 
-   askpass="$(mktemp)"
-   trap 'rm -f "$askpass"' EXIT
-   cat >"$askpass" <<'EOF'
-   #!/bin/sh
-   case "$1" in
-     *Username*) printf '%s\n' x-access-token ;;
-     *Password*) printf '%s\n' "$GH_TOKEN" ;;
-   esac
-   EOF
-   chmod 700 "$askpass"
+askpass="$(mktemp)"
+trap 'rm -f "$askpass"' EXIT
+cat >"$askpass" <<'EOF'
+#!/bin/sh
+case "$1" in
+*Username*) printf '%s\n' x-access-token ;;
+*Password*) printf '%s\n' "$GH_TOKEN" ;;
+esac
+EOF
+chmod 700 "$askpass"
 
-   git remote remove harness 2>/dev/null || true
-   git remote add harness https://github.com/fro-bot/agent.git
+git remote remove harness 2>/dev/null || true
+git remote add harness https://github.com/fro-bot/agent.git
 
-   HUSKY=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" \
-     git push --no-verify --force harness {{branch}}:refs/harness-integrate/{{version}}
-   ```
+HUSKY=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" \
+  git push --no-verify --force harness {{branch}}:refs/harness-integrate/{{version}}
+```
 
    `--force` is required so re-runs overwrite the throwaway ref. `--no-verify` is required so local hooks do not run.
 8. Return a concise plain-text final assistant message only — no GitHub posting — with:
