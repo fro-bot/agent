@@ -1399,6 +1399,205 @@ describe('buildAgentPrompt', () => {
       )
     })
   })
+
+  describe('responseMode', () => {
+    it('renders Response Protocol when responseMode is github (default)', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        responseMode: 'github',
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).toContain('### Response Protocol (REQUIRED)')
+      expect(prompt).toContain('You MUST post your response using the gh CLI')
+      expect(prompt).toContain('gh issue comment 42')
+      expect(prompt).toContain('gh pr comment 42')
+      expect(prompt).toContain('gh pr review 42')
+    })
+
+    it('renders Response Protocol when responseMode is omitted (defaults to github)', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        // responseMode intentionally omitted
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).toContain('### Response Protocol (REQUIRED)')
+      expect(prompt).toContain('You MUST post your response using the gh CLI')
+      expect(prompt).toContain('gh issue comment 42')
+      expect(prompt).toContain('gh pr comment 42')
+      expect(prompt).toContain('gh pr review 42')
+    })
+
+    it('suppresses Response Protocol when responseMode is none', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        responseMode: 'none',
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
+      expect(prompt).not.toContain('You MUST post your response using the gh CLI')
+      expect(prompt).not.toContain('gh issue comment')
+      expect(prompt).not.toContain('gh pr comment')
+      expect(prompt).not.toContain('gh pr review')
+    })
+
+    it('renders non-posting contract when responseMode is none', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        responseMode: 'none',
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).toContain('Response surface:')
+      expect(prompt).toContain('final assistant message')
+      expect(prompt).toContain('GitHub Actions job log')
+      expect(prompt).toContain('Do NOT create GitHub comments, reviews, issues, discussions, reactions, or labels')
+      expect(prompt).toContain('non-posting automation')
+    })
+
+    it('still includes Session Management when responseMode is none', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        responseMode: 'none',
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).toContain('### Session Management (REQUIRED)')
+      expect(prompt).toContain('session_search')
+      expect(prompt).toContain('session_read')
+    })
+
+    it('still includes GitHub Operations section when responseMode is none', () => {
+      // #given
+      const options: PromptOptions = {
+        context: createMockContext({issueNumber: 42}),
+        customPrompt: null,
+        cacheStatus: 'hit',
+        responseMode: 'none',
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then
+      expect(prompt).toContain('### GitHub Operations')
+      expect(prompt).toContain('`gh` CLI is pre-authenticated')
+    })
+
+    it('dMR regression guard: working-dir output-mode with github responseMode still has Response Protocol', () => {
+      // #given — daily DMR run uses working-dir but DOES post a comment
+      const context = createMockContext({
+        eventName: 'schedule',
+        issueNumber: 42,
+        issueTitle: 'Daily Maintenance Report',
+        issueType: 'issue',
+        commentBody: null,
+      })
+      const triggerContext = createMockTriggerContext({
+        eventType: 'schedule',
+        target: {
+          kind: 'issue',
+          number: 42,
+          title: 'Daily Maintenance Report',
+          body: null,
+          locked: false,
+        },
+        commentBody: null,
+      })
+      const options: PromptOptions = {
+        context,
+        customPrompt: 'Perform daily maintenance',
+        cacheStatus: 'hit',
+        triggerContext,
+        resolvedOutputMode: 'working-dir',
+        responseMode: 'github', // explicit github — DMR always posts
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then — Response Protocol MUST be present for DMR runs
+      expect(prompt).toContain('### Response Protocol (REQUIRED)')
+      expect(prompt).toContain('You MUST post your response using the gh CLI')
+    })
+
+    it('dMR regression guard: working-dir output-mode with unset responseMode still has Response Protocol', () => {
+      // #given — daily DMR run uses working-dir but DOES post a comment
+      const context = createMockContext({
+        eventName: 'schedule',
+        issueNumber: 42,
+        issueTitle: 'Daily Maintenance Report',
+        issueType: 'issue',
+        commentBody: null,
+      })
+      const triggerContext = createMockTriggerContext({
+        eventType: 'schedule',
+        target: {
+          kind: 'issue',
+          number: 42,
+          title: 'Daily Maintenance Report',
+          body: null,
+          locked: false,
+        },
+        commentBody: null,
+      })
+      const options: PromptOptions = {
+        context,
+        customPrompt: 'Perform daily maintenance',
+        cacheStatus: 'hit',
+        triggerContext,
+        resolvedOutputMode: 'working-dir',
+        // responseMode intentionally omitted — defaults to github
+      }
+
+      // #when
+      const result = buildAgentPrompt(options, mockLogger)
+      const prompt = result.text
+
+      // #then — Response Protocol MUST be present for DMR runs
+      expect(prompt).toContain('### Response Protocol (REQUIRED)')
+      expect(prompt).toContain('You MUST post your response using the gh CLI')
+    })
+  })
 })
 
 function createMockTriggerContext(overrides: Partial<TriggerContext> = {}): TriggerContext {
