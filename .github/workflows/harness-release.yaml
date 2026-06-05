@@ -207,7 +207,7 @@ jobs:
     # integrate.result is 'success' for non-empty carry → build runs.
     # integrate.result is 'failure' or 'cancelled' → build is blocked.
     # !cancelled() prevents running if the workflow was manually cancelled.
-    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && needs.integrate.result != 'failure' }}
+    if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     strategy:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
@@ -350,7 +350,7 @@ jobs:
     # build success already implies integrate didn't fail (build wouldn't have run),
     # but the explicit check makes the gate clear and guards against future refactors.
     # !cancelled() prevents running if the workflow was manually cancelled.
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.integrate.result != 'failure' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     runs-on: ubuntu-24.04
     environment: npm-publish # Maintainer-gated environment with required reviewers.
 
