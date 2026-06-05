@@ -460,14 +460,18 @@ jobs:
 
           # Write the provenance manifest into the main package for runtime use.
           # Values are passed via environment variables (not interpolated into the script body).
+          # integrationRefs is read from harness.config.json so the manifest is complete
+          # and isValidProvenance() accepts it (requires Array.isArray(v.integrationRefs)).
+          # INTEGRATION_COMMIT is the same SHA the build job resolved and verified — no
+          # split-brain between the binary's baked commit and the published manifest.
           node -e "
             const fs = require('fs');
             const baseVersion = process.env.BASE_VERSION;
             const integrationCommit = process.env.INTEGRATION_COMMIT;
             const buildSha = process.env.GITHUB_SHA || 'unknown';
-            let existing = {};
-            try { existing = JSON.parse(fs.readFileSync('packages/harness/provenance.json', 'utf8')); } catch {}
-            const manifest = { ...existing, baseVersion, integrationCommit, buildSha };
+            const config = JSON.parse(fs.readFileSync('packages/harness/harness.config.json', 'utf8'));
+            const integrationRefs = config.integrationRefs.map(ref => ({ ref, resolvedSha: integrationCommit }));
+            const manifest = { baseVersion, integrationRefs, integrationCommit, buildSha };
             fs.writeFileSync('packages/harness/provenance.json', JSON.stringify(manifest, null, 2) + '\n');
             console.log('provenance.json updated:', manifest);
           "
