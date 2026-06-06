@@ -12,9 +12,10 @@
 set -euo pipefail
 
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose.yaml}"
+PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 
 # ---------------------------------------------------------------------------
-# check_compose_topology — static network-topology invariant assertion.
+# check_compose_topology — static network-topology and persistence invariant assertion.
 #
 # Parses `docker compose config` output (no running containers needed) and
 # enforces the containment model:
@@ -31,13 +32,15 @@ COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose.yaml}"
 #      internet directly, even if a new network is added to the compose file.
 #   5. egress-net has EXACTLY ONE attached service (mitmproxy) — no other
 #      service may join the internet-capable network.
+#   6. workspace mounts the named volume 'workspace-repos' at exactly
+#      '/workspace/repos' — repo checkouts must survive container recreation.
 #
 # Exit non-zero with a descriptive message if any invariant fails.
 # ---------------------------------------------------------------------------
 check_compose_topology() {
   echo "==> Checking compose network topology invariants..."
 
-  COMPOSE_FILE="${COMPOSE_FILE}" python3 - <<'PYEOF'
+  COMPOSE_FILE="${COMPOSE_FILE}" "${PYTHON3_BIN}" - <<'PYEOF'
 import json
 import os
 import subprocess
@@ -53,9 +56,12 @@ try:
         check=True,
     )
     cfg = json.loads(result.stdout)
-except subprocess.CalledProcessError as e:
-    # Fall back to YAML parse if --format json is not supported by this
-    # docker compose version, or if docker compose is unavailable.
+except (subprocess.CalledProcessError, OSError):
+    # Fall back to YAML parse if:
+    #   - docker/compose is not installed (OSError/FileNotFoundError), or
+    #   - --format json is not supported by this docker compose version
+    #     (CalledProcessError), or
+    #   - docker compose is otherwise unavailable.
     try:
         import yaml
         try:
@@ -66,7 +72,7 @@ except subprocess.CalledProcessError as e:
                 check=True,
             )
             cfg = yaml.safe_load(result2.stdout)
-        except Exception:
+        except (subprocess.CalledProcessError, OSError):
             # docker compose unavailable — parse the raw YAML file directly.
             with open(compose_file) as fh:
                 cfg = yaml.safe_load(fh)
@@ -171,6 +177,75 @@ for egress_net in mitmproxy_egress_nets:
         )
 
 # ------------------------------------------------------------------
+# Invariant 6: workspace must mount the named volume 'workspace-repos'
+# at exactly '/workspace/repos'.
+#
+# docker compose config normalises volumes to a list of dicts with
+# 'type', 'source', and 'target' keys.  A short-form volume entry
+# (e.g. "workspace-repos:/workspace/repos") is expanded to:
+#   {"type": "volume", "source": "workspace-repos", "target": "/workspace/repos"}
+#
+# However, when falling back to raw YAML parsing (docker compose unavailable),
+# volume entries may remain as short-form strings:
+#   "workspace-repos:/workspace/repos"
+#   "workspace-repos:/workspace/repos:ro"
+# We must handle both dict entries and short-form string entries.
+# ------------------------------------------------------------------
+workspace_svc = services.get("workspace", {})
+workspace_vols = workspace_svc.get("volumes", [])
+
+REQUIRED_SOURCE = "workspace-repos"
+REQUIRED_TARGET = "/workspace/repos"
+
+def parse_volume_entry(v):
+    """Return (source, target) from a volume entry that is either a dict or a short-form string."""
+    if isinstance(v, dict):
+        return (v.get("source"), v.get("target"))
+    if isinstance(v, str):
+        # Short-form: "source:target" or "source:target:mode"
+        parts = v.split(":")
+        if len(parts) >= 2:
+            return (parts[0], parts[1])
+    return (None, None)
+
+repos_mount_found = any(
+    (
+        # Dict form: type must be "volume" (or absent in raw YAML short-form fallback)
+        (not isinstance(v, dict) or (v or {}).get("type") in ("volume", None))
+        and parse_volume_entry(v) == (REQUIRED_SOURCE, REQUIRED_TARGET)
+    )
+    for v in workspace_vols
+)
+
+if not repos_mount_found:
+    # Provide a targeted message: distinguish missing-entirely from wrong-path/wrong-name.
+    has_source = any(
+        parse_volume_entry(v)[0] == REQUIRED_SOURCE for v in workspace_vols
+    )
+    has_target = any(
+        parse_volume_entry(v)[1] == REQUIRED_TARGET for v in workspace_vols
+    )
+    if has_source and not has_target:
+        failures.append(
+            f"FAIL: workspace mounts volume '{REQUIRED_SOURCE}' but not at "
+            f"'{REQUIRED_TARGET}'. Repo checkouts will not survive container "
+            "recreation. Mount workspace-repos at /workspace/repos."
+        )
+    elif has_target and not has_source:
+        failures.append(
+            f"FAIL: workspace has a volume mounted at '{REQUIRED_TARGET}' but it "
+            f"is not the named volume '{REQUIRED_SOURCE}'. Repo checkouts will not "
+            "survive container recreation. Use the workspace-repos named volume."
+        )
+    else:
+        failures.append(
+            f"FAIL: workspace does not mount the named volume '{REQUIRED_SOURCE}' "
+            f"at '{REQUIRED_TARGET}'. Repo checkouts will not survive container "
+            "recreation. Add workspace-repos:/workspace/repos to the workspace "
+            "service volumes."
+        )
+
+# ------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------
 if failures:
@@ -184,24 +259,31 @@ print(f"    mitmproxy networks: {sorted(mitmproxy_nets)!r}  ✓")
 print(f"    mitmproxy egress leg(s): {sorted(mitmproxy_egress_nets)!r}  ✓")
 print("    workspace has no direct egress  ✓")
 print("    egress network(s) have exactly one attached service (mitmproxy)  ✓")
+print(f"    workspace mounts {REQUIRED_SOURCE!r} at {REQUIRED_TARGET!r}  ✓")
 PYEOF
 
   echo "    Topology invariants: OK"
 }
 
-echo "==> Validating compose config..."
-docker compose -f "${COMPOSE_FILE}" config > /dev/null
-echo "    OK"
-
-# Run the topology check unconditionally — it is cheap (no running stack needed).
-check_compose_topology
-
-# If --topology-only was passed, stop here.
+# If --topology-only was passed, skip the Docker config validation (which
+# requires a working Docker/compose installation) and go straight to the
+# raw-YAML topology check.  The topology check itself has a Docker-free
+# fallback path, so it works in environments without Docker.
 if [[ "${1:-}" == "--topology-only" ]]; then
+  check_compose_topology
   echo ""
   echo "==> Topology-only check complete."
   exit 0
 fi
+
+# Full validation: require Docker compose to be available and the config to
+# be syntactically valid before running the topology check.
+echo "==> Validating compose config..."
+docker compose -f "${COMPOSE_FILE}" config > /dev/null
+echo "    OK"
+
+# Run the topology check — it is cheap (no running stack needed).
+check_compose_topology
 
 echo "==> Service status:"
 docker compose -f "${COMPOSE_FILE}" ps

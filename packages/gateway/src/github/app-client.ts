@@ -184,11 +184,18 @@ export function createAppClient(options: AppClientOptions): AppClient {
         })
       }
 
-      // Stage 2: Mint an installation token using the discovered installationId.
+      // Stage 2: Mint a repository-scoped installation token.
+      // Narrow the token to the requested repository and the minimum required
+      // permissions (contents:read) so a compromised token cannot be used to
+      // access other repositories in the same installation.
       const installAuth = createAppAuth({appId, privateKey, installationId})
       let token: string
       try {
-        ;({token} = await installAuth({type: 'installation'}))
+        ;({token} = await installAuth({
+          type: 'installation',
+          repositoryNames: [repo],
+          permissions: {contents: 'read'},
+        }))
       } catch (mintError) {
         // Stage-2 failure means the cached installationId is no longer usable
         // (e.g. revoked installation, rotated key, transient API error).

@@ -47,6 +47,23 @@ function makeLogger() {
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers for installation auth call assertions
+// ---------------------------------------------------------------------------
+
+/** Shape of the argument passed to installAuth({type:'installation',...}) */
+interface InstallationAuthCallArg {
+  readonly type: string
+  readonly repositoryNames?: string[]
+  readonly permissions?: Record<string, string>
+}
+
+function getInstallationCalls(): InstallationAuthCallArg[] {
+  return mockAuth.mock.calls
+    .filter(args => (args[0] as {type: string}).type === 'installation')
+    .map(args => args[0] as InstallationAuthCallArg)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -244,6 +261,60 @@ describe('createAppClient', () => {
       expect(line).not.toContain(PRIVATE_KEY)
       expect(line).not.toContain('fake-key')
     }
+  })
+
+  // -------------------------------------------------------------------------
+  // Security: repository-scoped installation tokens
+  // -------------------------------------------------------------------------
+
+  it('security: installAuth({type:"installation"}) receives repositoryNames:[repo] and permissions:{contents:"read"}', async () => {
+    // #given
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.authForRepo('myorg', 'myrepo')
+
+    // #then — must succeed
+    expect(result.success).toBe(true)
+
+    // The installation-type auth call must carry repository scoping and minimal permissions.
+    const installationCalls = getInstallationCalls()
+    expect(installationCalls).toHaveLength(1)
+    const [installationCallArg] = installationCalls
+    expect(installationCallArg?.repositoryNames).toEqual(['myrepo'])
+    expect(installationCallArg?.permissions).toEqual({contents: 'read'})
+  })
+
+  it('security: second authForRepo call (cache hit) also passes repositoryNames and permissions', async () => {
+    // #given
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when — two calls; second hits the cache
+    await client.authForRepo('myorg', 'myrepo')
+    await client.authForRepo('myorg', 'myrepo')
+
+    // #then — both installation-type calls must carry scoping
+    const installationCalls = getInstallationCalls()
+    expect(installationCalls).toHaveLength(2)
+    for (const arg of installationCalls) {
+      expect(arg.repositoryNames).toEqual(['myrepo'])
+      expect(arg.permissions).toEqual({contents: 'read'})
+    }
+  })
+
+  it('security: repositoryNames uses the repo name, not the owner/repo path', async () => {
+    // #given — repo name differs from owner name
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    await client.authForRepo('some-org', 'specific-repo')
+
+    // #then — repositoryNames must be just the repo name, not "some-org/specific-repo"
+    const installationCalls = getInstallationCalls()
+    expect(installationCalls).toHaveLength(1)
+    const [arg] = installationCalls
+    expect(arg?.repositoryNames).toEqual(['specific-repo'])
+    expect(arg?.repositoryNames).not.toContain('some-org/specific-repo')
   })
 
   // -------------------------------------------------------------------------

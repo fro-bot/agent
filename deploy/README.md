@@ -183,6 +183,8 @@ The healthcheck is baked into `deploy/gateway.Dockerfile` — there is no overri
 
 The compose stack bind-mounts each secret file individually with `create_host_path: false`. A missing source file produces a clear `docker compose up` error instead of silently materializing as a directory. This is the fail-fast diagnostic — but it means **every time the compose stack adds a new optional secret, existing deployments must `touch` the new file before their next `docker compose up`**.
 
+The `workspace-repos` named volume is created automatically by Docker Compose on the first `up` after this change — no manual step is required. Existing repo checkouts in the container's ephemeral filesystem are not migrated; the workspace will re-clone them on the next mention.
+
 Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
 
 ### Current optional secrets
@@ -330,6 +332,34 @@ Each approval prompt has a deadline that is a sub-deadline of the overall run ti
 ### Restart limitation
 
 A pending approval prompt is held in memory by the per-run coordinator. If the gateway or workspace container restarts while a prompt is open, the approval is abandoned. The run surfaces as interrupted in the thread. Re-mention to retry.
+
+## Persistent Volumes
+
+The stack uses two named Docker volumes that survive container recreation and daemon upgrades:
+
+| Volume | Mounted at | Contents |
+| --- | --- | --- |
+| `workspace-repos` | `/workspace/repos` (workspace service) | Cloned repository checkouts |
+| `mitmproxy-certs` | `/home/mitmproxy/.mitmproxy` (mitmproxy) and `/run/mitmproxy-certs` (workspace, gateway) | mitmproxy CA certificate |
+
+**Safe operations** — these preserve both volumes:
+
+```bash
+# Rebuild and recreate containers without touching volumes
+docker compose -f deploy/compose.yaml up -d --build --force-recreate
+
+# Restart a single service
+docker compose -f deploy/compose.yaml restart workspace
+```
+
+**Destructive operation** — `docker compose down -v` removes all named volumes, including `workspace-repos` and `mitmproxy-certs`:
+
+```bash
+# WARNING: destroys cloned repos and mitmproxy CA state
+docker compose -f deploy/compose.yaml down -v
+```
+
+After a `down -v`, re-run `bash deploy/init-certs.sh` to regenerate the mitmproxy CA. Cloned repos are rehydrated automatically: mentioning Fro Bot in a bound channel triggers a fresh clone of the missing checkout before the agent run starts.
 
 ## Stopping the Stack
 
