@@ -66,6 +66,29 @@ export interface RunMentionDeps {
 // ---------------------------------------------------------------------------
 
 /**
+ * Format a millisecond duration as a human-readable string for user-facing
+ * timeout messages. Produces accurate compound minute+second strings for
+ * non-integral minutes; falls back to seconds for sub-minute values.
+ *
+ * Examples:
+ *   45_000  → "45 seconds"
+ *   60_000  → "1 minute"
+ *   90_000  → "1 minute 30 seconds"
+ *   600_000 → "10 minutes"
+ */
+export function formatTimeoutDuration(ms: number): string {
+  const totalSeconds = Math.round(ms / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  if (minutes >= 1) {
+    const minutePart = `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`
+    if (remainingSeconds === 0) return minutePart
+    return `${minutePart} ${remainingSeconds} ${remainingSeconds === 1 ? 'second' : 'seconds'}`
+  }
+  return `${totalSeconds} ${totalSeconds === 1 ? 'second' : 'seconds'}`
+}
+
+/**
  * Send a message to a Discord channel/thread with mentions disabled.
  * ALL Discord sends in this module MUST go through this helper — never call
  * `.send()` directly with user-controlled content.
@@ -549,9 +572,13 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       }
 
       // Coarse user message — no internal detail
+      const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
+      const hasVisibleOutput = sink !== null && sink.hasVisibleOutput() === true
       const userMessage =
         isTimeout === true
-          ? 'The task timed out. Please try again.'
+          ? hasVisibleOutput === true
+            ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+            : `The task reached the ${timeoutDuration} time limit. Please try again.`
           : isReachability === true
             ? 'The workspace is not reachable right now. Please try again later.'
             : isEmptyPrompt === true
