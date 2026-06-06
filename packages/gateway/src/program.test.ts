@@ -65,6 +65,15 @@ vi.mock('./discord/approvals.js', () => ({
   DENY_PREFIX: 'fb-deny:',
 }))
 
+// Stub ensureWorkspaceClone so program tests can assert wiring without live GitHub/workspace calls.
+vi.mock('./workspace-api/ensure-clone.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./workspace-api/ensure-clone.js')>()
+  return {
+    ...actual,
+    ensureWorkspaceClone: vi.fn().mockResolvedValue({success: true, data: '/workspace/repos/test/repo'}),
+  }
+})
+
 const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
@@ -524,6 +533,38 @@ describe('makeGatewayProgram', () => {
 
     // #then — approvalMode is threaded from GatewayConfig into the mention run deps
     expect(capturedDeps.run.approvalMode).toBe('approval-required')
+  })
+
+  it('messageCreate: RunMentionDeps.ensureClone calls ensureWorkspaceClone with owner, repo, appClient, workspaceClient, and logger', async () => {
+    // #given — mock ensureWorkspaceClone so we can assert it is called through real wiring
+    const {ensureWorkspaceClone} = await import('./workspace-api/ensure-clone.js')
+    const ensureWorkspaceCloneMock = vi.mocked(ensureWorkspaceClone)
+    ensureWorkspaceCloneMock.mockResolvedValue({success: true, data: '/workspace/repos/acme/widget'})
+
+    // #when — capture the deps passed to handleMention
+    const capturedDeps = await runAndCaptureMentionDeps('approval-required')
+
+    // #then — ensureClone is now in run (after concurrency gate), not at the top level
+    expect(typeof capturedDeps.run.ensureClone).toBe('function')
+
+    // #when — invoke the ensureClone function with owner/repo
+    await capturedDeps.run.ensureClone('acme', 'widget')
+
+    // #then — ensureWorkspaceClone was called with the correct owner, repo, and non-null clients
+    expect(ensureWorkspaceCloneMock).toHaveBeenCalledOnce()
+    const callArg = ensureWorkspaceCloneMock.mock.calls[0]?.[0]
+    expect(callArg).toBeDefined()
+    if (callArg === undefined) throw new Error('ensureWorkspaceClone was not called')
+    expect(callArg.owner).toBe('acme')
+    expect(callArg.repo).toBe('widget')
+    // appClient and workspaceClient must be the program-created instances (not null/undefined)
+    expect(callArg.appClient).toBeDefined()
+    expect(callArg.workspaceClient).toBeDefined()
+    // logger must be provided (adapter from GatewayLogger to EnsureCloneDeps logger)
+    expect(callArg.logger).toBeDefined()
+    expect(typeof callArg.logger.info).toBe('function')
+    expect(typeof callArg.logger.warn).toBe('function')
+    expect(typeof callArg.logger.error).toBe('function')
   })
 
   it('announce disabled: client events (messageCreate/interactionCreate) are still wired', async () => {

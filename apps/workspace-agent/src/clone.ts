@@ -256,10 +256,77 @@ async function executeCloneInner(
   try {
     // Ensure the owner dir exists.
     await mkdir(join(reposRoot, owner), {recursive: true, mode: 0o755})
-    // Idempotency: if the destination already exists, return 409.
+    // Idempotency: if the destination already exists, verify it is a usable git
+    // checkout before returning repo-exists. An empty or corrupt directory must
+    // not be treated as a successful prior clone — fail closed instead.
     try {
-      await realpath(destPath)
-      // If realpath succeeds, the path exists.
+      const existingResolved = await realpath(destPath)
+      // Symlink defense: verify the existing path is still within the repos root.
+      if (existingResolved.startsWith(`${reposRoot}/`) === false && existingResolved !== reposRoot) {
+        // Path escaped the workspace — reject without returning repo-exists.
+        return {
+          response: {ok: false, error: 'path-escaped-workspace'},
+          statusCode: 500,
+        }
+      }
+      // Verify it is a usable non-bare worktree with a resolvable HEAD commit.
+      // Two checks are required:
+      //   1. rev-parse --is-inside-work-tree must output exactly "true" — bare repos
+      //      and non-git directories both fail this check.
+      //   2. rev-parse --verify HEAD^{commit} must succeed — proves HEAD resolves to
+      //      a real commit object (not an empty/unborn branch).
+      // Use a minimal env (no GITHUB_TOKEN) for these local-only checks.
+      // Pass controller.signal so hung validation does not hold locks past timeout.
+      const localEnv: Record<string, string> = {
+        GIT_TRACE: '0',
+        GIT_TRACE_PACKET: '0',
+        GIT_TRACE_PERFORMANCE: '0',
+        GIT_CURL_VERBOSE: '0',
+        HOME: process.env.HOME ?? '/root',
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+      }
+      try {
+        const {stdout: insideWorkTree} = await execFileFn(
+          'git',
+          ['-C', existingResolved, 'rev-parse', '--is-inside-work-tree'],
+          {env: localEnv, signal: controller.signal},
+        )
+        if (insideWorkTree.trim() !== 'true') {
+          // Not inside a work tree (e.g. bare repo). Fail closed.
+          return {
+            response: {ok: false, error: 'head-resolution-failed'},
+            statusCode: 500,
+          }
+        }
+      } catch {
+        // rev-parse failed — directory exists but is not a valid git repo.
+        // Fail closed: do not return repo-exists for a non-git directory.
+        return {
+          response: {ok: false, error: 'head-resolution-failed'},
+          statusCode: 500,
+        }
+      }
+      try {
+        const {stdout: headCommit} = await execFileFn(
+          'git',
+          ['-C', existingResolved, 'rev-parse', '--verify', 'HEAD^{commit}'],
+          {env: localEnv, signal: controller.signal},
+        )
+        if (headCommit.trim().length === 0) {
+          // Empty output — unborn branch or corrupt checkout. Fail closed.
+          return {
+            response: {ok: false, error: 'head-resolution-failed'},
+            statusCode: 500,
+          }
+        }
+      } catch {
+        // HEAD^{commit} failed — unborn branch or corrupt checkout. Fail closed.
+        return {
+          response: {ok: false, error: 'head-resolution-failed'},
+          statusCode: 500,
+        }
+      }
+      // Valid non-bare worktree with resolvable HEAD confirmed — return repo-exists.
       return {
         response: {ok: false, error: 'repo-exists'},
         statusCode: 409,
@@ -373,7 +440,82 @@ async function executeCloneInner(
       const raw = error instanceof Error ? error.message : String(error)
       const scrubbed = scrubCredentials(raw)
       // Check if dest appeared concurrently (race with another request that won the lock).
+      // IMPORTANT: do NOT return repo-exists without validating the destination is a usable
+      // git checkout. An empty or corrupt directory at destPath must not be treated as a
+      // successful prior clone — fail closed instead.
       if (scrubbed.includes('ENOTEMPTY') || scrubbed.includes('EEXIST')) {
+        // Validate the race destination using the same logic as the initial existing-path check.
+        let raceResolved: string
+        try {
+          raceResolved = await realpath(destPath)
+        } catch {
+          // Cannot resolve the path — treat as a failed clone, not repo-exists.
+          return {
+            response: {ok: false, error: 'clone-failed'},
+            statusCode: 500,
+          }
+        }
+        // Symlink defense: verify the race destination is still within the repos root.
+        if (raceResolved.startsWith(`${reposRoot}/`) === false && raceResolved !== reposRoot) {
+          return {
+            response: {ok: false, error: 'path-escaped-workspace'},
+            statusCode: 500,
+          }
+        }
+        // Verify it is a usable non-bare worktree with a resolvable HEAD commit.
+        // Same two-step check as the initial existing-path validation:
+        //   1. rev-parse --is-inside-work-tree must output exactly "true".
+        //   2. rev-parse --verify HEAD^{commit} must succeed.
+        // Pass controller.signal so hung validation does not hold locks past timeout.
+        const localEnv: Record<string, string> = {
+          GIT_TRACE: '0',
+          GIT_TRACE_PACKET: '0',
+          GIT_TRACE_PERFORMANCE: '0',
+          GIT_CURL_VERBOSE: '0',
+          HOME: process.env.HOME ?? '/root',
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+        }
+        try {
+          const {stdout: insideWorkTree} = await execFileFn(
+            'git',
+            ['-C', raceResolved, 'rev-parse', '--is-inside-work-tree'],
+            {env: localEnv, signal: controller.signal},
+          )
+          if (insideWorkTree.trim() !== 'true') {
+            // Not inside a work tree (e.g. bare repo). Fail closed.
+            return {
+              response: {ok: false, error: 'clone-failed'},
+              statusCode: 500,
+            }
+          }
+        } catch {
+          // rev-parse failed — directory exists but is not a valid git repo. Fail closed.
+          return {
+            response: {ok: false, error: 'clone-failed'},
+            statusCode: 500,
+          }
+        }
+        try {
+          const {stdout: raceHeadCommit} = await execFileFn(
+            'git',
+            ['-C', raceResolved, 'rev-parse', '--verify', 'HEAD^{commit}'],
+            {env: localEnv, signal: controller.signal},
+          )
+          if (raceHeadCommit.trim().length === 0) {
+            // Empty output — unborn branch or corrupt checkout. Fail closed.
+            return {
+              response: {ok: false, error: 'clone-failed'},
+              statusCode: 500,
+            }
+          }
+        } catch {
+          // HEAD^{commit} failed — unborn branch or corrupt checkout. Fail closed.
+          return {
+            response: {ok: false, error: 'clone-failed'},
+            statusCode: 500,
+          }
+        }
+        // Valid non-bare worktree with resolvable HEAD confirmed — return repo-exists.
         return {
           response: {ok: false, error: 'repo-exists'},
           statusCode: 409,

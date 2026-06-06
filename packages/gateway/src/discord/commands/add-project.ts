@@ -309,7 +309,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   }
   if (existingResult.data !== null) {
     await interaction.editReply({
-      content: `\`${owner}/${repo}\` is already bound to #${existingResult.data.channelName}. Bindings cannot be moved in v1. To rebind, manually delete the S3 key \`bindings/${owner}/${repo}/repo.json\` and retry.`,
+      content: [
+        `\`${owner}/${repo}\` is already set up in <#${existingResult.data.channelId}>.`,
+        `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
+      ].join(' '),
     })
     return
   }
@@ -322,8 +325,9 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
       })
     } else {
+      // Do NOT surface authResult.error.message — it may contain tokens or internal details.
       await interaction.editReply({
-        content: `GitHub App authentication failed: ${authResult.error.message}`,
+        content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
       })
     }
     logger.warn('add-project: app auth failed', {
@@ -393,8 +397,14 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         }
         if (existing.data !== null) {
           // Genuinely already bound — redirect to the bound channel. Nothing to resume.
+          // Include the same recovery guidance as the PRE_FLIGHT already-bound path:
+          // if the workspace was recreated, the user can repair the missing checkout
+          // by @mentioning fro-bot in the bound channel.
           await interaction.editReply({
-            content: `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
+            content: [
+              `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
+              `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
+            ].join(' '),
           })
           return
         }
@@ -406,8 +416,9 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         logger.info('add-project phase', {phase: 'CLONING', outcome: 'resumed', owner, repo, correlationId})
         // fall through — do NOT return
       } else {
+        // Do NOT surface the internal code — it may confuse users and leaks implementation details.
         await interaction.editReply({
-          content: `Clone failed (${code}). Check workspace-agent logs for details.`,
+          content: `Clone failed. Check workspace-agent logs for details and retry.`,
         })
         return
       }
@@ -421,7 +432,8 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       })
       return
     } else {
-      await interaction.editReply({content: `Clone failed (${errorKind}). Check workspace-agent connectivity.`})
+      // Do NOT surface the internal errorKind — it leaks implementation details.
+      await interaction.editReply({content: `Clone failed. Check workspace-agent connectivity and retry.`})
       return
     }
   } else {
@@ -445,18 +457,22 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
 
   // Defensive permission re-check
   if (!botHasRequiredPermissions(interaction.appPermissions)) {
-    logger.warn('add-project: permissions revoked between pre-flight and channel creation', {correlationId, phase})
+    logger.warn('add-project: permissions revoked between pre-flight and channel creation', {
+      correlationId,
+      phase,
+      workspacePath,
+    })
     await interaction.editReply({
-      content: `fro-bot lost **Manage Channels** permission. Clone is preserved at \`${workspacePath}\`. Re-grant permissions and retry.`,
+      content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
     })
     return
   }
 
   // Interaction window guard
   if (Date.now() - startTime > INTERACTION_WINDOW_MS) {
-    logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo})
+    logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo, workspacePath})
     await interaction.editReply({
-      content: `Interaction window expired. Clone preserved at \`${workspacePath}\`. Retry the command.`,
+      content: `Interaction window expired. The clone is preserved — retry the command.`,
     })
     return
   }
@@ -483,8 +499,9 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`,
       })
     } else {
+      // Do NOT surface channelResult.error.message — it may contain internal Discord API details.
       await interaction.editReply({
-        content: `Failed to create channel: ${channelResult.error.message}`,
+        content: `Failed to create channel. Check fro-bot's permissions and retry.`,
       })
     }
     return
@@ -536,9 +553,18 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
       })
     } else if ('code' in error && error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
-      // TypeScript narrows error to PartialWriteError via the discriminant above
+      // TypeScript narrows error to PartialWriteError via the discriminant above.
+      // Log the S3 keys for operator recovery; do NOT surface them in the Discord reply.
+      logger.error('add-project: partial write — operator action required', {
+        correlationId,
+        phase,
+        owner,
+        repo,
+        primaryKey: 'primaryKey' in error ? error.primaryKey : undefined,
+        indexKey: 'indexKey' in error ? error.indexKey : undefined,
+      })
       await interaction.editReply({
-        content: `Partial write error: primary binding written but index failed. Manual S3 cleanup required:\n- Primary: \`${error.primaryKey}\`\n- Index: \`${error.indexKey}\``,
+        content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
       })
     } else {
       await interaction.editReply({

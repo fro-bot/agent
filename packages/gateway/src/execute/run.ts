@@ -1,9 +1,11 @@
-import type {CoordinationConfig} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
+import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
+import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
@@ -42,6 +44,22 @@ export interface RunMentionDeps {
    * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
    */
   readonly approvalMode: 'approval-required'
+  /**
+   * Ensure the workspace checkout exists for the given owner/repo.
+   * Called after the concurrency gate acquires a slot, before readyz/execution.
+   * Injected so tests can stub it without live GitHub/workspace calls.
+   *
+   * Returns ok(path) on success (fresh clone or repo-exists recovery).
+   * Returns err(EnsureCloneFailure) on auth/clone/network failure.
+   */
+  readonly ensureClone: (owner: string, repo: string) => Promise<Result<string, EnsureCloneFailure>>
+  /**
+   * Workspace readiness check. Called after ensure-clone, before execution.
+   * Injected so tests can stub it without a live workspace.
+   *
+   * Fail-closed: any error result or thrown exception → treat as not-ready.
+   */
+  readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
 }
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -117,7 +135,7 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  */
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, logger} = deps
-  const {approvalRegistry, approvalMode} = deps
+  const {approvalRegistry, approvalMode, ensureClone, readyz} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
@@ -127,6 +145,9 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   const runStartMs = Date.now()
 
   // ── Concurrency cap + per-channel in-flight guard ──────────
+  // IMPORTANT: ensureClone and readyz are called AFTER this gate so that
+  // same-channel mention storms do not each mint GitHub App tokens or call
+  // workspace clone before the busy/cap rejection fires.
 
   const slotResult = concurrency.tryAcquire(channelId)
 
@@ -142,6 +163,48 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
 
   // Slot acquired — MUST release in outer finally
   try {
+    // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
+    // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
+    // Placed after the concurrency gate so duplicate mentions are rejected before any
+    // GitHub App token is minted or workspace clone is attempted.
+    const ensureCloneResult = await ensureClone(binding.owner, binding.repo)
+    if (ensureCloneResult.success === false) {
+      logger.warn(
+        {
+          channelId,
+          owner: binding.owner,
+          repo: binding.repo,
+          failureKind: ensureCloneResult.error.kind,
+        },
+        'run: workspace clone unavailable — aborting',
+      )
+      await safeReply(message, 'The workspace is not available right now. Please try again later.')
+      return
+    }
+
+    // Use the ensured (canonical) path from ensureClone, not the potentially stale
+    // workspacePath stored in the binding (e.g. after container recreation).
+    const bindingWithEnsuredPath = {...binding, workspacePath: ensureCloneResult.data}
+
+    // ── Workspace readiness gate ──────────────────────────────────────────────────────────────
+    // Fail-closed: any error result or thrown exception → treat as not-ready.
+    // This prevents creating a thread, acquiring a lock, or creating run-state
+    // for a workspace that is not yet serving OpenCode.
+    let workspaceReady = false
+    try {
+      const readyzResult = await readyz()
+      workspaceReady = readyzResult.success === true && readyzResult.data.ready === true
+    } catch {
+      // Thrown exception (e.g. timeout) → fail closed
+      workspaceReady = false
+    }
+
+    if (workspaceReady === false) {
+      logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
+      await safeReply(message, 'The workspace is not reachable right now. Please try again later.')
+      return
+    }
+
     // ── Create response thread ─────────────────────────────────────────────────────────────────
 
     const runId = crypto.randomUUID()
@@ -244,8 +307,8 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       sink = createDiscordStreamSink(thread, {logger})
       const promptText = buildDiscordPrompt({
         messageText: message.content,
-        owner: binding.owner,
-        repo: binding.repo,
+        owner: bindingWithEnsuredPath.owner,
+        repo: bindingWithEnsuredPath.repo,
         botUserId,
       })
 
@@ -309,7 +372,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
             requestID,
             sessionID,
             channelID: rawThread.id,
-            directory: binding.workspacePath,
+            directory: bindingWithEnsuredPath.workspacePath,
             request,
             effects: {postReply: postReplyForRequest},
             deadlineMs: approvalDeadlineMs,
@@ -387,7 +450,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       try {
         await runOpenCodeCore({
           handle,
-          directory: binding.workspacePath,
+          directory: bindingWithEnsuredPath.workspacePath,
           promptText,
           sink,
           signal: timeoutSignal,

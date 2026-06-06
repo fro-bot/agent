@@ -24,6 +24,7 @@ import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
+import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
 // ---------------------------------------------------------------------------
 // Pure helper — builds the coordination config from the shared S3 adapter and
@@ -276,10 +277,27 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           logger,
           approvalRegistry,
           approvalMode: config.approvalMode,
+          // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
+          // Placed inside run so it is called after the concurrency gate, not before.
+          readyz: async () => workspaceClient.readyz(),
+          // Ensure workspace checkout exists. Called after the concurrency gate so
+          // same-channel mention storms do not each mint GitHub App tokens before
+          // the busy/cap rejection fires. Adapts GatewayLogger (context-first) to
+          // the EnsureCloneDeps logger (message-first) inline.
+          ensureClone: async (owner: string, repo: string) =>
+            ensureWorkspaceClone({
+              owner,
+              repo,
+              appClient,
+              workspaceClient,
+              logger: {
+                info: (msg, meta) => logger.info(meta ?? {}, msg),
+                warn: (msg, meta) => logger.warn(meta ?? {}, msg),
+                error: (msg, meta) => logger.error(meta ?? {}, msg),
+              },
+            }),
         },
         logger,
-        // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
-        readyz: async () => workspaceClient.readyz(),
       }
 
       const runPromise: Promise<void> = Effect.runPromise(handleMention(message, client.user.id, mentionDeps)).catch(

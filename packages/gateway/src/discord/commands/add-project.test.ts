@@ -379,8 +379,91 @@ describe('executeAddProject', () => {
       // #when
       await run(interaction, deps)
 
-      // #then
-      expect(lastEditReplyContent(editReply)).toContain('existing-channel')
+      // #then — reply mentions the bound channel by Discord mention token
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('<#ch-existing>')
+      // #and — reply does NOT instruct the user to delete S3 keys
+      expect(reply).not.toContain('S3')
+      expect(reply).not.toContain('delete')
+      expect(reply).not.toContain('bindings/')
+    })
+
+    it('already-bound reply tells user to mention Fro Bot in the bound channel to repair a missing checkout', async () => {
+      // #given — repo is already bound; user may be hitting this after workspace volume was recreated
+      const userId = uniqueUserId()
+      const existingBinding = {
+        owner: 'testowner',
+        repo: 'testrepo',
+        channelId: 'ch-existing',
+        channelName: 'existing-channel',
+        workspacePath: '/workspace/repos/testowner/testrepo',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        createdByDiscordId: 'user-old',
+      }
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(existingBinding))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — reply points to the bound channel with exact Discord mention token
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('<#ch-existing>')
+      // #and — reply explains the missing/recreated checkout context
+      expect(reply.toLowerCase()).toMatch(/recreated|missing|checkout/)
+      // #and — reply names Fro Bot as the repair mechanism (exact @mention fro-bot token)
+      expect(reply).toContain('@mention fro-bot')
+      // #and — reply says repair happens automatically (not manual steps)
+      expect(reply.toLowerCase()).toContain('automatically')
+    })
+
+    it('already-bound reply does not contain S3 deletion guidance', async () => {
+      // #given — repo is already bound
+      const userId = uniqueUserId()
+      const existingBinding = {
+        owner: 'testowner',
+        repo: 'testrepo',
+        channelId: 'ch-existing',
+        channelName: 'existing-channel',
+        workspacePath: '/workspace/repos/testowner/testrepo',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        createdByDiscordId: 'user-old',
+      }
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(existingBinding))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — no S3 deletion instructions in any reply
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('S3 key')
+        expect(content).not.toContain('manually delete')
+        expect(content).not.toContain('bindings/')
+      }
+    })
+
+    it('binding store failure during pre-flight still fails closed and does not attempt clone or recovery', async () => {
+      // #given — binding store returns an error result (not null, not a binding)
+      const userId = uniqueUserId()
+      const storeError = new Error('S3 timeout')
+      const getBindingByRepo = vi.fn().mockResolvedValue(err(storeError))
+      const clone = vi.fn()
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+        workspaceClient: makeWorkspaceClient({clone}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — fails closed with internal error message
+      expect(lastEditReplyContent(editReply)).toContain('Internal error checking existing bindings')
+      // #and — clone was never called (no recovery attempted)
+      expect(clone).not.toHaveBeenCalled()
     })
   })
 
@@ -411,16 +494,39 @@ describe('executeAddProject', () => {
   })
 
   describe('CLONING: workspace-agent errors', () => {
-    const cloneErrorCases: {code: string; expectedFragment: string}[] = [
-      {code: 'clone-failed', expectedFragment: 'clone-failed'},
-      {code: 'disk-full', expectedFragment: 'out of space'},
-      {code: 'enospc', expectedFragment: 'out of space'},
-      {code: 'head-resolution-failed', expectedFragment: 'head-resolution-failed'},
-      {code: 'clone-timeout', expectedFragment: 'clone-timeout'},
+    // Internal clone error codes must NOT leak verbatim into Discord replies.
+    // Each case asserts: (a) the reply is non-empty, (b) the raw internal code
+    // does NOT appear verbatim, and (c) the reply is a coarse user-facing message.
+    const cloneErrorCases: {code: string; mustNotContain: string[]; mustContain: string}[] = [
+      {
+        code: 'clone-failed',
+        mustNotContain: ['clone-failed'],
+        mustContain: 'Clone failed',
+      },
+      {
+        code: 'disk-full',
+        mustNotContain: ['disk-full'],
+        mustContain: 'out of space',
+      },
+      {
+        code: 'enospc',
+        mustNotContain: ['enospc'],
+        mustContain: 'out of space',
+      },
+      {
+        code: 'head-resolution-failed',
+        mustNotContain: ['head-resolution-failed'],
+        mustContain: 'Clone failed',
+      },
+      {
+        code: 'clone-timeout',
+        mustNotContain: ['clone-timeout'],
+        mustContain: 'Clone failed',
+      },
     ]
 
-    for (const {code, expectedFragment} of cloneErrorCases) {
-      it(`handles clone-error code: ${code}`, async () => {
+    for (const {code, mustNotContain, mustContain} of cloneErrorCases) {
+      it(`clone-error code '${code}' produces a coarse reply without leaking the internal code`, async () => {
         // #given
         const userId = uniqueUserId()
         const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code}))
@@ -430,12 +536,21 @@ describe('executeAddProject', () => {
         // #when
         await run(interaction, deps)
 
-        // #then
-        expect(lastEditReplyContent(editReply)).toContain(expectedFragment)
+        // #then — reply is non-empty
+        const reply = lastEditReplyContent(editReply)
+        expect(reply.length).toBeGreaterThan(0)
+
+        // #and — internal code does NOT appear verbatim in the Discord reply
+        for (const forbidden of mustNotContain) {
+          expect(reply).not.toContain(forbidden)
+        }
+
+        // #and — reply contains the expected coarse user-facing fragment
+        expect(reply).toContain(mustContain)
       })
     }
 
-    it('handles timeout from workspace client', async () => {
+    it('handles timeout from workspace client with coarse reply (no internal kind leaked)', async () => {
       // #given
       const userId = uniqueUserId()
       const clone = vi.fn().mockResolvedValue(err({kind: 'timeout'}))
@@ -445,11 +560,13 @@ describe('executeAddProject', () => {
       // #when
       await run(interaction, deps)
 
-      // #then
-      expect(lastEditReplyContent(editReply)).toContain('timed out')
+      // #then — coarse reply; internal kind 'timeout' must not appear verbatim
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('timed out')
+      expect(reply).not.toContain("kind: 'timeout'")
     })
 
-    it('handles response-mismatch with internal error message', async () => {
+    it('handles response-mismatch with coarse internal error message (no raw error detail)', async () => {
       // #given
       const userId = uniqueUserId()
       const clone = vi.fn().mockResolvedValue(err({kind: 'response-mismatch'}))
@@ -459,8 +576,48 @@ describe('executeAddProject', () => {
       // #when
       await run(interaction, deps)
 
-      // #then
-      expect(lastEditReplyContent(editReply)).toContain('Internal error')
+      // #then — coarse reply; no raw error detail
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('Internal error')
+      expect(reply).not.toContain('response-mismatch')
+    })
+
+    it('generic auth failure during clone does not leak raw error.message to Discord', async () => {
+      // #given — authForRepo returns a generic error (not AppNotInstalledError)
+      const userId = uniqueUserId()
+      const internalAuthDetail = 'JWT signature verification failed: secret-key-abc'
+      const authForRepo = vi.fn().mockResolvedValue(err(new Error(internalAuthDetail)))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({appClient: makeAppClient({authForRepo})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — raw error.message must NOT appear in the Discord reply
+      const reply = lastEditReplyContent(editReply)
+      expect(reply.length).toBeGreaterThan(0)
+      expect(reply).not.toContain(internalAuthDetail)
+      expect(reply).not.toContain('JWT')
+      expect(reply).not.toContain('secret-key-abc')
+    })
+
+    it('channel creation failure does not leak raw Discord error.message to Discord reply', async () => {
+      // #given — channel creation throws a generic error (not a known Discord code)
+      const userId = uniqueUserId()
+      const internalChannelDetail = 'Internal Discord API error: shard-42 overloaded'
+      const channelError = new Error(internalChannelDetail)
+      const guild = makeGuild('bot-user-id', true, [], channelError)
+      const {interaction, editReply} = makeInteraction({guild, userId})
+      const deps = makeDeps()
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — raw error.message must NOT appear in the Discord reply
+      const reply = lastEditReplyContent(editReply)
+      expect(reply.length).toBeGreaterThan(0)
+      expect(reply).not.toContain(internalChannelDetail)
+      expect(reply).not.toContain('shard-42')
     })
   })
 
@@ -487,6 +644,33 @@ describe('executeAddProject', () => {
 
       // #then — editReply was called (not a crash)
       expect(editReply).toHaveBeenCalled()
+    })
+
+    it('permission-revoked reply does not expose absolute workspace filesystem paths', async () => {
+      // #given — appPermissions.has returns true for first two calls (PRE_FLIGHT), false thereafter
+      // This simulates permissions being revoked after clone completes but before channel creation.
+      const userId = uniqueUserId()
+      const appPermissions = {
+        has: vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false),
+      }
+      const channelCache = {
+        filter: () => ({find: () => undefined, some: () => false}),
+      }
+      const create = vi.fn().mockResolvedValue(makeTextChannel().channel)
+      const guild = {
+        members: {fetch: vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(true)}})},
+        channels: {cache: channelCache, create},
+      } as unknown as Guild
+      const {interaction, editReply} = makeInteraction({guild, userId, appPermissions})
+      const deps = makeDeps()
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — no absolute filesystem paths in the Discord reply
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('/workspace/repos')
+      }
     })
   })
 
@@ -520,7 +704,7 @@ describe('executeAddProject', () => {
   })
 
   describe('WRITING_BINDING: PartialWriteError', () => {
-    it('reports partial write error with recovery instructions', async () => {
+    it('reports partial write error with coarse user-facing message (no S3 keys leaked)', async () => {
       // #given
       const userId = uniqueUserId()
       const {channel} = makeTextChannel('testrepo')
@@ -537,8 +721,38 @@ describe('executeAddProject', () => {
       // #when
       await run(interaction, deps)
 
-      // #then
-      expect(lastEditReplyContent(editReply)).toContain('Partial write')
+      // #then — user-facing reply mentions partial write but does NOT expose S3 keys or paths
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('Partial write')
+      // S3 internal keys must NOT appear in the Discord reply
+      expect(reply).not.toContain('bindings/testowner')
+      expect(reply).not.toContain('bindings/by-channel')
+      expect(reply).not.toContain('primaryKey')
+      expect(reply).not.toContain('indexKey')
+      expect(reply).not.toContain('S3')
+    })
+
+    it('partial write error reply does not expose absolute workspace filesystem paths', async () => {
+      // #given — partial write error after a fresh clone (workspacePath is set)
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const partialWriteError = Object.assign(new Error('Partial write'), {
+        code: 'BINDING_PARTIAL_WRITE_ERROR',
+        primaryKey: 'bindings/testowner/testrepo/repo.json',
+        indexKey: 'bindings/by-channel/ch-123.json',
+      })
+      const createBinding = vi.fn().mockResolvedValue(err(partialWriteError))
+      const {interaction, editReply} = makeInteraction({guild, userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({createBinding})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — no absolute filesystem paths in any reply
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('/workspace/repos')
+      }
     })
   })
 
@@ -743,6 +957,45 @@ describe('executeAddProject', () => {
       for (const content of allEditReplies(editReply)) {
         expect(content).not.toContain('rm -rf')
       }
+    })
+
+    it('repo-exists + binding found → reply includes missing checkout / repair / automatic recovery guidance', async () => {
+      // #given — clone fails with repo-exists; bindings store returns existing binding
+      // This path is hit when workspace was recreated and user tries add-project again.
+      // The reply must tell the user how to repair the missing checkout automatically.
+      const userId = uniqueUserId()
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'repo-exists'}))
+      const existingBinding = {
+        owner: 'testowner',
+        repo: 'testrepo',
+        channelId: 'ch-bound-456',
+        channelName: 'testrepo',
+        workspacePath: '/workspace/repos/testowner/testrepo',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        createdByDiscordId: 'user-original',
+      }
+      const getBindingByRepo = vi.fn().mockResolvedValueOnce(ok(null)).mockResolvedValue(ok(existingBinding))
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({
+        workspaceClient: makeWorkspaceClient({clone}),
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — reply points to the bound channel with exact Discord mention token
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).toContain('<#ch-bound-456>')
+      // #and — reply explains the missing/recreated checkout context
+      expect(reply.toLowerCase()).toMatch(/recreated|missing|checkout/)
+      // #and — reply names Fro Bot as the repair mechanism (exact @mention fro-bot token)
+      expect(reply).toContain('@mention fro-bot')
+      // #and — reply says repair happens automatically (not manual steps)
+      expect(reply.toLowerCase()).toContain('automatically')
+      // #and — no S3 deletion instructions
+      expect(reply).not.toContain('rm -rf')
+      expect(reply).not.toContain('S3')
     })
 
     it('repo-exists + NO binding → RESUMES: proceeds to channel creation and binding write', async () => {

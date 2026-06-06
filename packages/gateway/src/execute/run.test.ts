@@ -169,6 +169,24 @@ function makeDefaultConcurrency() {
   }
 }
 
+function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
+  return result === 'success'
+    ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/acme/widget'})
+    : vi.fn().mockResolvedValue({
+        success: false as const,
+        error: {kind: 'workspace-failure' as const, workspaceKind: 'network-error' as const},
+      })
+}
+
+function makeReadyzFn(result: 'ready' | 'not-ready' | 'throws' = 'ready') {
+  if (result === 'throws') {
+    return vi.fn().mockRejectedValue(new Error('readyz threw'))
+  }
+  return result === 'ready'
+    ? vi.fn().mockResolvedValue({success: true as const, data: {ready: true, opencode: 'ready'}})
+    : vi.fn().mockResolvedValue({success: true as const, data: {ready: false, opencode: 'starting'}})
+}
+
 function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
   return {
     coordinationConfig: {} as CoordinationConfig,
@@ -181,6 +199,8 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     approvalMode: overrides.approvalMode ?? 'approval-required',
+    ensureClone: overrides.ensureClone ?? makeEnsureCloneFn('success'),
+    readyz: overrides.readyz ?? makeReadyzFn('ready'),
     ...overrides,
   }
 }
@@ -316,6 +336,254 @@ describe('runMention', () => {
       expect(call.content).toContain('already a task')
       expect(call.allowedMentions).toEqual({parse: []})
       expect(message.startThread).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── Ensure-clone gate (after concurrency, before thread/lock) ──────────
+
+  describe('ensure-clone gate', () => {
+    it('happy path: ensure-clone succeeds → proceeds to thread creation and execution', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ensureClone = makeEnsureCloneFn('success')
+      const deps = makeDeps({ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — ensureClone was called; execution proceeded
+      expect(ensureClone).toHaveBeenCalledWith(OWNER, REPO)
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    })
+
+    it('ensure-clone failure → coarse reply, no thread created, concurrency slot released', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const ensureClone = makeEnsureCloneFn('failure')
+      const releaseFn = vi.fn()
+      const deps = makeDeps({
+        ensureClone,
+        concurrency: {
+          tryAcquire: vi.fn().mockReturnValue('ok'),
+          release: releaseFn,
+          activeCount: vi.fn().mockReturnValue(1),
+          max: 3,
+        },
+      })
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — coarse reply sent via message.reply (no thread yet)
+      expect(message.reply).toHaveBeenCalledOnce()
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        content: string
+        allowedMentions: unknown
+      }
+      expect(call.content).toContain('workspace')
+      expect(call.allowedMentions).toEqual({parse: []})
+      // No thread created
+      expect(message.startThread).not.toHaveBeenCalled()
+      // Concurrency slot released in finally
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+
+    it('ensure-clone failure does not expose internal details in reply', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const ensureClone = vi.fn().mockResolvedValue({
+        success: false as const,
+        error: {kind: 'auth-failure' as const, reason: 'auth-error' as const},
+      })
+      const deps = makeDeps({ensureClone})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — no internal detail in reply
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      expect(call.content).not.toContain('auth')
+      expect(call.content).not.toContain('token')
+      expect(call.content).not.toContain('clone')
+    })
+
+    it('ensure-clone is NOT called when concurrency cap is reached (storm guard)', async () => {
+      // #given — concurrency cap fires before ensure-clone
+      const {runMention} = await import('./run.js')
+      const ensureClone = makeEnsureCloneFn('success')
+      const deps = makeDeps({
+        ensureClone,
+        concurrency: {
+          tryAcquire: vi.fn().mockReturnValue('cap'),
+          release: vi.fn(),
+          activeCount: vi.fn().mockReturnValue(3),
+          max: 3,
+        },
+      })
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — cap reply sent; ensureClone never called
+      expect(message.reply).toHaveBeenCalledOnce()
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      expect(call.content).toContain('capacity')
+      expect(ensureClone).not.toHaveBeenCalled()
+    })
+
+    it('ensure-clone is NOT called when channel is busy (storm guard)', async () => {
+      // #given — busy fires before ensure-clone
+      const {runMention} = await import('./run.js')
+      const ensureClone = makeEnsureCloneFn('success')
+      const deps = makeDeps({
+        ensureClone,
+        concurrency: {
+          tryAcquire: vi.fn().mockReturnValue('busy'),
+          release: vi.fn(),
+          activeCount: vi.fn().mockReturnValue(1),
+          max: 3,
+        },
+      })
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — busy reply sent; ensureClone never called
+      expect(message.reply).toHaveBeenCalledOnce()
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      expect(call.content).toContain('already a task')
+      expect(ensureClone).not.toHaveBeenCalled()
+    })
+
+    it('runOpenCodeCore receives ensured path from ensureClone, not stale binding.workspacePath', async () => {
+      // #given — binding has a stale workspacePath; ensureClone returns the canonical path
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const canonicalPath = '/workspace/canonical/acme/widget'
+      const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: canonicalPath})
+      const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
+      const deps = makeDeps({ensureClone})
+      const msg = makeMessage()
+
+      // #when
+      await runMention(msg, staleBinding, deps)
+
+      // #then — runOpenCodeCore called with the canonical path
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      expect(coreParams.directory).toBe(canonicalPath)
+      expect(coreParams.directory).not.toBe('/old/stale/path')
+    })
+  })
+
+  // ── Readiness gate (after ensure-clone, before thread/lock) ─────────────
+
+  describe('readiness gate', () => {
+    it('happy path: readyz=ready → proceeds to thread creation and execution', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const readyz = makeReadyzFn('ready')
+      const deps = makeDeps({readyz})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — readyz called; execution proceeded
+      expect(readyz).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    })
+
+    it('readyz=not-ready → coarse reply, no thread created, concurrency slot released', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const readyz = makeReadyzFn('not-ready')
+      const releaseFn = vi.fn()
+      const deps = makeDeps({
+        readyz,
+        concurrency: {
+          tryAcquire: vi.fn().mockReturnValue('ok'),
+          release: releaseFn,
+          activeCount: vi.fn().mockReturnValue(1),
+          max: 3,
+        },
+      })
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — coarse reply; no thread
+      expect(message.reply).toHaveBeenCalledOnce()
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        content: string
+        allowedMentions: unknown
+      }
+      expect(call.content).toContain('not reachable')
+      expect(call.allowedMentions).toEqual({parse: []})
+      expect(message.startThread).not.toHaveBeenCalled()
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+
+    it('readyz throws → fail-closed: coarse reply, no thread created', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const readyz = makeReadyzFn('throws')
+      const deps = makeDeps({readyz})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — thrown exception treated as not-ready (fail-closed)
+      expect(message.reply).toHaveBeenCalledOnce()
+      const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+      expect(call.content).toContain('not reachable')
+      expect(message.startThread).not.toHaveBeenCalled()
+    })
+
+    it('readyz is NOT called when ensure-clone fails', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const ensureClone = makeEnsureCloneFn('failure')
+      const readyz = makeReadyzFn('ready')
+      const deps = makeDeps({ensureClone, readyz})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — ensure-clone failed: readyz never called
+      expect(readyz).not.toHaveBeenCalled()
+    })
+
+    it('readyz is NOT called when concurrency cap fires', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const readyz = makeReadyzFn('ready')
+      const deps = makeDeps({
+        readyz,
+        concurrency: {
+          tryAcquire: vi.fn().mockReturnValue('cap'),
+          release: vi.fn(),
+          activeCount: vi.fn().mockReturnValue(3),
+          max: 3,
+        },
+      })
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — cap fires before readyz
+      expect(readyz).not.toHaveBeenCalled()
     })
   })
 
@@ -843,10 +1111,15 @@ describe('runMention', () => {
       expect(deadlineMs).toBeGreaterThan(0)
     })
 
-    it('onPending: posts approval embed+buttons to thread and calls approvalRegistry.register', async () => {
-      // #given
+    it('onPending: posts approval embed+buttons to thread and calls approvalRegistry.register with ensured canonical path', async () => {
+      // #given — binding has a stale workspacePath; ensureClone returns the canonical path.
+      // approvalRegistry.register must receive the canonical path, NOT the stale binding path.
       const {runMention} = await import('./run.js')
       setupHappyPath()
+
+      const canonicalPath = '/workspace/canonical/acme/widget'
+      const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
+      const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: canonicalPath})
 
       const approvalRegistry = makeApprovalRegistry()
       const thread = makeThread()
@@ -854,8 +1127,7 @@ describe('runMention', () => {
       const fakeApprovalMessage = {id: 'msg-approval-1', edit: vi.fn()}
       thread.send.mockResolvedValue(fakeApprovalMessage)
       const message = makeMessage(thread)
-      const deps = makeDeps({approvalRegistry})
-      const binding = makeBinding()
+      const deps = makeDeps({approvalRegistry, ensureClone})
 
       // Capture the onPending callback from coordinator factory
       let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
@@ -870,7 +1142,7 @@ describe('runMention', () => {
       })
 
       // #when — run completes first so coordinator is created
-      await runMention(message, binding, deps)
+      await runMention(message, staleBinding, deps)
 
       expect(capturedOnPending).toBeDefined()
 
@@ -896,13 +1168,17 @@ describe('runMention', () => {
         }),
       )
 
-      // #and — approvalRegistry.register called with correct params
+      // #and — approvalRegistry.register called with the CANONICAL path from ensureClone,
+      // NOT the stale binding.workspacePath
       expect(approvalRegistry.register).toHaveBeenCalledWith(
         expect.objectContaining({
           requestID: 'req-abc-123',
           channelID: thread.id,
-          directory: binding.workspacePath,
+          directory: canonicalPath,
         }),
+      )
+      expect(approvalRegistry.register).not.toHaveBeenCalledWith(
+        expect.objectContaining({directory: '/old/stale/path'}),
       )
     })
 
