@@ -34,6 +34,7 @@ function makeSink(): DiscordStreamSink & {readonly _appended: string[]} {
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: buffer.length}),
     buffered: () => buffer,
     markVisibleOutputSent: vi.fn(),
+    hasVisibleOutput: vi.fn().mockReturnValue(false),
   }
 }
 
