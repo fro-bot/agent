@@ -43,8 +43,8 @@ importers:
         specifier: 4.0.0
         version: 4.0.0
       '@aws-sdk/client-s3':
-        specifier: 3.1059.0
-        version: 3.1059.0
+        specifier: 3.1061.0
+        version: 3.1061.0
       '@bfra.me/es':
         specifier: 0.1.0
         version: 0.1.0
@@ -235,8 +235,8 @@ packages:
     resolution: {integrity: sha512-DFCtlisEuWzw7rESV65jHK7De1QsJZRZgUNJ8ovpmdVaayPrxvmlsAlW8hka9E7f9B31d1T7lHG9oozZf6Bp6w==}
     engines: {node: '>=20.0.0'}
 
-  '@aws-sdk/client-s3@3.1059.0':
-    resolution: {integrity: sha512-bFzCViJh389MmuhiixKJYfp2kBfkLH7My4rkkFeFfIUH+esiWSvyhZ9bvHbkS8C5lnHfBrf8s5a8wLBoA+lezQ==}
+  '@aws-sdk/client-s3@3.1061.0':
+    resolution: {integrity: sha512-ygyRCIkktaDz4/kNzsxhbZqocLwCJV5absi/k7Xd3LThPOmVkid7Nghm/xTW2Yg+vSQIL0yq99oV7u3T+4ZbAQ==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.974.17':
@@ -4652,7 +4652,7 @@ snapshots:
       '@smithy/types': 4.14.3
       tslib: 2.8.1
 
-  '@aws-sdk/client-s3@3.1059.0':
+  '@aws-sdk/client-s3@3.1061.0':
     dependencies:
       '@aws-crypto/sha1-browser': 5.2.0
       '@aws-crypto/sha256-browser': 5.2.0
