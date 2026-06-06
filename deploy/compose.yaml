@@ -237,6 +237,12 @@ services:
       # entrypoint trusts this for git/libcurl and the opencode binary, which
       # read the system store (NODE_EXTRA_CA_CERTS does not cover them).
       - mitmproxy-certs:/run/mitmproxy-certs:ro
+      # workspace-repos: named volume for cloned repository checkouts.
+      # Survives `docker compose up --force-recreate` and daemon upgrades.
+      # WARNING: `docker compose down -v` removes this volume and destroys all
+      # cloned repos. Mentioning Fro Bot in a bound channel after a volume loss
+      # will rehydrate the checkout automatically.
+      - workspace-repos:/workspace/repos
     # Port model:
     #   9100 — Hono API (/healthz, /clone) — sandbox-net only, no host mapping
     #   9200 — OpenCode bearer-token proxy — sandbox-net only, no host mapping
@@ -311,6 +317,9 @@ services:
 volumes:
   # Shared CA cert volume: mitmproxy writes, gateway + workspace read
   mitmproxy-certs:
+  # Cloned repository checkouts — survives container recreation and daemon upgrades.
+  # Destroyed by `docker compose down -v` (same as mitmproxy-certs).
+  workspace-repos:
 
 networks:
   # External-facing network for gateway ↔ Discord/S3
