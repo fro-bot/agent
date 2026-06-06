@@ -2,6 +2,10 @@ packages:
   - apps/*
   - packages/*
 
+allowBuilds:
+  simple-git-hooks: true
+  unrs-resolver: true
+
 autoInstallPeers: true
 
 ignoreWorkspaceRootCheck: true
