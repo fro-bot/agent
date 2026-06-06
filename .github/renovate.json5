@@ -82,7 +82,7 @@
       // with DEFAULT_OPENCODE_VERSION so the baked binary cannot drift.
       customType: 'regex',
       managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
-      matchStrings: ["ARG OPENCODE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      matchStrings: ['ARG OPENCODE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',
@@ -92,7 +92,7 @@
       // ARG in step with DEFAULT_SYSTEMATIC_VERSION.
       customType: 'regex',
       managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
-      matchStrings: ["ARG SYSTEMATIC_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      matchStrings: ['ARG SYSTEMATIC_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
       depNameTemplate: '@fro.bot/systematic',
       datasourceTemplate: 'npm',
     },
@@ -167,7 +167,7 @@
     },
   ],
   postUpgradeTasks: {
-    commands: ['pnpm run bootstrap', 'pnpm run build', 'pnpm run fix'],
+    commands: ['pnpm install', 'pnpm run build', 'pnpm run fix'],
     executionMode: 'branch',
   },
 }
