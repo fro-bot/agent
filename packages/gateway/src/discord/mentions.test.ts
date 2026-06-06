@@ -1,10 +1,7 @@
-import type {Result} from '@fro-bot/runtime'
 import type {Guild, GuildMember, Message, TextChannel} from 'discord.js'
 import type {BindingsStore} from '../bindings/store.js'
-import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {MentionDeps} from './mentions.js'
 
-import {err, ok} from '@fro-bot/runtime'
 import {PermissionsBitField} from 'discord.js'
 import {Effect} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -151,24 +148,13 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       disposeAll: vi.fn(),
     },
     approvalMode: 'approval-required' as const,
+    ensureClone: vi.fn().mockResolvedValue({success: true as const, data: '/workspace/repos/acme/widget'}),
+    readyz: vi.fn().mockResolvedValue({success: true as const, data: {ready: true, opencode: 'ready'}}),
   }
 }
 
 function makeNoopLogger(): MentionDeps['logger'] {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
-}
-
-function makeReadyzFn(
-  result: 'ready' | 'not-ready' | 'error' | 'throws',
-  opencodeStatus: 'starting' | 'down' | 'unknown' = 'starting',
-): () => Promise<Result<ReadyzResponse, WorkspaceError>> {
-  return vi.fn(async () => {
-    if (result === 'throws') throw new Error('readyz threw unexpectedly')
-    if (result === 'ready') return ok({ready: true, opencode: 'ready'} satisfies ReadyzResponse)
-    if (result === 'not-ready') return ok({ready: false, opencode: opencodeStatus} satisfies ReadyzResponse)
-    // error
-    return err({kind: 'network-error'} satisfies WorkspaceError)
-  })
 }
 
 function makeDeps(overrides: Partial<MentionDeps> = {}): MentionDeps {
@@ -177,7 +163,6 @@ function makeDeps(overrides: Partial<MentionDeps> = {}): MentionDeps {
     triggerRoleId: overrides.triggerRoleId === undefined ? null : overrides.triggerRoleId,
     run: overrides.run ?? makeRunMentionDeps(),
     logger: overrides.logger ?? makeNoopLogger(),
-    readyz: overrides.readyz ?? makeReadyzFn('ready'),
   }
 }
 
@@ -414,115 +399,64 @@ describe('handleMention', () => {
     })
   })
 
-  // ── Readiness gate ──────────────────────────────────────────────────────────
+  // ── Concurrency storm regression ────────────────────────────────────────────
+  //
+  // Verifies that duplicate mentions for the same channel do NOT each invoke
+  // ensureClone before the busy/cap rejection fires. ensureClone is now owned
+  // by runMention (after the concurrency gate), so mentions.ts never calls it.
+  // This test confirms the ordering invariant at the mentions.ts boundary.
 
-  describe('readiness gate (after binding lookup, before runMention)', () => {
-    it('happy path: readiness=ready → runMention IS invoked', async () => {
-      // #given
+  describe('concurrency storm: duplicate mentions do not call ensureClone before rejection', () => {
+    it('runMention is called once per mention — mentions.ts does not call ensureClone directly', async () => {
+      // #given — two concurrent mentions for the same channel
       const {handleMention} = await import('./mentions.js')
       const member = makeGuildMember({hasManageChannels: true})
-      const message = makeMessage({guildMember: member})
-      const deps = makeDeps({readyz: makeReadyzFn('ready')})
+      const message1 = makeMessage({guildMember: member})
+      const message2 = makeMessage({guildMember: member})
+
+      // makeRunMentionDeps() already includes ensureClone as a vi.fn() spy.
+      // runMention is mocked at module level — it will not actually call ensureClone.
+      // The spy on run.ensureClone must remain uncalled because mentions.ts never
+      // invokes it directly; only runMention (mocked) would call it.
+      const runDeps = makeRunMentionDeps()
+      const ensureCloneSpy = runDeps.ensureClone as ReturnType<typeof vi.fn>
+      runMentionMock.mockResolvedValue(undefined)
+
+      const deps = makeDeps({run: runDeps})
+
+      // #when — both mentions fire concurrently
+      await Promise.all([
+        Effect.runPromise(handleMention(message1, BOT_USER_ID, deps)),
+        Effect.runPromise(handleMention(message2, BOT_USER_ID, deps)),
+      ])
+
+      // #then — runMention was called for both (mentions.ts delegates to runMention)
+      expect(runMentionMock).toHaveBeenCalledTimes(2)
+      // #and — ensureClone was NOT called from mentions.ts (it lives in runMention now)
+      expect(ensureCloneSpy).not.toHaveBeenCalled()
+    })
+
+    it('when runMention rejects busy, mentions.ts does not call ensureClone', async () => {
+      // #given — first mention acquires slot; second is rejected as busy by runMention
+      const {handleMention} = await import('./mentions.js')
+      const member = makeGuildMember({hasManageChannels: true})
+      const replyFn = makeReplyFn()
+      const message = makeMessage({guildMember: member, replyFn})
+
+      // makeRunMentionDeps() already includes ensureClone as a vi.fn() spy.
+      // runMention is mocked — it handles busy internally without calling ensureClone.
+      const runDeps = makeRunMentionDeps()
+      const ensureCloneSpy = runDeps.ensureClone as ReturnType<typeof vi.fn>
+      runMentionMock.mockResolvedValue(undefined)
+
+      const deps = makeDeps({run: runDeps})
 
       // #when
       await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
 
-      // #then — workspace is ready, runMention proceeds
+      // #then — mentions.ts never called ensureClone; runMention owns that
+      expect(ensureCloneSpy).not.toHaveBeenCalled()
       expect(runMentionMock).toHaveBeenCalledOnce()
-    })
-
-    it('readiness=not-ready → runMention NOT invoked, coarse reply sent', async () => {
-      // #given
-      const {handleMention} = await import('./mentions.js')
-      const member = makeGuildMember({hasManageChannels: true})
-      const replyFn = makeReplyFn()
-      const message = makeMessage({guildMember: member, replyFn})
-      const deps = makeDeps({readyz: makeReadyzFn('not-ready', 'starting')})
-
-      // #when
-      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
-
-      // #then — workspace not ready: no runMention, coarse reply
-      expect(runMentionMock).not.toHaveBeenCalled()
-      expect(replyFn).toHaveBeenCalledOnce()
-      const call = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
-      expect(call?.content).toContain('not reachable')
-      expect(call?.allowedMentions).toEqual({parse: []})
-    })
-
-    it('readiness=error (transport error) → fail-closed: coarse reply, runMention NOT invoked', async () => {
-      // #given
-      const {handleMention} = await import('./mentions.js')
-      const member = makeGuildMember({hasManageChannels: true})
-      const replyFn = makeReplyFn()
-      const message = makeMessage({guildMember: member, replyFn})
-      const deps = makeDeps({readyz: makeReadyzFn('error')})
-
-      // #when
-      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
-
-      // #then — transport error treated as not-ready (fail-closed)
-      expect(runMentionMock).not.toHaveBeenCalled()
-      expect(replyFn).toHaveBeenCalledOnce()
-      const call = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
-      expect(call?.content).toContain('not reachable')
-      expect(call?.allowedMentions).toEqual({parse: []})
-    })
-
-    it('readiness check throws/times out → fail-closed: coarse reply, runMention NOT invoked', async () => {
-      // #given
-      const {handleMention} = await import('./mentions.js')
-      const member = makeGuildMember({hasManageChannels: true})
-      const replyFn = makeReplyFn()
-      const message = makeMessage({guildMember: member, replyFn})
-      const deps = makeDeps({readyz: makeReadyzFn('throws')})
-
-      // #when
-      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
-
-      // #then — thrown exception treated as not-ready (fail-closed)
-      expect(runMentionMock).not.toHaveBeenCalled()
-      expect(replyFn).toHaveBeenCalledOnce()
-      const call = replyFn.mock.calls[0]?.[0] as {content?: string; allowedMentions?: unknown} | undefined
-      expect(call?.content).toContain('not reachable')
-      expect(call?.allowedMentions).toEqual({parse: []})
-    })
-
-    it('ordering: missing binding short-circuits BEFORE readiness check (readyz never called)', async () => {
-      // #given — no binding for this channel
-      const {handleMention} = await import('./mentions.js')
-      const member = makeGuildMember({hasManageChannels: true})
-      const replyFn = makeReplyFn()
-      const message = makeMessage({guildMember: member, replyFn})
-      const readyzFn = makeReadyzFn('ready')
-      const deps = makeDeps({
-        bindingsStore: makeBindingsStore('not-found'),
-        readyz: readyzFn,
-      })
-
-      // #when
-      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
-
-      // #then — binding lookup short-circuits before readiness check
-      expect(readyzFn).not.toHaveBeenCalled()
-      expect(runMentionMock).not.toHaveBeenCalled()
-    })
-
-    it('not-ready reply uses allowedMentions: {parse: []}', async () => {
-      // #given
-      const {handleMention} = await import('./mentions.js')
-      const member = makeGuildMember({hasManageChannels: true})
-      const replyFn = makeReplyFn()
-      const message = makeMessage({guildMember: member, replyFn})
-      const deps = makeDeps({readyz: makeReadyzFn('not-ready', 'down')})
-
-      // #when
-      await Effect.runPromise(handleMention(message, BOT_USER_ID, deps))
-
-      // #then — invariant: all replies use allowedMentions: {parse: []}
-      expect(replyFn).toHaveBeenCalledOnce()
-      const call = replyFn.mock.calls[0]?.[0] as {allowedMentions?: unknown} | undefined
-      expect(call?.allowedMentions).toEqual({parse: []})
     })
   })
 

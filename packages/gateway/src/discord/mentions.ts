@@ -7,6 +7,7 @@
  *   configured trigger role (or guild-level ManageChannels as fallback).
  * - Binding lookup: resolve the repo binding for the source channel.
  * - Hand off to `runMention` in `execute/run.ts` for the full execution lifecycle.
+ *   `runMention` owns: concurrency gate, ensure-clone, readyz, lock, run-state, execution.
  *
  * Security invariants (MUST NOT be weakened):
  * - Authorization gate uses `guild.members.fetch()` (REST) not `members.cache.get()`
@@ -18,12 +19,10 @@
  * - No internal detail (error messages, IDs, paths) is ever posted to Discord.
  */
 
-import type {Result} from '@fro-bot/runtime'
 import type {Guild, Message} from 'discord.js'
 
 import type {BindingsStore} from '../bindings/store.js'
 import type {RunMentionDeps} from '../execute/run.js'
-import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {GatewayLogger} from './client.js'
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
@@ -47,13 +46,6 @@ export interface MentionDeps {
   /** Run-lifecycle deps forwarded verbatim to `runMention`. */
   readonly run: RunMentionDeps
   readonly logger: GatewayLogger
-  /**
-   * Workspace readiness check. Called after binding lookup, before runMention.
-   * Injected so tests can stub it without a live workspace.
-   *
-   * Fail-closed: any error result or thrown exception → treat as not-ready.
-   */
-  readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
 }
 
 // ---------------------------------------------------------------------------
@@ -113,9 +105,14 @@ export async function userIsAuthorized(
  *
  * Returns an `Effect` so the caller (program.ts) can handle failures uniformly.
  * Internal errors are logged; coarse user-visible messages are posted to Discord.
+ *
+ * Ordering: binding lookup → authorization → hand off to runMention.
+ * runMention owns: concurrency gate → ensure-clone → readyz → execution.
+ * This ordering ensures duplicate mentions are rejected by the concurrency gate
+ * before any GitHub App token is minted or workspace clone is attempted.
  */
 export function handleMention(message: Message, botUserId: string, deps: MentionDeps): Effect.Effect<void, Error> {
-  const {bindingsStore, triggerRoleId, run: runDeps, logger, readyz} = deps
+  const {bindingsStore, triggerRoleId, run: runDeps, logger} = deps
 
   // ── Guard 1: Skip if already in a thread ────────────────────────────────
   if (message.channel.isThread()) {
@@ -163,29 +160,9 @@ export function handleMention(message: Message, botUserId: string, deps: Mention
       const binding = bindingResult.data
       logger.info({channelId: message.channel.id, repo: `${binding.owner}/${binding.repo}`}, 'mention: binding found')
 
-      // ── Step 4: Workspace readiness gate ────────────────────────────────
-      // Fail-closed: any error result or thrown exception → treat as not-ready.
-      // This prevents creating a thread, acquiring a lock, or creating run-state
-      // for a workspace that is not yet serving OpenCode.
-      let workspaceReady = false
-      try {
-        const readyzResult = await readyz()
-        workspaceReady = readyzResult.success === true && readyzResult.data.ready === true
-      } catch {
-        // Thrown exception (e.g. timeout) → fail closed
-        workspaceReady = false
-      }
-
-      if (workspaceReady === false) {
-        logger.warn(
-          {channelId: message.channel.id, repo: `${binding.owner}/${binding.repo}`},
-          'mention: workspace not ready — aborting',
-        )
-        await safeReply(message, 'The workspace is not reachable right now. Please try again later.')
-        return
-      }
-
-      // ── Steps 5–11: Execution lifecycle (concurrency + lock + run-state) ─
+      // ── Steps 4–12: Execution lifecycle ─────────────────────────────────
+      // runMention owns: concurrency gate → ensure-clone → readyz → lock → run-state → execution.
+      // Passing the raw binding; runMention will override workspacePath with the ensured path.
       await runMention(message, binding, runDeps)
     },
     catch: (error: unknown) => (error instanceof Error ? error : new Error(String(error))),

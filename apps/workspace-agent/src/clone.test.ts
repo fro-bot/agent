@@ -325,8 +325,9 @@ describe('executeClone — happy path', () => {
 })
 
 describe('executeClone — idempotency (repo-exists)', () => {
-  it('returns 409 repo-exists when destination already exists', async () => {
-    // #given — realpath succeeds on first call (path exists)
+  it('returns 409 repo-exists when destination already exists and is a valid non-bare git checkout', async () => {
+    // #given — realpath succeeds on first call (path exists);
+    // rev-parse --is-inside-work-tree returns "true" and rev-parse --verify HEAD^{commit} succeeds
     vi.resetAllMocks()
     resetCloneSemaphoreForTesting()
     mockMkdir.mockResolvedValue(undefined)
@@ -336,7 +337,13 @@ describe('executeClone — idempotency (repo-exists)', () => {
     fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
     // First realpath call succeeds → path already exists (no ENOENT)
     mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
-    const execFileFn = vi.fn()
+    // Second realpath call (symlink defense after repo-exists check) also succeeds
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+    // Two git validation calls: --is-inside-work-tree → "true", --verify HEAD^{commit} → sha
+    const execFileFn = makeExecFile([
+      {stdout: 'true\n', stderr: ''}, // rev-parse --is-inside-work-tree
+      {stdout: 'abc123def456\n', stderr: ''}, // rev-parse --verify HEAD^{commit}
+    ])
 
     // #when
     const result = await executeClone(VALID_REQUEST, {
@@ -349,8 +356,155 @@ describe('executeClone — idempotency (repo-exists)', () => {
     // #then
     expect(result.statusCode).toBe(409)
     expect(result.response).toEqual({ok: false, error: 'repo-exists'})
-    // No git clone invoked
-    expect(execFileFn).not.toHaveBeenCalled()
+  })
+
+  it('does NOT return repo-exists when destination is a bare repo (--is-inside-work-tree returns false)', async () => {
+    // #given — realpath succeeds (path exists) but --is-inside-work-tree returns "false" (bare repo)
+    vi.resetAllMocks()
+    resetCloneSemaphoreForTesting()
+    mockMkdir.mockResolvedValue(undefined)
+    mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+    mockRename.mockResolvedValue(undefined)
+    mockRm.mockResolvedValue(undefined)
+    fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
+    // First realpath call succeeds → path exists
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+    // --is-inside-work-tree returns "false" → bare repo
+    const execFileFn = makeExecFile([{stdout: 'false\n', stderr: ''}])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — bare repo must NOT return repo-exists; fail closed
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+  })
+
+  it('does NOT return repo-exists when destination exists but is empty (not a git repo)', async () => {
+    // #given — realpath succeeds (path exists) but --is-inside-work-tree fails (empty/non-git dir)
+    vi.resetAllMocks()
+    resetCloneSemaphoreForTesting()
+    mockMkdir.mockResolvedValue(undefined)
+    mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+    mockRename.mockResolvedValue(undefined)
+    mockRm.mockResolvedValue(undefined)
+    fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
+    // First realpath call succeeds → path exists
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+    // --is-inside-work-tree fails → not a git repo
+    const execFileFn = makeExecFile([{error: new Error('fatal: not a git repository')}])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists for a non-git directory
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    // Should fail closed (clone-failed or similar non-success)
+    expect(result.response.ok).toBe(false)
+  })
+
+  it('does NOT return repo-exists when destination exists but HEAD^{commit} returns empty (unborn branch)', async () => {
+    // #given — realpath succeeds (path exists); --is-inside-work-tree returns "true" but
+    // --verify HEAD^{commit} returns empty string (unborn branch / corrupt checkout)
+    vi.resetAllMocks()
+    resetCloneSemaphoreForTesting()
+    mockMkdir.mockResolvedValue(undefined)
+    mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+    mockRename.mockResolvedValue(undefined)
+    mockRm.mockResolvedValue(undefined)
+    fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
+    // First realpath call succeeds → path exists
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+    // --is-inside-work-tree returns "true" but HEAD^{commit} returns empty
+    const execFileFn = makeExecFile([
+      {stdout: 'true\n', stderr: ''}, // --is-inside-work-tree
+      {stdout: '', stderr: ''}, // --verify HEAD^{commit} → empty (unborn branch)
+    ])
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists for an unborn/corrupt checkout
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+  })
+
+  it('passes an AbortSignal to the validation exec calls (timeout signal propagation)', async () => {
+    // #given — realpath succeeds (path exists); capture the signal passed to validation calls
+    vi.resetAllMocks()
+    resetCloneSemaphoreForTesting()
+    mockMkdir.mockResolvedValue(undefined)
+    mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+    mockRename.mockResolvedValue(undefined)
+    mockRm.mockResolvedValue(undefined)
+    fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
+    // First realpath call succeeds → path exists
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    const capturedSignals: (AbortSignal | undefined)[] = []
+    const execFileFn = vi
+      .fn()
+      .mockImplementation(
+        async (_file: string, _args: string[], opts: {env: Record<string, string>; signal?: AbortSignal}) => {
+          capturedSignals.push(opts.signal)
+          return {stdout: 'true\n', stderr: ''}
+        },
+      ) as unknown as ExecFileFn
+
+    // #when
+    await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — the first two calls are the validation calls; both must receive an AbortSignal
+    // (call[0] = --is-inside-work-tree, call[1] = --verify HEAD^{commit})
+    expect(capturedSignals.length).toBeGreaterThanOrEqual(2)
+    expect(capturedSignals[0]).toBeInstanceOf(AbortSignal)
+    expect(capturedSignals[1]).toBeInstanceOf(AbortSignal)
+  })
+
+  it('preserves symlink/root safety: does NOT return repo-exists when resolved path escapes repos root', async () => {
+    // #given — realpath succeeds but resolves to a path outside the repos root (symlink attack)
+    vi.resetAllMocks()
+    resetCloneSemaphoreForTesting()
+    mockMkdir.mockResolvedValue(undefined)
+    mockOpen.mockResolvedValue(makeFakeFileHandle() as unknown as import('node:fs/promises').FileHandle)
+    mockRename.mockResolvedValue(undefined)
+    mockRm.mockResolvedValue(undefined)
+    fakeMkdtempFn.mockResolvedValue(FAKE_ASKPASS_DIR)
+    // First realpath call resolves to a path OUTSIDE the repos root
+    mockRealpath.mockResolvedValueOnce('/etc/passwd')
+    const execFileFn = vi.fn()
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists; path-escaped-workspace or similar failure
+    expect(result.response.ok).toBe(false)
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
   })
 })
 
@@ -609,6 +763,173 @@ describe('executeClone — atomic clone (rename)', () => {
     const tmpRm = rmCalls.find(p => p.includes('.tmp-agent-'))
     expect(tmpRm).toBeDefined()
   })
+
+  it('rename race EEXIST + valid non-bare git checkout at dest → returns repo-exists (409)', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), dest is a valid non-bare git checkout
+    // execFile calls: [clone, --is-inside-work-tree (race dest), --verify HEAD^{commit} (race dest)]
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone
+      {stdout: 'true\n', stderr: ''}, // --is-inside-work-tree (race dest)
+      {stdout: 'abc123def456\n', stderr: ''}, // --verify HEAD^{commit} (race dest)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    // realpath for the race dest resolves successfully within repos root
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — race dest is a valid non-bare git checkout → repo-exists
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'repo-exists'})
+  })
+
+  it('rename race ENOTEMPTY + valid non-bare git checkout at dest → returns repo-exists (409)', async () => {
+    // #given — clone succeeds, rename fails with ENOTEMPTY (race), dest is a valid non-bare git checkout
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone
+      {stdout: 'true\n', stderr: ''}, // --is-inside-work-tree (race dest)
+      {stdout: 'deadbeef1234\n', stderr: ''}, // --verify HEAD^{commit} (race dest)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('ENOTEMPTY: directory not empty'))
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — race dest is a valid non-bare git checkout → repo-exists
+    expect(result.statusCode).toBe(409)
+    expect(result.response).toEqual({ok: false, error: 'repo-exists'})
+  })
+
+  it('rename race EEXIST + dest is a bare repo → does NOT return repo-exists, fails closed', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), but dest is a bare repo
+    // (--is-inside-work-tree returns "false")
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone
+      {stdout: 'false\n', stderr: ''}, // --is-inside-work-tree → bare repo
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — bare repo must NOT return repo-exists; fail closed
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+    expect(result.statusCode).toBe(500)
+  })
+
+  it('rename race EEXIST + dest is empty/non-git → does NOT return repo-exists, fails closed', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), but dest is NOT a git repo
+    // (empty directory — --is-inside-work-tree fails)
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone
+      {error: new Error('fatal: not a git repository')}, // --is-inside-work-tree fails (non-git dest)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists for a non-git directory; fail closed
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+    expect(result.statusCode).toBe(500)
+  })
+
+  it('rename race EEXIST + dest HEAD^{commit} returns empty (unborn branch) → does NOT return repo-exists', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), dest --is-inside-work-tree is "true"
+    // but --verify HEAD^{commit} returns empty (unborn branch / corrupt checkout)
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone
+      {stdout: 'true\n', stderr: ''}, // --is-inside-work-tree → true
+      {stdout: '', stderr: ''}, // --verify HEAD^{commit} → empty (unborn branch)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    mockRealpath.mockResolvedValueOnce(`${TEST_REPOS_ROOT}/fro-bot/agent`)
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists for an unborn/corrupt checkout; fail closed
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+    expect(result.statusCode).toBe(500)
+  })
+
+  it('rename race EEXIST + realpath of dest fails (ENOENT) → does NOT return repo-exists, fails closed', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), but realpath of dest throws ENOENT
+    // (dest disappeared between rename failure and realpath — transient race)
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone (only call; rev-parse never reached)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    // realpath for the race dest throws (dest vanished)
+    mockRealpath.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — must NOT return repo-exists; fail closed
+    expect(result.response).not.toEqual({ok: false, error: 'repo-exists'})
+    expect(result.response.ok).toBe(false)
+    expect(result.statusCode).toBe(500)
+  })
+
+  it('rename race EEXIST + dest realpath escapes repos root → returns path-escaped-workspace', async () => {
+    // #given — clone succeeds, rename fails with EEXIST (race), dest realpath escapes workspace
+    const execFileFn = makeExecFile([
+      {stdout: '', stderr: ''}, // git clone (only call; rev-parse never reached)
+    ])
+    mockRename.mockRejectedValueOnce(new Error('EEXIST: file already exists'))
+    // realpath for the race dest resolves outside the repos root (symlink attack)
+    mockRealpath.mockResolvedValueOnce('/etc/passwd')
+
+    // #when
+    const result = await executeClone(VALID_REQUEST, {
+      execFileFn,
+      reposRoot: TEST_REPOS_ROOT,
+      mkdtempFn: fakeMkdtempFn,
+      options: {timeoutMs: 500},
+    })
+
+    // #then — path-escaped-workspace, not repo-exists
+    expect(result.response).toEqual({ok: false, error: 'path-escaped-workspace'})
+    expect(result.statusCode).toBe(500)
+  })
 })
 
 describe('executeClone — concurrency (overloaded)', () => {
@@ -810,11 +1131,11 @@ describe('clone.ts — no module-level SIGTERM/SIGINT handlers', () => {
 })
 
 describe('executeClone — rev-parse env omits GITHUB_TOKEN (Fix #2)', () => {
-  it('does not pass GITHUB_TOKEN to rev-parse execFile call', async () => {
-    // #given
+  it('does not pass GITHUB_TOKEN to the post-clone rev-parse HEAD call', async () => {
+    // #given — happy path: clone + post-clone rev-parse HEAD (no existing-path check)
     const execFileFn = makeExecFile([
       {stdout: '', stderr: ''}, // git clone
-      {stdout: 'abc123def456\n', stderr: ''}, // git rev-parse HEAD
+      {stdout: 'abc123def456\n', stderr: ''}, // git rev-parse HEAD (post-clone)
     ])
 
     // #when
@@ -825,7 +1146,7 @@ describe('executeClone — rev-parse env omits GITHUB_TOKEN (Fix #2)', () => {
       options: {timeoutMs: 500},
     })
 
-    // #then — second call is rev-parse; its env must NOT contain GITHUB_TOKEN
+    // #then — second call is the post-clone rev-parse HEAD; its env must NOT contain GITHUB_TOKEN
     const revParseCall = execFileFn.mock.calls[1] as [string, string[], {env: Record<string, string>}] | undefined
     expect(revParseCall).toBeDefined()
     expect(revParseCall![1]).toContain('rev-parse')
@@ -876,8 +1197,11 @@ describe('executeClone — per-repo lock serialization (Test B)', () => {
             cloneCallCount++
             // First clone hangs until released
             releaseFirst = () => resolve({stdout: '', stderr: ''})
+          } else if (args.includes('--is-inside-work-tree')) {
+            // Validation: non-bare worktree
+            resolve({stdout: 'true\n', stderr: ''})
           } else {
-            // rev-parse resolves immediately
+            // --verify HEAD^{commit} or final rev-parse HEAD — resolve with a sha
             resolve({stdout: 'sha123\n', stderr: ''})
           }
         }),
