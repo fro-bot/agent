@@ -116,6 +116,15 @@ export interface DiscordStreamSink {
    * Has no effect when the buffer contains non-whitespace text (text always flushes normally).
    */
   readonly markVisibleOutputSent: () => void
+  /**
+   * Returns `true` if visible output has been sent to the thread — either via
+   * `markVisibleOutputSent()` or via a successful flush of buffered text.
+   * Read-only; never resets once set.
+   *
+   * Use this to decide whether a timeout or error message should acknowledge
+   * partial output rather than treating the run as having produced nothing.
+   */
+  readonly hasVisibleOutput: () => boolean
 }
 
 /**
@@ -138,6 +147,8 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
   const markVisibleOutputSent = (): void => {
     visibleOutputSent = true
   }
+
+  const hasVisibleOutput = (): boolean => visibleOutputSent
 
   const flush = async (): Promise<FlushResult> => {
     const text = buffer
@@ -164,6 +175,7 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
       try {
         const attachment = new AttachmentBuilder(Buffer.from(text, 'utf-8'), {name: 'response.md'})
         await safeSend(thread, {content: LONG_OUTPUT_SUMMARY, files: [attachment]})
+        visibleOutputSent = true
         return {kind: 'attachment', charCount: text.length}
       } catch (sendError) {
         const message = sendError instanceof Error ? sendError.message : String(sendError)
@@ -175,6 +187,7 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
     // Short output → single message
     try {
       await safeSend(thread, {content: text})
+      visibleOutputSent = true
       return {kind: 'sent', charCount: text.length}
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : String(sendError)
@@ -183,5 +196,5 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
     }
   }
 
-  return {append, flush, buffered, markVisibleOutputSent}
+  return {append, flush, buffered, markVisibleOutputSent, hasVisibleOutput}
 }

@@ -281,6 +281,124 @@ describe('createDiscordStreamSink', () => {
 
   // ── Unit 4: markVisibleOutputSent — approval status prevents _(no output)_ ──
 
+  // ── Unit 1: hasVisibleOutput() — read-only predicate for visible-output state ──
+
+  describe('hasVisibleOutput()', () => {
+    it('returns false on a newly created sink', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when / #then
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('returns true after markVisibleOutputSent() is called', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+
+      // #when / #then
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('flushing an empty buffer does not reset visible-output state to false', async () => {
+      // #given — mark visible output, then flush an empty buffer
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+      await sink.flush() // returns skipped-visible; must not reset the flag
+
+      // #when / #then — still true after flush
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('flushing buffered text does not reset visible-output state', async () => {
+      // #given — mark visible output, append text, flush
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+      sink.append('some output')
+      await sink.flush()
+
+      // #when / #then — still true after flush
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    // ── flush() sets hasVisibleOutput — the core missing cases ──
+
+    it('returns true after flush() returns {kind:"sent"}', async () => {
+      // #given — short text, no prior markVisibleOutputSent
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(SHORT_TEXT)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — flush succeeded with sent, so visible output is now true
+      expect(result.kind).toBe('sent')
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('returns true after flush() returns {kind:"attachment"}', async () => {
+      // #given — long text triggers attachment path
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(LONG_TEXT)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — attachment was sent, so visible output is now true
+      expect(result.kind).toBe('attachment')
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('remains false after flush() returns {kind:"empty"}', async () => {
+      // #given — empty buffer, no prior markVisibleOutputSent
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — _(no output)_ is not "visible output" from the agent
+      expect(result.kind).toBe('empty')
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('remains true after flush() returns {kind:"skipped-visible"}', async () => {
+      // #given — visible output already marked, empty buffer
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputSent()
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — skipped-visible means output was already sent; flag stays true
+      expect(result.kind).toBe('skipped-visible')
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('remains false after flush() returns {kind:"error"} on a failed send', async () => {
+      // #given — send fails; no visible output was actually delivered
+      const sendFn = vi.fn().mockRejectedValue(new Error('Missing Permissions'))
+      const thread = makeThread(sendFn)
+      const sink = createDiscordStreamSink(thread)
+      sink.append(SHORT_TEXT)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — error means nothing was delivered; flag stays false
+      expect(result.kind).toBe('error')
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+  })
+
   describe('markVisibleOutputSent()', () => {
     it('flush returns {kind:"skipped-visible"} instead of posting _(no output)_ when visible output was already sent', async () => {
       // #given — nothing appended to buffer, but visible output was already posted (e.g. approval status)
