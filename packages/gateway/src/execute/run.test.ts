@@ -1587,14 +1587,14 @@ describe('runMention', () => {
       setupHappyPath()
 
       const SIMULATED_ELAPSED_MS = 5_000 // 5 s of simulated setup time
+      const SIMULATED_START_MS = 1_700_000_000_000
       const runTimeoutMs = 600_000
       let callCount = 0
-      const originalDateNow = Date.now.bind(Date)
       const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
         // First call: runStartMs capture at run entry → return base time
         // Subsequent calls: simulate elapsed setup time
         callCount++
-        return callCount === 1 ? originalDateNow() : originalDateNow() + SIMULATED_ELAPSED_MS
+        return callCount === 1 ? SIMULATED_START_MS : SIMULATED_START_MS + SIMULATED_ELAPSED_MS
       })
 
       const thread = makeThread()
@@ -1655,14 +1655,14 @@ describe('runMention', () => {
       setupHappyPath()
 
       const SIMULATED_ELAPSED_MS = 5_000 // 5 s of simulated setup time
+      const SIMULATED_START_MS = 1_700_000_000_000
       const runTimeoutMs = 600_000
       let callCount = 0
-      const originalDateNow = Date.now.bind(Date)
       const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
         // First call: runStartMs capture at run entry → return base time
         // Subsequent calls: simulate elapsed setup time
         callCount++
-        return callCount === 1 ? originalDateNow() : originalDateNow() + SIMULATED_ELAPSED_MS
+        return callCount === 1 ? SIMULATED_START_MS : SIMULATED_START_MS + SIMULATED_ELAPSED_MS
       })
 
       const abortTimeoutSpy = vi.spyOn(AbortSignal, 'timeout')
