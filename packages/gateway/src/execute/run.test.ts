@@ -12,6 +12,7 @@ import * as streamingModule from '../discord/streaming.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core.js'
+import {formatTimeoutDuration} from './run.js'
 
 // ---------------------------------------------------------------------------
 // Mock external collaborators so run.test.ts does not need real AWS/S3/Discord
@@ -61,6 +62,7 @@ vi.mock('../discord/streaming.js', () => ({
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 10}),
     buffered: vi.fn().mockReturnValue(''),
     markVisibleOutputSent: vi.fn(),
+    hasVisibleOutput: vi.fn().mockReturnValue(false),
   }),
 }))
 
@@ -169,6 +171,60 @@ function makeDefaultConcurrency() {
   }
 }
 
+/**
+ * Build a stream-sink mock with sensible defaults. Pass overrides to customise
+ * individual methods without repeating the full literal in every test.
+ */
+function makeStreamSinkMock(
+  overrides: {
+    append?: ReturnType<typeof vi.fn>
+    flush?: ReturnType<typeof vi.fn>
+    buffered?: ReturnType<typeof vi.fn>
+    markVisibleOutputSent?: ReturnType<typeof vi.fn>
+    hasVisibleOutput?: ReturnType<typeof vi.fn>
+  } = {},
+) {
+  return {
+    append: overrides.append ?? vi.fn(),
+    flush: overrides.flush ?? vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
+    buffered: overrides.buffered ?? vi.fn().mockReturnValue(''),
+    markVisibleOutputSent: overrides.markVisibleOutputSent ?? vi.fn(),
+    hasVisibleOutput: overrides.hasVisibleOutput ?? vi.fn().mockReturnValue(false),
+  }
+}
+
+/**
+ * Build a stateful stream-sink mock where flush() sets the visible flag and
+ * hasVisibleOutput() reads it. Simulates the real sink's post-flush visibility
+ * state so tests can prove the timeout classifier reads state AFTER flush.
+ *
+ * @param flushKind - the kind returned by flush() (determines whether visible is set)
+ * @param flushShouldSetVisible - when true, flush() sets visible=true (simulates sent/attachment)
+ */
+function makeStatefulSinkMock(
+  flushKind: 'sent' | 'attachment' | 'empty' | 'skipped-visible',
+  flushShouldSetVisible: boolean,
+) {
+  let visible = false
+  const flushFn = vi.fn().mockImplementation(async () => {
+    if (flushShouldSetVisible) visible = true
+    if (flushKind === 'sent') return {kind: 'sent' as const, charCount: 10}
+    if (flushKind === 'attachment') return {kind: 'attachment' as const, charCount: 3000}
+    if (flushKind === 'skipped-visible') return {kind: 'skipped-visible' as const}
+    return {kind: 'empty' as const}
+  })
+  const hasVisibleOutputFn = vi.fn().mockImplementation(() => visible)
+  return {
+    append: vi.fn(),
+    flush: flushFn,
+    buffered: vi.fn().mockReturnValue(''),
+    markVisibleOutputSent: vi.fn().mockImplementation(() => {
+      visible = true
+    }),
+    hasVisibleOutput: hasVisibleOutputFn,
+  }
+}
+
 function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
   return result === 'success'
     ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/acme/widget'})
@@ -229,12 +285,9 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
       })) as unknown as HeartbeatController['stop'],
     isRunning: false,
   })
-  mockCreateDiscordStreamSink.mockReturnValue({
-    append: vi.fn(),
-    flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
-    buffered: vi.fn().mockReturnValue(''),
-    markVisibleOutputSent: vi.fn(),
-  })
+  mockCreateDiscordStreamSink.mockReturnValue(
+    makeStreamSinkMock() as unknown as ReturnType<typeof streamingModule.createDiscordStreamSink>,
+  )
   mockRunOpenCodeCore.mockResolvedValue(undefined)
   vi.mocked(attachModule.attachOpencode).mockReturnValue({
     server: {url: 'http://workspace:9200'},
@@ -662,6 +715,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
 
       const deps = makeDeps()
@@ -829,6 +883,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial output'),
         markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
@@ -841,9 +896,268 @@ describe('runMention', () => {
 
       // #then — flush called on error path
       expect(flushMock).toHaveBeenCalledOnce()
-      // #and — error message sent after flush
+      // #and — error message sent after flush (last send is the timeout message)
       const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
-      expect(lastCall.content).toContain('timed out')
+      expect(lastCall.content).toMatch(/time.?limit|timed? ?out/i)
+    })
+
+    // ── Timeout copy branching (Unit 2) ─────────────────────────────────────
+
+    it('timeout with no visible output: message includes configured duration and generic retry guidance', async () => {
+      // #given — no visible output; runTimeoutMs = 600_000 (10 min)
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — message includes the configured timeout duration
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/10.?min/i)
+      // #and — does NOT use partial-output continuation wording
+      expect(lastCall.content).not.toMatch(/partial|continue|follow.?up/i)
+    })
+
+    it('timeout with no visible output: message does not leak internal error detail', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'AbortError: signal timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — no internal error detail in message
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).not.toContain('AbortError')
+      expect(lastCall.content).not.toContain('signal timed out')
+    })
+
+    it('timeout with visible text output: message acknowledges visible updates and gives new-request guidance', async () => {
+      // #given — visible output was flushed (text sent to thread)
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 42}),
+        buffered: vi.fn().mockReturnValue('some partial output'),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — message acknowledges visible updates
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/updates above/i)
+      // #and — gives explicit new-request guidance
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+      // #and — includes configured timeout duration
+      expect(lastCall.content).toMatch(/10.?min/i)
+    })
+
+    it('timeout with visible attachment output: message follows the visible-output branch', async () => {
+      // #given — visible output was flushed as an attachment
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'attachment' as const, charCount: 3000}),
+        buffered: vi.fn().mockReturnValue('x'.repeat(3000)),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — visible-output branch: new-request guidance present
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+      // #and — does NOT use no-output wording
+      expect(lastCall.content).not.toMatch(/try again/i)
+    })
+
+    it('timeout with approval-status visible output: message follows the visible-output branch', async () => {
+      // #given — approval waiting status was sent (markVisibleOutputSent called), no buffered text
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'skipped-visible' as const}),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — visible-output branch: new-request guidance present
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+    })
+
+    it('timeout: flush completes before the timeout message is sent (ordering invariant)', async () => {
+      // #given — track call order
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const callOrder: string[] = []
+      const flushMock = vi.fn().mockImplementation(async () => {
+        callOrder.push('flush')
+        return {kind: 'sent' as const, charCount: 5}
+      })
+      const thread = makeThread()
+      thread.send.mockImplementation((opts: unknown) => {
+        callOrder.push('send')
+        return opts
+      })
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush happened before the final send
+      const flushIdx = callOrder.indexOf('flush')
+      const lastSendIdx = callOrder.lastIndexOf('send')
+      expect(flushIdx).toBeGreaterThanOrEqual(0)
+      expect(lastSendIdx).toBeGreaterThan(flushIdx)
+    })
+
+    it('regression: stream-ended message is unchanged by timeout branching', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5}),
+        buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true), // visible output present — but stream-ended, not timeout
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — stream-ended message is unchanged
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toContain('stream closed unexpectedly')
+      // #and — does NOT use timeout-specific wording
+      expect(lastCall.content).not.toMatch(/timed? ?out/i)
+    })
+
+    it('regression: generic failure message is unchanged by timeout branching', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5}),
+        buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new Error('some unknown error'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — generic failure message unchanged
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toContain('failed')
+      expect(lastCall.content).not.toMatch(/timed? ?out/i)
+    })
+
+    it('timeout: FAILED run-state transition still occurs regardless of visible-output branch', async () => {
+      // #given — visible output present
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
+        buffered: vi.fn().mockReturnValue('output'),
+        markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(true),
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — run still transitions to FAILED (timeout is always a failure)
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('FAILED')
+      expect(transitionPhases).not.toContain('COMPLETED')
     })
 
     it('flushes partial sink output on stream-ended path before posting error', async () => {
@@ -857,6 +1171,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
 
@@ -882,6 +1197,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
 
@@ -907,6 +1223,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       setupHappyPath()
       // Make EXECUTING transition fail — error caught before sink is created
@@ -926,6 +1243,111 @@ describe('runMention', () => {
 
       // #then — flush NOT called because sink was never initialized
       expect(flushMock).not.toHaveBeenCalled()
+    })
+
+    // ── Stateful sink: timeout copy reads visibility AFTER flush ────────────
+
+    it('timeout: visible-output branch fires when flush() sets visible=true (stateful sink — sent)', async () => {
+      // #given — sink starts with visible=false; flush() sets visible=true (simulates sent output)
+      // This proves the classifier reads hasVisibleOutput() AFTER the error-path flush completes.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const statefulSink = makeStatefulSinkMock('sent', /* flushShouldSetVisible */ true)
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush was called and set visible=true
+      expect(statefulSink.flush).toHaveBeenCalledOnce()
+      // #and — visible-output branch used (new-request guidance present)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/what to do next|new.*@fro-bot/i)
+      // #and — does NOT use no-output retry wording
+      expect(lastCall.content).not.toMatch(/please try again/i)
+    })
+
+    it('timeout: visible-output branch fires when flush() sets visible=true (stateful sink — attachment)', async () => {
+      // #given — sink starts with visible=false; flush() sets visible=true (simulates attachment output)
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const statefulSink = makeStatefulSinkMock('attachment', /* flushShouldSetVisible */ true)
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — visible-output branch used
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/what to do next|new.*@fro-bot/i)
+    })
+
+    it('timeout: generic branch fires when flush() leaves visible=false (stateful sink — empty)', async () => {
+      // #given — sink starts with visible=false; flush() does NOT set visible (empty flush)
+      // This is the inverse case: flush errors or produces no visible output → generic timeout.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const statefulSink = makeStatefulSinkMock('empty', /* flushShouldSetVisible */ false)
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — generic branch used (no new-request guidance)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).not.toMatch(/what to do next|new.*@fro-bot/i)
+      // #and — includes configured duration
+      expect(lastCall.content).toMatch(/10.?min/i)
+    })
+
+    it('timeout: generic branch fires when flush() throws (stateful sink — flush error)', async () => {
+      // #given — flush throws; visible stays false → generic timeout branch
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      let visible = false
+      const flushFn = vi.fn().mockRejectedValue(new Error('flush network error'))
+      const hasVisibleOutputFn = vi.fn().mockImplementation(() => visible)
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushFn,
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn().mockImplementation(() => {
+          visible = true
+        }),
+        hasVisibleOutput: hasVisibleOutputFn,
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when — must not throw (flush failure is best-effort)
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — generic branch used (visible stayed false after flush threw)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).not.toMatch(/what to do next|new.*@fro-bot/i)
+      expect(lastCall.content).toMatch(/10.?min/i)
     })
   })
 
@@ -1471,6 +1893,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: markVisibleOutputSentFn,
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
 
       const thread = makeThread()
@@ -1689,5 +2112,43 @@ describe('runMention', () => {
       expect(signalBudgetMs).toBeLessThanOrEqual(runTimeoutMs - SIMULATED_ELAPSED_MS + 100) // +100ms tolerance
       expect(signalBudgetMs).toBeGreaterThan(0)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatTimeoutDuration — unit tests for the exported helper
+// ---------------------------------------------------------------------------
+
+describe('formatTimeoutDuration', () => {
+  it('45_000 ms → "45 seconds"', () => {
+    expect(formatTimeoutDuration(45_000)).toBe('45 seconds')
+  })
+
+  it('1_000 ms → "1 second"', () => {
+    expect(formatTimeoutDuration(1_000)).toBe('1 second')
+  })
+
+  it('60_000 ms → "1 minute" (no trailing seconds)', () => {
+    expect(formatTimeoutDuration(60_000)).toBe('1 minute')
+  })
+
+  it('90_000 ms → "1 minute 30 seconds" (non-integral minute)', () => {
+    expect(formatTimeoutDuration(90_000)).toBe('1 minute 30 seconds')
+  })
+
+  it('120_000 ms → "2 minutes" (no trailing seconds)', () => {
+    expect(formatTimeoutDuration(120_000)).toBe('2 minutes')
+  })
+
+  it('600_000 ms → "10 minutes"', () => {
+    expect(formatTimeoutDuration(600_000)).toBe('10 minutes')
+  })
+
+  it('61_000 ms → "1 minute 1 second" (singular second)', () => {
+    expect(formatTimeoutDuration(61_000)).toBe('1 minute 1 second')
+  })
+
+  it('125_000 ms → "2 minutes 5 seconds"', () => {
+    expect(formatTimeoutDuration(125_000)).toBe('2 minutes 5 seconds')
   })
 })
