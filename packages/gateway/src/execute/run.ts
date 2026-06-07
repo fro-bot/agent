@@ -411,18 +411,29 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
           // user sees the run is blocked even if the embed send is slow.
           // Fire-and-forget: status is best-effort; must not block onPending.
           // .catch() prevents an unhandled rejection if the Discord send fails.
+          //
+          // Pending-visibility: mark the send as in-flight BEFORE the void send so
+          // timeout classification sees it as visible context even if the Discord
+          // round-trip has not completed yet. settle(true) on success promotes to
+          // permanently delivered; settle(false) on failure retracts the claim.
+          const settleWaitingStatus = sink?.markVisibleOutputPending()
           // eslint-disable-next-line no-void
           void safeSend(rawThread, 'Waiting for tool approval…')
             .then(() => {
-              sink?.markVisibleOutputSent()
+              settleWaitingStatus?.(true)
             })
             .catch((error: unknown) => {
+              settleWaitingStatus?.(false)
               logger.warn({requestID, err: String(error)}, 'run: failed to post waiting-for-approval status')
             })
 
           // Fire-and-forget: send the embed then attach the render function.
           // rawThread has the full Discord.js API (embeds, components, edit).
           // onPending must not throw (coordinator catches internally anyway).
+          //
+          // Pending-visibility: same pattern as the waiting-status send above —
+          // mark in-flight before the void send, settle on resolution.
+          const settleEmbed = sink?.markVisibleOutputPending()
           // eslint-disable-next-line no-void
           void rawThread
             .send({
@@ -431,9 +442,9 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
               allowedMentions: {parse: []},
             })
             .then(postedMessage => {
-              // Embed send succeeded — mark sink visible so flush() does not add
-              // a misleading _(no output)_ even if the waiting-status send failed.
-              sink?.markVisibleOutputSent()
+              // Embed send succeeded — settle pending claim as delivered so
+              // flush() does not add a misleading _(no output)_.
+              settleEmbed?.(true)
               // Attach the render function now that we have a message reference.
               approvalRegistry.attachMessage(
                 requestID,
@@ -455,6 +466,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
               )
             })
             .catch((error: unknown) => {
+              settleEmbed?.(false)
               logger.warn({requestID, err: String(error)}, 'run: failed to post approval embed')
               approvalRegistry.markMessagePostFailed(requestID)
             })
