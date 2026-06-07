@@ -88,7 +88,15 @@ CONDITIONAL / REJECT → gh pr review --request-changes
 
 ## Caveat
 
-This is a prompt-level fix: it sharply reduces the failure but cannot *guarantee* LLM compliance. The fully robust backstop would be a harness guardrail that parses the agent's verdict and reconciles it against the emitted `gh` event before the review is sent. That was deferred because the agent emits the event directly via `gh`, so the prompt is the immediate control point — escalate to a guardrail only if the failure recurs after this fix.
+A prompt-level fix sharply reduces the failure but cannot *guarantee* LLM compliance. The recurrence arrived as predicted: on follow-up re-reviews (after a push dismisses the prior approval), the agent perceived itself as commenting on an already-reviewed PR and fell back to a comment, leaving the PR blocked again.
+
+That triggered the deferred backstop — a harness reconciliation phase (PR #808) that runs after the review session. It reads the bot's posted **formal review** (never an issue comment), and if the verdict is PASS but no approval exists for the current head, the harness submits the approval itself. The guard is deliberately narrow to avoid wrongful approvals:
+
+- Source of truth is a formal PR review authored by the bot (exact login + `user.type === 'Bot'`), not a comment — comments carry no `commit_id`, so they cannot prove which SHA was reviewed.
+- The reviewed commit must equal the current head, and the head is re-fetched immediately before submitting (skip if it moved) — closing the TOCTOU window where a push lands mid-reconciliation.
+- The approval is pinned to the reviewed SHA, and the phase is fail-safe (never affects the run's exit code), idempotent (skips if already approved), and a no-op on forks / self-authored PRs / non-PASS verdicts.
+
+Lesson: when a verdict maps to a side-effecting platform event the agent emits itself, the prompt is the first control point but not the last. A post-action reconciliation that reads the **posted artifact** (not the agent's private log) is the durable guarantee — and it must verify *which* state it is approving, or it becomes a wrongful-approval vector itself.
 
 ## Related
 
