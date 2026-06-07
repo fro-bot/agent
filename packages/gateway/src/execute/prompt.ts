@@ -103,12 +103,14 @@ export function buildDiscordPrompt(params: DiscordPromptParams): string {
   const sections: string[] = []
 
   // 1. Persona (fail-soft: absent/null/empty/whitespace → omit)
+  // Scoped with a header so the persona defines VOICE/STYLE only and cannot
+  // override the Discord-mechanical guidance that follows.
   const trimmedPersona = persona?.trim() ?? ''
   if (trimmedPersona.length > 0) {
-    sections.push(trimmedPersona)
+    sections.push(`--- Persona (voice and style only) ---\n${trimmedPersona}\n--- End Persona ---`)
   }
 
-  // 2. Discord-mechanical guidance (always present)
+  // 2. Discord-mechanical guidance (always present; takes precedence over persona)
   sections.push(DISCORD_MECHANICAL_GUIDANCE)
 
   // 3. Repository context

@@ -9,7 +9,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {formatToolPart, isEssentialTool, summarizeTool} from './format-part.js'
+import {formatToolPart, isEssentialTool, isReadOnlyBashCommand, summarizeTool} from './format-part.js'
 
 // ---------------------------------------------------------------------------
 // Shape helpers
@@ -55,27 +55,34 @@ describe('summarizeTool', () => {
     })
 
     it('uses only the basename of filePath', () => {
+      // #given
       const part = completedTool('edit', {
         filePath: 'packages/gateway/src/execute/run-core.ts',
         newString: 'line1\nline2',
         oldString: 'old',
       })
+
+      // #when / #then
       expect(summarizeTool(part)).toBe('*run-core.ts* (+2-1)')
     })
 
     it('falls back to tool name when filePath is absent', () => {
+      // #given
       const part = completedTool('edit', {newString: 'a', oldString: 'b'})
-      // No filePath → no filename → fallback to tool name
+
+      // #when / #then — No filePath → no filename → fallback to tool name
       expect(summarizeTool(part)).toBe('edit')
     })
 
     it('escapes markdown special chars in filename', () => {
+      // #given
       const part = completedTool('edit', {
         filePath: 'src/foo_bar.ts',
         newString: 'a',
         oldString: 'b',
       })
-      // underscore in filename must be escaped so Discord doesn't italicize
+
+      // #when / #then — underscore in filename must be escaped so Discord doesn't italicize
       expect(summarizeTool(part)).toContain(String.raw`foo\_bar.ts`)
     })
   })
@@ -96,18 +103,20 @@ describe('summarizeTool', () => {
     })
 
     it('uses singular "line" for 1-line content', () => {
+      // #given / #when / #then
       const part = completedTool('write', {filePath: 'src/x.ts', content: 'single'})
       expect(summarizeTool(part)).toBe('*x.ts* (1 line)')
     })
 
     it('falls back to tool name when filePath is absent', () => {
+      // #given / #when / #then
       const part = completedTool('write', {content: 'hello'})
       expect(summarizeTool(part)).toBe('write')
     })
   })
 
   describe('apply_patch tool', () => {
-    it('renders *filename* (+added-removed) from patchText', () => {
+    it('renders *filename* (+added-removed) from unified diff patchText', () => {
       // #given — a minimal unified diff with 3 additions and 1 deletion
       const patchText = [
         '--- a/src/app.ts',
@@ -126,12 +135,34 @@ describe('summarizeTool', () => {
       const result = summarizeTool(part)
 
       // #then — fields consumed: state.input.patchText
-      expect(result).toContain('app.ts')
-      expect(result).toContain('+')
-      expect(result).toContain('-')
+      expect(result).toBe('*app.ts* (+3-1)')
+    })
+
+    it('renders *filename* (+added-removed) from OpenCode *** Begin Patch envelope', () => {
+      // #given — OpenCode apply_patch envelope format
+      const patchText = [
+        '*** Begin Patch',
+        '*** Update File: src/app.ts',
+        '@@ -1,3 +1,5 @@',
+        ' context',
+        '-removed',
+        '+added1',
+        '+added2',
+        '+added3',
+        ' context2',
+        '*** End Patch',
+      ].join('\n')
+      const part = completedTool('apply_patch', {patchText})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — OpenCode envelope parsed correctly
+      expect(result).toBe('*app.ts* (+3-1)')
     })
 
     it('falls back to tool name when patchText is absent', () => {
+      // #given / #when / #then
       const part = completedTool('apply_patch', {})
       expect(summarizeTool(part)).toBe('apply_patch')
     })
@@ -150,17 +181,17 @@ describe('summarizeTool', () => {
     })
 
     it('renders description when command is multi-line', () => {
-      // #given — multi-line command with a description
+      // #given — multi-line side-effecting command with a description
       const part = completedTool('bash', {
-        command: 'echo line1\necho line2\necho line3',
-        description: 'Print lines',
+        command: 'pnpm build\npnpm test\npnpm lint',
+        description: 'Build and test',
       })
 
       // #when
       const result = summarizeTool(part)
 
       // #then — fields consumed: state.input.description (fallback from multi-line command)
-      expect(result).toBe('Print lines')
+      expect(result).toBe('Build and test')
     })
 
     it('renders description when command exceeds 100 chars', () => {
@@ -176,19 +207,120 @@ describe('summarizeTool', () => {
     })
 
     it('falls back to tool name when command and description are absent', () => {
+      // #given / #when / #then
       const part = completedTool('bash', {})
       expect(summarizeTool(part)).toBe('bash')
     })
 
     it('falls back to tool name when command is long and description is absent', () => {
+      // #given / #when / #then
       const part = completedTool('bash', {command: 'x'.repeat(101)})
       expect(summarizeTool(part)).toBe('bash')
     })
 
     it('also accepts cmd field (alias for command)', () => {
-      // run-core.ts uses getObjectProperty(stateInput, 'cmd') as a fallback
+      // #given — run-core.ts uses getObjectProperty(stateInput, 'cmd') as a fallback
       const part = completedTool('bash', {cmd: 'git status'})
-      expect(summarizeTool(part)).toBe('`git status`')
+
+      // #when / #then — git status is read-only → hidden
+      expect(summarizeTool(part)).toBeNull()
+    })
+
+    describe('read-only bash hiding (P2.4)', () => {
+      it('git ls-files → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'git ls-files'}))).toBeNull()
+      })
+
+      it('git status → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'git status'}))).toBeNull()
+      })
+
+      it('git log → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'git log --oneline -5'}))).toBeNull()
+      })
+
+      it('git diff → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'git diff HEAD'}))).toBeNull()
+      })
+
+      it('ls → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'ls -la'}))).toBeNull()
+      })
+
+      it('cat → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'cat src/foo.ts'}))).toBeNull()
+      })
+
+      it('find → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'find . -name "*.ts"'}))).toBeNull()
+      })
+
+      it('grep → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'grep -r TODO src/'}))).toBeNull()
+      })
+
+      it('rg → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'rg "TODO" src/'}))).toBeNull()
+      })
+
+      it('pwd → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'pwd'}))).toBeNull()
+      })
+
+      it('head → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'head -20 src/foo.ts'}))).toBeNull()
+      })
+
+      it('tail → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'tail -f logs/app.log'}))).toBeNull()
+      })
+
+      it('wc → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'wc -l src/foo.ts'}))).toBeNull()
+      })
+
+      it('which → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'which node'}))).toBeNull()
+      })
+
+      it('echo → hidden (null)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'echo hello'}))).toBeNull()
+      })
+
+      it('npm test → shown (side-effecting)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'npm test'}))).not.toBeNull()
+      })
+
+      it('rm → shown (side-effecting)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'rm -rf dist/'}))).not.toBeNull()
+      })
+
+      it('git commit → shown (side-effecting)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'git commit -m "fix"'}))).not.toBeNull()
+      })
+
+      it('pnpm build → shown (side-effecting)', () => {
+        // #given / #when / #then
+        expect(summarizeTool(completedTool('bash', {command: 'pnpm build'}))).not.toBeNull()
+      })
     })
   })
 
@@ -196,10 +328,13 @@ describe('summarizeTool', () => {
     it('renders _name_ from input.name', () => {
       // #given — fields consumed: state.input.name
       const part = completedTool('skill', {name: 'ce:review'})
+
+      // #when / #then
       expect(summarizeTool(part)).toBe('_ce:review_')
     })
 
     it('falls back to tool name when name is absent', () => {
+      // #given / #when / #then
       const part = completedTool('skill', {})
       expect(summarizeTool(part)).toBe('skill')
     })
@@ -209,40 +344,48 @@ describe('summarizeTool', () => {
     it('renders a labeled summary from input', () => {
       // #given — fields consumed: state.input (any available label)
       const part = completedTool('task', {description: 'Implement feature X'})
+
+      // #when
       const result = summarizeTool(part)
-      // Must contain some reference to the task description
+
+      // #then — Must contain some reference to the task description
       expect(result).toContain('Implement feature X')
     })
 
     it('falls back to tool name when no description', () => {
+      // #given / #when / #then
       const part = completedTool('task', {})
       expect(summarizeTool(part)).toBe('task')
     })
   })
 
   describe('read tool (hidden)', () => {
-    it('returns null — read is a hidden (non-essential) tool', () => {
+    it('returns null — read is a hidden (non-essential) tool when successful', () => {
+      // #given / #when / #then
       const part = completedTool('read', {filePath: 'src/foo.ts'})
       expect(summarizeTool(part)).toBeNull()
     })
   })
 
   describe('grep tool (hidden)', () => {
-    it('returns null — grep is a hidden (non-essential) tool', () => {
+    it('returns null — grep is a hidden (non-essential) tool when successful', () => {
+      // #given / #when / #then
       const part = completedTool('grep', {pattern: 'TODO'})
       expect(summarizeTool(part)).toBeNull()
     })
   })
 
   describe('glob tool (hidden)', () => {
-    it('returns null — glob is a hidden (non-essential) tool', () => {
+    it('returns null — glob is a hidden (non-essential) tool when successful', () => {
+      // #given / #when / #then
       const part = completedTool('glob', {pattern: '**/*.ts'})
       expect(summarizeTool(part)).toBeNull()
     })
   })
 
   describe('list tool (hidden)', () => {
-    it('returns null — list is a hidden (non-essential) tool', () => {
+    it('returns null — list is a hidden (non-essential) tool when successful', () => {
+      // #given / #when / #then
       const part = completedTool('list', {path: 'src/'})
       expect(summarizeTool(part)).toBeNull()
     })
@@ -266,15 +409,73 @@ describe('summarizeTool', () => {
       expect(result).toContain('broken.ts')
     })
 
-    it('error-status read tool still returns null (hidden)', () => {
-      // Hidden tools stay hidden even on error
+    it('error-status read tool renders terse error line (P2.5 — aids debugging)', () => {
+      // #given — hidden tool with error status
       const part = errorTool('read', {filePath: 'src/foo.ts'})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — errored hidden tool renders terse error line, not null
+      expect(result).not.toBeNull()
+      expect(result).toContain('⨯')
+      expect(result).toContain('read')
+      expect(result).toContain('src/foo.ts')
+    })
+
+    it('error-status grep tool renders terse error line with pattern', () => {
+      // #given
+      const part = errorTool('grep', {pattern: 'TODO'})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then
+      expect(result).not.toBeNull()
+      expect(result).toContain('⨯')
+      expect(result).toContain('grep')
+      expect(result).toContain('TODO')
+    })
+
+    it('error-status glob tool renders terse error line with path', () => {
+      // #given
+      const part = errorTool('glob', {pattern: '**/*.ts'})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then
+      expect(result).not.toBeNull()
+      expect(result).toContain('⨯')
+      expect(result).toContain('glob')
+    })
+
+    it('error-status list tool renders terse error line with path', () => {
+      // #given
+      const part = errorTool('list', {path: 'src/'})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then
+      expect(result).not.toBeNull()
+      expect(result).toContain('⨯')
+      expect(result).toContain('list')
+      expect(result).toContain('src/')
+    })
+
+    it('successful read tool still returns null (P2.5 — only errored hidden tools show)', () => {
+      // #given / #when / #then
+      const part = completedTool('read', {filePath: 'src/foo.ts'})
       expect(summarizeTool(part)).toBeNull()
     })
 
     it('error-status bash tool renders with error glyph', () => {
+      // #given / #when
       const part = errorTool('bash', {command: 'pnpm test'})
       const result = summarizeTool(part)
+
+      // #then
       expect(result).not.toBeNull()
       expect(result).toContain('⨯')
     })
@@ -298,14 +499,17 @@ describe('summarizeTool', () => {
     })
 
     it('truncates MCP tool args to ~50 chars', () => {
+      // #given / #when
       const part = completedTool('mcp_tool', {query: 'a'.repeat(100)})
       const result = summarizeTool(part)
+
+      // #then — The truncated arg should be ≤50 chars + ellipsis
       expect(result).not.toBeNull()
-      // The truncated arg should be ≤50 chars + ellipsis
       expect(result).toContain('…')
     })
 
     it('renders tool name as fallback when input is empty', () => {
+      // #given / #when / #then
       const part = completedTool('unknown_tool', {})
       expect(summarizeTool(part)).toBe('unknown_tool')
     })
@@ -313,14 +517,19 @@ describe('summarizeTool', () => {
 
   describe('missing title/input fallbacks', () => {
     it('falls back to tool name when state.input is empty and no title', () => {
+      // #given / #when / #then
       const part = completedTool('edit', {})
       expect(summarizeTool(part)).toBe('edit')
     })
 
     it('uses state.title as a fallback label when available', () => {
-      // For tools without specific field handling, title is used
+      // #given — For tools without specific field handling, title is used
       const part = completedTool('some_tool', {}, 'My title')
+
+      // #when
       const result = summarizeTool(part)
+
+      // #then
       expect(result).not.toBeNull()
       expect(result).toContain('My title')
     })
@@ -334,15 +543,18 @@ describe('summarizeTool', () => {
 describe('isEssentialTool', () => {
   describe('essential (shown) tools', () => {
     it.each(['edit', 'write', 'apply_patch', 'task', 'skill'])('%s is essential', tool => {
+      // #given / #when / #then
       expect(isEssentialTool(tool)).toBe(true)
     })
 
     it('bash is treated as essential (side-effecting by default)', () => {
-      // Design choice: bash is always shown; a follow-up can refine with hasSideEffect
+      // #given — Design choice: bash is always shown at the isEssentialTool level;
+      // read-only bash is filtered in summarizeTool based on command content
       expect(isEssentialTool('bash')).toBe(true)
     })
 
     it('unknown / MCP tools are essential (shown)', () => {
+      // #given / #when / #then
       expect(isEssentialTool('some_mcp_tool')).toBe(true)
       expect(isEssentialTool('mcp_search')).toBe(true)
     })
@@ -350,7 +562,60 @@ describe('isEssentialTool', () => {
 
   describe('non-essential (hidden) tools', () => {
     it.each(['read', 'grep', 'glob', 'list'])('%s is non-essential', tool => {
+      // #given / #when / #then
       expect(isEssentialTool(tool)).toBe(false)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isReadOnlyBashCommand
+// ---------------------------------------------------------------------------
+
+describe('isReadOnlyBashCommand', () => {
+  describe('read-only commands → true', () => {
+    it.each([
+      'git ls-files',
+      'git ls-files --others',
+      'git status',
+      'git status --short',
+      'git log',
+      'git log --oneline -5',
+      'git diff',
+      'git diff HEAD',
+      'ls',
+      'ls -la',
+      'cat src/foo.ts',
+      'find . -name "*.ts"',
+      'grep -r TODO src/',
+      'rg "TODO" src/',
+      'pwd',
+      'head -20 src/foo.ts',
+      'tail -f logs/app.log',
+      'wc -l src/foo.ts',
+      'which node',
+      'echo hello',
+    ])('%s → true', command => {
+      // #given / #when / #then
+      expect(isReadOnlyBashCommand(command)).toBe(true)
+    })
+  })
+
+  describe('side-effecting commands → false', () => {
+    it.each([
+      'npm test',
+      'rm -rf dist/',
+      'git commit -m "fix"',
+      'git push',
+      'pnpm build',
+      'pnpm install',
+      'mkdir -p dist',
+      'cp src/foo.ts dist/',
+      'mv old.ts new.ts',
+      'chmod +x script.sh',
+    ])('%s → false', command => {
+      // #given / #when / #then
+      expect(isReadOnlyBashCommand(command)).toBe(false)
     })
   })
 })
@@ -361,38 +626,63 @@ describe('isEssentialTool', () => {
 
 describe('formatToolPart', () => {
   it('returns the summary string for an essential tool', () => {
+    // #given
     const part = completedTool('edit', {
       filePath: 'src/app.ts',
       newString: 'a\nb',
       oldString: 'c',
     })
+
+    // #when / #then
     const result = formatToolPart(part)
     expect(result).toBe('*app.ts* (+2-1)')
   })
 
-  it('returns null for a non-essential (hidden) tool', () => {
+  it('returns null for a non-essential (hidden) successful tool', () => {
+    // #given / #when / #then
     const part = completedTool('read', {filePath: 'src/app.ts'})
     expect(formatToolPart(part)).toBeNull()
   })
 
-  it('returns null for grep (hidden)', () => {
+  it('returns null for grep (hidden, successful)', () => {
+    // #given / #when / #then
     const part = completedTool('grep', {pattern: 'TODO'})
     expect(formatToolPart(part)).toBeNull()
   })
 
-  it('returns a summary for bash (essential)', () => {
-    const part = completedTool('bash', {command: 'git status'})
+  it('returns a summary for bash (essential, side-effecting)', () => {
+    // #given / #when / #then
+    const part = completedTool('bash', {command: 'pnpm build'})
     expect(formatToolPart(part)).not.toBeNull()
   })
 
-  it('returns null for a non-essential error-status tool', () => {
-    const part = errorTool('read', {filePath: 'src/foo.ts'})
+  it('returns null for read-only bash (git status)', () => {
+    // #given / #when / #then
+    const part = completedTool('bash', {command: 'git status'})
     expect(formatToolPart(part)).toBeNull()
   })
 
-  it('returns an error-prefixed summary for an essential error-status tool', () => {
-    const part = errorTool('edit', {filePath: 'src/app.ts', newString: 'a', oldString: 'b'})
+  it('returns terse error line for errored hidden tool (P2.5)', () => {
+    // #given
+    const part = errorTool('read', {filePath: 'src/foo.ts'})
+
+    // #when
     const result = formatToolPart(part)
+
+    // #then — errored hidden tool renders terse error line
+    expect(result).not.toBeNull()
+    expect(result).toContain('⨯')
+    expect(result).toContain('read')
+  })
+
+  it('returns an error-prefixed summary for an essential error-status tool', () => {
+    // #given
+    const part = errorTool('edit', {filePath: 'src/app.ts', newString: 'a', oldString: 'b'})
+
+    // #when
+    const result = formatToolPart(part)
+
+    // #then
     expect(result).not.toBeNull()
     expect(result).toContain('⨯')
   })

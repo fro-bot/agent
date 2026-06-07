@@ -3,7 +3,8 @@
  *
  * Turns an extracted tool shape into a clean Discord summary line:
  * - Essential tool → one-line summary string
- * - Non-essential (read-only) tool → null (caller appends nothing)
+ * - Non-essential (read-only) tool, successful → null (caller appends nothing)
+ * - Non-essential (read-only) tool, errored → terse error line (aids debugging)
  *
  * No SDK imports. No Discord imports. Pure functions only.
  *
@@ -20,13 +21,7 @@
 /**
  * The extracted tool shape that run-core.ts pulls from a completed tool part.
  *
- * Field mapping (from run-core.ts lines ~315-340):
- *   tool        ← part.tool (string)
- *   state.title ← getStringProperty(toolState, 'title')
- *   state.input ← getObjectProperty(toolState, 'input')
- *   state.status← getStringProperty(toolState, 'status')
- *
- * Specific input fields consumed per tool:
+ * Fields consumed per tool:
  *   edit        → state.input.filePath, state.input.newString, state.input.oldString
  *   write       → state.input.filePath, state.input.content
  *   apply_patch → state.input.patchText
@@ -53,10 +48,34 @@ const MAX_MCP_ARG_LENGTH = 50
 const ERROR_GLYPH = '⨯'
 
 /**
- * Tools that are always hidden (non-essential / read-only).
+ * Tools that are always hidden (non-essential / read-only) when successful.
  * Everything NOT in this set is treated as essential (shown).
+ * Errored hidden tools still render a terse error line for debugging.
  */
 const HIDDEN_TOOLS = new Set(['read', 'grep', 'glob', 'list'])
+
+/**
+ * Read-only bash command prefixes that are hidden like other read-only tools.
+ * Matched against the first command token (leading word) of the bash command.
+ * If uncertain or compound, treat as essential (shown) — conservative default.
+ */
+const READ_ONLY_BASH_PREFIXES = new Set([
+  'git ls-files',
+  'git status',
+  'git log',
+  'git diff',
+  'ls',
+  'cat',
+  'find',
+  'grep',
+  'rg',
+  'pwd',
+  'head',
+  'tail',
+  'wc',
+  'which',
+  'echo',
+])
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,13 +111,33 @@ function str(input: Record<string, unknown> | undefined, key: string): string {
   return typeof val === 'string' ? val : ''
 }
 
+/**
+ * Returns true if the bash command is read-only (should be hidden like other read-only tools).
+ * Matches on the first command token or known multi-word read-only prefixes.
+ * Conservative: if uncertain, returns false (treat as essential = shown).
+ */
+function isReadOnlyBashCommand(command: string): boolean {
+  const trimmed = command.trim()
+  // Check multi-word prefixes first (e.g. "git ls-files", "git status")
+  for (const prefix of READ_ONLY_BASH_PREFIXES) {
+    if (trimmed === prefix || trimmed.startsWith(`${prefix} `) || trimmed.startsWith(`${prefix}\t`)) {
+      return true
+    }
+  }
+  return false
+}
+
 // ---------------------------------------------------------------------------
-// Patch line-count parser (minimal — counts +/- lines in unified diff)
+// Patch line-count parser
 // ---------------------------------------------------------------------------
 
 /**
- * Count added and removed lines in a unified diff patch text.
- * Returns { additions, deletions } for the first file found.
+ * Count added and removed lines in a patch text.
+ *
+ * Supports two formats:
+ * 1. Unified diff (`+++ b/file` headers) — standard git/diff output
+ * 2. OpenCode `*** Begin Patch` / `*** Update File:` envelope — OpenCode's apply_patch format
+ *
  * Falls back to { additions: 0, deletions: 0 } if unparseable.
  */
 function parsePatchCounts(patchText: string): {
@@ -112,17 +151,25 @@ function parsePatchCounts(patchText: string): {
   let deletions = 0
 
   for (const line of patchText.split('\n')) {
-    if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
-      // Flush previous file if any
+    // OpenCode envelope: *** Update File: path/to/file
+    if (line.startsWith('*** Update File:')) {
+      if (currentFile !== '') {
+        results.push({fileName: basename(currentFile), additions, deletions})
+      }
+      currentFile = line.replace(/^\*\*\* Update File:\s*/, '').trim()
+      additions = 0
+      deletions = 0
+    } else if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
+      // Unified diff header
       if (currentFile !== '') {
         results.push({fileName: basename(currentFile), additions, deletions})
       }
       currentFile = line.replace(/^\+\+\+ (?:b\/)?/, '')
       additions = 0
       deletions = 0
-    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+    } else if (line.startsWith('+') && !line.startsWith('+++') && !line.startsWith('*** ')) {
       additions++
-    } else if (line.startsWith('-') && !line.startsWith('---')) {
+    } else if (line.startsWith('-') && !line.startsWith('---') && !line.startsWith('*** ')) {
       deletions++
     }
   }
@@ -142,11 +189,9 @@ function parsePatchCounts(patchText: string): {
 /**
  * Returns true if the tool should be shown in the Discord output.
  *
- * Design choice: bash is always treated as essential (shown). A follow-up
- * can refine this with a `hasSideEffect` field check if needed.
- *
  * Hidden tools: read, grep, glob, list.
- * Everything else (edit, write, apply_patch, bash, skill, task, MCP, unknown) → shown.
+ * Read-only bash commands are also hidden (see isReadOnlyBashCommand).
+ * Everything else (edit, write, apply_patch, side-effecting bash, skill, task, MCP, unknown) → shown.
  */
 export function isEssentialTool(tool: string): boolean {
   return !HIDDEN_TOOLS.has(tool)
@@ -160,8 +205,8 @@ export function isEssentialTool(tool: string): boolean {
  * Summarize a completed (or errored) tool part into a single Discord line.
  *
  * Returns:
- * - `null`   — tool is non-essential (hidden); caller appends nothing
- * - `string` — one-line summary to append
+ * - `null`   — tool is non-essential (hidden) AND successful; caller appends nothing
+ * - `string` — one-line summary to append (essential tools, or errored hidden tools)
  *
  * Never throws on unexpected input shapes — unknown/malformed parts degrade
  * to a safe minimal summary or null.
@@ -170,12 +215,26 @@ export function summarizeTool(part: ExtractedToolPart): string | null {
   const {tool, state} = part
   const {input, title, status} = state
 
-  // Hidden tools → null regardless of status
+  const isError = status === 'error'
+
+  // Hidden tools (read, grep, glob, list): successful → null; errored → terse error line
   if (!isEssentialTool(tool)) {
+    if (isError) {
+      // Terse error line: ⨯ <tool>: <target> (no raw content)
+      const target = str(input, 'filePath') || str(input, 'pattern') || str(input, 'path') || str(input, 'query')
+      return target.length > 0 ? `${ERROR_GLYPH} ${tool}: ${target}` : `${ERROR_GLYPH} ${tool}`
+    }
     return null
   }
 
-  const isError = status === 'error'
+  // Read-only bash: hide successful invocations (same as hidden tools).
+  // Side-effecting bash stays shown. Errored read-only bash still shows (debugging aid).
+  if (tool === 'bash' && !isError) {
+    const command = str(input, 'command') || str(input, 'cmd')
+    if (command.length > 0 && isReadOnlyBashCommand(command)) {
+      return null
+    }
+  }
 
   // Compute the core summary text (without error prefix)
   const summary = computeSummary(tool, input, title)
@@ -197,11 +256,11 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
   if (tool === 'edit') {
     const filePath = str(input, 'filePath')
     const fileName = basename(filePath)
-    if (!fileName) return tool
+    if (fileName.length === 0) return tool
     const newString = str(input, 'newString')
     const oldString = str(input, 'oldString')
-    const added = newString ? newString.split('\n').length : 0
-    const removed = oldString ? oldString.split('\n').length : 0
+    const added = newString.length > 0 ? newString.split('\n').length : 0
+    const removed = oldString.length > 0 ? oldString.split('\n').length : 0
     return `*${escapeInlineMarkdown(fileName)}* (+${added}-${removed})`
   }
 
@@ -209,21 +268,23 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
   if (tool === 'write') {
     const filePath = str(input, 'filePath')
     const fileName = basename(filePath)
-    if (!fileName) return tool
+    if (fileName.length === 0) return tool
     const content = str(input, 'content')
-    const lines = content ? content.split('\n').length : 0
+    const lines = content.length > 0 ? content.split('\n').length : 0
     return `*${escapeInlineMarkdown(fileName)}* (${lines} ${lines === 1 ? 'line' : 'lines'})`
   }
 
   // --- apply_patch ---
   if (tool === 'apply_patch') {
     const patchText = str(input, 'patchText')
-    if (!patchText) return tool
+    if (patchText.length === 0) return tool
     const files = parsePatchCounts(patchText)
     if (files.length === 0) return tool
     return files
       .map(({fileName, additions, deletions}) =>
-        fileName ? `*${escapeInlineMarkdown(fileName)}* (+${additions}-${deletions})` : `(+${additions}-${deletions})`,
+        fileName.length > 0
+          ? `*${escapeInlineMarkdown(fileName)}* (+${additions}-${deletions})`
+          : `(+${additions}-${deletions})`,
       )
       .join(', ')
   }
@@ -232,7 +293,9 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
   if (tool === 'bash') {
     const command = str(input, 'command') || str(input, 'cmd')
     const description = str(input, 'description')
-    if (command) {
+    if (command.length > 0) {
+      // Read-only bash commands are hidden (return tool name as minimal fallback;
+      // caller checks isEssentialTool separately — this path is only reached for essential tools)
       const isSingleLine = !command.includes('\n')
       if (isSingleLine && command.length <= MAX_BASH_COMMAND_INLINE_LENGTH) {
         return `\`${command}\``
@@ -245,13 +308,13 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
   // --- skill ---
   if (tool === 'skill') {
     const name = str(input, 'name')
-    return name ? `_${escapeInlineMarkdown(name)}_` : tool
+    return name.length > 0 ? `_${escapeInlineMarkdown(name)}_` : tool
   }
 
   // --- task (subagent) ---
   if (tool === 'task') {
     const description = str(input, 'description') || str(input, 'prompt')
-    if (description) return `task: ${description}`
+    if (description.length > 0) return `task: ${description}`
     return title !== undefined && title.length > 0 ? title : tool
   }
 
@@ -261,7 +324,7 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
     return title.length > MAX_MCP_ARG_LENGTH ? `${title.slice(0, MAX_MCP_ARG_LENGTH)}…` : title
   }
 
-  if (input && Object.keys(input).length > 0) {
+  if (input !== undefined && Object.keys(input).length > 0) {
     const fields = Object.entries(input)
       .map(([key, value]) => {
         if (value === null || value === undefined) return null
@@ -286,13 +349,24 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
 // ---------------------------------------------------------------------------
 
 /**
- * The primary entry point for the wiring layer (Unit 2).
+ * The primary entry point for the wiring layer.
  *
  * Returns the summary string to append for an essential tool, or null to
- * append nothing (hidden tool or non-essential).
+ * append nothing (successful hidden tool).
+ * Errored hidden tools return a terse error line for debugging.
  *
  * This is a pure function — no SDK imports, no Discord imports.
  */
 export function formatToolPart(part: ExtractedToolPart): string | null {
   return summarizeTool(part)
 }
+
+// ---------------------------------------------------------------------------
+// isReadOnlyBash — exported for testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if the bash command is read-only (should be hidden).
+ * Exported for testing; run-core.ts uses this via formatToolPart indirectly.
+ */
+export {isReadOnlyBashCommand}

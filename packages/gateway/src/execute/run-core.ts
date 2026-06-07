@@ -160,6 +160,34 @@ interface ToolCallInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Shared tool-render helper (P2.6 + P1.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fail-soft tool-render helper shared by both tool event paths.
+ *
+ * Calls `formatToolPart`, catches any exception (malformed input, unexpected
+ * shape), logs `{tool, status}` only (no raw content), and appends nothing on
+ * error. A throwing `formatToolPart` must never abort the event stream.
+ */
+function appendToolSummary(
+  part: import('./format-part.js').ExtractedToolPart,
+  sink: DiscordStreamSink,
+  logger: GatewayLogger,
+): void {
+  let summary: string | null
+  try {
+    summary = formatToolPart(part)
+  } catch {
+    logger.warn({tool: part.tool, status: part.state.status}, 'run-core: formatToolPart threw — skipping tool line')
+    return
+  }
+  if (summary !== null && summary.length > 0) {
+    sink.append(`\n${summary}\n`)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Core
 // ---------------------------------------------------------------------------
 
@@ -351,20 +379,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const stateInput = getObjectProperty(toolState, 'input')
             const stateTitle = getStringProperty(toolState, 'title')
             logger.debug({tool, status}, 'run-core: tool completed (message.part.updated)')
-            const summary = formatToolPart({
-              tool,
-              state: {
-                input:
-                  stateInput != null && typeof stateInput === 'object'
-                    ? (stateInput as Record<string, unknown>)
-                    : undefined,
-                title: stateTitle ?? undefined,
-                status: status === 'error' ? 'error' : 'completed',
+            appendToolSummary(
+              {
+                tool,
+                state: {
+                  input:
+                    stateInput != null && typeof stateInput === 'object'
+                      ? (stateInput as Record<string, unknown>)
+                      : undefined,
+                  title: stateTitle ?? undefined,
+                  status: status === 'error' ? 'error' : 'completed',
+                },
               },
-            })
-            if (summary != null && summary.length > 0) {
-              sink.append(`\n${summary}\n`)
-            }
+              sink,
+              logger,
+            )
           }
         }
       }
@@ -396,17 +425,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const inputTitle = getStringProperty(input, 'title')
             const title = structuredTitle ?? inputTitle ?? undefined
             logger.debug({callID, tool}, 'run-core: tool success')
-            const summary = formatToolPart({
-              tool,
-              state: {
-                input: input != null && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
-                title,
-                status: 'completed',
+            appendToolSummary(
+              {
+                tool,
+                state: {
+                  input: input != null && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
+                  title,
+                  status: 'completed',
+                },
               },
-            })
-            if (summary != null && summary.length > 0) {
-              sink.append(`\n${summary}\n`)
-            }
+              sink,
+              logger,
+            )
           }
         }
       }

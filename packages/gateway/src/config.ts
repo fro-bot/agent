@@ -404,7 +404,21 @@ export function loadGatewayConfig(): GatewayConfig {
   // Persona — optional multi-line markdown file (e.g. fro-bot-persona.md).
   // Uses readOptionalMultilineSecret because persona files contain embedded newlines.
   // Absent/empty/whitespace → null (R4 fail-soft: the mention loop degrades gracefully).
-  const persona = readOptionalMultilineSecret('GATEWAY_PERSONA')
+  // Fail-soft: any read error (permission-denied, directory, oversized, etc.) logs a warning
+  // and resolves to null — a persona read failure must never crash gateway startup.
+  let persona: string | null = null
+  try {
+    persona = readOptionalMultilineSecret('GATEWAY_PERSONA')
+  } catch {
+    // Intentionally broad catch: permission-denied, directory, oversized, symlink, etc.
+    // Log a warning WITHOUT file contents (no secret leakage) and continue with null.
+    console.warn(
+      JSON.stringify({
+        level: 'warn',
+        msg: 'GATEWAY_PERSONA read failed — persona will be null; gateway startup continues. Check GATEWAY_PERSONA_FILE path and permissions.',
+      }),
+    )
+  }
 
   // Announce/presence endpoint — opt-in: both secrets must be set together, or neither.
   // Mirrors the AWS credential pair-validation block above.

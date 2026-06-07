@@ -1507,4 +1507,50 @@ describe('loadGatewayConfig — GATEWAY_PERSONA_FILE (persona)', () => {
 
     delete process.env.GATEWAY_PERSONA
   })
+
+  it('fail-soft: GATEWAY_PERSONA_FILE points to a directory → persona is null, startup continues', () => {
+    // #given — _FILE points to a directory (Docker bind-mount misconfiguration)
+    setRequiredEnv()
+    const dirPath = mkdtempSync(join(tmpDir, 'persona-dir-'))
+    process.env.GATEWAY_PERSONA_FILE = dirPath
+
+    // #when / #then — must NOT throw; persona degrades to null
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    let config: import('./config.js').GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.persona).toBeNull()
+    consoleSpy.mockRestore()
+  })
+
+  it('fail-soft: GATEWAY_PERSONA_FILE points to oversized file → persona is null, startup continues', () => {
+    // #given — file exceeds MAX_SECRET_BYTES (4096)
+    setRequiredEnv()
+    const largePath = join(tmpDir, 'persona-large.md')
+    writeFileSync(largePath, 'x'.repeat(5000), {mode: 0o600})
+    process.env.GATEWAY_PERSONA_FILE = largePath
+
+    // #when / #then — must NOT throw; persona degrades to null
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    let config: import('./config.js').GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.persona).toBeNull()
+    consoleSpy.mockRestore()
+  })
+
+  it('fail-soft: GATEWAY_PERSONA_FILE points to non-existent file → persona is null, no warning (ENOENT is normal)', () => {
+    // #given — _FILE points to a missing path, no env var fallback
+    setRequiredEnv()
+    process.env.GATEWAY_PERSONA_FILE = join(tmpDir, 'does-not-exist-2.md')
+
+    // #when / #then — must NOT throw; absent persona is fail-soft (ENOENT falls through to null)
+    let config: import('./config.js').GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.persona).toBeNull()
+  })
 })

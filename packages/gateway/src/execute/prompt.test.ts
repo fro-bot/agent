@@ -40,7 +40,7 @@ describe('buildDiscordPrompt', () => {
   })
 
   describe('persona composition', () => {
-    it('happy path: persona present → prompt is persona + mechanical guidance + repo + message, in order', () => {
+    it('happy path: persona present → prompt is scoped-persona + mechanical guidance + repo + message, in order', () => {
       // #given
       const persona = 'You are Fro Bot, a capable engineering assistant.'
 
@@ -52,7 +52,7 @@ describe('buildDiscordPrompt', () => {
         persona,
       })
 
-      // #then — persona first, then guidance, then repo, then message
+      // #then — scoped persona first, then guidance, then repo, then message
       const personaIdx = result.indexOf(persona)
       const guidanceIdx = result.indexOf(DISCORD_MECHANICAL_GUIDANCE)
       const repoIdx = result.indexOf('Repository: org/myrepo')
@@ -62,6 +62,27 @@ describe('buildDiscordPrompt', () => {
       expect(guidanceIdx).toBeGreaterThan(personaIdx)
       expect(repoIdx).toBeGreaterThan(guidanceIdx)
       expect(msgIdx).toBeGreaterThan(repoIdx)
+    })
+
+    it('persona scoping: persona is wrapped in a voice/style-only header so it cannot override Discord guidance', () => {
+      // #given
+      const persona = 'You are Fro Bot.'
+
+      // #when
+      const result = buildDiscordPrompt({
+        messageText: 'Do the thing',
+        owner: 'org',
+        repo: 'myrepo',
+        persona,
+      })
+
+      // #then — persona is wrapped in a scoped header
+      expect(result).toContain('--- Persona (voice and style only) ---')
+      expect(result).toContain('--- End Persona ---')
+      // Discord guidance appears AFTER the persona section
+      const personaSectionEnd = result.indexOf('--- End Persona ---')
+      const guidanceIdx = result.indexOf(DISCORD_MECHANICAL_GUIDANCE)
+      expect(guidanceIdx).toBeGreaterThan(personaSectionEnd)
     })
 
     it('edge (R4 fail-soft): persona absent → mechanical guidance + repo + message, no error', () => {
@@ -155,6 +176,42 @@ describe('buildDiscordPrompt', () => {
       // #given / #when — assert the DISCORD_MECHANICAL_GUIDANCE constant itself carries the policy
       expect(DISCORD_MECHANICAL_GUIDANCE).toMatch(/summarize|attach/i)
       expect(DISCORD_MECHANICAL_GUIDANCE).toMatch(/inline/i)
+    })
+
+    it('persona wiring (P2.8): non-empty persona flows into the built prompt', () => {
+      // #given — persona provided via deps
+      const persona = 'You are Fro Bot, a capable engineering assistant. Be direct.'
+
+      // #when
+      const result = buildDiscordPrompt({
+        messageText: 'Fix the bug',
+        owner: 'org',
+        repo: 'myrepo',
+        persona,
+      })
+
+      // #then — persona content appears in the prompt
+      expect(result).toContain(persona)
+      // And the scoped header is present
+      expect(result).toContain('--- Persona (voice and style only) ---')
+    })
+
+    it('persona wiring (P2.8): null persona → prompt contains only guidance + repo + message', () => {
+      // #given — null persona (config.persona is null when unset)
+
+      // #when
+      const result = buildDiscordPrompt({
+        messageText: 'Fix the bug',
+        owner: 'org',
+        repo: 'myrepo',
+        persona: null,
+      })
+
+      // #then — no persona section in prompt
+      expect(result).not.toContain('--- Persona')
+      expect(result).toContain(DISCORD_MECHANICAL_GUIDANCE)
+      expect(result).toContain('Repository: org/myrepo')
+      expect(result).toContain('Fix the bug')
     })
   })
 
