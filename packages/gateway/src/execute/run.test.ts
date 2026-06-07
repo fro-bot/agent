@@ -233,16 +233,22 @@ function makeStatefulSinkMock(
  * Build a stateful sink mock that properly tracks pending-visibility state
  * via markVisibleOutputPending(), mirroring the real sink's closure semantics.
  * Used to prove that in-flight sends count as visible context at classification time.
+ *
+ * flush() faithfully emulates the real createDiscordStreamSink empty-buffer semantics
+ * after FIX 1: when the buffer is empty, returns {kind:'skipped-visible'} if
+ * visibleOutputSent === true || pendingVisibleOutput > 0, else records that the
+ * _(no output)_ message was posted and returns {kind:'empty'}.
  */
 function makeStatefulPendingSinkMock() {
   let visibleOutputSent = false
   let pendingVisibleOutput = 0
+  let noOutputPosted = false
 
   const markVisibleOutputPending = vi.fn().mockImplementation(() => {
     pendingVisibleOutput += 1
     let settled = false
     return (delivered: boolean): void => {
-      if (settled) {
+      if (settled === true) {
         return
       }
       settled = true
@@ -253,15 +259,28 @@ function makeStatefulPendingSinkMock() {
     }
   })
 
+  const flushFn = vi.fn().mockImplementation(async () => {
+    // Emulate real sink empty-buffer path (FIX 1 semantics):
+    // skip _(no output)_ when either delivered OR pending visible output exists.
+    if (visibleOutputSent === true || pendingVisibleOutput > 0) {
+      return {kind: 'skipped-visible' as const}
+    }
+    // Genuinely empty — record that _(no output)_ would be posted
+    noOutputPosted = true
+    return {kind: 'empty' as const}
+  })
+
   return {
     append: vi.fn(),
-    flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
+    flush: flushFn,
     buffered: vi.fn().mockReturnValue(''),
     markVisibleOutputSent: vi.fn().mockImplementation(() => {
       visibleOutputSent = true
     }),
     markVisibleOutputPending,
-    hasVisibleOutput: vi.fn().mockImplementation(() => visibleOutputSent || pendingVisibleOutput > 0),
+    hasVisibleOutput: vi.fn().mockImplementation(() => visibleOutputSent === true || pendingVisibleOutput > 0),
+    /** Test-only: true if flush() posted the _(no output)_ fallback message. */
+    _noOutputPosted: () => noOutputPosted,
   }
 }
 
@@ -1468,6 +1487,81 @@ describe('runMention', () => {
       expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
       // #and — does NOT use no-output retry wording
       expect(lastCall.content).not.toMatch(/please try again/i)
+      // #and — the _(no output)_ fallback was NOT posted (flush returned skipped-visible)
+      // This is the FIX 1 regression guard: flush() must not post _(no output)_ when a
+      // pending send is in-flight, preventing the contradictory "(no output) + updates above" pair.
+      expect(statefulSink._noOutputPosted()).toBe(false)
+      // Verify flush returned skipped-visible (not empty)
+      const flushResult = await ((statefulSink.flush as ReturnType<typeof vi.fn>).mock.results[0]?.value as Promise<{
+        kind: string
+      }>)
+      expect(flushResult).toEqual({kind: 'skipped-visible'})
+    })
+
+    it('approval send PENDING at timeout + empty buffer → flush returns skipped-visible (no _(no output)_ posted) AND visible-output copy chosen', async () => {
+      // Regression test for FIX 1: the flush/classification contradiction race.
+      // When an approval send is still PENDING (not yet delivered) and the buffer is empty,
+      // flush() must return {kind:'skipped-visible'} — NOT post _(no output)_ — so that
+      // classification can then post the "updates above" copy without contradiction.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+
+      const statefulSink = makeStatefulPendingSinkMock()
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // The approval send never resolves — it is still PENDING when timeout fires.
+      const neverResolves = new Promise<never>(() => {
+        /* intentionally never resolves */
+      })
+      thread.send.mockReturnValueOnce(neverResolves).mockReturnValueOnce(neverResolves).mockResolvedValue(undefined)
+
+      mockRunOpenCodeCore.mockImplementation(async () => {
+        if (capturedOnPending !== undefined) {
+          capturedOnPending({
+            requestID: 'req-fix1-regression',
+            sessionID: 'sess-fix1',
+            permission: 'bash',
+            patterns: [],
+            title: 'Run command: ls',
+          })
+        }
+        throw new RunCoreError('timeout', 'timed out')
+      })
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush returned skipped-visible (pending send suppressed _(no output)_)
+      expect(statefulSink._noOutputPosted()).toBe(false)
+      const flushResult = await ((statefulSink.flush as ReturnType<typeof vi.fn>).mock.results[0]?.value as Promise<{
+        kind: string
+      }>)
+      expect(flushResult).toEqual({kind: 'skipped-visible'})
+
+      // #and — classification chose the visible-output branch ("updates above" copy)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/updates above/i)
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+
+      // #and — the contradictory _(no output)_ message was NOT sent at any point
+      const allContents = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+      expect(allContents.some(c => c.includes('_(no output)_'))).toBe(false)
     })
 
     it('approval send REJECTS before timeout fires → no-output timeout copy chosen', async () => {
@@ -1614,6 +1708,80 @@ describe('runMention', () => {
       expect(lastCall.content).not.toMatch(/what to do next/i)
       // #and — includes configured duration
       expect(lastCall.content).toMatch(/10.?min/i)
+    })
+  })
+
+  // ── onDeadlineSettled path ───────────────────────────────────────────────
+
+  describe('onDeadlineSettled path', () => {
+    it('deadline-settled send marks visible output on the sink (markVisibleOutputSent called after send)', async () => {
+      // Exercises the onDeadlineSettled path: when the deadline fires, run.ts calls
+      // safeSend then sink.markVisibleOutputSent(). This test asserts that after
+      // onDeadlineSettled completes, the sink reports visible output.
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const thread = makeThread()
+      const fakeApprovalMessage = {id: 'msg-deadline-vis', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+      const message = makeMessage(thread)
+      const approvalRegistry = makeApprovalRegistry()
+
+      // Use a stateful sink so we can observe markVisibleOutputSent
+      let visibleMarked = false
+      const sinkMock = makeStreamSinkMock({
+        markVisibleOutputSent: vi.fn().mockImplementation(() => {
+          visibleMarked = true
+        }),
+        hasVisibleOutput: vi.fn().mockImplementation(() => visibleMarked),
+      })
+      mockCreateDiscordStreamSink.mockReturnValue(
+        sinkMock as unknown as ReturnType<typeof streamingModule.createDiscordStreamSink>,
+      )
+
+      const deps = makeDeps({approvalRegistry})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnPending).toBeDefined()
+      if (capturedOnPending === undefined) throw new Error('onPending not captured')
+
+      capturedOnPending({
+        requestID: 'req-deadline-vis-1',
+        sessionID: 'sess-deadline-vis',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // Extract the onDeadlineSettled callback from the register call
+      const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
+        | {onDeadlineSettled?: () => void | Promise<void>}
+        | undefined
+      expect(registerCall?.onDeadlineSettled).toBeDefined()
+
+      // #when — simulate deadline firing
+      if (registerCall?.onDeadlineSettled !== undefined) {
+        await registerCall.onDeadlineSettled()
+      }
+
+      // #then — after onDeadlineSettled completes, the sink reports visible output
+      // (markVisibleOutputSent was called after the safeSend succeeded)
+      expect(visibleMarked).toBe(true)
+      // markVisibleOutputSent was called exactly once (by onDeadlineSettled)
+      expect(sinkMock.markVisibleOutputSent).toHaveBeenCalledOnce()
     })
   })
 

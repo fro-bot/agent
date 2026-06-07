@@ -502,6 +502,25 @@ describe('createDiscordStreamSink', () => {
       expect(result.kind).toBe('skipped-visible')
       expect(thread._send).not.toHaveBeenCalled()
     })
+
+    it('fix 1 regression: empty-buffer flush() while send is still PENDING (not yet settled) returns {kind:"skipped-visible"} — does NOT post _(no output)_', async () => {
+      // This is the core regression guard for FIX 1.
+      // Race: approval send is in-flight (pending) when flush() is called on an empty buffer.
+      // Before FIX 1, flush() only checked visibleOutputSent (false) and would post _(no output)_.
+      // After FIX 1, flush() also checks pendingVisibleOutput > 0 and returns skipped-visible.
+      // #given — pending send in-flight; buffer empty; NOT yet settled
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputPending() // increments pendingVisibleOutput; NOT settled
+
+      // #when — flush while send is still pending
+      const result = await sink.flush()
+
+      // #then — skipped-visible (pending suppresses _(no output)_)
+      expect(result.kind).toBe('skipped-visible')
+      // #and — _(no output)_ was NOT sent to Discord
+      expect(thread._send).not.toHaveBeenCalled()
+    })
   })
 
   describe('markVisibleOutputSent()', () => {
