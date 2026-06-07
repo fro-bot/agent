@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-05-17"
-updated-by: "ec2c628"
+last-updated: "2026-06-07"
+updated-by: "cbc7008"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -14,9 +14,11 @@ sources:
   - src/harness/phases/finalize.ts
   - src/harness/phases/cleanup.ts
   - src/harness/phases/dedup.ts
+  - src/harness/phases/review-reconciliation.ts
   - src/harness/post.ts
   - src/features/triggers/router.ts
   - src/features/agent/output-mode.ts
+  - src/features/reviews/review-reconciliation.ts
   - src/services/github/context.ts
   - packages/runtime/src/coordination/lock.ts
   - packages/runtime/src/coordination/types.ts
@@ -24,7 +26,7 @@ sources:
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
   - RFCs/RFC-019-S3-Storage-Backend.md
-summary: "Phase-by-phase walkthrough of a single action run from trigger to cache save"
+summary: "Phase-by-phase walkthrough of a single action run, including review reconciliation"
 ---
 
 # Execution Lifecycle
@@ -45,7 +47,8 @@ main.ts
        ├─  7. Session Prep
        ├─  8. Execute
        ├─  9. Finalize
-       └─ 10. Cleanup (always, via finally)
+       ├─ 10. Review Reconciliation
+       └─ 11. Cleanup (always, via finally)
 
 post.ts
   └─ runPost()
@@ -105,7 +108,13 @@ If the LLM returns a fetch error (transient provider failure), the system retrie
 
 Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Posts the run summary to GitHub. Collects metrics and sets action outputs (session ID, cache status, duration).
 
-## 10. Cleanup (Always)
+## 10. Review Reconciliation
+
+Runs after Finalize, only for `pull_request` review triggers. Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API. This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
+
+The phase is **fail-safe**: any error logs a warning and no-ops. It never throws and never fails the run. It also checks the bot login before acting — an empty or null `botLogin` triggers an immediate no-op.
+
+## 11. Cleanup (Always)
 
 Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server — importantly, this triggers a SQLite WAL checkpoint that merges in-flight session data into the main database file before cache save. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]). Saves the cache and optionally uploads a prompt log artifact for observability.
 

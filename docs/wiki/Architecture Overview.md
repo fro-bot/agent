@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-05-31"
-updated-by: "3d6d1f5"
+last-updated: "2026-06-07"
+updated-by: "cbc7008"
 sources:
   - src/main.ts
   - src/post.ts
@@ -9,9 +9,12 @@ sources:
   - src/harness/post.ts
   - packages/runtime/src/index.ts
   - packages/runtime/src/coordination/types.ts
+  - packages/harness/src/cli.ts
+  - packages/harness/src/integrate.ts
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/http/server.ts
+  - packages/gateway/src/approvals/coordinator.ts
   - packages/runtime/src/agent/remote-client.ts
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
@@ -19,7 +22,7 @@ sources:
   - AGENTS.md
   - action.yaml
   - pnpm-workspace.yaml
-summary: "Monorepo structure, four-layer action architecture, runtime, gateway, and workspace-agent packages"
+summary: "Monorepo structure, action + harness + gateway + workspace-agent packages, and module map"
 ---
 
 # Architecture Overview
@@ -33,6 +36,7 @@ The project is organized as a pnpm workspace monorepo with two workspace areas:
 | Package | Path | Purpose |
 | --- | --- | --- |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Consumed by both the Action and the Gateway. |
+| `@fro.bot/harness` | `packages/harness/` | Published, patched OpenCode binary built via LLM-merge integration. Acts as a drop-in replacement for the stock OpenCode CLI in the action setup. Ships as a main package plus per-platform binary packages (`@fro.bot/harness-linux-x64`, etc.). |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo coordination lock, and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
 | workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service that runs inside the Docker Compose deploy stack alongside the gateway. Provides a `POST /clone` endpoint to checkout repositories in an isolated container (keeping git credentials off the gateway), and hosts a loopback-bound OpenCode server fronted by a bearer-token proxy for the gateway to attach to. Also exposes `GET /healthz` for Docker Compose health checks. |
@@ -63,13 +67,23 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 ## Module Map
 
+### Harness Package (`packages/harness/`)
+
+`@fro.bot/harness` is a published, patched OpenCode binary built via the LLM-merge integration method (`cortexkit/orw`). Rather than downloading stock OpenCode, the action setup can install the harness binary, which carries a curated set of integration refs (stalled or closed upstream PRs, branch URLs) merged onto each deliberately-pinned upstream release via a one-time `opencode run` LLM merge. The produced binary is frozen: the merge runs once in CI per release bump, is reviewed as a bump PR, and the integration commit SHA is pinned before per-platform binaries are built and published.
+
+The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health.
+
+The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. The main package's `postinstall` resolver picks the host platform's binary, verifies it, and symlinks it; `OPENCODE_PATH` and a bare `opencode` on `PATH` are honored as fallbacks for local or unbuilt use. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`.
+
 ### Gateway Package (`packages/gateway/`)
 
 The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs and executes those runs end-to-end against a remote OpenCode server. Key modules:
 
 **Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`, including `/add-project` and `/fro-bot`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses.
 
-**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits, and `recovery.ts` handles interrupted runs.
+**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits, and `recovery.ts` handles interrupted runs. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
+
+**Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
 **HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
 

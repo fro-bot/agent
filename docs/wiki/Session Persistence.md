@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-05-24"
-updated-by: "201b294"
+last-updated: "2026-06-07"
+updated-by: "cbc7008"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
