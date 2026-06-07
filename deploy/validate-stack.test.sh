@@ -13,6 +13,15 @@
 #   (f) EXITS NON-ZERO for long-form bind mounts at /workspace/repos.
 #   (g) EXITS NON-ZERO for --topology-only without Docker when workspace-repos
 #       mount is missing (raw YAML fallback must still catch the invariant).
+#   (h) EXITS NON-ZERO when ANY service (not just workspace/mitmproxy) declares
+#       network_mode (broadened Invariant 1b scope).
+#   (i) EXITS NON-ZERO (fail-closed) when docker is absent and COMPOSE_FILE lists
+#       multiple files — raw-YAML shallow-merge cannot reproduce Docker Compose
+#       merge semantics and must not silently produce wrong results.
+#   (j) When docker IS available, multi-file topology violations are still caught
+#       via the authoritative docker compose merge (gated on docker presence).
+#   (k) Single-file raw YAML fallback (no docker) is unchanged — still exits zero
+#       for a valid single compose file.
 #
 # Run from repo root:
 #   bash deploy/validate-stack.test.sh
@@ -572,6 +581,418 @@ fi
 echo ""
 echo "  No-Docker-insecure-test output (stderr+stdout combined):"
 echo "${NO_DOCKER_INSECURE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 12 — Negative: network_mode:host on workspace must be rejected.
+#
+# An override can set network_mode: host on workspace, giving it full host
+# networking.  Because network_mode replaces the 'networks' key entirely,
+# the existing network-attachment invariants would pass vacuously.  The new
+# Invariant 1b must catch this regardless of the docker/no-docker path.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 12: topology guard rejects workspace with network_mode:host ---"
+
+NM_WORKSPACE_COMPOSE="${TMPDIR_TEST}/compose-nm-workspace.yaml"
+cat > "${NM_WORKSPACE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    network_mode: host
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+NM_WORKSPACE_OUTPUT=""
+NM_WORKSPACE_EXIT=0
+NM_WORKSPACE_OUTPUT="$(COMPOSE_FILE="${NM_WORKSPACE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NM_WORKSPACE_EXIT=$?
+
+if [[ "${NM_WORKSPACE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${NM_WORKSPACE_EXIT}) for workspace with network_mode:host"
+else
+  fail "validate-stack.sh exited ZERO for workspace with network_mode:host — guard did NOT fire"
+fi
+
+if echo "${NM_WORKSPACE_OUTPUT}" | grep -qi "network_mode"; then
+  pass "failure message mentions 'network_mode'"
+else
+  fail "failure message does not mention 'network_mode' — output: ${NM_WORKSPACE_OUTPUT}"
+fi
+
+# Blocking fix: network_mode services must NOT produce misleading secondary
+# attachment failures — exactly ONE failure line (the 1b network_mode FAIL).
+if echo "${NM_WORKSPACE_OUTPUT}" | grep -q "must be attached to exactly"; then
+  fail "workspace network_mode test: spurious Invariant 2 message 'must be attached to exactly' present — secondary failure not suppressed"
+else
+  pass "workspace network_mode test: no spurious 'must be attached to exactly' message (Invariant 2 correctly skipped)"
+fi
+
+echo ""
+echo "  network_mode-workspace-test output (stderr+stdout combined):"
+echo "${NM_WORKSPACE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 13 — Negative: network_mode:host on mitmproxy must be rejected.
+#
+# Same bypass vector as TEST 12 but targeting mitmproxy.  An operator could
+# set network_mode: host on mitmproxy to give it unrestricted host networking,
+# which also breaks the containment model.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 13: topology guard rejects mitmproxy with network_mode:host ---"
+
+NM_MITM_COMPOSE="${TMPDIR_TEST}/compose-nm-mitm.yaml"
+cat > "${NM_MITM_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    network_mode: host
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+NM_MITM_OUTPUT=""
+NM_MITM_EXIT=0
+NM_MITM_OUTPUT="$(COMPOSE_FILE="${NM_MITM_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NM_MITM_EXIT=$?
+
+if [[ "${NM_MITM_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${NM_MITM_EXIT}) for mitmproxy with network_mode:host"
+else
+  fail "validate-stack.sh exited ZERO for mitmproxy with network_mode:host — guard did NOT fire"
+fi
+
+if echo "${NM_MITM_OUTPUT}" | grep -qi "network_mode"; then
+  pass "failure message mentions 'network_mode'"
+else
+  fail "failure message does not mention 'network_mode' — output: ${NM_MITM_OUTPUT}"
+fi
+
+# Blocking fix: network_mode services must NOT produce misleading secondary
+# attachment failures — exactly ONE failure line (the 1b network_mode FAIL).
+if echo "${NM_MITM_OUTPUT}" | grep -q "is not attached to sandbox-net"; then
+  fail "mitmproxy network_mode test: spurious Invariant 3 message 'is not attached to sandbox-net' present — secondary failure not suppressed"
+else
+  pass "mitmproxy network_mode test: no spurious 'is not attached to sandbox-net' message (Invariant 3 correctly skipped)"
+fi
+
+echo ""
+echo "  network_mode-mitmproxy-test output (stderr+stdout combined):"
+echo "${NM_MITM_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 14 — Negative: network_mode:host on a non-workspace/mitmproxy service
+#           (e.g. a sidecar) must be rejected.
+#
+# Proves the broadened Invariant 1b scope: ANY service with network_mode is
+# rejected, not just workspace and mitmproxy.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 14: topology guard rejects sidecar service with network_mode:host ---"
+
+NM_SIDECAR_COMPOSE="${TMPDIR_TEST}/compose-nm-sidecar.yaml"
+cat > "${NM_SIDECAR_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+  sidecar:
+    image: ubuntu:22.04
+    network_mode: host
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+NM_SIDECAR_OUTPUT=""
+NM_SIDECAR_EXIT=0
+NM_SIDECAR_OUTPUT="$(COMPOSE_FILE="${NM_SIDECAR_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NM_SIDECAR_EXIT=$?
+
+if [[ "${NM_SIDECAR_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${NM_SIDECAR_EXIT}) for sidecar with network_mode:host"
+else
+  fail "validate-stack.sh exited ZERO for sidecar with network_mode:host — broadened guard did NOT fire"
+fi
+
+if echo "${NM_SIDECAR_OUTPUT}" | grep -qi "network_mode"; then
+  pass "failure message mentions 'network_mode' for sidecar service"
+else
+  fail "failure message does not mention 'network_mode' — output: ${NM_SIDECAR_OUTPUT}"
+fi
+
+echo ""
+echo "  network_mode-sidecar-test output (stderr+stdout combined):"
+echo "${NM_SIDECAR_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 18 — Negative: network_mode:service:<x> on a service must be rejected.
+#
+# Confirms the guard is value-agnostic: any truthy network_mode string is
+# rejected, not just "host".
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 18: topology guard rejects service with network_mode:service:mitmproxy ---"
+
+NM_SERVICE_COMPOSE="${TMPDIR_TEST}/compose-nm-service.yaml"
+cat > "${NM_SERVICE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    network_mode: "service:mitmproxy"
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+NM_SERVICE_OUTPUT=""
+NM_SERVICE_EXIT=0
+NM_SERVICE_OUTPUT="$(COMPOSE_FILE="${NM_SERVICE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NM_SERVICE_EXIT=$?
+
+if [[ "${NM_SERVICE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${NM_SERVICE_EXIT}) for network_mode:service:mitmproxy"
+else
+  fail "validate-stack.sh exited ZERO for network_mode:service:mitmproxy — guard did NOT fire"
+fi
+
+if echo "${NM_SERVICE_OUTPUT}" | grep -qi "network_mode"; then
+  pass "failure message mentions 'network_mode' for service:<x> value"
+else
+  fail "failure message does not mention 'network_mode' — output: ${NM_SERVICE_OUTPUT}"
+fi
+
+echo ""
+echo "  network_mode-service-test output (stderr+stdout combined):"
+echo "${NM_SERVICE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 19 — Negative: network_mode:container:<x> on a service must be rejected.
+#
+# Confirms the guard is value-agnostic for the container:<x> form as well.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 19: topology guard rejects service with network_mode:container:foo ---"
+
+NM_CONTAINER_COMPOSE="${TMPDIR_TEST}/compose-nm-container.yaml"
+cat > "${NM_CONTAINER_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    network_mode: "container:foo"
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+NM_CONTAINER_OUTPUT=""
+NM_CONTAINER_EXIT=0
+NM_CONTAINER_OUTPUT="$(COMPOSE_FILE="${NM_CONTAINER_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || NM_CONTAINER_EXIT=$?
+
+if [[ "${NM_CONTAINER_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${NM_CONTAINER_EXIT}) for network_mode:container:foo"
+else
+  fail "validate-stack.sh exited ZERO for network_mode:container:foo — guard did NOT fire"
+fi
+
+if echo "${NM_CONTAINER_OUTPUT}" | grep -qi "network_mode"; then
+  pass "failure message mentions 'network_mode' for container:<x> value"
+else
+  fail "failure message does not mention 'network_mode' — output: ${NM_CONTAINER_OUTPUT}"
+fi
+
+echo ""
+echo "  network_mode-container-test output (stderr+stdout combined):"
+echo "${NM_CONTAINER_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# Shared fixture for multi-file tests (base compose with valid topology).
+# ---------------------------------------------------------------------------
+MULTI_BASE_COMPOSE="${TMPDIR_TEST}/compose-multi-base.yaml"
+cat > "${MULTI_BASE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+# ---------------------------------------------------------------------------
+# TEST 15 — Negative (multi-file, docker-present): override attaches workspace
+#           to egress-net → must be rejected via docker compose real merge.
+#
+# When docker compose is available it performs the authoritative merge and the
+# guard must catch the topology violation in the merged result.
+# Skipped with a clear message when docker is absent from PATH.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 15: multi-file (docker-present) — override attaches workspace to egress-net (must be rejected) ---"
+
+MULTI_OVERRIDE_COMPOSE="${TMPDIR_TEST}/compose-multi-override.yaml"
+cat > "${MULTI_OVERRIDE_COMPOSE}" <<'YAML'
+services:
+  workspace:
+    networks:
+      - sandbox-net
+      - egress-net
+    volumes:
+      - workspace-repos:/workspace/repos
+YAML
+
+if command -v docker &>/dev/null; then
+  MULTI_OUTPUT=""
+  MULTI_EXIT=0
+  MULTI_OUTPUT="$(COMPOSE_FILE="${MULTI_BASE_COMPOSE}:${MULTI_OVERRIDE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || MULTI_EXIT=$?
+
+  if [[ "${MULTI_EXIT}" -ne 0 ]]; then
+    pass "multi-file (docker): validate-stack.sh exited non-zero (${MULTI_EXIT}) for override attaching workspace to egress-net"
+  else
+    fail "multi-file (docker): validate-stack.sh exited ZERO — merged topology violation was NOT caught"
+  fi
+
+  if echo "${MULTI_OUTPUT}" | grep -qi "egress\|non-internal\|direct internet"; then
+    pass "multi-file (docker): failure message mentions egress/non-internal violation"
+  else
+    fail "multi-file (docker): failure message does not mention egress violation — output: ${MULTI_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  multi-file-docker-test output (stderr+stdout combined):"
+  echo "${MULTI_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: multi-file (docker): docker not in PATH — docker-present multi-file test requires docker compose"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 16 — Negative (multi-file, docker-absent): fail-closed when docker is
+#           unavailable and COMPOSE_FILE lists multiple files.
+#
+# The raw-YAML fallback cannot faithfully reproduce Docker Compose merge
+# semantics (shallow dict-update replaces whole service dicts, producing
+# false failures on valid partial overrides).  The guard must exit non-zero
+# with a clear error message mentioning "multiple files" and
+# "docker compose is unavailable".
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 16: multi-file (no docker) — fail-closed with clear error message ---"
+
+MULTI_NODOCK_OUTPUT=""
+MULTI_NODOCK_EXIT=0
+MULTI_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${MULTI_BASE_COMPOSE}:${MULTI_OVERRIDE_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || MULTI_NODOCK_EXIT=$?
+
+if [[ "${MULTI_NODOCK_EXIT}" -ne 0 ]]; then
+  pass "multi-file (no docker): validate-stack.sh exited non-zero (${MULTI_NODOCK_EXIT}) — fail-closed as expected"
+else
+  fail "multi-file (no docker): validate-stack.sh exited ZERO — should have failed closed"
+fi
+
+if echo "${MULTI_NODOCK_OUTPUT}" | grep -qi "multiple files\|docker compose is unavailable"; then
+  pass "multi-file (no docker): error message mentions 'multiple files' / 'docker compose is unavailable'"
+else
+  fail "multi-file (no docker): error message missing expected text — output: ${MULTI_NODOCK_OUTPUT}"
+fi
+
+echo ""
+echo "  multi-file-no-docker-test output (stderr+stdout combined):"
+echo "${MULTI_NODOCK_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 17 — Positive (single-file, no docker): single-file raw YAML fallback
+#           must still succeed for a valid compose file when docker is absent.
+#
+# Confirms the single-file path is byte-for-byte unchanged by the fail-closed
+# multi-file change.  Uses the real deploy/compose.yaml as the positive control.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 17: single-file (no docker) — raw YAML fallback still exits zero for real compose.yaml ---"
+
+SINGLE_NODOCK_OUTPUT=""
+SINGLE_NODOCK_EXIT=0
+SINGLE_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="deploy/compose.yaml" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || SINGLE_NODOCK_EXIT=$?
+
+if [[ "${SINGLE_NODOCK_EXIT}" -eq 0 ]]; then
+  pass "single-file (no docker): validate-stack.sh exited zero for real compose.yaml via raw YAML fallback"
+else
+  fail "single-file (no docker): validate-stack.sh exited non-zero (${SINGLE_NODOCK_EXIT}) — output: ${SINGLE_NODOCK_OUTPUT}"
+fi
+
+echo ""
+echo "  single-file-no-docker-test output (stderr+stdout combined):"
+echo "${SINGLE_NODOCK_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # Summary

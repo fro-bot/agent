@@ -35,11 +35,32 @@ WORKSPACE_EGRESS_HOSTS
     (fail-closed default).
 """
 
+import concurrent.futures
 import ipaddress
 import os
 import socket
 import sys
 from mitmproxy import http
+
+# ---------------------------------------------------------------------------
+# Embedded-IPv4 IPv6 prefixes whose low 32 bits encode an IPv4 address.
+# Python's ipaddress does NOT decode the embedded IPv4 from these addresses,
+# so e.g. 64:ff9b::a00:1 (embedding 10.0.0.1) incorrectly reports is_global=True.
+# _ip_is_disallowed extracts and checks the embedded IPv4 for both prefixes.
+#
+# _NAT64_WKP  — NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052 §2.1)
+# _IPV4_COMPAT — IPv4-compatible IPv6 ::/96 (RFC 4291 §2.5.5.1, deprecated
+#                but still parseable; e.g. ::10.0.0.1 → is_global=True in Python)
+# ---------------------------------------------------------------------------
+_NAT64_WKP = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPAT = ipaddress.ip_network("::/96")
+_EMBEDDED_V4_PREFIXES = (_NAT64_WKP, _IPV4_COMPAT)
+
+# Hard timeout for DNS resolution in _resolve_has_disallowed_ip. getaddrinfo(3)
+# does NOT honor socket.setdefaulttimeout() on Linux/glibc (uses the C resolver),
+# so we bound it via a worker thread + future.result(timeout=...). On timeout we
+# fail closed (block the request) — same policy as a resolution error.
+_DNS_RESOLVE_TIMEOUT_S: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Allowlist — production-safe defaults for fro-bot v1.
@@ -89,6 +110,14 @@ def _ip_is_disallowed(ip_str: str) -> bool:
       - documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32)
       - benchmarking (198.18/15)
       - multicast, unspecified (0.0.0.0, ::), site-local, unique local IPv6 (fc00::/7)
+      - Embedded-IPv4 IPv6 prefixes where Python's ipaddress does not decode the
+        embedded IPv4 and the raw is_global check would incorrectly pass:
+          * NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052) — e.g. 64:ff9b::a00:1
+            embeds 10.0.0.1 but reports is_global=True
+          * IPv4-compatible IPv6 ::/96 (RFC 4291 §2.5.5.1, deprecated) — e.g.
+            ::10.0.0.1 (::a00:1) embeds 10.0.0.1 but reports is_global=True
+        For both prefixes the embedded IPv4 is extracted from the low 32 bits of
+        the address integer and evaluated with the same is_global rule.
 
     Returns False for globally-routable public IPs (accepted for self-hosted
     MinIO deployments and similar use cases).
@@ -98,6 +127,11 @@ def _ip_is_disallowed(ip_str: str) -> bool:
     except ValueError:
         # Not a parseable IP address — not our concern here.
         return False
+    # Embedded-IPv4 prefixes: extract and check the embedded IPv4 (low 32 bits).
+    if isinstance(ip, ipaddress.IPv6Address) and any(ip in net for net in _EMBEDDED_V4_PREFIXES):
+        embedded_v4 = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if not embedded_v4.is_global:
+            return True
     return not ip.is_global
 
 
@@ -268,16 +302,27 @@ def _is_allowed(host: str) -> bool:
 def _resolve_has_disallowed_ip(host: str) -> bool:
     """Resolve *host* and return True if ANY resolved address is disallowed.
 
-    Fails closed: if resolution raises (DNS error, timeout, or encoding
-    failure), returns True (block the request).
+    Fails closed: if resolution raises (DNS error or encoding failure), OR if
+    resolution does not complete within _DNS_RESOLVE_TIMEOUT_S seconds, returns
+    True (block the request). The 5-second budget bounds proxy stalls caused by
+    a slow or hanging system resolver — getaddrinfo(3) does not honor
+    socket.setdefaulttimeout() on Linux/glibc.
 
     Note: this check runs at the addon hook layer. mitmproxy performs its own
     independent resolution for the upstream dial (TOCTOU gap). This is
     defense-in-depth against operator misconfiguration and naive DNS rebinding,
     not a hermetic guarantee.
     """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(socket.getaddrinfo, host, None)
+    # Detach immediately — do NOT wait for the thread on shutdown. If the
+    # future times out the worker thread may keep running briefly in the
+    # background; that is acceptable (daemon-ish). We must not block here.
+    executor.shutdown(wait=False)
     try:
-        results = socket.getaddrinfo(host, None)
+        results = future.result(timeout=_DNS_RESOLVE_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        return True  # fail closed — resolution hung, block the request
     except (OSError, UnicodeError):
         return True  # fail closed — resolution failure blocks the request
     for _family, _type, _proto, _canonname, sockaddr in results:
