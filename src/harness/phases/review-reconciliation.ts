@@ -158,7 +158,11 @@ export async function runReviewReconciliation(
       return {reconciled: false, reason: 'self-or-fork'}
     }
 
-    // Step 2: Fetch bot's reviews on this PR
+    // Step 2: Fetch bot's reviews on this PR.
+    // Single page (max 100). On a PR with >100 reviews the latest bot review
+    // could fall on a later page, in which case this phase no-ops (the PR keeps
+    // its existing state) rather than approving — a safe degradation, not a
+    // wrongful approval. Pagination can be added if that ceiling is ever hit.
     const reviewsResponse = await octokit.rest.pulls.listReviews({
       owner,
       repo,
@@ -201,7 +205,12 @@ export async function runReviewReconciliation(
 
     const verdictBody: string | null = latestBotReview.body ?? null
     const headMatches = latestBotReview.commit_id === currentHeadSha
-    const verdictBelongsToRun = true // already filtered by runStart above
+    // Always true here: botReviewsThisRun is pre-filtered by submitted_at >= runStart,
+    // so any review reaching this point belongs to the current run. The field stays in
+    // decideReconciliation's contract so the decision logic is independently testable
+    // (and reusable by callers that don't pre-filter), but the phase's own guard is the
+    // timestamp filter above.
+    const verdictBelongsToRun = true
 
     // Step 4: Parse verdict and decide
     const verdict = verdictBody == null ? null : parseVerdict(verdictBody)
