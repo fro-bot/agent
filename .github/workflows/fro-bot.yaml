@@ -30,7 +30,7 @@ on:
         type: boolean
         default: false
       model:
-        description: Model override for the Fro Bot agent (e.g. anthropic/claude-haiku-4-5)
+        description: Model override for the Fro Bot agent (e.g. anthropic/claude-haiku-4-5-20251001)
         required: false
       correlation-id:
         description: Audit correlation token forwarded by an external dispatcher (e.g. the release-notes narration step)
@@ -256,4 +256,7 @@ jobs:
           # GitHub: the narrator edits the release body directly, so suppression is
           # enforced here, not left to prompt compliance.
           response-mode: ${{ (github.event.inputs.correlation-id != '' && 'none') || inputs.response-mode || 'github' }}
-          timeout: 0
+          # Release-notes narration runs are bounded so an unroutable model or
+          # provider stall fails fast (the successCmd then soft-warns) instead of
+          # hanging the run; all other runs remain unbounded.
+          timeout: ${{ github.event.inputs.correlation-id != '' && '600000' || '0' }}
