@@ -232,8 +232,11 @@ jobs:
           auth-json: ${{ secrets.AUTH_JSON }}
           github-token: ${{ secrets.FRO_BOT_PAT }}
           model: ${{ inputs.model || vars.FRO_BOT_MODEL }}
-          enable-omo: true
-          omo-providers: ${{ secrets.OMO_PROVIDERS }}
+          # Release-notes narration (correlation-id-tagged) runs on stock OpenCode with
+          # an explicit model override; oMo is skipped so its provider routing does not
+          # interfere with the narration model.
+          enable-omo: ${{ github.event.inputs.correlation-id != '' && 'false' || 'true' }}
+          omo-providers: ${{ github.event.inputs.correlation-id != '' && '' || secrets.OMO_PROVIDERS }}
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           # Wiki paths opt into branch-pr explicitly so delivery contract is
           # self-documenting and decoupled from prompt-wording drift. All other
