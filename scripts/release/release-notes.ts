@@ -3,6 +3,8 @@ const TAG_PATTERN = /^v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/
 // eslint-disable-next-line no-control-regex -- ANSI escape stripping requires the ESC control character
 const ANSI_ESCAPE_PATTERN = /\u001B\[[0-9;]*m/g
 
+// Module-scoped /g regex: hasOffTargetEdit() must reset lastIndex before each scan
+// (it does) — the global flag is stateful across calls and would otherwise skip matches.
 const RELEASE_EDIT_PATTERN = /release edit (v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)/g
 
 const AUTH_FAILURE_PATTERNS = [
@@ -151,6 +153,8 @@ export function selectDispatchedRun(
 ): number | null | typeof AMBIGUOUS_RUN_SENTINEL {
   const candidates = runs.filter(run => {
     const runEpoch = Math.floor(new Date(run.createdAt).getTime() / 1000)
+    // correlationId is a randomUUID; substring match is safe because UUID prefix
+    // collisions across concurrent dispatches are negligible.
     return runEpoch >= dispatchEpochSeconds && run.displayTitle.includes(correlationId)
   })
 
