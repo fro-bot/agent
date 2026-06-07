@@ -155,7 +155,7 @@ established voice (see origin).
 
 ## Implementation Units
 
-- [ ] **Unit 1: Part renderer + essential-tool filter (pure module)**
+- [x] **Unit 1: Part renderer + essential-tool filter (pure module)**
 
 **Goal:** A pure, tested module that turns an extracted **tool** shape into a clean Discord line: essential
 tool → one-line summary; non-essential (read-only) tool → null. (Reasoning suppression and text passthrough
@@ -199,7 +199,7 @@ title-resolution logic in `run-core.ts` (state.title → input.title → bash co
 
 **Verification:** Module tests pass; `pnpm --filter @fro-bot/gateway check-types` + `lint` clean.
 
-- [ ] **Unit 2: Wire the renderer into run-core (reasoning suppression + tool summaries)**
+- [x] **Unit 2: Wire the renderer into run-core (reasoning suppression + tool summaries)**
 
 **Goal:** Replace the raw `🔧 <tool>: <title>` appends with the Unit 1 summaries, and suppress reasoning
 content so it never reaches the sink.
@@ -246,7 +246,7 @@ a `read` tool produces no `🔧` line, while an `edit` produces a summary.
 **Verification:** New + existing run-core tests pass; no `🔧 <tool>: <title>` raw format remains;
 gateway suite green; check-types + lint clean.
 
-- [ ] **Unit 3: Discord persona config + prompt composition**
+- [x] **Unit 3: Discord persona config + prompt composition**
 
 **Goal:** The mention prompt prepends the canonical persona + Discord-mechanical guidance, delivered via
 `GATEWAY_PERSONA_FILE`, fail-soft when absent.
@@ -291,7 +291,7 @@ mechanical guidance.
 
 **Verification:** Prompt + config tests pass; check-types + lint clean.
 
-- [ ] **Unit 4: Deploy wiring + docs**
+- [x] **Unit 4: Deploy wiring + docs**
 
 **Goal:** Make `GATEWAY_PERSONA_FILE` deployable and document the new rendering + persona behavior.
 

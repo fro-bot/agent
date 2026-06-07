@@ -100,6 +100,16 @@ touch deploy/secrets/workspace-opencode-auth
 touch deploy/secrets/gateway-trigger-role-id
 # echo -n 'YOUR_ROLE_ID' > deploy/secrets/gateway-trigger-role-id
 
+# Optional — canonical Fro Bot persona for the @-mention loop. When set, the
+# persona text is prepended to the Discord agent prompt so responses carry Fro
+# Bot's voice; if unset, the loop falls back to built-in Discord guidance
+# (fail-soft). Provision the canonical file from fro-bot/.github
+# persona/fro-bot-persona.md, then uncomment GATEWAY_PERSONA_FILE + its bind-mount
+# in compose.yaml. (Mention replies hide chain-of-thought and read-only tool
+# noise, and summarize tool actions, regardless of whether the persona is set.)
+touch deploy/secrets/gateway-persona
+# cp /path/to/fro-bot-persona.md deploy/secrets/gateway-persona
+
 # Optional — announce/presence endpoint (opt-in). The gateway exposes an
 # HMAC-verified POST /v1/announce presence webhook ONLY when BOTH of these are
 # set; set NEITHER to leave it disabled (the default). Setting exactly one
