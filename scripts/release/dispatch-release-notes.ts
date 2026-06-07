@@ -87,7 +87,7 @@ function main(): void {
         '-f',
         `correlation-id=${correlationId}`,
         '-f',
-        'model=anthropic/claude-haiku-4-5',
+        'model=anthropic/claude-haiku-4-5-20251001',
       ],
       {env: childEnv, stdio: ['ignore', 'pipe', 'pipe']},
     )
