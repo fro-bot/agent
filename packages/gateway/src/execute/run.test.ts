@@ -62,6 +62,7 @@ vi.mock('../discord/streaming.js', () => ({
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 10}),
     buffered: vi.fn().mockReturnValue(''),
     markVisibleOutputSent: vi.fn(),
+    markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
     hasVisibleOutput: vi.fn().mockReturnValue(false),
   }),
 }))
@@ -181,6 +182,7 @@ function makeStreamSinkMock(
     flush?: ReturnType<typeof vi.fn>
     buffered?: ReturnType<typeof vi.fn>
     markVisibleOutputSent?: ReturnType<typeof vi.fn>
+    markVisibleOutputPending?: ReturnType<typeof vi.fn>
     hasVisibleOutput?: ReturnType<typeof vi.fn>
   } = {},
 ) {
@@ -189,6 +191,7 @@ function makeStreamSinkMock(
     flush: overrides.flush ?? vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
     buffered: overrides.buffered ?? vi.fn().mockReturnValue(''),
     markVisibleOutputSent: overrides.markVisibleOutputSent ?? vi.fn(),
+    markVisibleOutputPending: overrides.markVisibleOutputPending ?? vi.fn().mockReturnValue(vi.fn()),
     hasVisibleOutput: overrides.hasVisibleOutput ?? vi.fn().mockReturnValue(false),
   }
 }
@@ -221,6 +224,7 @@ function makeStatefulSinkMock(
     markVisibleOutputSent: vi.fn().mockImplementation(() => {
       visible = true
     }),
+    markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
     hasVisibleOutput: hasVisibleOutputFn,
   }
 }
@@ -715,6 +719,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
 
@@ -883,6 +888,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial output'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -913,6 +919,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -941,6 +948,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'AbortError: signal timed out'))
@@ -968,6 +976,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 42}),
         buffered: vi.fn().mockReturnValue('some partial output'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -998,6 +1007,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'attachment' as const, charCount: 3000}),
         buffered: vi.fn().mockReturnValue('x'.repeat(3000)),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -1026,6 +1036,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'skipped-visible' as const}),
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -1062,6 +1073,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -1089,6 +1101,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5}),
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true), // visible output present — but stream-ended, not timeout
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
@@ -1116,6 +1129,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 5}),
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new Error('some unknown error'))
@@ -1143,6 +1157,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
         buffered: vi.fn().mockReturnValue('output'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -1171,6 +1186,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
@@ -1197,6 +1213,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue('partial'),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
@@ -1223,6 +1240,7 @@ describe('runMention', () => {
         flush: flushMock,
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
       setupHappyPath()
@@ -1333,6 +1351,7 @@ describe('runMention', () => {
         markVisibleOutputSent: vi.fn().mockImplementation(() => {
           visible = true
         }),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: hasVisibleOutputFn,
       })
       mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
@@ -1893,6 +1912,7 @@ describe('runMention', () => {
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
         buffered: vi.fn().mockReturnValue(''),
         markVisibleOutputSent: markVisibleOutputSentFn,
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
 
