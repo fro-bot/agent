@@ -117,9 +117,23 @@ export interface DiscordStreamSink {
    */
   readonly markVisibleOutputSent: () => void
   /**
+   * Marks an out-of-band visible send as in-flight so timeout/error
+   * classification treats it as visible context while the Discord send is
+   * pending. Returns a one-shot settle handle:
+   * - `settle(true)` — send succeeded; promotes to permanently delivered
+   *   (same effect as `markVisibleOutputSent()`).
+   * - `settle(false)` — send failed; retracts the pending claim without
+   *   marking delivered.
+   * The handle is one-shot: calling it a second time is a no-op (guards
+   * against double-decrement and prevents a late `settle(true)` from
+   * overriding an earlier `settle(false)`).
+   */
+  readonly markVisibleOutputPending: () => (delivered: boolean) => void
+  /**
    * Returns `true` if visible output has been sent to the thread — either via
-   * `markVisibleOutputSent()` or via a successful flush of buffered text.
-   * Read-only; never resets once set.
+   * `markVisibleOutputSent()`, via a successful flush of buffered text, or via
+   * a pending out-of-band send that has not yet settled.
+   * Read-only; never resets once permanently set.
    *
    * Use this to decide whether a timeout or error message should acknowledge
    * partial output rather than treating the run as having produced nothing.
@@ -137,6 +151,7 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
   const {logger} = deps
   let buffer = ''
   let visibleOutputSent = false
+  let pendingVisibleOutput = 0
 
   const append = (text: string): void => {
     buffer += text
@@ -148,15 +163,33 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
     visibleOutputSent = true
   }
 
-  const hasVisibleOutput = (): boolean => visibleOutputSent
+  const markVisibleOutputPending = (): ((delivered: boolean) => void) => {
+    pendingVisibleOutput += 1
+    let settled = false
+    return (delivered: boolean): void => {
+      if (settled === true) {
+        return
+      }
+      settled = true
+      pendingVisibleOutput -= 1
+      if (delivered === true) {
+        visibleOutputSent = true
+      }
+    }
+  }
+
+  const hasVisibleOutput = (): boolean => visibleOutputSent === true || pendingVisibleOutput > 0
 
   const flush = async (): Promise<FlushResult> => {
     const text = buffer
 
     // Empty / whitespace — check if visible output was already sent outside the buffer
     if (text.trim().length === 0) {
-      // Visible output already sent (e.g. approval waiting status) → skip _(no output)_
-      if (visibleOutputSent) {
+      // Visible output already delivered OR an out-of-band send is still in-flight (pending).
+      // A pending send that later fails will retract via settle(false) for future reads, but
+      // suppressing _(no output)_ here avoids a contradictory "(no output) + updates above"
+      // pair in the timeout race where flush() runs before classification reads hasVisibleOutput().
+      if (visibleOutputSent === true || pendingVisibleOutput > 0) {
         return {kind: 'skipped-visible'}
       }
       // Genuinely empty run → post the "no output" fallback
@@ -196,5 +229,5 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
     }
   }
 
-  return {append, flush, buffered, markVisibleOutputSent, hasVisibleOutput}
+  return {append, flush, buffered, markVisibleOutputSent, markVisibleOutputPending, hasVisibleOutput}
 }

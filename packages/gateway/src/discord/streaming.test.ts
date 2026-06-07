@@ -399,6 +399,130 @@ describe('createDiscordStreamSink', () => {
     })
   })
 
+  // ── Unit: markVisibleOutputPending() — pending-visibility counter ──
+
+  describe('markVisibleOutputPending()', () => {
+    it('happy path: makes hasVisibleOutput() return true immediately before settle', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when — mark pending, do NOT settle yet
+      sink.markVisibleOutputPending()
+
+      // #then — pending counts as visible
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('happy path: settle(true) keeps hasVisibleOutput() true after pending drops to 0', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle = sink.markVisibleOutputPending()
+
+      // #when — settle as delivered
+      settle(true)
+
+      // #then — permanently visible (visibleOutputSent promoted)
+      expect(sink.hasVisibleOutput()).toBe(true)
+    })
+
+    it('error path: settle(false) with no other visible output makes hasVisibleOutput() return false', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle = sink.markVisibleOutputPending()
+
+      // #when — settle as failed
+      settle(false)
+
+      // #then — pending retracted, not promoted to delivered
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('edge case: two concurrent handles — settle one false keeps hasVisibleOutput() true while other is still pending', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle1 = sink.markVisibleOutputPending()
+      const settle2 = sink.markVisibleOutputPending()
+
+      // #when — settle first as failed
+      settle1(false)
+
+      // #then — second is still pending, so still visible
+      expect(sink.hasVisibleOutput()).toBe(true)
+
+      // #when — settle second as failed too
+      settle2(false)
+
+      // #then — both retracted, no other visible output
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('edge case: double-settle is a no-op — pending→settle(false)→settle(false) leaves hasVisibleOutput false (no negative count)', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle = sink.markVisibleOutputPending()
+
+      // #when — settle twice with false
+      settle(false)
+      settle(false) // must be a no-op, not decrement again
+
+      // #then — still false, count not negative
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('edge case: double-settle — first settle wins; pending→settle(false)→settle(true) does NOT promote to delivered', () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle = sink.markVisibleOutputPending()
+
+      // #when — first settle false, then try to promote with true
+      settle(false)
+      settle(true) // must be a no-op; first settle already won
+
+      // #then — not promoted to delivered
+      expect(sink.hasVisibleOutput()).toBe(false)
+    })
+
+    it('integration: empty-buffer flush() after settle(true) returns {kind:"skipped-visible"}', async () => {
+      // #given — settle(true) promotes to visibleOutputSent; buffer is empty
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      const settle = sink.markVisibleOutputPending()
+      settle(true)
+
+      // #when
+      const result = await sink.flush()
+
+      // #then — existing skipped-visible contract still holds
+      expect(result.kind).toBe('skipped-visible')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+
+    it('fix 1 regression: empty-buffer flush() while send is still PENDING (not yet settled) returns {kind:"skipped-visible"} — does NOT post _(no output)_', async () => {
+      // This is the core regression guard for FIX 1.
+      // Race: approval send is in-flight (pending) when flush() is called on an empty buffer.
+      // Before FIX 1, flush() only checked visibleOutputSent (false) and would post _(no output)_.
+      // After FIX 1, flush() also checks pendingVisibleOutput > 0 and returns skipped-visible.
+      // #given — pending send in-flight; buffer empty; NOT yet settled
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.markVisibleOutputPending() // increments pendingVisibleOutput; NOT settled
+
+      // #when — flush while send is still pending
+      const result = await sink.flush()
+
+      // #then — skipped-visible (pending suppresses _(no output)_)
+      expect(result.kind).toBe('skipped-visible')
+      // #and — _(no output)_ was NOT sent to Discord
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+  })
+
   describe('markVisibleOutputSent()', () => {
     it('flush returns {kind:"skipped-visible"} instead of posting _(no output)_ when visible output was already sent', async () => {
       // #given — nothing appended to buffer, but visible output was already posted (e.g. approval status)
