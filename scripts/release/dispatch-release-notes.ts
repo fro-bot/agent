@@ -15,6 +15,7 @@ import {
   escapeAnnotation,
   isAuthError,
   parseDispatchedRuns,
+  resolveNarrationModel,
   selectDispatchedRun,
   validateTag,
 } from './release-notes.ts'
@@ -64,7 +65,15 @@ function main(): void {
   // Step 5: build prompt
   const prompt = buildNarrationPrompt({tag, repo, correlationId})
 
-  // Step 6: build child env — override GH_TOKEN with the dispatch PAT when available
+  // Step 6a: resolve narration model — fail-soft if unset
+  const modelResult = resolveNarrationModel(process.env)
+  if ('skip' in modelResult) {
+    process.stdout.write(`::warning::${escapeAnnotation(modelResult.skip)}\n`)
+    process.exit(0)
+  }
+  const releaseNotesModel = modelResult.model
+
+  // Step 6b: build child env — override GH_TOKEN with the dispatch PAT when available
   const dispatchToken = process.env.RELEASE_NOTES_DISPATCH_TOKEN
   const childEnv: NodeJS.ProcessEnv =
     dispatchToken != null && dispatchToken !== '' ? {...process.env, GH_TOKEN: dispatchToken} : {...process.env}
@@ -87,7 +96,7 @@ function main(): void {
         '-f',
         `correlation-id=${correlationId}`,
         '-f',
-        'model=anthropic/claude-haiku-4-5-20251001',
+        `model=${releaseNotesModel}`,
       ],
       {env: childEnv, stdio: ['ignore', 'pipe', 'pipe']},
     )

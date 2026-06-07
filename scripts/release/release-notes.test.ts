@@ -5,9 +5,70 @@ import {
   classifyOutcome,
   escapeAnnotation,
   parseDispatchedRuns,
+  resolveNarrationModel,
   selectDispatchedRun,
   validateTag,
 } from './release-notes.js'
+
+describe('resolveNarrationModel', () => {
+  it('returns model when RELEASE_NOTES_MODEL is set to a non-empty value', () => {
+    // #given
+    const env = {RELEASE_NOTES_MODEL: 'anthropic/claude-haiku-4-5-20251001'}
+
+    // #when
+    const result = resolveNarrationModel(env)
+
+    // #then
+    expect('model' in result).toBe(true)
+    expect((result as {model: string}).model).toBe('anthropic/claude-haiku-4-5-20251001')
+  })
+
+  it('returns skip when RELEASE_NOTES_MODEL is absent', () => {
+    // #given
+    const env: NodeJS.ProcessEnv = {}
+
+    // #when
+    const result = resolveNarrationModel(env)
+
+    // #then
+    expect('skip' in result).toBe(true)
+    expect((result as {skip: string}).skip).toContain('RELEASE_NOTES_MODEL')
+  })
+
+  it('returns skip when RELEASE_NOTES_MODEL is an empty string', () => {
+    // #given
+    const env = {RELEASE_NOTES_MODEL: ''}
+
+    // #when
+    const result = resolveNarrationModel(env)
+
+    // #then
+    expect('skip' in result).toBe(true)
+  })
+
+  it('returns skip when RELEASE_NOTES_MODEL is whitespace-only', () => {
+    // #given
+    const env = {RELEASE_NOTES_MODEL: '   '}
+
+    // #when
+    const result = resolveNarrationModel(env)
+
+    // #then
+    expect('skip' in result).toBe(true)
+  })
+
+  it('trims surrounding whitespace from a valid model value', () => {
+    // #given
+    const env = {RELEASE_NOTES_MODEL: '  anthropic/claude-haiku-4-5-20251001  '}
+
+    // #when
+    const result = resolveNarrationModel(env)
+
+    // #then
+    expect('model' in result).toBe(true)
+    expect((result as {model: string}).model).toBe('anthropic/claude-haiku-4-5-20251001')
+  })
+})
 
 describe('validateTag', () => {
   it('accepts a standard semver tag', () => {
