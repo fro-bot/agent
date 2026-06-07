@@ -22,6 +22,22 @@ export const MIN_RELEASE_BODY_LENGTH = 200
 
 export type ValidateTagResult = {ok: true} | {ok: false; error: string}
 
+export type ResolveNarrationModelResult = {readonly model: string} | {readonly skip: string}
+
+/**
+ * Resolve the narration model from the environment.
+ * Returns `{ model }` when the env var is set and non-empty (after trimming).
+ * Returns `{ skip: reason }` when it is absent, empty, or whitespace-only.
+ */
+export function resolveNarrationModel(env: NodeJS.ProcessEnv): ResolveNarrationModelResult {
+  const raw = env.RELEASE_NOTES_MODEL
+  const model = raw?.trim() ?? ''
+  if (model === '') {
+    return {skip: 'RELEASE_NOTES_MODEL is not set; narration skipped'}
+  }
+  return {model}
+}
+
 export function validateTag(tag: string): ValidateTagResult {
   if (TAG_PATTERN.test(tag)) {
     return {ok: true}

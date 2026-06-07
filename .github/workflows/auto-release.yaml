@@ -68,6 +68,7 @@ jobs:
           # Used by the release-notes narration successCmd to dispatch fro-bot.yaml.
           # The App token is contents:read only; FRO_BOT_PAT carries actions:write.
           RELEASE_NOTES_DISPATCH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL }}
         id: semantic-release
         name: Semantic Release
         run: |
