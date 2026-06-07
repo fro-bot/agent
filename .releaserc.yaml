@@ -8,6 +8,7 @@ plugins:
 
   - - '@semantic-release/exec'
     - verifyReleaseCmd: 'echo "version=${nextRelease.version}" >> "$GITHUB_OUTPUT"'
+      successCmd: 'node --experimental-strip-types --experimental-transform-types scripts/release/dispatch-release-notes.ts "${nextRelease.gitTag}"'
 
   - '@semantic-release/npm'
 

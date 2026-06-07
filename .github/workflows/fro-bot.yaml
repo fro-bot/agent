@@ -1,6 +1,9 @@
 ---
 name: Fro Bot
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.correlation-id != '' && format('Fro Bot · release-notes · {0}', github.event.inputs.correlation-id) || 'Fro Bot' }}
+
 on:
   issue_comment:
     types: [created]
@@ -26,6 +29,12 @@ on:
         description: Run with the built-in Wiki update prompt
         type: boolean
         default: false
+      model:
+        description: Model override for the Fro Bot agent (e.g. anthropic/claude-haiku-4-5)
+        required: false
+      correlation-id:
+        description: Audit correlation token forwarded by an external dispatcher (e.g. the release-notes narration step)
+        required: false
   # Called by other workflows (e.g. harness-release) to run Fro Bot with a
   # specific model and/or prompt. Secrets are inherited from the caller via
   # `secrets: inherit` — no secret passthrough inputs needed.
@@ -233,11 +242,15 @@ jobs:
           # See docs/plans/2026-04-17-001-fix-manual-delivery-mode-plan.md.
           output-mode: >-
             ${{
-              (inputs.prompt != '' && 'working-dir')
+              (github.event.inputs.correlation-id != '' && 'working-dir')
+              || (inputs.prompt != '' && 'working-dir')
               || (github.event_name == 'workflow_dispatch' && github.event.inputs.use-wiki-prompt == 'true' && 'branch-pr')
               || (github.event_name == 'schedule' && github.event.schedule == '0 20 * * 0' && 'branch-pr')
               || 'auto'
             }}
           prompt: ${{ env.PROMPT }}
-          response-mode: ${{ inputs.response-mode || 'github' }}
+          # Correlation-id-tagged dispatches (release-notes narration) post nothing to
+          # GitHub: the narrator edits the release body directly, so suppression is
+          # enforced here, not left to prompt compliance.
+          response-mode: ${{ (github.event.inputs.correlation-id != '' && 'none') || inputs.response-mode || 'github' }}
           timeout: 0
