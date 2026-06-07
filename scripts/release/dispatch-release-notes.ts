@@ -12,7 +12,9 @@ import {
   AMBIGUOUS_RUN_SENTINEL,
   buildNarrationPrompt,
   classifyOutcome,
+  escapeAnnotation,
   isAuthError,
+  parseDispatchedRuns,
   selectDispatchedRun,
   validateTag,
 } from './release-notes.ts'
@@ -42,14 +44,14 @@ function main(): void {
   // Step 1: read target tag from argv
   const tag = process.argv[2]
   if (tag === undefined || tag === '') {
-    process.stdout.write('::error::Missing required argument: target tag\n')
+    process.stdout.write(`::error::${escapeAnnotation('Missing required argument: target tag')}\n`)
     process.exit(1)
   }
 
   // Step 2: validate tag shape
   const validation = validateTag(tag)
   if (!validation.ok) {
-    process.stdout.write(`::error::Invalid RELEASE_VERSION shape: ${tag}\n`)
+    process.stdout.write(`::error::${escapeAnnotation(`Invalid RELEASE_VERSION shape: ${tag}`)}\n`)
     process.exit(1)
   }
 
@@ -97,13 +99,13 @@ function main(): void {
 
     if (isAuthError(message)) {
       // Auth/permission failure is a genuine security signal — hard-fail
-      process.stdout.write(`::error::Dispatch auth failure: ${sanitized}\n`)
+      process.stdout.write(`::error::${escapeAnnotation(`Dispatch auth failure: ${sanitized}`)}\n`)
       process.exit(1)
     }
 
     // Everything else: soft-warn, release is unaffected
     process.stdout.write(
-      `::warning::Dispatch failed (correlation=${correlationId}): ${sanitized}. Narration skipped; release is unaffected.\n`,
+      `::warning::${escapeAnnotation(`Dispatch failed (correlation=${correlationId}): ${sanitized}. Narration skipped; release is unaffected.`)}\n`,
     )
     process.exit(0)
   }
@@ -132,7 +134,7 @@ function main(): void {
         ],
         childEnv,
       )
-      const runs = JSON.parse(raw) as readonly {databaseId: number; createdAt: string; displayTitle: string}[]
+      const runs = parseDispatchedRuns(raw)
       const selected = selectDispatchedRun(runs, dispatchEpoch, correlationId)
       if (selected === AMBIGUOUS_RUN_SENTINEL) {
         ambiguous = true
@@ -151,14 +153,14 @@ function main(): void {
 
   if (ambiguous) {
     process.stdout.write(
-      `::warning::ambiguous run selection (multiple candidates for correlation ${correlationId}); narration runs async, release unaffected\n`,
+      `::warning::${escapeAnnotation(`ambiguous run selection (multiple candidates for correlation ${correlationId}); narration runs async, release unaffected`)}\n`,
     )
     process.exit(0)
   }
 
   if (runId === null) {
     process.stdout.write(
-      `::warning::Dispatch sent but run not confirmed within ${pollBudget}s (correlation=${correlationId}, dispatched_at_epoch=${dispatchEpoch}). Narration runs async; release unaffected.\n`,
+      `::warning::${escapeAnnotation(`Dispatch sent but run not confirmed within ${pollBudget}s (correlation=${correlationId}, dispatched_at_epoch=${dispatchEpoch}). Narration runs async; release unaffected.`)}\n`,
     )
     process.exit(0)
   }
@@ -204,11 +206,11 @@ function main(): void {
   const result = classifyOutcome({watchExit, conclusion, log, bodyLen, targetTag: tag})
 
   if (result.level === 'error') {
-    process.stdout.write(`::error::${result.message}\n`)
+    process.stdout.write(`::error::${escapeAnnotation(result.message)}\n`)
   } else if (result.level === 'warn') {
-    process.stdout.write(`::warning::${result.message}\n`)
+    process.stdout.write(`::warning::${escapeAnnotation(result.message)}\n`)
   } else {
-    process.stdout.write(`${result.message}\n`)
+    process.stdout.write(`${escapeAnnotation(result.message)}\n`)
   }
 
   process.exit(result.exitCode)

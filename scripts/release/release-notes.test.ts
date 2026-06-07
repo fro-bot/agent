@@ -3,6 +3,8 @@ import {
   AMBIGUOUS_RUN_SENTINEL,
   buildNarrationPrompt,
   classifyOutcome,
+  escapeAnnotation,
+  parseDispatchedRuns,
   selectDispatchedRun,
   validateTag,
 } from './release-notes.js'
@@ -557,5 +559,263 @@ describe('buildNarrationPrompt', () => {
     // #then
     expect(prompt).toContain('<details>')
     expect(prompt).toContain('Full changelog')
+  })
+})
+
+describe('parseDispatchedRuns', () => {
+  it('returns a valid array from well-formed JSON', () => {
+    // #given
+    const raw = JSON.stringify([
+      {databaseId: 1, createdAt: '2024-01-01T00:00:00Z', displayTitle: 'Fro Bot · release-notes · abc'},
+      {databaseId: 2, createdAt: '2024-01-02T00:00:00Z', displayTitle: 'Fro Bot · release-notes · def'},
+    ])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toHaveLength(2)
+    expect(result[0]).toEqual({
+      databaseId: 1,
+      createdAt: '2024-01-01T00:00:00Z',
+      displayTitle: 'Fro Bot · release-notes · abc',
+    })
+    expect(result[1]).toEqual({
+      databaseId: 2,
+      createdAt: '2024-01-02T00:00:00Z',
+      displayTitle: 'Fro Bot · release-notes · def',
+    })
+  })
+
+  it('returns empty array for an empty string', () => {
+    // #given
+    const raw = ''
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('returns empty array for non-JSON garbage', () => {
+    // #given
+    const raw = 'error: could not connect to github.com'
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('returns empty array when JSON is a non-array value (object)', () => {
+    // #given
+    const raw = JSON.stringify({databaseId: 1, createdAt: '2024-01-01T00:00:00Z', displayTitle: 'title'})
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('returns empty array when JSON is a non-array value (null)', () => {
+    // #given
+    const raw = 'null'
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out rows with missing databaseId', () => {
+    // #given
+    const raw = JSON.stringify([{createdAt: '2024-01-01T00:00:00Z', displayTitle: 'title'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out rows with wrong-typed databaseId (string instead of number)', () => {
+    // #given
+    const raw = JSON.stringify([{databaseId: '123', createdAt: '2024-01-01T00:00:00Z', displayTitle: 'title'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out rows with missing createdAt', () => {
+    // #given
+    const raw = JSON.stringify([{databaseId: 1, displayTitle: 'title'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out rows with empty createdAt string', () => {
+    // #given
+    const raw = JSON.stringify([{databaseId: 1, createdAt: '', displayTitle: 'title'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out rows with missing displayTitle', () => {
+    // #given
+    const raw = JSON.stringify([{databaseId: 1, createdAt: '2024-01-01T00:00:00Z'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('filters out null entries in the array', () => {
+    // #given
+    const raw = JSON.stringify([null, {databaseId: 1, createdAt: '2024-01-01T00:00:00Z', displayTitle: 'title'}])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toHaveLength(1)
+    expect(result[0]?.databaseId).toBe(1)
+  })
+
+  it('keeps valid rows and drops invalid rows in a mixed array', () => {
+    // #given
+    const raw = JSON.stringify([
+      {databaseId: 10, createdAt: '2024-01-01T00:00:00Z', displayTitle: 'good'},
+      {databaseId: 'bad', createdAt: '2024-01-01T00:00:00Z', displayTitle: 'bad-type'},
+      null,
+      {databaseId: 20, createdAt: '2024-01-02T00:00:00Z', displayTitle: 'also-good'},
+      {createdAt: '2024-01-03T00:00:00Z', displayTitle: 'missing-id'},
+    ])
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then — only the two fully-valid rows survive
+    expect(result).toHaveLength(2)
+    expect(result[0]?.databaseId).toBe(10)
+    expect(result[1]?.databaseId).toBe(20)
+  })
+
+  it('filters out rows with non-finite databaseId (null, as JSON cannot represent Infinity)', () => {
+    // #given — JSON cannot represent Infinity/NaN; they serialize as null.
+    // Test the isFinite guard via a raw string with null databaseId.
+    const raw = '[{"databaseId":null,"createdAt":"2024-01-01T00:00:00Z","displayTitle":"title"}]'
+
+    // #when
+    const result = parseDispatchedRuns(raw)
+
+    // #then
+    expect(result).toEqual([])
+  })
+})
+
+describe('escapeAnnotation', () => {
+  it('leaves normal text unchanged', () => {
+    // #given
+    const message = 'narrative applied successfully'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('narrative applied successfully')
+  })
+
+  it('escapes % as %25', () => {
+    // #given
+    const message = '50% complete'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('50%25 complete')
+  })
+
+  it(String.raw`escapes CR (\r) as %0D`, () => {
+    // #given
+    const message = 'line one\rline two'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('line one%0Dline two')
+  })
+
+  it(String.raw`escapes LF (\n) as %0A`, () => {
+    // #given
+    const message = 'line one\nline two'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('line one%0Aline two')
+  })
+
+  it('escapes % before CR/LF to avoid double-encoding', () => {
+    // #given — if % were encoded after \n, the %0A would become %250A
+    const message = '%\n'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then — % → %25 first, then \n → %0A; result is %25%0A not %250A
+    expect(result).toBe('%25%0A')
+  })
+
+  it('escapes all three special characters in a single string', () => {
+    // #given
+    const message = 'err: 100% failed\r\ncheck logs'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('err: 100%25 failed%0D%0Acheck logs')
+  })
+
+  it('handles an empty string', () => {
+    // #given
+    const message = ''
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('')
+  })
+
+  it('handles multiple consecutive special characters', () => {
+    // #given
+    const message = '%%\n\n\r\r'
+
+    // #when
+    const result = escapeAnnotation(message)
+
+    // #then
+    expect(result).toBe('%25%25%0A%0A%0D%0D')
   })
 })

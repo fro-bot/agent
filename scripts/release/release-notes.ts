@@ -111,6 +111,39 @@ export interface DispatchedRun {
 // Callers must distinguish null-from-zero vs null-from-ambiguous via the exported sentinel.
 export const AMBIGUOUS_RUN_SENTINEL = Symbol('ambiguous')
 
+// CHANGE A: safe parser — never throws; returns empty array on any malformed input
+export function parseDispatchedRuns(raw: string): readonly DispatchedRun[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(parsed)) return []
+  const out: DispatchedRun[] = []
+  for (const item of parsed) {
+    if (item == null || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const {databaseId, createdAt, displayTitle} = rec
+    if (
+      typeof databaseId === 'number' &&
+      Number.isFinite(databaseId) &&
+      typeof createdAt === 'string' &&
+      createdAt !== '' &&
+      typeof displayTitle === 'string'
+    ) {
+      out.push({databaseId, createdAt, displayTitle})
+    }
+  }
+  return out
+}
+
+// CHANGE B: escape GitHub Actions annotation message bodies
+// % → %25 must come first to avoid double-encoding CR/LF escapes
+export function escapeAnnotation(message: string): string {
+  return message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')
+}
+
 export function selectDispatchedRun(
   runs: readonly DispatchedRun[],
   dispatchEpochSeconds: number,
