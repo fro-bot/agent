@@ -218,6 +218,135 @@ describe('decodeAnnounce — edge cases', () => {
   })
 })
 
+// ── daily_digest ──────────────────────────────────────────────────────────────
+
+const validDailyDigest = {
+  v: 1,
+  event_type: 'daily_digest',
+  fired_at: VALID_FIRED_AT,
+  context: {
+    repos_tracked: 12,
+    surveys_today: 3,
+    report_url: 'https://example.com/report/2026-05-29',
+  },
+  rendered_text: null,
+} as const
+
+describe('decodeAnnounce — daily_digest happy path', () => {
+  it('decodes a valid daily_digest payload to Right with typed context', () => {
+    // #given a well-formed daily_digest payload
+    // #when decoded
+    const result = decodeAnnounce(validDailyDigest)
+    // #then it is Right with correct shape
+    const payload = expectRight(result)
+    expect(payload.event_type).toBe('daily_digest')
+    expect(payload.v).toBe(1)
+    if (payload.event_type !== 'daily_digest') throw new Error('unreachable')
+    expect(payload.context.repos_tracked).toBe(12)
+    expect(payload.context.surveys_today).toBe(3)
+    expect(payload.context.report_url).toBe('https://example.com/report/2026-05-29')
+    expect(payload.rendered_text).toBeNull()
+  })
+
+  it('accepts rendered_text as a non-null string on daily_digest', () => {
+    // #given a daily_digest payload with a string rendered_text
+    const withText = {...validDailyDigest, rendered_text: 'Today in review...'}
+    // #when decoded
+    const result = decodeAnnounce(withText)
+    // #then it is Right with the override text
+    const payload = expectRight(result)
+    expect(payload.rendered_text).toBe('Today in review...')
+  })
+
+  it('accepts fired_at with sub-second precision on daily_digest', () => {
+    // #given a daily_digest with millisecond fired_at
+    const payload = {...validDailyDigest, fired_at: '2026-05-29T12:00:00.456Z'}
+    // #when decoded
+    expect(Either.isRight(decodeAnnounce(payload))).toBe(true)
+  })
+})
+
+describe('decodeAnnounce — daily_digest error path', () => {
+  it('returns Left(malformed_body) when repos_tracked is a string instead of number', () => {
+    // #given a daily_digest with wrong-typed repos_tracked
+    const payload = {
+      ...validDailyDigest,
+      context: {...validDailyDigest.context, repos_tracked: 'x'},
+    }
+    // #when decoded
+    const result = decodeAnnounce(payload)
+    // #then it is Left with malformed_body
+    const reason = expectLeft(result)
+    expect(reason).toBe('malformed_body')
+  })
+
+  it('returns Left(malformed_body) when report_url is missing from context', () => {
+    // #given a daily_digest missing report_url
+    const payload = {
+      ...validDailyDigest,
+      context: {repos_tracked: 12, surveys_today: 3},
+    }
+    // #when decoded
+    const result = decodeAnnounce(payload)
+    // #then it is Left with malformed_body
+    const reason = expectLeft(result)
+    expect(reason).toBe('malformed_body')
+  })
+
+  it('returns Left(malformed_body) when surveys_today is missing from context', () => {
+    // #given a daily_digest missing surveys_today
+    const payload = {
+      ...validDailyDigest,
+      context: {repos_tracked: 12, report_url: 'https://example.com/report/2026-05-29'},
+    }
+    // #when decoded
+    const result = decodeAnnounce(payload)
+    // #then it is Left with malformed_body
+    const reason = expectLeft(result)
+    expect(reason).toBe('malformed_body')
+  })
+
+  it('returns Left(malformed_body) for daily_digest with a non-ISO fired_at', () => {
+    // #given a daily_digest with a bad fired_at
+    const payload = {...validDailyDigest, fired_at: 'not-a-date'}
+    // #when decoded
+    const result = decodeAnnounce(payload)
+    // #then it is Left with malformed_body
+    const reason = expectLeft(result)
+    expect(reason).toBe('malformed_body')
+  })
+})
+
+describe('decodeAnnounce — daily_digest regression: existing variants unaffected', () => {
+  it('still decodes invitation_accepted after adding daily_digest to union', () => {
+    // #given a valid invitation_accepted payload
+    // #when decoded
+    const result = decodeAnnounce(validInvitation)
+    // #then it is Right
+    const payload = expectRight(result)
+    expect(payload.event_type).toBe('invitation_accepted')
+  })
+
+  it('still decodes survey_completed after adding daily_digest to union', () => {
+    // #given a valid survey_completed payload
+    // #when decoded
+    const result = decodeAnnounce(validSurvey)
+    // #then it is Right
+    const payload = expectRight(result)
+    expect(payload.event_type).toBe('survey_completed')
+  })
+
+  it('still returns Left(unknown_event_type) for an unrecognized event_type', () => {
+    // #given a payload with an unknown event_type
+    const payload = {...validInvitation, event_type: 'totally_unknown_event'}
+    // #when decoded
+    const result = decodeAnnounce(payload)
+    // #then it is Left with unknown_event_type
+    const reason = expectLeft(result)
+    expect(reason).toBe('unknown_event_type')
+  })
+})
+
 // ── Security: no payload echo ─────────────────────────────────────────────────
 
 describe('decodeAnnounce — security: reason string must not echo payload content', () => {
