@@ -26,6 +26,12 @@ on:
         description: Run with the built-in Wiki update prompt
         type: boolean
         default: false
+      model:
+        description: Model override for the Fro Bot agent (e.g. anthropic/claude-haiku-4-5)
+        required: false
+      correlation-id:
+        description: Audit correlation token forwarded by an external dispatcher (e.g. the release-notes narration step)
+        required: false
   # Called by other workflows (e.g. harness-release) to run Fro Bot with a
   # specific model and/or prompt. Secrets are inherited from the caller via
   # `secrets: inherit` — no secret passthrough inputs needed.

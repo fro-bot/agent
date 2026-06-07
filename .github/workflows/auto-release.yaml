@@ -65,6 +65,9 @@ jobs:
           GIT_COMMITTER_EMAIL: ${{ steps.get-user-id.outputs.user-email }}
           GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
           GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
+          # Used by the release-notes narration successCmd to dispatch fro-bot.yaml.
+          # The App token is contents:read only; FRO_BOT_PAT carries actions:write.
+          RELEASE_NOTES_DISPATCH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
         id: semantic-release
         name: Semantic Release
         run: |
