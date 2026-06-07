@@ -1,6 +1,9 @@
 ---
 name: Fro Bot
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.correlation-id != '' && format('Fro Bot · release-notes · {0}', github.event.inputs.correlation-id) || 'Fro Bot' }}
+
 on:
   issue_comment:
     types: [created]

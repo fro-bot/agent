@@ -8,7 +8,14 @@ import process from 'node:process'
 // --experimental-strip-types / --experimental-transform-types.
 // The test file (release-notes.test.ts) uses .js because it runs under
 // Vitest with bundler module resolution. Both are correct for their runtime.
-import {buildNarrationPrompt, classifyOutcome, selectDispatchedRun, validateTag} from './release-notes.ts'
+import {
+  AMBIGUOUS_RUN_SENTINEL,
+  buildNarrationPrompt,
+  classifyOutcome,
+  isAuthError,
+  selectDispatchedRun,
+  validateTag,
+} from './release-notes.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,7 +70,7 @@ function main(): void {
   // Step 7: capture dispatch epoch BEFORE the dispatch
   const dispatchEpoch = Math.floor(Date.now() / 1000)
 
-  // Step 8: dispatch — fail-soft on any error
+  // Step 8: dispatch — CHANGE 2: auth failures hard-fail; everything else soft-warns
   try {
     execFileSync(
       'gh',
@@ -80,22 +87,34 @@ function main(): void {
         '-f',
         'model=anthropic/claude-haiku-4-5',
       ],
-      {env: childEnv, stdio: 'inherit'},
+      {env: childEnv, stdio: ['ignore', 'pipe', 'pipe']},
     )
   } catch (error: unknown) {
+    // Capture stderr/message for auth detection — do NOT echo full env or token
     const message = error instanceof Error ? error.message : String(error)
+    // Sanitize: strip anything that looks like a token (40+ hex chars or Bearer patterns)
+    const sanitized = message.replaceAll(/\b\w{40,}\b/g, '[REDACTED]').replaceAll(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+
+    if (isAuthError(message)) {
+      // Auth/permission failure is a genuine security signal — hard-fail
+      process.stdout.write(`::error::Dispatch auth failure: ${sanitized}\n`)
+      process.exit(1)
+    }
+
+    // Everything else: soft-warn, release is unaffected
     process.stdout.write(
-      `::warning::Dispatch failed (correlation=${correlationId}): ${message}. Narration skipped; release is unaffected.\n`,
+      `::warning::Dispatch failed (correlation=${correlationId}): ${sanitized}. Narration skipped; release is unaffected.\n`,
     )
     process.exit(0)
   }
 
-  // Step 9: poll loop
+  // Step 9: poll loop — CHANGE 3: include displayTitle in gh run list for correlation
   const pollBudget = Number(process.env.RELEASE_NOTES_TEST_POLL_BUDGET_SECS ?? 180)
   const pollInterval = Number(process.env.RELEASE_NOTES_TEST_POLL_INTERVAL_SECS ?? 5)
   const pollDeadline = Date.now() + pollBudget * 1000
 
   let runId: number | null = null
+  let ambiguous = false
 
   while (Date.now() < pollDeadline) {
     try {
@@ -107,15 +126,20 @@ function main(): void {
           '--branch=main',
           '--event=workflow_dispatch',
           '--json',
-          'databaseId,createdAt',
+          'databaseId,createdAt,displayTitle',
           '--limit',
-          '10',
+          '20',
         ],
         childEnv,
       )
-      const runs = JSON.parse(raw) as readonly {databaseId: number; createdAt: string}[]
-      runId = selectDispatchedRun(runs, dispatchEpoch)
-      if (runId !== null) {
+      const runs = JSON.parse(raw) as readonly {databaseId: number; createdAt: string; displayTitle: string}[]
+      const selected = selectDispatchedRun(runs, dispatchEpoch, correlationId)
+      if (selected === AMBIGUOUS_RUN_SENTINEL) {
+        ambiguous = true
+        break
+      }
+      if (selected !== null) {
+        runId = selected
         break
       }
     } catch {
@@ -123,6 +147,13 @@ function main(): void {
     }
 
     sleep(pollInterval)
+  }
+
+  if (ambiguous) {
+    process.stdout.write(
+      `::warning::ambiguous run selection (multiple candidates for correlation ${correlationId}); narration runs async, release unaffected\n`,
+    )
+    process.exit(0)
   }
 
   if (runId === null) {
