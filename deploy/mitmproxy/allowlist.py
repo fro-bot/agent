@@ -35,6 +35,7 @@ WORKSPACE_EGRESS_HOSTS
     (fail-closed default).
 """
 
+import concurrent.futures
 import ipaddress
 import os
 import socket
@@ -54,6 +55,12 @@ from mitmproxy import http
 _NAT64_WKP = ipaddress.ip_network("64:ff9b::/96")
 _IPV4_COMPAT = ipaddress.ip_network("::/96")
 _EMBEDDED_V4_PREFIXES = (_NAT64_WKP, _IPV4_COMPAT)
+
+# Hard timeout for DNS resolution in _resolve_has_disallowed_ip. getaddrinfo(3)
+# does NOT honor socket.setdefaulttimeout() on Linux/glibc (uses the C resolver),
+# so we bound it via a worker thread + future.result(timeout=...). On timeout we
+# fail closed (block the request) — same policy as a resolution error.
+_DNS_RESOLVE_TIMEOUT_S: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Allowlist — production-safe defaults for fro-bot v1.
@@ -295,16 +302,27 @@ def _is_allowed(host: str) -> bool:
 def _resolve_has_disallowed_ip(host: str) -> bool:
     """Resolve *host* and return True if ANY resolved address is disallowed.
 
-    Fails closed: if resolution raises (DNS error, timeout, or encoding
-    failure), returns True (block the request).
+    Fails closed: if resolution raises (DNS error or encoding failure), OR if
+    resolution does not complete within _DNS_RESOLVE_TIMEOUT_S seconds, returns
+    True (block the request). The 5-second budget bounds proxy stalls caused by
+    a slow or hanging system resolver — getaddrinfo(3) does not honor
+    socket.setdefaulttimeout() on Linux/glibc.
 
     Note: this check runs at the addon hook layer. mitmproxy performs its own
     independent resolution for the upstream dial (TOCTOU gap). This is
     defense-in-depth against operator misconfiguration and naive DNS rebinding,
     not a hermetic guarantee.
     """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(socket.getaddrinfo, host, None)
+    # Detach immediately — do NOT wait for the thread on shutdown. If the
+    # future times out the worker thread may keep running briefly in the
+    # background; that is acceptable (daemon-ish). We must not block here.
+    executor.shutdown(wait=False)
     try:
-        results = socket.getaddrinfo(host, None)
+        results = future.result(timeout=_DNS_RESOLVE_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        return True  # fail closed — resolution hung, block the request
     except (OSError, UnicodeError):
         return True  # fail closed — resolution failure blocks the request
     for _family, _type, _proto, _canonname, sockaddr in results:
