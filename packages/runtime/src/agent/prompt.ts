@@ -67,6 +67,7 @@ export function getTriggerDirective(context: TriggerContext, promptInput: string
           'Review this pull request for code quality, potential bugs, and improvements.',
           'Submit your review via `gh pr review` and choose the event that matches your verdict: `--approve` for a PASS verdict, `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (including the Run Summary) in the --body.',
           'A comment-only review does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST approve or request changes — never deliver a verdict as a plain comment.',
+          'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation is still a review, not a comment. Always use `gh pr review --approve` or `gh pr review --request-changes` — never `gh pr comment` or `gh issue comment` — to deliver your verdict.',
           'Do not post a separate comment. If the author is a collaborator, prioritize actionable feedback over style nits.',
         ].join('\n'),
         appendMode: true,
@@ -681,7 +682,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
 3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
 4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
-5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via \`gh pr review\`: use \`--approve\` for a PASS verdict and \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the \`--body\` argument. A comment-only review (\`gh pr review --comment\` or \`gh pr comment\`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. Do not post a separate PR comment afterward.
+5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via \`gh pr review\`: use \`--approve\` for a PASS verdict and \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the \`--body\` argument. A comment-only review (\`gh pr review --comment\` or \`gh pr comment\`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.
 6. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
 
 **Response Format:**
@@ -824,7 +825,7 @@ function buildHistoricalSessionContext(
 function buildOutputContractSection(context: AgentContext): string {
   const lines: string[] = ['## Output Contract']
   lines.push(
-    `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR; use it only if you genuinely cannot reach a verdict.`,
+    `- Review action (REQUIRED): submit the GitHub review event that matches your verdict — PASS → \`gh pr review --approve\`, CONDITIONAL or REJECT → \`gh pr review --request-changes\`. A comment-only review does not satisfy review-required and blocks the PR. A review run always reaches a verdict; deliver it as the matching event. This applies on re-reviews too — never substitute a plain comment for a review event.`,
   )
   lines.push(`- Requested reviewer: ${context.isRequestedReviewer ? 'yes' : 'no'}`)
   if (context.authorAssociation != null) {
