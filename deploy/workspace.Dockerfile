@@ -37,7 +37,7 @@ WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
 ARG OPENCODE_VERSION=1.15.13
-ARG SYSTEMATIC_VERSION=2.28.0
+ARG SYSTEMATIC_VERSION=2.29.0
 
 # System packages:
 #   git            — clone.ts runs `git clone` via execFile
