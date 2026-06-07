@@ -229,6 +229,42 @@ function makeStatefulSinkMock(
   }
 }
 
+/**
+ * Build a stateful sink mock that properly tracks pending-visibility state
+ * via markVisibleOutputPending(), mirroring the real sink's closure semantics.
+ * Used to prove that in-flight sends count as visible context at classification time.
+ */
+function makeStatefulPendingSinkMock() {
+  let visibleOutputSent = false
+  let pendingVisibleOutput = 0
+
+  const markVisibleOutputPending = vi.fn().mockImplementation(() => {
+    pendingVisibleOutput += 1
+    let settled = false
+    return (delivered: boolean): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      pendingVisibleOutput -= 1
+      if (delivered === true) {
+        visibleOutputSent = true
+      }
+    }
+  })
+
+  return {
+    append: vi.fn(),
+    flush: vi.fn().mockResolvedValue({kind: 'empty' as const}),
+    buffered: vi.fn().mockReturnValue(''),
+    markVisibleOutputSent: vi.fn().mockImplementation(() => {
+      visibleOutputSent = true
+    }),
+    markVisibleOutputPending,
+    hasVisibleOutput: vi.fn().mockImplementation(() => visibleOutputSent || pendingVisibleOutput > 0),
+  }
+}
+
 function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
   return result === 'success'
     ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/acme/widget'})
@@ -1370,6 +1406,217 @@ describe('runMention', () => {
     })
   })
 
+  // ── Approval pending-visibility race (Unit 2) ───────────────────────────
+
+  describe('approval pending-visibility race', () => {
+    it('approval send STARTED but UNRESOLVED when timeout fires → visible-output timeout copy chosen', async () => {
+      // #given — the approval send promise never resolves before the timeout fires.
+      // This is the core race: onPending fires (marking pending), runOpenCodeCore throws
+      // timeout, classification reads hasVisibleOutput() → true (pending counts as visible).
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+
+      const statefulSink = makeStatefulPendingSinkMock()
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // Capture onPending from the coordinator factory
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // thread.send returns a never-resolving promise for the first 2 calls
+      // (waiting-status send + embed send) so they are still in-flight when
+      // the timeout fires. The 3rd call (error message) resolves immediately.
+      const neverResolves = new Promise<never>(() => {
+        /* intentionally never resolves — simulates in-flight Discord send */
+      })
+      thread.send.mockReturnValueOnce(neverResolves).mockReturnValueOnce(neverResolves).mockResolvedValue(undefined)
+
+      // runOpenCodeCore calls onPending (triggering the fire-and-forget sends)
+      // then throws a timeout error — simulating the race condition.
+      mockRunOpenCodeCore.mockImplementation(async () => {
+        if (capturedOnPending !== undefined) {
+          capturedOnPending({
+            requestID: 'req-race-1',
+            sessionID: 'sess-race',
+            permission: 'bash',
+            patterns: [],
+            title: 'Run command: ls',
+          })
+        }
+        throw new RunCoreError('timeout', 'timed out')
+      })
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — visible-output branch chosen (pending send counts as visible context)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/updates above/i)
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+      // #and — does NOT use no-output retry wording
+      expect(lastCall.content).not.toMatch(/please try again/i)
+    })
+
+    it('approval send REJECTS before timeout fires → no-output timeout copy chosen', async () => {
+      // #given — the approval send rejects (settle(false) retracts the pending claim).
+      // After rejection, hasVisibleOutput() returns false → no-output branch.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+
+      const statefulSink = makeStatefulPendingSinkMock()
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // thread.send rejects for the first 2 calls (approval sends fail).
+      // The 3rd call (error message) resolves immediately.
+      const sendRejected = Promise.reject(new Error('Discord send failed'))
+      // Attach a no-op catch so the unhandled rejection doesn't leak in test output
+      sendRejected.catch(() => undefined)
+      thread.send.mockReturnValueOnce(sendRejected).mockReturnValueOnce(sendRejected).mockResolvedValue(undefined)
+
+      // runOpenCodeCore calls onPending then throws timeout.
+      // The approval sends reject first (microtask queue), then timeout is classified.
+      mockRunOpenCodeCore.mockImplementation(async () => {
+        if (capturedOnPending !== undefined) {
+          capturedOnPending({
+            requestID: 'req-reject-1',
+            sessionID: 'sess-reject',
+            permission: 'bash',
+            patterns: [],
+            title: 'Run command: ls',
+          })
+        }
+        // Yield to the microtask queue so the rejection .catch() handlers run
+        // and settle(false) retracts the pending claim before the timeout is thrown.
+        await new Promise(resolve => setTimeout(resolve, 0))
+        throw new RunCoreError('timeout', 'timed out')
+      })
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — no-output branch chosen (failed send retracted the pending claim)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/please try again/i)
+      // #and — does NOT use visible-output wording
+      expect(lastCall.content).not.toMatch(/updates above/i)
+      expect(lastCall.content).not.toMatch(/what to do next/i)
+    })
+
+    it('approval send RESOLVES before timeout fires → visible-output timeout copy chosen', async () => {
+      // #given — the approval send resolves successfully (settle(true) promotes to delivered).
+      // This is the existing behavior preserved: successful send → visible-output branch.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+
+      const statefulSink = makeStatefulPendingSinkMock()
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+      mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+        capturedOnPending = coordinatorDeps.onPending
+        return {
+          onPermissionAsked: vi.fn(),
+          onPermissionReplied: vi.fn(),
+          pending: vi.fn().mockReturnValue([]),
+          dispose: vi.fn(),
+        }
+      })
+
+      // thread.send resolves immediately for all calls (approval sends succeed).
+      const fakeApprovalMessage = {id: 'msg-approval-race', edit: vi.fn()}
+      thread.send.mockResolvedValue(fakeApprovalMessage)
+
+      // runOpenCodeCore calls onPending, yields so sends resolve, then throws timeout.
+      mockRunOpenCodeCore.mockImplementation(async () => {
+        if (capturedOnPending !== undefined) {
+          capturedOnPending({
+            requestID: 'req-resolve-1',
+            sessionID: 'sess-resolve',
+            permission: 'bash',
+            patterns: [],
+            title: 'Run command: ls',
+          })
+        }
+        // Yield so the .then() handlers run and settle(true) promotes to delivered
+        await new Promise(resolve => setTimeout(resolve, 0))
+        throw new RunCoreError('timeout', 'timed out')
+      })
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — visible-output branch chosen (send resolved → permanently delivered)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/updates above/i)
+      expect(lastCall.content).toMatch(/new.*@fro-bot request|what to do next/i)
+      // #and — does NOT use no-output retry wording
+      expect(lastCall.content).not.toMatch(/please try again/i)
+    })
+
+    it('no approval requested + empty output + timeout → no-output copy (unchanged baseline)', async () => {
+      // #given — no onPending ever called; sink has no visible output; timeout fires.
+      // Verifies the baseline no-output path is unchanged by the pending-visibility feature.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+
+      const statefulSink = makeStatefulPendingSinkMock()
+      mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
+
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({runTimeoutMs: 600_000})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — no-output branch chosen (no approval, no visible output)
+      const lastCall = thread.send.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastCall.content).toMatch(/please try again/i)
+      // #and — does NOT use visible-output wording
+      expect(lastCall.content).not.toMatch(/updates above/i)
+      expect(lastCall.content).not.toMatch(/what to do next/i)
+      // #and — includes configured duration
+      expect(lastCall.content).toMatch(/10.?min/i)
+    })
+  })
+
   // ── Security invariants ──────────────────────────────────────────────────
 
   describe('security invariants', () => {
@@ -1901,18 +2148,21 @@ describe('runMention', () => {
       expect(statusSend?.content).toContain('Waiting for tool approval')
     })
 
-    it('onPending: sink.markVisibleOutputSent() is called so flush cannot add _(no output)_ after approval status', async () => {
-      // #given
+    it('onPending: sink.markVisibleOutputPending() is called and settle(true) fires on success so flush cannot add _(no output)_ after approval status', async () => {
+      // #given — verifies the pending-visibility API is used: markVisibleOutputPending()
+      // is called synchronously before the send, and the returned settle handle is called
+      // with true on success (promoting to permanently delivered).
       const {runMention} = await import('./run.js')
       setupHappyPath()
 
-      const markVisibleOutputSentFn = vi.fn()
+      const settleFn = vi.fn()
+      const markVisibleOutputPendingFn = vi.fn().mockReturnValue(settleFn)
       mockCreateDiscordStreamSink.mockReturnValue({
         append: vi.fn(),
         flush: vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),
         buffered: vi.fn().mockReturnValue(''),
-        markVisibleOutputSent: markVisibleOutputSentFn,
-        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: markVisibleOutputPendingFn,
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
 
@@ -1947,8 +2197,10 @@ describe('runMention', () => {
       })
       await new Promise(resolve => setTimeout(resolve, 0))
 
-      // #then — markVisibleOutputSent was called on the sink
-      expect(markVisibleOutputSentFn).toHaveBeenCalled()
+      // #then — markVisibleOutputPending was called (once per send: waiting-status + embed)
+      expect(markVisibleOutputPendingFn).toHaveBeenCalled()
+      // #and — the settle handle was called with true (sends succeeded → permanently delivered)
+      expect(settleFn).toHaveBeenCalledWith(true)
     })
 
     it('deadline settlement: posts visible timed-out/denied status to thread with allowedMentions:{parse:[]}', async () => {
