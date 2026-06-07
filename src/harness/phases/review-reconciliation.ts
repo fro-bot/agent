@@ -1,5 +1,5 @@
 /**
- * Review Reconciliation Phase (Unit 2)
+ * Review Reconciliation Phase
  *
  * After the agent session on a pull_request review trigger, gathers GitHub
  * facts, calls decideReconciliation(), and on 'approve' submits a formal

@@ -1,5 +1,5 @@
 /**
- * Tests for runReviewReconciliation phase (Unit 2)
+ * Tests for runReviewReconciliation phase
  *
  * TDD: these tests are written BEFORE the implementation.
  * They should fail (RED) until review-reconciliation.ts is created.

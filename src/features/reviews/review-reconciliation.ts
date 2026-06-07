@@ -12,7 +12,7 @@ export type Verdict = 'PASS' | 'CONDITIONAL' | 'REJECT'
 
 /**
  * Input facts for the reconciliation decision.
- * All fields are pre-fetched by the caller (Unit 2) — this module is pure.
+ * All fields are pre-fetched by the caller (the reconciliation phase) — this module is pure.
  */
 export interface ReconciliationInput {
   /** Parsed verdict from the agent's review body, or null if absent/ambiguous. */
