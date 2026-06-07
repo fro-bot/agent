@@ -962,6 +962,54 @@ def test_dns_rebinding_request_hook_also_enforced():
     assert call_args[0][0] == 403
 
 
+def test_dns_resolve_timeout_fails_closed():
+    """getaddrinfo hanging longer than _DNS_RESOLVE_TIMEOUT_S → fail closed, bounded wall time."""
+    import time
+    import unittest.mock as mock
+
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    # Patch the timeout constant to 0.2s so the test stays fast.
+    mod._DNS_RESOLVE_TIMEOUT_S = 0.2
+
+    def slow_getaddrinfo(host, port):
+        time.sleep(1.0)  # sleeps well past the 0.2s budget
+        return [(None, None, None, None, ("8.8.8.8", 0))]
+
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.side_effect = slow_getaddrinfo
+
+    start = time.monotonic()
+    result = mod._resolve_has_disallowed_ip("cliproxy.fro.bot")
+    elapsed = time.monotonic() - start
+
+    assert result is True, "should fail closed on timeout"
+    assert elapsed < 0.8, f"should return well before the 1s sleep, got {elapsed:.3f}s"
+
+
+def test_dns_resolve_fast_public_ip_allowed():
+    """Fast resolution to a public IP is allowed (timeout path does not interfere)."""
+    import unittest.mock as mock
+
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.return_value = [(None, None, None, None, ("8.8.8.8", 0))]
+
+    result = mod._resolve_has_disallowed_ip("cliproxy.fro.bot")
+    assert result is False, "public IP should be allowed"
+
+
+def test_dns_resolve_oserror_still_fails_closed_with_threading():
+    """OSError from getaddrinfo inside the worker thread still fails closed."""
+    import unittest.mock as mock
+
+    mod = _load_allowlist({"WORKSPACE_EGRESS_HOSTS": "cliproxy.fro.bot"})
+    mod.socket = mock.MagicMock()
+    mod.socket.getaddrinfo.side_effect = OSError("network unreachable")
+
+    result = mod._resolve_has_disallowed_ip("cliproxy.fro.bot")
+    assert result is True, "OSError should fail closed"
+
+
 # ===========================================================================
 # NAT64 Well-Known Prefix (64:ff9b::/96) embedded-IPv4 bypass — RFC 6052
 # ===========================================================================
