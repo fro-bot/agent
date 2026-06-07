@@ -1,10 +1,11 @@
 import type {AnnouncePayload} from './announce-schema.js'
 import {describe, expect, it} from 'vitest'
-import {renderEmbed} from './templates.js'
+import {renderDailyDigest, renderEmbed} from './templates.js'
 
 // Accent color constants (mirror templates.ts for assertions)
 const COLOR_BLUE = 0x5865f2
 const COLOR_GREEN = 0x57f287
+const COLOR_PURPLE = 0x9b59b6
 
 const BASE = {v: 1 as const, fired_at: '2026-05-29T12:00:00Z', rendered_text: null}
 
@@ -186,6 +187,78 @@ describe('renderEmbed', () => {
       const embed = renderEmbed(payload)
       // #then
       expect(embed.description).toBe('real text')
+    })
+  })
+
+  describe('daily_digest', () => {
+    it('happy path: plural surveys_today and repos_tracked, includes report_url', () => {
+      // #given
+      const context = {surveys_today: 2, repos_tracked: 25, report_url: 'https://example.com/report/2026-06-07'}
+      // #when
+      const text = renderDailyDigest(context)
+      // #then
+      expect(text).toContain('2')
+      expect(text).toContain('25')
+      expect(text).toContain('https://example.com/report/2026-06-07')
+      // reads as a reflection, not a status line — must not be empty
+      expect(text.length).toBeGreaterThan(0)
+    })
+
+    it('edge case: singular surveys_today=1 uses singular noun', () => {
+      // #given
+      const context = {surveys_today: 1, repos_tracked: 1, report_url: 'https://example.com/report/today'}
+      // #when
+      const text = renderDailyDigest(context)
+      // #then — singular form for both counts
+      expect(text).toContain('1')
+      // should NOT contain plural forms when counts are 1
+      expect(text).not.toMatch(/\bsurveys\b/)
+      expect(text).not.toMatch(/\brepos\b/)
+    })
+
+    it('edge case: plural surveys_today=3 uses plural noun', () => {
+      // #given
+      const context = {surveys_today: 3, repos_tracked: 10, report_url: 'https://example.com/r'}
+      // #when
+      const text = renderDailyDigest(context)
+      // #then — plural form
+      expect(text).toContain('3')
+      expect(text).toContain('10')
+    })
+
+    it('integration: renderEmbed on daily_digest payload returns purple accent and daily-digest description', () => {
+      // #given
+      const payload: AnnouncePayload = {
+        ...BASE,
+        event_type: 'daily_digest',
+        context: {surveys_today: 4, repos_tracked: 30, report_url: 'https://example.com/report'},
+      }
+      // #when
+      const embed = renderEmbed(payload)
+      // #then — purple accent, NOT survey fallthrough
+      expect(embed.color).toBe(COLOR_PURPLE)
+      expect(embed.description).toContain('4')
+      expect(embed.description).toContain('30')
+      expect(embed.description).toContain('https://example.com/report')
+      // must NOT contain survey_completed template text
+      expect(embed.description).not.toContain('Surveyed')
+    })
+
+    it('integration: daily_digest with non-empty rendered_text uses override verbatim, accent still purple', () => {
+      // #given
+      const payload: AnnouncePayload = {
+        ...BASE,
+        event_type: 'daily_digest',
+        rendered_text: 'Custom daily digest override',
+        context: {surveys_today: 99, repos_tracked: 999, report_url: 'https://example.com/r'},
+      }
+      // #when
+      const embed = renderEmbed(payload)
+      // #then — override wins for description, accent is still purple
+      expect(embed.color).toBe(COLOR_PURPLE)
+      expect(embed.description).toBe('Custom daily digest override')
+      // template text must NOT appear
+      expect(embed.description).not.toContain('99')
     })
   })
 })
