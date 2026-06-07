@@ -22,7 +22,6 @@ import {runReviewReconciliation} from './review-reconciliation.js'
 function makeOctokit(overrides?: {
   readonly getPR?: () => Promise<unknown>
   readonly listReviews?: () => Promise<unknown>
-  readonly listComments?: () => Promise<unknown>
   readonly createReview?: () => Promise<unknown>
   readonly getPRDiff?: () => Promise<unknown>
 }) {
@@ -34,7 +33,6 @@ function makeOctokit(overrides?: {
     },
   }
   const defaultReviews = {data: []}
-  const defaultComments = {data: []}
   const defaultCreateReview = {data: {id: 999, state: 'APPROVED', html_url: 'https://github.com/pr/1/reviews/999'}}
   const defaultDiff = {data: []}
 
@@ -47,7 +45,9 @@ function makeOctokit(overrides?: {
         listFiles: vi.fn().mockResolvedValue(overrides?.getPRDiff?.() ?? defaultDiff),
       },
       issues: {
-        listComments: vi.fn().mockResolvedValue(overrides?.listComments?.() ?? defaultComments),
+        // listComments is no longer called by the phase — kept in mock for
+        // tests that assert it is NOT called.
+        listComments: vi.fn().mockResolvedValue({data: []}),
       },
     },
   }
@@ -103,29 +103,16 @@ function makeBotReview(opts: {
   readonly commitId: string
   readonly submittedAt: string
   readonly login?: string
+  readonly userType?: string
 }) {
   return {
     id: 1,
-    user: {login: opts.login ?? 'fro-bot[bot]'},
+    user: {login: opts.login ?? 'fro-bot[bot]', type: opts.userType ?? 'Bot'},
     state: opts.state,
     body: opts.body,
     commit_id: opts.commitId,
     submitted_at: opts.submittedAt,
     html_url: 'https://github.com/pr/1/reviews/1',
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helper: build an issue comment object
-// ---------------------------------------------------------------------------
-
-function makeBotComment(opts: {readonly body: string; readonly createdAt: string; readonly login?: string}) {
-  return {
-    id: 10,
-    user: {login: opts.login ?? 'fro-bot[bot]'},
-    body: opts.body,
-    created_at: opts.createdAt,
-    html_url: 'https://github.com/pr/1#issuecomment-10',
   }
 }
 
@@ -184,11 +171,11 @@ describe('runReviewReconciliation', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Happy path: issue-comment fallback (gh pr comment path)
+  // Security: issue-comment-only path must NOT approve (FIX 1)
   // -------------------------------------------------------------------------
 
-  it('approves via issue-comment fallback when bot used gh pr comment with PASS', async () => {
-    // #given no bot reviews, but bot left an issue comment with PASS verdict
+  it('skips with no-bot-review when bot used only an issue comment (no PR review) with PASS', async () => {
+    // #given no bot PR reviews, but bot left an issue comment with PASS verdict
     const octokit = makeOctokit()
     octokit.rest.pulls.get.mockResolvedValue({
       data: {
@@ -198,23 +185,17 @@ describe('runReviewReconciliation', () => {
       },
     })
     octokit.rest.pulls.listReviews.mockResolvedValue({data: []})
-    octokit.rest.issues.listComments.mockResolvedValue({
-      data: [
-        makeBotComment({
-          body: '## Verdict: PASS\n\nAll checks pass.',
-          createdAt: AFTER_START,
-        }),
-      ],
-    })
     const params = makeParams({octokit})
 
     // #when running review reconciliation
     const result = await runReviewReconciliation(params, logger)
 
-    // #then approve is submitted via the issue-comment fallback path
-    expect(result.reconciled).toBe(true)
-    expect(result.reason).toBe('approved')
-    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({event: 'APPROVE'}))
+    // #then no approval — issue comments cannot verify the reviewed SHA
+    expect(result.reconciled).toBe(false)
+    expect(result.reason).toBe('no-bot-review')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    // listComments must NOT be called — the fallback is removed
+    expect(octokit.rest.issues.listComments).not.toHaveBeenCalled()
   })
 
   // -------------------------------------------------------------------------
@@ -275,14 +256,14 @@ describe('runReviewReconciliation', () => {
         }),
       ],
     })
-    octokit.rest.issues.listComments.mockResolvedValue({data: []})
     const params = makeParams({octokit})
 
     // #when running review reconciliation
     const result = await runReviewReconciliation(params, logger)
 
-    // #then no review is submitted — stale artifact
+    // #then no review is submitted — stale artifact (no qualifying review this run)
     expect(result.reconciled).toBe(false)
+    expect(result.reason).toBe('no-bot-review')
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 
@@ -318,6 +299,91 @@ describe('runReviewReconciliation', () => {
     // #then no review is submitted — stale head
     expect(result.reconciled).toBe(false)
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // Security: head moves between initial fetch and pre-submit re-fetch (FIX 2c)
+  // -------------------------------------------------------------------------
+
+  it('skips with head-moved-before-submit when head changes between initial fetch and pre-submit re-check', async () => {
+    // #given bot left a PASS review at HEAD_SHA, but a push happens before submit
+    const octokit = makeOctokit()
+    const NEW_HEAD = 'new-sha-pushed-after-review'
+
+    // First pulls.get returns HEAD_SHA; second (pre-submit re-check) returns NEW_HEAD
+    octokit.rest.pulls.get
+      .mockResolvedValueOnce({
+        data: {
+          head: {sha: HEAD_SHA, repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          head: {sha: NEW_HEAD, repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      })
+    octokit.rest.pulls.listReviews.mockResolvedValue({
+      data: [
+        makeBotReview({
+          state: 'COMMENTED',
+          body: '## Verdict: PASS\n\nLooks good.',
+          commitId: HEAD_SHA,
+          submittedAt: AFTER_START,
+        }),
+      ],
+    })
+    const params = makeParams({octokit})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then no approval — head moved before submit
+    expect(result.reconciled).toBe(false)
+    expect(result.reason).toBe('head-moved-before-submit')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // Security: approve path pins commit_id to reviewed SHA (FIX 2a)
+  // -------------------------------------------------------------------------
+
+  it('passes commitSha (currentHeadSha) to createReview as commit_id on the approve path', async () => {
+    // #given bot left a PASS review at HEAD_SHA, head is stable
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockResolvedValue({
+      data: {
+        head: {sha: HEAD_SHA, repo: {full_name: 'owner/repo'}},
+        base: {repo: {full_name: 'owner/repo'}},
+        user: {login: 'pr-author'},
+      },
+    })
+    octokit.rest.pulls.listReviews.mockResolvedValue({
+      data: [
+        makeBotReview({
+          state: 'COMMENTED',
+          body: '## Verdict: PASS\n\nLooks good.',
+          commitId: HEAD_SHA,
+          submittedAt: AFTER_START,
+        }),
+      ],
+    })
+    const params = makeParams({octokit})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then createReview is called with commit_id pinned to the reviewed SHA
+    expect(result.reconciled).toBe(true)
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        commit_id: HEAD_SHA,
+        event: 'APPROVE',
+      }),
+    )
   })
 
   // -------------------------------------------------------------------------
@@ -576,11 +642,48 @@ describe('runReviewReconciliation', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Bot login normalization: fro-bot[bot] matches fro-bot[bot] reviews
+  // Security: non-bot user.type must NOT be treated as bot verdict (FIX 3)
   // -------------------------------------------------------------------------
 
-  it('matches bot reviews using normalized login (strips [bot] suffix)', async () => {
-    // #given bot login is 'fro-bot[bot]' and review user.login is also 'fro-bot[bot]'
+  it('does not treat a non-bot (user.type=User) review with PASS as the bot verdict', async () => {
+    // #given a human account named 'fro-bot[bot]' (user.type=User) left a PASS review
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockResolvedValue({
+      data: {
+        head: {sha: HEAD_SHA, repo: {full_name: 'owner/repo'}},
+        base: {repo: {full_name: 'owner/repo'}},
+        user: {login: 'pr-author'},
+      },
+    })
+    octokit.rest.pulls.listReviews.mockResolvedValue({
+      data: [
+        makeBotReview({
+          state: 'COMMENTED',
+          body: '## Verdict: PASS\n\nLooks good.',
+          commitId: HEAD_SHA,
+          submittedAt: AFTER_START,
+          login: 'fro-bot[bot]', // same login as bot
+          userType: 'User', // but NOT a Bot account
+        }),
+      ],
+    })
+    const params = makeParams({octokit, botLogin: 'fro-bot[bot]'})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then no approval — user.type !== 'Bot' fails the exact-match guard
+    expect(result.reconciled).toBe(false)
+    expect(result.reason).toBe('no-bot-review')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // Bot login exact match: fro-bot[bot] matches fro-bot[bot] reviews
+  // -------------------------------------------------------------------------
+
+  it('matches bot reviews using exact login + Bot type (fro-bot[bot] matches fro-bot[bot])', async () => {
+    // #given bot login is 'fro-bot[bot]' and review user.login is also 'fro-bot[bot]' with type Bot
     const octokit = makeOctokit()
     octokit.rest.pulls.get.mockResolvedValue({
       data: {
@@ -597,11 +700,12 @@ describe('runReviewReconciliation', () => {
           commitId: HEAD_SHA,
           submittedAt: AFTER_START,
           login: 'fro-bot[bot]',
+          userType: 'Bot',
         }),
         // A non-bot review that should be ignored
         {
           id: 2,
-          user: {login: 'human-reviewer'},
+          user: {login: 'human-reviewer', type: 'User'},
           state: 'APPROVED',
           body: 'LGTM',
           commit_id: HEAD_SHA,

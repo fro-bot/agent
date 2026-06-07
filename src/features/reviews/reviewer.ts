@@ -66,13 +66,17 @@ export function prepareReviewComments(
  * Uses the modern GitHub REST API createReview endpoint which allows submitting
  * a review with all comments atomically. This is preferred over posting individual
  * comments as it groups them under a single review event.
+ *
+ * When `comments` is empty, skips the diff fetch entirely — no TOCTOU window,
+ * no unnecessary API call. When `commitSha` is provided, pins the review to
+ * that exact commit.
  */
 export async function submitReview(
   octokit: Octokit,
   options: SubmitReviewOptions,
   logger: Logger,
 ): Promise<ReviewResult> {
-  const {prNumber, owner, repo, event, body, comments} = options
+  const {prNumber, owner, repo, event, body, comments, commitSha} = options
 
   logger.info('Submitting review', {
     prNumber,
@@ -80,8 +84,15 @@ export async function submitReview(
     commentCount: comments.length,
   })
 
-  const diff = await getPRDiff(octokit, owner, repo, prNumber, logger)
-  const prepared = prepareReviewComments(comments, diff, logger)
+  let readyComments: readonly GitHubReviewComment[] = []
+  let skippedCount = 0
+
+  if (comments.length > 0) {
+    const diff = await getPRDiff(octokit, owner, repo, prNumber, logger)
+    const prepared = prepareReviewComments(comments, diff, logger)
+    readyComments = prepared.ready
+    skippedCount = prepared.skipped.length
+  }
 
   const {data} = await octokit.rest.pulls.createReview({
     owner,
@@ -89,7 +100,8 @@ export async function submitReview(
     pull_number: prNumber,
     event,
     body,
-    comments: prepared.ready.map(c => ({
+    ...(commitSha === undefined ? {} : {commit_id: commitSha}),
+    comments: readyComments.map(c => ({
       path: c.path,
       body: c.body,
       line: c.line,
@@ -102,15 +114,15 @@ export async function submitReview(
   logger.info('Review submitted', {
     reviewId: data.id,
     state: data.state,
-    commentsPosted: prepared.ready.length,
-    commentsSkipped: prepared.skipped.length,
+    commentsPosted: readyComments.length,
+    commentsSkipped: skippedCount,
   })
 
   return {
     reviewId: data.id,
     state: data.state ?? '',
-    commentsPosted: prepared.ready.length,
-    commentsSkipped: prepared.skipped.length,
+    commentsPosted: readyComments.length,
+    commentsSkipped: skippedCount,
     url: data.html_url ?? '',
   }
 }

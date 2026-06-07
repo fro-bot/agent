@@ -37,7 +37,14 @@ export interface ApproveAction {
  */
 export interface SkipAction {
   readonly action: 'skip'
-  readonly reason: 'no-verdict' | 'not-pass' | 'already-approved' | 'stale-or-not-this-run' | 'stale-head'
+  readonly reason:
+    | 'no-verdict'
+    | 'not-pass'
+    | 'already-approved'
+    | 'stale-or-not-this-run'
+    | 'stale-head'
+    | 'no-bot-review'
+    | 'head-moved-before-submit'
 }
 
 export type ReconciliationDecision = ApproveAction | SkipAction
@@ -64,8 +71,7 @@ export function parseVerdict(body: string): Verdict | null {
   while (match !== null) {
     const token = match[1]
     if (token !== undefined) {
-      // Strip any trailing punctuation that might follow the token on the same line
-      // The regex already stops at whitespace via \S+, so token is the bare word.
+      // The regex stops at whitespace via \S+, so trailing prose after the token is ignored.
       if (!validVerdicts.has(token)) {
         // Unrecognized token — treat the whole body as unparseable
         return null

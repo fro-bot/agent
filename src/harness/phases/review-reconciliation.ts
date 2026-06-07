@@ -51,9 +51,27 @@ export interface ReviewReconciliationOutcome {
 /**
  * Normalize a GitHub login for comparison.
  * Strips the `[bot]` suffix and lowercases.
+ * Used only for the self-authored-PR guard (conservative).
  */
 function normalizeLogin(login: string): string {
   return login.toLowerCase().replace(/\[bot\]$/i, '')
+}
+
+/**
+ * Returns true when the review was authored by the bot.
+ *
+ * Requires EXACT login match AND user.type === 'Bot' to prevent a human
+ * account named 'fro-bot' from matching the bot 'fro-bot[bot]'.
+ * Fails closed: returns false when user is null or type is not 'Bot'.
+ */
+function isBotReview(
+  review: {readonly user: {readonly login: string; readonly type?: string} | null},
+  botLogin: string,
+): boolean {
+  if (review.user == null) {
+    return false
+  }
+  return review.user.login === botLogin && review.user.type === 'Bot'
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +105,7 @@ export async function runReviewReconciliation(
   // Early no-op guards — zero octokit calls
   // -------------------------------------------------------------------------
 
-  if (!isPullRequestReviewTrigger) {
+  if (isPullRequestReviewTrigger === false) {
     return {reconciled: false, reason: 'not-pr-review-trigger'}
   }
 
@@ -95,11 +113,11 @@ export async function runReviewReconciliation(
     return {reconciled: false, reason: 'no-pr-number'}
   }
 
-  if (!responseModeIsGithub) {
+  if (responseModeIsGithub === false) {
     return {reconciled: false, reason: 'response-mode-not-github'}
   }
 
-  if (!agentSucceeded) {
+  if (agentSucceeded === false) {
     return {reconciled: false, reason: 'agent-failed'}
   }
 
@@ -110,6 +128,8 @@ export async function runReviewReconciliation(
   // -------------------------------------------------------------------------
   // Main path — wrapped in try/catch for fail-safe behavior
   // -------------------------------------------------------------------------
+
+  logger.info('Review reconciliation: phase entered', {prNumber})
 
   try {
     const normalizedBotLogin = normalizeLogin(botLogin)
@@ -126,7 +146,7 @@ export async function runReviewReconciliation(
     const headRepoFullName: string = prResponse.data.head.repo?.full_name ?? ''
     const baseRepoFullName: string = prResponse.data.base.repo.full_name
 
-    // Guard: self-authored PR (bot is the PR author)
+    // Guard: self-authored PR (bot is the PR author) — normalized comparison is fine here
     if (normalizeLogin(prAuthorLogin) === normalizedBotLogin) {
       logger.info('Review reconciliation: skipping self-authored PR', {prNumber, prAuthorLogin})
       return {reconciled: false, reason: 'self-or-fork'}
@@ -148,23 +168,18 @@ export async function runReviewReconciliation(
 
     const allReviews = reviewsResponse.data
 
-    // Determine if bot already has an APPROVED review at the current head
+    // Determine if bot already has an APPROVED review at the current head.
+    // Requires exact login + Bot type to prevent human 'fro-bot' from matching.
     const alreadyApprovedAtHead = allReviews.some(
-      review =>
-        review.user != null &&
-        normalizeLogin(review.user.login) === normalizedBotLogin &&
-        review.state === 'APPROVED' &&
-        review.commit_id === currentHeadSha,
+      review => isBotReview(review, botLogin) && review.state === 'APPROVED' && review.commit_id === currentHeadSha,
     )
 
-    // Find the latest bot review from this run (submitted_at >= runStart)
+    // Find the latest bot review from this run (submitted_at >= runStart).
+    // Only formal PR reviews qualify — issue comments carry no commit_id and
+    // cannot be used to verify the reviewed SHA.
     const runStartIso = new Date(runStartMs).toISOString()
     const botReviewsThisRun = allReviews.filter(
-      review =>
-        review.user != null &&
-        normalizeLogin(review.user.login) === normalizedBotLogin &&
-        review.submitted_at != null &&
-        review.submitted_at >= runStartIso,
+      review => isBotReview(review, botLogin) && review.submitted_at != null && review.submitted_at >= runStartIso,
     )
 
     // Sort descending by submitted_at to get the latest
@@ -176,44 +191,17 @@ export async function runReviewReconciliation(
 
     const latestBotReview = botReviewsThisRun[0] ?? null
 
-    // Step 3: Fallback to issue comments if no qualifying bot review found
-    let verdictBody: string | null = null
-    let headMatches = false
-    let verdictBelongsToRun = false
-
+    // Step 3: Require a qualifying bot PR review — no issue-comment fallback.
+    // Issue comments carry no commit_id and cannot verify the reviewed SHA,
+    // making them an unsafe approval vector.
     if (latestBotReview == null) {
-      // Fallback: look for a bot issue comment from this run
-      const commentsResponse = await octokit.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number: prNumber,
-        per_page: 100,
-      })
-
-      const botCommentsThisRun = commentsResponse.data.filter(
-        comment =>
-          comment.user != null &&
-          normalizeLogin(comment.user.login) === normalizedBotLogin &&
-          comment.created_at >= runStartIso,
-      )
-
-      // Sort descending by created_at
-      botCommentsThisRun.sort((a, b) => b.created_at.localeCompare(a.created_at))
-
-      const latestBotComment = botCommentsThisRun[0] ?? null
-
-      if (latestBotComment != null) {
-        verdictBody = latestBotComment.body ?? null
-        // Issue comments have no commit_id — treat headMatches as true when
-        // the comment is within this run window (already filtered above)
-        headMatches = true
-        verdictBelongsToRun = true
-      }
-    } else {
-      verdictBody = latestBotReview.body ?? null
-      headMatches = latestBotReview.commit_id === currentHeadSha
-      verdictBelongsToRun = true // already filtered by runStart
+      logger.info('Review reconciliation: no qualifying bot review found this run', {prNumber})
+      return {reconciled: false, reason: 'no-bot-review'}
     }
+
+    const verdictBody: string | null = latestBotReview.body ?? null
+    const headMatches = latestBotReview.commit_id === currentHeadSha
+    const verdictBelongsToRun = true // already filtered by runStart above
 
     // Step 4: Parse verdict and decide
     const verdict = verdictBody == null ? null : parseVerdict(verdictBody)
@@ -230,7 +218,26 @@ export async function runReviewReconciliation(
       return {reconciled: false, reason: decision.reason}
     }
 
-    // Step 5: Submit formal APPROVE
+    // Step 5: Re-fetch PR head immediately before submitting to close the TOCTOU window.
+    // If the head moved since Step 1, abort — we must not approve an unreviewed commit.
+    const freshPrResponse = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: prNumber,
+    })
+
+    const freshHeadSha: string = freshPrResponse.data.head.sha
+
+    if (freshHeadSha !== currentHeadSha) {
+      logger.info('Review reconciliation: head moved before submit, aborting', {
+        prNumber,
+        originalHead: currentHeadSha,
+        freshHead: freshHeadSha,
+      })
+      return {reconciled: false, reason: 'head-moved-before-submit'}
+    }
+
+    // Step 6: Submit formal APPROVE, pinned to the reviewed SHA
     logger.info('Review reconciliation: submitting APPROVE', {prNumber, currentHeadSha})
 
     await submitReview(
@@ -242,6 +249,7 @@ export async function runReviewReconciliation(
         event: 'APPROVE',
         body: 'Approving to match the review verdict above.',
         comments: [],
+        commitSha: currentHeadSha,
       },
       logger,
     )
