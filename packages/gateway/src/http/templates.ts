@@ -16,13 +16,15 @@ import type {AnnouncePayload} from './announce-schema.js'
 const COLOR_BLUE = 0x5865f2
 /** Discord green — survey_completed */
 const COLOR_GREEN = 0x57f287
+/** Discord purple — daily_digest */
+const COLOR_PURPLE = 0x9b59b6
 // v2 stubs (not yet emitted — colors reserved for when templates are added):
-// reconcile_notable  → 0x9b59b6 (purple)
 // wiki_lint_findings → 0xfee75c (yellow)
 
 const ACCENT: Record<AnnouncePayload['event_type'], number> = {
   invitation_accepted: COLOR_BLUE,
   survey_completed: COLOR_GREEN,
+  daily_digest: COLOR_PURPLE,
 }
 
 // ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ const ACCENT: Record<AnnouncePayload['event_type'], number> = {
 
 type InvitationAcceptedContext = Extract<AnnouncePayload, {event_type: 'invitation_accepted'}>['context']
 type SurveyCompletedContext = Extract<AnnouncePayload, {event_type: 'survey_completed'}>['context']
+type DailyDigestContext = Extract<AnnouncePayload, {event_type: 'daily_digest'}>['context']
 
 function renderInvitationAccepted(context: InvitationAcceptedContext): string {
   const {count, repos} = context
@@ -47,6 +50,18 @@ function renderSurveyCompleted(context: SurveyCompletedContext): string {
   const pagesChanged = context.wiki_pages_changed
   const noun = pagesChanged === 1 ? 'entry' : 'entries'
   return `Surveyed ${owner}/${repo}, added ${pagesChanged} wiki ${noun}`
+}
+
+export function renderDailyDigest(context: DailyDigestContext): string {
+  const surveysToday = context.surveys_today
+  const reposTracked = context.repos_tracked
+  const reportUrl = context.report_url
+  const surveyNoun = surveysToday === 1 ? 'repo' : 'repos'
+  const trackedNoun = reposTracked === 1 ? 'repo' : 'repos'
+  return (
+    `Wrapped up today's sweep — surveyed ${surveysToday} ${surveyNoun} out of ${reposTracked} tracked ${trackedNoun}. ` +
+    `Full report: ${reportUrl}`
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +96,8 @@ export function renderEmbed(payload: AnnouncePayload): PresenceEmbed {
     description = payload.rendered_text
   } else if (payload.event_type === 'invitation_accepted') {
     description = renderInvitationAccepted(payload.context)
+  } else if (payload.event_type === 'daily_digest') {
+    description = renderDailyDigest(payload.context)
   } else {
     description = renderSurveyCompleted(payload.context)
   }
