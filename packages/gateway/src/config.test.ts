@@ -66,6 +66,8 @@ beforeEach(() => {
     'GATEWAY_MAX_CONCURRENT_RUNS',
     'GATEWAY_APPROVAL_MODE',
     'GATEWAY_APPROVAL_MODE_FILE',
+    'GATEWAY_PERSONA',
+    'GATEWAY_PERSONA_FILE',
   ]) {
     delete process.env[key]
   }
@@ -1398,5 +1400,111 @@ describe('loadGatewayConfig — GATEWAY_APPROVAL_MODE', () => {
     expect(() => loadGatewayConfig()).toThrow(
       'Invalid GATEWAY_APPROVAL_MODE value: "full-auto" (valid values: approval-required)',
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_PERSONA_FILE
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GATEWAY_PERSONA_FILE (persona)', () => {
+  it('happy path: GATEWAY_PERSONA_FILE unset → config.persona is null', () => {
+    // #given — no persona env var or file
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.persona).toBeNull()
+  })
+
+  it('happy path: GATEWAY_PERSONA_FILE set to a file with content → config.persona is the trimmed content', () => {
+    // #given — persona file with multi-line markdown content
+    setRequiredEnv()
+    const personaFile = join(tmpDir, 'persona.md')
+    writeFileSync(
+      personaFile,
+      '# Fro Bot\n\nYou are Fro Bot, a capable engineering assistant.\n\nBe direct and concise.\n',
+      {mode: 0o600},
+    )
+    process.env.GATEWAY_PERSONA_FILE = personaFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — content is read and trailing whitespace trimmed
+    expect(config.persona).toBe(
+      '# Fro Bot\n\nYou are Fro Bot, a capable engineering assistant.\n\nBe direct and concise.',
+    )
+  })
+
+  it('edge: GATEWAY_PERSONA_FILE points to empty file → config.persona is null', () => {
+    // #given — empty file is treated as absent
+    setRequiredEnv()
+    const personaFile = join(tmpDir, 'persona-empty.md')
+    writeFileSync(personaFile, '', {mode: 0o600})
+    process.env.GATEWAY_PERSONA_FILE = personaFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.persona).toBeNull()
+  })
+
+  it('edge: GATEWAY_PERSONA_FILE points to whitespace-only file → config.persona is null', () => {
+    // #given — whitespace-only file is treated as absent
+    setRequiredEnv()
+    const personaFile = join(tmpDir, 'persona-ws.md')
+    writeFileSync(personaFile, '   \n  \n', {mode: 0o600})
+    process.env.GATEWAY_PERSONA_FILE = personaFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.persona).toBeNull()
+  })
+
+  it('edge: GATEWAY_PERSONA_FILE content is trimmed (trailing newline stripped)', () => {
+    // #given — file with trailing newline (common in text editors)
+    setRequiredEnv()
+    const personaFile = join(tmpDir, 'persona-trailing.md')
+    writeFileSync(personaFile, 'You are Fro Bot.\n', {mode: 0o600})
+    process.env.GATEWAY_PERSONA_FILE = personaFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — trailing newline stripped
+    expect(config.persona).toBe('You are Fro Bot.')
+  })
+
+  it('edge: GATEWAY_PERSONA_FILE points to non-existent file → config.persona is null (fail-soft)', () => {
+    // #given — _FILE points to a missing path, no env var fallback
+    setRequiredEnv()
+    process.env.GATEWAY_PERSONA_FILE = join(tmpDir, 'does-not-exist.md')
+
+    // #when / #then — must NOT throw; absent persona is fail-soft
+    let config: import('./config.js').GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+    expect(config?.persona).toBeNull()
+  })
+
+  it('edge: GATEWAY_PERSONA env var set → config.persona is the value (env var path)', () => {
+    // #given — persona provided directly via env var (single-line for readOptionalMultilineSecret)
+    setRequiredEnv()
+    process.env.GATEWAY_PERSONA = 'You are Fro Bot, a capable engineering assistant.'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.persona).toBe('You are Fro Bot, a capable engineering assistant.')
+
+    delete process.env.GATEWAY_PERSONA
   })
 })

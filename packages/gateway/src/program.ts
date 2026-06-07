@@ -274,6 +274,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           attachToken: config.workspaceOpencodeToken,
           runTimeoutMs: config.runTimeoutMs,
           botUserId: client.user.id,
+          persona: config.persona,
           logger,
           approvalRegistry,
           approvalMode: config.approvalMode,

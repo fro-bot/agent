@@ -57,6 +57,13 @@ export interface GatewayConfig {
    */
   readonly approvalMode: 'approval-required'
   /**
+   * Canonical Fro Bot persona text, read from `GATEWAY_PERSONA_FILE` (or `GATEWAY_PERSONA` env var).
+   * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
+   * `null` when unset, empty, or whitespace-only — the mention loop degrades gracefully to
+   * mechanical guidance only (R4 fail-soft).
+   */
+  readonly persona: string | null
+  /**
    * Announce/presence endpoint configuration. Present only when both
    * `GATEWAY_WEBHOOK_SECRET` and `GATEWAY_PRESENCE_CHANNEL_ID` are set.
    * When absent, the announce HTTP server is not started.
@@ -394,6 +401,11 @@ export function loadGatewayConfig(): GatewayConfig {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }
 
+  // Persona — optional multi-line markdown file (e.g. fro-bot-persona.md).
+  // Uses readOptionalMultilineSecret because persona files contain embedded newlines.
+  // Absent/empty/whitespace → null (R4 fail-soft: the mention loop degrades gracefully).
+  const persona = readOptionalMultilineSecret('GATEWAY_PERSONA')
+
   // Announce/presence endpoint — opt-in: both secrets must be set together, or neither.
   // Mirrors the AWS credential pair-validation block above.
   const gatewayWebhookSecret = readOptionalSecret('GATEWAY_WEBHOOK_SECRET')
@@ -438,6 +450,7 @@ export function loadGatewayConfig(): GatewayConfig {
     logLevel,
     privilegedIntents,
     approvalMode,
+    persona,
     githubAppId,
     githubAppPrivateKey,
     gatewayGitHubAppInstallUrl,
