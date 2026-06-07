@@ -17,6 +17,7 @@ import {runCleanup} from './phases/cleanup.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {runExecute} from './phases/execute.js'
 import {runFinalize} from './phases/finalize.js'
+import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 
@@ -112,6 +113,29 @@ export async function run(): Promise<number> {
 
     const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
     agentSuccess = execution.success
+
+    // Review reconciliation: after the agent session, check if a formal APPROVE
+    // is needed to satisfy branch protection when the agent delivered a PASS
+    // verdict as a comment instead of a review event. Fail-safe — never throws.
+    const reconciliationLogger = createLogger({phase: 'review-reconciliation'})
+    const triggerContext = routing.triggerResult.context
+    const isPullRequestReviewTrigger = triggerContext.eventType === 'pull_request'
+    const prNumber =
+      triggerContext.target != null && triggerContext.target.kind === 'pr' ? triggerContext.target.number : null
+    await runReviewReconciliation(
+      {
+        octokit: routing.githubClient,
+        botLogin: routing.botLogin,
+        owner: triggerContext.repo.owner,
+        repo: triggerContext.repo.repo,
+        prNumber,
+        isPullRequestReviewTrigger,
+        responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
+        agentSucceeded: agentSuccess,
+        runStartMs: startTime,
+      },
+      reconciliationLogger,
+    )
 
     if (agentSuccess && dedup.entity != null) {
       await saveDedupMarker(routing.triggerResult.context, dedup.entity, repo)

@@ -1715,6 +1715,9 @@ describe('getTriggerDirective', () => {
     expect(directive.directive).toContain('`--approve` for a PASS verdict')
     expect(directive.directive).toContain('`--request-changes` for a CONDITIONAL or REJECT verdict')
     expect(directive.directive).toContain('comment-only review does NOT satisfy a requested review')
+    // Re-review awareness: follow-up validations must still use a review event, never a plain comment
+    expect(directive.directive).toContain('re-reviews')
+    expect(directive.directive).toContain('never `gh pr comment`')
     expect(directive.directive).toContain('If the author is a collaborator, prioritize actionable feedback')
     expect(directive.appendMode).toBe(true)
   })
@@ -2093,6 +2096,10 @@ describe('output contract', () => {
     expect(prompt).toContain('PASS → `gh pr review --approve`')
     expect(prompt).toContain('CONDITIONAL or REJECT → `gh pr review --request-changes`')
     expect(prompt).not.toContain('approve/request-changes if confident; otherwise comment-only')
+    // Escape-hatch phrase removed — model must never be told to use comment-only when it "cannot reach a verdict"
+    expect(prompt).not.toContain('genuinely cannot reach a verdict')
+    // Re-review awareness present in Output Contract
+    expect(prompt).toContain('This applies on re-reviews too')
   })
 
   it('shows requested reviewer as no when not requested', () => {

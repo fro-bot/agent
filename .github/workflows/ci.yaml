@@ -162,8 +162,9 @@ jobs:
 
         Submit the review with the event matching your verdict: PASS must use
         `gh pr review --approve`; CONDITIONAL or REJECT must use
-        `gh pr review --request-changes`. A comment-only review does not count
-        and leaves the PR blocked on review-required.
+        `gh pr review --request-changes`. A reached verdict requires the matching
+        review event even on a re-review; a comment-only review never satisfies
+        review-required and leaves the PR blocked.
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
