@@ -1,8 +1,9 @@
 ---
 title: "fix: Reconcile PR review approval event when the agent delivers a verdict as a comment"
 type: fix
-status: active
+status: completed
 date: 2026-06-06
+completed: 2026-06-06
 ---
 
 # fix: Reconcile PR review approval event when the agent delivers a verdict as a comment
@@ -86,7 +87,7 @@ The agent's review body uses a `## Verdict: PASS | CONDITIONAL | REJECT` heading
 
 ## Implementation Units
 
-- [ ] **Unit 1: Review-verdict parsing + reconciliation decision (pure logic)**
+- [x] **Unit 1: Review-verdict parsing + reconciliation decision (pure logic)**
 
 **Goal:** A pure, well-tested module that, given the bot's latest review state + verdict-bearing artifact body + current head SHA + run-start time, decides whether to submit an APPROVE (and why not, when not).
 
@@ -118,7 +119,7 @@ The agent's review body uses a `## Verdict: PASS | CONDITIONAL | REJECT` heading
 **Verification:**
 - `decideReconciliation` returns `approve` only in the exact R1 case; every other branch returns a named skip reason. Full table-style coverage.
 
-- [ ] **Unit 2: `runReviewReconciliation` phase (octokit I/O + submit)**
+- [x] **Unit 2: `runReviewReconciliation` phase (octokit I/O + submit)**
 
 **Goal:** A harness phase that gathers the GitHub facts, calls `decideReconciliation`, and on `approve` submits the formal APPROVE via `submitReview()`. Fail-safe throughout.
 
@@ -160,7 +161,7 @@ The agent's review body uses a `## Verdict: PASS | CONDITIONAL | REJECT` heading
 **Verification:**
 - On the COMMENTED-PASS-at-head case the harness produces a formal APPROVE; every skip/error branch leaves PR state untouched and never fails the run.
 
-- [ ] **Unit 3: Remove the prompt comment-only escape hatch (advisory layer)**
+- [x] **Unit 3: Remove the prompt comment-only escape hatch (advisory layer)**
 
 **Goal:** Tighten the verdict-delivery wording so a reached verdict can never be framed as legitimately comment-only, and add re-review awareness.
 
