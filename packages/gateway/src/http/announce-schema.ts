@@ -1,7 +1,7 @@
 /**
  * Effect Schema definitions for the POST /v1/announce webhook payload.
  *
- * Validates and decodes the two v1 event types. Unknown event types and
+ * Validates and decodes the v1 event types. Unknown event types and
  * malformed shapes produce a Left with a content-free reason string —
  * payload values (context, rendered_text) are never echoed.
  */
@@ -47,7 +47,19 @@ const SurveyCompleted = Schema.Struct({
   rendered_text: Schema.NullOr(Schema.String),
 })
 
-const AnnouncePayloadSchema = Schema.Union(InvitationAccepted, SurveyCompleted)
+const DailyDigest = Schema.Struct({
+  v: Schema.Literal(1),
+  event_type: Schema.Literal('daily_digest'),
+  fired_at: FiredAt,
+  context: Schema.Struct({
+    repos_tracked: Schema.Number,
+    surveys_today: Schema.Number,
+    report_url: Schema.String,
+  }),
+  rendered_text: Schema.NullOr(Schema.String),
+})
+
+const AnnouncePayloadSchema = Schema.Union(InvitationAccepted, SurveyCompleted, DailyDigest)
 
 export type AnnouncePayload = Schema.Schema.Type<typeof AnnouncePayloadSchema>
 
