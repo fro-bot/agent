@@ -46,11 +46,23 @@ import os
 import subprocess
 import sys
 
-compose_file = os.environ.get("COMPOSE_FILE", "deploy/compose.yaml")
+compose_file_env = os.environ.get("COMPOSE_FILE", "deploy/compose.yaml")
+
+# Support Docker's native multi-file COMPOSE_FILE: files are separated by
+# COMPOSE_PATH_SEPARATOR (default ':' on Linux/macOS, ';' on Windows).
+# When multiple files are specified, docker compose merges them in order
+# (later files override earlier ones), exactly as `docker compose -f a -f b`.
+path_sep = os.environ.get("COMPOSE_PATH_SEPARATOR", ":")
+compose_files = [f for f in compose_file_env.split(path_sep) if f]
+
+# Build the list of -f args for docker compose invocations.
+# Single-file case produces exactly ["-f", "<file>"] — byte-for-byte identical
+# to the previous behaviour.
+f_args = sum([["-f", f] for f in compose_files], [])
 
 try:
     result = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "config", "--format", "json"],
+        ["docker", "compose"] + f_args + ["config", "--format", "json"],
         capture_output=True,
         text=True,
         check=True,
@@ -66,15 +78,31 @@ except (subprocess.CalledProcessError, OSError):
         import yaml
         try:
             result2 = subprocess.run(
-                ["docker", "compose", "-f", compose_file, "config"],
+                ["docker", "compose"] + f_args + ["config"],
                 capture_output=True,
                 text=True,
                 check=True,
             )
             cfg = yaml.safe_load(result2.stdout)
         except (subprocess.CalledProcessError, OSError):
-            # docker compose unavailable — parse the raw YAML file directly.
-            with open(compose_file) as fh:
+            # docker compose unavailable — parse the raw YAML file(s) directly.
+            # docker-present multi-file: `docker compose -f a -f b config` performs
+            #   an authoritative merge (stays correct above in the docker-present path).
+            # docker-absent single-file: parse the raw YAML directly (safe).
+            # docker-absent multi-file: FAIL CLOSED — raw YAML shallow-merge replaces
+            #   whole service dicts and cannot faithfully reproduce Docker Compose merge
+            #   semantics; a partial override would be misread as a full replacement,
+            #   producing false failures on valid configs.
+            if len(compose_files) > 1:
+                print(
+                    "ERROR: COMPOSE_FILE lists multiple files but docker compose is "
+                    "unavailable. The raw-YAML fallback cannot faithfully reproduce "
+                    "Docker Compose merge semantics. Install docker compose, or "
+                    "validate a single fully-rendered compose file.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            with open(compose_files[0]) as fh:
                 cfg = yaml.safe_load(fh)
     except Exception as e2:
         print(f"ERROR: could not parse compose config: {e2}", file=sys.stderr)
@@ -123,9 +151,38 @@ workspace_nets = service_networks("workspace")
 mitmproxy_nets = service_networks("mitmproxy")
 
 # ------------------------------------------------------------------
-# Invariant 2: workspace is attached to sandbox-net only
+# Invariant 1b: NO service may declare network_mode.
+#
+# A compose override can set network_mode: host (or service:<x> /
+# container:<x>) on any service.  Such a service has NO 'networks' key,
+# so the network-attachment invariants below pass VACUOUSLY while the
+# container actually has host/shared networking — bypassing containment
+# entirely.  Reject any network_mode declaration on ANY service,
+# regardless of value.  Service names are sorted for deterministic output.
+#
+# Capture the set of services that declare network_mode so that the
+# per-service network-attachment invariants below can skip them — a
+# service with network_mode produces EXACTLY ONE failure line (this one),
+# not confusing secondary attachment messages.
 # ------------------------------------------------------------------
-if workspace_nets != {"sandbox-net"}:
+network_mode_services = set()
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _nm = _svc_cfg.get("network_mode")
+    if _nm:
+        network_mode_services.add(_svc)
+        failures.append(
+            f"FAIL: service '{_svc}' declares network_mode '{_nm}' — "
+            "network_mode bypasses the sandbox/egress network-attachment model "
+            "and is not permitted."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 2: workspace is attached to sandbox-net only
+# (skipped when workspace declares network_mode — Invariant 1b already
+# covers that case and workspace_nets would be empty/misleading)
+# ------------------------------------------------------------------
+if "workspace" not in network_mode_services and workspace_nets != {"sandbox-net"}:
     failures.append(
         f"FAIL: workspace is attached to networks {sorted(workspace_nets)!r} "
         f"but must be attached to exactly ['sandbox-net']."
@@ -134,14 +191,16 @@ if workspace_nets != {"sandbox-net"}:
 # ------------------------------------------------------------------
 # Invariant 3: mitmproxy is attached to sandbox-net AND at least one
 # non-internal network (its upstream leg).
+# (skipped when mitmproxy declares network_mode — Invariant 1b covers it)
 # ------------------------------------------------------------------
-if "sandbox-net" not in mitmproxy_nets:
-    failures.append(
-        "FAIL: mitmproxy is not attached to sandbox-net — it cannot receive "
-        "workspace traffic."
-    )
+if "mitmproxy" not in network_mode_services:
+    if "sandbox-net" not in mitmproxy_nets:
+        failures.append(
+            "FAIL: mitmproxy is not attached to sandbox-net — it cannot receive "
+            "workspace traffic."
+        )
 mitmproxy_egress_nets = mitmproxy_nets & non_internal_nets
-if not mitmproxy_egress_nets:
+if "mitmproxy" not in network_mode_services and not mitmproxy_egress_nets:
     failures.append(
         f"FAIL: mitmproxy is attached only to internal networks {sorted(mitmproxy_nets)!r}. "
         "It needs at least one non-internal network as its upstream leg so it "
@@ -150,9 +209,10 @@ if not mitmproxy_egress_nets:
 
 # ------------------------------------------------------------------
 # Invariant 4: workspace is attached to NO non-internal network
+# (skipped when workspace declares network_mode — Invariant 1b covers it)
 # ------------------------------------------------------------------
 workspace_egress_nets = workspace_nets & non_internal_nets
-if workspace_egress_nets:
+if "workspace" not in network_mode_services and workspace_egress_nets:
     failures.append(
         f"FAIL: workspace is attached to non-internal network(s) "
         f"{sorted(workspace_egress_nets)!r} — it has direct internet egress, "
@@ -162,6 +222,8 @@ if workspace_egress_nets:
 # ------------------------------------------------------------------
 # Invariant 5: each non-internal network that mitmproxy uses must have
 # EXACTLY ONE attached service (mitmproxy itself).
+# (mitmproxy_egress_nets is empty when mitmproxy has network_mode, so
+# this loop is a no-op in that case — no explicit skip needed)
 # ------------------------------------------------------------------
 for egress_net in mitmproxy_egress_nets:
     attached = [
