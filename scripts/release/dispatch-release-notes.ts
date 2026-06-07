@@ -175,6 +175,9 @@ function main(): void {
   }
 
   // Step 10: watch with hard timeout
+  // Note: this bounds how long we WATCH the narration run (seconds, for `gh run watch`).
+  // It is distinct from the OpenCode execution timeout set on the dispatched run itself
+  // (fro-bot.yaml `timeout:`, milliseconds). Different layers, deceptively similar values.
   const watchTimeoutSecs = Number(process.env.RELEASE_NOTES_TEST_WATCH_TIMEOUT_SECS ?? 600)
   let watchExit = 0
   try {
