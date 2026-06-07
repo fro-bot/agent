@@ -42,6 +42,14 @@ import sys
 from mitmproxy import http
 
 # ---------------------------------------------------------------------------
+# NAT64 Well-Known Prefix (RFC 6052 §2.1).
+# Python's ipaddress does NOT decode the embedded IPv4 from these addresses,
+# so 64:ff9b::a00:1 (embedding 10.0.0.1) incorrectly reports is_global=True.
+# _ip_is_disallowed extracts and checks the embedded IPv4 for this prefix.
+# ---------------------------------------------------------------------------
+_NAT64_WKP = ipaddress.ip_network("64:ff9b::/96")
+
+# ---------------------------------------------------------------------------
 # Allowlist — production-safe defaults for fro-bot v1.
 # Entries starting with "*." match any subdomain of the given domain.
 #
@@ -89,6 +97,11 @@ def _ip_is_disallowed(ip_str: str) -> bool:
       - documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32)
       - benchmarking (198.18/15)
       - multicast, unspecified (0.0.0.0, ::), site-local, unique local IPv6 (fc00::/7)
+      - NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052) embedding a non-global IPv4:
+        Python's ipaddress does not decode the embedded IPv4, so the raw IPv6
+        is_global check would incorrectly pass addresses like 64:ff9b::a00:1
+        (which embeds 10.0.0.1). The embedded IPv4 is extracted from the low
+        32 bits of the address integer and evaluated with the same is_global rule.
 
     Returns False for globally-routable public IPs (accepted for self-hosted
     MinIO deployments and similar use cases).
@@ -98,6 +111,11 @@ def _ip_is_disallowed(ip_str: str) -> bool:
     except ValueError:
         # Not a parseable IP address — not our concern here.
         return False
+    # NAT64 Well-Known Prefix: extract and check the embedded IPv4 (low 32 bits).
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_WKP:
+        embedded_v4 = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if not embedded_v4.is_global:
+            return True
     return not ip.is_global
 
 

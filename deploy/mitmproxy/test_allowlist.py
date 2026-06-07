@@ -963,6 +963,77 @@ def test_dns_rebinding_request_hook_also_enforced():
 
 
 # ===========================================================================
+# NAT64 Well-Known Prefix (64:ff9b::/96) embedded-IPv4 bypass — RFC 6052
+# ===========================================================================
+
+
+def test_ip_is_disallowed_nat64_embeds_rfc1918_10():
+    """64:ff9b::a00:1 embeds 10.0.0.1 (RFC 1918) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::a00:1") is True
+
+
+def test_ip_is_disallowed_nat64_embeds_loopback():
+    """64:ff9b::7f00:1 embeds 127.0.0.1 (loopback) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::7f00:1") is True
+
+
+def test_ip_is_disallowed_nat64_embeds_link_local():
+    """64:ff9b::a9fe:1 embeds 169.254.0.1 (link-local) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::a9fe:1") is True
+
+
+def test_ip_is_disallowed_nat64_embeds_cgnat():
+    """64:ff9b::6440:1 embeds 100.64.0.1 (CGNAT / RFC 6598) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::6440:1") is True
+
+
+def test_ip_is_disallowed_nat64_embeds_public_allowed():
+    """64:ff9b::808:808 embeds 8.8.8.8 (public) — must NOT be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::808:808") is False
+
+
+def test_ip_is_disallowed_nat64_regression_6to4_still_blocked():
+    """2002:0a00:0001:: (6to4 embedding 10.0.0.1) — already blocked, must stay True."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("2002:0a00:0001::") is True
+
+
+def test_ip_is_disallowed_nat64_regression_v4mapped_still_blocked():
+    """::ffff:10.0.0.1 (v4-mapped) — already blocked, must stay True."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("::ffff:10.0.0.1") is True
+
+
+def test_ip_is_disallowed_nat64_regression_rfc8215_still_blocked():
+    """64:ff9b:1::a00:1 (RFC 8215 local NAT64 prefix) — already blocked, must stay True."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b:1::a00:1") is True
+
+
+def test_ip_is_disallowed_nat64_regression_public_ipv6_allowed():
+    """2606:4700::1111 (Cloudflare public IPv6) — must NOT be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("2606:4700::1111") is False
+
+
+def test_ip_is_disallowed_nat64_embeds_private_172():
+    """64:ff9b::ac10:1 embeds 172.16.0.1 (RFC 1918) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::ac10:1") is True
+
+
+def test_ip_is_disallowed_nat64_embeds_private_192_168():
+    """64:ff9b::c0a8:101 embeds 192.168.1.1 (RFC 1918) — must be disallowed."""
+    mod = _load_allowlist()
+    assert mod._ip_is_disallowed("64:ff9b::c0a8:101") is True
+
+
+# ===========================================================================
 # Standalone runner (no pytest required)
 # ===========================================================================
 
