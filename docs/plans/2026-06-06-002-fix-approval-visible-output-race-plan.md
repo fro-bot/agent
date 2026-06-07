@@ -1,8 +1,9 @@
 ---
 title: "fix: Resolve gateway approval/status visible-output race in timeout classification"
 type: fix
-status: active
+status: completed
 date: 2026-06-06
+completed: 2026-06-06
 ---
 
 # fix: Resolve gateway approval/status visible-output race in timeout classification
@@ -74,7 +75,7 @@ The race: timeout fires → classification reads `hasVisibleOutput()` → an app
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add pending-visibility counter to the sink**
+- [x] **Unit 1: Add pending-visibility counter to the sink**
 
 **Goal:** Extend `DiscordStreamSink` so out-of-band sends can mark visibility as *pending* before delivery, and resolve it on success/failure, with `hasVisibleOutput()` treating pending as visible.
 
@@ -106,7 +107,7 @@ The race: timeout fires → classification reads `hasVisibleOutput()` → an app
 **Verification:**
 - The sink exposes `markVisibleOutputPending`; `hasVisibleOutput()` reflects pending-as-visible and failure-retraction; all existing streaming tests still pass.
 
-- [ ] **Unit 2: Wire approval/status sends through the pending API in run.ts**
+- [x] **Unit 2: Wire approval/status sends through the pending API in run.ts**
 
 **Goal:** Make the waiting-status and embed sends mark visibility *pending* synchronously before their Discord send, settling true/false on resolution, so timeout classification sees in-flight sends as visible context.
 
