@@ -27,6 +27,7 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
+import {formatToolPart} from './format-part.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -276,6 +277,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // V2 sync tool lifecycle: correlate called→success by callID.
   const pendingToolCalls = new Map<string, ToolCallInfo>()
 
+  // Reasoning suppression (R5): track part IDs of reasoning parts so their
+  // deltas can be suppressed at the message.part.delta site. Reasoning parts
+  // carry `id` on `message.part.updated` (type === 'reasoning'); their deltas
+  // carry `partID` on `message.part.delta` but no part kind — correlation is
+  // the only way to distinguish them from text deltas.
+  const reasoningPartIds = new Set<string>()
+
   // Wrap the raw event stream in an abort-aware iterator so we do not block
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
@@ -293,19 +301,26 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (eventType === 'message.part.delta') {
       // New SDK shape: streaming text delta events.
       // delta may be {type:'text', text:string} or a plain string when field === 'text'.
+      // Reasoning suppression: skip any delta whose partID is a known reasoning part.
       const eventSessionID = getEventSessionID(rawEvent)
       if (eventSessionID === sessionId) {
-        const delta = getObjectProperty(eventPayload, 'delta')
-        const deltaType = getStringProperty(delta, 'type')
-        const deltaText = getStringProperty(delta, 'text')
-        if (deltaType === 'text' && deltaText != null) {
-          sink.append(deltaText)
-        } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
-          sink.append(delta)
+        const deltaPartId = getStringProperty(eventPayload, 'partID')
+        if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
+          // This delta belongs to a reasoning part — suppress it entirely.
+        } else {
+          const delta = getObjectProperty(eventPayload, 'delta')
+          const deltaType = getStringProperty(delta, 'type')
+          const deltaText = getStringProperty(delta, 'text')
+          if (deltaType === 'text' && deltaText != null) {
+            sink.append(deltaText)
+          } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
+            sink.append(delta)
+          }
         }
       }
     } else if (eventType === 'session.next.text.delta') {
       // Sync/session.next shape: delta is a plain string or {type:'text', text:string}.
+      // No partID on this legacy path — reasoning suppression does not apply here.
       const eventSessionID = getEventSessionID(rawEvent)
       if (eventSessionID === sessionId) {
         const deltaRaw = getObjectProperty(eventPayload, 'delta')
@@ -320,22 +335,36 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
       if (eventSessionID === sessionId) {
         const partType = getStringProperty(part, 'type')
-        if (partType === 'tool') {
+        if (partType === 'reasoning') {
+          // Reasoning suppression: register this part's ID so its deltas are suppressed
+          // at the message.part.delta site. Render nothing for reasoning parts.
+          const reasoningId = getStringProperty(part, 'id')
+          if (reasoningId !== null) {
+            reasoningPartIds.add(reasoningId)
+          }
+        } else if (partType === 'tool') {
           // ONLY handle tool parts — text parts are streamed via message.part.delta.
           const toolState = getObjectProperty(part, 'state')
-          if (getStringProperty(toolState, 'status') === 'completed') {
+          const status = getStringProperty(toolState, 'status')
+          if (status === 'completed' || status === 'error') {
             const tool = getStringProperty(part, 'tool') ?? ''
-            // Title resolution: state.title → input.title → bash command/cmd → tool name.
-            const stateTitle = getStringProperty(toolState, 'title')
             const stateInput = getObjectProperty(toolState, 'input')
-            const title =
-              stateTitle ??
-              getStringProperty(stateInput, 'title') ??
-              (tool.toLowerCase() === 'bash'
-                ? String(getObjectProperty(stateInput, 'command') ?? getObjectProperty(stateInput, 'cmd') ?? tool)
-                : tool)
-            logger.debug({tool, title}, 'run-core: tool completed (message.part.updated)')
-            sink.append(`\n🔧 ${tool}: ${title}\n`)
+            const stateTitle = getStringProperty(toolState, 'title')
+            logger.debug({tool, status}, 'run-core: tool completed (message.part.updated)')
+            const summary = formatToolPart({
+              tool,
+              state: {
+                input:
+                  stateInput != null && typeof stateInput === 'object'
+                    ? (stateInput as Record<string, unknown>)
+                    : undefined,
+                title: stateTitle ?? undefined,
+                status: status === 'error' ? 'error' : 'completed',
+              },
+            })
+            if (summary != null && summary.length > 0) {
+              sink.append(`\n${summary}\n`)
+            }
           }
         }
       }
@@ -363,14 +392,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const {tool, input} = callInfo
             // Title resolution: structured.title → input.title → bash command → tool name.
             const structured = getObjectProperty(eventPayload, 'structured')
-            const title =
-              getStringProperty(structured, 'title') ??
-              getStringProperty(input, 'title') ??
-              (tool.toLowerCase() === 'bash'
-                ? String(getObjectProperty(input, 'command') ?? getObjectProperty(input, 'cmd') ?? tool)
-                : tool)
-            logger.debug({callID, tool, title}, 'run-core: tool success')
-            sink.append(`\n🔧 ${tool}: ${title}\n`)
+            const structuredTitle = getStringProperty(structured, 'title')
+            const inputTitle = getStringProperty(input, 'title')
+            const title = structuredTitle ?? inputTitle ?? undefined
+            logger.debug({callID, tool}, 'run-core: tool success')
+            const summary = formatToolPart({
+              tool,
+              state: {
+                input: input != null && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
+                title,
+                status: 'completed',
+              },
+            })
+            if (summary != null && summary.length > 0) {
+              sink.append(`\n${summary}\n`)
+            }
           }
         }
       }
