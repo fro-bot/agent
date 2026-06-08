@@ -1787,4 +1787,131 @@ describe('runOpenCodeCore', () => {
       expect(sink.buffered()).toContain('helper.ts')
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // Item 5: stream-ended error kind
+  // ---------------------------------------------------------------------------
+
+  describe('stream-ended error kind', () => {
+    it('throws RunCoreError with kind "stream-ended" when event stream closes before session.idle', async () => {
+      // #given — stream ends immediately with no events (no session.idle, no abort)
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              // Yields nothing — stream closes immediately without session.idle
+            })(),
+          }),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when / #then — stream-ended kind thrown
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('stream-ended')
+    })
+
+    it('throws RunCoreError with kind "stream-ended" when stream closes after some events but before session.idle', async () => {
+      // #given — stream yields some text deltas then closes without session.idle
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partDeltaObjectEvent('partial answer'),
+            // No sessionIdleEvent — stream ends prematurely
+          ]),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when / #then
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('stream-ended')
+    })
+
+    it('stream-ended error is NOT thrown when signal is aborted (timeout takes precedence)', async () => {
+      // #given — signal aborts before stream ends; timeout kind should be thrown, not stream-ended
+      const controller = new AbortController()
+      const handle = makeHandle({
+        promptAsync: async () => {
+          controller.abort()
+          return promptAsyncOk()
+        },
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              // Silent stream — never yields
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+      const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
+
+      // #when / #then — timeout kind, not stream-ended
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Item 7: session.error with eventSessionID === null (global error path)
+  // ---------------------------------------------------------------------------
+
+  describe('session.error with null sessionID (global error path)', () => {
+    it('throws RunCoreError with kind "session-error" when session.error has no sessionID (null)', async () => {
+      // #given — session.error event with no sessionID in properties
+      // The run-core code: `if (eventSessionID === null || eventSessionID === sessionId)`
+      // A null sessionID is treated as a global error that applies to any session.
+      const globalErrorEvent = {
+        type: 'session.error',
+        properties: {error: 'global LLM failure'},
+        // no sessionID field → getEventSessionID returns null
+      }
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([globalErrorEvent]),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when / #then — global session.error (null sessionID) surfaces as session-error
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('session-error')
+    })
+
+    it('session.error with null sessionID carries the error detail in the message', async () => {
+      // #given — global session.error with a specific error message
+      const globalErrorEvent = {
+        type: 'session.error',
+        properties: {error: 'quota exceeded globally'},
+      }
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([globalErrorEvent]),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — error message contains the detail from the event
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).message).toContain('quota exceeded globally')
+    })
+
+    it('session.error from a different (non-null) sessionID is ignored', async () => {
+      // #given — session.error for a different session; our session continues to idle
+      const otherSessionError = {
+        type: 'session.error',
+        properties: {sessionID: 'other-session', error: 'other session failed'},
+      }
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([otherSessionError, sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when / #then — other session's error is ignored; our session resolves normally
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+  })
 })

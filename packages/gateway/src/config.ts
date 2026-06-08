@@ -415,7 +415,7 @@ export function loadGatewayConfig(): GatewayConfig {
     console.warn(
       JSON.stringify({
         level: 'warn',
-        msg: 'GATEWAY_PERSONA read failed — persona will be null; gateway startup continues. Check GATEWAY_PERSONA_FILE path and permissions.',
+        msg: 'GATEWAY_PERSONA read failed — persona will be null; gateway startup continues. Check GATEWAY_PERSONA_FILE path, permissions, or whether the file exceeds the 4096-byte secret size limit.',
       }),
     )
   }

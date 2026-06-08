@@ -57,13 +57,27 @@ export class EmptyPromptError extends Error {
 }
 
 /**
+ * Escape all regex metacharacters in `s` so it can be safely interpolated
+ * into a `RegExp` pattern and matched literally.
+ *
+ * Discord snowflakes are digits-only in practice, but this guard removes the
+ * theoretical broken-regex path for any future ID format.
+ */
+function escapeRegExp(s: string): string {
+  return s.replaceAll(/[$()*+.?[\\\]^{|}]/g, String.raw`\$&`)
+}
+
+/**
  * Strip leading Discord mention token(s) (`<@ID>` or `<@!ID>`) that match
  * `botUserId` from the start of `text`. Removes as many consecutive leading
  * matches as are present, then trims the result.
  */
 function stripLeadingMentions(text: string, botUserId: string): string {
   // A single mention pattern: optional whitespace, then <@ID> or <@!ID>.
-  const mentionPattern = new RegExp(String.raw`^\s*<@!?${botUserId}>`, '')
+  // escapeRegExp ensures botUserId is matched literally even if it contains
+  // regex metacharacters (e.g. a dot in a non-snowflake ID).
+  const escapedId = escapeRegExp(botUserId)
+  const mentionPattern = new RegExp(String.raw`^\s*<@!?${escapedId}>`, '')
   let result = text
   let prev: string
   do {
