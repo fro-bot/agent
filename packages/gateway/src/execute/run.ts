@@ -35,6 +35,12 @@ export interface RunMentionDeps {
    * does not silently dispatch a no-op run.
    */
   readonly botUserId: string
+  /**
+   * Optional canonical persona text (from `GatewayConfig.persona`).
+   * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
+   * `null` → mechanical guidance only (R4 fail-soft).
+   */
+  readonly persona: string | null
   readonly logger: GatewayLogger
   /** Program-scoped approval registry shared with the button handler and shutdown drain. */
   readonly approvalRegistry: ApprovalRegistry
@@ -157,7 +163,8 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  * - Every Discord send uses `allowedMentions: {parse: []}`.
  */
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, logger} = deps
+  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, persona, logger} =
+    deps
   const {approvalRegistry, approvalMode, ensureClone, readyz} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
@@ -328,6 +335,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         owner: bindingWithEnsuredPath.owner,
         repo: bindingWithEnsuredPath.repo,
         botUserId,
+        persona,
       })
 
       // ── Remaining budget — single origin for hard abort AND approval deadline ──

@@ -148,6 +148,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       disposeAll: vi.fn(),
     },
     approvalMode: 'approval-required' as const,
+    persona: null,
     ensureClone: vi.fn().mockResolvedValue({success: true as const, data: '/workspace/repos/acme/widget'}),
     readyz: vi.fn().mockResolvedValue({success: true as const, data: {ready: true, opencode: 'ready'}}),
   }

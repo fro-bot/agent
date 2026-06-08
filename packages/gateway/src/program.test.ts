@@ -157,6 +157,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
     approvalMode: 'approval-required',
+    persona: null,
     announce: {
       webhookSecret: 'test-webhook-secret',
       presenceChannelId: 'test-presence-channel-id',

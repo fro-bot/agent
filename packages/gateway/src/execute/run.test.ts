@@ -311,6 +311,7 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     attachToken: 'secret-bearer-token',
     runTimeoutMs: overrides.runTimeoutMs ?? 600000,
     botUserId: overrides.botUserId ?? 'bot-123',
+    persona: overrides.persona ?? null,
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     approvalMode: overrides.approvalMode ?? 'approval-required',
