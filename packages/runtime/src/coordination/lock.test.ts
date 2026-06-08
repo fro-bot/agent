@@ -412,4 +412,58 @@ describe('lock coordination', () => {
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error.message : '').toContain('Invalid lock record payload')
   })
+
+  it('returns err when initial acquire succeeds but adapter returns an empty etag', async () => {
+    // #given — adapter returns success with an empty string etag (impossible state guard)
+    const storeAdapter = createStoreAdapter({
+      conditionalPut: vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(async () => ok({etag: ''})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
+
+    // #then — must NOT return acquired:true; must return err
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('usable ETag')
+  })
+
+  it('returns err when stale-takeover succeeds but adapter returns an empty etag', async () => {
+    // #given — first put precondition-fails, getObject returns a stale lock,
+    //          takeover put returns success with an empty etag
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T17:30:00.000Z'})
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(err(new Error('precondition failed')))
+      .mockResolvedValueOnce(ok({etag: ''}))
+    const storeAdapter = createStoreAdapter({
+      conditionalPut,
+      getObject: vi.fn(async () => ok({data: JSON.stringify(staleLock), etag: 'etag-stale'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+
+    // #then — must NOT return acquired:true; must return err
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('usable ETag')
+  })
+
+  it('happy path: valid etag on initial acquire returns acquired:true with the etag', async () => {
+    // #given — adapter returns a valid non-empty etag
+    const storeAdapter = createStoreAdapter({
+      conditionalPut: vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(async () => ok({etag: 'etag-valid'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
+
+    // #then
+    expect(result).toEqual(ok({acquired: true, etag: 'etag-valid', holder: null}))
+  })
 })

@@ -198,10 +198,11 @@ describe('runAcquireLock', () => {
     expect(result).toEqual({outcome: 'error', error: networkError})
   })
 
-  it('returns error when adapter reports acquired but no etag', async () => {
-    // #given adapter returned acquired:true with null etag (defensive — should not happen)
+  it('returns error when acquireLock returns err (e.g. adapter returned no usable ETag)', async () => {
+    // #given acquireLock itself returns err — the impossible state {acquired:true, etag:null}
+    //        is now prevented at the source; the harness maps any err Result to outcome:'error'
     const storeConfig = createStoreConfig()
-    acquireLockMock.mockResolvedValue(lockOk({acquired: true, etag: null, holder: null}))
+    acquireLockMock.mockResolvedValue(lockErr(new Error('Lock acquisition succeeded without a usable ETag')))
 
     // #when running acquire-lock phase
     const result = await runAcquireLock({
@@ -212,9 +213,9 @@ describe('runAcquireLock', () => {
       logger: createMockLogger(),
     })
 
-    // #then phase fails fast — releasing without an etag would be unsafe
+    // #then phase reports error — releasing without an etag would be unsafe
     expect(result.outcome).toBe('error')
     const errorMessage = result.outcome === 'error' ? result.error.message : ''
-    expect(errorMessage).toContain('no ETag')
+    expect(errorMessage).toContain('usable ETag')
   })
 })

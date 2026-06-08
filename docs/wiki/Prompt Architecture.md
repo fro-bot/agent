@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-04-26"
-updated-by: "ca17d5e"
+last-updated: "2026-06-07"
+updated-by: "cbc7008"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/prompt-thread.ts
