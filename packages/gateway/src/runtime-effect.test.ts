@@ -109,7 +109,7 @@ describe('acquireLockEffect', () => {
   // #when Effect runs
   // #then resolves to data
   it('resolves to LockAcquisitionResult on success', async () => {
-    const data = {acquired: true, etag: 'abc', holder: null}
+    const data = {acquired: true as const, etag: 'abc', holder: null}
     vi.mocked(acquireLock).mockResolvedValue(ok(data))
 
     const exit = await Effect.runPromiseExit(

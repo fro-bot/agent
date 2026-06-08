@@ -70,11 +70,6 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
   }
 
   if (result.data.acquired === true) {
-    if (result.data.etag === null) {
-      const error = new Error('Lock acquired but adapter returned no ETag')
-      logger.warning(error.message, {repo, holderId})
-      return {outcome: 'error', error}
-    }
     logger.info('Lock acquired', {repo, holderId, etag: result.data.etag})
     return {outcome: 'acquired', lockEtag: result.data.etag}
   }
