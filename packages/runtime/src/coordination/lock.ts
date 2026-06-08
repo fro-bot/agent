@@ -101,6 +101,9 @@ export async function acquireLock(
   logger.debug('Attempting lock acquisition', {key: key.data, repo, runId, surface})
   const acquired = await conditionalPut.data(key.data, JSON.stringify(lockRecord), {ifNoneMatch: '*'})
   if (acquired.success === true) {
+    if (typeof acquired.data.etag !== 'string' || acquired.data.etag.length === 0) {
+      return err(new Error('Lock acquisition succeeded without a usable ETag'))
+    }
     return ok({acquired: true, etag: acquired.data.etag, holder: null})
   }
 
@@ -131,6 +134,9 @@ export async function acquireLock(
     return err(takeover.error)
   }
 
+  if (typeof takeover.data.etag !== 'string' || takeover.data.etag.length === 0) {
+    return err(new Error('Lock acquisition succeeded without a usable ETag'))
+  }
   return ok({acquired: true, etag: takeover.data.etag, holder: null})
 }
 
