@@ -161,6 +161,36 @@ function sessionIdleEvent(sessionID: string): object {
   return {type: 'session.idle', properties: {sessionID}}
 }
 
+/**
+ * Factory: `message.part.updated` with a reasoning part carrying an `id`.
+ * Used to register a reasoning partID in the suppression set (Unit 2 / R5).
+ */
+function reasoningPartUpdatedEvent(partId: string, sessionID = 'sess-123'): object {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {
+        type: 'reasoning',
+        id: partId,
+        sessionID,
+        text: 'I am thinking about this...',
+      },
+    },
+  }
+}
+
+/**
+ * Factory: `message.part.delta` with a specific `partID` in properties.
+ * Used to simulate both reasoning deltas (suppressed) and text deltas (passed through).
+ */
+function partDeltaWithPartId(text: string, partId: string, sessionID = 'sess-123'): object {
+  return {
+    type: 'message.part.delta',
+    properties: {sessionID, partID: partId, delta: {type: 'text', text}, field: 'text'},
+  }
+}
+
 /** `session.error` event for a given session. */
 function sessionErrorEvent(sessionID: string, error = 'LLM error'): object {
   return {type: 'session.error', properties: {sessionID, error}}
@@ -420,19 +450,18 @@ describe('runOpenCodeCore', () => {
       // #when
       await runOpenCodeCore(params)
 
-      // #then
+      // #then — summarizer renders bash command inline (not raw 🔧 format)
       const combined = sink.buffered()
       expect(combined).toContain('pnpm test')
-      expect(combined).toContain('bash')
     })
 
-    it('uses input.cmd as fallback for bash when command is absent', async () => {
-      // #given
+    it('uses input.cmd as fallback for bash when command is absent (side-effecting command)', async () => {
+      // #given — uses a side-effecting command so it is not hidden by read-only bash filtering
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
           subscribeOk([
-            toolCalledEvent('call-1', 'bash', {cmd: 'ls -la'}),
+            toolCalledEvent('call-1', 'bash', {cmd: 'pnpm install'}),
             toolSuccessEvent('call-1'),
             sessionIdleEvent('sess-123'),
           ]),
@@ -443,11 +472,11 @@ describe('runOpenCodeCore', () => {
       await runOpenCodeCore(params)
 
       // #then
-      expect(sink.buffered()).toContain('ls -la')
+      expect(sink.buffered()).toContain('pnpm install')
     })
 
-    it('uses structured.title when present (wins over input.command)', async () => {
-      // #given
+    it('bash tool: input.command is shown inline (summarizer uses command, not structured.title)', async () => {
+      // #given — bash summarizer renders the command inline; structured.title is not used for bash
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
@@ -462,14 +491,12 @@ describe('runOpenCodeCore', () => {
       // #when
       await runOpenCodeCore(params)
 
-      // #then
-      expect(sink.buffered()).toContain('Structured Title')
-      // Should NOT fall through to the raw command
-      expect(sink.buffered()).not.toContain('some command')
+      // #then — bash summarizer renders the command inline
+      expect(sink.buffered()).toContain('some command')
     })
 
-    it('uses tool name as title for non-bash tools', async () => {
-      // #given
+    it('non-bash MCP tool: summarizer renders input fields as fallback', async () => {
+      // #given — read_file is not in the hidden-tools list; MCP fallback renders input fields
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
@@ -484,8 +511,9 @@ describe('runOpenCodeCore', () => {
       // #when
       await runOpenCodeCore(params)
 
-      // #then
-      expect(sink.buffered()).toContain('read_file')
+      // #then — MCP fallback renders input fields (not raw 🔧 format)
+      expect(sink.buffered()).toContain('path')
+      expect(sink.buffered()).not.toContain('🔧')
     })
 
     it('uses input.title when present for non-bash tools', async () => {
@@ -530,13 +558,18 @@ describe('runOpenCodeCore', () => {
   })
 
   describe('tool call progress (message.part.updated — OpenCode 1.15.13 contract)', () => {
-    it('appends a progress line for a bash tool using state.title', async () => {
-      // #given
+    it('appends a progress line for a bash tool using input.command (side-effecting command)', async () => {
+      // #given — bash summarizer renders the command inline (not the tool name)
+      // Uses a side-effecting command (pnpm build) so it is not hidden by read-only bash filtering
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
           subscribeOk([
-            partUpdatedToolEvent('bash', 'completed', {title: 'echo hi', input: {command: 'echo hi'}, output: ''}),
+            partUpdatedToolEvent('bash', 'completed', {
+              title: 'pnpm build',
+              input: {command: 'pnpm build'},
+              output: '',
+            }),
             sessionIdleEvent('sess-123'),
           ]),
       })
@@ -545,10 +578,9 @@ describe('runOpenCodeCore', () => {
       // #when
       await runOpenCodeCore(params)
 
-      // #then
+      // #then — summarizer renders command inline
       const combined = sink.buffered()
-      expect(combined).toContain('bash')
-      expect(combined).toContain('echo hi')
+      expect(combined).toContain('pnpm build')
     })
 
     it('falls back to input.command when state.title is absent', async () => {
@@ -570,13 +602,13 @@ describe('runOpenCodeCore', () => {
       expect(sink.buffered()).toContain('pnpm test')
     })
 
-    it('falls back to input.cmd when command is absent', async () => {
-      // #given
+    it('falls back to input.cmd when command is absent (side-effecting command)', async () => {
+      // #given — uses a side-effecting command so it is not hidden by read-only bash filtering
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
           subscribeOk([
-            partUpdatedToolEvent('bash', 'completed', {input: {cmd: 'ls -la'}, output: ''}),
+            partUpdatedToolEvent('bash', 'completed', {input: {cmd: 'pnpm install'}, output: ''}),
             sessionIdleEvent('sess-123'),
           ]),
       })
@@ -586,11 +618,11 @@ describe('runOpenCodeCore', () => {
       await runOpenCodeCore(params)
 
       // #then
-      expect(sink.buffered()).toContain('ls -la')
+      expect(sink.buffered()).toContain('pnpm install')
     })
 
-    it('uses tool name as title for non-bash tools when state.title is absent', async () => {
-      // #given
+    it('non-bash MCP tool: summarizer renders input fields as fallback when state.title is absent', async () => {
+      // #given — read_file is not in the hidden-tools list; MCP fallback renders input fields
       const sink = makeSink()
       const handle = makeHandle({
         subscribe: async () =>
@@ -604,8 +636,9 @@ describe('runOpenCodeCore', () => {
       // #when
       await runOpenCodeCore(params)
 
-      // #then
-      expect(sink.buffered()).toContain('read_file')
+      // #then — MCP fallback renders input fields (not raw 🔧 format)
+      expect(sink.buffered()).toContain('path')
+      expect(sink.buffered()).not.toContain('🔧')
     })
 
     it('does NOT emit a tool line for partType text (no double-render)', async () => {
@@ -1212,6 +1245,269 @@ describe('runOpenCodeCore', () => {
   })
 
   // ---------------------------------------------------------------------------
+  // Unit 2: Reasoning suppression (R5 regression) + tool summarizer wiring
+  // ---------------------------------------------------------------------------
+
+  describe('reasoning suppression — R5 regression (partID correlation)', () => {
+    it('(R5 critical) reasoning part registers its id; subsequent deltas with that partID → sink receives nothing', async () => {
+      // #given — reasoning part arrives first, then its deltas
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            reasoningPartUpdatedEvent('part-reasoning-1'),
+            partDeltaWithPartId('I am thinking step 1', 'part-reasoning-1'),
+            partDeltaWithPartId('I am thinking step 2', 'part-reasoning-1'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — reasoning deltas must be fully suppressed
+      expect(sink._appended).toHaveLength(0)
+      expect(sink.buffered()).toBe('')
+    })
+
+    it('text delta whose partID is NOT a reasoning part → passes through unchanged', async () => {
+      // #given — no reasoning part registered; text delta with any partID passes through
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([partDeltaWithPartId('Hello from the answer', 'part-text-1'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — text delta passes through
+      expect(sink._appended).toEqual(['Hello from the answer'])
+    })
+
+    it('interleaved: reasoning deltas suppressed, text deltas from different partID pass through', async () => {
+      // #given — realistic ordering: reasoning part registered, then interleaved deltas
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // Reasoning part arrives first (registers the ID)
+            reasoningPartUpdatedEvent('part-reasoning-1'),
+            // Reasoning delta — must be suppressed
+            partDeltaWithPartId('chain of thought A', 'part-reasoning-1'),
+            // Text delta from a different part — must pass through
+            partDeltaWithPartId('real answer part 1', 'part-text-2'),
+            // Another reasoning delta — suppressed
+            partDeltaWithPartId('chain of thought B', 'part-reasoning-1'),
+            // More real answer — passes through
+            partDeltaWithPartId(' real answer part 2', 'part-text-2'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — only the text deltas reach the sink
+      expect(sink._appended).toEqual(['real answer part 1', ' real answer part 2'])
+      expect(sink.buffered()).toBe('real answer part 1 real answer part 2')
+    })
+
+    it('reasoning part from a different session does NOT register in the suppression set', async () => {
+      // #given — reasoning part from other-session; text delta with same partID from our session passes through
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // Reasoning part from a DIFFERENT session — must not pollute our set
+            {
+              type: 'message.part.updated',
+              properties: {
+                sessionID: 'other-session',
+                part: {type: 'reasoning', id: 'part-r-1', sessionID: 'other-session', text: 'thinking'},
+              },
+            },
+            // Text delta from our session with the same partID — must NOT be suppressed
+            partDeltaWithPartId('our answer', 'part-r-1'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — the text delta passes through (other-session reasoning didn't register)
+      expect(sink._appended).toEqual(['our answer'])
+    })
+  })
+
+  describe('tool summarizer wiring — Unit 2 (replaces raw 🔧 format)', () => {
+    it('edit tool via message.part.updated → sink receives summary line, NOT raw 🔧 format', async () => {
+      // #given — edit tool with filePath and newString/oldString
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('edit', 'completed', {
+              input: {filePath: 'src/foo.ts', newString: 'line1\nline2\nline3', oldString: 'old1\nold2'},
+            }),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — summary format, not raw 🔧
+      const combined = sink.buffered()
+      expect(combined).toContain('foo.ts')
+      expect(combined).not.toContain('🔧')
+      // Summary contains the file name in italic markdown
+      expect(combined).toContain('*foo.ts*')
+    })
+
+    it('read tool via message.part.updated → sink receives nothing (hidden)', async () => {
+      // #given — read tool is non-essential
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('read', 'completed', {input: {filePath: 'src/foo.ts'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — nothing appended for hidden tool
+      expect(sink._appended).toHaveLength(0)
+    })
+
+    it('grep tool via message.part.updated → sink receives nothing (hidden)', async () => {
+      // #given — grep tool is non-essential
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('grep', 'completed', {input: {pattern: 'foo', path: 'src/'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then
+      expect(sink._appended).toHaveLength(0)
+    })
+
+    it('write tool via message.part.updated → sink receives summary line', async () => {
+      // #given — write tool with filePath and content
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('write', 'completed', {
+              input: {filePath: 'src/bar.ts', content: 'line1\nline2\nline3\nline4\nline5'},
+            }),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — summary contains filename and line count
+      const combined = sink.buffered()
+      expect(combined).toContain('bar.ts')
+      expect(combined).not.toContain('🔧')
+    })
+
+    it('read tool via session.next.tool.success → sink receives nothing (hidden)', async () => {
+      // #given — read tool via legacy path
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            toolCalledEvent('call-r1', 'read', {filePath: 'src/foo.ts'}),
+            toolSuccessEvent('call-r1'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — nothing appended for hidden tool
+      expect(sink._appended).toHaveLength(0)
+    })
+
+    it('integration: session.next.tool.success and message.part.updated produce identical output for same edit tool', async () => {
+      // #given — same edit tool input via both paths
+      const editInput = {filePath: 'src/utils.ts', newString: 'a\nb\nc', oldString: 'x\ny'}
+
+      const sinkA = makeSink()
+      const handleA = makeHandle({
+        subscribe: async () =>
+          subscribeOk([partUpdatedToolEvent('edit', 'completed', {input: editInput}), sessionIdleEvent('sess-123')]),
+      })
+      const paramsA = {...buildParams(handleA), sink: sinkA, coordinator: makeCoordinator()}
+
+      const sinkB = makeSink()
+      const handleB = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            toolCalledEvent('call-e1', 'edit', editInput),
+            toolSuccessEvent('call-e1'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const paramsB = {...buildParams(handleB), sink: sinkB, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(paramsA)
+      await runOpenCodeCore(paramsB)
+
+      // #then — both paths produce identical output
+      expect(sinkA.buffered()).toBe(sinkB.buffered())
+      // And neither contains the raw 🔧 format
+      expect(sinkA.buffered()).not.toContain('🔧')
+      expect(sinkB.buffered()).not.toContain('🔧')
+    })
+
+    it('no raw 🔧 format in any tool output — bash tool uses summarizer', async () => {
+      // #given — bash tool via message.part.updated
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('bash', 'completed', {input: {command: 'pnpm build'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — summary format (backtick-wrapped command), not raw 🔧
+      const combined = sink.buffered()
+      expect(combined).toContain('pnpm build')
+      expect(combined).not.toContain('🔧')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
   // Coordinator required — fail-closed before session creation
   // ---------------------------------------------------------------------------
 
@@ -1263,6 +1559,232 @@ describe('runOpenCodeCore', () => {
 
       // #when / #then — must resolve cleanly
       await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // P1.2: Fail-soft tool rendering — malformed tool input must not abort stream
+  // ---------------------------------------------------------------------------
+
+  describe('fail-soft tool rendering (P1.2) — malformed tool input does not abort stream', () => {
+    it('message.part.updated: hostile/malformed tool input does not abort stream — subsequent text deltas still process', async () => {
+      // #given — a tool part with a deeply hostile input that would cause formatToolPart to throw
+      // We simulate this by passing a Proxy that throws on property access
+      const sink = makeSink()
+      const hostileInput = new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('hostile property access')
+          },
+        },
+      )
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // Hostile tool part — formatToolPart will throw when accessing input
+            {
+              type: 'message.part.updated',
+              properties: {
+                sessionID: 'sess-123',
+                part: {
+                  type: 'tool',
+                  tool: 'bash',
+                  sessionID: 'sess-123',
+                  state: {status: 'completed', input: hostileInput},
+                },
+              },
+            },
+            // Subsequent text delta — must still be processed
+            partDeltaObjectEvent('answer after hostile tool'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when — must NOT throw; stream continues
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then — text delta after the hostile tool still reached the sink
+      expect(sink._appended).toContain('answer after hostile tool')
+    })
+
+    it('session.next.tool.success: hostile/malformed tool input does not abort stream', async () => {
+      // #given — hostile input on the legacy tool success path
+      // The tool is called with a Proxy that throws on property access, simulating a malformed input
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () => {
+          // Build a hostile proxy that throws on any property access
+          const hostileInput = new Proxy(
+            {},
+            {
+              get() {
+                throw new Error('hostile property access')
+              },
+            },
+          )
+          return subscribeOk([
+            // Tool called with hostile input (stored in pendingToolCalls)
+            {
+              type: 'session.next.tool.called',
+              properties: {sessionID: 'sess-123', callID: 'call-hostile', tool: 'bash', input: hostileInput},
+            },
+            // Tool success — formatToolPart will throw when accessing the hostile input
+            {
+              type: 'session.next.tool.success',
+              properties: {sessionID: 'sess-123', callID: 'call-hostile'},
+            },
+            partDeltaObjectEvent('answer after hostile legacy tool'),
+            sessionIdleEvent('sess-123'),
+          ])
+        },
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when — must NOT throw
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then — text delta still reached the sink
+      expect(sink._appended).toContain('answer after hostile legacy tool')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // P1.3: R5 ordering + cross-run isolation
+  // ---------------------------------------------------------------------------
+
+  describe('R5 ordering + cross-run isolation (P1.3)', () => {
+    it('out-of-order: reasoning delta AFTER its part.updated registration → suppressed', async () => {
+      // #given — normal OpenCode order: reasoning part.updated first, then its deltas
+      // This is the load-bearing ordering: part.updated registers the ID before deltas arrive
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // 1. Reasoning part registers its ID
+            reasoningPartUpdatedEvent('part-r-order'),
+            // 2. Reasoning delta with that partID → must be suppressed
+            partDeltaWithPartId('chain of thought', 'part-r-order'),
+            // 3. Text delta with a different partID → must stream
+            partDeltaWithPartId('real answer', 'part-text-order'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — reasoning delta suppressed; text delta passes through
+      expect(sink._appended).toEqual(['real answer'])
+      expect(sink.buffered()).toBe('real answer')
+    })
+
+    it('out-of-order: delta whose partID was never registered as reasoning → streams (answer never eaten)', async () => {
+      // #given — no reasoning part registered; text delta with any partID passes through
+      // This verifies the suppression set is not over-eager
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // No reasoning part.updated — partID 'part-unknown' is not in the suppression set
+            partDeltaWithPartId('this is the answer', 'part-unknown'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — unregistered partID passes through unchanged
+      expect(sink._appended).toEqual(['this is the answer'])
+    })
+
+    it('cross-run isolation: reasoningPartIds is per-run, not shared across runs', async () => {
+      // #given — run 1 registers reasoning partID 'part-shared'
+      const sink1 = makeSink()
+      const handle1 = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            reasoningPartUpdatedEvent('part-shared'),
+            partDeltaWithPartId('run1 reasoning — suppressed', 'part-shared'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params1 = {...buildParams(handle1), sink: sink1, coordinator: makeCoordinator()}
+
+      // #when — run 1 completes
+      await runOpenCodeCore(params1)
+
+      // #then — run 1: reasoning suppressed
+      expect(sink1._appended).toHaveLength(0)
+
+      // #given — run 2: fresh run, same partID 'part-shared' used for a TEXT delta
+      const sink2 = makeSink()
+      const handle2 = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            // No reasoning part.updated in run 2 — 'part-shared' is NOT in the new run's set
+            partDeltaWithPartId('run2 answer — must stream', 'part-shared'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params2 = {...buildParams(handle2), sink: sink2, coordinator: makeCoordinator()}
+
+      // #when — run 2 completes
+      await runOpenCodeCore(params2)
+
+      // #then — run 2: text delta with previously-seen partID STREAMS (per-run isolation)
+      expect(sink2._appended).toEqual(['run2 answer — must stream'])
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // P2.6: Both tool event paths route through appendToolSummary
+  // ---------------------------------------------------------------------------
+
+  describe('tool render helper routing (P2.6) — both event paths produce output', () => {
+    it('message.part.updated path produces tool summary line', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('edit', 'completed', {
+              input: {filePath: 'src/helper.ts', newString: 'a\nb', oldString: 'c'},
+            }),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — summary line appended via message.part.updated path
+      expect(sink.buffered()).toContain('helper.ts')
+    })
+
+    it('session.next.tool.success path produces tool summary line', async () => {
+      // #given
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            toolCalledEvent('call-p26', 'edit', {filePath: 'src/helper.ts', newString: 'a\nb', oldString: 'c'}),
+            toolSuccessEvent('call-p26'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator()}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — summary line appended via session.next.tool.success path
+      expect(sink.buffered()).toContain('helper.ts')
     })
   })
 })

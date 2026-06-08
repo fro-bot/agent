@@ -42,7 +42,11 @@ services:
       # (the endpoint stays disabled). Uncomment both lines AND both bind-mounts below.
       # GATEWAY_WEBHOOK_SECRET_FILE: /run/secrets/gateway_webhook_secret
       # GATEWAY_PRESENCE_CHANNEL_ID_FILE: /run/secrets/gateway_presence_channel_id
-      # Egress proxy (regular proxy mode — NOT transparent)
+      # Optional — canonical Fro Bot persona for the @-mention loop. When set, the
+      # persona text is prepended to the Discord agent prompt (voice + behavior).
+      # Absent → the loop falls back to built-in Discord guidance (fail-soft).
+      # Provision the file from fro-bot/.github persona/fro-bot-persona.md.
+      # GATEWAY_PERSONA_FILE: /run/secrets/gateway_persona
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
       NO_PROXY: workspace,localhost,127.0.0.1
@@ -171,6 +175,13 @@ services:
       # - type: bind
       #   source: ./secrets/gateway-presence-channel-id
       #   target: /run/secrets/gateway_presence_channel_id
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
+      # Optional — Fro Bot persona for the @-mention loop (see GATEWAY_PERSONA_FILE above).
+      # - type: bind
+      #   source: ./secrets/gateway-persona
+      #   target: /run/secrets/gateway_persona
       #   read_only: true
       #   bind:
       #     create_host_path: false
