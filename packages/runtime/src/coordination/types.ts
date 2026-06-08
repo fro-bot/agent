@@ -25,11 +25,9 @@ export interface LockRecord {
   readonly run_id: string
 }
 
-export interface LockAcquisitionResult {
-  readonly acquired: boolean
-  readonly etag: string | null
-  readonly holder: LockRecord | null
-}
+export type LockAcquisitionResult =
+  | {readonly acquired: true; readonly etag: string; readonly holder: null}
+  | {readonly acquired: false; readonly etag: null; readonly holder: LockRecord | null}
 
 export interface CoordinationConfig {
   readonly storeAdapter: ObjectStoreAdapter

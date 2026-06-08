@@ -254,11 +254,6 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     }
 
     // Lock acquired — must release in inner finally
-    if (lockResult.data.etag === null) {
-      logger.error({repo, runId}, 'run: lock acquired without etag')
-      await safeSend(thread, 'Could not start the task — please try again.')
-      return
-    }
     let lockEtag = lockResult.data.etag
 
     // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
