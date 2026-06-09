@@ -66,6 +66,8 @@ beforeEach(() => {
     'GATEWAY_MAX_CONCURRENT_RUNS',
     'GATEWAY_APPROVAL_MODE',
     'GATEWAY_APPROVAL_MODE_FILE',
+    'GATEWAY_STATUS_MODE',
+    'GATEWAY_STATUS_MODE_FILE',
     'GATEWAY_PERSONA',
     'GATEWAY_PERSONA_FILE',
   ]) {
@@ -1552,5 +1554,122 @@ describe('loadGatewayConfig — GATEWAY_PERSONA_FILE (persona)', () => {
       config = loadGatewayConfig()
     }).not.toThrow()
     expect(config?.persona).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_STATUS_MODE
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GATEWAY_STATUS_MODE', () => {
+  it('happy path: unset GATEWAY_STATUS_MODE → statusMode defaults to "live-status"', () => {
+    // #given — GATEWAY_STATUS_MODE not set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('live-status')
+  })
+
+  it('happy path: GATEWAY_STATUS_MODE=live-status → statusMode is "live-status"', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_STATUS_MODE = 'live-status'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('live-status')
+  })
+
+  it('happy path: GATEWAY_STATUS_MODE=typing-only → statusMode is "typing-only"', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_STATUS_MODE = 'typing-only'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('typing-only')
+  })
+
+  it('edge case: empty GATEWAY_STATUS_MODE → treated as unset, defaults to "live-status"', () => {
+    // #given — empty string is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_STATUS_MODE = ''
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('live-status')
+  })
+
+  it('edge case: whitespace-only GATEWAY_STATUS_MODE → treated as unset, defaults to "live-status"', () => {
+    // #given — whitespace-only is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    process.env.GATEWAY_STATUS_MODE = '   '
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('live-status')
+  })
+
+  it('error path: unknown GATEWAY_STATUS_MODE value → throws with clear config error naming valid values', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_STATUS_MODE = 'silent'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Invalid GATEWAY_STATUS_MODE value: "silent" (valid values: live-status, typing-only)',
+    )
+  })
+
+  it('error path: GATEWAY_STATUS_MODE_FILE with unknown value → throws with clear config error', () => {
+    // #given
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'status-mode-bad.txt')
+    writeFileSync(modeFile, 'verbose\n', {mode: 0o600})
+    process.env.GATEWAY_STATUS_MODE_FILE = modeFile
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(
+      'Invalid GATEWAY_STATUS_MODE value: "verbose" (valid values: live-status, typing-only)',
+    )
+  })
+
+  it('edge case: GATEWAY_STATUS_MODE_FILE with typing-only value → reads from file', () => {
+    // #given — value provided via _FILE (the compose bind-mount pattern)
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'status-mode.txt')
+    writeFileSync(modeFile, 'typing-only\n', {mode: 0o600})
+    process.env.GATEWAY_STATUS_MODE_FILE = modeFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — trailing newline stripped; value parsed correctly
+    expect(config.statusMode).toBe('typing-only')
+  })
+
+  it('edge case: GATEWAY_STATUS_MODE_FILE with empty file → defaults to "live-status"', () => {
+    // #given — empty file is treated as absent by readOptionalSecret
+    setRequiredEnv()
+    const modeFile = join(tmpDir, 'status-mode-empty.txt')
+    writeFileSync(modeFile, '', {mode: 0o600})
+    process.env.GATEWAY_STATUS_MODE_FILE = modeFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.statusMode).toBe('live-status')
   })
 })
