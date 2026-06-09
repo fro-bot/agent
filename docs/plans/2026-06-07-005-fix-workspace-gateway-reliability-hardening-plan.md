@@ -79,7 +79,7 @@ These are independent and low-priority — resilience and coverage on top of a w
 
 ## Implementation Units
 
-- [ ] **Unit 1: Non-SSE upstream timeout in the workspace proxy**
+- [x] **Unit 1: Non-SSE upstream timeout in the workspace proxy**
 
 **Goal:** Bound ordinary proxy request/response forwarding so a stalled upstream returns a 504-class error instead of hanging, while leaving SSE event streams unbounded.
 
@@ -110,7 +110,7 @@ These are independent and low-priority — resilience and coverage on top of a w
 
 **Verification:** a stalled non-SSE upstream (no-response OR mid-body) yields a bounded 504; slow-but-progressing non-SSE and SSE streams are unaffected.
 
-- [ ] **Unit 2: `/readyz` gates on the attach path (bearer proxy)**
+- [x] **Unit 2: `/readyz` gates on the attach path (bearer proxy)**
 
 **Goal:** `/readyz` returns ready only when the `:9200` bearer proxy the gateway attaches through is usable, not merely when loopback OpenCode booted.
 
@@ -139,7 +139,7 @@ These are independent and low-priority — resilience and coverage on top of a w
 
 **Verification:** `/readyz` reflects attach-path usability; a down proxy leg yields 503 even when OpenCode booted; no startup flap during normal boot.
 
-- [ ] **Unit 3: Per-probe readiness deadline cap**
+- [x] **Unit 3: Per-probe readiness deadline cap**
 
 **Goal:** Cap each readiness probe to the remaining overall deadline so the loop can't overshoot `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` by a full probe.
 
@@ -165,7 +165,7 @@ These are independent and low-priority — resilience and coverage on top of a w
 
 **Verification:** both the direct and supervised readiness loops respect the overall deadline within a negligible margin, with no zero/negative probe timeout.
 
-- [ ] **Unit 4: Cross-package `ReadyzResponse` type-mirror test**
+- [x] **Unit 4: Cross-package `ReadyzResponse` type-mirror test**
 
 **Goal:** Fail compilation if the workspace-agent and gateway `ReadyzResponse` wire shapes drift out of compatibility.
 
@@ -188,7 +188,7 @@ These are independent and low-priority — resilience and coverage on top of a w
 
 **Verification:** `pnpm check-types` fails if the gateway `ReadyzResponse` stops being assignable to the workspace-agent shape.
 
-- [ ] **Unit 5: `startWorkspaceAgent(deps)` entrypoint seam**
+- [x] **Unit 5: `startWorkspaceAgent(deps)` entrypoint seam**
 
 **Goal:** Extract `main.ts`'s import-time side effects into a testable `startWorkspaceAgent(deps)` so the env → `startOpencodeServer` readiness-timeout wiring is assertable without binding ports.
 
