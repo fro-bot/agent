@@ -3,6 +3,7 @@ import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
+import type {RunTask} from './execute/run.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
@@ -20,6 +21,7 @@ import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
+import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
@@ -152,6 +154,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     })
 
     const concurrencyRegistry = createConcurrencyRegistry(config.maxConcurrentRuns)
+    const channelQueue = createChannelQueue<RunTask>(DEFAULT_MAX_QUEUE_DEPTH)
     const bindingsStore = createBindingsStore({
       adapter: s3Adapter,
       storeConfig: config.objectStore,
@@ -270,6 +273,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           concurrency: concurrencyRegistry,
+          queue: channelQueue,
           attachUrl: config.workspaceOpencodeUrl,
           attachToken: config.workspaceOpencodeToken,
           runTimeoutMs: config.runTimeoutMs,

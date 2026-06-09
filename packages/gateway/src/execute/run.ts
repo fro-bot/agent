@@ -7,6 +7,7 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
+import type {ChannelQueue} from './queue.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
@@ -26,6 +27,8 @@ export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
   readonly concurrency: ConcurrencyRegistry
+  /** Per-channel FIFO queue for pending tasks. */
+  readonly queue: ChannelQueue<RunTask>
   readonly attachUrl: string
   readonly attachToken: string
   /** Wall-clock milliseconds before an in-progress run is timed out. */
@@ -74,6 +77,17 @@ export interface RunMentionDeps {
    */
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
 }
+
+/**
+ * The task descriptor stored in the per-channel queue.
+ * Exactly the three arguments `runMention` takes — the stable contract the queue stores.
+ */
+export interface RunTask {
+  readonly message: Message
+  readonly binding: RepoBinding
+  readonly deps: RunMentionDeps
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -153,25 +167,38 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
 }
 
 // ---------------------------------------------------------------------------
-// runMention — the lifecycle wrapper
+// startRun — the slot-holding execution pipeline
 // ---------------------------------------------------------------------------
 
 /**
- * Execute a mention-triggered OpenCode run with full lifecycle management.
+ * Execute the post-acquire pipeline for a task.
  *
- * Called by `mentions.ts` after authorization and binding lookup succeed.
- * Owns: concurrency registry, thread creation, lock, run-state, heartbeat,
- * execution, and release of all resources in a `finally` block.
+ * ASSUMES the channel concurrency slot is already held by the caller.
+ * Owns: clone → readyz → thread → lock → run-state → heartbeat → execute → cleanup.
  *
- * Hard invariants:
- * - "busy", "cap", "waiting" are TERMINAL — no queue, no retry. * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
- *   raw errors) are logged but NEVER posted to Discord.
- * - Bearer token (`attachToken`) is never logged.
- * - Every Discord send uses `allowedMentions: {parse: []}`.
+ * On completion (success or failure), performs an **atomic handoff**:
+ * - Calls `queue.takeNext(channelId)` while the slot is still held.
+ * - If a next task exists → starts it on the held slot (no release/re-acquire gap).
+ * - If the queue is empty → calls `concurrency.release(channelId)` (only then is the slot freed).
+ *
+ * The handoff `startRun` is fire-and-forget from the completing run's perspective.
+ * Its own outer finally runs the same handoff/release logic, so the chain continues
+ * and a thrown handoff still releases.
  */
-export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, persona, logger} =
-    deps
+async function startRun(task: RunTask): Promise<void> {
+  const {message, binding, deps} = task
+  const {
+    concurrency,
+    queue,
+    coordinationConfig,
+    identity,
+    attachUrl,
+    attachToken,
+    runTimeoutMs,
+    botUserId,
+    persona,
+    logger,
+  } = deps
   const {approvalRegistry, approvalMode, statusMode, ensureClone, readyz} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
@@ -181,24 +208,6 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // deadline clearance are computed from the same wall-clock reference.
   const runStartMs = Date.now()
 
-  // ── Concurrency cap + per-channel in-flight guard ──────────
-  // IMPORTANT: ensureClone and readyz are called AFTER this gate so that
-  // same-channel mention storms do not each mint GitHub App tokens or call
-  // workspace clone before the busy/cap rejection fires.
-
-  const slotResult = concurrency.tryAcquire(channelId)
-
-  if (slotResult === 'cap') {
-    await safeReply(message, 'fro-bot is at capacity right now — please try again shortly.')
-    return
-  }
-
-  if (slotResult === 'busy') {
-    await safeReply(message, 'There is already a task running in this channel — please wait for it to finish.')
-    return
-  }
-
-  // Slot acquired — MUST release in outer finally
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
     // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
@@ -670,7 +679,94 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       }
     }
   } finally {
-    // ALWAYS release the concurrency slot
-    concurrency.release(channelId)
+    // ── Atomic handoff — replaces bare concurrency.release ──────────────────
+    //
+    // While the channel slot is still held, attempt to drain the next queued task.
+    // If a task is waiting → start it on the held slot (no release/re-acquire gap).
+    // If the queue is empty → release the slot now.
+    //
+    // This closes the free-slot window: there is NO moment where tryAcquire could
+    // return 'ok' for a channel that still has pending/handing-off work.
+    //
+    // The handed-off startRun is fire-and-forget from this run's perspective so
+    // cleanup completes, but its own outer finally runs the same handoff/release
+    // logic — so the chain continues and a thrown handoff still releases.
+    const nextTask = queue.takeNext(channelId)
+    if (nextTask === undefined) {
+      // Queue is empty — release the slot now.
+      concurrency.release(channelId)
+    } else {
+      // Slot ownership transfers to the next run — do NOT call concurrency.release.
+      // eslint-disable-next-line no-void
+      void startRun(nextTask).catch((error: unknown) => {
+        logger.error(
+          {channelId, err: error instanceof Error ? error.message : String(error)},
+          'run: handoff startRun failed',
+        )
+      })
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// runMention — the thin front door
+// ---------------------------------------------------------------------------
+
+/**
+ * Front door for a mention-triggered run.
+ *
+ * Decides whether to run immediately or enqueue, in this order:
+ * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (FIFO fix: pending work
+ *    has priority; never take an immediate slot ahead of it).
+ * 2. Else `concurrency.tryAcquire(channelId)`:
+ *    - `'ok'`   → `startRun(task)` (slot held).
+ *    - `'busy'` → enqueue + queued ack (or "queue is full" if at capacity). Return without blocking.
+ *    - `'cap'`  → terminal capacity reply, no enqueue (R6: global cap stays terminal).
+ *
+ * Hard invariants:
+ * - `'cap'` is TERMINAL — no queue, no retry.
+ * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
+ *   raw errors) are logged but NEVER posted to Discord.
+ * - Bearer token (`attachToken`) is never logged.
+ * - Every Discord send uses `allowedMentions: {parse: []}`.
+ */
+export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
+  const {concurrency, queue} = deps
+  const channelId = message.channel.id
+  const task: RunTask = {message, binding, deps}
+
+  // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
+  // A new mention must never leapfrog older queued work, even if a slot is free.
+  // Only the handoff path (startRun's outer finally) may start the next task.
+  if (queue.pendingCount(channelId) > 0) {
+    const result = queue.enqueue(channelId, task)
+    if (result === 'queued') {
+      await safeReply(message, "Queued — I'll start this when the current task finishes.")
+    } else {
+      await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
+    }
+    return
+  }
+
+  // ── Concurrency cap + per-channel in-flight guard ──────────────────────────
+  const slotResult = concurrency.tryAcquire(channelId)
+
+  if (slotResult === 'cap') {
+    await safeReply(message, 'fro-bot is at capacity right now — please try again shortly.')
+    return
+  }
+
+  if (slotResult === 'busy') {
+    // Channel has an in-flight run — enqueue instead of rejecting (R1).
+    const enqueueResult = queue.enqueue(channelId, task)
+    if (enqueueResult === 'queued') {
+      await safeReply(message, "Queued — I'll start this when the current task finishes.")
+    } else {
+      await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
+    }
+    return
+  }
+
+  // Slot acquired — startRun owns the release (via atomic handoff in its outer finally).
+  await startRun(task)
 }
