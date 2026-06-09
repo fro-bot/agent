@@ -76,6 +76,10 @@ Existing deployments that need the privileged set must set this on the next
 deploy. The allowlist is intentionally narrow — operators cannot enable
 arbitrary Discord intents via this knob.
 
+### `GATEWAY_STATUS_MODE`
+
+Controls the working-state UX posted to the run thread while the agent is executing. `live-status` (default) posts a single live status message plus a typing indicator; `typing-only` shows only the typing indicator (no status message). Absent or empty → `live-status`.
+
 ## Mention-triggered execution loop
 
 When a guild member `@fro-bot`s in a channel, `discord/mentions.ts` handles the event:

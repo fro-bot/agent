@@ -1914,4 +1914,208 @@ describe('runOpenCodeCore', () => {
       await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // Unit 3: onActivity and onBusy hooks
+  // ---------------------------------------------------------------------------
+
+  describe('onActivity and onBusy hooks (Unit 3)', () => {
+    it('onBusy(true) called after prompt is sent successfully', async () => {
+      // #given
+      const onBusy = vi.fn()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), coordinator: makeCoordinator(), onBusy}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onBusy(true) called after prompt send
+      expect(onBusy).toHaveBeenCalledWith(true)
+    })
+
+    it('onBusy(false) called when session.idle is received', async () => {
+      // #given
+      const onBusy = vi.fn()
+      const handle = makeHandle()
+      const params = {...buildParams(handle), coordinator: makeCoordinator(), onBusy}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onBusy(false) called on session.idle
+      expect(onBusy).toHaveBeenCalledWith(false)
+    })
+
+    it('onBusy call order: true (prompt sent) then false (session.idle)', async () => {
+      // #given
+      const callOrder: boolean[] = []
+      const onBusy = vi.fn().mockImplementation((busy: boolean) => {
+        callOrder.push(busy)
+      })
+      const handle = makeHandle()
+      const params = {...buildParams(handle), coordinator: makeCoordinator(), onBusy}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — true before false
+      expect(callOrder[0]).toBe(true)
+      expect(callOrder.at(-1)).toBe(false)
+    })
+
+    it('onActivity called with tool summary when message.part.updated tool completes', async () => {
+      // #given — edit tool via message.part.updated
+      const onActivity = vi.fn()
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('edit', 'completed', {
+              input: {filePath: 'src/foo.ts', newString: 'new\ncontent', oldString: 'old'},
+            }),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator(), onActivity}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onActivity called with the same summary appended to the sink
+      expect(onActivity).toHaveBeenCalledOnce()
+      const activitySummary = (onActivity as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+      expect(typeof activitySummary).toBe('string')
+      expect(activitySummary.length).toBeGreaterThan(0)
+      // The summary should contain the filename (same as what the sink received)
+      expect(activitySummary).toContain('foo.ts')
+    })
+
+    it('onActivity called with tool summary when session.next.tool.success fires', async () => {
+      // #given — bash tool via legacy path
+      const onActivity = vi.fn()
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            toolCalledEvent('call-act-1', 'bash', {command: 'pnpm build'}),
+            toolSuccessEvent('call-act-1'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator(), onActivity}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onActivity called with the bash summary
+      expect(onActivity).toHaveBeenCalledOnce()
+      const activitySummary = (onActivity as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+      expect(activitySummary).toContain('pnpm build')
+    })
+
+    it('onActivity NOT called for hidden tools (read, grep)', async () => {
+      // #given — read tool is non-essential; formatToolPart returns null → no append, no onActivity
+      const onActivity = vi.fn()
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('read', 'completed', {input: {filePath: 'src/foo.ts'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator(), onActivity}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onActivity NOT called (hidden tool produces no summary)
+      expect(onActivity).not.toHaveBeenCalled()
+    })
+
+    it('onActivity called once per essential tool, not per text delta', async () => {
+      // #given — two essential tools + text deltas
+      const onActivity = vi.fn()
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partDeltaObjectEvent('text delta 1'),
+            partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'a.ts', newString: 'x', oldString: 'y'}}),
+            partDeltaObjectEvent('text delta 2'),
+            partUpdatedToolEvent('write', 'completed', {input: {filePath: 'b.ts', content: 'content'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), sink, coordinator: makeCoordinator(), onActivity}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onActivity called exactly twice (once per essential tool)
+      expect(onActivity).toHaveBeenCalledTimes(2)
+    })
+
+    it('onBusy(false) called on permission.asked (approval wait pauses typing)', async () => {
+      // #given — permission.asked event arrives
+      const onBusy = vi.fn()
+      const coordinator = makeCoordinator()
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([permissionAskedEvent('req-busy-1'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {...buildParams(handle), coordinator, onBusy}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onBusy(false) called when approval wait starts
+      const calls = (onBusy as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as boolean)
+      expect(calls).toContain(false)
+      // The false call should come after the initial true (prompt sent)
+      const trueIdx = calls.indexOf(true)
+      const falseIdx = calls.indexOf(false)
+      expect(trueIdx).toBeGreaterThanOrEqual(0)
+      expect(falseIdx).toBeGreaterThan(trueIdx)
+    })
+
+    it('onBusy(true) called on permission.replied (typing resumes after approval)', async () => {
+      // #given — permission.asked then permission.replied
+      const onBusy = vi.fn()
+      const coordinator = makeCoordinator()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            permissionAskedEvent('req-resume-1'),
+            permissionRepliedEvent('req-resume-1', 'once'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), coordinator, onBusy}
+
+      // #when
+      await runOpenCodeCore(params)
+
+      // #then — onBusy(true) called after permission.replied (resume after approval)
+      const calls = (onBusy as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as boolean)
+      // Sequence: true (prompt), false (asked), true (replied), false (idle)
+      expect(calls.filter(v => v === true).length).toBeGreaterThanOrEqual(2)
+      expect(calls.filter(v => v === false).length).toBeGreaterThanOrEqual(2)
+    })
+
+    it('onActivity and onBusy are optional — omitting them does not throw', async () => {
+      // #given — no onActivity or onBusy provided (backward compatibility)
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'x.ts', newString: 'a', oldString: 'b'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+      // No onActivity or onBusy in params
+
+      // #when / #then — must not throw
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+  })
 })

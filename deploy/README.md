@@ -343,6 +343,23 @@ Each approval prompt has a deadline that is a sub-deadline of the overall run ti
 
 A pending approval prompt is held in memory by the per-run coordinator. If the gateway or workspace container restarts while a prompt is open, the approval is abandoned. The run surfaces as interrupted in the thread. Re-mention to retry.
 
+## Working-state UX
+
+`GATEWAY_STATUS_MODE` controls what the gateway posts in the run thread while the agent is working:
+
+| Value | Behaviour |
+| --- | --- |
+| `live-status` (default) | Posts a single live status message that updates as the agent progresses, plus a typing indicator. |
+| `typing-only` | Shows only the typing indicator — no status message. Quieter; useful when status noise is unwanted. |
+
+Set it as a plain environment variable on the `gateway` service (in `deploy/.env` or `compose.override.yaml`):
+
+```env
+GATEWAY_STATUS_MODE=typing-only
+```
+
+Absent or empty → `live-status` applies.
+
 ## Persistent Volumes
 
 The stack uses two named Docker volumes that survive container recreation and daemon upgrades:

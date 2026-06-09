@@ -12,6 +12,7 @@ import {acquireLock, createHeartbeatController, createRun, releaseLock, transiti
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
+import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
@@ -50,6 +51,12 @@ export interface RunMentionDeps {
    * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
    */
   readonly approvalMode: 'approval-required'
+  /**
+   * Working-state UX mode. Propagated from `GatewayConfig.statusMode`.
+   * - `live-status` (default): posts a single editable status message that updates as the agent works.
+   * - `typing-only`: suppresses the status message; only the typing indicator is shown.
+   */
+  readonly statusMode: 'live-status' | 'typing-only'
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -165,7 +172,7 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, persona, logger} =
     deps
-  const {approvalRegistry, approvalMode, ensureClone, readyz} = deps
+  const {approvalRegistry, approvalMode, statusMode, ensureClone, readyz} = deps
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
@@ -310,6 +317,16 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
 
     let heartbeatStopped = false
     let sink: ReturnType<typeof createDiscordStreamSink> | null = null
+
+    // ── Status controller — per-run, created after thread is available ────────────────────────
+    // Adapts rawThread to StatusThread: discord.js ThreadChannel has .send() and .sendTyping()
+    // which structurally satisfy the StatusThread interface. Messages returned by .send() have
+    // .edit() and .delete() which satisfy StatusMessage.
+    const statusController = createStatusController({
+      thread: rawThread,
+      mode: statusMode,
+      logger,
+    })
 
     try {
       const execResult = await transitionRun(
@@ -495,6 +512,12 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
           logger,
           coordinator,
           approvalMode,
+          onActivity: (summary: string) => {
+            statusController.noteActivity(summary)
+          },
+          onBusy: (busy: boolean) => {
+            statusController.setBusy(busy)
+          },
         })
       } finally {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
@@ -528,7 +551,17 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         // Non-fatal: continue to flush sink and release resources
       }
 
-      await sink.flush()
+      // ── Status controller final-answer transition ─────────────────────────────────────────────
+      // Get the buffered text BEFORE flush so the controller can decide whether to edit in place.
+      // resolveToAnswer returns:
+      //   'handled'   → controller edited the status message into the answer; skip sink flush.
+      //   'delegated' → controller deleted the status (or typing-only); flush via sink as normal.
+      const finalText = sink.buffered()
+      const answerResult = await statusController.resolveToAnswer(finalText)
+      if (answerResult.transition === 'delegated') {
+        await sink.flush()
+      }
+      // 'handled': answer is already in the status message — do not flush (would double-post).
     } catch (execError: unknown) {
       // ── Error classification ───────────────────────────────────────────────
 
@@ -602,9 +635,20 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
                 ? 'The task stream closed unexpectedly. Please try again.'
                 : 'The task failed. Please try again.'
 
-      await safeSend(thread, userMessage).catch((error: unknown) => {
-        logger.warn({repo, runId, err: String(error)}, 'run: failed to send error reply to thread')
+      // ── Status controller failure transition ──────────────────────────────────────────────────
+      // resolveToFailure returns:
+      //   'handled'   → controller edited the status message into the failure note; skip safeSend.
+      //   'delegated' → no status to edit (or typing-only); post via safeSend as normal.
+      // Never both — single owner for the failure message.
+      const failureResult = await statusController.resolveToFailure(userMessage).catch((error: unknown) => {
+        logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
+        return {transition: 'delegated' as const}
       })
+      if (failureResult.transition === 'delegated') {
+        await safeSend(thread, userMessage).catch((error: unknown) => {
+          logger.warn({repo, runId, err: String(error)}, 'run: failed to send error reply to thread')
+        })
+      }
     } finally {
       // Stop heartbeat if not yet stopped (defensive — should not normally happen)
       if (heartbeatStopped === false) {
@@ -612,6 +656,12 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
           /* best-effort */
         })
       }
+
+      // Dispose status controller — guaranteed cleanup of typing interval and debounce timer.
+      // Must run in finally so timers never leak regardless of success or failure.
+      await statusController.dispose().catch((error: unknown) => {
+        logger.warn({repo, runId, err: String(error)}, 'run: statusController.dispose failed')
+      })
 
       // Release lock (best-effort)
       const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)

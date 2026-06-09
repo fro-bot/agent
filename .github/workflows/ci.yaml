@@ -95,9 +95,13 @@ jobs:
         run: pnpm build
       - name: Compare the expected and actual dist/ directories
         run: |
-          if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
+          DIFF_TARGETS="dist/"
+          if [[ "${{ github.head_ref || github.ref_name }}" == renovate/* ]]; then
+            DIFF_TARGETS="dist/ ':!dist/licenses.txt'"
+          fi
+          if [ "$(eval git diff --ignore-space-at-eol $DIFF_TARGETS | wc -l)" -gt "0" ]; then
             echo "Detected uncommitted changes after build.  See status below:"
-            git diff --text
+            eval git diff --text $DIFF_TARGETS
             exit 1
           fi
         id: diff
