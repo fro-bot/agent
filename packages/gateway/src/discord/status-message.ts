@@ -10,9 +10,13 @@
  * - `typing-only`: suppresses the status message entirely; only the typing indicator is shown.
  *
  * All Discord I/O is fail-soft: rejections are caught + logged and never abort the run.
+ * Exception: terminal edits (resolveToAnswer / resolveToFailure) return `delegated` on
+ * failure so the caller can fall back to posting via the sink / safeSend.
  */
 
 import type {GatewayLogger} from './client.js'
+
+import {MAX_DISCORD_MESSAGE_LENGTH} from './constants.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -24,9 +28,6 @@ export const STATUS_DEBOUNCE_MS = 1500
 /** Typing indicator re-pulse interval (ms). Discord typing auto-expires ~10s; pulse at ~7s. */
 export const STATUS_TYPING_PULSE_MS = 7000
 
-/** Discord's hard content-length limit for a single message. */
-const DISCORD_MESSAGE_CHAR_LIMIT = 2000
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -36,7 +37,10 @@ const DISCORD_MESSAGE_CHAR_LIMIT = 2000
  * Typed narrowly so test doubles don't need the full `ThreadChannel` API.
  */
 export interface StatusThread {
-  readonly send: (options: {readonly content: string}) => Promise<StatusMessage>
+  readonly send: (options: {
+    readonly content: string
+    readonly allowedMentions: {readonly parse: readonly []}
+  }) => Promise<StatusMessage>
   readonly sendTyping: () => Promise<void>
 }
 
@@ -45,7 +49,10 @@ export interface StatusThread {
  * Typed narrowly for testability.
  */
 export interface StatusMessage {
-  readonly edit: (options: {readonly content: string}) => Promise<unknown>
+  readonly edit: (options: {
+    readonly content: string
+    readonly allowedMentions: {readonly parse: readonly []}
+  }) => Promise<unknown>
   readonly delete: () => Promise<unknown>
 }
 
@@ -58,6 +65,7 @@ export interface StatusController {
    * Record an essential-action summary and schedule a debounced status edit.
    * First call posts the initial status message; subsequent calls edit it.
    * In `typing-only` mode, this is a no-op (no message posted).
+   * No-ops once a terminal transition (resolveToAnswer/resolveToFailure/dispose) has begun.
    */
   readonly noteActivity: (summary: string) => void
   /**
@@ -70,23 +78,26 @@ export interface StatusController {
   /**
    * Settle, then resolve the status message into the final answer.
    * - `handled`: controller edited the status message into the answer (caller does nothing more).
-   * - `delegated`: caller must post the answer via the sink (status deleted or never existed).
+   * - `delegated`: caller must post the answer via the sink (status deleted, never existed, or
+   *   the terminal edit failed).
    *
    * Conditions for `handled`: live-status mode AND a status message exists AND
-   * the answer is non-empty, non-whitespace, and fits one Discord message (≤2000 chars).
+   * the answer is non-empty, non-whitespace, and fits one Discord message (≤2000 chars)
+   * AND the terminal edit succeeds.
    * All other cases → `delegated`.
    */
   readonly resolveToAnswer: (text: string) => Promise<TransitionResult>
   /**
    * Settle, then resolve the status message into a failure note.
    * - `handled`: controller edited the status message into the note (caller does nothing more).
-   * - `delegated`: caller must post the failure note via safeSend (no status to edit, or typing-only).
+   * - `delegated`: caller must post the failure note via safeSend (no status to edit, typing-only,
+   *   or the terminal edit failed).
    *
    * Never both edits and delegates.
    */
   readonly resolveToFailure: (note: string) => Promise<TransitionResult>
   /**
-   * Settle (cancel debounce, await in-flight edit), then clear all timers.
+   * Settle (cancel debounce, await in-flight update), then clear all timers.
    * Idempotent. No edits or pulses fire after dispose.
    */
   readonly dispose: () => Promise<void>
@@ -106,7 +117,7 @@ export interface StatusControllerDeps {
 /**
  * Aggregate activity summaries into a human-readable status line.
  * Counts occurrences of key action verbs and formats them as a compact summary.
- * e.g. `⏳ Working… edited 2 files · ran 1 command`
+ * e.g. `⏳ Working… edited 2 times · ran 1 time`
  */
 function buildStatusContent(summaries: readonly string[]): string {
   if (summaries.length === 0) {
@@ -161,8 +172,11 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
   /** Pending debounce timer ID. */
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
-  /** In-flight edit promise (awaited during settle). */
-  let inFlightEdit: Promise<unknown> | null = null
+  /**
+   * In-flight update promise — tracks BOTH the initial safePost AND subsequent safeEdits.
+   * Awaited during settle() so no late update can land after the terminal transition.
+   */
+  let inFlightUpdate: Promise<unknown> | null = null
 
   /** Typing pulse interval ID. */
   let typingInterval: ReturnType<typeof setInterval> | null = null
@@ -170,13 +184,21 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
   /** Whether the controller has been disposed. */
   let disposed = false
 
+  /**
+   * Set to true at the start of resolveToAnswer / resolveToFailure / dispose.
+   * Once set, noteActivity (and its debounce scheduling) no-ops so a late event
+   * during settle can't schedule a new edit that overwrites the final answer.
+   */
+  let terminal = false
+
   // -------------------------------------------------------------------------
   // Fail-soft Discord I/O wrappers
   // -------------------------------------------------------------------------
 
+  /** Post the initial status message. Fail-soft: returns null on error. */
   async function safePost(content: string): Promise<StatusMessage | null> {
     try {
-      const msg = await thread.send({content})
+      const msg = await thread.send({content, allowedMentions: {parse: []}})
       return msg
     } catch (error) {
       logger.warn({err: String(error)}, 'status-message: failed to post status message')
@@ -184,11 +206,30 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
     }
   }
 
+  /**
+   * Edit the status message. Fail-soft: catches and logs errors.
+   * Used for ORDINARY progress edits (debounce path) — errors are swallowed.
+   */
   async function safeEdit(msg: StatusMessage, content: string): Promise<void> {
     try {
-      await msg.edit({content})
+      await msg.edit({content, allowedMentions: {parse: []}})
     } catch (error) {
       logger.warn({err: String(error)}, 'status-message: failed to edit status message')
+    }
+  }
+
+  /**
+   * Edit the status message for a TERMINAL transition.
+   * Returns true if the edit succeeded, false if it failed.
+   * The caller uses this to decide between 'handled' and 'delegated'.
+   */
+  async function terminalEdit(msg: StatusMessage, content: string): Promise<boolean> {
+    try {
+      await msg.edit({content, allowedMentions: {parse: []}})
+      return true
+    } catch (error) {
+      logger.warn({err: String(error)}, 'status-message: failed to perform terminal edit')
+      return false
     }
   }
 
@@ -218,7 +259,7 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
     }
     debounceTimer = setTimeout(() => {
       debounceTimer = null
-      if (disposed === true) {
+      if (disposed === true || terminal === true) {
         return
       }
       // eslint-disable-next-line no-void
@@ -230,23 +271,31 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
     const content = buildStatusContent(activitySummaries)
 
     if (statusMessage === null) {
-      // First update — post the initial status message
-      const posted = await safePost(content)
-      statusMessage = posted
+      // First update — post the initial status message.
+      // Track the post as inFlightUpdate so settle() can await it.
+      const postPromise = safePost(content)
+      inFlightUpdate = postPromise
+      try {
+        const posted = await postPromise
+        statusMessage = posted
+      } finally {
+        inFlightUpdate = null
+      }
     } else {
       // Subsequent update — edit the existing message
       const msg = statusMessage
-      inFlightEdit = safeEdit(msg, content)
+      const editPromise = safeEdit(msg, content)
+      inFlightUpdate = editPromise
       try {
-        await inFlightEdit
+        await editPromise
       } finally {
-        inFlightEdit = null
+        inFlightUpdate = null
       }
     }
   }
 
   // -------------------------------------------------------------------------
-  // Settle phase — cancel debounce + await in-flight edit
+  // Settle phase — cancel debounce + await in-flight update (post OR edit)
   // -------------------------------------------------------------------------
 
   async function settle(): Promise<void> {
@@ -255,10 +304,12 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
       clearTimeout(debounceTimer)
       debounceTimer = null
     }
-    // Await any in-flight edit so it can't land after the final message
-    if (inFlightEdit !== null) {
-      await inFlightEdit
-      inFlightEdit = null
+    // Await any in-flight update (initial post OR progress edit) so it can't
+    // land after the final message. After this, statusMessage reflects the
+    // actual posted state.
+    if (inFlightUpdate !== null) {
+      await inFlightUpdate
+      inFlightUpdate = null
     }
   }
 
@@ -267,7 +318,8 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
   // -------------------------------------------------------------------------
 
   const noteActivity = (summary: string): void => {
-    if (disposed === true) {
+    if (disposed === true || terminal === true) {
+      // P2: once a terminal transition has begun, no new activity is scheduled
       return
     }
     if (mode === 'typing-only') {
@@ -308,6 +360,9 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
   }
 
   const resolveToAnswer = async (text: string): Promise<TransitionResult> => {
+    // P2: mark terminal before settle so noteActivity no-ops during the await
+    terminal = true
+
     await settle()
 
     if (disposed === true) {
@@ -334,18 +389,25 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
     }
 
     // Long answer (>2000 chars): delete status and delegate
-    if (text.length > DISCORD_MESSAGE_CHAR_LIMIT) {
+    if (text.length > MAX_DISCORD_MESSAGE_LENGTH) {
       await safeDelete(statusMessage)
       statusMessage = null
       return {transition: 'delegated'}
     }
 
-    // Short answer that fits: edit in place
-    await safeEdit(statusMessage, text)
+    // P1-A: Short answer that fits — use terminalEdit so failure is observable.
+    // If the edit fails, return 'delegated' so the caller falls back to sink.flush().
+    const editSucceeded = await terminalEdit(statusMessage, text)
+    if (editSucceeded === false) {
+      return {transition: 'delegated'}
+    }
     return {transition: 'handled'}
   }
 
   const resolveToFailure = async (note: string): Promise<TransitionResult> => {
+    // P2: mark terminal before settle so noteActivity no-ops during the await
+    terminal = true
+
     await settle()
 
     if (disposed === true) {
@@ -362,8 +424,12 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
       return {transition: 'delegated'}
     }
 
-    // Status message exists: edit into the failure note
-    await safeEdit(statusMessage, note)
+    // P1-A: Status message exists — use terminalEdit so failure is observable.
+    // If the edit fails, return 'delegated' so the caller falls back to safeSend.
+    const editSucceeded = await terminalEdit(statusMessage, note)
+    if (editSucceeded === false) {
+      return {transition: 'delegated'}
+    }
     return {transition: 'handled'}
   }
 
@@ -371,9 +437,11 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
     if (disposed === true) {
       return
     }
+    // P2: mark terminal before settle so noteActivity no-ops during the await
+    terminal = true
     disposed = true
 
-    // Settle: cancel debounce + await in-flight edit
+    // Settle: cancel debounce + await in-flight update
     await settle()
 
     // Clear typing interval

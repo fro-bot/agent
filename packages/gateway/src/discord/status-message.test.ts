@@ -147,23 +147,315 @@ describe('createStatusController', () => {
       expect(thread._send).toHaveBeenCalledOnce()
     })
 
-    it('status content reflects accumulated essential-action counts', async () => {
+    it('status content reflects accumulated essential-action counts with working prefix', async () => {
       // #given
       const mockMsg = makeMockMessage()
       const thread = makeThread(async () => mockMsg)
       const logger = makeLogger()
       const ctrl = createStatusController({thread, mode: 'live-status', logger})
 
-      // #when — multiple activities
+      // #when — multiple activities: 2x "edited", 1x "ran"
       ctrl.noteActivity('edited 1 file')
       ctrl.noteActivity('ran 1 command')
       ctrl.noteActivity('edited 1 file')
       await flushDebounce()
 
-      // #then — the posted content should mention the activities
+      // #then — the posted content starts with the working prefix and includes counted summaries
       const [sendArg] = thread._send.mock.calls[0] as [{content: string}]
-      expect(typeof sendArg.content).toBe('string')
-      expect(sendArg.content.length).toBeGreaterThan(0)
+      expect(sendArg.content).toMatch(/^⏳ Working…/)
+      // "edited" appears 2 times, "ran" appears 1 time
+      expect(sendArg.content).toMatch(/edited 2 times/)
+      expect(sendArg.content).toMatch(/ran 1 time/)
+    })
+
+    it('status content with no activities is just the working prefix', async () => {
+      // #given — noteActivity called but with empty-ish content that still triggers a post
+      const thread = makeThread()
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // #when — trigger a post with a single activity
+      ctrl.noteActivity('worked')
+      await flushDebounce()
+
+      // #then — content starts with working prefix
+      const [sendArg] = thread._send.mock.calls[0] as [{content: string}]
+      expect(sendArg.content).toMatch(/^⏳ Working…/)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // P1-C — allowedMentions on status sends and edits
+  // -------------------------------------------------------------------------
+
+  describe('P1-C — allowedMentions suppression', () => {
+    it('initial status post includes allowedMentions: {parse: []}', async () => {
+      // #given
+      const thread = makeThread()
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // #when
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #then — send called with allowedMentions
+      expect(thread._send).toHaveBeenCalledOnce()
+      const [sendArg] = thread._send.mock.calls[0] as [{content: string; allowedMentions: unknown}]
+      expect(sendArg.allowedMentions).toEqual({parse: []})
+    })
+
+    it('progress edit includes allowedMentions: {parse: []}', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // Post initial status
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when — trigger a progress edit
+      ctrl.noteActivity('ran 1 command')
+      await flushDebounce()
+
+      // #then — edit called with allowedMentions
+      expect(mockMsg.edit).toHaveBeenCalledOnce()
+      const [editArg] = mockMsg.edit.mock.calls[0] as [{content: string; allowedMentions: unknown}]
+      expect(editArg.allowedMentions).toEqual({parse: []})
+    })
+
+    it('terminal edit (resolveToAnswer) includes allowedMentions: {parse: []}', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when
+      await ctrl.resolveToAnswer('Final answer')
+
+      // #then — terminal edit includes allowedMentions
+      const lastEditArg = mockMsg.edit.mock.calls.at(-1)?.[0] as {content: string; allowedMentions: unknown}
+      expect(lastEditArg.allowedMentions).toEqual({parse: []})
+    })
+
+    it('terminal edit (resolveToFailure) includes allowedMentions: {parse: []}', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when
+      await ctrl.resolveToFailure('Something went wrong')
+
+      // #then — terminal edit includes allowedMentions
+      const lastEditArg = mockMsg.edit.mock.calls.at(-1)?.[0] as {content: string; allowedMentions: unknown}
+      expect(lastEditArg.allowedMentions).toEqual({parse: []})
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // P1-A — Terminal edit failure returns 'delegated'
+  // -------------------------------------------------------------------------
+
+  describe('P1-A — terminal edit failure returns delegated', () => {
+    it('resolveToAnswer: terminal msg.edit() rejects → returns delegated', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      // All edits fail (progress edits are fail-soft; terminal edit must return delegated)
+      mockMsg.edit.mockRejectedValue(new Error('Unknown Message'))
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when — terminal edit will fail
+      const result = await ctrl.resolveToAnswer('Final answer')
+
+      // #then — delegated because the edit failed
+      expect(result.transition).toBe('delegated')
+      // edit was attempted
+      expect(mockMsg.edit).toHaveBeenCalled()
+      // warn was logged
+      expect(logger.warn).toHaveBeenCalled()
+    })
+
+    it('resolveToFailure: terminal msg.edit() rejects → returns delegated', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      mockMsg.edit.mockRejectedValue(new Error('Unknown Message'))
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when — terminal edit will fail
+      const result = await ctrl.resolveToFailure('Failure note')
+
+      // #then — delegated because the edit failed
+      expect(result.transition).toBe('delegated')
+      expect(mockMsg.edit).toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalled()
+    })
+
+    it('resolveToAnswer: terminal edit succeeds → returns handled', async () => {
+      // #given — edit succeeds (default mock)
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when
+      const result = await ctrl.resolveToAnswer('Final answer')
+
+      // #then — handled because the edit succeeded
+      expect(result.transition).toBe('handled')
+    })
+
+    it('resolveToFailure: terminal edit succeeds → returns handled', async () => {
+      // #given — edit succeeds (default mock)
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when
+      const result = await ctrl.resolveToFailure('Failure note')
+
+      // #then — handled because the edit succeeded
+      expect(result.transition).toBe('handled')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // P1-B — Settle must await the in-flight INITIAL post
+  // -------------------------------------------------------------------------
+
+  describe('P1-B — settle awaits in-flight initial post', () => {
+    it('resolveToAnswer while initial thread.send is pending: no stale "Working…" after resolve', async () => {
+      // #given — controllable initial post promise
+      let resolvePost!: (msg: MockMessage) => void
+      const postPromise = new Promise<MockMessage>(resolve => {
+        resolvePost = resolve
+      })
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => postPromise)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // Trigger the initial post (debounce fires, safePost starts but doesn't resolve yet)
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+      // The send was called but not yet resolved
+      expect(thread._send).toHaveBeenCalledOnce()
+
+      // #when — resolveToAnswer starts while the initial post is still in flight
+      const resolvePromise = ctrl.resolveToAnswer('Final answer')
+
+      // Now resolve the initial post
+      resolvePost(mockMsg)
+      const result = await resolvePromise
+
+      // #then — the controller awaited the post, so statusMessage is now known
+      // Since the post resolved with mockMsg, the terminal edit should have been attempted
+      expect(result.transition).toBe('handled')
+      // The terminal edit was called on the now-known message (not a stale "Working…")
+      expect(mockMsg.edit).toHaveBeenCalledOnce()
+      const [editArg] = mockMsg.edit.mock.calls[0] as [{content: string}]
+      expect(editArg.content).toBe('Final answer')
+    })
+
+    it('dispose while initial thread.send is pending: no stale "Working…" message left', async () => {
+      // #given — controllable initial post promise
+      let resolvePost!: (msg: MockMessage) => void
+      const postPromise = new Promise<MockMessage>(resolve => {
+        resolvePost = resolve
+      })
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => postPromise)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // Trigger the initial post
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+      expect(thread._send).toHaveBeenCalledOnce()
+
+      // #when — dispose starts while the initial post is still in flight
+      const disposePromise = ctrl.dispose()
+
+      // Resolve the initial post
+      resolvePost(mockMsg)
+      await disposePromise
+
+      // #then — dispose completed; no further edits or sends
+      // The controller is disposed; no stale "Working…" message was left untracked
+      expect(mockMsg.edit).not.toHaveBeenCalled()
+      expect(mockMsg.delete).not.toHaveBeenCalled()
+    })
+
+    it('combined: debounce timer pending AND in-flight edit when resolveToAnswer runs → final answer is last write', async () => {
+      // #given — controllable in-flight edit promise
+      let resolveEdit!: () => void
+      const editPromise = new Promise<void>(resolve => {
+        resolveEdit = resolve
+      })
+      const mockMsg = {
+        edit: vi.fn().mockReturnValueOnce(editPromise).mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+      }
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      // Post initial status
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // Trigger a second debounced edit — this starts the in-flight edit
+      ctrl.noteActivity('ran 1 command')
+      await flushDebounce()
+      // The in-flight edit is now pending (not yet resolved)
+      expect(mockMsg.edit).toHaveBeenCalledOnce()
+
+      // Schedule another debounce (timer NOT yet fired)
+      ctrl.noteActivity('read 1 file')
+
+      // #when — resolveToAnswer is called while edit is in flight AND debounce is pending
+      const resolvePromise = ctrl.resolveToAnswer('Final answer')
+
+      // Resolve the in-flight edit
+      resolveEdit()
+      const result = await resolvePromise
+
+      // Advance timers — the debounce should have been cancelled
+      await flushDebounce()
+
+      // #then — final answer edit happened; no late edit from the cancelled debounce
+      expect(result.transition).toBe('handled')
+      // edit called twice: once for the in-flight debounce, once for the final answer
+      expect(mockMsg.edit).toHaveBeenCalledTimes(2)
+      const lastEditArg = mockMsg.edit.mock.calls[1]?.[0] as {content: string}
+      expect(lastEditArg.content).toBe('Final answer')
     })
   })
 
@@ -372,6 +664,83 @@ describe('createStatusController', () => {
       expect(mockMsg.edit).toHaveBeenCalledTimes(2)
       const lastEditArg = mockMsg.edit.mock.calls[1]?.[0] as {content: string}
       expect(lastEditArg.content).toBe('Final answer')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // P2 — Settling flag stops late activity
+  // -------------------------------------------------------------------------
+
+  describe('P2 — terminal flag stops late activity', () => {
+    it('noteActivity after resolveToAnswer has begun does nothing (no new debounce)', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+      const editCallsBeforeResolve = mockMsg.edit.mock.calls.length
+
+      // #when — start resolving (sets terminal=true)
+      const resolvePromise = ctrl.resolveToAnswer('Final answer')
+      // Immediately try to schedule more activity
+      ctrl.noteActivity('ran 1 command')
+      ctrl.noteActivity('read 1 file')
+      await resolvePromise
+
+      // Advance timers — any debounce that was scheduled should NOT fire
+      await flushDebounce()
+
+      // #then — only the terminal edit happened; no extra edits from late activity
+      // editCallsBeforeResolve is 0 (no progress edits yet), terminal edit is 1
+      expect(mockMsg.edit.mock.calls.length).toBe(editCallsBeforeResolve + 1)
+      const lastEditArg = mockMsg.edit.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastEditArg.content).toBe('Final answer')
+    })
+
+    it('noteActivity after resolveToFailure has begun does nothing', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+      const editCallsBeforeResolve = mockMsg.edit.mock.calls.length
+
+      // #when — start resolving failure
+      const resolvePromise = ctrl.resolveToFailure('Failure note')
+      ctrl.noteActivity('ran 1 command')
+      await resolvePromise
+
+      await flushDebounce()
+
+      // #then — only the terminal edit happened
+      expect(mockMsg.edit.mock.calls.length).toBe(editCallsBeforeResolve + 1)
+      const lastEditArg = mockMsg.edit.mock.calls.at(-1)?.[0] as {content: string}
+      expect(lastEditArg.content).toBe('Failure note')
+    })
+
+    it('noteActivity after dispose does nothing', async () => {
+      // #given
+      const mockMsg = makeMockMessage()
+      const thread = makeThread(async () => mockMsg)
+      const logger = makeLogger()
+      const ctrl = createStatusController({thread, mode: 'live-status', logger})
+
+      ctrl.noteActivity('edited 1 file')
+      await flushDebounce()
+
+      // #when
+      await ctrl.dispose()
+      ctrl.noteActivity('ran 1 command')
+      await flushDebounce()
+
+      // #then — no extra edits after dispose
+      expect(mockMsg.edit).not.toHaveBeenCalled()
     })
   })
 
@@ -618,7 +987,7 @@ describe('createStatusController', () => {
       expect(logger.warn).toHaveBeenCalled()
     })
 
-    it('rejected message.edit is caught and logged, does not throw', async () => {
+    it('rejected message.edit (progress) is caught and logged, does not throw', async () => {
       // #given
       const mockMsg = makeMockMessage()
       mockMsg.edit.mockRejectedValue(new Error('Unknown Message'))
@@ -629,7 +998,7 @@ describe('createStatusController', () => {
       ctrl.noteActivity('edited 1 file')
       await flushDebounce()
 
-      // #when — second activity triggers an edit
+      // #when — second activity triggers a progress edit
       ctrl.noteActivity('ran 1 command')
 
       // #then — must not throw when debounce fires

@@ -2870,6 +2870,126 @@ describe('runMention', () => {
       // #and — sink.flush called (delegated → sink owns the no-output fallback)
       expect(flushMock).toHaveBeenCalledOnce()
     })
+
+    // ── P1-A integration: terminal edit failure falls back to sink/safeSend ──
+
+    it('p1-A: resolveToAnswer returns delegated (terminal edit failed) → answer delivered via sink.flush with exact content', async () => {
+      // #given — status controller returns 'delegated' (simulating a failed terminal edit)
+      // This is the P1-A regression guard: when the final edit fails, the answer must still
+      // reach the user via sink.flush(), not be silently dropped.
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+      const ANSWER_TEXT = 'Here is the answer from the agent.'
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: ANSWER_TEXT.length})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue(ANSWER_TEXT),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToAnswer was called with the buffered answer text
+      expect(ctrl.resolveToAnswer).toHaveBeenCalledWith(ANSWER_TEXT)
+      // #and — exactly ONE flush call (answer delivered via sink, not dropped)
+      expect(flushMock).toHaveBeenCalledOnce()
+      // #and — no extra thread.send for the answer (sink.flush owns it)
+      // (thread.send may be called for other reasons but not for the answer content)
+    })
+
+    it('p1-A: resolveToFailure returns delegated (terminal edit failed) → failure note delivered via safeSend with exact content', async () => {
+      // #given — run-core throws; status controller returns 'delegated' (simulating a failed terminal edit)
+      // P1-A regression guard: when the final failure edit fails, the note must still reach
+      // the user via safeSend(), not be silently dropped.
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'delegated'}})
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToFailure was called
+      expect(ctrl.resolveToFailure).toHaveBeenCalledOnce()
+      const failureNote = (ctrl.resolveToFailure as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+      expect(typeof failureNote).toBe('string')
+      expect(failureNote.length).toBeGreaterThan(0)
+      // #and — thread.send was called with the exact failure note content (safeSend path)
+      const sendContents = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+      expect(sendContents.includes(failureNote)).toBe(true)
+      // #and — the send includes allowedMentions: {parse: []} (mention-safe)
+      const failureSend = thread.send.mock.calls.find(c => (c[0] as {content?: string}).content === failureNote)
+      expect((failureSend?.[0] as {allowedMentions?: unknown}).allowedMentions).toEqual({parse: []})
+    })
+
+    it('p1-A: resolveToAnswer returns handled → sink.flush NOT called (exactly one message path)', async () => {
+      // #given — status controller returns 'handled' (terminal edit succeeded)
+      // Verifies the single-owner invariant: when handled, the answer is in the status message
+      // and sink.flush must NOT be called (would double-post).
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('Short answer'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToAnswer called
+      expect(ctrl.resolveToAnswer).toHaveBeenCalledOnce()
+      // #and — sink.flush NOT called (answer is in the status message — no double-post)
+      expect(flushMock).not.toHaveBeenCalled()
+    })
+
+    it('p1-A: resolveToFailure returns handled → safeSend NOT called (exactly one message path)', async () => {
+      // #given — run-core throws; status controller returns 'handled' (terminal edit succeeded)
+      // Verifies the single-owner invariant: when handled, the failure note is in the status
+      // message and safeSend must NOT be called (would double-post).
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'handled'}})
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToFailure called
+      expect(ctrl.resolveToFailure).toHaveBeenCalledOnce()
+      const failureNote = (ctrl.resolveToFailure as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+      // #and — thread.send NOT called with the failure note (controller owns it)
+      const sendContents = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+      expect(sendContents.includes(failureNote)).toBe(false)
+    })
   })
 })
 

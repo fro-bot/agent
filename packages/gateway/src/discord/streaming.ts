@@ -16,12 +16,14 @@ import type {GatewayLogger} from './client.js'
 import {Buffer} from 'node:buffer'
 import {AttachmentBuilder} from 'discord.js'
 
+import {MAX_DISCORD_MESSAGE_LENGTH} from './constants.js'
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /** Discord's hard content-length limit for a single message. */
-const DISCORD_MESSAGE_CHAR_LIMIT = 2000
+const DISCORD_MESSAGE_CHAR_LIMIT = MAX_DISCORD_MESSAGE_LENGTH
 
 /** Fallback message shown when a flush yields nothing. */
 const EMPTY_OUTPUT_MESSAGE = '_(no output)_'
