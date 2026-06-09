@@ -16,12 +16,28 @@
  * If the gateway ReadyzResponse stops being assignable to the workspace-agent shape (e.g. a
  * new field is added to the gateway type that the workspace-agent doesn't produce), `tsc` will
  * fail here, catching wire-compatibility drift at compile time.
+ *
+ * NOTE: The workspace-agent shape is mirrored locally (NOT imported across the package/container
+ * boundary). The gateway Docker image builds in isolation without apps/workspace-agent present,
+ * so cross-package imports would break `pnpm --filter @fro-bot/gateway build`. This follows the
+ * same convention as client.ts. Keep `WorkspaceReadyzResponse` in sync with the source of truth:
+ * apps/workspace-agent/src/types.ts `ReadyzResponse`.
  */
 
-import type {ReadyzResponse as WorkspaceReadyzResponse} from '../../../../apps/workspace-agent/src/types.js'
 import type {ReadyzResponse as GatewayReadyzResponse} from './types.js'
 
 import {describe, expect, it} from 'vitest'
+
+/**
+ * Local mirror of apps/workspace-agent/src/types.ts `ReadyzResponse` (the wire producer shape).
+ * NOT imported across the package/container boundary — the gateway image builds in isolation
+ * without apps/workspace-agent present (see client.ts for the same mirroring convention).
+ * Keep in sync with the workspace-agent source of truth.
+ */
+interface WorkspaceReadyzResponse {
+  readonly ready: boolean
+  readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
+}
 
 // ---------------------------------------------------------------------------
 // Compile-time type assertion helpers
