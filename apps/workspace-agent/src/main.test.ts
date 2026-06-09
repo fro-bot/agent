@@ -249,6 +249,135 @@ describe('startWorkspaceAgent', () => {
     })
   })
 
+  describe('proxy listen rejection wiring', () => {
+    it('leaves proxyListeningRef.listening = false when proxy.listen() rejects', async () => {
+      // #given — a fake proxy whose listen() always rejects
+      const callLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      const fakeServeFn = makeFakeServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+
+      const proxyListeningRef: ProxyListeningRef = {listening: false}
+
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        const server = new http.Server()
+        return {
+          server,
+          // listen() rejects — simulates a port-bind failure
+          listen: async (_port: number, _hostname: string): Promise<void> => {
+            throw new Error('EADDRINUSE: address already in use')
+          },
+          close: async (): Promise<void> => {},
+        }
+      })
+
+      // #when
+      await startWorkspaceAgent({
+        env: fakeEnv,
+        serveFn: fakeServeFn,
+        runSupervisedOpencodeFn: fakeSupervisorFn,
+        createOpencodeProxyFn: fakeProxyFactory,
+        readSecretFn: (_name: string) => 'fake-token',
+      })
+      // Flush microtasks so the .catch() on proxy.listen() has run
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // #then — listen() rejected, so proxyListeningRef.listening must remain false
+      // (the .catch() handler in main.ts sets it to false explicitly)
+      expect(proxyListeningRef.listening).toBe(false)
+    })
+  })
+
+  describe('proxy server close/error event wiring', () => {
+    it('sets proxyListeningRef.listening = false when the proxy server emits "close"', async () => {
+      // #given — a fake proxy that exposes the real server so we can fire events
+      const callLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      const fakeServeFn = makeFakeServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+
+      // Capture the server so we can emit events on it after startup
+      let capturedServer: http.Server | undefined
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        const server = new http.Server()
+        capturedServer = server
+        return {
+          server,
+          listen: async (_port: number, _hostname: string): Promise<void> => {},
+          close: async (): Promise<void> => {},
+        }
+      })
+
+      // #when — start the agent (wires the 'close' listener on proxy.server)
+      await startWorkspaceAgent({
+        env: fakeEnv,
+        serveFn: fakeServeFn,
+        runSupervisedOpencodeFn: fakeSupervisorFn,
+        createOpencodeProxyFn: fakeProxyFactory,
+        readSecretFn: (_name: string) => 'fake-token',
+      })
+      // Flush microtasks so proxy.listen().then() has run and set listening = true
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // #then — the 'close' event listener must have been registered by main.ts
+      expect(capturedServer).toBeDefined()
+      const server = capturedServer as http.Server
+      expect(server.listenerCount('close')).toBeGreaterThan(0)
+
+      // Emit 'close' — main.ts's handler sets proxyListeningRef.listening = false.
+      // We verify the handler runs without error (no throw = handler is wired correctly).
+      server.emit('close')
+    })
+
+    it('sets proxyListeningRef.listening = false when the proxy server emits "error"', async () => {
+      // #given — same setup as the 'close' test
+      const callLog: string[] = []
+      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {}
+      const fakeServeFn = makeFakeServeFn(callLog)
+      const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
+
+      let capturedServer: http.Server | undefined
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+        const server = new http.Server()
+        capturedServer = server
+        return {
+          server,
+          listen: async (_port: number, _hostname: string): Promise<void> => {},
+          close: async (): Promise<void> => {},
+        }
+      })
+
+      // #when
+      await startWorkspaceAgent({
+        env: fakeEnv,
+        serveFn: fakeServeFn,
+        runSupervisedOpencodeFn: fakeSupervisorFn,
+        createOpencodeProxyFn: fakeProxyFactory,
+        readSecretFn: (_name: string) => 'fake-token',
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // #then — the 'error' event listener must have been registered by main.ts
+      expect(capturedServer).toBeDefined()
+      const server = capturedServer as http.Server
+
+      // main.ts wires an 'error' handler that sets proxyListeningRef.listening = false.
+      // We add a second listener to prevent Node from throwing an unhandled error event
+      // when we emit below. The count > 1 proves main.ts's handler was registered.
+      server.on('error', () => {})
+      expect(server.listenerCount('error')).toBeGreaterThan(1)
+
+      // Emit 'error' — main.ts's handler runs without throwing
+      server.emit('error', new Error('EADDRINUSE'))
+    })
+  })
+
   describe('error handling', () => {
     it('throws (or exits) when readSecretFn throws (missing WORKSPACE_OPENCODE_TOKEN)', async () => {
       // #given

@@ -1429,10 +1429,12 @@ describe('startOpencodeServer — per-probe deadline cap (Unit 3)', () => {
       }),
     ).rejects.toThrow(/did not become ready within/)
 
-    // #then — probe may be called 0 or very few times (loop exits when remaining <= 0)
-    // The key invariant: no probe is called with a 0 or negative timeout
-    // (the loop exits before probing when remaining <= 0)
-    expect(probeCallCount).toBeGreaterThanOrEqual(0) // may be 0 if deadline already passed
+    // #then — the loop exits very early: with a 1ms deadline the `remaining <= 0`
+    // guard fires within the first few iterations. The key invariant is that the
+    // probe is NOT called many times — the early-exit guard prevents unbounded
+    // probing past the deadline. A small upper bound (10) is generous enough to
+    // be stable on slow CI while still proving the guard works.
+    expect(probeCallCount).toBeLessThan(10)
   })
 })
 
@@ -1553,9 +1555,12 @@ describe('runSupervisedOpencode — per-probe deadline cap (Unit 3)', () => {
 
     await supervisorPromise
 
-    // #then — probe may be called 0 or very few times; no zero/negative timeout passed
-    // The loop exits before probing when remaining <= 0
-    expect(probeCallCount).toBeGreaterThanOrEqual(0)
+    // #then — the supervisor readiness loop exits very early: with a 1ms deadline
+    // the `remaining <= 0` guard fires within the first few iterations. The key
+    // invariant is that the probe is NOT called many times — the early-exit guard
+    // prevents unbounded probing past the deadline. A small upper bound (10) is
+    // generous enough to be stable on slow CI while still proving the guard works.
+    expect(probeCallCount).toBeLessThan(10)
     expect(statusRef.status).toBe('degraded')
   })
 })

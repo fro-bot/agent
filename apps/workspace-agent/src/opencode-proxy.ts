@@ -148,22 +148,31 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
     // Cancelled entirely when SSE (text/event-stream) is detected.
     // On fire: destroy the upstream request and return 504.
     //
-    // upstreamReq is declared as `let` before armTimer so the timer callback
-    // can reference it. http.request() is synchronous — upstreamReq is assigned
-    // before any timer can fire (timers are async), so the reference is always
-    // valid when the callback runs.
+    // `settled` prevents double-operation: the timer callback is a no-op if the
+    // response already completed (end/close/error) or if the timer already fired.
+    // This closes the race where the timer fires just as the response completes.
+    //
+    // `reqRef` is a mutable object so the timer callback can reference the upstream
+    // request without a forward-reference lint violation. It is populated
+    // synchronously by http.request() below before armTimer() is first called,
+    // so reqRef.current is always set when the callback runs. Timers are async —
+    // no callback can fire before the synchronous assignment completes.
     let inactivityTimer: ReturnType<typeof setTimeout> | undefined
-
-    let upstreamReq: http.ClientRequest
+    let settled = false
+    const reqRef: {current: http.ClientRequest | undefined} = {current: undefined}
 
     const armTimer = (): void => {
       clearTimeout(inactivityTimer)
       inactivityTimer = setTimeout(() => {
+        // Guard: if the response already completed or was destroyed, do nothing.
+        // This prevents double-operation on an already-ended response.
+        if (settled === true) return
+        settled = true
         logger.warn('opencode-proxy: upstream inactivity timeout', {
           url: req.url,
           timeoutMs: inactivityTimeoutMs,
         })
-        upstreamReq.destroy()
+        reqRef.current?.destroy()
         if (res.headersSent === false) {
           res.writeHead(504, {
             'Content-Type': 'text/plain',
@@ -181,15 +190,20 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
       inactivityTimer = undefined
     }
 
-    // Arm the inactivity timer immediately on request start.
-    armTimer()
-
-    upstreamReq = http.request(forwardOptions, upstreamRes => {
+    // Populate reqRef.current synchronously before arming the timer.
+    // http.request() is synchronous — the assignment completes before any timer
+    // callback can fire (timers are async).
+    const upstreamReq = http.request(forwardOptions, upstreamRes => {
       // --- SSE detection ---
       // Check the upstream response Content-Type. If it is text/event-stream,
       // cancel the inactivity timer entirely — SSE is a long-lived intentional
       // stream that must never be timed out.
-      const contentType = upstreamRes.headers['content-type'] ?? ''
+      //
+      // Node headers can be string | string[] | undefined — normalize to a single
+      // string before the substring check so an array-valued header doesn't break
+      // SSE detection (e.g. when a proxy merges duplicate Content-Type headers).
+      const rawContentType = upstreamRes.headers['content-type']
+      const contentType = Array.isArray(rawContentType) ? rawContentType.join(',') : (rawContentType ?? '')
       const isSSE = contentType.includes('text/event-stream')
 
       if (isSSE === true) {
@@ -205,8 +219,20 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
           armTimer()
         })
 
-        // Cancel the timer when the response ends cleanly.
+        // Cancel the timer when the response ends cleanly, or when the TCP
+        // connection drops mid-stream (close/error). Without close/error handlers,
+        // a mid-stream TCP drop emits close/error (not end), leaving the timer
+        // armed — it would fire uselessly and log a false "inactivity timeout".
         upstreamRes.on('end', () => {
+          settled = true
+          cancelTimer()
+        })
+        upstreamRes.on('close', () => {
+          settled = true
+          cancelTimer()
+        })
+        upstreamRes.on('error', () => {
+          settled = true
           cancelTimer()
         })
       }
@@ -215,6 +241,11 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
       // Pipe without buffering — SSE streams through correctly
       upstreamRes.pipe(res, {end: true})
     })
+
+    // Populate the ref and arm the timer — both happen synchronously after
+    // http.request() returns, so reqRef.current is set before any timer fires.
+    reqRef.current = upstreamReq
+    armTimer()
 
     upstreamReq.on('error', (err: Error) => {
       cancelTimer()

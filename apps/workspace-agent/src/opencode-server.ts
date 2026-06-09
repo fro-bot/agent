@@ -99,6 +99,17 @@ export interface DefaultPollReadyOptions {
 }
 
 /**
+ * Clamp the per-probe timeout to the remaining overall deadline.
+ *
+ * Prevents a single probe from overshooting the overall readiness timeout.
+ * Math.max(1, …) floors at 1ms so clock jitter never produces a zero or
+ * negative timeout (which would fire immediately or be rejected by setTimeout).
+ */
+function clampProbeTimeout(remaining: number, max: number): number {
+  return Math.max(1, Math.min(max, remaining))
+}
+
+/**
  * Kill the child's entire process group when a pid is available.
  *
  * When `child.pid` is a safe integer > 1, sends SIGTERM to the whole process
@@ -256,7 +267,7 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     // Cap the per-probe timeout to the remaining deadline so a single probe
     // cannot overshoot the overall readiness timeout. Math.max(1, …) prevents
     // clock jitter from producing a 0 or negative timeout.
-    const probeTimeoutMs = Math.max(1, Math.min(defaultProbeTimeoutMs, remaining))
+    const probeTimeoutMs = clampProbeTimeout(remaining, defaultProbeTimeoutMs)
     const ready = await pollReadyFn(url, signal, probeTimeoutMs)
     if (ready === true) {
       logger.info('opencode-server: ready', {url})
@@ -472,7 +483,7 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
         // Cap the per-probe timeout to the remaining deadline so a single probe
         // cannot overshoot the overall readiness timeout. Math.max(1, …) prevents
         // clock jitter from producing a 0 or negative timeout.
-        const probeTimeoutMs = Math.max(1, Math.min(defaultProbeTimeoutMs, remaining))
+        const probeTimeoutMs = clampProbeTimeout(remaining, defaultProbeTimeoutMs)
         const ready = await pollReadyFn(url, signal, probeTimeoutMs)
         if (ready === true) {
           becameReady = true

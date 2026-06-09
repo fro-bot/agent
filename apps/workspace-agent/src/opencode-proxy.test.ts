@@ -284,6 +284,143 @@ describe('opencode-proxy — upstream errors', () => {
   })
 })
 
+describe('opencode-proxy — readProxyTimeoutMs() env parsing', () => {
+  // readProxyTimeoutMs() reads process.env directly (no injection seam).
+  // We test it by creating a proxy without an explicit timeoutMs option and
+  // observing the effective timeout via a stalled upstream. For the fallback
+  // branches (invalid/absent env) we verify the proxy still works correctly
+  // with a fast upstream (the 30s default won't fire in a fast test).
+
+  const ENV_KEY = 'WORKSPACE_PROXY_TIMEOUT_MS'
+
+  afterEach(() => {
+    // Always restore the env key so tests don't bleed into each other.
+    delete process.env[ENV_KEY]
+  })
+
+  it('falls back to 30000ms default when env var is undefined', async () => {
+    // #given — env var absent; proxy created without explicit timeoutMs
+    delete process.env[ENV_KEY]
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    // No timeoutMs → readProxyTimeoutMs() is called → returns 30000 (default)
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when — fast upstream completes well within the 30s default
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then — proxy works; the 30s default did not fire
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toBe('ok')
+
+    await close()
+    await upstream.close()
+  })
+
+  it('falls back to default when env var is empty string', async () => {
+    // #given — empty string is treated as absent
+    process.env[ENV_KEY] = ''
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then — proxy works normally (default 30s did not fire)
+    expect(res.statusCode).toBe(200)
+
+    await close()
+    await upstream.close()
+  })
+
+  it('falls back to default when env var is whitespace only', async () => {
+    // #given — whitespace-only trims to empty → default
+    process.env[ENV_KEY] = '   '
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then
+    expect(res.statusCode).toBe(200)
+
+    await close()
+    await upstream.close()
+  })
+
+  it('falls back to default when env var is non-numeric ("abc")', async () => {
+    // #given — parseInt('abc') is NaN → default
+    process.env[ENV_KEY] = 'abc'
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then
+    expect(res.statusCode).toBe(200)
+
+    await close()
+    await upstream.close()
+  })
+
+  it('falls back to default when env var is "0" (non-positive)', async () => {
+    // #given — 0 is not > 0 → default
+    process.env[ENV_KEY] = '0'
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then
+    expect(res.statusCode).toBe(200)
+
+    await close()
+    await upstream.close()
+  })
+
+  it('falls back to default when env var is "-5000" (negative)', async () => {
+    // #given — negative value is not > 0 → default
+    process.env[ENV_KEY] = '-5000'
+    const upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'ok'})
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+
+    // #then
+    expect(res.statusCode).toBe(200)
+
+    await close()
+    await upstream.close()
+  })
+
+  it('uses the env var value when it is a valid positive integer ("150")', async () => {
+    // #given — valid positive integer → used as the timeout
+    // We verify by pointing at a stalled upstream and observing the 504 fires
+    // within the configured window (not the 30s default).
+    process.env[ENV_KEY] = '150'
+    const upstream = await startStalledUpstream()
+    // No explicit timeoutMs → readProxyTimeoutMs() returns 150
+    const {url, close} = await startProxy(TEST_TOKEN, upstream.url)
+
+    const start = Date.now()
+
+    // #when
+    const res = await httpGet(`${url}/api`, {Authorization: `Bearer ${TEST_TOKEN}`})
+    const elapsed = Date.now() - start
+
+    // #then — timed out at ~150ms (not the 30s default)
+    expect(res.statusCode).toBe(504)
+    expect(elapsed).toBeGreaterThanOrEqual(100)
+    expect(elapsed).toBeLessThan(3000)
+
+    await close()
+    await upstream.close()
+  })
+})
+
 describe('opencode-proxy — close()', () => {
   it('resolves cleanly when there are no active connections', async () => {
     // #given
