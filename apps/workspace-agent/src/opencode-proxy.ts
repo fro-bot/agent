@@ -10,6 +10,15 @@
  * 3. Token is never logged, never echoed in error responses.
  * 4. Missing or wrong bearer → 401 with a fixed body, request NOT forwarded.
  * 5. Supports HTTP and SSE (fetch-based SSE streams through the pipe without buffering).
+ *
+ * INACTIVITY TIMEOUT:
+ * Non-SSE requests are subject to an inactivity timeout: a timer is armed on
+ * request start and reset on each data chunk of the upstream response. If no
+ * progress is made for the configured interval, the upstream request is destroyed
+ * and a 504 Gateway Timeout is returned. SSE (text/event-stream) responses are
+ * fully exempt — the timer is cancelled when SSE is detected so long-lived event
+ * streams are never cut off. The interval is configurable via the `timeoutMs`
+ * option (or `WORKSPACE_PROXY_TIMEOUT_MS` env var) with a 30s default.
  */
 
 import type {Logger} from './opencode-server.js'
@@ -17,10 +26,38 @@ import type {Logger} from './opencode-server.js'
 import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
 import http from 'node:http'
+import process from 'node:process'
 import {URL} from 'node:url'
 
 const UNAUTHORIZED_BODY = 'Unauthorized\n'
 const UNAUTHORIZED_BODY_BYTES = Buffer.from(UNAUTHORIZED_BODY)
+
+const GATEWAY_TIMEOUT_BODY = 'Gateway Timeout\n'
+const GATEWAY_TIMEOUT_BODY_BYTES = Buffer.from(GATEWAY_TIMEOUT_BODY)
+
+/** Default inactivity timeout: 30 seconds. */
+const PROXY_TIMEOUT_DEFAULT_MS = 30_000
+
+/**
+ * Read the proxy inactivity timeout from the environment.
+ * Returns the default (30s) if the variable is absent, empty, or invalid.
+ * Fail-soft: invalid values fall back to the default (not a startup-critical config).
+ */
+function readProxyTimeoutMs(): number {
+  const raw = process.env.WORKSPACE_PROXY_TIMEOUT_MS
+  if (raw === undefined || raw === '') {
+    return PROXY_TIMEOUT_DEFAULT_MS
+  }
+  const trimmed = raw.trim()
+  if (trimmed === '') {
+    return PROXY_TIMEOUT_DEFAULT_MS
+  }
+  const parsed = Number.parseInt(trimmed, 10)
+  if (Number.isInteger(parsed) === false || String(parsed) !== trimmed || parsed <= 0) {
+    return PROXY_TIMEOUT_DEFAULT_MS
+  }
+  return parsed
+}
 
 export interface OpencodeProxyOptions {
   /**
@@ -31,6 +68,13 @@ export interface OpencodeProxyOptions {
   /** Upstream loopback URL, e.g. http://127.0.0.1:54321 */
   readonly upstreamUrl: string
   readonly logger: Logger
+  /**
+   * Inactivity timeout in milliseconds for non-SSE upstream requests.
+   * The timer is armed on request start and reset on each data chunk of the
+   * upstream response. SSE (text/event-stream) responses are fully exempt.
+   * Defaults to `WORKSPACE_PROXY_TIMEOUT_MS` env var, or 30000ms if unset.
+   */
+  readonly timeoutMs?: number
 }
 
 export interface OpencodeProxyHandle {
@@ -48,6 +92,8 @@ export interface OpencodeProxyHandle {
  */
 export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProxyHandle {
   const {token, upstreamUrl, logger} = options
+  // Resolve timeout: explicit option takes precedence, then env, then default.
+  const inactivityTimeoutMs = options.timeoutMs === undefined ? readProxyTimeoutMs() : options.timeoutMs
 
   const expectedBuf = Buffer.from(token)
   const upstream = new URL(upstreamUrl)
@@ -97,13 +143,115 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
       },
     }
 
+    // --- Inactivity timer ---
+    // Armed on request start. Reset on each non-SSE response data chunk.
+    // Cancelled entirely when SSE (text/event-stream) is detected.
+    // On fire: destroy the upstream request and return 504.
+    //
+    // `settled` prevents double-operation: the timer callback is a no-op if the
+    // response already completed (end/close/error) or if the timer already fired.
+    // This closes the race where the timer fires just as the response completes.
+    //
+    // `reqRef` is a mutable object so the timer callback can reference the upstream
+    // request without a forward-reference lint violation. It is populated
+    // synchronously by http.request() below before armTimer() is first called,
+    // so reqRef.current is always set when the callback runs. Timers are async —
+    // no callback can fire before the synchronous assignment completes.
+    let inactivityTimer: ReturnType<typeof setTimeout> | undefined
+    let settled = false
+    const reqRef: {current: http.ClientRequest | undefined} = {current: undefined}
+
+    const armTimer = (): void => {
+      clearTimeout(inactivityTimer)
+      inactivityTimer = setTimeout(() => {
+        // Guard: if the response already completed or was destroyed, do nothing.
+        // This prevents double-operation on an already-ended response.
+        if (settled === true) return
+        settled = true
+        logger.warn('opencode-proxy: upstream inactivity timeout', {
+          url: req.url,
+          timeoutMs: inactivityTimeoutMs,
+        })
+        reqRef.current?.destroy()
+        if (res.headersSent === false) {
+          res.writeHead(504, {
+            'Content-Type': 'text/plain',
+            'Content-Length': String(GATEWAY_TIMEOUT_BODY_BYTES.length),
+          })
+          res.end(GATEWAY_TIMEOUT_BODY)
+        } else {
+          res.destroy()
+        }
+      }, inactivityTimeoutMs)
+    }
+
+    const cancelTimer = (): void => {
+      clearTimeout(inactivityTimer)
+      inactivityTimer = undefined
+    }
+
+    // Populate reqRef.current synchronously before arming the timer.
+    // http.request() is synchronous — the assignment completes before any timer
+    // callback can fire (timers are async).
     const upstreamReq = http.request(forwardOptions, upstreamRes => {
+      // --- SSE detection ---
+      // Check the upstream response Content-Type. If it is text/event-stream,
+      // cancel the inactivity timer entirely — SSE is a long-lived intentional
+      // stream that must never be timed out.
+      //
+      // Node headers can be string | string[] | undefined — normalize to a single
+      // string before the substring check so an array-valued header doesn't break
+      // SSE detection (e.g. when a proxy merges duplicate Content-Type headers).
+      const rawContentType = upstreamRes.headers['content-type']
+      const contentType = Array.isArray(rawContentType) ? rawContentType.join(',') : (rawContentType ?? '')
+      const isSSE = contentType.includes('text/event-stream')
+
+      if (isSSE === true) {
+        // SSE is fully exempt: cancel the inactivity timer and never re-arm it.
+        cancelTimer()
+      } else {
+        // Non-SSE: reset the timer on each data chunk so a slow-but-progressing
+        // response is not killed. The timer fires only after no progress for the
+        // configured interval.
+        // IMPORTANT: do NOT cancel the timer here just because headers arrived —
+        // a server can send headers fast then stall mid-body forever.
+        upstreamRes.on('data', () => {
+          armTimer()
+        })
+
+        // Cancel the timer when the response ends cleanly, or when the TCP
+        // connection drops mid-stream (close/error). Without close/error handlers,
+        // a mid-stream TCP drop emits close/error (not end), leaving the timer
+        // armed — it would fire uselessly and log a false "inactivity timeout".
+        upstreamRes.on('end', () => {
+          settled = true
+          cancelTimer()
+        })
+        upstreamRes.on('close', () => {
+          settled = true
+          cancelTimer()
+        })
+        upstreamRes.on('error', () => {
+          settled = true
+          cancelTimer()
+        })
+      }
+
       res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers)
       // Pipe without buffering — SSE streams through correctly
       upstreamRes.pipe(res, {end: true})
     })
 
+    // Populate the ref and arm the timer — both happen synchronously after
+    // http.request() returns, so reqRef.current is set before any timer fires.
+    reqRef.current = upstreamReq
+    armTimer()
+
     upstreamReq.on('error', (err: Error) => {
+      // Mark settled (symmetric with the upstreamRes handlers) so a timer firing
+      // in the same tick as this error is a no-op rather than double-operating on res.
+      settled = true
+      cancelTimer()
       logger.error('opencode-proxy: upstream error', {message: err.message})
       if (res.headersSent === false) {
         res.writeHead(502, {'Content-Type': 'text/plain'})

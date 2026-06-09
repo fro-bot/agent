@@ -32,11 +32,27 @@ export interface OpencodeStatusRef {
   status: OpencodeStatus
 }
 
+/**
+ * Bearer proxy listening state shared between the proxy lifecycle and the server.
+ * Set to true when the proxy http.Server emits 'listening'; cleared on close/error.
+ * Used by /readyz to gate on the attach path (`:9200`) being usable.
+ */
+export interface ProxyListeningRef {
+  /** Whether the bearer proxy is currently bound and listening. */
+  listening: boolean
+}
+
 export interface ServerDeps {
   /** Injected clone executor for testability. */
   readonly cloneExecutor?: CloneExecutorFn
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
+  /**
+   * Bearer proxy listening reference. When present, /readyz requires BOTH
+   * opencodeStatus === 'ready' AND proxyListening.listening === true.
+   * When absent, /readyz falls back to the opencode-only check (legacy/clone-only mode).
+   */
+  readonly proxyListening?: ProxyListeningRef
 }
 
 /**
@@ -45,7 +61,7 @@ export interface ServerDeps {
  * @param deps - Optional dependency overrides for testing.
  */
 export function createApp(deps: ServerDeps = {}): Hono {
-  const {cloneExecutor = executeClone, opencodeStatus} = deps
+  const {cloneExecutor = executeClone, opencodeStatus, proxyListening} = deps
   const app = new Hono()
 
   // GET /healthz — liveness probe (always 200; clone-only signal)
@@ -55,13 +71,26 @@ export function createApp(deps: ServerDeps = {}): Hono {
     return c.json(body, 200)
   })
 
-  // GET /readyz — readiness probe (200 only when OpenCode is ready; 503 otherwise)
+  // GET /readyz — readiness probe (200 only when the full attach path is ready; 503 otherwise)
+  //
+  // When proxyListening is provided (production mode), BOTH conditions must hold:
+  //   1. opencodeStatus.status === 'ready'  (loopback OpenCode is up)
+  //   2. proxyListening.listening === true  (bearer proxy on :9200 is bound)
+  //
+  // This ensures /readyz reflects attach-path usability, not just loopback boot.
+  // The startup false-negative is avoided because the proxy binds (OS-level, milliseconds)
+  // before OpenCode finishes booting (seconds), so proxyListening.listening is true
+  // before opencodeStatus can transition to 'ready' in normal boot.
+  //
+  // When proxyListening is absent (legacy/clone-only mode), falls back to opencode-only check.
   app.get('/readyz', c => {
     if (opencodeStatus === undefined) {
       const body: ReadyzResponse = {ready: false, opencode: 'unknown'}
       return c.json(body, 503)
     }
-    const isReady = opencodeStatus.status === 'ready'
+    const opencodeReady = opencodeStatus.status === 'ready'
+    const proxyReady = proxyListening === undefined || proxyListening.listening === true
+    const isReady = opencodeReady === true && proxyReady === true
     const body: ReadyzResponse = {ready: isReady, opencode: opencodeStatus.status}
     return c.json(body, isReady === true ? 200 : 503)
   })
