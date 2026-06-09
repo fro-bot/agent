@@ -82,16 +82,24 @@ function isPnpmLicensesJson(value: unknown): value is PnpmLicensesJson {
 }
 
 async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
-  const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
-    encoding: 'utf8',
-  })
+  try {
+    const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
+      encoding: 'utf8',
+    })
 
-  const parsed: unknown = JSON.parse(stdout)
-  if (!isPnpmLicensesJson(parsed)) {
-    throw new Error('pnpm licenses list returned invalid JSON')
+    const parsed: unknown = JSON.parse(stdout)
+    if (!isPnpmLicensesJson(parsed)) {
+      console.warn('[license-collector] pnpm licenses list returned invalid JSON; falling back to empty map')
+      return {}
+    }
+
+    return parsed
+  } catch (error) {
+    console.warn(
+      `[license-collector] pnpm licenses list failed (${error instanceof Error ? error.message : String(error)}); license types will be "Unknown"`,
+    )
+    return {}
   }
-
-  return parsed
 }
 
 function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
