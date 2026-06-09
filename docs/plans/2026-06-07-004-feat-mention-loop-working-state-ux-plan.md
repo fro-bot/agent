@@ -88,7 +88,7 @@ Phase 2 of the production-ready `@Fro Bot` Discord mention loop. Phase 1 (clean 
 
 ## Implementation Units
 
-- [ ] **Unit 1: `GATEWAY_STATUS_MODE` config**
+- [x] **Unit 1: `GATEWAY_STATUS_MODE` config**
 
 **Goal:** Add the deploy-wide working-state mode setting.
 
@@ -113,7 +113,7 @@ Phase 2 of the production-ready `@Fro Bot` Discord mention loop. Phase 1 (clean 
 
 **Verification:** config exposes a validated `statusMode`; invalid values are rejected at load.
 
-- [ ] **Unit 2: Status-message manager + typing pulse**
+- [x] **Unit 2: Status-message manager + typing pulse**
 
 **Goal:** A per-run component that owns one status message (post/edit/resolve) on a debounced cadence and pulses the typing indicator while busy.
 
@@ -152,7 +152,7 @@ Phase 2 of the production-ready `@Fro Bot` Discord mention loop. Phase 1 (clean 
 
 **Verification:** the controller posts/edits exactly one status message on cadence, pulses typing only while genuinely busy (paused during approval waits), resolves to a single `handled`/`delegated` outcome with no late-edit race, and never throws on Discord I/O failure.
 
-- [ ] **Unit 3: Wire the status controller into the run lifecycle**
+- [x] **Unit 3: Wire the status controller into the run lifecycle**
 
 **Goal:** Drive the controller from the run-core event stream and own its lifecycle in `run.ts`, coordinating with the sink's final flush and failure paths.
 
@@ -191,7 +191,7 @@ Phase 2 of the production-ready `@Fro Bot` Discord mention loop. Phase 1 (clean 
 
 **Verification:** during a live-status run the thread shows one updating status message that becomes the answer (or is replaced for long answers); failures read as a persona note; typing-only shows only typing + answer; no timers leak.
 
-- [ ] **Unit 4: Deploy wiring + docs**
+- [x] **Unit 4: Deploy wiring + docs**
 
 **Goal:** Surface `GATEWAY_STATUS_MODE` for operators.
 
