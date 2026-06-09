@@ -8,6 +8,7 @@ import * as runtimeModule from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
+import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
@@ -89,6 +90,16 @@ vi.mock('./run-core.js', () => ({
   },
 }))
 
+vi.mock('../discord/status-message.js', () => ({
+  createStatusController: vi.fn().mockReturnValue({
+    noteActivity: vi.fn(),
+    setBusy: vi.fn(),
+    resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+    resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+    dispose: vi.fn().mockResolvedValue(undefined),
+  }),
+}))
+
 // ---------------------------------------------------------------------------
 // Typed mocks
 // ---------------------------------------------------------------------------
@@ -97,6 +108,7 @@ const mockRuntime = vi.mocked(runtimeModule)
 const mockRunOpenCodeCore = vi.mocked(runCoreModule.runOpenCodeCore)
 const mockCreateDiscordStreamSink = vi.mocked(streamingModule.createDiscordStreamSink)
 const mockCreatePermissionCoordinator = vi.mocked(coordinatorModule.createPermissionCoordinator)
+const mockCreateStatusController = vi.mocked(statusMessageModule.createStatusController)
 vi.mocked(discordApprovalsModule) // ensure module mock is applied
 
 // ---------------------------------------------------------------------------
@@ -284,6 +296,27 @@ function makeStatefulPendingSinkMock() {
   }
 }
 
+/**
+ * Build a status controller mock with configurable transition results.
+ * Returns the mock controller and wires it into `mockCreateStatusController`.
+ */
+function makeStatusControllerMock(
+  opts: {
+    resolveToAnswerResult?: {transition: 'handled' | 'delegated'}
+    resolveToFailureResult?: {transition: 'handled' | 'delegated'}
+  } = {},
+) {
+  const ctrl = {
+    noteActivity: vi.fn(),
+    setBusy: vi.fn(),
+    resolveToAnswer: vi.fn().mockResolvedValue(opts.resolveToAnswerResult ?? {transition: 'delegated'}),
+    resolveToFailure: vi.fn().mockResolvedValue(opts.resolveToFailureResult ?? {transition: 'delegated'}),
+    dispose: vi.fn().mockResolvedValue(undefined),
+  }
+  mockCreateStatusController.mockReturnValue(ctrl)
+  return ctrl
+}
+
 function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
   return result === 'success'
     ? vi.fn().mockResolvedValue({success: true as const, data: '/workspace/acme/widget'})
@@ -315,6 +348,7 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     approvalMode: overrides.approvalMode ?? 'approval-required',
+    statusMode: overrides.statusMode ?? 'live-status',
     ensureClone: overrides.ensureClone ?? makeEnsureCloneFn('success'),
     readyz: overrides.readyz ?? makeReadyzFn('ready'),
     ...overrides,
@@ -2552,6 +2586,289 @@ describe('runMention', () => {
       // Must be approximately runTimeoutMs − SIMULATED_ELAPSED_MS
       expect(signalBudgetMs).toBeLessThanOrEqual(runTimeoutMs - SIMULATED_ELAPSED_MS + 100) // +100ms tolerance
       expect(signalBudgetMs).toBeGreaterThan(0)
+    })
+  })
+
+  // ── Unit 3: Status controller wiring ────────────────────────────────────
+
+  describe('status controller wiring (Unit 3)', () => {
+    it('integration (live-status, short answer): resolveToAnswer(handled) → sink.flush NOT called', async () => {
+      // #given — status controller returns 'handled' (edited in place)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('Short answer text'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const deps = makeDeps({statusMode: 'live-status'})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToAnswer called with buffered text
+      expect(ctrl.resolveToAnswer).toHaveBeenCalledWith('Short answer text')
+      // #and — sink.flush NOT called (answer is in the status message)
+      expect(flushMock).not.toHaveBeenCalled()
+    })
+
+    it('integration (live-status, long answer): resolveToAnswer(delegated) → sink.flush IS called', async () => {
+      // #given — status controller returns 'delegated' (status deleted, sink posts)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+      const flushMock = vi.fn().mockResolvedValue({kind: 'attachment' as const, charCount: 3000})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('x'.repeat(2001)),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const deps = makeDeps({statusMode: 'live-status'})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToAnswer called
+      expect(ctrl.resolveToAnswer).toHaveBeenCalled()
+      // #and — sink.flush IS called (delegated → sink owns the answer)
+      expect(flushMock).toHaveBeenCalledOnce()
+    })
+
+    it('integration (failure, status present): resolveToFailure(handled) → safeSend NOT called', async () => {
+      // #given — run-core throws; status controller returns 'handled' for failure
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'handled'}})
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToFailure called with the coarse failure note
+      expect(ctrl.resolveToFailure).toHaveBeenCalledOnce()
+      const failureNote = (ctrl.resolveToFailure as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+      expect(typeof failureNote).toBe('string')
+      expect(failureNote.length).toBeGreaterThan(0)
+      // #and — thread.send NOT called for the failure message (controller owns it)
+      // The only sends should be from the sink flush (partial output), not the error message
+      const sendContents = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+      // None of the sends should be the coarse failure note (controller handled it)
+      expect(sendContents.includes(failureNote)).toBe(false)
+    })
+
+    it('integration (failure before activity, no status): resolveToFailure(delegated) → safeSend IS called', async () => {
+      // #given — run-core throws; no status message posted; controller returns 'delegated'
+      const {runMention} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'delegated'}})
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
+
+      const thread = makeThread()
+      const message = makeMessage(thread)
+      const deps = makeDeps({statusMode: 'live-status'})
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToFailure called
+      expect(ctrl.resolveToFailure).toHaveBeenCalledOnce()
+      // #and — thread.send called for the failure message (delegated → safeSend posts it)
+      const sendContents = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+      expect(sendContents.some(c => c.includes('not reachable'))).toBe(true)
+    })
+
+    it('integration (typing-only mode): resolveToAnswer always delegated → sink.flush called', async () => {
+      // #given — typing-only mode; controller always returns 'delegated'
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('answer text'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const deps = makeDeps({statusMode: 'typing-only'})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — createStatusController called with typing-only mode
+      expect(mockCreateStatusController).toHaveBeenCalledWith(expect.objectContaining({mode: 'typing-only'}))
+      // #and — sink.flush called (delegated)
+      expect(flushMock).toHaveBeenCalledOnce()
+      // #and — resolveToAnswer called (same call site regardless of mode)
+      expect(ctrl.resolveToAnswer).toHaveBeenCalledOnce()
+    })
+
+    it('edge (cleanup): controller.dispose called in finally on success', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock()
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — dispose called exactly once
+      expect(ctrl.dispose).toHaveBeenCalledOnce()
+    })
+
+    it('edge (cleanup): controller.dispose called in finally on failure', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock()
+      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — dispose called even when run-core throws
+      expect(ctrl.dispose).toHaveBeenCalledOnce()
+    })
+
+    it('createStatusController receives statusMode from deps', async () => {
+      // #given — live-status mode
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      makeStatusControllerMock()
+
+      const deps = makeDeps({statusMode: 'live-status'})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — createStatusController called with mode: 'live-status'
+      expect(mockCreateStatusController).toHaveBeenCalledWith(expect.objectContaining({mode: 'live-status'}))
+    })
+
+    it('runOpenCodeCore receives onActivity and onBusy callbacks', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      makeStatusControllerMock()
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — runOpenCodeCore called with onActivity and onBusy
+      expect(mockRunOpenCodeCore).toHaveBeenCalledWith(
+        expect.objectContaining({
+          onActivity: expect.any(Function) as unknown,
+          onBusy: expect.any(Function) as unknown,
+        }),
+      )
+    })
+
+    it('onActivity callback calls controller.noteActivity', async () => {
+      // #given — capture the onActivity callback from runOpenCodeCore
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock()
+
+      let capturedOnActivity: ((summary: string) => void) | undefined
+      mockRunOpenCodeCore.mockImplementation(async params => {
+        capturedOnActivity = (params as {onActivity?: (s: string) => void}).onActivity
+      })
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnActivity).toBeDefined()
+      capturedOnActivity?.('edited 1 file')
+
+      // #then — noteActivity called with the summary
+      expect(ctrl.noteActivity).toHaveBeenCalledWith('edited 1 file')
+    })
+
+    it('onBusy callback calls controller.setBusy', async () => {
+      // #given — capture the onBusy callback from runOpenCodeCore
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock()
+
+      let capturedOnBusy: ((busy: boolean) => void) | undefined
+      mockRunOpenCodeCore.mockImplementation(async params => {
+        capturedOnBusy = (params as {onBusy?: (b: boolean) => void}).onBusy
+      })
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      expect(capturedOnBusy).toBeDefined()
+      capturedOnBusy?.(true)
+      capturedOnBusy?.(false)
+
+      // #then — setBusy called with the correct values
+      expect(ctrl.setBusy).toHaveBeenCalledWith(true)
+      expect(ctrl.setBusy).toHaveBeenCalledWith(false)
+    })
+
+    it('edge (no output): empty answer → resolveToAnswer called with empty string → delegated → sink.flush called', async () => {
+      // #given — empty buffer; controller returns 'delegated' for empty answer
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const ctrl = makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+      const flushMock = vi.fn().mockResolvedValue({kind: 'empty' as const})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const deps = makeDeps()
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — resolveToAnswer called with empty string
+      expect(ctrl.resolveToAnswer).toHaveBeenCalledWith('')
+      // #and — sink.flush called (delegated → sink owns the no-output fallback)
+      expect(flushMock).toHaveBeenCalledOnce()
     })
   })
 })
