@@ -7,7 +7,9 @@
  * Handles SIGTERM gracefully with a 25s drain window.
  */
 
+import type {ProxyListeningRef} from './server.js'
 import process from 'node:process'
+
 import {serve} from '@hono/node-server'
 
 import {asyncCleanupAllAskpassDirs} from './clone.js'
@@ -28,13 +30,20 @@ const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 // The supervisor (runSupervisedOpencode) writes all transitions here.
 const opencodeStatus = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
 
+// Shared mutable state for bearer proxy listening state, read by /readyz.
+// Set to true when proxy.listen() resolves (OS port bind); cleared on close/error.
+// /readyz requires BOTH opencodeStatus === 'ready' AND proxyListening.listening === true.
+// Startup false-negative is avoided because the proxy binds (milliseconds) before
+// OpenCode finishes booting (seconds), so this is true before opencodeStatus → 'ready'.
+const proxyListeningRef: ProxyListeningRef = {listening: false}
+
 // AbortController for the supervised OpenCode lifecycle.
 // Aborting this stops the supervisor and reaps the child's process group.
 // Required because detached:true puts the child in its OWN process group —
 // it does NOT inherit SIGTERM from the parent on container stop.
 const opencodeController = new AbortController()
 
-const app = createApp({opencodeStatus})
+const app = createApp({opencodeStatus, proxyListening: proxyListeningRef})
 
 const server = serve({fetch: app.fetch, port: PORT, hostname: HOST}, info => {
   console.warn(`workspace-agent listening on ${info.address}:${info.port}`)
@@ -78,9 +87,27 @@ try {
     upstreamUrl: `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`,
     logger: opencodeLogger,
   })
-  proxy.listen(PROXY_PORT, HOST).catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error)
-    console.error('workspace-agent: proxy failed to start', {message})
+  // Wire the proxy listening signal into the readiness state.
+  // listen() resolves when the OS assigns the port (milliseconds), which happens
+  // before OpenCode finishes booting (seconds). This ensures proxyListeningRef.listening
+  // is true before opencodeStatus can transition to 'ready', avoiding a startup
+  // false-negative on /readyz.
+  proxy
+    .listen(PROXY_PORT, HOST)
+    .then(() => {
+      proxyListeningRef.listening = true
+    })
+    .catch((error: unknown) => {
+      proxyListeningRef.listening = false
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('workspace-agent: proxy failed to start', {message})
+    })
+  // Clear the signal if the proxy server closes or errors after startup.
+  proxy.server.on('close', () => {
+    proxyListeningRef.listening = false
+  })
+  proxy.server.on('error', () => {
+    proxyListeningRef.listening = false
   })
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error)
