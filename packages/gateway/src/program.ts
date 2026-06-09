@@ -278,6 +278,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           logger,
           approvalRegistry,
           approvalMode: config.approvalMode,
+          statusMode: config.statusMode,
           // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
           // Placed inside run so it is called after the concurrency gate, not before.
           readyz: async () => workspaceClient.readyz(),

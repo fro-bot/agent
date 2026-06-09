@@ -18,6 +18,9 @@ const DEFAULT_APPROVAL_MODE = 'approval-required' as const
 const VALID_APPROVAL_MODES = ['approval-required'] as const
 const DEFERRED_APPROVAL_MODES = ['autonomous-low-risk'] as const
 
+const DEFAULT_STATUS_MODE = 'live-status' as const
+const VALID_STATUS_MODES = ['live-status', 'typing-only'] as const
+
 const ALLOWED_PRIVILEGED_INTENTS = {
   MessageContent: GatewayIntentBits.MessageContent,
   GuildMembers: GatewayIntentBits.GuildMembers,
@@ -56,6 +59,13 @@ export interface GatewayConfig {
    * the rationale (OpenCode last-match-wins evaluation makes session-scoped denies unsafe).
    */
   readonly approvalMode: 'approval-required'
+  /**
+   * Deploy-wide working-state UX mode for mention runs.
+   * - `live-status` (default): posts a single editable status message that updates on a
+   *   debounced cadence while the agent works, then transitions into the final answer.
+   * - `typing-only`: suppresses the status message entirely; only the typing indicator is shown.
+   */
+  readonly statusMode: 'live-status' | 'typing-only'
   /**
    * Canonical Fro Bot persona text, read from `GATEWAY_PERSONA_FILE` (or `GATEWAY_PERSONA` env var).
    * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
@@ -301,6 +311,14 @@ export function loadGatewayConfig(): GatewayConfig {
   }
   const approvalMode = rawApprovalMode as GatewayConfig['approvalMode']
 
+  const rawStatusMode = readOptionalSecret('GATEWAY_STATUS_MODE') ?? DEFAULT_STATUS_MODE
+  if (!(VALID_STATUS_MODES as readonly string[]).includes(rawStatusMode)) {
+    throw new Error(
+      `Invalid GATEWAY_STATUS_MODE value: "${rawStatusMode}" (valid values: ${VALID_STATUS_MODES.join(', ')})`,
+    )
+  }
+  const statusMode = rawStatusMode as GatewayConfig['statusMode']
+
   const rawIntents = readOptionalSecret('DISCORD_PRIVILEGED_INTENTS')
   const privilegedIntents: GatewayIntentBits[] = []
   if (rawIntents !== null) {
@@ -464,6 +482,7 @@ export function loadGatewayConfig(): GatewayConfig {
     logLevel,
     privilegedIntents,
     approvalMode,
+    statusMode,
     persona,
     githubAppId,
     githubAppPrivateKey,

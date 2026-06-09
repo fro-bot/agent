@@ -47,6 +47,10 @@ services:
       # Absent → the loop falls back to built-in Discord guidance (fail-soft).
       # Provision the file from fro-bot/.github persona/fro-bot-persona.md.
       # GATEWAY_PERSONA_FILE: /run/secrets/gateway_persona
+      # Optional — working-state UX for the @-mention loop.
+      # live-status (default): posts a single live status message + typing indicator while the agent works.
+      # typing-only: shows only the typing indicator (quieter; no status message).
+      # GATEWAY_STATUS_MODE: live-status
       HTTPS_PROXY: http://mitmproxy:8080
       HTTP_PROXY: http://mitmproxy:8080
       NO_PROXY: workspace,localhost,127.0.0.1

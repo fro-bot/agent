@@ -99,6 +99,21 @@ export interface RunCoreParams {
    * supported mode). Fail-closed: if absent, `runOpenCodeCore` throws before session creation.
    */
   readonly coordinator?: PermissionCoordinator
+  /**
+   * Optional hook called with each essential tool-action summary string as it is appended.
+   * Receives the same summary string that `appendToolSummary` computes — no recomputation.
+   * Used by `run.ts` to drive the status controller's `noteActivity`.
+   * No-op when absent.
+   */
+  readonly onActivity?: (summary: string) => void
+  /**
+   * Optional hook called when the busy state changes.
+   * - `true`: work has started (prompt sent to session).
+   * - `false`: work has stopped (session.idle received, or run is blocked on an approval wait).
+   * Used by `run.ts` to drive the status controller's `setBusy`.
+   * No-op when absent.
+   */
+  readonly onBusy?: (busy: boolean) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -169,11 +184,15 @@ interface ToolCallInfo {
  * Calls `formatToolPart`, catches any exception (malformed input, unexpected
  * shape), logs `{tool, status}` only (no raw content), and appends nothing on
  * error. A throwing `formatToolPart` must never abort the event stream.
+ *
+ * When `onActivity` is provided, it is called with the same summary string
+ * that is appended to the sink — no recomputation.
  */
 function appendToolSummary(
   part: import('./format-part.js').ExtractedToolPart,
   sink: DiscordStreamSink,
   logger: GatewayLogger,
+  onActivity?: (summary: string) => void,
 ): void {
   let summary: string | null
   try {
@@ -184,6 +203,7 @@ function appendToolSummary(
   }
   if (summary !== null && summary.length > 0) {
     sink.append(`\n${summary}\n`)
+    onActivity?.(summary)
   }
 }
 
@@ -192,7 +212,7 @@ function appendToolSummary(
 // ---------------------------------------------------------------------------
 
 export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
-  const {handle, directory, promptText, sink, signal, logger, coordinator, approvalMode} = params
+  const {handle, directory, promptText, sink, signal, logger, coordinator, approvalMode, onActivity, onBusy} = params
   const {client} = handle
 
   // ── 0. Mode/coordinator pre-flight ────────────────────────────────────────
@@ -288,6 +308,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       throw new RunCoreError('prompt-error', `PromptAsync error: ${errMsg}`)
     }
     logger.info({sessionId, directory}, 'run-core: prompt sent')
+    // Signal busy: work has started — drive typing indicator in the status controller.
+    onBusy?.(true)
   } catch (error) {
     if (error instanceof RunCoreError) throw error
     const message = error instanceof Error ? error.message : String(error)
@@ -393,6 +415,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               },
               sink,
               logger,
+              onActivity,
             )
           }
         }
@@ -436,6 +459,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
               },
               sink,
               logger,
+              onActivity,
             )
           }
         }
@@ -449,6 +473,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         if (req === null) {
           logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
         } else {
+          // Pause typing while waiting on a human approval — the run is blocked,
+          // not actively working. Typing would falsely imply active work.
+          onBusy?.(false)
           // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
           // eslint-disable-next-line no-void
           void coordinator.onPermissionAsked(req)
@@ -464,6 +491,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         if (ev === null) {
           logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
         } else {
+          // Approval resolved — resume typing if the run continues.
+          onBusy?.(true)
           coordinator.onPermissionReplied(ev)
           logger.info(
             {requestID: ev.requestID, reply: ev.reply},
@@ -475,6 +504,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       const eventSessionID = getEventSessionID(rawEvent)
       if (eventSessionID === sessionId) {
         logger.info({sessionId}, 'run-core: session.idle received — stream complete')
+        // Signal not-busy: work is done.
+        onBusy?.(false)
         return
       }
     } else if (eventType === 'session.error') {
