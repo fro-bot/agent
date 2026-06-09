@@ -84,7 +84,7 @@ Source: [#847](https://github.com/fro-bot/agent/issues/847) and its Fro Bot tria
 
 ## Implementation Units
 
-- [ ] **Unit 1: Hermetic entry + scoped rootDir (root-cause fix)**
+- [x] **Unit 1: Hermetic entry + scoped rootDir (root-cause fix)**
 
 **Goal:** Make the workspace-agent build resolve only its own `src/main.ts`, regardless of CWD or repo-root files.
 
@@ -112,7 +112,7 @@ Source: [#847](https://github.com/fro-bot/agent/issues/847) and its Fro Bot tria
 **Verification:**
 - From the repo root, the workspace-agent bundle entry is the package's own `main.ts` (asserted by Unit 2's guard), and types/build are clean.
 
-- [ ] **Unit 2: Post-build symbol guard (defense-in-depth)**
+- [x] **Unit 2: Post-build symbol guard (defense-in-depth)**
 
 **Goal:** Fail the build if the produced bundle does not contain a known workspace-agent symbol.
 
@@ -140,7 +140,7 @@ Source: [#847](https://github.com/fro-bot/agent/issues/847) and its Fro Bot tria
 **Verification:**
 - A deliberately wrong entry (or empty bundle) causes the build to fail with the descriptive guard error; the correct build passes.
 
-- [ ] **Unit 3: CI repo-root build regression step**
+- [x] **Unit 3: CI repo-root build regression step**
 
 **Goal:** Catch the full-monorepo regression in CI — the context the Docker smoke test cannot reproduce.
 
