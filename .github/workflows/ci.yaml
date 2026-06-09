@@ -357,6 +357,28 @@ jobs:
         run: bash deploy/validate-stack.sh --topology-only
       - name: Topology guard negative test
         run: bash deploy/validate-stack.test.sh
+      - name: Build workspace-agent from repo root (full-monorepo regression guard)
+        run: |
+          # Build from the repo root where src/main.ts (the action harness) is present.
+          # This reproduces the full-monorepo context the Docker build cannot — Docker
+          # copies only apps/workspace-agent/ and never sees the repo-root src/.
+          # The tsdown post-build guard (bundleSymbolGuardPlugin) fails the build if the
+          # wrong entry is bundled; the grep assertions below give a clear CI failure message.
+          pnpm --filter @fro-bot/workspace-agent build
+      - name: Assert workspace-agent bundle contains expected symbol (not action harness)
+        run: |
+          if ! grep -q "startWorkspaceAgent" apps/workspace-agent/dist/main.mjs; then
+            echo "REGRESSION: startWorkspaceAgent not found in apps/workspace-agent/dist/main.mjs"
+            echo "The bundle likely resolved the repo-root action harness (src/main.ts) instead of apps/workspace-agent/src/main.ts"
+            exit 1
+          fi
+          echo "OK: startWorkspaceAgent present in bundle"
+          if grep -q "await run()" apps/workspace-agent/dist/main.mjs; then
+            echo "REGRESSION: action harness entry (await run()) found in apps/workspace-agent/dist/main.mjs"
+            echo "The bundle resolved the repo-root action harness instead of the workspace-agent entry"
+            exit 1
+          fi
+          echo "OK: action harness entry not present in bundle"
       - name: Build workspace Docker image
         run: |
           for attempt in 1 2 3; do
