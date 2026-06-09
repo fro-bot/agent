@@ -175,6 +175,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       installUrl: config.gatewayGitHubAppInstallUrl,
       logger: addProjectLogger,
       isShuttingDown,
+      queue: channelQueue,
     }
 
     const registry = getCommandRegistry(commandDeps)
