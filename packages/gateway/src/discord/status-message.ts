@@ -118,6 +118,14 @@ export interface StatusControllerDeps {
  * Aggregate activity summaries into a human-readable status line.
  * Counts occurrences of key action verbs and formats them as a compact summary.
  * e.g. `⏳ Working… edited 2 times · ran 1 time`
+ *
+ * **Input contract**: each `summary` string must start with an action verb
+ * (e.g. `edited`, `ran`, `read`). The grouping logic extracts the FIRST WORD
+ * of each summary as the verb key — this matches the current `formatToolPart`
+ * outputs. If a future tool summary starts with a noun or article instead of a
+ * verb, grouping degrades silently to less-useful counts rather than erroring.
+ * Callers supplying summaries via the `onActivity` callback should follow this
+ * convention.
  */
 function buildStatusContent(summaries: readonly string[]): string {
   if (summaries.length === 0) {
@@ -362,6 +370,10 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
   const resolveToAnswer = async (text: string): Promise<TransitionResult> => {
     // P2: mark terminal before settle so noteActivity no-ops during the await
     terminal = true
+    // NOTE: typingInterval is intentionally NOT cleared here. dispose() (always
+    // called in run.ts's finally) is responsible for clearing it. Any typing
+    // pulse that fires between this terminal transition and dispose() is harmless
+    // because the pulse callback no-ops once `disposed` is true.
 
     await settle()
 
@@ -388,7 +400,14 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
       return {transition: 'delegated'}
     }
 
-    // Long answer (>2000 chars): delete status and delegate
+    // Long answer (>2000 chars): delete status and delegate.
+    // NOTE: intentionally uses raw `text.length`, NOT `trimmed.length`.
+    // Discord's 2000-character limit counts raw characters including whitespace,
+    // so a >2000-char string would be rejected by the API regardless of how much
+    // leading/trailing whitespace it contains. The empty check above uses
+    // `trimmed.length` because "empty" is a semantic question (all-whitespace
+    // counts as empty); this check doesn't trim because "fits one Discord
+    // message" is a raw-length question.
     if (text.length > MAX_DISCORD_MESSAGE_LENGTH) {
       await safeDelete(statusMessage)
       statusMessage = null
@@ -449,6 +468,12 @@ export function createStatusController(deps: StatusControllerDeps): StatusContro
       clearInterval(typingInterval)
       typingInterval = null
     }
+    // NOTE: dispose does NOT delete an unresolved status message. In normal
+    // call-graph order, resolveToAnswer or resolveToFailure always runs before
+    // dispose (dispose is the safety net in run.ts's finally), so the status
+    // message is already resolved (edited or deleted) by the time dispose runs.
+    // Future callers must NOT rely on dispose to clean up an unresolved status
+    // message — call resolveToFailure explicitly before dispose if needed.
   }
 
   return {noteActivity, setBusy, resolveToAnswer, resolveToFailure, dispose}
