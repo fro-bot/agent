@@ -1,10 +1,11 @@
 ---
 title: "feat: Serial per-channel queue for mention loop"
 type: feat
-status: active
+status: completed
 date: 2026-06-09
 origin: docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md
 deepened: 2026-06-09
+completed: 2026-06-09
 ---
 
 # feat: Serial per-channel queue for mention loop
@@ -93,7 +94,7 @@ Two serialization layers exist and only one changes: the **per-channel concurren
 
 ## Implementation Units
 
-- [ ] **Unit 1: In-memory channel queue component**
+- [x] **Unit 1: In-memory channel queue component**
 
 **Goal:** A `ChannelQueue` that holds pending per-channel tasks FIFO with an atomic `takeNext` pop, plus clear-by-channel and a required depth cap.
 
@@ -128,7 +129,7 @@ Two serialization layers exist and only one changes: the **per-channel concurren
 
 **Verification:** Queue holds/returns tasks FIFO, isolates channels, enforces the depth cap, clears pending by channel, and `takeNext` never double-returns a task.
 
-- [ ] **Unit 2: `startRun` seam + front-door enqueue + atomic handoff**
+- [x] **Unit 2: `startRun` seam + front-door enqueue + atomic handoff**
 
 **Goal:** Split `runMention` into an acquire-or-enqueue front door and a slot-holding `startRun` pipeline; replace the `'busy'` reject with enqueue+ack; hand the slot to the next queued task atomically on completion (no release-then-drain gap).
 
@@ -170,7 +171,7 @@ Two serialization layers exist and only one changes: the **per-channel concurren
 
 **Verification:** A busy-channel mention is queued+acked and runs after the current finishes in FIFO order; the slot is handed off without a free-slot gap (no double-start); a new mention with pending work enqueues rather than leapfrogging; `'cap'`/lock behavior unchanged.
 
-- [ ] **Unit 3: `/fro-bot clear-queue` subcommand**
+- [x] **Unit 3: `/fro-bot clear-queue` subcommand**
 
 **Goal:** Operators/users can drop pending queued tasks for their channel; the in-flight run is unaffected.
 
