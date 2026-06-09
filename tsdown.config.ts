@@ -181,7 +181,15 @@ function licenseCollectorPlugin(): Plugin {
       const highestVersions = new Map<string, {version: string; license: string; content: string}>()
       const licenseTypeMap = buildLicenseTypeMap(await getPnpmLicensesJson())
 
-      const licenses = await getProjectLicenses('./package.json')
+      let licenses: Awaited<ReturnType<typeof getProjectLicenses>>
+      try {
+        licenses = await getProjectLicenses('./package.json')
+      } catch (error) {
+        console.warn(
+          `[license-collector] getProjectLicenses failed (${error instanceof Error ? error.message : String(error)}); preserving existing licenses.txt`,
+        )
+        return
+      }
 
       for (const license of licenses) {
         for (const dep of license.dependencies) {
