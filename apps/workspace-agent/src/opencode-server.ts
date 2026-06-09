@@ -46,8 +46,14 @@ export type SpawnFn = (
 const nodeSpawn: SpawnFn = (command, args, options) =>
   nodeSpawnRaw(command, [...args], options) as unknown as ChildHandle
 
-/** Readiness probe — return true if the server is accepting connections. */
-export type PollReadyFn = (url: string, signal?: AbortSignal) => Promise<boolean>
+/**
+ * Readiness probe — return true if the server is accepting connections.
+ *
+ * The optional `probeTimeoutMs` parameter allows the caller to pass a
+ * per-probe deadline cap (e.g. the remaining overall deadline) so a single
+ * probe cannot overshoot the overall readiness timeout.
+ */
+export type PollReadyFn = (url: string, signal?: AbortSignal, probeTimeoutMs?: number) => Promise<boolean>
 
 export interface OpencodeServerHandle {
   /** Loopback URL, e.g. http://127.0.0.1:54321 */
@@ -90,6 +96,17 @@ export interface DefaultPollReadyOptions {
    * the outer deadline loop can retry. Default: 3000ms.
    */
   readonly probeTimeoutMs?: number
+}
+
+/**
+ * Clamp the per-probe timeout to the remaining overall deadline.
+ *
+ * Prevents a single probe from overshooting the overall readiness timeout.
+ * Math.max(1, …) floors at 1ms so clock jitter never produces a zero or
+ * negative timeout (which would fire immediately or be rejected by setTimeout).
+ */
+function clampProbeTimeout(remaining: number, max: number): number {
+  return Math.max(1, Math.min(max, remaining))
 }
 
 /**
@@ -189,7 +206,9 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
     readyTimeoutMs = 60_000,
     pollIntervalMs = 250,
     spawnFn = nodeSpawn,
-    pollReadyFn = defaultPollReady,
+    // Default: wrap defaultPollReady to thread the per-probe timeout cap through.
+    pollReadyFn = async (url: string, sig?: AbortSignal, probeTimeoutMs?: number) =>
+      defaultPollReady(url, sig, probeTimeoutMs === undefined ? undefined : {probeTimeoutMs}),
   } = options
 
   const url = `http://${hostname}:${port}`
@@ -231,13 +250,25 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
 
   // Poll until ready or timeout
   const deadline = Date.now() + readyTimeoutMs
+  // Default per-probe timeout (3s) — capped to remaining deadline each iteration.
+  const defaultProbeTimeoutMs = 3_000
 
-  while (Date.now() < deadline) {
+  while (true) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      // Overall deadline reached — exit before probing.
+      break
+    }
+
     if (state.exited === true) {
       throw new Error(`opencode process exited before becoming ready (exit code: ${state.exitCode})`)
     }
 
-    const ready = await pollReadyFn(url, signal)
+    // Cap the per-probe timeout to the remaining deadline so a single probe
+    // cannot overshoot the overall readiness timeout. Math.max(1, …) prevents
+    // clock jitter from producing a 0 or negative timeout.
+    const probeTimeoutMs = clampProbeTimeout(remaining, defaultProbeTimeoutMs)
+    const ready = await pollReadyFn(url, signal, probeTimeoutMs)
     if (ready === true) {
       logger.info('opencode-server: ready', {url})
       return {
@@ -330,7 +361,9 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
     maxBackoffMs = 10_000,
     stableReadyResetMs = 60_000,
     spawnFn = nodeSpawn,
-    pollReadyFn = defaultPollReady,
+    // Default: wrap defaultPollReady to thread the per-probe timeout cap through.
+    pollReadyFn = async (url: string, sig?: AbortSignal, probeTimeoutMs?: number) =>
+      defaultPollReady(url, sig, probeTimeoutMs === undefined ? undefined : {probeTimeoutMs}),
   } = options
 
   const url = `http://${hostname}:${port}`
@@ -424,8 +457,16 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
       const deadline = Date.now() + readyTimeoutMs
       let becameReady = false
       let readyAt = 0
+      // Default per-probe timeout (3s) — capped to remaining deadline each iteration.
+      const defaultProbeTimeoutMs = 3_000
 
-      while (Date.now() < deadline) {
+      while (true) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          // Overall deadline reached — exit before probing.
+          break
+        }
+
         // Fix 4: abort check inside the readiness poll loop.
         if (signal !== undefined && signal.aborted) {
           if (state.exited === false) {
@@ -439,7 +480,11 @@ export async function runSupervisedOpencode(options: RunSupervisedOpencodeOption
           break
         }
 
-        const ready = await pollReadyFn(url, signal)
+        // Cap the per-probe timeout to the remaining deadline so a single probe
+        // cannot overshoot the overall readiness timeout. Math.max(1, …) prevents
+        // clock jitter from producing a 0 or negative timeout.
+        const probeTimeoutMs = clampProbeTimeout(remaining, defaultProbeTimeoutMs)
+        const ready = await pollReadyFn(url, signal, probeTimeoutMs)
         if (ready === true) {
           becameReady = true
           readyAt = Date.now()
