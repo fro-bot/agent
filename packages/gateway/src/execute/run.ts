@@ -42,7 +42,7 @@ export interface RunMentionDeps {
   /**
    * Optional canonical persona text (from `GatewayConfig.persona`).
    * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
-   * `null` → mechanical guidance only (R4 fail-soft).
+   * `null` → mechanical guidance only (fail-soft: omit persona rather than failing).
    */
   readonly persona: string | null
   readonly logger: GatewayLogger
@@ -60,6 +60,15 @@ export interface RunMentionDeps {
    * - `typing-only`: suppresses the status message; only the typing indicator is shown.
    */
   readonly statusMode: 'live-status' | 'typing-only'
+  /**
+   * Optional shutdown-drain hook. When present, called with the handoff promise so the
+   * program-level drain set can await it on SIGTERM. The completing run does NOT await
+   * the handoff — it remains fire-and-forget from the completing run's perspective.
+   *
+   * When absent (e.g. in tests that don't exercise shutdown drain), the handoff behaves
+   * exactly as before: fire-and-forget with no external tracking.
+   */
+  readonly trackRun?: (p: Promise<void>) => void
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -200,6 +209,12 @@ async function startRun(task: RunTask): Promise<void> {
     logger,
   } = deps
   const {approvalRegistry, approvalMode, statusMode, ensureClone, readyz} = deps
+
+  // ── All mutable state that the outer finally needs is declared here so the
+  // finally block can always reference channelId regardless of where execution
+  // stopped. Async functions never throw synchronously, so the outer try/finally
+  // always runs — but keeping these declarations before the try makes the
+  // dependency explicit and avoids any ambiguity.
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
@@ -254,7 +269,14 @@ async function startRun(task: RunTask): Promise<void> {
     // ── Create response thread ─────────────────────────────────────────────────────────────────
 
     const runId = crypto.randomUUID()
-    const rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
+    let rawThread: Awaited<ReturnType<typeof message.startThread>>
+    try {
+      rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
+    } catch (threadError) {
+      logger.error({channelId, repo, err: String(threadError)}, 'run: startThread threw — aborting')
+      await safeReply(message, 'Could not start the task — please try again.')
+      return
+    }
     const threadId = rawThread.id
     const thread: SinkThread = rawThread
 
@@ -697,13 +719,17 @@ async function startRun(task: RunTask): Promise<void> {
       concurrency.release(channelId)
     } else {
       // Slot ownership transfers to the next run — do NOT call concurrency.release.
-      // eslint-disable-next-line no-void
-      void startRun(nextTask).catch((error: unknown) => {
+      const handoffPromise = startRun(nextTask).catch((error: unknown) => {
         logger.error(
           {channelId, err: error instanceof Error ? error.message : String(error)},
           'run: handoff startRun failed',
         )
       })
+      // Register the handoff promise with the shutdown drain if a tracker is provided,
+      // so SIGTERM can await it before tearing down. The completing run does not await it.
+      deps.trackRun?.(handoffPromise)
+      // eslint-disable-next-line no-void
+      void handoffPromise
     }
   }
 }
@@ -716,12 +742,12 @@ async function startRun(task: RunTask): Promise<void> {
  * Front door for a mention-triggered run.
  *
  * Decides whether to run immediately or enqueue, in this order:
- * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (FIFO fix: pending work
- *    has priority; never take an immediate slot ahead of it).
+ * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (pending work has
+ *    priority; never take an immediate slot ahead of it).
  * 2. Else `concurrency.tryAcquire(channelId)`:
  *    - `'ok'`   → `startRun(task)` (slot held).
  *    - `'busy'` → enqueue + queued ack (or "queue is full" if at capacity). Return without blocking.
- *    - `'cap'`  → terminal capacity reply, no enqueue (R6: global cap stays terminal).
+ *    - `'cap'`  → terminal capacity reply, no enqueue (global cap stays terminal).
  *
  * Hard invariants:
  * - `'cap'` is TERMINAL — no queue, no retry.
@@ -730,6 +756,18 @@ async function startRun(task: RunTask): Promise<void> {
  * - Bearer token (`attachToken`) is never logged.
  * - Every Discord send uses `allowedMentions: {parse: []}`.
  */
+/**
+ * Send the appropriate ephemeral ack for an enqueue result.
+ * Centralises the two reply strings so they live in exactly one place.
+ */
+async function ackEnqueueResult(message: Message, result: 'queued' | 'full'): Promise<void> {
+  if (result === 'queued') {
+    await safeReply(message, "Queued — I'll start this when the current task finishes.")
+  } else {
+    await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
+  }
+}
+
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, queue} = deps
   const channelId = message.channel.id
@@ -739,12 +777,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // A new mention must never leapfrog older queued work, even if a slot is free.
   // Only the handoff path (startRun's outer finally) may start the next task.
   if (queue.pendingCount(channelId) > 0) {
-    const result = queue.enqueue(channelId, task)
-    if (result === 'queued') {
-      await safeReply(message, "Queued — I'll start this when the current task finishes.")
-    } else {
-      await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
-    }
+    await ackEnqueueResult(message, queue.enqueue(channelId, task))
     return
   }
 
@@ -757,13 +790,8 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   }
 
   if (slotResult === 'busy') {
-    // Channel has an in-flight run — enqueue instead of rejecting (R1).
-    const enqueueResult = queue.enqueue(channelId, task)
-    if (enqueueResult === 'queued') {
-      await safeReply(message, "Queued — I'll start this when the current task finishes.")
-    } else {
-      await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
-    }
+    // Channel has an in-flight run — enqueue instead of rejecting.
+    await ackEnqueueResult(message, queue.enqueue(channelId, task))
     return
   }
 

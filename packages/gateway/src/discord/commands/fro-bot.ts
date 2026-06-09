@@ -13,12 +13,14 @@
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
+import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
 import type {SlashCommand} from './index.js'
 
 import {SlashCommandBuilder} from 'discord.js'
 import {Effect} from 'effect'
 
+import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
 import {executePing} from './ping.js'
 
@@ -35,6 +37,15 @@ import {executePing} from './ping.js'
 export interface FroBotDeps extends AddProjectDeps {
   /** Per-channel FIFO queue — the same instance used by the run path. */
   readonly queue: ChannelQueue<RunTask>
+  /**
+   * Discord role ID that confers trigger authorization.
+   * Mirrors the same field in `MentionDeps` — used by `clear-queue` to apply
+   * the same auth gate as the mention path (trigger role OR guild ManageChannels).
+   * `null` → fall back to guild-level ManageChannels.
+   */
+  readonly triggerRoleId: string | null
+  /** Gateway-scoped logger (context-first) for auth-gate resolution errors. */
+  readonly gatewayLogger: GatewayLogger
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +95,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
     }
 
     if (subcommand === 'clear-queue') {
-      return executeClearQueue(interaction, deps.queue)
+      return executeClearQueue(interaction, deps)
     }
 
     return Effect.fail(new Error(`Unknown subcommand: ${subcommand}`))
@@ -100,18 +111,38 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
 /**
  * Handler for the `/fro-bot clear-queue` subcommand.
  *
+ * Authorization-gated: only users who pass the same authority check as the
+ * mention path (trigger role OR guild-level ManageChannels) may clear the queue.
+ * Fail closed: null guild or auth resolution failure → deny.
+ *
  * Drops all pending queued tasks for the invoking channel and replies
  * ephemerally with the count dropped. The in-flight run (if any) is
  * unaffected — it holds the concurrency slot, not the queue.
  */
-function executeClearQueue(
-  interaction: ChatInputCommandInteraction,
-  queue: ChannelQueue<RunTask>,
-): Effect.Effect<void, Error> {
+function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBotDeps): Effect.Effect<void, Error> {
   return Effect.tryPromise({
     try: async () => {
+      // Fail closed: command must be used inside a server (guild).
+      const guild = interaction.guild
+      if (guild === null) {
+        await interaction.reply({
+          content: 'This command must be used in a server.',
+          ephemeral: true,
+        })
+        return
+      }
+
+      const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, deps.gatewayLogger)
+      if (authorized === false) {
+        await interaction.reply({
+          content: 'You do not have permission to clear the queue.',
+          ephemeral: true,
+        })
+        return
+      }
+
       const channelId = interaction.channelId
-      const dropped = queue.clear(channelId)
+      const dropped = deps.queue.clear(channelId)
       await interaction.reply({
         content: `Cleared ${dropped} queued task(s). The running task will finish.`,
         ephemeral: true,

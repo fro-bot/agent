@@ -176,6 +176,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger: addProjectLogger,
       isShuttingDown,
       queue: channelQueue,
+      triggerRoleId: config.triggerRoleId,
+      gatewayLogger: logger,
     }
 
     const registry = getCommandRegistry(commandDeps)
@@ -303,6 +305,18 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                 error: (msg, meta) => logger.error(meta ?? {}, msg),
               },
             }),
+          // Shutdown-drain hook: register handoff promises in the same inFlightRuns
+          // set so SIGTERM can await them before tearing down. Mirrors the
+          // add-at-inFlightRuns / delete-in-finally pattern used for the initial
+          // handleMention promise above.
+          trackRun: (p: Promise<void>) => {
+            inFlightRuns.add(p)
+            p.finally(() => {
+              inFlightRuns.delete(p)
+            }).catch(() => {
+              // Errors are already handled inside the handoff promise; finally() cannot throw here.
+            })
+          },
         },
         logger,
       }

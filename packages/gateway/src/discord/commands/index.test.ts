@@ -39,6 +39,13 @@ function makeMockDeps(): FroBotDeps {
       takeNext: vi.fn().mockReturnValue(undefined),
       clear: vi.fn().mockReturnValue(0),
     },
+    triggerRoleId: null,
+    gatewayLogger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
   }
 }
 

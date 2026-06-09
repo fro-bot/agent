@@ -1016,7 +1016,7 @@ describe('runMention', () => {
       expect(lastCall.content).toMatch(/time.?limit|timed? ?out/i)
     })
 
-    // ── Timeout copy branching (Unit 2) ─────────────────────────────────────
+    // ── Timeout copy branching ───────────────────────────────────────────────
 
     it('timeout with no visible output: message includes configured duration and generic retry guidance', async () => {
       // #given — no visible output; runTimeoutMs = 600_000 (10 min)
@@ -1479,7 +1479,7 @@ describe('runMention', () => {
     })
   })
 
-  // ── Approval pending-visibility race (Unit 2) ───────────────────────────
+  // ── Approval pending-visibility race ────────────────────────────────────
 
   describe('approval pending-visibility race', () => {
     it('approval send STARTED but UNRESOLVED when timeout fires → visible-output timeout copy chosen', async () => {
@@ -1956,7 +1956,7 @@ describe('runMention', () => {
     })
   })
 
-  // ── Approval mode propagation (Unit 2) ──────────────────────────────────
+  // ── Approval mode propagation ────────────────────────────────────────────
 
   describe('approval mode propagation', () => {
     it('approval-required: runOpenCodeCore is called with approvalMode === "approval-required"', async () => {
@@ -2284,9 +2284,9 @@ describe('runMention', () => {
     })
   })
 
-  // ── Unit 4: Approval wait and timeout UX ────────────────────────────────
+  // ── Approval wait and timeout UX ────────────────────────────────────────
 
-  describe('approval wait and timeout UX (Unit 4)', () => {
+  describe('approval wait and timeout UX', () => {
     it('computeApprovalDeadlineMs: uses remainingBudgetMs (not raw runTimeoutMs) — shorter budget yields shorter deadline', async () => {
       // #given — the function should accept remainingBudgetMs
       const {computeApprovalDeadlineMs} = await import('./run.js')
@@ -2608,9 +2608,9 @@ describe('runMention', () => {
     })
   })
 
-  // ── Unit 3: Status controller wiring ────────────────────────────────────
+  // ── Status controller wiring ─────────────────────────────────────────────
 
-  describe('status controller wiring (Unit 3)', () => {
+  describe('status controller wiring', () => {
     it('integration (live-status, short answer): resolveToAnswer(handled) → sink.flush NOT called', async () => {
       // #given — status controller returns 'handled' (edited in place)
       const {runMention} = await import('./run.js')
@@ -3011,10 +3011,10 @@ describe('runMention', () => {
     })
   })
 
-  // ── Unit 2: Serial per-channel queue — front door + atomic handoff ───────
+  // ── Serial per-channel queue — front door + atomic handoff ─────────────
 
-  describe('serial per-channel queue (Unit 2)', () => {
-    // ── R1: busy → enqueue + queued ack ─────────────────────────────────────
+  describe('serial per-channel queue', () => {
+    // ── busy → enqueue + queued ack ──────────────────────────────────────────
 
     it('r1: mention while channel busy → queue.enqueue called + queued ack sent (not old reject)', async () => {
       // #given — channel is busy; queue has capacity
@@ -3119,7 +3119,7 @@ describe('runMention', () => {
       expect(call.content).toMatch(/queue/i)
     })
 
-    // ── R2: completion with pending task → takeNext + next startRun ──────────
+    // ── completion with pending task → takeNext + next startRun ─────────────
 
     it('r2: completion with pending task → takeNext called + next startRun begins', async () => {
       // #given — first run completes; queue has one pending task
@@ -3247,7 +3247,7 @@ describe('runMention', () => {
       expect(callOrder.slice(firstRunIdx + 1, secondRunIdx)).not.toContain('release')
     })
 
-    // ── R5/R6: ok path and cap path unchanged ────────────────────────────────
+    // ── ok path and cap path ─────────────────────────────────────────────────
 
     it('r5: ok path (no pending work) runs normally — startRun pipeline invoked', async () => {
       // #given — no pending work; tryAcquire returns ok
@@ -3289,7 +3289,7 @@ describe('runMention', () => {
       expect(message.reply).toHaveBeenCalledOnce()
       const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
       expect(call.content).toContain('capacity')
-      // #and — NOT enqueued (R6: cap stays terminal)
+      // #and — NOT enqueued (cap stays terminal)
       expect(queue.enqueue).not.toHaveBeenCalled()
       // #and — no thread created
       expect(message.startThread).not.toHaveBeenCalled()
@@ -3427,6 +3427,279 @@ describe('runMention', () => {
       // #and — queue fully drained
       expect(realQueue.pendingCount(CHANNEL_ID)).toBe(0)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// F1: trackRun — shutdown-drain hook for handoff promises
+// ---------------------------------------------------------------------------
+
+describe('trackRun — shutdown-drain hook', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('trackRun is called with the handoff promise when a queued task is handed off', async () => {
+    // #given — first run completes; queue has one pending task
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const trackRun = vi.fn()
+    const sharedConcurrency = {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: vi.fn(),
+      activeCount: vi.fn().mockReturnValue(1),
+      max: 3,
+    }
+    const queue = makeDefaultQueue()
+
+    const pendingMessage = makeMessage()
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+    // Allow the fire-and-forget handoff to settle
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — trackRun was called with a Promise (the handoff promise)
+    expect(trackRun).toHaveBeenCalledOnce()
+    const arg: unknown = trackRun.mock.calls[0]?.[0]
+    expect(arg).toBeInstanceOf(Promise)
+  })
+
+  it('the completing run does NOT await the handoff (returns before handoff settles)', async () => {
+    // #given — first run completes; queue has one pending task that is slow
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const handoffSettled: string[] = []
+    const trackRun = vi.fn()
+
+    const sharedConcurrency = {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: vi.fn(),
+      activeCount: vi.fn().mockReturnValue(1),
+      max: 3,
+    }
+    const queue = makeDefaultQueue()
+
+    // Handoff run is slow — resolves after a delay
+    let resolveHandoff!: () => void
+    const handoffPaused = new Promise<void>(resolve => {
+      resolveHandoff = resolve
+    })
+
+    const pendingMessage = makeMessage()
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
+
+    // First run resolves immediately; second (handoff) waits
+    mockRunOpenCodeCore
+      .mockResolvedValueOnce(undefined) // first run
+      .mockImplementationOnce(async () => {
+        await handoffPaused
+        handoffSettled.push('handoff-done')
+      })
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const message = makeMessage()
+
+    // #when — await the first run (should return before handoff settles)
+    await runMention(message, makeBinding(), deps)
+
+    // #then — handoff has NOT settled yet (completing run did not await it)
+    expect(handoffSettled).toHaveLength(0)
+
+    // Cleanup: resolve the handoff so the test doesn't leak
+    resolveHandoff()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(handoffSettled).toHaveLength(1)
+  })
+
+  it('trackRun is NOT called when the queue is empty (no handoff)', async () => {
+    // #given — first run completes; queue is empty
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const trackRun = vi.fn()
+    const queue = makeDefaultQueue()
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValue(undefined)
+
+    const deps = makeDeps({queue, trackRun})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — no handoff → trackRun not called
+    expect(trackRun).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// F3: startThread throws → failure reply sent to message
+// ---------------------------------------------------------------------------
+
+describe('startThread throws — failure reply sent', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('startThread rejection → safeReply sent to message, no thread-level send', async () => {
+    // #given — startThread rejects (e.g. Discord API error)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const message = makeMessage()
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Discord API error'))
+
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — a failure reply was sent to the original message
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toMatch(/could not start|please try again/i)
+
+    // #and — no thread-level sends (thread was never created)
+    expect(message._thread.send).not.toHaveBeenCalled()
+  })
+
+  it('startThread rejection → concurrency slot is released in outer finally', async () => {
+    // #given — startThread rejects
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const message = makeMessage()
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('thread creation failed'))
+
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — slot released (outer finally ran)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// F8: Additional handoff unit tests
+// ---------------------------------------------------------------------------
+
+describe('handoff unit tests (F8)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('mocked handoff: startRun runs for the next task; release NOT called during handoff; release IS called when takeNext returns undefined', async () => {
+    // #given — first run completes; queue has one pending task
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const callOrder: string[] = []
+
+    releaseFn.mockImplementation(() => {
+      callOrder.push('release')
+    })
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      callOrder.push('runOpenCodeCore')
+    })
+
+    const sharedConcurrency = {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: releaseFn,
+      activeCount: vi.fn().mockReturnValue(1),
+      max: 3,
+    }
+    const queue = makeDefaultQueue()
+
+    const pendingMessage = makeMessage()
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
+    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+
+    // First takeNext returns the pending task; second returns undefined (queue empty)
+    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — (1) startRun ran for the next task (runOpenCodeCore called twice)
+    expect(callOrder.filter(e => e === 'runOpenCodeCore')).toHaveLength(2)
+    // #and — (2) release NOT called during handoff (only after second run)
+    const firstRunIdx = callOrder.indexOf('runOpenCodeCore')
+    const secondRunIdx = callOrder.lastIndexOf('runOpenCodeCore')
+    const releaseIdx = callOrder.indexOf('release')
+    expect(callOrder.slice(firstRunIdx + 1, secondRunIdx)).not.toContain('release')
+    // #and — (3) release IS called after takeNext returns undefined
+    expect(releaseIdx).toBeGreaterThan(secondRunIdx)
+    expect(releaseFn).toHaveBeenCalledExactlyOnceWith(CHANNEL_ID)
+  })
+
+  it('fIFO-gate full branch: pendingCount > 0 and enqueue returns "full" → "queue is full" reply', async () => {
+    // #given — pending work exists; queue is at capacity
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const queue = makeDefaultQueue()
+    ;(queue.pendingCount as ReturnType<typeof vi.fn>).mockReturnValue(1)
+    ;(queue.enqueue as ReturnType<typeof vi.fn>).mockReturnValue('full')
+
+    const deps = makeDeps({queue})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — "queue is full" reply via the FIFO-gate path
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toMatch(/full/i)
+    // #and — ensureClone NOT called (rejected before pipeline)
+    expect(message.startThread).not.toHaveBeenCalled()
+  })
+
+  it('fIFO-gate: ensureClone not called when pendingCount > 0', async () => {
+    // #given — pending work exists; slot would be free
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const ensureClone = makeEnsureCloneFn('success')
+    const queue = makeDefaultQueue()
+    ;(queue.pendingCount as ReturnType<typeof vi.fn>).mockReturnValue(1)
+    ;(queue.enqueue as ReturnType<typeof vi.fn>).mockReturnValue('queued')
+
+    const deps = makeDeps({queue, ensureClone})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — ensureClone NOT called (FIFO gate short-circuits before pipeline)
+    expect(ensureClone).not.toHaveBeenCalled()
   })
 })
 

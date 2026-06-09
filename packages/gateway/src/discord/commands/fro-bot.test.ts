@@ -6,10 +6,11 @@
  * - Dispatch routing for each subcommand
  * - `/fro-bot clear-queue` handler: calls queue.clear(channelId), replies ephemerally with count
  * - Zero-pending edge case
- * - R3: clear-queue does not touch the in-flight run (only queue.clear is called)
+ * - clear-queue does not touch the in-flight run (only queue.clear is called)
+ * - Authorization gate: only authorized users may clear the queue
  */
 
-import type {ChatInputCommandInteraction} from 'discord.js'
+import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
 import type {FroBotDeps} from './fro-bot.js'
@@ -30,6 +31,29 @@ function makeQueue(clearReturnValue = 0): ChannelQueue<RunTask> {
     takeNext: vi.fn().mockReturnValue(undefined),
     clear: vi.fn().mockReturnValue(clearReturnValue),
   }
+}
+
+/**
+ * Build a mock Guild where members.fetch() resolves to a member with the given
+ * role set and ManageChannels permission.
+ */
+function makeGuild(opts: {hasRole?: boolean; hasManageChannels?: boolean} = {}): Guild {
+  const {hasRole = true, hasManageChannels = true} = opts
+  const member = {
+    roles: {
+      cache: {
+        has: vi.fn().mockReturnValue(hasRole),
+      },
+    },
+    permissions: {
+      has: vi.fn().mockReturnValue(hasManageChannels),
+    },
+  }
+  return {
+    members: {
+      fetch: vi.fn().mockResolvedValue(member),
+    },
+  } as unknown as Guild
 }
 
 function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
@@ -55,6 +79,13 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
       error: vi.fn(),
     },
     queue: makeQueue(),
+    triggerRoleId: null,
+    gatewayLogger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
     ...overrides,
   }
 }
@@ -62,6 +93,8 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
 function makeInteraction(
   subcommand: string,
   channelId = 'ch-test-123',
+  guild: Guild | null = makeGuild(),
+  userId = 'user-authorized-123',
 ): {
   interaction: ChatInputCommandInteraction
   reply: ReturnType<typeof vi.fn>
@@ -70,6 +103,8 @@ function makeInteraction(
   const interaction = {
     commandName: 'fro-bot',
     channelId,
+    guild,
+    user: {id: userId},
     reply,
     options: {
       getSubcommand: vi.fn().mockReturnValue(subcommand),
@@ -225,5 +260,106 @@ describe('/fro-bot clear-queue', () => {
     expect(replyArg.content).toMatch(/Cleared 1 queued task/)
     expect(replyArg.content).toMatch(/running task will finish/)
     expect(replyArg.ephemeral).toBe(true)
+  })
+
+  it('queue.clear was called with interaction.channelId exactly', async () => {
+    // #given
+    const queue = makeQueue(2)
+    const deps = makeDeps({queue})
+    const cmd = createFroBotCommand(deps)
+    const channelId = 'ch-exact-id-check'
+    const {interaction} = makeInteraction('clear-queue', channelId)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — clear called with the exact channelId from the interaction
+    expect(queue.clear).toHaveBeenCalledExactlyOnceWith(channelId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot clear-queue — authorization gate (F2)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot clear-queue — authorization gate', () => {
+  it('authorized user (has trigger role) → queue.clear called + count reply', async () => {
+    // #given — user has the trigger role
+    const queue = makeQueue(3)
+    const guild = makeGuild({hasRole: true})
+    const deps = makeDeps({queue, triggerRoleId: 'role-trigger-123'})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, reply} = makeInteraction('clear-queue', 'ch-auth', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — queue.clear was called
+    expect(queue.clear).toHaveBeenCalledOnce()
+    // #and — reply mentions the count
+    expect(reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        ephemeral: true,
+        content: expect.stringContaining('3') as unknown as string,
+      }),
+    )
+  })
+
+  it('unauthorized user (no role, no ManageChannels) → queue.clear NOT called + permission-denied reply', async () => {
+    // #given — user has neither the trigger role nor ManageChannels
+    const queue = makeQueue(2)
+    const guild = makeGuild({hasRole: false, hasManageChannels: false})
+    const deps = makeDeps({queue, triggerRoleId: 'role-trigger-123'})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, reply} = makeInteraction('clear-queue', 'ch-unauth', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — queue.clear NOT called
+    expect(queue.clear).not.toHaveBeenCalled()
+    // #and — ephemeral permission-denied reply
+    expect(reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        ephemeral: true,
+        content: expect.stringMatching(/permission|not authorized/i) as unknown as string,
+      }),
+    )
+  })
+
+  it('null guild → queue.clear NOT called + server-only reply', async () => {
+    // #given — interaction has no guild (DM context)
+    const queue = makeQueue(1)
+    const deps = makeDeps({queue})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, reply} = makeInteraction('clear-queue', 'ch-dm', null)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — queue.clear NOT called
+    expect(queue.clear).not.toHaveBeenCalled()
+    // #and — ephemeral server-only reply
+    expect(reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        ephemeral: true,
+        content: expect.stringMatching(/server/i) as unknown as string,
+      }),
+    )
+  })
+
+  it('authorized user with ManageChannels (no trigger role configured) → queue.clear called', async () => {
+    // #given — no trigger role configured; user has ManageChannels
+    const queue = makeQueue(1)
+    const guild = makeGuild({hasRole: false, hasManageChannels: true})
+    const deps = makeDeps({queue, triggerRoleId: null})
+    const cmd = createFroBotCommand(deps)
+    const {interaction} = makeInteraction('clear-queue', 'ch-manage', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — queue.clear was called (ManageChannels fallback authorized)
+    expect(queue.clear).toHaveBeenCalledOnce()
   })
 })
