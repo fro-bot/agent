@@ -161,6 +161,56 @@ describe('summarizeTool', () => {
       expect(result).toBe('*app.ts* (+3-1)')
     })
 
+    it('renders *filename* (+N-0) from OpenCode *** Add File: envelope', () => {
+      // #given — OpenCode apply_patch Add File verb
+      const patchText = [
+        '*** Begin Patch',
+        '*** Add File: src/new-module.ts',
+        '+export function hello() {',
+        '+  return "world"',
+        '+}',
+        '*** End Patch',
+      ].join('\n')
+      const part = completedTool('apply_patch', {patchText})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — Add File parsed: 3 additions, 0 deletions
+      expect(result).toBe('*new-module.ts* (+3-0)')
+    })
+
+    it('renders *filename* (+0-N) from OpenCode *** Delete File: envelope', () => {
+      // #given — OpenCode apply_patch Delete File verb (body lines are removals)
+      const patchText = [
+        '*** Begin Patch',
+        '*** Delete File: src/old-module.ts',
+        '-export function goodbye() {',
+        '-  return "bye"',
+        '-}',
+        '*** End Patch',
+      ].join('\n')
+      const part = completedTool('apply_patch', {patchText})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — Delete File parsed: 0 additions, 3 deletions
+      expect(result).toBe('*old-module.ts* (+0-3)')
+    })
+
+    it('renders *filename* (+0-0) from OpenCode *** Delete File: envelope with no body lines', () => {
+      // #given — Delete File with no body (pure deletion marker, no diff lines)
+      const patchText = ['*** Begin Patch', '*** Delete File: src/empty.ts', '*** End Patch'].join('\n')
+      const part = completedTool('apply_patch', {patchText})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — Delete File with no body: counts are 0/0 but file is still rendered
+      expect(result).toBe('*empty.ts* (+0-0)')
+    })
+
     it('falls back to tool name when patchText is absent', () => {
       // #given / #when / #then
       const part = completedTool('apply_patch', {})
@@ -356,6 +406,37 @@ describe('summarizeTool', () => {
       // #given / #when / #then
       const part = completedTool('task', {})
       expect(summarizeTool(part)).toBe('task')
+    })
+
+    it('truncates a long task description at ~120 chars with an ellipsis', () => {
+      // #given — description longer than 120 chars
+      const longDescription = 'A'.repeat(150)
+      const part = completedTool('task', {description: longDescription})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — result must be truncated and end with ellipsis
+      expect(result).not.toBeNull()
+      expect(typeof result === 'string' && result.endsWith('…')).toBe(true)
+      // The full 150-char description must NOT appear verbatim
+      expect(result).not.toContain(longDescription)
+      // But the prefix should be present
+      expect(result).toContain('task: ')
+      // Total length should be well under 150
+      expect(typeof result === 'string' && result.length).toBeLessThan(140)
+    })
+
+    it('does NOT truncate a task description at or below the cap', () => {
+      // #given — description exactly at the cap (120 chars)
+      const exactDescription = 'B'.repeat(120)
+      const part = completedTool('task', {description: exactDescription})
+
+      // #when
+      const result = summarizeTool(part)
+
+      // #then — no truncation for descriptions at or below the cap
+      expect(result).toBe(`task: ${exactDescription}`)
     })
   })
 

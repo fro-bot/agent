@@ -44,6 +44,7 @@ export interface ExtractedToolPart {
 // ---------------------------------------------------------------------------
 
 const MAX_BASH_COMMAND_INLINE_LENGTH = 100
+const MAX_TASK_DESCRIPTION_LENGTH = 120
 const MAX_MCP_ARG_LENGTH = 50
 const ERROR_GLYPH = '⨯'
 
@@ -151,12 +152,16 @@ function parsePatchCounts(patchText: string): {
   let deletions = 0
 
   for (const line of patchText.split('\n')) {
-    // OpenCode envelope: *** Update File: path/to/file
-    if (line.startsWith('*** Update File:')) {
+    // OpenCode envelope: *** Update File: / *** Add File: / *** Delete File: path/to/file
+    if (
+      line.startsWith('*** Update File:') ||
+      line.startsWith('*** Add File:') ||
+      line.startsWith('*** Delete File:')
+    ) {
       if (currentFile !== '') {
         results.push({fileName: basename(currentFile), additions, deletions})
       }
-      currentFile = line.replace(/^\*\*\* Update File:\s*/, '').trim()
+      currentFile = line.replace(/^\*\*\* (?:Update|Add|Delete) File:\s*/, '').trim()
       additions = 0
       deletions = 0
     } else if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
@@ -314,7 +319,13 @@ function computeSummary(tool: string, input: Record<string, unknown> | undefined
   // --- task (subagent) ---
   if (tool === 'task') {
     const description = str(input, 'description') || str(input, 'prompt')
-    if (description.length > 0) return `task: ${description}`
+    if (description.length > 0) {
+      const truncated =
+        description.length > MAX_TASK_DESCRIPTION_LENGTH
+          ? `${description.slice(0, MAX_TASK_DESCRIPTION_LENGTH)}…`
+          : description
+      return `task: ${truncated}`
+    }
     return title !== undefined && title.length > 0 ? title : tool
   }
 
