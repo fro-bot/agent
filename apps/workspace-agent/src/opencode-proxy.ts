@@ -248,6 +248,9 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
     armTimer()
 
     upstreamReq.on('error', (err: Error) => {
+      // Mark settled (symmetric with the upstreamRes handlers) so a timer firing
+      // in the same tick as this error is a no-op rather than double-operating on res.
+      settled = true
       cancelTimer()
       logger.error('opencode-proxy: upstream error', {message: err.message})
       if (res.headersSent === false) {
