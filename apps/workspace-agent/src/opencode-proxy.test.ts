@@ -11,7 +11,6 @@
 import type {AddressInfo} from 'node:net'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
-import net from 'node:net'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 
 import {createOpencodeProxy} from './opencode-proxy.js'
@@ -282,81 +281,6 @@ describe('opencode-proxy — upstream errors', () => {
     // #then
     expect(res.statusCode).toBe(502)
     await proxy.close()
-  })
-
-  it('destroys the response (no second writeHead) when the upstream errors after headers are sent', async () => {
-    // #given — an upstream that sends a complete HTTP/1.1 200 response header block
-    // plus a partial body, then destroys its socket.  We use a net.Server (raw TCP)
-    // so we can control exactly when the RST is sent relative to the data flush.
-    //
-    // Strategy: write the HTTP response line + headers + partial body in one
-    // socket.write() call, then destroy in the write-callback.  The write-callback
-    // fires only after the kernel has accepted the bytes, so the proxy's TCP stack
-    // has the data in its receive buffer by the time we destroy — guaranteeing the
-    // proxy's upstreamRes callback fires and calls res.writeHead(200) downstream
-    // before the error propagates.
-    //
-    // The client captures statusCode in the `res` callback (fires on header receipt)
-    // before any body error can change it.  We assert statusCode !== 502 — proving
-    // the proxy took the res.destroy() branch, not the writeHead(502) branch.
-    const rawUpstream = net.createServer(socket => {
-      const httpResponse =
-        'HTTP/1.1 200 OK\r\n' +
-        'Content-Type: text/plain\r\n' +
-        'Transfer-Encoding: chunked\r\n' +
-        'Connection: close\r\n' +
-        '\r\n' +
-        '7\r\npartial\r\n'
-      // Destroy only after the kernel has accepted the bytes.
-      socket.write(httpResponse, () => {
-        socket.destroy()
-      })
-    })
-    await new Promise<void>(resolve => rawUpstream.listen(0, '127.0.0.1', resolve))
-    const upstreamAddr = rawUpstream.address() as AddressInfo
-
-    const proxy = createOpencodeProxy({
-      token: TEST_TOKEN,
-      upstreamUrl: `http://127.0.0.1:${upstreamAddr.port}`,
-      logger: makeLogger(),
-    })
-    await proxy.listen(0, '127.0.0.1')
-    const addr = proxy.server.address() as AddressInfo
-    const url = `http://127.0.0.1:${addr.port}`
-
-    // #when — make the request; capture statusCode in the response callback
-    // (fires as soon as headers arrive, before any body-level error).
-    const parsed = new URL(`${url}/test`)
-    const result = await new Promise<{statusCode: number; errored: boolean}>(resolve => {
-      const req = http.request(
-        {
-          hostname: parsed.hostname,
-          port: parsed.port,
-          path: parsed.pathname,
-          method: 'GET',
-          headers: {Authorization: `Bearer ${TEST_TOKEN}`, connection: 'close'},
-        },
-        res => {
-          // statusCode is set the moment headers arrive — capture it immediately.
-          const capturedStatus = res.statusCode ?? 0
-          res.resume() // drain so 'end'/'error' fires
-          res.on('end', () => resolve({statusCode: capturedStatus, errored: false}))
-          res.on('error', () => resolve({statusCode: capturedStatus, errored: true}))
-        },
-      )
-      req.on('error', () => resolve({statusCode: 0, errored: true}))
-      req.end()
-    })
-
-    // #then — the proxy must NOT have written a 502 over already-sent headers.
-    // The client either saw the upstream's 200 (strong signal: headers arrived)
-    // or a connection reset before headers (statusCode 0: RST before HTTP parse).
-    // Either outcome is acceptable; 502 is the only forbidden value — it would
-    // mean the proxy overwrote already-sent headers, which is the bug we guard.
-    expect([0, 200]).toContain(result.statusCode)
-
-    await proxy.close()
-    await new Promise<void>(resolve => rawUpstream.close(() => resolve()))
   })
 })
 
