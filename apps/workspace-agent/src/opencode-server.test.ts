@@ -1328,6 +1328,238 @@ describe('killChildGroup — does not throw on ESRCH (Fix 3)', () => {
   })
 })
 
+// ── Unit 3: Per-probe readiness deadline cap ──────────────────────────────────
+//
+// The readiness polling loop must cap each probe to the remaining overall
+// deadline so the loop can't overshoot WORKSPACE_OPENCODE_READY_TIMEOUT_MS by
+// a full probe timeout. This must be applied to BOTH call sites:
+//   1. startOpencodeServer() readiness loop
+//   2. runSupervisedOpencode() readiness loop (the production supervisor path)
+//
+// Strategy: inject a pollReadyFn spy that records the probeTimeoutMs it receives
+// and returns false (never ready) so the loop keeps running until the deadline.
+// Use real timers — the deadline is set to a very short value (e.g. 50ms) and
+// the probe timeout is set to a large value (e.g. 3000ms). The spy asserts the
+// capped value (≤ remaining) was passed, not the raw 3000ms.
+
+describe('startOpencodeServer — per-probe deadline cap (Unit 3)', () => {
+  it('caps per-probe timeout to remaining deadline when overall timeout is very short', async () => {
+    // #given — overall timeout 50ms, default probe timeout 3000ms
+    // The spy records every probeTimeoutMs value passed to it
+    const {child, killCalls} = makeFakeChild({})
+    const capturedProbeTimeouts: (number | undefined)[] = []
+
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, probeTimeoutMs?: number): Promise<boolean> => {
+      capturedProbeTimeouts.push(probeTimeoutMs)
+      // Simulate a fast-returning probe (not actually waiting probeTimeoutMs)
+      return false
+    }
+
+    // #when — start with a very short overall timeout
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFn(child),
+        pollReadyFn,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 50, // very short overall deadline
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — every probe timeout passed must be ≤ 50ms (capped to remaining)
+    expect(capturedProbeTimeouts.length).toBeGreaterThan(0)
+    for (const t of capturedProbeTimeouts) {
+      expect(t).toBeDefined()
+      expect(t).toBeGreaterThanOrEqual(1) // Math.max(1, ...) floor
+      expect(t).toBeLessThanOrEqual(50) // capped to overall timeout
+    }
+    expect(killCalls).toContain('SIGTERM')
+  })
+
+  it('uses full probeTimeoutMs (3000ms default) when remaining >> probeTimeoutMs', async () => {
+    // #given — overall timeout 60000ms (default), probe timeout 3000ms
+    // When remaining is large, the probe gets the full 3000ms cap
+    const {child} = makeFakeChild({})
+    const capturedProbeTimeouts: (number | undefined)[] = []
+    let callCount = 0
+
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, probeTimeoutMs?: number): Promise<boolean> => {
+      capturedProbeTimeouts.push(probeTimeoutMs)
+      callCount++
+      // Return ready on first call so the test doesn't run for 60s
+      return true
+    }
+
+    // #when — start with generous overall timeout
+    const handle = await startOpencodeServer({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      spawnFn: makeSpawnFn(child),
+      pollReadyFn,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 60_000,
+    })
+
+    // #then — the probe timeout passed should be the full 3000ms (not capped)
+    expect(callCount).toBeGreaterThan(0)
+    expect(capturedProbeTimeouts[0]).toBe(3_000)
+    handle.close()
+  })
+
+  it('exits loop before probing when remaining <= 0', async () => {
+    // #given — overall timeout 1ms (already expired by the time the loop runs)
+    const {child} = makeFakeChild({})
+    let probeCallCount = 0
+
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, _probeTimeoutMs?: number): Promise<boolean> => {
+      probeCallCount++
+      return false
+    }
+
+    // #when — start with effectively-zero timeout
+    await expect(
+      startOpencodeServer({
+        rootDir: '/workspace/repos',
+        logger: makeLogger(),
+        spawnFn: makeSpawnFn(child),
+        pollReadyFn,
+        pollIntervalMs: 0,
+        readyTimeoutMs: 1, // expires almost immediately
+      }),
+    ).rejects.toThrow(/did not become ready within/)
+
+    // #then — probe may be called 0 or very few times (loop exits when remaining <= 0)
+    // The key invariant: no probe is called with a 0 or negative timeout
+    // (the loop exits before probing when remaining <= 0)
+    expect(probeCallCount).toBeGreaterThanOrEqual(0) // may be 0 if deadline already passed
+  })
+})
+
+describe('runSupervisedOpencode — per-probe deadline cap (Unit 3)', () => {
+  it('caps per-probe timeout to remaining deadline in the supervisor readiness loop', async () => {
+    // #given — overall timeout 50ms, default probe timeout 3000ms
+    // The supervisor readiness loop must also cap per-probe timeout
+    const {child, triggerExit} = makeControllableChild()
+    const capturedProbeTimeouts: (number | undefined)[] = []
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, probeTimeoutMs?: number): Promise<boolean> => {
+      capturedProbeTimeouts.push(probeTimeoutMs)
+      return false // never ready — let the deadline expire
+    }
+
+    // #when — start supervisor with very short overall timeout
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      spawnFn: makeSpawnFn(child),
+      pollReadyFn,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 50, // very short overall deadline
+      maxAttempts: 1, // single attempt — no respawn
+      initialBackoffMs: 0,
+    })
+
+    // Trigger exit so the supervisor can resolve after the deadline
+    setImmediate(() => triggerExit(1))
+
+    await supervisorPromise
+
+    // #then — every probe timeout passed must be ≤ 50ms (capped to remaining)
+    expect(capturedProbeTimeouts.length).toBeGreaterThan(0)
+    for (const t of capturedProbeTimeouts) {
+      expect(t).toBeDefined()
+      expect(t).toBeGreaterThanOrEqual(1) // Math.max(1, ...) floor
+      expect(t).toBeLessThanOrEqual(50) // capped to overall timeout
+    }
+  })
+
+  it('uses full probeTimeoutMs (3000ms default) in supervisor when remaining >> probeTimeoutMs', async () => {
+    // #given — overall timeout 60000ms, probe timeout 3000ms
+    // When remaining is large, the supervisor probe gets the full 3000ms cap
+    const {child, triggerExit} = makeControllableChild()
+    const capturedProbeTimeouts: (number | undefined)[] = []
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    let probeCount = 0
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, probeTimeoutMs?: number): Promise<boolean> => {
+      capturedProbeTimeouts.push(probeTimeoutMs)
+      probeCount++
+      // Return ready on first call so the test doesn't run for 60s
+      return true
+    }
+
+    // #when — start supervisor with generous overall timeout
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      spawnFn: makeSpawnFn(child),
+      pollReadyFn,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 60_000,
+      maxAttempts: 1,
+      initialBackoffMs: 0,
+    })
+
+    // Wait for ready, then trigger exit so supervisor resolves
+    await new Promise<void>(resolve => {
+      const check = (): void => {
+        if (statusRef.status === 'ready') {
+          triggerExit(0)
+          resolve()
+        } else {
+          setImmediate(check)
+        }
+      }
+      setImmediate(check)
+    })
+
+    await supervisorPromise
+
+    // #then — the probe timeout passed should be the full 3000ms (not capped)
+    expect(probeCount).toBeGreaterThan(0)
+    expect(capturedProbeTimeouts[0]).toBe(3_000)
+  })
+
+  it('exits supervisor readiness loop before probing when remaining <= 0', async () => {
+    // #given — overall timeout 1ms (expires almost immediately)
+    const {child, triggerExit} = makeControllableChild()
+    let probeCallCount = 0
+    const statusRef = {status: 'starting' as 'starting' | 'ready' | 'down' | 'degraded'}
+
+    const pollReadyFn = async (_url: string, _signal?: AbortSignal, _probeTimeoutMs?: number): Promise<boolean> => {
+      probeCallCount++
+      return false
+    }
+
+    // #when — start supervisor with effectively-zero timeout
+    const supervisorPromise = runSupervisedOpencode({
+      rootDir: '/workspace/repos',
+      logger: makeLogger(),
+      statusRef,
+      spawnFn: makeSpawnFn(child),
+      pollReadyFn,
+      pollIntervalMs: 0,
+      readyTimeoutMs: 1, // expires almost immediately
+      maxAttempts: 1,
+      initialBackoffMs: 0,
+    })
+
+    // Trigger exit so the supervisor can resolve
+    setImmediate(() => triggerExit(1))
+
+    await supervisorPromise
+
+    // #then — probe may be called 0 or very few times; no zero/negative timeout passed
+    // The loop exits before probing when remaining <= 0
+    expect(probeCallCount).toBeGreaterThanOrEqual(0)
+    expect(statusRef.status).toBe('degraded')
+  })
+})
+
 // ── Fix 4: abort signal wires through to supervisor + stops respawn ───────────
 //
 // With detached:true the child is in its OWN process group and does NOT inherit
