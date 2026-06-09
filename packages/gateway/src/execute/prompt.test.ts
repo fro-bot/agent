@@ -229,6 +229,36 @@ describe('buildDiscordPrompt', () => {
       expect(result).toContain('Fix the bug')
       expect(result).not.toContain('<@123>')
     })
+
+    it('handles botUserId containing a regex metachar (e.g. "123.456") literally — does not throw', () => {
+      // #given — botUserId with a dot (regex metachar); without escaping, "123.456" would
+      // match "123X456" etc. With escaping it matches only the literal string.
+      const result = buildDiscordPrompt({
+        messageText: '<@123.456> Fix the bug',
+        owner: 'org',
+        repo: 'repo',
+        botUserId: '123.456',
+      })
+
+      // #then — must not throw, and the mention is stripped correctly
+      expect(result).toContain('Fix the bug')
+      expect(result).not.toContain('<@123.456>')
+    })
+
+    it('botUserId with regex metachar does NOT match a different ID (literal match only)', () => {
+      // #given — botUserId "123.456" must NOT strip a mention like "<@123X456>"
+      // (the dot should be treated as a literal dot, not a wildcard)
+      const result = buildDiscordPrompt({
+        messageText: '<@123X456> Fix the bug',
+        owner: 'org',
+        repo: 'repo',
+        botUserId: '123.456',
+      })
+
+      // #then — the mention is NOT stripped (different ID), message still present
+      expect(result).toContain('<@123X456>')
+      expect(result).toContain('Fix the bug')
+    })
   })
 
   describe('empty / whitespace guard', () => {
