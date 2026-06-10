@@ -1,9 +1,10 @@
 ---
 title: "feat: Mention-loop operator commands — /fro-bot force-release-lock + run reactions"
 type: feat
-status: active
+status: completed
 date: 2026-06-09
 deepened: 2026-06-09
+completed: 2026-06-09
 origin: docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md
 ---
 
@@ -90,7 +91,7 @@ Both are bounded, follow existing patterns, and need no new durable state — ma
 
 ## Implementation Units
 
-- [ ] **Unit 1: `forceReleaseStaleLock` runtime primitive (lock + run-state two-signal check)**
+- [x] **Unit 1: `forceReleaseStaleLock` runtime primitive (lock + run-state two-signal check)**
 
 **Goal:** Provide a safe, reusable coordination operation that releases a per-repo lock ONLY when its owning run is proven dead — lock lease expired AND run-state heartbeat stale/absent — using an `IfMatch` conditional delete as a race backstop. Closes the etag gap and the live-run deletion P0 in the runtime layer.
 
@@ -124,7 +125,7 @@ Both are bounded, follow existing patterns, and need no new durable state — ma
 
 **Verification:** Runtime coordination tests cover release-when-dead (both heartbeat-stale and run-state-absent), refusal-when-lease-live, refusal-when-heartbeat-live, absent lock, the `IfMatch` precondition-failure race, and malformed records; acquire/normal-release behavior is unchanged.
 
-- [ ] **Unit 2: `/fro-bot force-release-lock` subcommand**
+- [x] **Unit 2: `/fro-bot force-release-lock` subcommand**
 
 **Goal:** Expose the dead-run-verified force-release to operators via a `/fro-bot` subcommand for the current channel's bound repo, with the raised (`ManageChannels`) auth bar and the standard interaction posture.
 
@@ -158,7 +159,7 @@ Both are bounded, follow existing patterns, and need no new durable state — ma
 
 **Verification:** The subcommand registers and dispatches; a ManageChannels user can clear a proven-dead lock end-to-end; a trigger-role-only user is denied; null-guild/no-binding/live-holder/conflict/no-lock all produce clear distinct ephemeral replies; dispatch-path integration test passes.
 
-- [ ] **Unit 3: Run-state reactions (R9)**
+- [x] **Unit 3: Run-state reactions (R9)**
 
 **Goal:** Add a glanceable reaction on the triggering message reflecting mention-run state, as a best-effort secondary affordance that never affects execution.
 
