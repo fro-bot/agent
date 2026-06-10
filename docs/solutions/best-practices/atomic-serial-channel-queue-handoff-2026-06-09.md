@@ -1,9 +1,9 @@
 ---
 title: Serial per-channel work queue with atomic slot handoff and honest graceful shutdown
 date: 2026-06-09
-category: docs/solutions/best-practices
+category: best-practices
 module: gateway
-problem_type: architecture_pattern
+problem_type: best_practice
 component: assistant
 severity: high
 applies_when:
