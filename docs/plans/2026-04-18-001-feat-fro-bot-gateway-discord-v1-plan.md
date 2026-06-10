@@ -752,12 +752,11 @@ The Action and gateway both import from `@fro-bot/runtime` (the name is internal
 
 **Dependencies:** Unit 1 (runtime), Unit 2 (coordination), Unit 4 (gateway skeleton), Unit 5 (binding)
 
-**Unit 6 reconciliation (2026-06-01):**
+**Unit 6 reconciliation (updated 2026-06-09):**
 
-- **Shipped (MVP):** mention → thread creation → lock/run-state/heartbeat coordination → remote OpenCode attach (workspace container, bearer-token proxy, HTTP/SSE) → streamed Discord final output; trigger-role/ManageChannels authorization; failure-path partial-output flush.
-- **Not yet shipped (deferred from original Unit 6 scope):** tool-approval embeds/buttons + `permission.updated` handling (S5); reactions + working-message progress editor (R9); serial per-channel queue + `/clear-queue` (current behavior REJECTS concurrent same-channel runs rather than queueing, R11); `/review`, `/sessions`, `/resume`, `/approvals`, `/force-release-lock` commands (only `ping` + `add-project` are registered); reactions + working-message progress editor (R9).
+- **Shipped:** mention execution + remote-attach streaming (PR #705); native tool-approval embeds/buttons + `permission.asked`/`permission.replied` handling (S5, shipped earlier); working-state status UX — live status message + typing indicator (Phase 2, PR #843); clean rendering + Discord persona prompt (Phase 1, PR #831); serial per-channel queue + `/fro-bot clear-queue` (Phase 3, PR #850). Commands registered: `/fro-bot ping`, `/fro-bot add-project`, `/fro-bot clear-queue`.
+- **Remaining:** `/fro-bot sessions`, `/fro-bot resume`, `/fro-bot force-release-lock`, `/fro-bot review`, `/fro-bot approvals` command; reactions/R9 progress affordances; abort/self-test command-surface gaps.
 - **Dropped (won't-do):** `no-fro-bot` block role (R6) — redundant deny-list on top of the existing allow-list authorization model. The mention/approval gate already requires the trigger role or guild-level `ManageChannels`; excluding a user is done by not granting the trigger role, so a separate block role adds a second provisioning surface and a precedence question for no real gain.
-- **Shipped since:** tool-approval embeds/buttons + `permission.asked`/`permission.replied` handling (S5); gateway startup conditional-write self-test wiring (`validateProviderSemanticsEffect` now runs fail-fast at boot before `client.login`).
 
 **Files:**
 - Create: `packages/gateway/src/execute/local.ts` (orchestrates: acquire lock, create run-state, spawn OpenCode session in workspace, stream events → Discord)
