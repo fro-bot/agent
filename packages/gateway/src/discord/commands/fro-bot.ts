@@ -311,100 +311,124 @@ function executeForceReleaseLock(
       debug: (msg: string, ctx?: Record<string, unknown>) => deps.gatewayLogger.debug(ctx ?? {}, msg),
     }
 
-    // Call the dead-run-verified force-release Effect.
-    // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
-    const releaseResult = yield* deps.forceReleaseStaleLock(
-      deps.coordinationConfig,
-      repoSlug,
-      deps.identity,
-      coordLogger,
+    // Call the dead-run-verified force-release Effect and map the typed outcome
+    // to an ephemeral reply. Wrapped in a sub-Effect so that if the force-release
+    // Effect itself fails (rare infra path: missing adapter capability, key-build
+    // error, etc.) the catchAll can still edit the already-deferred reply before
+    // re-failing — preventing the interaction token from expiring at "thinking…".
+    yield* Effect.gen(function* () {
+      // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
+      const releaseResult = yield* deps.forceReleaseStaleLock(
+        deps.coordinationConfig,
+        repoSlug,
+        deps.identity,
+        coordLogger,
+      )
+
+      const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult
+
+      // Map typed outcome → ephemeral reply.
+      // allowedMentions: {parse: []} prevents Discord from pinging holder IDs.
+      switch (outcome) {
+        case 'released': {
+          const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
+          const holderInfo = holderId === null ? '' : ` Cleared holder: \`${holderId}\`.`
+          const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`,
+                allowedMentions: {parse: []},
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+          break
+        }
+
+        case 'live-holder': {
+          const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
+          const heartbeatSeconds = heartbeatAgeMs === null ? null : Math.round(heartbeatAgeMs / 1000)
+          const holderInfo = holderId === null ? '' : ` Held by: \`${holderId}\`.`
+          const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
+          const heartbeatInfo = heartbeatSeconds === null ? '' : ` Last heartbeat: ${heartbeatSeconds}s ago.`
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
+                allowedMentions: {parse: []},
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+          break
+        }
+
+        case 'no-lock': {
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`,
+                allowedMentions: {parse: []},
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+          break
+        }
+
+        case 'conflict': {
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
+                allowedMentions: {parse: []},
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+          break
+        }
+
+        case 'error': {
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`,
+                allowedMentions: {parse: []},
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+          break
+        }
+
+        default: {
+          // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
+          const exhaustiveCheck: never = outcome
+          deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: 'An internal error occurred. Please try again.',
+              }),
+            catch: error => (error instanceof Error ? error : new Error(String(error))),
+          })
+        }
+      }
+    }).pipe(
+      // Infra-failure guard: if the force-release Effect itself fails (e.g. missing
+      // adapter capability, key-build error), edit the already-deferred reply so the
+      // user is not left at "thinking…" until the token expires. Re-fail after editing
+      // so dispatchCommand's logger still sees the error.
+      Effect.catchAll(err =>
+        Effect.gen(function* () {
+          yield* Effect.tryPromise({
+            try: async () =>
+              interaction.editReply({
+                content: 'An internal error occurred. Please try again.',
+                allowedMentions: {parse: []},
+              }),
+            catch: editError => (editError instanceof Error ? editError : new Error(String(editError))),
+          })
+          return yield* Effect.fail(err)
+        }),
+      ),
     )
-
-    const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult
-
-    // Map typed outcome → ephemeral reply.
-    // allowedMentions: {parse: []} prevents Discord from pinging holder IDs.
-    switch (outcome) {
-      case 'released': {
-        const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
-        const holderInfo = holderId === null ? '' : ` Cleared holder: \`${holderId}\`.`
-        const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`,
-              allowedMentions: {parse: []},
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-        break
-      }
-
-      case 'live-holder': {
-        const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
-        const heartbeatSeconds = heartbeatAgeMs === null ? null : Math.round(heartbeatAgeMs / 1000)
-        const holderInfo = holderId === null ? '' : ` Held by: \`${holderId}\`.`
-        const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
-        const heartbeatInfo = heartbeatSeconds === null ? '' : ` Last heartbeat: ${heartbeatSeconds}s ago.`
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
-              allowedMentions: {parse: []},
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-        break
-      }
-
-      case 'no-lock': {
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`,
-              allowedMentions: {parse: []},
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-        break
-      }
-
-      case 'conflict': {
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
-              allowedMentions: {parse: []},
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-        break
-      }
-
-      case 'error': {
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`,
-              allowedMentions: {parse: []},
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-        break
-      }
-
-      default: {
-        // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
-        const exhaustiveCheck: never = outcome
-        deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
-        yield* Effect.tryPromise({
-          try: async () =>
-            interaction.editReply({
-              content: 'An internal error occurred. Please try again.',
-            }),
-          catch: error => (error instanceof Error ? error : new Error(String(error))),
-        })
-      }
-    }
   })
 }

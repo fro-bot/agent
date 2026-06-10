@@ -3771,6 +3771,45 @@ describe('reaction wiring — lifecycle hooks', () => {
       expect(call[0]).toBe(message)
     }
   })
+
+  it('awaiting-approval reaction fires on the onPending path', async () => {
+    // #given — capture onPending from the coordinator factory and invoke it
+    // to simulate the approval-pending transition; assert awaiting-approval fires.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      // Invoke onPending to trigger the awaiting-approval reaction
+      capturedOnPending?.({
+        requestID: 'req-pending-1',
+        sessionID: 'sess-pending',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — awaiting-approval reaction was set
+    const states = mockSetRunReaction.mock.calls.map(c => c[1])
+    expect(states).toContain('awaiting-approval')
+  })
 })
 
 describe('reaction wiring — containment (failure isolation)', () => {

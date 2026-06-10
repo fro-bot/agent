@@ -853,6 +853,41 @@ describe('/fro-bot force-release-lock — forceReleaseStaleLock returns outcome 
 // /fro-bot force-release-lock — integration: dispatch path
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — infra-failure path (outer Effect.fail)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — infra-failure path', () => {
+  it('forceReleaseStaleLock Effect.fail → editReply called with internal-error copy AND Effect ends in failure', async () => {
+    // #given — forceReleaseStaleLock produces an outer Effect failure (missing adapter
+    // capability, key-build error, etc.) — distinct from the handled outcome:'error' path.
+    const infraError = new Error('adapter capability missing')
+    const forceReleaseStaleLock: FroBotDeps['forceReleaseStaleLock'] = vi.fn().mockReturnValue(Effect.fail(infraError))
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when — run via Effect.either so we can assert on both the reply AND the failure
+    const result = await Effect.runPromise(Effect.either(cmd.execute(interaction)))
+
+    // #then — the deferred reply was edited (not left hanging at "thinking…")
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+
+    // #and — the error still propagates (dispatchCommand-level logger sees it)
+    expect(result._tag).toBe('Left')
+    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('adapter capability missing')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — dispatch integration
+// ---------------------------------------------------------------------------
+
 describe('/fro-bot force-release-lock — dispatch integration', () => {
   it('dispatches force-release-lock through getCommandRegistry + dispatchCommand', async () => {
     // #given — real registry + dispatch path
