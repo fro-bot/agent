@@ -278,8 +278,8 @@ async function readLockRecord(
  *
  * Returns:
  * - `ok(runState)` — run-state exists and is valid.
- * - `ok(null)`     — run-state object does not exist or is unreadable (treated as dead).
- * - `err(error)`   — parse error on a present record (fail-closed).
+ * - `ok(null)`     — run-state object does not exist (NoSuchKey / not-found → genuinely absent → dead).
+ * - `err(error)`   — transient/unknown read failure OR parse error on a present record (fail-closed).
  */
 async function readRunStateByRunId(
   config: CoordinationConfig,
@@ -298,8 +298,13 @@ async function readRunStateByRunId(
 
   const fetched = await getObject.data(key.data)
   if (fetched.success === false) {
-    // Any read failure (not-found, network, etc.) → treat as absent → dead
-    return ok(null)
+    if (isNotFound(fetched.error) === true) {
+      // Genuinely absent (NoSuchKey / not-found) → treat as dead, OK to proceed.
+      return ok(null)
+    }
+    // Transient or unknown read failure (network, 503, etc.) → fail-closed.
+    // Do NOT treat as absent: a live run's lock must not be deleted on a transient error.
+    return err(fetched.error)
   }
 
   const parsed = parseRunState(fetched.data.data)
@@ -439,6 +444,20 @@ export async function forceReleaseStaleLock(
       })
       return ok({
         outcome: 'conflict',
+        holderId: lockRecord.holder_id,
+        runId: lockRecord.run_id,
+        lockAgeMs,
+        heartbeatAgeMs,
+      })
+    }
+    if (isNotFound(deleted.error) === true) {
+      // Lock object vanished between read and delete — nothing to release.
+      logger.debug('forceReleaseStaleLock: lock object not found during delete (vanished between read and delete)', {
+        repo,
+        runId: lockRecord.run_id,
+      })
+      return ok({
+        outcome: 'no-lock',
         holderId: lockRecord.holder_id,
         runId: lockRecord.run_id,
         lockAgeMs,

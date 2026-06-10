@@ -197,9 +197,10 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
  * **Raised authorization bar:** requires guild-level `ManageChannels` — NOT
  * the configured trigger role. Lock deletion is a destructive cross-run action
  * (can reopen concurrent execution and can target another user's run), so the
- * trigger-role-only gate is insufficient. We achieve this by passing
- * `triggerRoleId: null` to `userIsAuthorized`, which forces the ManageChannels-
- * only arm of that helper regardless of what `deps.triggerRoleId` is set to.
+ * trigger-role-only gate is insufficient. Authorization is checked via a direct
+ * `guild.members.fetch()` + `permissions.has(ManageChannels)` call (fail-closed),
+ * chosen to require ManageChannels specifically and deny trigger-role-only users
+ * — without depending on `userIsAuthorized`'s fallback logic.
  *
  * Flow: synchronous null-guild guard → deferReply → ManageChannels auth →
  * binding lookup → forceReleaseStaleLock → editReply with typed outcome.
@@ -230,11 +231,19 @@ function executeForceReleaseLock(
       await interaction.deferReply({ephemeral: true})
 
       // Raised auth bar: ManageChannels required, NOT the trigger role.
-      // Pass triggerRoleId: null to force the ManageChannels-only arm of
-      // userIsAuthorized, regardless of what deps.triggerRoleId is set to.
-      // This means a trigger-role-only user is denied even when a trigger role
-      // is configured — the correct behavior for this destructive command.
-      const member = await guild.members.fetch(interaction.user.id).catch(() => null)
+      // Direct guild.members.fetch() + permissions.has(ManageChannels) check (fail-closed).
+      // A trigger-role-only user is denied even when a trigger role is configured
+      // — the correct behavior for this destructive command.
+      const member = await guild.members.fetch(interaction.user.id).catch((error: unknown) => {
+        deps.gatewayLogger.warn(
+          {
+            channelId: interaction.channelId,
+            err: error instanceof Error ? error.message : String(error),
+          },
+          'force-release-lock: member permission resolution failed — denying',
+        )
+        return null
+      })
       if (member === null || member.permissions.has(PermissionFlagsBits.ManageChannels) === false) {
         await interaction.editReply({
           content: 'You do not have permission to force-release a lock (ManageChannels required).',

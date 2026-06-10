@@ -3698,7 +3698,7 @@ describe('handoff unit tests (F8)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Reaction-wiring containment — Unit 3 (R9)
+// Reaction-wiring containment
 // ---------------------------------------------------------------------------
 //
 // These tests assert that:

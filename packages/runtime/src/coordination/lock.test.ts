@@ -677,4 +677,79 @@ describe('forceReleaseStaleLock', () => {
     expect(result.success === true ? result.data.outcome : null).toBe('error')
     expect(conditionalDelete).not.toHaveBeenCalled()
   })
+
+  it('returns error and does NOT delete when run-state getObject returns a transient (non-not-found) error', async () => {
+    // #given — lock lease is expired; run-state read fails with a transient error (not NoSuchKey)
+    // This is the P0 fail-closed guard: a network/503 error must NOT be treated as "absent → dead".
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('connection reset')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — fail closed: transient error → outcome 'error', NO delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('error')
+    // The core P0 guard: conditionalDelete must NOT be called on a transient read failure
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('releases the lock when run-state is absent (NoSuchKey) — genuinely-absent path still works', async () => {
+    // #given — lock lease expired; run-state returns a not-found error (genuinely absent → dead)
+    // This confirms the NoSuchKey → ok(null) → released path is preserved after the P0 fix.
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — NoSuchKey is genuinely absent → treated as dead → released
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-lock',
+    })
+  })
+
+  it('returns no-lock when conditionalDelete returns a not-found error (lock vanished between read and delete)', async () => {
+    // #given — both signals say dead, but the lock object disappeared before the delete
+    // P2-a: NoSuchKey on delete → outcome 'no-lock' (not err)
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const staleRunState = createRunState({last_heartbeat: '2026-04-24T18:00:00.000Z'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleRunState), etag: 'etag-run'}))
+    const conditionalDelete = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalDelete']>()
+      .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — lock vanished between read and delete → no-lock (not an error)
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    // Delete was attempted exactly once
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-lock',
+    })
+  })
 })

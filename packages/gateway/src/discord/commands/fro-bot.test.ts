@@ -414,7 +414,7 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// /fro-bot force-release-lock — tests (Unit 2)
+// /fro-bot force-release-lock — tests
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -789,6 +789,61 @@ describe('/fro-bot force-release-lock — outcome mapping', () => {
     await Effect.runPromise(cmd.execute(interaction))
 
     // #then — editReply mentions internal error
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/error|failed|internal/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — missing branch coverage (P2-f)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — binding store error', () => {
+  it('binding store returns err → internal-error ephemeral reply, forceReleaseStaleLock NOT called', async () => {
+    // #given — getBindingByChannelId returns an err result (store failure)
+    const forceReleaseStaleLock = vi.fn()
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = {
+      createBinding: vi.fn(),
+      getBindingByRepo: vi.fn(),
+      getBindingByChannelId: vi.fn().mockResolvedValue({success: false, error: new Error('DynamoDB timeout')}),
+      listBindings: vi.fn(),
+    }
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — forceReleaseStaleLock NOT called
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+    // #and — internal-error ephemeral reply
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/something went wrong|internal error|try again/i)
+  })
+})
+
+describe('/fro-bot force-release-lock — forceReleaseStaleLock returns outcome error', () => {
+  it('forceReleaseStaleLock returns outcome error → internal-error ephemeral reply', async () => {
+    // #given — forceReleaseStaleLock returns ok({outcome: 'error', ...})
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'error',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — internal-error ephemeral reply
     const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
     expect(replyArg.content).toMatch(/error|failed|internal/i)
   })
