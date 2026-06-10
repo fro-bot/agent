@@ -7,6 +7,7 @@
 
 import type {
   CoordinationConfig,
+  ForceReleaseStaleLockResult,
   LockAcquisitionResult,
   LockRecord,
   Logger,
@@ -22,6 +23,7 @@ import {
   createRun,
   findStaleRuns,
   forceReleaseLock,
+  forceReleaseStaleLock,
   releaseLock,
   renewLease,
   syncArtifactsToStore,
@@ -91,6 +93,17 @@ export const forceReleaseLockEffect = (
 ): Effect.Effect<void, Error> =>
   Effect.tryPromise({
     try: async () => forceReleaseLock(config, repo, etag, logger),
+    catch: error => (error instanceof Error ? error : new Error(String(error))),
+  }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
+
+export const forceReleaseStaleLockEffect = (
+  config: CoordinationConfig,
+  repo: string,
+  identity: string,
+  logger: CoordinationLogger,
+): Effect.Effect<ForceReleaseStaleLockResult, Error> =>
+  Effect.tryPromise({
+    try: async () => forceReleaseStaleLock(config, repo, identity, logger),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 

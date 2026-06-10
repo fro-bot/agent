@@ -3,6 +3,7 @@ import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
+import type {RunTask} from './execute/run.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
@@ -20,8 +21,10 @@ import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
+import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
+import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
@@ -152,6 +155,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     })
 
     const concurrencyRegistry = createConcurrencyRegistry(config.maxConcurrentRuns)
+    const channelQueue = createChannelQueue<RunTask>(DEFAULT_MAX_QUEUE_DEPTH)
     const bindingsStore = createBindingsStore({
       adapter: s3Adapter,
       storeConfig: config.objectStore,
@@ -172,6 +176,16 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       installUrl: config.gatewayGitHubAppInstallUrl,
       logger: addProjectLogger,
       isShuttingDown,
+      queue: channelQueue,
+      triggerRoleId: config.triggerRoleId,
+      gatewayLogger: logger,
+      // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
+      // (injected so tests can mock without real S3 calls)
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      // identity is the run-state owner identity (gateway identity); forwarded to
+      // forceReleaseStaleLockEffect so it reads run-state under the correct key segment.
+      identity: config.identity,
+      forceReleaseStaleLock: forceReleaseStaleLockEffect,
     }
 
     const registry = getCommandRegistry(commandDeps)
@@ -270,6 +284,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           coordinationConfig: makeCoordinationConfig(s3Adapter, config),
           identity: config.identity,
           concurrency: concurrencyRegistry,
+          queue: channelQueue,
           attachUrl: config.workspaceOpencodeUrl,
           attachToken: config.workspaceOpencodeToken,
           runTimeoutMs: config.runTimeoutMs,
@@ -298,6 +313,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                 error: (msg, meta) => logger.error(meta ?? {}, msg),
               },
             }),
+          // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
+          // The in-memory queue is lossy by design; dropping pending tasks on graceful
+          // shutdown matches that contract and is consistent with the messageCreate
+          // guard above that refuses new mentions once isShuttingDown() returns true.
+          isShuttingDown,
         },
         logger,
       }
