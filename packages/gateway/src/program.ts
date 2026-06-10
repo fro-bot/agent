@@ -12,6 +12,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_STALE_THRESHOLD_MS,
+  forceReleaseStaleLock,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
@@ -178,6 +179,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       queue: channelQueue,
       triggerRoleId: config.triggerRoleId,
       gatewayLogger: logger,
+      // force-release-lock deps: pre-built coordination config + injected primitive
+      // (injected so tests can mock without real S3 calls)
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      forceReleaseStaleLock,
     }
 
     const registry = getCommandRegistry(commandDeps)
