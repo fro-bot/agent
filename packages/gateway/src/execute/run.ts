@@ -13,6 +13,7 @@ import {acquireLock, createHeartbeatController, createRun, releaseLock, transiti
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
+import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
@@ -126,22 +127,6 @@ export function formatTimeoutDuration(ms: number): string {
   return `${totalSeconds} ${totalSeconds === 1 ? 'second' : 'seconds'}`
 }
 
-/**
- * Send a message to a Discord channel/thread with mentions disabled.
- * ALL Discord sends in this module MUST go through this helper — never call
- * `.send()` directly with user-controlled content.
- */
-async function safeSend(target: SinkThread, content: string): Promise<void> {
-  await target.send({content, allowedMentions: {parse: []}})
-}
-
-/**
- * Reply to the original mention message with mentions disabled.
- */
-async function safeReply(message: Message, content: string): Promise<void> {
-  await message.reply({content, allowedMentions: {parse: []}})
-}
-
 /** Narrow logger adapter for runtime coordination functions. */
 function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
   return {
@@ -241,7 +226,7 @@ async function startRun(task: RunTask): Promise<void> {
         },
         'run: workspace clone unavailable — aborting',
       )
-      await safeReply(message, 'The workspace is not available right now. Please try again later.')
+      await sendMessage(message, {content: 'The workspace is not available right now. Please try again later.'}, logger)
       return
     }
 
@@ -264,7 +249,7 @@ async function startRun(task: RunTask): Promise<void> {
 
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
-      await safeReply(message, 'The workspace is not reachable right now. Please try again later.')
+      await sendMessage(message, {content: 'The workspace is not reachable right now. Please try again later.'}, logger)
       return
     }
 
@@ -276,7 +261,7 @@ async function startRun(task: RunTask): Promise<void> {
       rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
     } catch (threadError) {
       logger.error({channelId, repo, err: String(threadError)}, 'run: startThread threw — aborting')
-      await safeReply(message, 'Could not start the task — please try again.')
+      await sendMessage(message, {content: 'Could not start the task — please try again.'}, logger)
       return
     }
     const threadId = rawThread.id
@@ -289,14 +274,18 @@ async function startRun(task: RunTask): Promise<void> {
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
-      await safeSend(thread, 'Could not start the task — please try again.')
+      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
       return
     }
 
     if (lockResult.data.acquired === false) {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
       logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
-      await safeSend(thread, 'Another task is already in progress for this repo. Try again when it completes.')
+      await sendMessage(
+        thread,
+        {content: 'Another task is already in progress for this repo. Try again when it completes.'},
+        logger,
+      )
       return
     }
 
@@ -321,7 +310,7 @@ async function startRun(task: RunTask): Promise<void> {
     const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
     if (createResult.success === false) {
       logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed')
-      await safeSend(thread, 'Could not start the task — please try again.')
+      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
@@ -339,7 +328,7 @@ async function startRun(task: RunTask): Promise<void> {
     )
     if (ackResult.success === false) {
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
-      await safeSend(thread, 'Could not start the task — please try again.')
+      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
@@ -459,8 +448,14 @@ async function startRun(task: RunTask): Promise<void> {
             onDeadlineSettled: async () => {
               // markVisibleOutputSent AFTER the send succeeds so flush() still
               // adds _(no output)_ if the send fails (user needs the fallback).
-              await safeSend(rawThread, 'Approval timed out — the task could not continue.')
-              sink?.markVisibleOutputSent()
+              const deadlineResult = await sendMessage(
+                rawThread,
+                {content: 'Approval timed out — the task could not continue.'},
+                logger,
+              )
+              if (deadlineResult.success === true) {
+                sink?.markVisibleOutputSent()
+              }
             },
           })
 
@@ -480,14 +475,14 @@ async function startRun(task: RunTask): Promise<void> {
           // permanently delivered; settle(false) on failure retracts the claim.
           const settleWaitingStatus = sink?.markVisibleOutputPending()
           // eslint-disable-next-line no-void
-          void safeSend(rawThread, 'Waiting for tool approval…')
-            .then(() => {
+          void sendMessage(rawThread, {content: 'Waiting for tool approval…'}, logger).then(result => {
+            if (result.success === true) {
               settleWaitingStatus?.(true)
-            })
-            .catch((error: unknown) => {
+            } else {
               settleWaitingStatus?.(false)
-              logger.warn({requestID, err: String(error)}, 'run: failed to post waiting-for-approval status')
-            })
+              logger.warn({requestID, err: result.error.message}, 'run: failed to post waiting-for-approval status')
+            }
+          })
 
           // Fire-and-forget: send the embed then attach the render function.
           // rawThread has the full Discord.js API (embeds, components, edit).
@@ -689,17 +684,18 @@ async function startRun(task: RunTask): Promise<void> {
 
       // ── Status controller failure transition ──────────────────────────────────────────────────
       // resolveToFailure returns:
-      //   'handled'   → controller edited the status message into the failure note; skip safeSend.
-      //   'delegated' → no status to edit (or typing-only); post via safeSend as normal.
+      //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
+      //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
       // Never both — single owner for the failure message.
       const failureResult = await statusController.resolveToFailure(userMessage).catch((error: unknown) => {
         logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
         return {transition: 'delegated' as const}
       })
       if (failureResult.transition === 'delegated') {
-        await safeSend(thread, userMessage).catch((error: unknown) => {
-          logger.warn({repo, runId, err: String(error)}, 'run: failed to send error reply to thread')
-        })
+        const failureSendResult = await sendMessage(thread, {content: userMessage}, logger)
+        if (failureSendResult.success === false) {
+          logger.warn({repo, runId, err: failureSendResult.error.message}, 'run: failed to send error reply to thread')
+        }
       }
     } finally {
       // Stop heartbeat if not yet stopped (defensive — should not normally happen)
@@ -788,16 +784,20 @@ async function startRun(task: RunTask): Promise<void> {
  * Send the appropriate ephemeral ack for an enqueue result.
  * Centralises the two reply strings so they live in exactly one place.
  */
-async function ackEnqueueResult(message: Message, result: 'queued' | 'full'): Promise<void> {
+async function ackEnqueueResult(message: Message, result: 'queued' | 'full', logger: GatewayLogger): Promise<void> {
   if (result === 'queued') {
-    await safeReply(message, "Queued — I'll start this when the current task finishes.")
+    await sendMessage(message, {content: "Queued — I'll start this when the current task finishes."}, logger)
   } else {
-    await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
+    await sendMessage(
+      message,
+      {content: 'The queue is full for this channel — please wait for pending tasks to complete.'},
+      logger,
+    )
   }
 }
 
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, queue} = deps
+  const {concurrency, queue, logger} = deps
   const channelId = message.channel.id
   const task: RunTask = {message, binding, deps}
 
@@ -805,7 +805,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // A new mention must never leapfrog older queued work, even if a slot is free.
   // Only the handoff path (startRun's outer finally) may start the next task.
   if (queue.pendingCount(channelId) > 0) {
-    await ackEnqueueResult(message, queue.enqueue(channelId, task))
+    await ackEnqueueResult(message, queue.enqueue(channelId, task), logger)
     return
   }
 
@@ -813,13 +813,13 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   const slotResult = concurrency.tryAcquire(channelId)
 
   if (slotResult === 'cap') {
-    await safeReply(message, 'fro-bot is at capacity right now — please try again shortly.')
+    await sendMessage(message, {content: 'fro-bot is at capacity right now — please try again shortly.'}, logger)
     return
   }
 
   if (slotResult === 'busy') {
     // Channel has an in-flight run — enqueue instead of rejecting.
-    await ackEnqueueResult(message, queue.enqueue(channelId, task))
+    await ackEnqueueResult(message, queue.enqueue(channelId, task), logger)
     return
   }
 

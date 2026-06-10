@@ -23,7 +23,13 @@
  */
 
 import type {Result} from '@fro-bot/runtime'
-import type {Message, MessageMentionTypes} from 'discord.js'
+import type {
+  BaseMessageOptions,
+  Message,
+  MessageCreateOptions,
+  MessageMentionTypes,
+  MessageReplyOptions,
+} from 'discord.js'
 
 import type {GatewayLogger} from './client.js'
 import {err, ok} from '@fro-bot/runtime'
@@ -38,18 +44,26 @@ import {Effect} from 'effect'
  * Mirrors `SinkThread` from `streaming.ts` but typed to return `Message` so
  * callers can use the sent message reference.
  *
+ * Uses `MessageCreateOptions` as the parameter type so that discord.js
+ * `ThreadChannel` (whose `.send` accepts `string | MessagePayload | MessageCreateOptions`)
+ * is structurally assignable without casts.
+ *
  * Invariant: agent or interpolated text can NEVER ping `@everyone`, roles, or
  * users. Asserted at every call site in tests.
  */
 export interface SendCapable {
-  readonly send: (options: SendOptions) => Promise<unknown>
+  readonly send: (options: MessageCreateOptions) => Promise<unknown>
 }
 
 /**
  * Minimal reply-capable shape. Covers `Message.reply`.
+ *
+ * Uses `MessageReplyOptions` as the parameter type so that discord.js
+ * `Message` (whose `.reply` accepts `string | MessagePayload | MessageReplyOptions`)
+ * is structurally assignable without casts.
  */
 export interface ReplyCapable {
-  readonly reply: (options: SendOptions) => Promise<unknown>
+  readonly reply: (options: MessageReplyOptions) => Promise<unknown>
 }
 
 /**
@@ -58,14 +72,14 @@ export interface ReplyCapable {
  */
 export type SendOrReplyTarget = SendCapable | ReplyCapable
 
-/** Options accepted by `sendMessage` and `editMessage`. No `allowedMentions` — it is always injected. */
-export interface MessageContentOptions {
-  readonly content?: string
-  readonly embeds?: readonly unknown[]
-  readonly components?: readonly unknown[]
-  readonly files?: readonly unknown[]
-  readonly flags?: unknown
-}
+/**
+ * Options accepted by `sendMessage` and `editMessage`. No `allowedMentions` — it is always injected.
+ *
+ * Field types are picked from `MessageCreateOptions` so that the spread
+ * `{...options, allowedMentions: SAFE_MENTIONS}` is assignable to
+ * `MessageCreateOptions` / `MessageEditOptions` without casts.
+ */
+export type MessageContentOptions = Pick<MessageCreateOptions, 'content' | 'embeds' | 'components' | 'files' | 'flags'>
 
 /** Options accepted by `replyInteraction` and `editInteraction`. No `allowedMentions` — always injected. */
 export interface InteractionContentOptions {
@@ -95,13 +109,28 @@ interface AllowedMentions {
   readonly parse: readonly MessageMentionTypes[]
 }
 
-interface SendOptions {
+/**
+ * Internal send options — a subset of `MessageCreateOptions` with `allowedMentions`
+ * required. Assignable to `MessageCreateOptions` so no cast is needed when
+ * calling `target.send(sendOptions)`.
+ */
+type SendOptions = Pick<
+  MessageCreateOptions,
+  'content' | 'embeds' | 'components' | 'files' | 'flags' | 'allowedMentions'
+>
+
+/**
+ * Internal edit options — uses `BaseMessageOptions` fields (shared between
+ * `MessageCreateOptions` and `MessageEditOptions`) plus `content?: string`.
+ * Assignable to `MessageEditOptions` so no cast is needed when calling
+ * `message.edit(editOptions)`.
+ *
+ * We avoid `Pick<MessageEditOptions, 'flags'>` because `MessageEditOptions.flags`
+ * and `MessageCreateOptions.flags` have incompatible `BitFieldResolvable` types.
+ * The `editMessage` helper does not use `flags`, so omitting it is safe.
+ */
+type EditOptions = Pick<BaseMessageOptions, 'embeds' | 'components' | 'files' | 'allowedMentions'> & {
   readonly content?: string
-  readonly embeds?: readonly unknown[]
-  readonly components?: readonly unknown[]
-  readonly files?: readonly unknown[]
-  readonly flags?: unknown
-  readonly allowedMentions: AllowedMentions
 }
 
 interface InteractionSendOptions {
@@ -205,10 +234,10 @@ export async function editMessage(
   options: MessageContentOptions,
   logger: GatewayLogger,
 ): Promise<Result<unknown, Error>> {
-  const editOptions: SendOptions = {...options, allowedMentions: SAFE_MENTIONS}
+  const editOptions: EditOptions = {...options, allowedMentions: SAFE_MENTIONS}
 
   try {
-    const result = await message.edit(editOptions as Parameters<Message['edit']>[0])
+    const result = await message.edit(editOptions)
     return ok(result)
   } catch (error: unknown) {
     const sanitized = sanitizeError(error)

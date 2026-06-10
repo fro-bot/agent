@@ -21,13 +21,17 @@ import {formatTimeoutDuration} from './run.js'
 // Mock external collaborators so run.test.ts does not need real AWS/S3/Discord
 // ---------------------------------------------------------------------------
 
-vi.mock('@fro-bot/runtime', () => ({
-  acquireLock: vi.fn(),
-  releaseLock: vi.fn(),
-  createRun: vi.fn(),
-  transitionRun: vi.fn(),
-  createHeartbeatController: vi.fn(),
-}))
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const actual = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {
+    ...actual,
+    acquireLock: vi.fn(),
+    releaseLock: vi.fn(),
+    createRun: vi.fn(),
+    transitionRun: vi.fn(),
+    createHeartbeatController: vi.fn(),
+  }
+})
 
 vi.mock('../approvals/coordinator.js', () => ({
   createPermissionCoordinator: vi.fn().mockReturnValue({

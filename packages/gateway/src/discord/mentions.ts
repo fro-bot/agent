@@ -14,8 +14,8 @@
  *   (which returns undefined without the GuildMembers privileged intent — documented
  *   false-negative trap). Fail CLOSED: any fetch/permission error → deny.
  * - Unauthorized → terminal "not authorized" reply, no further work.
- * - Every Discord send routes through `safeReply` which enforces
- *   `allowedMentions: { parse: [] }`.
+ * - Every Discord send routes through `sendMessage` (from `discord/io.ts`) which
+ *   enforces `allowedMentions: { parse: [] }`.
  * - No internal detail (error messages, IDs, paths) is ever posted to Discord.
  */
 
@@ -26,8 +26,8 @@ import type {RunMentionDeps} from '../execute/run.js'
 import type {GatewayLogger} from './client.js'
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
-
 import {runMention} from '../execute/run.js'
+import {sendMessage} from './io.js'
 
 // ---------------------------------------------------------------------------
 // Deps
@@ -46,14 +46,6 @@ export interface MentionDeps {
   /** Run-lifecycle deps forwarded verbatim to `runMention`. */
   readonly run: RunMentionDeps
   readonly logger: GatewayLogger
-}
-
-// ---------------------------------------------------------------------------
-// Internal Discord send helper — ALL replies route through here.
-// ---------------------------------------------------------------------------
-
-async function safeReply(message: Message, content: string): Promise<void> {
-  await message.reply({content, allowedMentions: {parse: []}})
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +129,7 @@ export function handleMention(message: Message, botUserId: string, deps: Mention
       const authorized = await userIsAuthorized(guild, message.author.id, triggerRoleId, logger)
       if (authorized === false) {
         logger.info({userId: message.author.id}, 'mention: unauthorized user')
-        await safeReply(message, 'You are not authorized to run tasks here.')
+        await sendMessage(message, {content: 'You are not authorized to run tasks here.'}, logger)
         return
       }
 
@@ -147,13 +139,17 @@ export function handleMention(message: Message, botUserId: string, deps: Mention
       if (bindingResult.success === false) {
         // Store error — fail safely without leaking internal details.
         logger.error({channelId: message.channel.id, err: bindingResult.error.message}, 'mention: binding store error')
-        await safeReply(message, 'Something went wrong looking up this channel. Please try again.')
+        await sendMessage(message, {content: 'Something went wrong looking up this channel. Please try again.'}, logger)
         return
       }
 
       if (bindingResult.data === null) {
         // No binding — channel not connected to a repo.
-        await safeReply(message, 'This channel is not bound to a repository. Use `/fro-bot add-project` first.')
+        await sendMessage(
+          message,
+          {content: 'This channel is not bound to a repository. Use `/fro-bot add-project` first.'},
+          logger,
+        )
         return
       }
 
