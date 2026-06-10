@@ -305,18 +305,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                 error: (msg, meta) => logger.error(meta ?? {}, msg),
               },
             }),
-          // Shutdown-drain hook: register handoff promises in the same inFlightRuns
-          // set so SIGTERM can await them before tearing down. Mirrors the
-          // add-at-inFlightRuns / delete-in-finally pattern used for the initial
-          // handleMention promise above.
-          trackRun: (p: Promise<void>) => {
-            inFlightRuns.add(p)
-            p.finally(() => {
-              inFlightRuns.delete(p)
-            }).catch(() => {
-              // Errors are already handled inside the handoff promise; finally() cannot throw here.
-            })
-          },
+          // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
+          // The in-memory queue is lossy by design; dropping pending tasks on graceful
+          // shutdown matches that contract and is consistent with the messageCreate
+          // guard above that refuses new mentions once isShuttingDown() returns true.
+          isShuttingDown,
         },
         logger,
       }

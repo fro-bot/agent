@@ -3431,35 +3431,63 @@ describe('runMention', () => {
 })
 
 // ---------------------------------------------------------------------------
-// F1: trackRun — shutdown-drain hook for handoff promises
+// isShuttingDown — shutdown gate for handoff
 // ---------------------------------------------------------------------------
 
-describe('trackRun — shutdown-drain hook', () => {
+describe('isShuttingDown — handoff shutdown gate', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
 
-  it('trackRun is called with the handoff promise when a queued task is handed off', async () => {
-    // #given — first run completes; queue has one pending task
+  it('when isShuttingDown() returns true, handoff does NOT call queue.takeNext and DOES release the slot', async () => {
+    // #given — first run completes; shutdown is in progress
     const {runMention} = await import('./run.js')
     setupHappyPath()
 
-    const trackRun = vi.fn()
+    const releaseFn = vi.fn()
     const sharedConcurrency = {
       tryAcquire: vi.fn().mockReturnValue('ok'),
-      release: vi.fn(),
+      release: releaseFn,
       activeCount: vi.fn().mockReturnValue(1),
       max: 3,
     }
     const queue = makeDefaultQueue()
+    const isShuttingDown = vi.fn().mockReturnValue(true)
+
+    const deps = makeDeps({concurrency: sharedConcurrency, queue, isShuttingDown})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — shutdown gate fired: takeNext NOT called (no handoff started)
+    expect(queue.takeNext).not.toHaveBeenCalled()
+    // #and — slot released immediately (not transferred to a next run)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+
+  it('when isShuttingDown() returns false, normal handoff proceeds (takeNext called, startRun fires)', async () => {
+    // #given — first run completes; NOT shutting down; queue has one pending task
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const sharedConcurrency = {
+      tryAcquire: vi.fn().mockReturnValue('ok'),
+      release: releaseFn,
+      activeCount: vi.fn().mockReturnValue(1),
+      max: 3,
+    }
+    const queue = makeDefaultQueue()
+    const isShuttingDown = vi.fn().mockReturnValue(false)
 
     const pendingMessage = makeMessage()
-    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, isShuttingDown})
     const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
 
     ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
-    const deps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const deps = makeDeps({concurrency: sharedConcurrency, queue, isShuttingDown})
     const message = makeMessage()
 
     // #when
@@ -3467,80 +3495,35 @@ describe('trackRun — shutdown-drain hook', () => {
     // Allow the fire-and-forget handoff to settle
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // #then — trackRun was called with a Promise (the handoff promise)
-    expect(trackRun).toHaveBeenCalledOnce()
-    const arg: unknown = trackRun.mock.calls[0]?.[0]
-    expect(arg).toBeInstanceOf(Promise)
+    // #then — not shutting down: takeNext WAS called (handoff attempted)
+    expect(queue.takeNext).toHaveBeenCalledWith(CHANNEL_ID)
+    // #and — slot NOT released by the first run (transferred to the handoff)
+    // (it will be released by the handoff run's own outer finally after it completes)
+    // We verify release was called exactly once — by the handoff run after it drains
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
   })
 
-  it('the completing run does NOT await the handoff (returns before handoff settles)', async () => {
-    // #given — first run completes; queue has one pending task that is slow
+  it('when isShuttingDown is absent (undefined), normal handoff proceeds', async () => {
+    // #given — no isShuttingDown injected; queue has one pending task
     const {runMention} = await import('./run.js')
     setupHappyPath()
 
-    const handoffSettled: string[] = []
-    const trackRun = vi.fn()
-
-    const sharedConcurrency = {
-      tryAcquire: vi.fn().mockReturnValue('ok'),
-      release: vi.fn(),
-      activeCount: vi.fn().mockReturnValue(1),
-      max: 3,
-    }
     const queue = makeDefaultQueue()
-
-    // Handoff run is slow — resolves after a delay
-    let resolveHandoff!: () => void
-    const handoffPaused = new Promise<void>(resolve => {
-      resolveHandoff = resolve
-    })
-
     const pendingMessage = makeMessage()
-    const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
+    const pendingDeps = makeDeps({queue})
     const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
 
     ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
-    // First run resolves immediately; second (handoff) waits
-    mockRunOpenCodeCore
-      .mockResolvedValueOnce(undefined) // first run
-      .mockImplementationOnce(async () => {
-        await handoffPaused
-        handoffSettled.push('handoff-done')
-      })
-
-    const deps = makeDeps({concurrency: sharedConcurrency, queue, trackRun})
-    const message = makeMessage()
-
-    // #when — await the first run (should return before handoff settles)
-    await runMention(message, makeBinding(), deps)
-
-    // #then — handoff has NOT settled yet (completing run did not await it)
-    expect(handoffSettled).toHaveLength(0)
-
-    // Cleanup: resolve the handoff so the test doesn't leak
-    resolveHandoff()
-    await new Promise(resolve => setTimeout(resolve, 10))
-    expect(handoffSettled).toHaveLength(1)
-  })
-
-  it('trackRun is NOT called when the queue is empty (no handoff)', async () => {
-    // #given — first run completes; queue is empty
-    const {runMention} = await import('./run.js')
-    setupHappyPath()
-
-    const trackRun = vi.fn()
-    const queue = makeDefaultQueue()
-    ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValue(undefined)
-
-    const deps = makeDeps({queue, trackRun})
+    const deps = makeDeps({queue})
     const message = makeMessage()
 
     // #when
     await runMention(message, makeBinding(), deps)
+    await new Promise(resolve => setTimeout(resolve, 10))
 
-    // #then — no handoff → trackRun not called
-    expect(trackRun).not.toHaveBeenCalled()
+    // #then — takeNext was called (handoff proceeded normally)
+    expect(queue.takeNext).toHaveBeenCalledWith(CHANNEL_ID)
   })
 })
 

@@ -63,6 +63,7 @@ export function createChannelQueue<T>(maxDepth: number = DEFAULT_MAX_QUEUE_DEPTH
     enqueue: (channelId: string, task: T): 'queued' | 'full' => {
       const existing = queues.get(channelId)
       if (existing === undefined) {
+        if (maxDepth <= 0) return 'full'
         queues.set(channelId, [task])
       } else {
         if (existing.length >= maxDepth) return 'full'

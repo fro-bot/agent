@@ -61,14 +61,15 @@ export interface RunMentionDeps {
    */
   readonly statusMode: 'live-status' | 'typing-only'
   /**
-   * Optional shutdown-drain hook. When present, called with the handoff promise so the
-   * program-level drain set can await it on SIGTERM. The completing run does NOT await
-   * the handoff — it remains fire-and-forget from the completing run's perspective.
+   * Optional shutdown predicate. When present and returns `true`, the outer-finally
+   * handoff is suppressed: the channel slot is released immediately instead of
+   * starting the next queued task. Matches the `messageCreate` guard in program.ts
+   * that refuses new mentions during shutdown.
    *
-   * When absent (e.g. in tests that don't exercise shutdown drain), the handoff behaves
-   * exactly as before: fire-and-forget with no external tracking.
+   * When absent (e.g. in tests that don't exercise shutdown), the handoff always
+   * proceeds as normal.
    */
-  readonly trackRun?: (p: Promise<void>) => void
+  readonly isShuttingDown?: () => boolean
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -710,26 +711,33 @@ async function startRun(task: RunTask): Promise<void> {
     // This closes the free-slot window: there is NO moment where tryAcquire could
     // return 'ok' for a channel that still has pending/handing-off work.
     //
+    // Shutdown gate: if shutdown has been requested, skip the handoff and release
+    // the slot immediately. The in-memory queue is lossy by design (documented in
+    // AGENTS.md); dropping pending tasks on graceful shutdown matches that contract.
+    // This is consistent with the messageCreate guard in program.ts that refuses
+    // new mentions once isShuttingDown() returns true.
+    //
     // The handed-off startRun is fire-and-forget from this run's perspective so
     // cleanup completes, but its own outer finally runs the same handoff/release
     // logic — so the chain continues and a thrown handoff still releases.
-    const nextTask = queue.takeNext(channelId)
-    if (nextTask === undefined) {
-      // Queue is empty — release the slot now.
+    if (deps.isShuttingDown?.() === true) {
+      // Shutdown in progress — drop pending queued tasks; release the slot.
       concurrency.release(channelId)
     } else {
-      // Slot ownership transfers to the next run — do NOT call concurrency.release.
-      const handoffPromise = startRun(nextTask).catch((error: unknown) => {
-        logger.error(
-          {channelId, err: error instanceof Error ? error.message : String(error)},
-          'run: handoff startRun failed',
-        )
-      })
-      // Register the handoff promise with the shutdown drain if a tracker is provided,
-      // so SIGTERM can await it before tearing down. The completing run does not await it.
-      deps.trackRun?.(handoffPromise)
-      // eslint-disable-next-line no-void
-      void handoffPromise
+      const nextTask = queue.takeNext(channelId)
+      if (nextTask === undefined) {
+        // Queue is empty — release the slot now.
+        concurrency.release(channelId)
+      } else {
+        // Slot ownership transfers to the next run — do NOT call concurrency.release.
+        // eslint-disable-next-line no-void
+        void startRun(nextTask).catch((error: unknown) => {
+          logger.error(
+            {channelId, err: error instanceof Error ? error.message : String(error)},
+            'run: handoff startRun failed',
+          )
+        })
+      }
     }
   }
 }

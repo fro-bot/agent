@@ -145,6 +145,18 @@ describe('createChannelQueue', () => {
   })
 
   describe('required depth cap', () => {
+    it('createChannelQueue(0) rejects the very first enqueue (cap is zero)', () => {
+      // #given — maxDepth=0 means no tasks are ever accepted
+      const queue = createChannelQueue(0)
+
+      // #when
+      const result = queue.enqueue('ch-a', {id: 'task-1'})
+
+      // #then — first enqueue is rejected even though the channel is unknown
+      expect(result).toBe('full')
+      expect(queue.pendingCount('ch-a')).toBe(0)
+    })
+
     it('enqueue at maxDepth returns full', () => {
       // #given
       const queue = createChannelQueue(2)

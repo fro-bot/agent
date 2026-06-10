@@ -130,6 +130,8 @@ Each channel runs tasks serially via a per-channel FIFO queue. When a mention ar
 
 On completion, the finishing run atomically hands the channel slot to the next queued task (if any) without releasing and re-acquiring it. This closes the window where a concurrent mention could slip in ahead of queued work. The queue is in-memory only — a gateway restart drops any pending tasks.
 
+On graceful shutdown (SIGTERM), pending queued tasks are dropped: the handoff is suppressed and the channel slot is released immediately. The in-flight run finishes its own cleanup (lock release, run-state transition, heartbeat stop) but does not start any new runs. This is consistent with the `messageCreate` guard that refuses new mentions once shutdown is requested. The in-memory queue is lossy by design; dropping pending tasks on shutdown matches that contract.
+
 The `/fro-bot clear-queue` subcommand drops all pending queued tasks for the invoking channel. It is authorization-gated with the same authority check as the mention path (trigger role or guild-level ManageChannels). The in-flight run (if any) is unaffected.
 
 Releasing is always done in a `finally` block so crashes leave the system in a recoverable state.

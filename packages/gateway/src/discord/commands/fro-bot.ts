@@ -123,6 +123,8 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
   return Effect.tryPromise({
     try: async () => {
       // Fail closed: command must be used inside a server (guild).
+      // Guard is synchronous (no await before it) so a plain reply is safe here
+      // — we haven't consumed the 3 s interaction window yet.
       const guild = interaction.guild
       if (guild === null) {
         await interaction.reply({
@@ -132,20 +134,23 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
         return
       }
 
+      // Defer immediately — userIsAuthorized calls guild.members.fetch() (REST) which
+      // can exceed Discord's 3 s interaction-token window under latency. Deferring here
+      // acks the interaction before any await, matching the add-project pattern.
+      await interaction.deferReply({ephemeral: true})
+
       const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, deps.gatewayLogger)
       if (authorized === false) {
-        await interaction.reply({
+        await interaction.editReply({
           content: 'You do not have permission to clear the queue.',
-          ephemeral: true,
         })
         return
       }
 
       const channelId = interaction.channelId
       const dropped = deps.queue.clear(channelId)
-      await interaction.reply({
+      await interaction.editReply({
         content: `Cleared ${dropped} queued task(s). The running task will finish.`,
-        ephemeral: true,
       })
     },
     catch: error => (error instanceof Error ? error : new Error(String(error))),

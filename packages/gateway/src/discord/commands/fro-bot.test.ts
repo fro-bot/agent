@@ -98,19 +98,25 @@ function makeInteraction(
 ): {
   interaction: ChatInputCommandInteraction
   reply: ReturnType<typeof vi.fn>
+  deferReply: ReturnType<typeof vi.fn>
+  editReply: ReturnType<typeof vi.fn>
 } {
   const reply = vi.fn().mockResolvedValue(undefined)
+  const deferReply = vi.fn().mockResolvedValue(undefined)
+  const editReply = vi.fn().mockResolvedValue(undefined)
   const interaction = {
     commandName: 'fro-bot',
     channelId,
     guild,
     user: {id: userId},
     reply,
+    deferReply,
+    editReply,
     options: {
       getSubcommand: vi.fn().mockReturnValue(subcommand),
     },
   } as unknown as ChatInputCommandInteraction
-  return {interaction, reply}
+  return {interaction, reply, deferReply, editReply}
 }
 
 // ---------------------------------------------------------------------------
@@ -183,46 +189,50 @@ describe('createFroBotCommand — dispatch', () => {
 // ---------------------------------------------------------------------------
 
 describe('/fro-bot clear-queue', () => {
-  it('happy path: calls queue.clear with the interaction channelId and replies ephemerally with count', async () => {
+  it('happy path: calls queue.clear with the interaction channelId and editReplies ephemerally with count', async () => {
     // #given — 3 pending tasks in the queue
     const queue = makeQueue(3)
     const deps = makeDeps({queue})
     const cmd = createFroBotCommand(deps)
     const channelId = 'ch-pending-123'
-    const {interaction, reply} = makeInteraction('clear-queue', channelId)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', channelId)
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — queue.clear was called with the channel ID
+    // #then — deferReply was called first (ephemeral)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+
+    // #and — queue.clear was called with the channel ID
     expect(queue.clear).toHaveBeenCalledExactlyOnceWith(channelId)
 
-    // #and — reply was ephemeral and mentions the count
-    expect(reply).toHaveBeenCalledExactlyOnceWith(
+    // #and — editReply mentions the count (no ephemeral flag needed — deferred reply inherits it)
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        ephemeral: true,
         content: expect.stringContaining('3') as unknown as string,
       }),
     )
   })
 
-  it('zero pending: clear returns 0 → reply still sent with count 0', async () => {
+  it('zero pending: clear returns 0 → editReply still sent with count 0', async () => {
     // #given — empty queue
     const queue = makeQueue(0)
     const deps = makeDeps({queue})
     const cmd = createFroBotCommand(deps)
-    const {interaction, reply} = makeInteraction('clear-queue', 'ch-empty')
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-empty')
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — queue.clear was still called
+    // #then — deferReply called
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+
+    // #and — queue.clear was still called
     expect(queue.clear).toHaveBeenCalledExactlyOnceWith('ch-empty')
 
-    // #and — reply mentions 0
-    expect(reply).toHaveBeenCalledExactlyOnceWith(
+    // #and — editReply mentions 0
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        ephemeral: true,
         content: expect.stringContaining('0') as unknown as string,
       }),
     )
@@ -250,16 +260,15 @@ describe('/fro-bot clear-queue', () => {
     const queue = makeQueue(1)
     const deps = makeDeps({queue})
     const cmd = createFroBotCommand(deps)
-    const {interaction, reply} = makeInteraction('clear-queue', 'ch-wording')
+    const {interaction, editReply} = makeInteraction('clear-queue', 'ch-wording')
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — reply content matches expected format
-    const replyArg = reply.mock.calls[0]?.[0] as {content: string; ephemeral: boolean}
+    // #then — editReply content matches expected format
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
     expect(replyArg.content).toMatch(/Cleared 1 queued task/)
     expect(replyArg.content).toMatch(/running task will finish/)
-    expect(replyArg.ephemeral).toBe(true)
   })
 
   it('queue.clear was called with interaction.channelId exactly', async () => {
@@ -276,6 +285,27 @@ describe('/fro-bot clear-queue', () => {
     // #then — clear called with the exact channelId from the interaction
     expect(queue.clear).toHaveBeenCalledExactlyOnceWith(channelId)
   })
+
+  it('deferReply is called on the happy path (before auth and queue.clear)', async () => {
+    // #given — authorized user; verify deferReply is called as part of the happy path
+    // The code structure guarantees deferReply fires before userIsAuthorized (which awaits
+    // guild.members.fetch). This test proves deferReply is wired in at all.
+    const queue = makeQueue(2)
+    const guild = makeGuild({hasRole: true})
+    const deps = makeDeps({queue, triggerRoleId: 'role-123'})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-defer-check', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — deferReply was called (ephemeral)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+    // #and — editReply was used for the outcome (not reply)
+    expect(editReply).toHaveBeenCalledOnce()
+    // #and — queue.clear was called (auth passed)
+    expect(queue.clear).toHaveBeenCalledOnce()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -283,69 +313,74 @@ describe('/fro-bot clear-queue', () => {
 // ---------------------------------------------------------------------------
 
 describe('/fro-bot clear-queue — authorization gate', () => {
-  it('authorized user (has trigger role) → queue.clear called + count reply', async () => {
+  it('authorized user (has trigger role) → queue.clear called + count editReply', async () => {
     // #given — user has the trigger role
     const queue = makeQueue(3)
     const guild = makeGuild({hasRole: true})
     const deps = makeDeps({queue, triggerRoleId: 'role-trigger-123'})
     const cmd = createFroBotCommand(deps)
-    const {interaction, reply} = makeInteraction('clear-queue', 'ch-auth', guild)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-auth', guild)
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — queue.clear was called
+    // #then — deferReply called first
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+    // #and — queue.clear was called
     expect(queue.clear).toHaveBeenCalledOnce()
-    // #and — reply mentions the count
-    expect(reply).toHaveBeenCalledExactlyOnceWith(
+    // #and — editReply mentions the count
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        ephemeral: true,
         content: expect.stringContaining('3') as unknown as string,
       }),
     )
   })
 
-  it('unauthorized user (no role, no ManageChannels) → queue.clear NOT called + permission-denied reply', async () => {
+  it('unauthorized user (no role, no ManageChannels) → queue.clear NOT called + permission-denied editReply', async () => {
     // #given — user has neither the trigger role nor ManageChannels
     const queue = makeQueue(2)
     const guild = makeGuild({hasRole: false, hasManageChannels: false})
     const deps = makeDeps({queue, triggerRoleId: 'role-trigger-123'})
     const cmd = createFroBotCommand(deps)
-    const {interaction, reply} = makeInteraction('clear-queue', 'ch-unauth', guild)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-unauth', guild)
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — queue.clear NOT called
+    // #then — deferReply called (interaction acked before auth)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+    // #and — queue.clear NOT called
     expect(queue.clear).not.toHaveBeenCalled()
-    // #and — ephemeral permission-denied reply
-    expect(reply).toHaveBeenCalledExactlyOnceWith(
+    // #and — ephemeral permission-denied editReply
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        ephemeral: true,
         content: expect.stringMatching(/permission|not authorized/i) as unknown as string,
       }),
     )
   })
 
-  it('null guild → queue.clear NOT called + server-only reply', async () => {
+  it('null guild → queue.clear NOT called + server-only reply (synchronous guard, no defer)', async () => {
     // #given — interaction has no guild (DM context)
+    // The null-guild guard fires before deferReply because it is synchronous.
     const queue = makeQueue(1)
     const deps = makeDeps({queue})
     const cmd = createFroBotCommand(deps)
-    const {interaction, reply} = makeInteraction('clear-queue', 'ch-dm', null)
+    const {interaction, reply, deferReply} = makeInteraction('clear-queue', 'ch-dm', null)
 
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
     // #then — queue.clear NOT called
     expect(queue.clear).not.toHaveBeenCalled()
-    // #and — ephemeral server-only reply
+    // #and — plain reply (not deferred) with server-only message
     expect(reply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         ephemeral: true,
         content: expect.stringMatching(/server/i) as unknown as string,
       }),
     )
+    // #and — deferReply NOT called (guard fires before defer)
+    expect(deferReply).not.toHaveBeenCalled()
   })
 
   it('authorized user with ManageChannels (no trigger role configured) → queue.clear called', async () => {
