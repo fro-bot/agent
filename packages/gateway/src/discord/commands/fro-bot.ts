@@ -56,6 +56,12 @@ export interface FroBotDeps extends AddProjectDeps {
    */
   readonly coordinationConfig: CoordinationConfig
   /**
+   * Run-state owner identity (the gateway identity, e.g. `'discord-gateway'`).
+   * Passed to `forceReleaseStaleLock` so it reads run-state under the correct
+   * identity segment — distinct from the lock key's `COORDINATION_IDENTITY`.
+   */
+  readonly identity: string
+  /**
    * Dead-run-verified force-release primitive (injected for testability).
    * In production this is `forceReleaseStaleLock` from `@fro-bot/runtime`.
    * Tests inject a mock to avoid real S3 calls.
@@ -63,6 +69,7 @@ export interface FroBotDeps extends AddProjectDeps {
   readonly forceReleaseStaleLock: (
     config: CoordinationConfig,
     repo: string,
+    identity: string,
     logger: {debug: (message: string, context?: Record<string, unknown>) => void},
   ) => Promise<Result<ForceReleaseStaleLockResult, Error>>
 }
@@ -282,7 +289,13 @@ function executeForceReleaseLock(
       }
 
       // Call the dead-run-verified force-release primitive.
-      const releaseResult = await deps.forceReleaseStaleLock(deps.coordinationConfig, repoSlug, coordLogger)
+      // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
+      const releaseResult = await deps.forceReleaseStaleLock(
+        deps.coordinationConfig,
+        repoSlug,
+        deps.identity,
+        coordLogger,
+      )
 
       if (releaseResult.success === false) {
         deps.gatewayLogger.error(

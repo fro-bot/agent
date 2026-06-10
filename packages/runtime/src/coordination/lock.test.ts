@@ -492,8 +492,8 @@ function createRunState(overrides: Partial<RunState> = {}): RunState {
 describe('forceReleaseStaleLock', () => {
   // The outer beforeEach already sets fake timers to 2026-04-24T18:15:00.000Z.
 
-  // Lock key: fro-bot-state/coordination/owner/repo/locks/repo.json
-  // Run-state key: fro-bot-state/coordination/owner/repo/runs/run-1.json
+  // Lock key:      fro-bot-state/coordination/owner/repo/locks/repo.json
+  // Run-state key: fro-bot-state/discord-gateway/owner/repo/runs/run-1.json  (gateway identity, NOT coordination)
 
   it('releases the lock when lease is expired AND run-state heartbeat is stale', async () => {
     // #given — lock is stale (acquired 15 min ago, ttl=900s), run-state heartbeat is 15 min ago (staleThresholdMs=60s)
@@ -509,7 +509,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then
     expect(result.success).toBe(true)
@@ -534,7 +534,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then
     expect(result.success).toBe(true)
@@ -559,7 +559,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — must refuse, no delete
     expect(result.success).toBe(true)
@@ -582,7 +582,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — live-holder, no run-state read, no delete
     expect(result.success).toBe(true)
@@ -603,7 +603,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then
     expect(result.success).toBe(true)
@@ -627,7 +627,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — conflict, not an error; the new holder's lock is NOT deleted
     expect(result.success).toBe(true)
@@ -649,7 +649,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — fail closed, no delete
     expect(result.success).toBe(true)
@@ -670,7 +670,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — fail closed, no delete
     expect(result.success).toBe(true)
@@ -692,7 +692,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — fail closed: transient error → outcome 'error', NO delete
     expect(result.success).toBe(true)
@@ -715,7 +715,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — NoSuchKey is genuinely absent → treated as dead → released
     expect(result.success).toBe(true)
@@ -742,7 +742,7 @@ describe('forceReleaseStaleLock', () => {
     const logger = createLogger()
 
     // #when
-    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
 
     // #then — lock vanished between read and delete → no-lock (not an error)
     expect(result.success).toBe(true)
@@ -751,5 +751,36 @@ describe('forceReleaseStaleLock', () => {
     expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
       ifMatch: 'etag-lock',
     })
+  })
+
+  it('run-state key uses the gateway identity segment, NOT the coordination identity', async () => {
+    // #given — lock is stale; run-state is absent (NoSuchKey) so we can assert the exact key used
+    // This test PINS the run-state key identity segment: it must contain /discord-gateway/ (the
+    // gateway identity passed in), NOT /coordination/ (the lock key's identity). This is the
+    // regression test for the P0 bug where readRunStateByRunId used COORDINATION_IDENTITY.
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-42'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when — pass 'discord-gateway' as the run-state owner identity
+    await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — the second getObject call (run-state read) must use the gateway identity segment
+    // Key shape: {prefix}/{identity}/{owner}/{repo}/runs/{runId}.json
+    const runStateCall = getObject.mock.calls[1]
+    expect(runStateCall).toBeDefined()
+    const runStateKey = runStateCall?.[0] as string
+    // Must contain the gateway identity segment
+    expect(runStateKey).toContain('/discord-gateway/')
+    // Must reference the correct run ID
+    expect(runStateKey).toContain('/runs/run-42.json')
+    // Must NOT use the coordination identity (the lock key's identity)
+    expect(runStateKey).not.toContain('/coordination/')
   })
 })

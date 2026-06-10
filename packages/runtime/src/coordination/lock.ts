@@ -274,7 +274,10 @@ async function readLockRecord(
 /**
  * Internal helper: reads the run-state record for a given `run_id`.
  *
- * Uses `COORDINATION_IDENTITY` as the identity segment (same as the lock key).
+ * Uses the run-owner `identity` (e.g. the gateway identity `'discord-gateway'`) as the identity
+ * segment — distinct from the lock key's `COORDINATION_IDENTITY`. Run-state records are written
+ * under the gateway identity; the lock key lives under `COORDINATION_IDENTITY`. These are two
+ * separate key families and must not be conflated.
  *
  * Returns:
  * - `ok(runState)` — run-state exists and is valid.
@@ -284,9 +287,10 @@ async function readLockRecord(
 async function readRunStateByRunId(
   config: CoordinationConfig,
   repo: string,
+  identity: string,
   runId: string,
 ): Promise<Result<RunState | null, Error>> {
-  const key = buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'runs', `${runId}.json`)
+  const key = buildObjectStoreKey(config.storeConfig, identity, repo, 'runs', `${runId}.json`)
   if (key.success === false) {
     return err(key.error)
   }
@@ -327,6 +331,10 @@ async function readRunStateByRunId(
  * changed between read and delete (re-acquire/renewal), the delete fails and the outcome
  * is `conflict` — the new holder's lock is never deleted.
  *
+ * `identity` is the run-owner identity (e.g. `'discord-gateway'`) used to build the
+ * run-state key. This is distinct from the lock key's `COORDINATION_IDENTITY` — run-state
+ * records are written under the gateway identity, not the coordination identity.
+ *
  * Returns a `Result<ForceReleaseStaleLockResult, Error>`. The outer `Result` is `err` only
  * for unexpected infrastructure failures (key-build errors, missing adapter capabilities).
  * All semantic outcomes (`released`, `live-holder`, `no-lock`, `conflict`, `error`) are
@@ -335,6 +343,7 @@ async function readRunStateByRunId(
 export async function forceReleaseStaleLock(
   config: CoordinationConfig,
   repo: string,
+  identity: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
 ): Promise<Result<ForceReleaseStaleLockResult, Error>> {
   const now = new Date()
@@ -372,7 +381,9 @@ export async function forceReleaseStaleLock(
   }
 
   // Step 3 — Signal 2 (heartbeat): read the run-state for the lock's run_id.
-  const runStateRead = await readRunStateByRunId(config, repo, lockRecord.run_id)
+  // Use the run-owner identity (gateway identity), NOT COORDINATION_IDENTITY — run-state
+  // records are written under the gateway identity, not the coordination identity.
+  const runStateRead = await readRunStateByRunId(config, repo, identity, lockRecord.run_id)
   if (runStateRead.success === false) {
     // Malformed run-state record → fail-closed, no delete.
     logger.debug('forceReleaseStaleLock: malformed run-state record', {

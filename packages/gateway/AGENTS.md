@@ -31,6 +31,8 @@ Effect.tryPromise(() => runtimeFn(args)) // catches promise rejections
 
 All gateway code outside `runtime-effect.ts` works exclusively in Effect — `Effect.Effect<A, E, R>` everywhere. Subagents asked to add a new runtime call should add the wrapper to `runtime-effect.ts` first, never import directly from `@fro-bot/runtime` outside that adapter.
 
+**Exception:** `forceReleaseStaleLock` is imported directly from `@fro-bot/runtime` in `program.ts` and injected into `FroBotDeps` (not wrapped in `runtime-effect.ts`). This is intentional: the command handler awaits its `Result<>` inside `Effect.tryPromise`, keeping the DI boundary clean for testing without a real S3 adapter. Do not move it to `runtime-effect.ts`.
+
 ### Effect surface used
 
 - **Core** (`Effect.Effect`, `pipe`, `Effect.tryPromise`, `Effect.flatMap`, `Effect.gen`, `Effect.runPromise`, `Effect.try`, `Effect.succeed`, `Effect.fail`, `Effect.either`, `Effect.void`, `Effect.catchAll`) — composing async error paths

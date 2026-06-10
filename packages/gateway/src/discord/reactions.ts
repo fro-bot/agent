@@ -36,7 +36,9 @@ export type RunReactionState = keyof typeof REACTION_EMOJIS
 
 /**
  * Standard unicode emoji per run state.
- * No custom emoji — no `ManageMessages` permission dependency.
+ * No custom emoji — but note: `setRunReaction` calls `message.reactions.removeAll()`,
+ * which DOES require the `ManageMessages` permission. Without it the removeAll call
+ * will fail (the catch logs a warn and reactions may accumulate), but execution continues.
  */
 export const REACTION_EMOJIS = {
   working: '⏳',

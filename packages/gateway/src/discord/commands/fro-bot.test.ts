@@ -99,6 +99,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
       heartbeatIntervalMs: 30_000,
       staleThresholdMs: 60_000,
     },
+    identity: 'discord-gateway',
     forceReleaseStaleLock: defaultForceRelease,
     ...overrides,
   }
@@ -424,6 +425,7 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 type ForceReleaseFn = (
   config: CoordinationConfig,
   repo: string,
+  identity: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
 ) => Promise<Result<ForceReleaseStaleLockResult, Error>>
 
@@ -544,7 +546,7 @@ describe('/fro-bot force-release-lock — null guild guard', () => {
 // ---------------------------------------------------------------------------
 
 describe('/fro-bot force-release-lock — authorization gate', () => {
-  it('manageChannels user → deferReply called first, then forceReleaseStaleLock called', async () => {
+  it('manageChannels user → deferReply called first, then forceReleaseStaleLock called with gateway identity', async () => {
     // #given — user has ManageChannels
     const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
       outcome: 'released',
@@ -555,7 +557,7 @@ describe('/fro-bot force-release-lock — authorization gate', () => {
     })
     const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
     const bindingsStore = makeBindingsStore()
-    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore, identity: 'discord-gateway'})
     const cmd = createFroBotCommand(deps)
     const {interaction, deferReply, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
 
@@ -564,8 +566,10 @@ describe('/fro-bot force-release-lock — authorization gate', () => {
 
     // #then — deferReply called first (ephemeral)
     expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
-    // #and — forceReleaseStaleLock was called
+    // #and — forceReleaseStaleLock was called with the gateway identity as the 3rd argument
     expect(forceReleaseStaleLock).toHaveBeenCalledOnce()
+    const callArgs = (forceReleaseStaleLock as ReturnType<typeof vi.fn>).mock.calls[0] as unknown[]
+    expect(callArgs[2]).toBe('discord-gateway')
     // #and — editReply was called with released confirmation
     expect(editReply).toHaveBeenCalledOnce()
   })

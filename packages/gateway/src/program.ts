@@ -182,6 +182,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // force-release-lock deps: pre-built coordination config + injected primitive
       // (injected so tests can mock without real S3 calls)
       coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      // identity is the run-state owner identity (gateway identity); forwarded to
+      // forceReleaseStaleLock so it reads run-state under the correct key segment.
+      identity: config.identity,
       forceReleaseStaleLock,
     }
 

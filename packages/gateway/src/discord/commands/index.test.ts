@@ -54,6 +54,7 @@ function makeMockDeps(): FroBotDeps {
       heartbeatIntervalMs: 30_000,
       staleThresholdMs: 60_000,
     },
+    identity: 'discord-gateway',
     forceReleaseStaleLock: vi.fn().mockResolvedValue({
       success: true,
       data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
