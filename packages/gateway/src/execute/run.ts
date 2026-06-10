@@ -7,6 +7,7 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
+import type {ChannelQueue} from './queue.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
@@ -26,6 +27,8 @@ export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
   readonly concurrency: ConcurrencyRegistry
+  /** Per-channel FIFO queue for pending tasks. */
+  readonly queue: ChannelQueue<RunTask>
   readonly attachUrl: string
   readonly attachToken: string
   /** Wall-clock milliseconds before an in-progress run is timed out. */
@@ -39,7 +42,7 @@ export interface RunMentionDeps {
   /**
    * Optional canonical persona text (from `GatewayConfig.persona`).
    * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
-   * `null` → mechanical guidance only (R4 fail-soft).
+   * `null` → mechanical guidance only (fail-soft: omit persona rather than failing).
    */
   readonly persona: string | null
   readonly logger: GatewayLogger
@@ -58,6 +61,16 @@ export interface RunMentionDeps {
    */
   readonly statusMode: 'live-status' | 'typing-only'
   /**
+   * Optional shutdown predicate. When present and returns `true`, the outer-finally
+   * handoff is suppressed: the channel slot is released immediately instead of
+   * starting the next queued task. Matches the `messageCreate` guard in program.ts
+   * that refuses new mentions during shutdown.
+   *
+   * When absent (e.g. in tests that don't exercise shutdown), the handoff always
+   * proceeds as normal.
+   */
+  readonly isShuttingDown?: () => boolean
+  /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
    * Injected so tests can stub it without live GitHub/workspace calls.
@@ -74,6 +87,17 @@ export interface RunMentionDeps {
    */
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>
 }
+
+/**
+ * The task descriptor stored in the per-channel queue.
+ * Exactly the three arguments `runMention` takes — the stable contract the queue stores.
+ */
+export interface RunTask {
+  readonly message: Message
+  readonly binding: RepoBinding
+  readonly deps: RunMentionDeps
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -153,26 +177,45 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
 }
 
 // ---------------------------------------------------------------------------
-// runMention — the lifecycle wrapper
+// startRun — the slot-holding execution pipeline
 // ---------------------------------------------------------------------------
 
 /**
- * Execute a mention-triggered OpenCode run with full lifecycle management.
+ * Execute the post-acquire pipeline for a task.
  *
- * Called by `mentions.ts` after authorization and binding lookup succeed.
- * Owns: concurrency registry, thread creation, lock, run-state, heartbeat,
- * execution, and release of all resources in a `finally` block.
+ * ASSUMES the channel concurrency slot is already held by the caller.
+ * Owns: clone → readyz → thread → lock → run-state → heartbeat → execute → cleanup.
  *
- * Hard invariants:
- * - "busy", "cap", "waiting" are TERMINAL — no queue, no retry. * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
- *   raw errors) are logged but NEVER posted to Discord.
- * - Bearer token (`attachToken`) is never logged.
- * - Every Discord send uses `allowedMentions: {parse: []}`.
+ * On completion (success or failure), performs an **atomic handoff**:
+ * - Calls `queue.takeNext(channelId)` while the slot is still held.
+ * - If a next task exists → starts it on the held slot (no release/re-acquire gap).
+ * - If the queue is empty → calls `concurrency.release(channelId)` (only then is the slot freed).
+ *
+ * The handoff `startRun` is fire-and-forget from the completing run's perspective.
+ * Its own outer finally runs the same handoff/release logic, so the chain continues
+ * and a thrown handoff still releases.
  */
-export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, coordinationConfig, identity, attachUrl, attachToken, runTimeoutMs, botUserId, persona, logger} =
-    deps
+async function startRun(task: RunTask): Promise<void> {
+  const {message, binding, deps} = task
+  const {
+    concurrency,
+    queue,
+    coordinationConfig,
+    identity,
+    attachUrl,
+    attachToken,
+    runTimeoutMs,
+    botUserId,
+    persona,
+    logger,
+  } = deps
   const {approvalRegistry, approvalMode, statusMode, ensureClone, readyz} = deps
+
+  // ── All mutable state that the outer finally needs is declared here so the
+  // finally block can always reference channelId regardless of where execution
+  // stopped. Async functions never throw synchronously, so the outer try/finally
+  // always runs — but keeping these declarations before the try makes the
+  // dependency explicit and avoids any ambiguity.
   const channelId = message.channel.id
   const repo = `${binding.owner}/${binding.repo}`
 
@@ -181,24 +224,6 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // deadline clearance are computed from the same wall-clock reference.
   const runStartMs = Date.now()
 
-  // ── Concurrency cap + per-channel in-flight guard ──────────
-  // IMPORTANT: ensureClone and readyz are called AFTER this gate so that
-  // same-channel mention storms do not each mint GitHub App tokens or call
-  // workspace clone before the busy/cap rejection fires.
-
-  const slotResult = concurrency.tryAcquire(channelId)
-
-  if (slotResult === 'cap') {
-    await safeReply(message, 'fro-bot is at capacity right now — please try again shortly.')
-    return
-  }
-
-  if (slotResult === 'busy') {
-    await safeReply(message, 'There is already a task running in this channel — please wait for it to finish.')
-    return
-  }
-
-  // Slot acquired — MUST release in outer finally
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
     // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
@@ -245,7 +270,14 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     // ── Create response thread ─────────────────────────────────────────────────────────────────
 
     const runId = crypto.randomUUID()
-    const rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
+    let rawThread: Awaited<ReturnType<typeof message.startThread>>
+    try {
+      rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
+    } catch (threadError) {
+      logger.error({channelId, repo, err: String(threadError)}, 'run: startThread threw — aborting')
+      await safeReply(message, 'Could not start the task — please try again.')
+      return
+    }
     const threadId = rawThread.id
     const thread: SinkThread = rawThread
 
@@ -670,7 +702,107 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
       }
     }
   } finally {
-    // ALWAYS release the concurrency slot
-    concurrency.release(channelId)
+    // ── Atomic handoff — replaces bare concurrency.release ──────────────────
+    //
+    // While the channel slot is still held, attempt to drain the next queued task.
+    // If a task is waiting → start it on the held slot (no release/re-acquire gap).
+    // If the queue is empty → release the slot now.
+    //
+    // This closes the free-slot window: there is NO moment where tryAcquire could
+    // return 'ok' for a channel that still has pending/handing-off work.
+    //
+    // Shutdown gate: if shutdown has been requested, skip the handoff and release
+    // the slot immediately. The in-memory queue is lossy by design (documented in
+    // AGENTS.md); dropping pending tasks on graceful shutdown matches that contract.
+    // This is consistent with the messageCreate guard in program.ts that refuses
+    // new mentions once isShuttingDown() returns true.
+    //
+    // The handed-off startRun is fire-and-forget from this run's perspective so
+    // cleanup completes, but its own outer finally runs the same handoff/release
+    // logic — so the chain continues and a thrown handoff still releases.
+    if (deps.isShuttingDown?.() === true) {
+      // Shutdown in progress — drop pending queued tasks; release the slot.
+      concurrency.release(channelId)
+    } else {
+      const nextTask = queue.takeNext(channelId)
+      if (nextTask === undefined) {
+        // Queue is empty — release the slot now.
+        concurrency.release(channelId)
+      } else {
+        // Slot ownership transfers to the next run — do NOT call concurrency.release.
+        // eslint-disable-next-line no-void
+        void startRun(nextTask).catch((error: unknown) => {
+          logger.error(
+            {channelId, err: error instanceof Error ? error.message : String(error)},
+            'run: handoff startRun failed',
+          )
+        })
+      }
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// runMention — the thin front door
+// ---------------------------------------------------------------------------
+
+/**
+ * Front door for a mention-triggered run.
+ *
+ * Decides whether to run immediately or enqueue, in this order:
+ * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (pending work has
+ *    priority; never take an immediate slot ahead of it).
+ * 2. Else `concurrency.tryAcquire(channelId)`:
+ *    - `'ok'`   → `startRun(task)` (slot held).
+ *    - `'busy'` → enqueue + queued ack (or "queue is full" if at capacity). Return without blocking.
+ *    - `'cap'`  → terminal capacity reply, no enqueue (global cap stays terminal).
+ *
+ * Hard invariants:
+ * - `'cap'` is TERMINAL — no queue, no retry.
+ * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
+ *   raw errors) are logged but NEVER posted to Discord.
+ * - Bearer token (`attachToken`) is never logged.
+ * - Every Discord send uses `allowedMentions: {parse: []}`.
+ */
+/**
+ * Send the appropriate ephemeral ack for an enqueue result.
+ * Centralises the two reply strings so they live in exactly one place.
+ */
+async function ackEnqueueResult(message: Message, result: 'queued' | 'full'): Promise<void> {
+  if (result === 'queued') {
+    await safeReply(message, "Queued — I'll start this when the current task finishes.")
+  } else {
+    await safeReply(message, 'The queue is full for this channel — please wait for pending tasks to complete.')
+  }
+}
+
+export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
+  const {concurrency, queue} = deps
+  const channelId = message.channel.id
+  const task: RunTask = {message, binding, deps}
+
+  // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
+  // A new mention must never leapfrog older queued work, even if a slot is free.
+  // Only the handoff path (startRun's outer finally) may start the next task.
+  if (queue.pendingCount(channelId) > 0) {
+    await ackEnqueueResult(message, queue.enqueue(channelId, task))
+    return
+  }
+
+  // ── Concurrency cap + per-channel in-flight guard ──────────────────────────
+  const slotResult = concurrency.tryAcquire(channelId)
+
+  if (slotResult === 'cap') {
+    await safeReply(message, 'fro-bot is at capacity right now — please try again shortly.')
+    return
+  }
+
+  if (slotResult === 'busy') {
+    // Channel has an in-flight run — enqueue instead of rejecting.
+    await ackEnqueueResult(message, queue.enqueue(channelId, task))
+    return
+  }
+
+  // Slot acquired — startRun owns the release (via atomic handoff in its outer finally).
+  await startRun(task)
 }

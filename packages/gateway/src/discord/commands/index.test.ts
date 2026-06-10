@@ -1,5 +1,5 @@
 import type {ChatInputCommandInteraction} from 'discord.js'
-import type {AddProjectDeps} from './add-project.js'
+import type {FroBotDeps} from './fro-bot.js'
 
 import {Routes} from 'discord.js'
 import {Effect} from 'effect'
@@ -11,7 +11,7 @@ import {dispatchCommand, getCommandRegistry, registerSlashCommands, type SlashCo
 // Minimal mock deps for getCommandRegistry
 // ---------------------------------------------------------------------------
 
-function makeMockDeps(): AddProjectDeps {
+function makeMockDeps(): FroBotDeps {
   return {
     bindingsStore: {
       createBinding: vi.fn(),
@@ -29,6 +29,19 @@ function makeMockDeps(): AddProjectDeps {
     },
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    queue: {
+      enqueue: vi.fn().mockReturnValue('queued'),
+      pendingCount: vi.fn().mockReturnValue(0),
+      takeNext: vi.fn().mockReturnValue(undefined),
+      clear: vi.fn().mockReturnValue(0),
+    },
+    triggerRoleId: null,
+    gatewayLogger: {
+      debug: vi.fn(),
       info: vi.fn(),
       warn: vi.fn(),
       error: vi.fn(),
