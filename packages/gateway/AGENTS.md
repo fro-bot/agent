@@ -52,6 +52,8 @@ Not used at this scope:
 - `src/discord/` — Discord.js integration. Client construction with safe `allowedMentions` defaults, command registry, mention handler.
   - `src/discord/channels.ts` — channel creation helper used by the add-project flow. `createChannelWithCollisionSuffix` always creates a fresh channel; it never returns an existing one. Tries the exact name first, then `name-2` through `name-10`, skipping any candidate whose name is already taken.
   - `src/discord/commands/add-project.ts` — `/fro-bot add-project` slash command. Orchestrates the 5-phase flow (PRE_FLIGHT → CLONING → CREATING_CHANNEL → WRITING_BINDING → READY). Depends on `channels.ts` for channel creation, `workspace-api/client.ts` for repo cloning, `bindings/store.ts` for durable binding persistence, and `github/app-client.ts` for GitHub App token acquisition.
+  - `src/discord/commands/fro-bot.ts` — `/fro-bot` parent slash command. Hosts `ping`, `add-project`, `clear-queue`, and `force-release-lock` subcommands; dispatches to per-subcommand handlers.
+  - `src/discord/reactions.ts` — run-state emoji reactions. Posts lifecycle emoji (working / succeeded / failed) to the source message as the run progresses.
   - `src/discord/presence.ts` — resolves a channel by ID via `client.channels.fetch` and posts an embed with `allowedMentions: {parse: []}`. Used by the announce webhook to post control-plane presence messages as the Fro Bot user.
 - `src/workspace-api/` — HTTP client for the workspace-agent sidecar service. `WorkspaceClient` wraps the `/clone` endpoint and maps HTTP error shapes to typed `Result<CloneSuccess, CloneError>` values. The client is injected into `add-project.ts` via `AddProjectDeps`.
 - `src/http/` — the inbound announce webhook (`POST /v1/announce`), the gateway's only HTTP ingress. Hono server (`server.ts`) reads the raw body and maps the framework-agnostic handler (`announce-handler.ts`) result to a response. The handler runs an ordered fail-closed pipeline: 8 KB size cap → rate limit → required headers → HMAC verify → timestamp window → replay reserve → JSON parse → exact-string `fired_at` cross-check → schema decode → embed render → Discord post. Auth failures (`hmac_invalid` / `timestamp_expired` / `replayed`) return an identical generic 401 so the caller cannot tell which check failed. Supporting modules: `hmac.ts` (HMAC-SHA256 over `timestamp + "." + rawBody`, `timingSafeEqual`), `announce-schema.ts` (Effect Schema), `templates.ts` (event_type → embed), `replay-cache.ts` (atomic reserve/commit/release seen-signature cache), `rate-limit.ts` (socket-keyed token bucket, bounded key count). Config: `GATEWAY_WEBHOOK_SECRET`, `GATEWAY_PRESENCE_CHANNEL_ID`, `GATEWAY_HTTP_PORT`.
@@ -121,11 +123,20 @@ Both ports are loopback-bound inside the sandbox network. The egress proxy (`mit
 
 ### Concurrent-run semantics
 
-There is no run queue. When capacity is exhausted or a channel already has an active run, the response is terminal:
+Each channel runs tasks serially via a per-channel FIFO queue. When a mention arrives:
 
-- **cap** — global `GATEWAY_MAX_CONCURRENT_RUNS` limit reached → "at capacity, try again shortly".
-- **busy** — this channel already has an active run → "task already running, wait for it to finish".
+- **cap** — global `GATEWAY_MAX_CONCURRENT_RUNS` limit reached → terminal "at capacity, try again shortly" reply. No queue entry is created.
+- **busy** — this channel already has an active run → the new task is enqueued (up to the per-channel queue depth). The user receives a "Queued" ack and the task starts automatically when the current run finishes.
+- **pending work present** — even if a slot appears free, a new mention is enqueued rather than starting immediately, so older queued work is never leapfrogged.
 - **waiting** — the repo lock is held by another run → "another task in progress for this repo, try again when it completes".
+
+On completion, the finishing run atomically hands the channel slot to the next queued task (if any) without releasing and re-acquiring it. This closes the window where a concurrent mention could slip in ahead of queued work. The queue is in-memory only — a gateway restart drops any pending tasks.
+
+On graceful shutdown (SIGTERM), pending queued tasks are dropped: the handoff is suppressed and the channel slot is released immediately. The in-flight run finishes its own cleanup (lock release, run-state transition, heartbeat stop) but does not start any new runs. This is consistent with the `messageCreate` guard that refuses new mentions once shutdown is requested. The in-memory queue is lossy by design; dropping pending tasks on shutdown matches that contract.
+
+The `/fro-bot clear-queue` subcommand drops all pending queued tasks for the invoking channel. It is authorization-gated with the same authority check as the mention path (trigger role or guild-level ManageChannels). The in-flight run (if any) is unaffected.
+
+The `/fro-bot force-release-lock` subcommand lets a ManageChannels operator clear a stuck per-repo coordination lock. It is dead-run-verified: the lock is only deleted when BOTH the lock lease is expired AND the run-state heartbeat is stale or absent. An `IfMatch` conditional delete ensures a live run's re-acquired lock is never deleted. Requires guild-level ManageChannels (trigger-role-only users are denied). Operator-facing; not a substitute for normal lock release.
 
 Releasing is always done in a `finally` block so crashes leave the system in a recoverable state.
 
@@ -171,7 +182,7 @@ When the workspace OpenCode config sets any tool to `ask` (rather than the defau
   Discord-independent execution primitive and caller surface is deferred until a
   non-Discord caller exists.
 
-- **No run queue.** Mentions that arrive while the concurrency cap or repo lock is held are rejected immediately. There is no persistent queue, no back-pressure mechanism, and no retry. Users must manually re-send their message when the system is free.
+- **In-memory queue only.** The per-channel FIFO queue is in-memory and does not survive a gateway restart. Any pending queued tasks are silently dropped on restart; users must re-mention to retry. The global concurrency cap (`cap` path) is still terminal — no queue entry is created when the cap is reached.
 
 - **Tool approval does not survive a restart.** A pending approval is held in memory by the per-run coordinator. If the gateway or workspace restarts while a permission prompt is in flight, the pending approval is abandoned: the coordinator's deadline fires (or the process exits fail-closed), the Discord embed is settled with `rejected`, and the run surfaces as interrupted. Re-mention to retry.
 

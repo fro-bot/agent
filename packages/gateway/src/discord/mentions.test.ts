@@ -125,6 +125,12 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       activeCount: vi.fn().mockReturnValue(0),
       max: 3,
     },
+    queue: {
+      enqueue: vi.fn().mockReturnValue('queued'),
+      pendingCount: vi.fn().mockReturnValue(0),
+      takeNext: vi.fn().mockReturnValue(undefined),
+      clear: vi.fn().mockReturnValue(0),
+    },
     attachUrl: 'http://workspace:9200',
     attachToken: 'secret-token',
     runTimeoutMs: 600_000,

@@ -1,5 +1,5 @@
 import type {ChatInputCommandInteraction, SlashCommandBuilder} from 'discord.js'
-import type {AddProjectDeps} from './add-project.js'
+import type {FroBotDeps} from './fro-bot.js'
 
 import {REST, Routes} from 'discord.js'
 import {Effect} from 'effect'
@@ -16,7 +16,7 @@ export interface SlashCommand {
  *
  * @param deps - Runtime dependencies injected into command handlers.
  */
-export function getCommandRegistry(deps: AddProjectDeps): SlashCommand[] {
+export function getCommandRegistry(deps: FroBotDeps): SlashCommand[] {
   return [createFroBotCommand(deps)]
 }
 

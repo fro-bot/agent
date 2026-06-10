@@ -1,9 +1,10 @@
 ---
 title: "fix: Workspace/gateway reliability hardening (#763)"
 type: fix
-status: active
+status: completed
 date: 2026-06-07
 deepened: 2026-06-07
+completed: 2026-06-09
 ---
 
 # fix: Workspace/gateway reliability hardening (#763)
