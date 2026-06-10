@@ -12,8 +12,9 @@
  *   awaiting-approval → ⏸️  (run is waiting for tool approval)
  *
  * Design:
- * - Each call to `setRunReaction` clears all prior reactions on the message
- *   before adding the new one, so the message never accumulates stale cues.
+ * - Each call to `setRunReaction` removes only the bot's own prior reactions
+ *   (one per known emoji), then adds the new one — so the message never
+ *   accumulates stale cues. No ManageMessages permission is required.
  * - Every Discord API call is wrapped in its own try/catch so the exported
  *   method resolves to void and NEVER rejects.
  * - Failures are logged at warn level (not silently swallowed).
@@ -36,9 +37,7 @@ export type RunReactionState = keyof typeof REACTION_EMOJIS
 
 /**
  * Standard unicode emoji per run state.
- * No custom emoji — but note: `setRunReaction` calls `message.reactions.removeAll()`,
- * which DOES require the `ManageMessages` permission. Without it the removeAll call
- * will fail (the catch logs a warn and reactions may accumulate), but execution continues.
+ * No custom emoji — no elevated permissions required.
  */
 export const REACTION_EMOJIS = {
   working: '⏳',
@@ -54,8 +53,9 @@ export const REACTION_EMOJIS = {
 /**
  * Set a run-state reaction on the triggering message.
  *
- * Clears all existing reactions first (replace, not accumulate), then adds
- * the emoji for the given state.
+ * Removes only the bot's own prior reactions (iterates known REACTION_EMOJIS,
+ * removes each where `r.me === true`) before adding the new one. This requires
+ * NO ManageMessages permission — only the bot's own reactions are touched.
  *
  * CATCH BOUNDARY: every Discord API call is wrapped in its own try/catch.
  * This method resolves to void and NEVER rejects. Failures are logged at warn.
@@ -65,12 +65,18 @@ export const REACTION_EMOJIS = {
  * @param logger  - Gateway logger for failure logging.
  */
 export async function setRunReaction(message: Message, state: RunReactionState, logger: GatewayLogger): Promise<void> {
-  // Step 1: clear prior reactions (best-effort)
-  try {
-    await message.reactions.removeAll()
-  } catch (error: unknown) {
-    logger.warn({state, err: String(error)}, 'reactions: failed to remove prior reactions (best-effort)')
-    // Do not return — still attempt to add the new reaction
+  // Step 1: remove only the bot's own prior reactions (best-effort, no ManageMessages needed).
+  // Iterate all known emoji; for each, if the bot has reacted, remove its own reaction.
+  for (const emoji of Object.values(REACTION_EMOJIS)) {
+    try {
+      const myReaction = message.reactions.cache.find(r => r.emoji.name === emoji && r.me === true)
+      if (myReaction !== undefined) {
+        await myReaction.users.remove(message.client.user.id)
+      }
+    } catch (error: unknown) {
+      logger.warn({state, emoji, err: String(error)}, 'reactions: failed to remove prior bot reaction (best-effort)')
+      // Do not return — still attempt to add the new reaction
+    }
   }
 
   // Step 2: add the new state reaction (best-effort)

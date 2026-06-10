@@ -1,14 +1,17 @@
+import type {ObjectStoreOperationError} from '../object-store/types.js'
 import type {Result} from '../shared/types.js'
 import type {CoordinationConfig, LockAcquisitionResult, LockRecord, RunState, Surface} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {resolveConditionalDelete, resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
-import {parseRunState} from './run-state.js'
+import {getRunKey, parseRunState} from './run-state.js'
 
-const COORDINATION_IDENTITY = 'coordination'
+/** The identity segment used for all lock keys. Exported so consumers (e.g. recovery.ts) can import it instead of maintaining a local copy. */
+export const COORDINATION_IDENTITY = 'coordination'
 
-function getLockKey(config: CoordinationConfig, repo: string): Result<string, Error> {
+/** Build the S3 key for a repo's coordination lock. Exported so consumers share the single source of truth for the lock key shape. */
+export function getLockKey(config: CoordinationConfig, repo: string): Result<string, Error> {
   const key = buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'locks', 'repo.json')
   if (key.success === false) {
     return err(key.error)
@@ -22,6 +25,22 @@ function isPreconditionFailed(error: Error): boolean {
 }
 
 function isNotFound(error: Error): boolean {
+  // Check structured S3 error fields first (ObjectStoreOperationError shape).
+  // These are set by the s3-adapter when it wraps AWS SDK errors and are more
+  // reliable than message-substring matching.
+  //
+  // Precedence rules:
+  //   1. httpStatusCode present → authoritative: 404 = not-found; anything else = not not-found.
+  //   2. errorCode/errorName present → authoritative: 'NoSuchKey' = not-found; anything else = not not-found.
+  //   3. No structured fields → fall back to message regex (plain-Error adapters).
+  //
+  // This prevents a transient error (e.g. 503) whose message happens to contain
+  // "not found" from being misclassified as a genuine absence.
+  const e = error as Partial<ObjectStoreOperationError>
+  if (e.httpStatusCode !== undefined) return e.httpStatusCode === 404
+  if (e.errorCode !== undefined) return e.errorCode === 'NoSuchKey'
+  if (e.errorName !== undefined) return e.errorName === 'NoSuchKey'
+  // Fallback: plain-message match for adapters that don't set structured fields.
   return /nosuchkey|not found|does not exist/i.test(error.message)
 }
 
@@ -290,7 +309,7 @@ async function readRunStateByRunId(
   identity: string,
   runId: string,
 ): Promise<Result<RunState | null, Error>> {
-  const key = buildObjectStoreKey(config.storeConfig, identity, repo, 'runs', `${runId}.json`)
+  const key = getRunKey(config, identity, repo, runId)
   if (key.success === false) {
     return err(key.error)
   }

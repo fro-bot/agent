@@ -10,7 +10,7 @@
  * - Authorization gate: only authorized users may clear the queue
  */
 
-import type {CoordinationConfig, ForceReleaseStaleLockResult, Result} from '@fro-bot/runtime'
+import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
@@ -59,10 +59,11 @@ function makeGuild(opts: {hasRole?: boolean; hasManageChannels?: boolean} = {}):
 }
 
 function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
-  const defaultForceRelease: FroBotDeps['forceReleaseStaleLock'] = vi.fn().mockResolvedValue({
-    success: true,
-    data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
-  })
+  const defaultForceRelease: FroBotDeps['forceReleaseStaleLock'] = vi
+    .fn()
+    .mockReturnValue(
+      Effect.succeed({outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null}),
+    )
   return {
     bindingsStore: {
       createBinding: vi.fn(),
@@ -422,15 +423,10 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 // Helpers for force-release-lock tests
 // ---------------------------------------------------------------------------
 
-type ForceReleaseFn = (
-  config: CoordinationConfig,
-  repo: string,
-  identity: string,
-  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
-) => Promise<Result<ForceReleaseStaleLockResult, Error>>
+type ForceReleaseFn = FroBotDeps['forceReleaseStaleLock']
 
 function makeForceReleaseStaleLockMock(result: ForceReleaseStaleLockResult): ForceReleaseFn {
-  return vi.fn().mockResolvedValue({success: true, data: result})
+  return vi.fn().mockReturnValue(Effect.succeed(result))
 }
 
 function makeCoordinationConfig(): CoordinationConfig {

@@ -4,8 +4,18 @@ import type {CoordinationConfig, LockRecord, RunState} from './types.js'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {createObjectStoreOperationError} from '../object-store/types.js'
 import {err, ok} from '../shared/types.js'
-import {acquireLock, forceReleaseLock, forceReleaseStaleLock, releaseLock, renewLease} from './lock.js'
+import {
+  acquireLock,
+  COORDINATION_IDENTITY,
+  forceReleaseLock,
+  forceReleaseStaleLock,
+  getLockKey,
+  releaseLock,
+  renewLease,
+} from './lock.js'
+import {getRunKey} from './run-state.js'
 
 function createLogger(): Logger {
   return {
@@ -753,7 +763,7 @@ describe('forceReleaseStaleLock', () => {
     })
   })
 
-  it('run-state key uses the gateway identity segment, NOT the coordination identity', async () => {
+  it('run-state key uses the gateway identity segment, NOT the coordination identity (NBC-2 regression)', async () => {
     // #given — lock is stale; run-state is absent (NoSuchKey) so we can assert the exact key used
     // This test PINS the run-state key identity segment: it must contain /discord-gateway/ (the
     // gateway identity passed in), NOT /coordination/ (the lock key's identity). This is the
@@ -782,5 +792,176 @@ describe('forceReleaseStaleLock', () => {
     expect(runStateKey).toContain('/runs/run-42.json')
     // Must NOT use the coordination identity (the lock key's identity)
     expect(runStateKey).not.toContain('/coordination/')
+  })
+})
+
+// ─── NBC-2: exported key-builder contracts ────────────────────────────────────
+
+describe('COORDINATION_IDENTITY', () => {
+  it('is the string "coordination"', () => {
+    expect(COORDINATION_IDENTITY).toBe('coordination')
+  })
+})
+
+describe('getLockKey', () => {
+  it('builds a key containing COORDINATION_IDENTITY (not the gateway identity)', () => {
+    // #given
+    const config = createCoordinationConfig(createStoreAdapter())
+
+    // #when
+    const result = getLockKey(config, 'owner/repo')
+
+    // #then
+    expect(result.success).toBe(true)
+    const key = result.success === true ? result.data : ''
+    // Must contain the coordination identity segment
+    expect(key).toContain(`/${COORDINATION_IDENTITY}/`)
+    // Must NOT contain a gateway identity
+    expect(key).not.toContain('/discord-gateway/')
+    // Must end with the lock path
+    expect(key).toContain('/locks/repo.json')
+  })
+
+  it('key shape: {prefix}/{COORDINATION_IDENTITY}/{owner}/{repo}/locks/repo.json', () => {
+    // #given
+    const config = createCoordinationConfig(createStoreAdapter())
+
+    // #when
+    const result = getLockKey(config, 'owner/repo')
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data : '').toBe('fro-bot-state/coordination/owner/repo/locks/repo.json')
+  })
+})
+
+describe('getRunKey', () => {
+  it('builds a key containing the passed identity (not COORDINATION_IDENTITY)', () => {
+    // #given
+    const config = createCoordinationConfig(createStoreAdapter())
+
+    // #when
+    const result = getRunKey(config, 'discord-gateway', 'owner/repo', 'run-42')
+
+    // #then
+    expect(result.success).toBe(true)
+    const key = result.success === true ? result.data : ''
+    // Must contain the gateway identity segment
+    expect(key).toContain('/discord-gateway/')
+    // Must NOT contain the coordination identity
+    expect(key).not.toContain(`/${COORDINATION_IDENTITY}/`)
+    // Must reference the run ID
+    expect(key).toContain('/runs/run-42.json')
+  })
+
+  it('key shape: {prefix}/{identity}/{owner}/{repo}/runs/{runId}.json', () => {
+    // #given
+    const config = createCoordinationConfig(createStoreAdapter())
+
+    // #when
+    const result = getRunKey(config, 'discord-gateway', 'owner/repo', 'run-42')
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data : '').toBe('fro-bot-state/discord-gateway/owner/repo/runs/run-42.json')
+  })
+})
+
+// ─── NBC-5: isNotFound structured-error check ─────────────────────────────────
+
+describe('isNotFound (via forceReleaseStaleLock lock-read path)', () => {
+  // isNotFound is private; we exercise it indirectly through forceReleaseStaleLock's
+  // lock-read path: a not-found error on the lock read → outcome 'no-lock'.
+  // A non-not-found error → outcome 'error'.
+
+  it('httpStatusCode 404 → classified as not-found (structured field takes precedence)', async () => {
+    // #given — lock read returns an ObjectStoreOperationError with httpStatusCode=404
+    const notFoundError = createObjectStoreOperationError('some message', {httpStatusCode: 404})
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>().mockResolvedValueOnce(err(notFoundError))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — 404 → not-found → no-lock (not error)
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('errorCode "NoSuchKey" → classified as not-found', async () => {
+    // #given — lock read returns an ObjectStoreOperationError with errorCode=NoSuchKey
+    const notFoundError = createObjectStoreOperationError('some message', {errorCode: 'NoSuchKey'})
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>().mockResolvedValueOnce(err(notFoundError))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — NoSuchKey errorCode → not-found → no-lock
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('errorName "NoSuchKey" → classified as not-found', async () => {
+    // #given — lock read returns an ObjectStoreOperationError with errorName=NoSuchKey
+    const notFoundError = createObjectStoreOperationError('some message', {errorName: 'NoSuchKey'})
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>().mockResolvedValueOnce(err(notFoundError))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — NoSuchKey errorName → not-found → no-lock
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('transient error with non-404 httpStatusCode → NOT classified as not-found (structured field takes precedence over message)', async () => {
+    // #given — error message contains "not found" but httpStatusCode is 503 (transient)
+    // The structured field must win: 503 is NOT a not-found, even if the message says "not found".
+    const transientError = createObjectStoreOperationError('service not found temporarily', {httpStatusCode: 503})
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>().mockResolvedValueOnce(err(transientError))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — 503 with "not found" in message → classified as error (not no-lock), no delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('error')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('plain-message NoSuchKey (no structured fields) → still classified as not-found via fallback', async () => {
+    // #given — plain Error with "NoSuchKey" in message, no structured fields
+    const plainError = new Error('NoSuchKey: object not found')
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>().mockResolvedValueOnce(err(plainError))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', 'discord-gateway', logger)
+
+    // #then — fallback regex matches → no-lock
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    expect(conditionalDelete).not.toHaveBeenCalled()
   })
 })

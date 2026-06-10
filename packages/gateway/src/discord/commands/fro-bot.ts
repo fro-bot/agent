@@ -11,10 +11,11 @@
  * - `force-release-lock` — dead-run-verified force-release of a stuck per-repo lock
  */
 
-import type {CoordinationConfig, ForceReleaseStaleLockResult, Result} from '@fro-bot/runtime'
+import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
+import type {CoordinationLogger} from '../../runtime-effect.js'
 import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
 import type {SlashCommand} from './index.js'
@@ -63,15 +64,15 @@ export interface FroBotDeps extends AddProjectDeps {
   readonly identity: string
   /**
    * Dead-run-verified force-release primitive (injected for testability).
-   * In production this is `forceReleaseStaleLock` from `@fro-bot/runtime`.
-   * Tests inject a mock to avoid real S3 calls.
+   * In production this is `forceReleaseStaleLockEffect` from `runtime-effect.ts`.
+   * Tests inject a mock returning `Effect.succeed(result)` to avoid real S3 calls.
    */
   readonly forceReleaseStaleLock: (
     config: CoordinationConfig,
     repo: string,
     identity: string,
-    logger: {debug: (message: string, context?: Record<string, unknown>) => void},
-  ) => Promise<Result<ForceReleaseStaleLockResult, Error>>
+    logger: CoordinationLogger,
+  ) => Effect.Effect<ForceReleaseStaleLockResult, Error>
 }
 
 // ---------------------------------------------------------------------------
@@ -219,158 +220,191 @@ function executeForceReleaseLock(
   interaction: ChatInputCommandInteraction,
   deps: FroBotDeps,
 ): Effect.Effect<void, Error> {
-  return Effect.tryPromise({
-    try: async () => {
-      // Fail closed: command must be used inside a server (guild).
-      // Guard is synchronous (no await before it) so a plain reply is safe here
-      // — we haven't consumed the 3 s interaction window yet.
-      const guild = interaction.guild
-      if (guild === null) {
-        await interaction.reply({
-          content: 'This command must be used in a server.',
-          ephemeral: true,
-        })
-        return
-      }
-
-      // Defer immediately — guild.members.fetch() (REST) inside the auth check
-      // can exceed Discord's 3 s interaction-token window under latency.
-      await interaction.deferReply({ephemeral: true})
-
-      // Raised auth bar: ManageChannels required, NOT the trigger role.
-      // Direct guild.members.fetch() + permissions.has(ManageChannels) check (fail-closed).
-      // A trigger-role-only user is denied even when a trigger role is configured
-      // — the correct behavior for this destructive command.
-      const member = await guild.members.fetch(interaction.user.id).catch((error: unknown) => {
-        deps.gatewayLogger.warn(
-          {
-            channelId: interaction.channelId,
-            err: error instanceof Error ? error.message : String(error),
-          },
-          'force-release-lock: member permission resolution failed — denying',
-        )
-        return null
+  return Effect.gen(function* () {
+    // Fail closed: command must be used inside a server (guild).
+    // Guard is synchronous (no await before it) so a plain reply is safe here
+    // — we haven't consumed the 3 s interaction window yet.
+    const guild = interaction.guild
+    if (guild === null) {
+      yield* Effect.tryPromise({
+        try: async () =>
+          interaction.reply({
+            content: 'This command must be used in a server.',
+            ephemeral: true,
+          }),
+        catch: error => (error instanceof Error ? error : new Error(String(error))),
       })
-      if (member === null || member.permissions.has(PermissionFlagsBits.ManageChannels) === false) {
-        await interaction.editReply({
-          content: 'You do not have permission to force-release a lock (ManageChannels required).',
+      return
+    }
+
+    // Defer immediately — guild.members.fetch() (REST) inside the auth check
+    // can exceed Discord's 3 s interaction-token window under latency.
+    yield* Effect.tryPromise({
+      try: async () => interaction.deferReply({ephemeral: true}),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
+    // Raised auth bar: ManageChannels required, NOT the trigger role.
+    // Direct guild.members.fetch() + permissions.has(ManageChannels) check (fail-closed).
+    // A trigger-role-only user is denied even when a trigger role is configured
+    // — the correct behavior for this destructive command.
+    const member = yield* Effect.tryPromise({
+      try: async () =>
+        guild.members.fetch(interaction.user.id).catch((error: unknown) => {
+          deps.gatewayLogger.warn(
+            {
+              channelId: interaction.channelId,
+              err: error instanceof Error ? error.message : String(error),
+            },
+            'force-release-lock: member permission resolution failed — denying',
+          )
+          return null
+        }),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+    if (member === null || member.permissions.has(PermissionFlagsBits.ManageChannels) === false) {
+      yield* Effect.tryPromise({
+        try: async () =>
+          interaction.editReply({
+            content: 'You do not have permission to force-release a lock (ManageChannels required).',
+          }),
+        catch: error => (error instanceof Error ? error : new Error(String(error))),
+      })
+      return
+    }
+
+    // Resolve the repo binding for this channel.
+    const channelId = interaction.channelId
+    const bindingResult = yield* Effect.tryPromise({
+      try: async () => deps.bindingsStore.getBindingByChannelId(channelId),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+    if (bindingResult.success === false) {
+      deps.gatewayLogger.error({channelId, err: bindingResult.error.message}, 'force-release-lock: binding store error')
+      yield* Effect.tryPromise({
+        try: async () =>
+          interaction.editReply({
+            content: 'Something went wrong looking up this channel. Please try again.',
+          }),
+        catch: error => (error instanceof Error ? error : new Error(String(error))),
+      })
+      return
+    }
+
+    if (bindingResult.data === null) {
+      yield* Effect.tryPromise({
+        try: async () =>
+          interaction.editReply({
+            content: 'No repo is bound to this channel. Use `/fro-bot add-project` first.',
+          }),
+        catch: error => (error instanceof Error ? error : new Error(String(error))),
+      })
+      return
+    }
+
+    const {owner, repo} = bindingResult.data
+    const repoSlug = `${owner}/${repo}`
+
+    // Narrow logger adapter — runtime coordination functions take a narrow
+    // {debug} logger; adapt the gateway logger inline (same pattern as run.ts).
+    const coordLogger: CoordinationLogger = {
+      debug: (msg: string, ctx?: Record<string, unknown>) => deps.gatewayLogger.debug(ctx ?? {}, msg),
+    }
+
+    // Call the dead-run-verified force-release Effect.
+    // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
+    const releaseResult = yield* deps.forceReleaseStaleLock(
+      deps.coordinationConfig,
+      repoSlug,
+      deps.identity,
+      coordLogger,
+    )
+
+    const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult
+
+    // Map typed outcome → ephemeral reply.
+    // allowedMentions: {parse: []} prevents Discord from pinging holder IDs.
+    switch (outcome) {
+      case 'released': {
+        const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
+        const holderInfo = holderId === null ? '' : ` Cleared holder: \`${holderId}\`.`
+        const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`,
+              allowedMentions: {parse: []},
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
         })
-        return
+        break
       }
 
-      // Resolve the repo binding for this channel.
-      const channelId = interaction.channelId
-      const bindingResult = await deps.bindingsStore.getBindingByChannelId(channelId)
-      if (bindingResult.success === false) {
-        deps.gatewayLogger.error(
-          {channelId, err: bindingResult.error.message},
-          'force-release-lock: binding store error',
-        )
-        await interaction.editReply({
-          content: 'Something went wrong looking up this channel. Please try again.',
+      case 'live-holder': {
+        const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
+        const heartbeatSeconds = heartbeatAgeMs === null ? null : Math.round(heartbeatAgeMs / 1000)
+        const holderInfo = holderId === null ? '' : ` Held by: \`${holderId}\`.`
+        const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
+        const heartbeatInfo = heartbeatSeconds === null ? '' : ` Last heartbeat: ${heartbeatSeconds}s ago.`
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
+              allowedMentions: {parse: []},
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
         })
-        return
+        break
       }
 
-      if (bindingResult.data === null) {
-        await interaction.editReply({
-          content: 'No repo is bound to this channel. Use `/fro-bot add-project` first.',
+      case 'no-lock': {
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`,
+              allowedMentions: {parse: []},
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
         })
-        return
+        break
       }
 
-      const {owner, repo} = bindingResult.data
-      const repoSlug = `${owner}/${repo}`
-
-      // Narrow logger adapter — runtime coordination functions take a narrow
-      // {debug} logger; adapt the gateway logger inline (same pattern as run.ts).
-      const coordLogger = {
-        debug: (msg: string, ctx?: Record<string, unknown>) => deps.gatewayLogger.debug(ctx ?? {}, msg),
-      }
-
-      // Call the dead-run-verified force-release primitive.
-      // Pass deps.identity (the gateway identity) so run-state is read under the correct key.
-      const releaseResult = await deps.forceReleaseStaleLock(
-        deps.coordinationConfig,
-        repoSlug,
-        deps.identity,
-        coordLogger,
-      )
-
-      if (releaseResult.success === false) {
-        deps.gatewayLogger.error(
-          {err: releaseResult.error.message, repo: repoSlug},
-          'force-release-lock: unexpected infrastructure error',
-        )
-        await interaction.editReply({
-          content: 'An internal error occurred. Please try again.',
+      case 'conflict': {
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
+              allowedMentions: {parse: []},
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
         })
-        return
+        break
       }
 
-      const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult.data
-
-      // Map typed outcome → ephemeral reply.
-      // allowedMentions: {parse: []} prevents Discord from pinging holder IDs.
-      switch (outcome) {
-        case 'released': {
-          const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
-          const holderInfo = holderId === null ? '' : ` Cleared holder: \`${holderId}\`.`
-          const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
-          await interaction.editReply({
-            content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`,
-            allowedMentions: {parse: []},
-          })
-          break
-        }
-
-        case 'live-holder': {
-          const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
-          const heartbeatSeconds = heartbeatAgeMs === null ? null : Math.round(heartbeatAgeMs / 1000)
-          const holderInfo = holderId === null ? '' : ` Held by: \`${holderId}\`.`
-          const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
-          const heartbeatInfo = heartbeatSeconds === null ? '' : ` Last heartbeat: ${heartbeatSeconds}s ago.`
-          await interaction.editReply({
-            content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
-            allowedMentions: {parse: []},
-          })
-          break
-        }
-
-        case 'no-lock': {
-          await interaction.editReply({
-            content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`,
-            allowedMentions: {parse: []},
-          })
-          break
-        }
-
-        case 'conflict': {
-          await interaction.editReply({
-            content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
-            allowedMentions: {parse: []},
-          })
-          break
-        }
-
-        case 'error': {
-          await interaction.editReply({
-            content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`,
-            allowedMentions: {parse: []},
-          })
-          break
-        }
-
-        default: {
-          // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
-          const exhaustiveCheck: never = outcome
-          deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
-          await interaction.editReply({
-            content: 'An internal error occurred. Please try again.',
-          })
-        }
+      case 'error': {
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`,
+              allowedMentions: {parse: []},
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
+        })
+        break
       }
-    },
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
+
+      default: {
+        // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
+        const exhaustiveCheck: never = outcome
+        deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
+        yield* Effect.tryPromise({
+          try: async () =>
+            interaction.editReply({
+              content: 'An internal error occurred. Please try again.',
+            }),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
+        })
+      }
+    }
   })
 }

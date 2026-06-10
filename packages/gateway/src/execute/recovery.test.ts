@@ -13,7 +13,8 @@ import {recoverStaleRuns} from './recovery.js'
 // ---------------------------------------------------------------------------
 
 vi.mock('@fro-bot/runtime', () => ({
-  buildObjectStoreKey: vi.fn(),
+  getRunKey: vi.fn(),
+  getLockKey: vi.fn(),
   findStaleRuns: vi.fn(),
   transitionRun: vi.fn(),
   releaseLock: vi.fn(),
@@ -23,7 +24,8 @@ vi.mock('@fro-bot/runtime', () => ({
 // Typed mock accessors
 // ---------------------------------------------------------------------------
 
-const mockBuildObjectStoreKey = vi.mocked(runtimeModule.buildObjectStoreKey)
+const mockGetRunKey = vi.mocked(runtimeModule.getRunKey)
+const mockGetLockKey = vi.mocked(runtimeModule.getLockKey)
 const mockFindStaleRuns = vi.mocked(runtimeModule.findStaleRuns)
 const mockTransitionRun = vi.mocked(runtimeModule.transitionRun)
 const mockReleaseLock = vi.mocked(runtimeModule.releaseLock)
@@ -41,7 +43,6 @@ const RUN_KEY = 'state/identity/acme/widget/runs/run-stale-001.json'
 const LOCK_KEY = 'state/coordination/acme/widget/locks/repo.json'
 const RUN_ETAG = 'etag-run-1'
 const LOCK_ETAG = 'etag-lock-1'
-const COORDINATION_IDENTITY = 'coordination'
 
 // ---------------------------------------------------------------------------
 // Factories
@@ -131,14 +132,14 @@ function makeValidationError(message: string): Error & {readonly code: 'VALIDATI
   return error
 }
 
-type BuildKeyResult = ReturnType<typeof runtimeModule.buildObjectStoreKey>
+type KeyResult = ReturnType<typeof runtimeModule.getRunKey>
 
-function okKey(key: string): BuildKeyResult {
+function okKey(key: string): KeyResult {
   return {success: true, data: key}
 }
 
-function errKey(message: string): BuildKeyResult {
-  return {success: false, error: makeValidationError(message)} as unknown as BuildKeyResult
+function errKey(message: string): KeyResult {
+  return {success: false, error: makeValidationError(message)} as unknown as KeyResult
 }
 
 // ---------------------------------------------------------------------------
@@ -148,11 +149,14 @@ function errKey(message: string): BuildKeyResult {
 beforeEach(() => {
   vi.clearAllMocks()
 
-  mockBuildObjectStoreKey.mockImplementation((_config, _identity, _repo, _type, suffix) => {
-    if (suffix === `${RUN_ID}.json`) return okKey(RUN_KEY)
-    if (suffix === 'repo.json') return okKey(LOCK_KEY)
-    return errKey('unexpected key')
+  // getRunKey: called with (config, identity, repo, runId) → returns key result
+  mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => {
+    if (runId === RUN_ID) return okKey(RUN_KEY)
+    return errKey('unexpected run key')
   })
+
+  // getLockKey: called with (config, repo) → returns lock key result
+  mockGetLockKey.mockReturnValue(okKey(LOCK_KEY))
 
   mockFindStaleRuns.mockResolvedValue({success: true, data: []})
   mockTransitionRun.mockResolvedValue({
@@ -281,12 +285,12 @@ describe('recoverStaleRuns', () => {
 
       const RUN_KEY_2 = 'state/identity/acme/widget/runs/run-002.json'
 
-      mockBuildObjectStoreKey.mockImplementation((_config, identity, _repo, _type, suffix) => {
-        if (suffix === 'run-001.json') return okKey(RUN_KEY)
-        if (suffix === 'run-002.json') return okKey(RUN_KEY_2)
-        if (suffix === 'repo.json' && identity === COORDINATION_IDENTITY) return okKey(LOCK_KEY)
-        return errKey('unexpected')
+      mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => {
+        if (runId === 'run-001') return okKey(RUN_KEY)
+        if (runId === 'run-002') return okKey(RUN_KEY_2)
+        return errKey('unexpected run key')
       })
+      mockGetLockKey.mockReturnValue(okKey(LOCK_KEY))
 
       // Make getObject return etags for both run keys — typed cast is test-only
       const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
