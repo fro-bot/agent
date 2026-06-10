@@ -1,9 +1,10 @@
 ---
 title: "refactor: Centralized fail-soft Discord I/O helper (discord/io.ts)"
 type: refactor
-status: active
+status: completed
 date: 2026-06-09
 deepened: 2026-06-09
+completed: 2026-06-09
 ---
 
 # Centralized fail-soft Discord I/O helper (`discord/io.ts`)
@@ -90,7 +91,7 @@ Two recurring problems, both surfaced by the Oracle assessment during PR #854 re
 
 ## Implementation Units
 
-- [ ] **Unit 1: `discord/io.ts` module — the fail-soft helpers**
+- [x] **Unit 1: `discord/io.ts` module — the fail-soft helpers**
 
 **Goal:** Create the single module with both helper families (Message/Thread send+reply + separate edit; interaction reply/edit), mention-safe by default (no override), catch+log+Result, redacted error context.
 
@@ -119,7 +120,7 @@ Two recurring problems, both surfaced by the Oracle assessment during PR #854 re
 
 **Verification:** `io.ts` exports the message send/reply + edit helpers and the Effect-returning interaction helpers; all default the guard with no opt-out, return Result/Effect-of-Result, never throw, log redacted; unit tests cover happy/error/edge for each.
 
-- [ ] **Unit 2: Migrate the Message/Thread surface + remove the 3 duplicate helpers**
+- [x] **Unit 2: Migrate the Message/Thread surface + remove the 3 duplicate helpers**
 
 **Goal:** Replace `streaming.ts` `safeSend`, `run.ts` `safeSend`/`safeReply`, `mentions.ts` `safeReply` and their callers with `io.ts`; delete the local helpers.
 
@@ -148,7 +149,7 @@ Two recurring problems, both surfaced by the Oracle assessment during PR #854 re
 
 **Verification:** the 3 local helpers are gone; all callers use io.ts; gateway tests pass; the never-ping invariant is preserved.
 
-- [ ] **Unit 3: Migrate the command-interaction surface + apply the missing guard**
+- [x] **Unit 3: Migrate the command-interaction surface + apply the missing guard**
 
 **Goal:** Route every `interaction.reply`/`editReply` site through the Effect-returning io.ts interaction helper, adding `allowedMentions: {parse: []}` where missing, preserving the #854 hanging-reply fix.
 
@@ -178,7 +179,7 @@ Two recurring problems, both surfaced by the Oracle assessment during PR #854 re
 
 **Verification:** all targeted interaction sites (incl. `program.ts` button path) route through io.ts with the guard; ephemeral/behavioral semantics preserved; the #854 fix has a passing regression test; gateway tests pass.
 
-- [ ] **Unit 4: Boundary enforcement — no raw Discord sends bypass io.ts**
+- [x] **Unit 4: Boundary enforcement — no raw Discord sends bypass io.ts**
 
 **Goal:** Add a check that fails if gateway source reintroduces a raw `interaction.reply`/`editReply` or message/thread `.send`/`.reply`/`.edit` outside `io.ts`, so the guard can't drift back out (R5).
 
