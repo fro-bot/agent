@@ -19,6 +19,7 @@ import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
 import {createDiscordClient} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
+import {editInteraction} from './discord/io.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
@@ -219,12 +220,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             // Auth: reuse the same authorization gate as the mention path.
             const guild = interaction.guild
             if (guild === null) {
-              await interaction.editReply({content: 'Not authorized to approve.'})
+              await Effect.runPromise(editInteraction(interaction, {content: 'Not authorized to approve.'}, logger))
               return
             }
             const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, logger)
             if (authorized === false) {
-              await interaction.editReply({content: 'Not authorized to approve.'})
+              await Effect.runPromise(editInteraction(interaction, {content: 'Not authorized to approve.'}, logger))
               return
             }
 
@@ -249,11 +250,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                       ? 'Already decided.'
                       : 'Failed to record decision, try again.'
 
-            await interaction.editReply({content: ackContent})
+            await Effect.runPromise(editInteraction(interaction, {content: ackContent}, logger))
           } catch (error: unknown) {
             logger.error({err: String(error)}, 'button: unexpected error handling approval interaction')
             // Best-effort edit — if this also throws Discord considers the interaction failed.
-            await interaction.editReply({content: 'Failed to record decision, try again.'}).catch(() => {})
+            // editInteraction never throws (errors are caught and returned as Result).
+            await Effect.runPromise(
+              editInteraction(interaction, {content: 'Failed to record decision, try again.'}, logger),
+            )
           }
         })()
         return

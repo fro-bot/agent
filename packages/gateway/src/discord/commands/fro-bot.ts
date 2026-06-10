@@ -23,6 +23,7 @@ import type {SlashCommand} from './index.js'
 import {PermissionFlagsBits, SlashCommandBuilder} from 'discord.js'
 import {Effect} from 'effect'
 
+import {editInteraction, replyInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
 import {executePing} from './ping.js'
@@ -165,10 +166,13 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
       // — we haven't consumed the 3 s interaction window yet.
       const guild = interaction.guild
       if (guild === null) {
-        await interaction.reply({
-          content: 'This command must be used in a server.',
-          ephemeral: true,
-        })
+        await Effect.runPromise(
+          replyInteraction(
+            interaction,
+            {content: 'This command must be used in a server.', ephemeral: true},
+            deps.gatewayLogger,
+          ),
+        )
         return
       }
 
@@ -179,17 +183,21 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
 
       const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, deps.gatewayLogger)
       if (authorized === false) {
-        await interaction.editReply({
-          content: 'You do not have permission to clear the queue.',
-        })
+        await Effect.runPromise(
+          editInteraction(interaction, {content: 'You do not have permission to clear the queue.'}, deps.gatewayLogger),
+        )
         return
       }
 
       const channelId = interaction.channelId
       const dropped = deps.queue.clear(channelId)
-      await interaction.editReply({
-        content: `Cleared ${dropped} queued task(s). The running task will finish.`,
-      })
+      await Effect.runPromise(
+        editInteraction(
+          interaction,
+          {content: `Cleared ${dropped} queued task(s). The running task will finish.`},
+          deps.gatewayLogger,
+        ),
+      )
     },
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   })
@@ -213,8 +221,8 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
  * Flow: synchronous null-guild guard → deferReply → ManageChannels auth →
  * binding lookup → forceReleaseStaleLock → editReply with typed outcome.
  *
- * All replies are ephemeral. `allowedMentions: {parse: []}` is applied where
- * user-controlled content (holder IDs) appears in the reply.
+ * All replies are ephemeral. `allowedMentions: {parse: []}` is applied via
+ * the io.ts interaction helper (always injected, no override).
  */
 function executeForceReleaseLock(
   interaction: ChatInputCommandInteraction,
@@ -226,14 +234,11 @@ function executeForceReleaseLock(
     // — we haven't consumed the 3 s interaction window yet.
     const guild = interaction.guild
     if (guild === null) {
-      yield* Effect.tryPromise({
-        try: async () =>
-          interaction.reply({
-            content: 'This command must be used in a server.',
-            ephemeral: true,
-          }),
-        catch: error => (error instanceof Error ? error : new Error(String(error))),
-      })
+      yield* replyInteraction(
+        interaction,
+        {content: 'This command must be used in a server.', ephemeral: true},
+        deps.gatewayLogger,
+      )
       return
     }
 
@@ -263,13 +268,11 @@ function executeForceReleaseLock(
       catch: error => (error instanceof Error ? error : new Error(String(error))),
     })
     if (member === null || member.permissions.has(PermissionFlagsBits.ManageChannels) === false) {
-      yield* Effect.tryPromise({
-        try: async () =>
-          interaction.editReply({
-            content: 'You do not have permission to force-release a lock (ManageChannels required).',
-          }),
-        catch: error => (error instanceof Error ? error : new Error(String(error))),
-      })
+      yield* editInteraction(
+        interaction,
+        {content: 'You do not have permission to force-release a lock (ManageChannels required).'},
+        deps.gatewayLogger,
+      )
       return
     }
 
@@ -281,24 +284,20 @@ function executeForceReleaseLock(
     })
     if (bindingResult.success === false) {
       deps.gatewayLogger.error({channelId, err: bindingResult.error.message}, 'force-release-lock: binding store error')
-      yield* Effect.tryPromise({
-        try: async () =>
-          interaction.editReply({
-            content: 'Something went wrong looking up this channel. Please try again.',
-          }),
-        catch: error => (error instanceof Error ? error : new Error(String(error))),
-      })
+      yield* editInteraction(
+        interaction,
+        {content: 'Something went wrong looking up this channel. Please try again.'},
+        deps.gatewayLogger,
+      )
       return
     }
 
     if (bindingResult.data === null) {
-      yield* Effect.tryPromise({
-        try: async () =>
-          interaction.editReply({
-            content: 'No repo is bound to this channel. Use `/fro-bot add-project` first.',
-          }),
-        catch: error => (error instanceof Error ? error : new Error(String(error))),
-      })
+      yield* editInteraction(
+        interaction,
+        {content: 'No repo is bound to this channel. Use `/fro-bot add-project` first.'},
+        deps.gatewayLogger,
+      )
       return
     }
 
@@ -328,20 +327,17 @@ function executeForceReleaseLock(
       const {outcome, holderId, lockAgeMs, heartbeatAgeMs} = releaseResult
 
       // Map typed outcome → ephemeral reply.
-      // allowedMentions: {parse: []} prevents Discord from pinging holder IDs.
+      // allowedMentions: {parse: []} is always applied by editInteraction (no override needed).
       switch (outcome) {
         case 'released': {
           const ageSeconds = lockAgeMs === null ? null : Math.round(lockAgeMs / 1000)
           const holderInfo = holderId === null ? '' : ` Cleared holder: \`${holderId}\`.`
           const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`,
-                allowedMentions: {parse: []},
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`},
+            deps.gatewayLogger,
+          )
           break
         }
 
@@ -351,50 +347,42 @@ function executeForceReleaseLock(
           const holderInfo = holderId === null ? '' : ` Held by: \`${holderId}\`.`
           const ageInfo = ageSeconds === null ? '' : ` Lock age: ${ageSeconds}s.`
           const heartbeatInfo = heartbeatSeconds === null ? '' : ` Last heartbeat: ${heartbeatSeconds}s ago.`
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
-                allowedMentions: {parse: []},
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {
+              content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
+            },
+            deps.gatewayLogger,
+          )
           break
         }
 
         case 'no-lock': {
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`,
-                allowedMentions: {parse: []},
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`},
+            deps.gatewayLogger,
+          )
           break
         }
 
         case 'conflict': {
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
-                allowedMentions: {parse: []},
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {
+              content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
+            },
+            deps.gatewayLogger,
+          )
           break
         }
 
         case 'error': {
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`,
-                allowedMentions: {parse: []},
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`},
+            deps.gatewayLogger,
+          )
           break
         }
 
@@ -402,13 +390,11 @@ function executeForceReleaseLock(
           // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
           const exhaustiveCheck: never = outcome
           deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: 'An internal error occurred. Please try again.',
-              }),
-            catch: error => (error instanceof Error ? error : new Error(String(error))),
-          })
+          yield* editInteraction(
+            interaction,
+            {content: 'An internal error occurred. Please try again.'},
+            deps.gatewayLogger,
+          )
         }
       }
     }).pipe(
@@ -416,16 +402,17 @@ function executeForceReleaseLock(
       // adapter capability, key-build error), edit the already-deferred reply so the
       // user is not left at "thinking…" until the token expires. Re-fail after editing
       // so dispatchCommand's logger still sees the error.
+      //
+      // #854 fix: editInteraction is Effect-returning and NEVER fails (errors are caught
+      // inside and returned as Result). This means the catchAll can safely yield* it and
+      // then re-fail with the original error — the deferred reply is never left hanging.
       Effect.catchAll(err =>
         Effect.gen(function* () {
-          yield* Effect.tryPromise({
-            try: async () =>
-              interaction.editReply({
-                content: 'An internal error occurred. Please try again.',
-                allowedMentions: {parse: []},
-              }),
-            catch: editError => (editError instanceof Error ? editError : new Error(String(editError))),
-          })
+          yield* editInteraction(
+            interaction,
+            {content: 'An internal error occurred. Please try again.'},
+            deps.gatewayLogger,
+          )
           return yield* Effect.fail(err)
         }),
       ),

@@ -740,8 +740,11 @@ describe('button interaction handler (approval flow)', () => {
     })
 
     // #and — deferred then edited with approved ack
+    // editInteraction always injects allowedMentions: {parse: []}
     expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
-    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Approved.'})
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Approved.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('deferReply is called BEFORE userIsAuthorized (call order)', async () => {
@@ -796,8 +799,11 @@ describe('button interaction handler (approval flow)', () => {
     expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
 
     // #and — editReply used (NOT reply) for the unauthorized message
+    // editInteraction always injects allowedMentions: {parse: []}
     expect(interaction.reply).not.toHaveBeenCalled()
-    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Not authorized to approve.'})
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Not authorized to approve.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('deny click → decision=reject, ephemeral Denied.', async () => {
@@ -820,8 +826,11 @@ describe('button interaction handler (approval flow)', () => {
     expect(fakeRegistry.handleButtonDecision).toHaveBeenCalledWith(expect.objectContaining({decision: 'reject'}))
 
     // #and — deferred then edited with denied ack
+    // editInteraction always injects allowedMentions: {parse: []}
     expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
-    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Denied.'})
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Denied.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('outcome channel-mismatch → ephemeral correct text', async () => {
@@ -840,10 +849,10 @@ describe('button interaction handler (approval flow)', () => {
     await interactionHandler(interaction)
     await new Promise(resolve => setTimeout(resolve, 0))
 
-    // #then
-    expect(interaction.editReply).toHaveBeenCalledWith({
-      content: 'This approval belongs to another channel.',
-    })
+    // #then — editInteraction always injects allowedMentions: {parse: []}
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'This approval belongs to another channel.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('outcome not-found → ephemeral correct text', async () => {
@@ -862,10 +871,10 @@ describe('button interaction handler (approval flow)', () => {
     await interactionHandler(interaction)
     await new Promise(resolve => setTimeout(resolve, 0))
 
-    // #then
-    expect(interaction.editReply).toHaveBeenCalledWith({
-      content: 'This approval is no longer pending.',
-    })
+    // #then — editInteraction always injects allowedMentions: {parse: []}
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'This approval is no longer pending.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('outcome already-claimed → ephemeral correct text', async () => {
@@ -884,8 +893,10 @@ describe('button interaction handler (approval flow)', () => {
     await interactionHandler(interaction)
     await new Promise(resolve => setTimeout(resolve, 0))
 
-    // #then
-    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Already decided.'})
+    // #then — editInteraction always injects allowedMentions: {parse: []}
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Already decided.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('outcome reply-failed → ephemeral correct text', async () => {
@@ -904,8 +915,10 @@ describe('button interaction handler (approval flow)', () => {
     await interactionHandler(interaction)
     await new Promise(resolve => setTimeout(resolve, 0))
 
-    // #then
-    expect(interaction.editReply).toHaveBeenCalledWith({content: 'Failed to record decision, try again.'})
+    // #then — editInteraction always injects allowedMentions: {parse: []}
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Failed to record decision, try again.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('shutdown → approvalRegistry.disposeAll called', async () => {

@@ -182,8 +182,10 @@ describe('createFroBotCommand — dispatch', () => {
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — reply was called with pong
-    expect(reply).toHaveBeenCalledWith({content: 'pong', ephemeral: true})
+    // #then — reply was called with pong; helper always injects allowedMentions: {parse: []}
+    expect(reply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'pong', ephemeral: true, allowedMentions: {parse: []}}),
+    )
   })
 
   it('returns Effect.fail for an unknown subcommand', async () => {
@@ -674,6 +676,32 @@ describe('/fro-bot force-release-lock — no binding', () => {
 // ---------------------------------------------------------------------------
 // /fro-bot force-release-lock — outcome → reply mapping
 // ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — allowedMentions guard', () => {
+  it('all outcome editReply calls include allowedMentions: {parse: []} (mention-safety guard)', async () => {
+    // #given — released outcome (holder ID in content — must not be parsed as a mention)
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: 'holder-abc',
+      runId: 'run-xyz',
+      lockAgeMs: 120_000,
+      heartbeatAgeMs: 90_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply was called with allowedMentions: {parse: []} (injected by io.ts helper)
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+  })
+})
 
 describe('/fro-bot force-release-lock — outcome mapping', () => {
   it('released → ephemeral confirmation with holder info', async () => {

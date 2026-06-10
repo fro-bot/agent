@@ -25,6 +25,8 @@
 import type {Result} from '@fro-bot/runtime'
 import type {
   BaseMessageOptions,
+  InteractionEditReplyOptions,
+  InteractionReplyOptions,
   Message,
   MessageCreateOptions,
   MessageMentionTypes,
@@ -81,24 +83,35 @@ export type SendOrReplyTarget = SendCapable | ReplyCapable
  */
 export type MessageContentOptions = Pick<MessageCreateOptions, 'content' | 'embeds' | 'components' | 'files' | 'flags'>
 
-/** Options accepted by `replyInteraction` and `editInteraction`. No `allowedMentions` — always injected. */
-export interface InteractionContentOptions {
-  readonly content?: string
-  readonly embeds?: readonly unknown[]
-  readonly components?: readonly unknown[]
-  readonly files?: readonly unknown[]
-  readonly ephemeral?: boolean
-  readonly flags?: unknown
-}
+/**
+ * Options accepted by `replyInteraction`. No `allowedMentions` — always injected.
+ * Mirrors the `MessageContentOptions` approach: a `Pick` of discord.js's own option type so the
+ * helper's `{...options, allowedMentions}` spread is assignable without a cast. `ephemeral` is
+ * reply-only (an edit inherits the deferred reply's visibility and cannot change it).
+ */
+export type InteractionContentOptions = Pick<
+  InteractionReplyOptions,
+  'content' | 'embeds' | 'components' | 'files' | 'flags' | 'ephemeral'
+>
+
+/** Options accepted by `editInteraction`. Same as the reply options minus `ephemeral` (edits can't set it). */
+export type InteractionEditContentOptions = Pick<
+  InteractionEditReplyOptions,
+  'content' | 'embeds' | 'components' | 'files' | 'flags'
+>
 
 /**
  * Minimal interaction shape broad enough to cover both `ChatInputCommandInteraction`
  * and the button interaction used in `program.ts` (which uses `editReply` after
  * `deferReply`). Structural type — not tied to a specific discord.js class.
+ *
+ * Uses discord.js's own `InteractionReplyOptions` / `InteractionEditReplyOptions`
+ * as the parameter types so that `ChatInputCommandInteraction` and `ButtonInteraction`
+ * are structurally assignable without casts.
  */
 export interface RepliableInteractionTarget {
-  readonly reply: (options: InteractionSendOptions) => Promise<unknown>
-  readonly editReply: (options: InteractionEditOptions) => Promise<unknown>
+  readonly reply: (options: InteractionReplyOptions) => Promise<unknown>
+  readonly editReply: (options: InteractionEditReplyOptions) => Promise<unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -133,24 +146,17 @@ type EditOptions = Pick<BaseMessageOptions, 'embeds' | 'components' | 'files' | 
   readonly content?: string
 }
 
-interface InteractionSendOptions {
-  readonly content?: string
-  readonly embeds?: readonly unknown[]
-  readonly components?: readonly unknown[]
-  readonly files?: readonly unknown[]
-  readonly ephemeral?: boolean
-  readonly flags?: unknown
-  readonly allowedMentions: AllowedMentions
-}
+/**
+ * Internal send options — extends `InteractionReplyOptions` with `allowedMentions` required.
+ * Using discord.js's own type ensures structural assignability when calling `interaction.reply`.
+ */
+type InteractionSendOptions = InteractionReplyOptions & {readonly allowedMentions: AllowedMentions}
 
-interface InteractionEditOptions {
-  readonly content?: string
-  readonly embeds?: readonly unknown[]
-  readonly components?: readonly unknown[]
-  readonly files?: readonly unknown[]
-  readonly flags?: unknown
-  readonly allowedMentions: AllowedMentions
-}
+/**
+ * Internal edit options — extends `InteractionEditReplyOptions` with `allowedMentions` required.
+ * Using discord.js's own type ensures structural assignability when calling `interaction.editReply`.
+ */
+type InteractionEditOptions = InteractionEditReplyOptions & {readonly allowedMentions: AllowedMentions}
 
 // ---------------------------------------------------------------------------
 // Shared guard constant
@@ -312,7 +318,7 @@ export function replyInteraction(
  */
 export function editInteraction(
   interaction: RepliableInteractionTarget,
-  options: InteractionContentOptions,
+  options: InteractionEditContentOptions,
   logger: GatewayLogger,
 ): Effect.Effect<Result<unknown, Error>, never> {
   return Effect.promise(async () => {

@@ -211,6 +211,26 @@ describe('executeAddProject', () => {
       expect(send).toHaveBeenCalledOnce()
     })
 
+    it('all editReply calls include allowedMentions: {parse: []} (mention-safety guard)', async () => {
+      // #given — run through the full happy path
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({guild, userId})
+      const deps = makeDeps()
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — every editReply call must include allowedMentions: {parse: []}
+      // This asserts the io.ts helper always injects the mention-safety guard.
+      const calls = editReply.mock.calls as [{allowedMentions?: {parse: string[]}}][]
+      expect(calls.length).toBeGreaterThan(0)
+      for (const [arg] of calls) {
+        expect(arg?.allowedMentions).toEqual({parse: []})
+      }
+    })
+
     it('canonicalizes Owner/Repo to lowercase before binding', async () => {
       // #given
       const userId = uniqueUserId()
