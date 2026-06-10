@@ -1,9 +1,10 @@
 import type {Result} from '../shared/types.js'
-import type {CoordinationConfig, LockAcquisitionResult, LockRecord, Surface} from './types.js'
+import type {CoordinationConfig, LockAcquisitionResult, LockRecord, RunState, Surface} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {resolveConditionalDelete, resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
+import {parseRunState} from './run-state.js'
 
 const COORDINATION_IDENTITY = 'coordination'
 
@@ -18,6 +19,10 @@ function getLockKey(config: CoordinationConfig, repo: string): Result<string, Er
 
 function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/.test(error.message.toLowerCase())
+}
+
+function isNotFound(error: Error): boolean {
+  return /nosuchkey|not found|does not exist/i.test(error.message)
 }
 
 function isStale(lockRecord: LockRecord, now: Date): boolean {
@@ -200,4 +205,261 @@ export async function forceReleaseLock(
 
   logger.debug('Force releasing lock', {key: key.data, repo})
   return conditionalDelete.data(key.data, {ifMatch: etag})
+}
+
+// ─── forceReleaseStaleLock ────────────────────────────────────────────────────
+
+/**
+ * Typed outcome of a `forceReleaseStaleLock` call.
+ *
+ * - `released`    — lock was proven dead (lease expired + run-state stale/absent) and deleted.
+ * - `live-holder` — lock is held by a live run (lease fresh OR heartbeat fresh); no delete.
+ * - `no-lock`     — no lock record exists for the repo; nothing to release.
+ * - `conflict`    — both signals said dead but the lock object changed between read and delete
+ *                   (IfMatch precondition failure); the new holder's lock was NOT deleted.
+ * - `error`       — malformed/partial lock or run-state record; fail-closed, no delete.
+ */
+export type ForceReleaseStaleLockOutcome = 'released' | 'live-holder' | 'no-lock' | 'conflict' | 'error'
+
+export interface ForceReleaseStaleLockResult {
+  readonly outcome: ForceReleaseStaleLockOutcome
+  /** The `holder_id` from the lock record, if one was read. */
+  readonly holderId: string | null
+  /** The `run_id` from the lock record, if one was read. */
+  readonly runId: string | null
+  /** Age of the lock in milliseconds at the time of the check, if a lock record was read. */
+  readonly lockAgeMs: number | null
+  /** Age of the last heartbeat in milliseconds at the time of the check, if run-state was read. */
+  readonly heartbeatAgeMs: number | null
+}
+
+/**
+ * Internal helper: reads the current lock record and its S3 etag.
+ *
+ * Returns:
+ * - `ok({record, etag})` — lock exists and is valid.
+ * - `ok(null)`           — lock object does not exist (NoSuchKey / not-found).
+ * - `err(error)`         — unexpected read or parse error (fail-closed).
+ */
+async function readLockRecord(
+  config: CoordinationConfig,
+  repo: string,
+): Promise<Result<{readonly record: LockRecord; readonly etag: string} | null, Error>> {
+  const key = getLockKey(config, repo)
+  if (key.success === false) {
+    return err(key.error)
+  }
+
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const fetched = await getObject.data(key.data)
+  if (fetched.success === false) {
+    if (isNotFound(fetched.error) === true) {
+      return ok(null)
+    }
+    return err(fetched.error)
+  }
+
+  const parsed = parseLockRecord(fetched.data.data)
+  if (parsed.success === false) {
+    return err(parsed.error)
+  }
+
+  return ok({record: parsed.data, etag: fetched.data.etag})
+}
+
+/**
+ * Internal helper: reads the run-state record for a given `run_id`.
+ *
+ * Uses `COORDINATION_IDENTITY` as the identity segment (same as the lock key).
+ *
+ * Returns:
+ * - `ok(runState)` — run-state exists and is valid.
+ * - `ok(null)`     — run-state object does not exist or is unreadable (treated as dead).
+ * - `err(error)`   — parse error on a present record (fail-closed).
+ */
+async function readRunStateByRunId(
+  config: CoordinationConfig,
+  repo: string,
+  runId: string,
+): Promise<Result<RunState | null, Error>> {
+  const key = buildObjectStoreKey(config.storeConfig, COORDINATION_IDENTITY, repo, 'runs', `${runId}.json`)
+  if (key.success === false) {
+    return err(key.error)
+  }
+
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const fetched = await getObject.data(key.data)
+  if (fetched.success === false) {
+    // Any read failure (not-found, network, etc.) → treat as absent → dead
+    return ok(null)
+  }
+
+  const parsed = parseRunState(fetched.data.data)
+  if (parsed.success === false) {
+    // Present but malformed → fail-closed
+    return err(parsed.error)
+  }
+
+  return ok(parsed.data)
+}
+
+/**
+ * Dead-run-verified force-release of a per-repo coordination lock.
+ *
+ * Releases the lock ONLY when BOTH signals confirm the owning run is dead:
+ *   1. Lock lease expired (`acquired_at + ttl_seconds ≤ now`).
+ *   2. Run-state heartbeat is stale (`last_heartbeat + staleThresholdMs ≤ now`) OR absent.
+ *
+ * An `IfMatch: etag` conditional delete guards the read→delete race: if the lock object
+ * changed between read and delete (re-acquire/renewal), the delete fails and the outcome
+ * is `conflict` — the new holder's lock is never deleted.
+ *
+ * Returns a `Result<ForceReleaseStaleLockResult, Error>`. The outer `Result` is `err` only
+ * for unexpected infrastructure failures (key-build errors, missing adapter capabilities).
+ * All semantic outcomes (`released`, `live-holder`, `no-lock`, `conflict`, `error`) are
+ * returned as `ok(result)` with the appropriate `outcome` discriminant.
+ */
+export async function forceReleaseStaleLock(
+  config: CoordinationConfig,
+  repo: string,
+  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+): Promise<Result<ForceReleaseStaleLockResult, Error>> {
+  const now = new Date()
+
+  // Step 1: Read the current lock record + etag.
+  const lockRead = await readLockRecord(config, repo)
+  if (lockRead.success === false) {
+    logger.debug('forceReleaseStaleLock: failed to read lock record', {error: lockRead.error.message, repo})
+    return ok({outcome: 'error', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null})
+  }
+
+  if (lockRead.data === null) {
+    logger.debug('forceReleaseStaleLock: no lock record found', {repo})
+    return ok({outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null})
+  }
+
+  const {record: lockRecord, etag: lockEtag} = lockRead.data
+  const lockAgeMs = now.getTime() - new Date(lockRecord.acquired_at).getTime()
+
+  // Step 2 — Signal 1 (lease): check if the lock lease has expired.
+  if (isStale(lockRecord, now) === false) {
+    logger.debug('forceReleaseStaleLock: lock lease is still active', {
+      holderId: lockRecord.holder_id,
+      lockAgeMs,
+      repo,
+      runId: lockRecord.run_id,
+    })
+    return ok({
+      outcome: 'live-holder',
+      holderId: lockRecord.holder_id,
+      runId: lockRecord.run_id,
+      lockAgeMs,
+      heartbeatAgeMs: null,
+    })
+  }
+
+  // Step 3 — Signal 2 (heartbeat): read the run-state for the lock's run_id.
+  const runStateRead = await readRunStateByRunId(config, repo, lockRecord.run_id)
+  if (runStateRead.success === false) {
+    // Malformed run-state record → fail-closed, no delete.
+    logger.debug('forceReleaseStaleLock: malformed run-state record', {
+      error: runStateRead.error.message,
+      repo,
+      runId: lockRecord.run_id,
+    })
+    return ok({
+      outcome: 'error',
+      holderId: lockRecord.holder_id,
+      runId: lockRecord.run_id,
+      lockAgeMs,
+      heartbeatAgeMs: null,
+    })
+  }
+
+  const runState = runStateRead.data
+  let heartbeatAgeMs: number | null = null
+
+  if (runState !== null) {
+    heartbeatAgeMs = now.getTime() - new Date(runState.last_heartbeat).getTime()
+    const heartbeatThreshold = config.staleThresholdMs
+
+    if (heartbeatAgeMs < heartbeatThreshold) {
+      // Run is alive — heartbeat is fresh. Refuse to delete.
+      logger.debug('forceReleaseStaleLock: run-state heartbeat is fresh, refusing to release', {
+        heartbeatAgeMs,
+        holderId: lockRecord.holder_id,
+        repo,
+        runId: lockRecord.run_id,
+      })
+      return ok({
+        outcome: 'live-holder',
+        holderId: lockRecord.holder_id,
+        runId: lockRecord.run_id,
+        lockAgeMs,
+        heartbeatAgeMs,
+      })
+    }
+  }
+
+  // Both signals say dead: lease expired AND (run-state absent OR heartbeat stale).
+  // Step 4: Perform the IfMatch conditional delete.
+  const conditionalDelete = resolveConditionalDelete(config)
+  if (conditionalDelete.success === false) {
+    return err(conditionalDelete.error)
+  }
+
+  const lockKey = getLockKey(config, repo)
+  if (lockKey.success === false) {
+    return err(lockKey.error)
+  }
+
+  logger.debug('forceReleaseStaleLock: both signals dead, attempting conditional delete', {
+    heartbeatAgeMs,
+    holderId: lockRecord.holder_id,
+    lockAgeMs,
+    repo,
+    runId: lockRecord.run_id,
+  })
+
+  const deleted = await conditionalDelete.data(lockKey.data, {ifMatch: lockEtag})
+  if (deleted.success === false) {
+    if (isPreconditionFailed(deleted.error) === true) {
+      // Lock object changed between read and delete — new holder's lock is safe.
+      logger.debug('forceReleaseStaleLock: IfMatch precondition failed (lock re-acquired between read and delete)', {
+        repo,
+        runId: lockRecord.run_id,
+      })
+      return ok({
+        outcome: 'conflict',
+        holderId: lockRecord.holder_id,
+        runId: lockRecord.run_id,
+        lockAgeMs,
+        heartbeatAgeMs,
+      })
+    }
+    return err(deleted.error)
+  }
+
+  logger.debug('forceReleaseStaleLock: lock released', {
+    heartbeatAgeMs,
+    holderId: lockRecord.holder_id,
+    lockAgeMs,
+    repo,
+    runId: lockRecord.run_id,
+  })
+  return ok({
+    outcome: 'released',
+    holderId: lockRecord.holder_id,
+    runId: lockRecord.run_id,
+    lockAgeMs,
+    heartbeatAgeMs,
+  })
 }

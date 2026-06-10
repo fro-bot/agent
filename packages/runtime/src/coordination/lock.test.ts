@@ -1,11 +1,11 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/types.js'
 import type {Logger} from '../shared/logger.js'
-import type {CoordinationConfig, LockRecord} from './types.js'
+import type {CoordinationConfig, LockRecord, RunState} from './types.js'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {acquireLock, forceReleaseLock, releaseLock, renewLease} from './lock.js'
+import {acquireLock, forceReleaseLock, forceReleaseStaleLock, releaseLock, renewLease} from './lock.js'
 
 function createLogger(): Logger {
   return {
@@ -465,5 +465,216 @@ describe('lock coordination', () => {
 
     // #then
     expect(result).toEqual(ok({acquired: true, etag: 'etag-valid', holder: null}))
+  })
+})
+
+// ─── forceReleaseStaleLock ────────────────────────────────────────────────────
+
+function createRunState(overrides: Partial<RunState> = {}): RunState {
+  return {
+    run_id: 'run-1',
+    surface: 'discord',
+    thread_id: 'thread-1',
+    entity_ref: 'owner/repo#123',
+    phase: 'EXECUTING',
+    started_at: '2026-04-24T18:00:00.000Z',
+    last_heartbeat: '2026-04-24T18:00:00.000Z',
+    holder_id: 'holder-1',
+    details: {},
+    ...overrides,
+  }
+}
+
+// System time is set to 2026-04-24T18:15:00.000Z in the outer beforeEach.
+// Lock record: acquired_at=2026-04-24T18:00:00.000Z, ttl_seconds=900 → expires at 18:15:00 (stale at boundary).
+// Run-state: last_heartbeat=2026-04-24T18:00:00.000Z → 15 min ago; staleThresholdMs=60_000 (1 min) → stale.
+
+describe('forceReleaseStaleLock', () => {
+  // The outer beforeEach already sets fake timers to 2026-04-24T18:15:00.000Z.
+
+  // Lock key: fro-bot-state/coordination/owner/repo/locks/repo.json
+  // Run-state key: fro-bot-state/coordination/owner/repo/runs/run-1.json
+
+  it('releases the lock when lease is expired AND run-state heartbeat is stale', async () => {
+    // #given — lock is stale (acquired 15 min ago, ttl=900s), run-state heartbeat is 15 min ago (staleThresholdMs=60s)
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const staleRunState = createRunState({last_heartbeat: '2026-04-24T18:00:00.000Z'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleRunState), etag: 'etag-run'}))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(result.success === true ? result.data.holderId : null).toBe('holder-1')
+    expect(result.success === true ? result.data.runId : null).toBe('run-1')
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-lock',
+    })
+  })
+
+  it('releases the lock when lease is expired AND run-state record is absent (treated as dead)', async () => {
+    // #given — lock is stale, run-state object does not exist (404-style error)
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('released')
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-lock',
+    })
+  })
+
+  it('refuses to delete when lease is expired BUT run-state heartbeat is fresh (P0 guard)', async () => {
+    // #given — lock lease expired, but run is still heartbeating (heartbeat 30s ago, threshold=60s → alive)
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    // 18:14:30 is 30 seconds before 18:15:00 — within the 60s staleThresholdMs → live
+    const liveRunState = createRunState({last_heartbeat: '2026-04-24T18:14:30.000Z'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(liveRunState), etag: 'etag-run'}))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — must refuse, no delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('live-holder')
+    expect(result.success === true ? result.data.holderId : null).toBe('holder-1')
+    expect(result.success === true ? result.data.runId : null).toBe('run-1')
+    // The core P0 guard: assert NO delete call was made
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('returns live-holder when lease is NOT expired (no run-state read, no delete)', async () => {
+    // #given — lock acquired 30s ago, ttl=900s → not expired
+    const freshLock = createLockRecord({acquired_at: '2026-04-24T18:14:30.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(freshLock), etag: 'etag-lock'}))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — live-holder, no run-state read, no delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('live-holder')
+    // Only one getObject call (the lock read) — no run-state read
+    expect(getObject).toHaveBeenCalledOnce()
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('returns no-lock when no lock record exists', async () => {
+    // #given — getObject returns a not-found error for the lock key
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(err(new Error('NoSuchKey: object not found')))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('no-lock')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('returns conflict when lock object changed between read and delete (IfMatch precondition failure)', async () => {
+    // #given — both signals say dead, but conditionalDelete fails with precondition error
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const staleRunState = createRunState({last_heartbeat: '2026-04-24T18:00:00.000Z'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleRunState), etag: 'etag-run'}))
+    const conditionalDelete = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalDelete']>()
+      .mockResolvedValueOnce(err(new Error('precondition failed')))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — conflict, not an error; the new holder's lock is NOT deleted
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('conflict')
+    // Delete was attempted exactly once (with the read etag) but failed
+    expect(conditionalDelete).toHaveBeenCalledExactlyOnceWith('fro-bot-state/coordination/owner/repo/locks/repo.json', {
+      ifMatch: 'etag-lock',
+    })
+  })
+
+  it('returns error and does NOT delete when lock record is malformed', async () => {
+    // #given — lock object exists but has invalid shape
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify({repo: 'owner/repo'}), etag: 'etag-lock'}))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — fail closed, no delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('error')
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
+  it('returns error and does NOT delete when run-state record is malformed', async () => {
+    // #given — lock is stale, but run-state has invalid shape
+    const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(staleLock), etag: 'etag-lock'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify({run_id: 'run-1'}), etag: 'etag-run'}))
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const storeAdapter = createStoreAdapter({getObject, conditionalDelete})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', logger)
+
+    // #then — fail closed, no delete
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.outcome : null).toBe('error')
+    expect(conditionalDelete).not.toHaveBeenCalled()
   })
 })
