@@ -1,3 +1,4 @@
+import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {FroBotDeps} from './fro-bot.js'
 
@@ -46,6 +47,18 @@ function makeMockDeps(): FroBotDeps {
       warn: vi.fn(),
       error: vi.fn(),
     },
+    coordinationConfig: {
+      storeAdapter: {} as CoordinationConfig['storeAdapter'],
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'test'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+    },
+    identity: 'discord-gateway',
+    forceReleaseStaleLock: vi.fn().mockResolvedValue({
+      success: true,
+      data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
+    }),
   }
 }
 

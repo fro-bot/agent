@@ -24,6 +24,7 @@ import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
+import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
@@ -178,6 +179,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       queue: channelQueue,
       triggerRoleId: config.triggerRoleId,
       gatewayLogger: logger,
+      // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
+      // (injected so tests can mock without real S3 calls)
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      // identity is the run-state owner identity (gateway identity); forwarded to
+      // forceReleaseStaleLockEffect so it reads run-state under the correct key segment.
+      identity: config.identity,
+      forceReleaseStaleLock: forceReleaseStaleLockEffect,
     }
 
     const registry = getCommandRegistry(commandDeps)

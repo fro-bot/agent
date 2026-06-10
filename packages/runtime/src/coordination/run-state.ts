@@ -14,7 +14,13 @@ const VALID_TRANSITIONS: Record<RunPhase, readonly RunPhase[]> = {
   CANCELLED: [],
 }
 
-function getRunKey(config: CoordinationConfig, identity: string, repo: string, runId: string): Result<string, Error> {
+/** Build the S3 key for a specific run-state record. Exported so consumers share the single source of truth for the run-state key shape. */
+export function getRunKey(
+  config: CoordinationConfig,
+  identity: string,
+  repo: string,
+  runId: string,
+): Result<string, Error> {
   const key = buildObjectStoreKey(config.storeConfig, identity, repo, 'runs', `${runId}.json`)
   if (key.success === false) {
     return err(key.error)
@@ -23,7 +29,8 @@ function getRunKey(config: CoordinationConfig, identity: string, repo: string, r
   return ok(key.data)
 }
 
-function getRunPrefix(config: CoordinationConfig, identity: string, repo: string): Result<string, Error> {
+/** Build the S3 prefix for all run-state records under a given identity+repo. Exported so consumers share the single source of truth for the run-state prefix shape. */
+export function getRunPrefix(config: CoordinationConfig, identity: string, repo: string): Result<string, Error> {
   const key = buildObjectStoreKey(config.storeConfig, identity, repo, 'runs')
   if (key.success === false) {
     return err(key.error)

@@ -13,6 +13,7 @@ import {acquireLock, createHeartbeatController, createRun, releaseLock, transiti
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
+import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {attachOpencode} from './opencode-attach.js'
@@ -375,6 +376,10 @@ async function startRun(task: RunTask): Promise<void> {
       }
       runEtag = execResult.data.etag
 
+      // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
+      // eslint-disable-next-line no-void
+      void setRunReaction(message, 'working', logger)
+
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
       const handle = attachOpencode(attachUrl, attachToken)
@@ -458,6 +463,11 @@ async function startRun(task: RunTask): Promise<void> {
               sink?.markVisibleOutputSent()
             },
           })
+
+          // Awaiting-approval reaction — best-effort, fire-and-forget.
+          // Replaces the working reaction with the awaiting-approval cue.
+          // eslint-disable-next-line no-void
+          void setRunReaction(message, 'awaiting-approval', logger)
 
           // Post a visible waiting-for-approval status BEFORE the embed so the
           // user sees the run is blocked even if the embed send is slow.
@@ -557,6 +567,11 @@ async function startRun(task: RunTask): Promise<void> {
         coordinator.dispose('run ended')
       }
 
+      // ── Succeeded reaction — best-effort, fire-and-forget ────────────────────────────────────
+      // Replaces the working/awaiting reaction with the succeeded cue.
+      // eslint-disable-next-line no-void
+      void setRunReaction(message, 'succeeded', logger)
+
       // ── session.idle received — transition to COMPLETED ──────────────────────────────────────
 
       const stopResult = await heartbeat.stop()
@@ -612,6 +627,11 @@ async function startRun(task: RunTask): Promise<void> {
         },
         'run: execution failed',
       )
+
+      // ── Failed reaction — best-effort, fire-and-forget ────────────────────────────────────────
+      // Replaces the working/awaiting reaction with the failed cue.
+      // eslint-disable-next-line no-void
+      void setRunReaction(message, 'failed', logger)
 
       // Stop heartbeat (best-effort) if not already stopped
       if (heartbeatStopped === false) {

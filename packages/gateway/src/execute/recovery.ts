@@ -21,7 +21,7 @@ import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
-import {buildObjectStoreKey, findStaleRuns, releaseLock, transitionRun} from '@fro-bot/runtime'
+import {findStaleRuns, getLockKey, getRunKey, releaseLock, transitionRun} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -48,12 +48,6 @@ export interface RecoverStaleRunsDeps {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/** Lock identity constant — matches the hardcoded value in coordination/lock.ts */
-// INVARIANT: must stay in sync with the private `COORDINATION_IDENTITY` constant in
-// `packages/runtime/src/coordination/lock.ts` (line 8). That constant is not exported —
-// if it is ever exported, import it here instead of maintaining a local copy.
-const COORDINATION_IDENTITY = 'coordination'
 
 /** Narrow logger adapter for runtime coordination functions. */
 function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
@@ -210,7 +204,7 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
 
   // ── 1. Transition run state to FAILED ───────────────────────────────────
 
-  const runKeyResult = buildObjectStoreKey(coordinationConfig.storeConfig, identity, repo, 'runs', `${run.run_id}.json`)
+  const runKeyResult = getRunKey(coordinationConfig, identity, repo, run.run_id)
 
   if (runKeyResult.success === false) {
     logger.warn(
@@ -245,13 +239,7 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
 
   // ── 2. Release the repo lock ─────────────────────────────────────────────
 
-  const lockKeyResult = buildObjectStoreKey(
-    coordinationConfig.storeConfig,
-    COORDINATION_IDENTITY,
-    repo,
-    'locks',
-    'repo.json',
-  )
+  const lockKeyResult = getLockKey(coordinationConfig, repo)
 
   if (lockKeyResult.success === false) {
     logger.warn({runId: run.run_id, repo, err: lockKeyResult.error.message}, 'recovery: could not build lock key')

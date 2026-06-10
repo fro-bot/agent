@@ -10,6 +10,7 @@
  * - Authorization gate: only authorized users may clear the queue
  */
 
+import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
@@ -19,6 +20,7 @@ import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 
 import {createFroBotCommand} from './fro-bot.js'
+import {dispatchCommand, getCommandRegistry} from './index.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -57,6 +59,11 @@ function makeGuild(opts: {hasRole?: boolean; hasManageChannels?: boolean} = {}):
 }
 
 function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
+  const defaultForceRelease: FroBotDeps['forceReleaseStaleLock'] = vi
+    .fn()
+    .mockReturnValue(
+      Effect.succeed({outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null}),
+    )
   return {
     bindingsStore: {
       createBinding: vi.fn(),
@@ -86,6 +93,15 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
       warn: vi.fn(),
       error: vi.fn(),
     },
+    coordinationConfig: {
+      storeAdapter: {} as CoordinationConfig['storeAdapter'],
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'test'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+    },
+    identity: 'discord-gateway',
+    forceReleaseStaleLock: defaultForceRelease,
     ...overrides,
   }
 }
@@ -396,5 +412,502 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 
     // #then — queue.clear was called (ManageChannels fallback authorized)
     expect(queue.clear).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — tests
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Helpers for force-release-lock tests
+// ---------------------------------------------------------------------------
+
+type ForceReleaseFn = FroBotDeps['forceReleaseStaleLock']
+
+function makeForceReleaseStaleLockMock(result: ForceReleaseStaleLockResult): ForceReleaseFn {
+  return vi.fn().mockReturnValue(Effect.succeed(result))
+}
+
+function makeCoordinationConfig(): CoordinationConfig {
+  return {
+    storeAdapter: {} as CoordinationConfig['storeAdapter'],
+    storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'test'},
+    lockTtlSeconds: 900,
+    heartbeatIntervalMs: 30_000,
+    staleThresholdMs: 60_000,
+  }
+}
+
+function makeFrlDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
+  const defaultForceRelease = makeForceReleaseStaleLockMock({
+    outcome: 'released',
+    holderId: 'holder-abc',
+    runId: 'run-xyz',
+    lockAgeMs: 120_000,
+    heartbeatAgeMs: 90_000,
+  })
+  return makeDeps({
+    coordinationConfig: makeCoordinationConfig(),
+    forceReleaseStaleLock: defaultForceRelease,
+    ...overrides,
+  })
+}
+
+/**
+ * Build a mock Guild where members.fetch() resolves to a member with the given
+ * role set and ManageChannels permission — for force-release-lock tests.
+ */
+function makeFrlGuild(opts: {hasRole?: boolean; hasManageChannels?: boolean} = {}): Guild {
+  return makeGuild(opts)
+}
+
+function makeBindingsStore(binding: {owner: string; repo: string} | null = {owner: 'acme', repo: 'widget'}) {
+  return {
+    createBinding: vi.fn(),
+    getBindingByRepo: vi.fn(),
+    getBindingByChannelId: vi.fn().mockResolvedValue(
+      binding === null
+        ? {success: true, data: null}
+        : {
+            success: true,
+            data: {
+              owner: binding.owner,
+              repo: binding.repo,
+              channelId: 'ch-test-123',
+              surface: 'discord',
+              createdAt: new Date().toISOString(),
+            },
+          },
+    ),
+    listBindings: vi.fn(),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — builder registration
+// ---------------------------------------------------------------------------
+
+describe('createFroBotCommand — builder registration (force-release-lock)', () => {
+  it('registers force-release-lock subcommand on the builder', () => {
+    // #given
+    const cmd = createFroBotCommand(makeFrlDeps())
+
+    // #when
+    const json = cmd.data.toJSON()
+
+    // #then
+    const subNames = (json.options ?? []).map((o: {name: string}) => o.name)
+    expect(subNames).toContain('force-release-lock')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — null guild guard
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — null guild guard', () => {
+  it('null guild → plain ephemeral reply, no defer, no forceReleaseStaleLock call', async () => {
+    // #given — interaction has no guild (DM context)
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const deps = makeFrlDeps({forceReleaseStaleLock})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, reply, deferReply} = makeInteraction('force-release-lock', 'ch-dm', null)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — plain reply (not deferred) with server-only message
+    expect(reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        ephemeral: true,
+        content: expect.stringMatching(/server/i) as unknown as string,
+      }),
+    )
+    // #and — deferReply NOT called
+    expect(deferReply).not.toHaveBeenCalled()
+    // #and — forceReleaseStaleLock NOT called
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — authorization gate (raised bar: ManageChannels only)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — authorization gate', () => {
+  it('manageChannels user → deferReply called first, then forceReleaseStaleLock called with gateway identity', async () => {
+    // #given — user has ManageChannels
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: 'holder-abc',
+      runId: 'run-xyz',
+      lockAgeMs: 120_000,
+      heartbeatAgeMs: 90_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore, identity: 'discord-gateway'})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, deferReply, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — deferReply called first (ephemeral)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+    // #and — forceReleaseStaleLock was called with the gateway identity as the 3rd argument
+    expect(forceReleaseStaleLock).toHaveBeenCalledOnce()
+    const callArgs = (forceReleaseStaleLock as ReturnType<typeof vi.fn>).mock.calls[0] as unknown[]
+    expect(callArgs[2]).toBe('discord-gateway')
+    // #and — editReply was called with released confirmation
+    expect(editReply).toHaveBeenCalledOnce()
+  })
+
+  it('trigger-role-only user (has role, NO ManageChannels) → DENIED, forceReleaseStaleLock NOT called', async () => {
+    // #given — user has trigger role but NOT ManageChannels (the raised bar test)
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: true, hasManageChannels: false})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({
+      forceReleaseStaleLock,
+      bindingsStore,
+      triggerRoleId: 'role-trigger-123',
+    })
+    const cmd = createFroBotCommand(deps)
+    const {interaction, deferReply, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — deferReply was called (interaction acked before auth)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+    // #and — forceReleaseStaleLock NOT called (denied)
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+    // #and — ephemeral permission-denied editReply
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        content: expect.stringMatching(/permission|not authorized/i) as unknown as string,
+      }),
+    )
+  })
+
+  it('unauthorized user (neither role nor ManageChannels) → denied, forceReleaseStaleLock NOT called', async () => {
+    // #given — user has neither trigger role nor ManageChannels
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: false})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({
+      forceReleaseStaleLock,
+      bindingsStore,
+      triggerRoleId: 'role-trigger-123',
+    })
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — forceReleaseStaleLock NOT called
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+    // #and — denied reply
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        content: expect.stringMatching(/permission|not authorized/i) as unknown as string,
+      }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — no binding edge case
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — no binding', () => {
+  it('no binding for channel → ephemeral "no repo bound", forceReleaseStaleLock NOT called', async () => {
+    // #given — channel has no binding
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore(null)
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-unbound', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — forceReleaseStaleLock NOT called
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+    // #and — editReply mentions no binding
+    expect(editReply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        content: expect.stringMatching(/no repo|not bound|no project/i) as unknown as string,
+      }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — outcome → reply mapping
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — outcome mapping', () => {
+  it('released → ephemeral confirmation with holder info', async () => {
+    // #given — forceReleaseStaleLock returns released
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: 'holder-abc',
+      runId: 'run-xyz',
+      lockAgeMs: 120_000,
+      heartbeatAgeMs: 90_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply confirms release with holder info
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/released/i)
+    expect(replyArg.content).toContain('holder-abc')
+  })
+
+  it('live-holder → ephemeral refusal with holder id and run age', async () => {
+    // #given — forceReleaseStaleLock returns live-holder
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'live-holder',
+      holderId: 'holder-live',
+      runId: 'run-live',
+      lockAgeMs: 30_000,
+      heartbeatAgeMs: 5_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply mentions live holder
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/active|live|held/i)
+    expect(replyArg.content).toContain('holder-live')
+  })
+
+  it('no-lock → ephemeral "nothing to release"', async () => {
+    // #given — forceReleaseStaleLock returns no-lock
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'no-lock',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply says nothing to release
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/no lock|nothing to release|not locked/i)
+  })
+
+  it('conflict → ephemeral "lock changed, try again"', async () => {
+    // #given — forceReleaseStaleLock returns conflict
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'conflict',
+      holderId: 'holder-abc',
+      runId: 'run-xyz',
+      lockAgeMs: 120_000,
+      heartbeatAgeMs: 90_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply mentions conflict / try again
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/changed|conflict|try again/i)
+  })
+
+  it('error outcome → ephemeral internal-error reply', async () => {
+    // #given — forceReleaseStaleLock returns error
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'error',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply mentions internal error
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/error|failed|internal/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — missing branch coverage (P2-f)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — binding store error', () => {
+  it('binding store returns err → internal-error ephemeral reply, forceReleaseStaleLock NOT called', async () => {
+    // #given — getBindingByChannelId returns an err result (store failure)
+    const forceReleaseStaleLock = vi.fn()
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = {
+      createBinding: vi.fn(),
+      getBindingByRepo: vi.fn(),
+      getBindingByChannelId: vi.fn().mockResolvedValue({success: false, error: new Error('DynamoDB timeout')}),
+      listBindings: vi.fn(),
+    }
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — forceReleaseStaleLock NOT called
+    expect(forceReleaseStaleLock).not.toHaveBeenCalled()
+    // #and — internal-error ephemeral reply
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/something went wrong|internal error|try again/i)
+  })
+})
+
+describe('/fro-bot force-release-lock — forceReleaseStaleLock returns outcome error', () => {
+  it('forceReleaseStaleLock returns outcome error → internal-error ephemeral reply', async () => {
+    // #given — forceReleaseStaleLock returns ok({outcome: 'error', ...})
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'error',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — internal-error ephemeral reply
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/error|failed|internal/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — integration: dispatch path
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — infra-failure path (outer Effect.fail)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — infra-failure path', () => {
+  it('forceReleaseStaleLock Effect.fail → editReply called with internal-error copy AND Effect ends in failure', async () => {
+    // #given — forceReleaseStaleLock produces an outer Effect failure (missing adapter
+    // capability, key-build error, etc.) — distinct from the handled outcome:'error' path.
+    const infraError = new Error('adapter capability missing')
+    const forceReleaseStaleLock: FroBotDeps['forceReleaseStaleLock'] = vi.fn().mockReturnValue(Effect.fail(infraError))
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when — run via Effect.either so we can assert on both the reply AND the failure
+    const result = await Effect.runPromise(Effect.either(cmd.execute(interaction)))
+
+    // #then — the deferred reply was edited (not left hanging at "thinking…")
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+
+    // #and — the error still propagates (dispatchCommand-level logger sees it)
+    expect(result._tag).toBe('Left')
+    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('adapter capability missing')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot force-release-lock — dispatch integration
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot force-release-lock — dispatch integration', () => {
+  it('dispatches force-release-lock through getCommandRegistry + dispatchCommand', async () => {
+    // #given — real registry + dispatch path
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'no-lock',
+      holderId: null,
+      runId: null,
+      lockAgeMs: null,
+      heartbeatAgeMs: null,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const registry = getCommandRegistry(deps)
+    const {interaction} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when — dispatch through the real registry
+    const result = await Effect.runPromise(Effect.either(dispatchCommand(interaction, registry)))
+
+    // #then — dispatch resolves (not an unknown-command failure)
+    expect(result._tag).toBe('Right')
   })
 })
