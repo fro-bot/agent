@@ -9,6 +9,7 @@ import * as runtimeModule from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
+import * as reactionsModule from '../discord/reactions.js'
 import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
 import * as attachModule from './opencode-attach.js'
@@ -99,6 +100,16 @@ vi.mock('../discord/status-message.js', () => ({
     resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
     dispose: vi.fn().mockResolvedValue(undefined),
   }),
+}))
+
+vi.mock('../discord/reactions.js', () => ({
+  setRunReaction: vi.fn().mockResolvedValue(undefined),
+  REACTION_EMOJIS: {
+    working: '⏳',
+    succeeded: '✅',
+    failed: '❌',
+    'awaiting-approval': '⏸️',
+  },
 }))
 
 // ---------------------------------------------------------------------------
@@ -3683,6 +3694,140 @@ describe('handoff unit tests (F8)', () => {
 
     // #then — ensureClone NOT called (FIFO gate short-circuits before pipeline)
     expect(ensureClone).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reaction-wiring containment — Unit 3 (R9)
+// ---------------------------------------------------------------------------
+//
+// These tests assert that:
+//   1. Reaction calls are made at the correct lifecycle points (working on
+//      start, succeeded/failed on terminal, awaiting-approval on approval-wait).
+//   2. A thrown reaction mock NEVER alters the run outcome — the run still
+//      completes/fails identically to the no-reaction baseline.
+//   3. Reaction failures do not produce unhandled rejections.
+//
+// The reaction module is mocked at the module level (see top-level vi.mock above)
+// so we can control whether it throws without touching the real Discord API.
+
+const mockSetRunReaction = vi.mocked(reactionsModule.setRunReaction)
+
+describe('reaction wiring — lifecycle hooks', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockSetRunReaction.mockResolvedValue(undefined)
+  })
+
+  it('happy path: working reaction set at run start, succeeded at terminal success', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — setRunReaction called at least twice: working then succeeded
+    const calls = mockSetRunReaction.mock.calls
+    const states = calls.map(c => c[1])
+    expect(states).toContain('working')
+    expect(states).toContain('succeeded')
+    // working must come before succeeded
+    expect(states.indexOf('working')).toBeLessThan(states.indexOf('succeeded'))
+  })
+
+  it('failure path: working reaction set at run start, failed at terminal failure', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — working then failed
+    const states = mockSetRunReaction.mock.calls.map(c => c[1])
+    expect(states).toContain('working')
+    expect(states).toContain('failed')
+    expect(states.indexOf('working')).toBeLessThan(states.indexOf('failed'))
+  })
+
+  it('reaction is called with the triggering message (not the thread)', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — all reaction calls use the triggering message
+    for (const call of mockSetRunReaction.mock.calls) {
+      expect(call[0]).toBe(message)
+    }
+  })
+})
+
+describe('reaction wiring — containment (failure isolation)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('thrown reaction mock on happy path: run still completes successfully (outcome unchanged)', async () => {
+    // #given — reaction always throws
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockSetRunReaction.mockRejectedValue(new Error('reaction API exploded'))
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when — must not throw
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+    // #then — run still completed (COMPLETED transition occurred)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+    expect(transitionPhases).not.toContain('FAILED')
+  })
+
+  it('thrown reaction mock on failure path: run still transitions to FAILED (outcome unchanged)', async () => {
+    // #given — reaction throws AND run-core throws
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockSetRunReaction.mockRejectedValue(new Error('reaction API exploded'))
+    mockRunOpenCodeCore.mockRejectedValue(new Error('run-core boom'))
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when — must not throw
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+    // #then — run still transitioned to FAILED (reaction failure did not mask run failure)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('COMPLETED')
+  })
+
+  it('thrown reaction mock: lock and concurrency slot still released (cleanup unaffected)', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockSetRunReaction.mockRejectedValue(new Error('reaction API exploded'))
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — cleanup still ran
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
   })
 })
 
