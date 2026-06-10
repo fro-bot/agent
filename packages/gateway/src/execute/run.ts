@@ -13,7 +13,7 @@ import {acquireLock, createHeartbeatController, createRun, releaseLock, transiti
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
-import {sendMessage} from '../discord/io.js'
+import {editMessage, sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
@@ -492,16 +492,18 @@ async function startRun(task: RunTask): Promise<void> {
           // mark in-flight before the void send, settle on resolution.
           const settleEmbed = sink?.markVisibleOutputPending()
           // eslint-disable-next-line no-void
-          void rawThread
-            .send({
-              embeds: [buildApprovalEmbed(request)],
-              components: [buildApprovalButtons(requestID)],
-              allowedMentions: {parse: []},
-            })
-            .then(postedMessage => {
+          void sendMessage(
+            rawThread,
+            {embeds: [buildApprovalEmbed(request)], components: [buildApprovalButtons(requestID)]},
+            logger,
+          ).then(result => {
+            if (result.success) {
               // Embed send succeeded — settle pending claim as delivered so
               // flush() does not add a misleading _(no output)_.
               settleEmbed?.(true)
+              // Narrow the sdk's unknown ok data to discord.js Message — sendMessage
+              // returns Promise<Result<unknown>> and the actual value is the sent Message.
+              const postedMessage = result.data as Message
               // Attach the render function now that we have a message reference.
               approvalRegistry.attachMessage(
                 requestID,
@@ -511,22 +513,28 @@ async function startRun(task: RunTask): Promise<void> {
                   decidedBy: string | null,
                   reason: import('../approvals/coordinator.js').SettlementReason,
                 ) => {
-                  try {
-                    await (postedMessage as {edit: (opts: unknown) => Promise<unknown>}).edit({
+                  const editResult = await editMessage(
+                    postedMessage,
+                    {
                       embeds: [buildSettledEmbed(req, decision, {decidedBy: decidedBy ?? undefined, reason})],
                       components: [],
-                    })
-                  } catch (error) {
-                    logger.warn({requestID: req.requestID, err: String(error)}, 'run: failed to edit approval message')
+                    },
+                    logger,
+                  )
+                  if (!editResult.success) {
+                    logger.warn(
+                      {requestID: req.requestID, err: editResult.error.message},
+                      'run: failed to edit approval message',
+                    )
                   }
                 },
               )
-            })
-            .catch((error: unknown) => {
+            } else {
               settleEmbed?.(false)
-              logger.warn({requestID, err: String(error)}, 'run: failed to post approval embed')
+              logger.warn({requestID, err: result.error.message}, 'run: failed to post approval embed')
               approvalRegistry.markMessagePostFailed(requestID)
-            })
+            }
+          })
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
