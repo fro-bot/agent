@@ -181,19 +181,6 @@ async function userIsAuthorized(guild: Guild, userId: string, logger: AddProject
 const INTERACTION_WINDOW_MS = 14 * 60 * 1000
 
 // ---------------------------------------------------------------------------
-// Logger adapter — adapts AddProjectDeps.logger (message-first) to GatewayLogger (context-first)
-// ---------------------------------------------------------------------------
-
-function makeGatewayLoggerAdapter(logger: AddProjectDeps['logger']): GatewayLogger {
-  return {
-    debug: () => undefined, // AddProjectDeps.logger has no debug level
-    info: (ctx, msg) => logger.info(msg, ctx),
-    warn: (ctx, msg) => logger.warn(msg, ctx),
-    error: (ctx, msg) => logger.error(msg, ctx),
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Pipeline spec builder
 // ---------------------------------------------------------------------------
 
@@ -205,16 +192,16 @@ function makeGatewayLoggerAdapter(logger: AddProjectDeps['logger']): GatewayLogg
  *
  * The phase orchestration body (clone/channel/binding phases) is the work function.
  */
-export function buildAddProjectSpec(deps: AddProjectDeps) {
-  // Adapt the message-first logger to GatewayLogger (context-first) for io.ts helpers.
-  // The pipeline will further scope it with {command: 'add-project'} via withLogContext.
-  const baseGatewayLogger = makeGatewayLoggerAdapter(deps.logger)
-
+export function buildAddProjectSpec(deps: AddProjectDeps): {
+  readonly preDefer: (ctx: PreDeferCtx) => Effect.Effect<PreDeferSignal, never>
+  readonly authorize: (ctx: GuildCommandCtx) => Effect.Effect<AuthDecision, never>
+  readonly work: (ctx: GuildCommandCtx) => Effect.Effect<void, Error>
+} {
   const preDefer = (ctx: PreDeferCtx): Effect.Effect<PreDeferSignal, never> => {
     const userId = ctx.interaction.user.id
     const rateCheck = checkRateLimit(userId)
-    if (rateCheck.allowed) {
-      return Effect.succeed({continue: true as const})
+    if (rateCheck.allowed === true) {
+      return Effect.succeed({proceed: true as const})
     }
     const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
     return Effect.promise(async () => {
@@ -226,12 +213,23 @@ export function buildAddProjectSpec(deps: AddProjectDeps) {
         },
         ctx.log,
       )
-      return {continue: false as const}
+      return {proceed: false as const}
     })
   }
 
   const authorize = (ctx: GuildCommandCtx): Effect.Effect<AuthDecision, never> => {
     return Effect.promise(async () => {
+      // Shutdown gate — must precede any auth REST calls (guild.members.fetch).
+      // Refusing here avoids a misleading permission-denial if the fetch fails
+      // during draining shutdown. The user sees a restart message, not a denial.
+      const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
+      if (shuttingDownCheck() === true) {
+        return {
+          authorized: false as const,
+          copy: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.',
+        }
+      }
+
       // Bot-permission gate: ManageChannels + SendMessages required.
       if (botHasRequiredPermissions(ctx.interaction.appPermissions) === false) {
         ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: missing bot permissions')
@@ -264,7 +262,7 @@ export function buildAddProjectSpec(deps: AddProjectDeps) {
     })
   }
 
-  return {preDefer, authorize, work, baseGatewayLogger}
+  return {preDefer, authorize, work}
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +280,10 @@ export function executeAddProject(
   deps: AddProjectDeps,
 ): Effect.Effect<void, Error> {
   const {preDefer, authorize, work} = buildAddProjectSpec(deps)
-  const executor = makeGuildCommand({name: 'add-project', preDefer, authorize, work}, deps)
+  const executor = makeGuildCommand(
+    {name: 'add-project', preDefer, authorize, work, serverOnlyCopy: 'This command can only be used in a server.'},
+    deps,
+  )
   return executor(interaction)
 }
 
@@ -301,19 +302,6 @@ async function runAddProjectPhases(
   // ---------------------------------------------------------------------------
   let phase: AddProjectPhase = 'PRE_FLIGHT'
   logger.info('add-project phase', {correlationId, phase, outcome: 'start'})
-
-  // Shutdown gate — placed as the first step of work (after defer) so Discord gets its
-  // mandatory ack (<3s). Refuse new work during draining shutdown; resume (Part 1) heals
-  // any hard-killed run.
-  const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
-  if (shuttingDownCheck() === true) {
-    await editInteractionAsync(
-      interaction,
-      {content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.'},
-      log,
-    )
-    return
-  }
 
   // Parse and validate URL
   const rawUrl = interaction.options.getString('url', true)
@@ -569,7 +557,7 @@ async function runAddProjectPhases(
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName, outcome: 'start'})
 
   // Defensive permission re-check
-  if (!botHasRequiredPermissions(interaction.appPermissions)) {
+  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
     logger.warn('add-project: permissions revoked between pre-flight and channel creation', {
       correlationId,
       phase,

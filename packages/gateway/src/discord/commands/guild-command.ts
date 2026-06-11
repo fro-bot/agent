@@ -60,9 +60,9 @@ export type AuthDecision = {readonly authorized: true} | {readonly authorized: f
 
 /**
  * Signal returned by `preDefer` to control pipeline continuation.
- * `{continue: false}` means the hook already replied and the pipeline should stop.
+ * `{proceed: false}` means the hook already replied and the pipeline should stop.
  */
-export type PreDeferSignal = {readonly continue: true} | {readonly continue: false}
+export type PreDeferSignal = {readonly proceed: true} | {readonly proceed: false}
 
 /**
  * Spec for a guild-bound slash command.
@@ -99,7 +99,7 @@ export interface GuildCommandDeps {
 
 const DEFAULT_SERVER_ONLY_COPY = 'This command must be used in a server.'
 const DEFAULT_DENIAL_COPY = 'You do not have permission to use this command.'
-const INTERNAL_ERROR_COPY = 'An internal error occurred. Please try again.'
+export const INTERNAL_ERROR_COPY = 'An internal error occurred. Please try again.'
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -138,7 +138,7 @@ export function makeGuildCommand(
       if (spec.preDefer !== undefined) {
         const preDeferCtx: PreDeferCtx = {interaction, log}
         const signal = yield* spec.preDefer(preDeferCtx)
-        if (signal.continue === false) {
+        if (signal.proceed === false) {
           return
         }
       }
@@ -185,8 +185,16 @@ export function makeGuildCommand(
         // failures and Effect.fail calls. Effect.suspend converts sync throws
         // to defects (Die cause); catchAllCause normalizes them to typed Error
         // failures so the outer catchAll sees them uniformly.
+        //
+        // Interrupt guard: if the cause is interrupt-only, re-fail with the
+        // original cause so the interrupt propagates past Effect.catchAll
+        // (catchAll only catches typed failures, so failCause with an interrupt
+        // cause skips the reply-edit path — the fiber is interrupted cleanly).
         yield* Effect.suspend(() => spec.work(ctx)).pipe(
           Effect.catchAllCause(cause => {
+            if (Cause.isInterruptedOnly(cause)) {
+              return Effect.failCause(cause)
+            }
             const squashed = Cause.squash(cause)
             return Effect.fail(squashed instanceof Error ? squashed : new Error(String(squashed)))
           }),
@@ -196,11 +204,14 @@ export function makeGuildCommand(
         // Edits the deferred reply so the user is not left at "thinking…",
         // then re-fails so dispatchCommand's logger still sees the error.
         //
-        // editInteraction never fails as an Effect (errors are caught inside
-        // and returned as Result) — safe to yield* before re-failing.
+        // editInteraction returns a Result — capture it so operators can
+        // distinguish "user saw internal error" from "user saw nothing".
         Effect.catchAll(error =>
           Effect.gen(function* () {
-            yield* editInteraction(interaction, {content: INTERNAL_ERROR_COPY}, log)
+            const editResult = yield* editInteraction(interaction, {content: INTERNAL_ERROR_COPY}, log)
+            if (editResult.success === false) {
+              log.error({err: editResult.error.message}, 'guild-command: failed to deliver internal-error reply')
+            }
             return yield* Effect.fail(error)
           }),
         ),

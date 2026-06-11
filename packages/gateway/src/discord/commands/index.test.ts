@@ -226,7 +226,7 @@ describe('dispatchCommand', () => {
 
   it('dispatches /fro-bot add-project to executeAddProject with injected deps', async () => {
     // #given — registry built with mock deps; guild is null to exercise the guild-null guard path.
-    // Named delta (Unit 3): add-project now uses the pipeline, which guards BEFORE defer.
+    // add-project uses the pipeline, which guards BEFORE defer.
     // So guild-null → immediate ephemeral reply (interaction.reply), deferReply NOT called.
     const deps = makeMockDeps()
     const registry = getCommandRegistry(deps)
@@ -257,7 +257,7 @@ describe('dispatchCommand', () => {
     expect(reply).toHaveBeenCalledWith(
       expect.objectContaining({content: expect.stringContaining('server') as unknown as string}),
     )
-    // #and — deferReply NOT called (guard fires before defer — deliberate delta 2 from the plan)
+    // #and — deferReply NOT called (guard fires before defer)
     expect(deferReply).not.toHaveBeenCalled()
   })
 })

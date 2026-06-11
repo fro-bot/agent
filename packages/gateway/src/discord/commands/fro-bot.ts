@@ -26,7 +26,7 @@ import {Effect} from 'effect'
 import {editInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
-import {makeGuildCommand} from './guild-command.js'
+import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
 import {executePing} from './ping.js'
 
 // ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
       authorize: ctx =>
         Effect.promise(async () => {
           const authorized = await userIsAuthorized(ctx.guild, ctx.interaction.user.id, deps.triggerRoleId, ctx.log)
-          if (authorized) {
+          if (authorized === true) {
             return {authorized: true as const}
           }
           return {authorized: false as const}
@@ -287,11 +287,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
               // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
               const exhaustiveCheck: never = outcome
               ctx.log.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
-              yield* editInteraction(
-                ctx.interaction,
-                {content: 'An internal error occurred. Please try again.'},
-                ctx.log,
-              )
+              yield* editInteraction(ctx.interaction, {content: INTERNAL_ERROR_COPY}, ctx.log)
             }
           }
         }),

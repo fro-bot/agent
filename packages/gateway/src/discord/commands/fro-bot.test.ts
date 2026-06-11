@@ -951,6 +951,29 @@ describe('/fro-bot force-release-lock — infra-failure path', () => {
 })
 
 // ---------------------------------------------------------------------------
+// /fro-bot clear-queue — dispatch integration
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot clear-queue — dispatch integration', () => {
+  it('dispatches clear-queue through getCommandRegistry + dispatchCommand', async () => {
+    // #given — real registry + dispatch path; authorized user with ManageChannels
+    const queue = makeQueue(0)
+    const guild = makeGuild({hasRole: false, hasManageChannels: true})
+    const deps = makeDeps({queue})
+    const registry = getCommandRegistry(deps)
+    const {interaction} = makeInteraction('clear-queue', 'ch-dispatch-test', guild)
+
+    // #when — dispatch through the real registry
+    const result = await Effect.runPromise(Effect.either(dispatchCommand(interaction, registry)))
+
+    // #then — dispatch resolves (not an unknown-command failure)
+    expect(result._tag).toBe('Right')
+    // #and — queue.clear was called (command ran end-to-end)
+    expect(queue.clear).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // /fro-bot force-release-lock — dispatch integration
 // ---------------------------------------------------------------------------
 

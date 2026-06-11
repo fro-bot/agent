@@ -17,7 +17,7 @@
 import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 
 import type {GuildCommandDeps, GuildCommandSpec, PreDeferCtx} from './guild-command.js'
-import {Effect} from 'effect'
+import {Cause, Effect, Exit, Fiber} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 import {makeGuildCommand} from './guild-command.js'
 
@@ -127,7 +127,7 @@ describe('makeGuildCommand — pipeline ordering', () => {
     const preDefer = vi.fn().mockImplementation((ctx: unknown) => {
       capturedPreDeferCtx = ctx
       preDeferCallCount++
-      return Effect.succeed({continue: true as const})
+      return Effect.succeed({proceed: true as const})
     })
     const authorize = vi.fn().mockImplementation(() => {
       preDeferCountWhenDeferRan = preDeferCallCount
@@ -167,7 +167,7 @@ describe('makeGuildCommand — pipeline ordering', () => {
 describe('makeGuildCommand — preDefer short-circuit', () => {
   it('preDefer returning stop skips guard, defer, auth, and work', async () => {
     // #given — preDefer signals stop (e.g. rate limit already replied)
-    const preDefer = vi.fn().mockReturnValue(Effect.succeed({continue: false as const}))
+    const preDefer = vi.fn().mockReturnValue(Effect.succeed({proceed: false as const}))
     const authorize = vi.fn()
     const work = vi.fn()
 
@@ -190,7 +190,7 @@ describe('makeGuildCommand — preDefer short-circuit', () => {
 
   it('preDefer short-circuit does not fail the Effect', async () => {
     // #given — preDefer signals stop
-    const preDefer = vi.fn().mockReturnValue(Effect.succeed({continue: false as const}))
+    const preDefer = vi.fn().mockReturnValue(Effect.succeed({proceed: false as const}))
     const spec: GuildCommandSpec = {
       name: 'test-cmd',
       preDefer,
@@ -310,7 +310,7 @@ describe('makeGuildCommand — defer failure', () => {
     const spec: GuildCommandSpec = {name: 'test-cmd', authorize, work}
     const deps = makeDeps()
     const executor = makeGuildCommand(spec, deps)
-    const {interaction, deferReply} = makeInteraction()
+    const {interaction, deferReply, editReply} = makeInteraction()
 
     deferReply.mockRejectedValue(deferError)
 
@@ -323,6 +323,11 @@ describe('makeGuildCommand — defer failure', () => {
     // #and — auth and work NOT called (defer failed before they ran)
     expect(authorize).not.toHaveBeenCalled()
     expect(work).not.toHaveBeenCalled()
+    // #and — catchAll ATTEMPTED editReply with the internal-error copy (even though it fails
+    // silently via io.ts — the user may or may not see it, but the attempt was made)
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
   })
 })
 
@@ -565,6 +570,38 @@ describe('makeGuildCommand — work failure (catchAll)', () => {
     // #and — Effect re-fails with the original error
     expect(result._tag).toBe('Left')
     expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('sync construction error')
+  })
+
+  it('fiber interrupt does NOT trigger the catchAll reply-edit path', async () => {
+    // #given — work never completes; the fiber is interrupted externally.
+    // The catchAll must NOT call editReply with the internal-error copy when the
+    // cause is interrupt-only — the interrupt should propagate cleanly.
+    const work = vi.fn().mockReturnValue(Effect.never)
+    const authorize = vi.fn().mockReturnValue(Effect.succeed({authorized: true as const}))
+    const spec: GuildCommandSpec = {name: 'test-cmd', authorize, work}
+    const deps = makeDeps()
+    const executor = makeGuildCommand(spec, deps)
+    const {interaction, editReply} = makeInteraction()
+
+    // #when — fork the pipeline, interrupt the fiber, await its exit
+    const exit = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.fork(executor(interaction))
+        yield* Fiber.interrupt(fiber)
+        return yield* Fiber.await(fiber)
+      }),
+    )
+
+    // #then — exit is a failure with an interrupted cause (not a typed Error failure)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(Exit.isFailure(exit) && Cause.isInterrupted(exit.cause)).toBe(true)
+    // #and — editReply was NOT called with the internal-error copy
+    const internalErrorCalls = (editReply.mock.calls as unknown[][]).filter(
+      call =>
+        typeof (call[0] as {content?: string}).content === 'string' &&
+        (call[0] as {content: string}).content.toLowerCase().includes('internal error'),
+    )
+    expect(internalErrorCalls).toHaveLength(0)
   })
 
   it('catchAll is scoped to defer-onward: guild-null guard reply does NOT trigger catchAll', async () => {
