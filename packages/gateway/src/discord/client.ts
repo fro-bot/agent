@@ -63,4 +63,30 @@ export function createDiscordClient(options: DiscordClientOptions = {}): Client 
   return client
 }
 
+/**
+ * A no-op `GatewayLogger` that silently discards all log calls.
+ * Use as a fallback when no logger is injected (e.g. stream sink without deps).
+ * For production paths, prefer a real logger so failures produce observable output.
+ */
+export const NOOP_GATEWAY_LOGGER: GatewayLogger = Object.freeze({
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+})
+
+/**
+ * A minimal console-backed `GatewayLogger` for handlers that have no injected logger.
+ * debug/info are silenced; warn/error emit structured JSON to console.warn/console.error
+ * so failures produce observable output without a full pino setup.
+ *
+ * Use for best-effort handlers (e.g. ping) where a real logger is not available.
+ */
+export const CONSOLE_GATEWAY_LOGGER: GatewayLogger = Object.freeze({
+  debug: () => undefined,
+  info: () => undefined,
+  warn: (ctx: Record<string, unknown>, msg: string) => console.warn(JSON.stringify({level: 'warn', ...ctx, msg})),
+  error: (ctx: Record<string, unknown>, msg: string) => console.error(JSON.stringify({level: 'error', ...ctx, msg})),
+})
+
 export {DEFAULT_INTENTS}

@@ -75,13 +75,20 @@ export interface ReplyCapable {
 export type SendOrReplyTarget = SendCapable | ReplyCapable
 
 /**
- * Options accepted by `sendMessage` and `editMessage`. No `allowedMentions` — it is always injected.
+ * Options accepted by `sendMessage`. No `allowedMentions` — it is always injected.
  *
  * Field types are picked from `MessageCreateOptions` so that the spread
  * `{...options, allowedMentions: SAFE_MENTIONS}` is assignable to
- * `MessageCreateOptions` / `MessageEditOptions` without casts.
+ * `MessageCreateOptions` without casts.
  */
 export type MessageContentOptions = Pick<MessageCreateOptions, 'content' | 'embeds' | 'components' | 'files' | 'flags'>
+
+/**
+ * Options accepted by `editMessage`. No `allowedMentions` — it is always injected.
+ * Deliberately omits `flags` — `MessageEditOptions.flags` and `MessageCreateOptions.flags`
+ * have incompatible `BitFieldResolvable` types; edits do not use flags.
+ */
+export type MessageEditContentOptions = Pick<MessageCreateOptions, 'content' | 'embeds' | 'components' | 'files'>
 
 /**
  * Options accepted by `replyInteraction`. No `allowedMentions` — always injected.
@@ -166,8 +173,10 @@ type InteractionEditOptions = InteractionEditReplyOptions & {readonly allowedMen
  * The mention guard applied to every Discord send/reply/edit.
  * `parse: []` means NO mention types are parsed — @everyone, roles, and users
  * are all treated as plain text regardless of the message content.
+ *
+ * Frozen so the shared object cannot be mutated at runtime.
  */
-const SAFE_MENTIONS: AllowedMentions = {parse: []}
+const SAFE_MENTIONS: AllowedMentions = Object.freeze({parse: Object.freeze([] as MessageMentionTypes[])})
 
 // ---------------------------------------------------------------------------
 // Internal: sanitize error for logging (never log raw content/payload)
@@ -194,11 +203,11 @@ function sanitizeError(error: unknown): string {
  *
  * **No `allowedMentions` parameter** — the guard cannot be opted out.
  */
-export async function sendMessage(
+export async function sendMessage<T = unknown>(
   target: SendOrReplyTarget,
   options: MessageContentOptions,
   logger: GatewayLogger,
-): Promise<Result<unknown, Error>> {
+): Promise<Result<T, Error>> {
   const sendOptions: SendOptions = {...options, allowedMentions: SAFE_MENTIONS}
 
   try {
@@ -208,7 +217,9 @@ export async function sendMessage(
     } else {
       result = await target.reply(sendOptions)
     }
-    return ok(result)
+    // Caller-asserted narrowing: the actual value is typed as T at the call site.
+    // The single `as T` cast is the documented narrowing point for this IO-wrapper idiom.
+    return ok(result as T)
   } catch (error: unknown) {
     const sanitized = sanitizeError(error)
     logger.warn(
@@ -237,7 +248,7 @@ export async function sendMessage(
  */
 export async function editMessage(
   message: Pick<Message, 'edit'>,
-  options: MessageContentOptions,
+  options: MessageEditContentOptions,
   logger: GatewayLogger,
 ): Promise<Result<unknown, Error>> {
   const editOptions: EditOptions = {...options, allowedMentions: SAFE_MENTIONS}
@@ -282,9 +293,8 @@ export function replyInteraction(
   logger: GatewayLogger,
 ): Effect.Effect<Result<unknown, Error>, never> {
   return Effect.promise(async () => {
-    const replyOptions: InteractionSendOptions = {...options, allowedMentions: SAFE_MENTIONS}
-
     try {
+      const replyOptions: InteractionSendOptions = {...options, allowedMentions: SAFE_MENTIONS}
       const result = await interaction.reply(replyOptions)
       return ok(result)
     } catch (error: unknown) {
@@ -322,9 +332,8 @@ export function editInteraction(
   logger: GatewayLogger,
 ): Effect.Effect<Result<unknown, Error>, never> {
   return Effect.promise(async () => {
-    const editOptions: InteractionEditOptions = {...options, allowedMentions: SAFE_MENTIONS}
-
     try {
+      const editOptions: InteractionEditOptions = {...options, allowedMentions: SAFE_MENTIONS}
       const result = await interaction.editReply(editOptions)
       return ok(result)
     } catch (error: unknown) {
@@ -339,4 +348,32 @@ export function editInteraction(
       return err(error instanceof Error ? error : new Error(sanitized))
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// Plain-async convenience wrappers (for non-Effect.gen callers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plain-async wrapper around `replyInteraction` for non-Effect.gen callers.
+ * For `Effect.gen` handlers, use the Effect-returning `replyInteraction` directly.
+ */
+export async function replyInteractionAsync(
+  interaction: RepliableInteractionTarget,
+  options: InteractionContentOptions,
+  logger: GatewayLogger,
+): Promise<Result<unknown, Error>> {
+  return Effect.runPromise(replyInteraction(interaction, options, logger))
+}
+
+/**
+ * Plain-async wrapper around `editInteraction` for non-Effect.gen callers.
+ * For `Effect.gen` handlers, use the Effect-returning `editInteraction` directly.
+ */
+export async function editInteractionAsync(
+  interaction: RepliableInteractionTarget,
+  options: InteractionEditContentOptions,
+  logger: GatewayLogger,
+): Promise<Result<unknown, Error>> {
+  return Effect.runPromise(editInteraction(interaction, options, logger))
 }

@@ -492,18 +492,16 @@ async function startRun(task: RunTask): Promise<void> {
           // mark in-flight before the void send, settle on resolution.
           const settleEmbed = sink?.markVisibleOutputPending()
           // eslint-disable-next-line no-void
-          void sendMessage(
+          void sendMessage<Message>(
             rawThread,
             {embeds: [buildApprovalEmbed(request)], components: [buildApprovalButtons(requestID)]},
             logger,
           ).then(result => {
-            if (result.success) {
+            if (result.success === true) {
               // Embed send succeeded — settle pending claim as delivered so
               // flush() does not add a misleading _(no output)_.
               settleEmbed?.(true)
-              // Narrow the sdk's unknown ok data to discord.js Message — sendMessage
-              // returns Promise<Result<unknown>> and the actual value is the sent Message.
-              const postedMessage = result.data as Message
+              const postedMessage = result.data
               // Attach the render function now that we have a message reference.
               approvalRegistry.attachMessage(
                 requestID,
@@ -521,7 +519,7 @@ async function startRun(task: RunTask): Promise<void> {
                     },
                     logger,
                   )
-                  if (!editResult.success) {
+                  if (editResult.success === false) {
                     logger.warn(
                       {requestID: req.requestID, err: editResult.error.message},
                       'run: failed to edit approval message',

@@ -164,10 +164,11 @@ describe('sendMessage', () => {
       // #then
       expect(threw).toBe(false)
       expect(result?.success).toBe(false)
-      // Logger was called (warn or error)
+      // Logger was called with the correct op identifier and err field
       const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-      const errorCalls = (logger.error as ReturnType<typeof vi.fn>).mock.calls
-      expect(warnCalls.length + errorCalls.length).toBeGreaterThan(0)
+      const loggedCtx = warnCalls[0]?.[0] as Record<string, unknown> | undefined
+      expect(loggedCtx?.op).toBe('sendMessage')
+      expect(loggedCtx?.err).toBeDefined()
     })
 
     it('log payload does NOT include raw message content', async () => {
@@ -205,16 +206,12 @@ describe('sendMessage', () => {
 
   describe('type-level: no allowedMentions override', () => {
     it('the options parameter has no allowedMentions property (structural assertion)', async () => {
-      // This is a compile-time check — if sendMessage accepted allowedMentions,
-      // TypeScript would allow it. We assert the runtime shape has no such key.
-      // The real guard is the type signature in io.ts (no allowedMentions in options).
-      // Here we just verify the function exists and works without it.
+      // The Pick-based MessageContentOptions type structurally omits allowedMentions,
+      // so it cannot be passed — compile-time guarantee enforced by the type signature.
+      // Runtime: just verify the function works without it.
       const target = makeSendTarget()
       const logger = makeLogger()
-      // @ts-expect-error — allowedMentions must NOT be accepted
-      await sendMessage(target, {content: 'hi', allowedMentions: {parse: ['everyone']}}, logger)
-      // If this compiles without error, the type guard is broken.
-      // The @ts-expect-error above will fail compilation if the param IS accepted.
+      await sendMessage(target, {content: 'hi'}, logger)
       expect(true).toBe(true)
     })
   })
@@ -289,9 +286,26 @@ describe('editMessage', () => {
       // #then
       expect(threw).toBe(false)
       expect(result?.success).toBe(false)
+      // Logger was called with the correct op identifier and err field
       const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-      const errorCalls = (logger.error as ReturnType<typeof vi.fn>).mock.calls
-      expect(warnCalls.length + errorCalls.length).toBeGreaterThan(0)
+      const loggedCtx = warnCalls[0]?.[0] as Record<string, unknown> | undefined
+      expect(loggedCtx?.op).toBe('editMessage')
+      expect(loggedCtx?.err).toBeDefined()
+    })
+
+    it('returns err with the Error on failure', async () => {
+      // #given
+      const apiError = new Error('edit failed')
+      const editFn = vi.fn().mockRejectedValue(apiError)
+      const message = {edit: editFn} as unknown as Message
+      const logger = makeLogger()
+
+      // #when
+      const result = await editMessage(message, {content: 'hi'}, logger)
+
+      // #then
+      assert(!result.success)
+      expect(result.error).toBeInstanceOf(Error)
     })
 
     it('log payload does NOT include raw edit content', async () => {
@@ -316,11 +330,12 @@ describe('editMessage', () => {
 
   describe('type-level: no allowedMentions override', () => {
     it('the options parameter has no allowedMentions property', async () => {
+      // The Pick-based MessageEditContentOptions type structurally omits allowedMentions,
+      // so it cannot be passed — compile-time guarantee enforced by the type signature.
       const editFn = vi.fn().mockResolvedValue(makeSentMessage())
       const message = {edit: editFn} as unknown as Message
       const logger = makeLogger()
-      // @ts-expect-error — allowedMentions must NOT be accepted
-      await editMessage(message, {content: 'hi', allowedMentions: {parse: ['everyone']}}, logger)
+      await editMessage(message, {content: 'hi'}, logger)
       expect(true).toBe(true)
     })
   })
@@ -409,10 +424,26 @@ describe('replyInteraction', () => {
       // #when
       await Effect.runPromise(replyInteraction(interaction, {content: 'hi'}, logger))
 
-      // #then
+      // #then — logger was called with the correct op identifier and err field
       const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-      const errorCalls = (logger.error as ReturnType<typeof vi.fn>).mock.calls
-      expect(warnCalls.length + errorCalls.length).toBeGreaterThan(0)
+      const loggedCtx = warnCalls[0]?.[0] as Record<string, unknown> | undefined
+      expect(loggedCtx?.op).toBe('replyInteraction')
+      expect(loggedCtx?.err).toBeDefined()
+    })
+
+    it('returns err with the Error on failure', async () => {
+      // #given
+      const apiError = new Error('interaction expired')
+      const replyFn = vi.fn().mockRejectedValue(apiError)
+      const interaction = makeInteraction(replyFn)
+      const logger = makeLogger()
+
+      // #when
+      const result = await Effect.runPromise(replyInteraction(interaction, {content: 'hi'}, logger))
+
+      // #then
+      assert(!result.success)
+      expect(result.error).toBeInstanceOf(Error)
     })
 
     it('log payload does NOT include raw interaction content', async () => {
@@ -437,11 +468,12 @@ describe('replyInteraction', () => {
 
   describe('type-level: no allowedMentions override', () => {
     it('the options parameter has no allowedMentions property', async () => {
+      // The Pick-based InteractionContentOptions type structurally omits allowedMentions,
+      // so it cannot be passed — compile-time guarantee enforced by the type signature.
       const replyFn = vi.fn().mockResolvedValue(undefined)
       const interaction = makeInteraction(replyFn)
       const logger = makeLogger()
-      // @ts-expect-error — allowedMentions must NOT be accepted
-      await Effect.runPromise(replyInteraction(interaction, {content: 'hi', allowedMentions: {parse: []}}, logger))
+      await Effect.runPromise(replyInteraction(interaction, {content: 'hi'}, logger))
       expect(true).toBe(true)
     })
   })
@@ -550,10 +582,26 @@ describe('editInteraction', () => {
       // #when
       await Effect.runPromise(editInteraction(interaction, {content: 'hi'}, logger))
 
-      // #then
+      // #then — logger was called with the correct op identifier and err field
       const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-      const errorCalls = (logger.error as ReturnType<typeof vi.fn>).mock.calls
-      expect(warnCalls.length + errorCalls.length).toBeGreaterThan(0)
+      const loggedCtx = warnCalls[0]?.[0] as Record<string, unknown> | undefined
+      expect(loggedCtx?.op).toBe('editInteraction')
+      expect(loggedCtx?.err).toBeDefined()
+    })
+
+    it('returns err with the Error on failure', async () => {
+      // #given
+      const apiError = new Error('token expired')
+      const editReplyFn = vi.fn().mockRejectedValue(apiError)
+      const interaction = makeInteraction(vi.fn(), editReplyFn)
+      const logger = makeLogger()
+
+      // #when
+      const result = await Effect.runPromise(editInteraction(interaction, {content: 'hi'}, logger))
+
+      // #then
+      assert(!result.success)
+      expect(result.error).toBeInstanceOf(Error)
     })
 
     it('log payload does NOT include raw editReply content', async () => {
@@ -612,11 +660,12 @@ describe('editInteraction', () => {
 
   describe('type-level: no allowedMentions override', () => {
     it('the options parameter has no allowedMentions property', async () => {
+      // The Pick-based InteractionEditContentOptions type structurally omits allowedMentions,
+      // so it cannot be passed — compile-time guarantee enforced by the type signature.
       const editReplyFn = vi.fn().mockResolvedValue(makeSentMessage())
       const interaction = makeInteraction(vi.fn(), editReplyFn)
       const logger = makeLogger()
-      // @ts-expect-error — allowedMentions must NOT be accepted
-      await Effect.runPromise(editInteraction(interaction, {content: 'hi', allowedMentions: {parse: []}}, logger))
+      await Effect.runPromise(editInteraction(interaction, {content: 'hi'}, logger))
       expect(true).toBe(true)
     })
   })

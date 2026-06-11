@@ -15,6 +15,7 @@ import type {SendCapable} from './io.js'
 import {Buffer} from 'node:buffer'
 
 import {AttachmentBuilder} from 'discord.js'
+import {NOOP_GATEWAY_LOGGER} from './client.js'
 import {MAX_DISCORD_MESSAGE_LENGTH} from './constants.js'
 import {sendMessage} from './io.js'
 
@@ -119,17 +120,6 @@ export interface DiscordStreamSink {
   readonly hasVisibleOutput: () => boolean
 }
 
-// ---------------------------------------------------------------------------
-// Internal: no-op logger fallback for when deps.logger is absent
-// ---------------------------------------------------------------------------
-
-const NOOP_LOGGER: import('./client.js').GatewayLogger = {
-  debug: () => undefined,
-  info: () => undefined,
-  warn: () => undefined,
-  error: () => undefined,
-}
-
 /**
  * Create a `DiscordStreamSink` bound to `thread`.
  *
@@ -138,7 +128,7 @@ const NOOP_LOGGER: import('./client.js').GatewayLogger = {
  */
 export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps = {}): DiscordStreamSink {
   const {logger} = deps
-  const ioLogger = logger ?? NOOP_LOGGER
+  const ioLogger = logger ?? NOOP_GATEWAY_LOGGER
   let buffer = ''
   let visibleOutputSent = false
   let pendingVisibleOutput = 0
@@ -193,8 +183,17 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
 
     // Long output → summary line + .md attachment fallback
     if (text.length > DISCORD_MESSAGE_CHAR_LIMIT) {
-      const attachment = new AttachmentBuilder(Buffer.from(text, 'utf-8'), {name: 'response.md'})
-      const attachResult = await sendMessage(sendTarget, {content: LONG_OUTPUT_SUMMARY, files: [attachment]}, ioLogger)
+      // AttachmentBuilder construction is inside the sendMessage call so any sync
+      // throw (e.g. invalid buffer) is caught by sendMessage's try/catch, preserving
+      // flush()'s never-throws contract.
+      const attachResult = await sendMessage(
+        sendTarget,
+        {
+          content: LONG_OUTPUT_SUMMARY,
+          files: [new AttachmentBuilder(Buffer.from(text, 'utf-8'), {name: 'response.md'})],
+        },
+        ioLogger,
+      )
       if (attachResult.success === false) {
         return {kind: 'error', message: attachResult.error.message}
       }

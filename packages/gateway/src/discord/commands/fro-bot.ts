@@ -23,7 +23,7 @@ import type {SlashCommand} from './index.js'
 import {PermissionFlagsBits, SlashCommandBuilder} from 'discord.js'
 import {Effect} from 'effect'
 
-import {editInteraction, replyInteraction} from '../io.js'
+import {editInteraction, editInteractionAsync, replyInteraction, replyInteractionAsync} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
 import {executePing} from './ping.js'
@@ -166,12 +166,10 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
       // — we haven't consumed the 3 s interaction window yet.
       const guild = interaction.guild
       if (guild === null) {
-        await Effect.runPromise(
-          replyInteraction(
-            interaction,
-            {content: 'This command must be used in a server.', ephemeral: true},
-            deps.gatewayLogger,
-          ),
+        await replyInteractionAsync(
+          interaction,
+          {content: 'This command must be used in a server.', ephemeral: true},
+          deps.gatewayLogger,
         )
         return
       }
@@ -183,20 +181,20 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
 
       const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, deps.gatewayLogger)
       if (authorized === false) {
-        await Effect.runPromise(
-          editInteraction(interaction, {content: 'You do not have permission to clear the queue.'}, deps.gatewayLogger),
+        await editInteractionAsync(
+          interaction,
+          {content: 'You do not have permission to clear the queue.'},
+          deps.gatewayLogger,
         )
         return
       }
 
       const channelId = interaction.channelId
       const dropped = deps.queue.clear(channelId)
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: `Cleared ${dropped} queued task(s). The running task will finish.`},
-          deps.gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: `Cleared ${dropped} queued task(s). The running task will finish.`},
+        deps.gatewayLogger,
       )
     },
     catch: error => (error instanceof Error ? error : new Error(String(error))),

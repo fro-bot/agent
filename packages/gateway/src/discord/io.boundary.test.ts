@@ -1,7 +1,7 @@
 /**
  * io.boundary.test.ts — Boundary enforcement for the centralized Discord I/O helper.
  *
- * Requirement R5: A boundary check that FAILS if any raw Discord content-send
+ * Boundary enforcement: A boundary check that FAILS if any raw Discord content-send
  * bypasses `src/discord/io.ts` in the gateway source, so the `allowedMentions:{parse:[]}`
  * guard cannot silently drift back out in future code.
  *
@@ -10,10 +10,10 @@
  * if any such pattern appears outside the explicitly-allowlisted files.
  *
  * Patterns scanned (raw discord.js content-send methods io.ts wraps):
- *   .editReply(         — interaction edit
- *   interaction.reply(  — interaction reply (anchored to avoid matching replyInteraction)
- *   .send(              — Thread/Message send
- *   .edit(              — Message edit
+ *   .editReply(  — interaction edit
+ *   .reply(      — any .reply call (interaction.reply, message.reply, etc.)
+ *   .send(       — Thread/Message send
+ *   .edit(       — Message edit
  *
  * Excluded from matching (ACKs/typing, not content sends):
  *   .deferReply(   — acknowledgement, not a content send
@@ -77,8 +77,8 @@ const ALLOWLISTED_FILES: readonly string[] = [
  *
  * Precision notes:
  * - `.editReply(` — raw interaction edit; io.ts helper is named `editInteraction`
- * - `interaction.reply(` — anchored to `interaction.` to avoid matching
- *   `replyInteraction(` (the io.ts helper name) or `message.reply(` inside io.ts
+ * - `.reply(` — bare pattern catches both `interaction.reply(` and `message.reply(`;
+ *   io.ts helper names (`replyInteraction`, `replyInteractionAsync`) do not contain `.reply(`
  * - `.send(` — raw Thread/Message send; io.ts helper is named `sendMessage`
  * - `.edit(` — raw Message edit; io.ts helper is named `editMessage`
  *
@@ -86,7 +86,7 @@ const ALLOWLISTED_FILES: readonly string[] = [
  * - `.deferReply(` — ACK, not a content send
  * - `.sendTyping(` — typing indicator, not a content send
  */
-const RAW_SEND_PATTERNS: readonly RegExp[] = [/\.editReply\(/, /interaction\.reply\(/, /\.send\(/, /\.edit\(/]
+const RAW_SEND_PATTERNS: readonly RegExp[] = [/\.editReply\(/, /\.reply\(/, /\.send\(/, /\.edit\(/]
 
 /**
  * Patterns to EXCLUDE from matching even when a raw-send pattern fires.
@@ -148,14 +148,14 @@ function scanContent(content: string, filePath: string): RawSendViolation[] {
  * excluding allowlisted files, and scan each for raw content-send patterns.
  */
 function scanGatewaySource(): RawSendViolation[] {
-  // globSync with **/*.ts will only match files (not directories) since dirs don't end in .ts
-  const allFiles = globSync('**/*.ts', {cwd: gatewaySrcRoot})
+  // globSync with **/*.{ts,mts,cts} will only match files (not directories)
+  const allFiles = globSync('**/*.{ts,mts,cts}', {cwd: gatewaySrcRoot})
 
   const violations: RawSendViolation[] = []
 
   for (const relPath of allFiles) {
     // Skip test files
-    if (relPath.endsWith('.test.ts')) continue
+    if (relPath.endsWith('.test.ts') || relPath.endsWith('.test.mts') || relPath.endsWith('.test.cts')) continue
 
     // Skip allowlisted files
     if (ALLOWLISTED_FILES.includes(relPath)) continue
@@ -175,7 +175,7 @@ function scanGatewaySource(): RawSendViolation[] {
 
 describe('io.ts boundary enforcement: no raw Discord content-sends bypass io.ts', () => {
   it('gateway source tree is clean — no raw content-send calls outside the allowlist', () => {
-    // #given — the migrated gateway source tree (Units 1-3 complete)
+    // #given — the fully migrated source tree
     // #when — scan all non-test, non-allowlisted source files
     const violations = scanGatewaySource()
 

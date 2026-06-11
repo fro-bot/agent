@@ -22,7 +22,7 @@ import {Effect} from 'effect'
 import {AppNotInstalledError} from '../../github/app-client.js'
 import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
-import {editInteraction, replyInteraction, sendMessage} from '../io.js'
+import {editInteractionAsync, replyInteractionAsync, sendMessage} from '../io.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -226,15 +226,13 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const rateCheck = checkRateLimit(userId)
   if (!rateCheck.allowed) {
     const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
-    await Effect.runPromise(
-      replyInteraction(
-        interaction,
-        {
-          content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
-          ephemeral: true,
-        },
-        gatewayLogger,
-      ),
+    await replyInteractionAsync(
+      interaction,
+      {
+        content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
+        ephemeral: true,
+      },
+      gatewayLogger,
     )
     return
   }
@@ -252,35 +250,29 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // Refuse new work during draining shutdown; resume (Part 1) heals any hard-killed run.
   const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
   if (shuttingDownCheck() === true) {
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.'},
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.'},
+      gatewayLogger,
     )
     return
   }
 
   const guild = interaction.guild
   if (guild === null) {
-    await Effect.runPromise(
-      editInteraction(interaction, {content: 'This command can only be used in a server.'}, gatewayLogger),
-    )
+    await editInteractionAsync(interaction, {content: 'This command can only be used in a server.'}, gatewayLogger)
     return
   }
 
   // Check bot permissions
   if (botHasRequiredPermissions(interaction.appPermissions) === false) {
     logger.warn('add-project: missing bot permissions', {correlationId, phase})
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {
-          content: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${installUrl}`,
-        },
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {
+        content: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${installUrl}`,
+      },
+      gatewayLogger,
     )
     return
   }
@@ -290,12 +282,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // command (including /ping). This is a scoped runtime check per subcommand.
   if ((await userIsAuthorized(guild, interaction.user.id, logger)) === false) {
     logger.warn('add-project: unauthorized user', {correlationId, phase})
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {content: 'You need the **Manage Channels** permission to use this command.'},
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {content: 'You need the **Manage Channels** permission to use this command.'},
+      gatewayLogger,
     )
     return
   }
@@ -304,12 +294,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const rawUrl = interaction.options.getString('url', true)
   const parsed = parseGitHubUrl(rawUrl)
   if (parsed === null) {
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {content: 'Invalid GitHub URL. Expected format: `https://github.com/owner/repo`'},
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {content: 'Invalid GitHub URL. Expected format: `https://github.com/owner/repo`'},
+      gatewayLogger,
     )
     return
   }
@@ -325,12 +313,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   if (rawChannelName === null) {
     const derived = deriveChannelName(repo)
     if (derived === null) {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: "Couldn't derive a channel name from the repo name. Please specify `channel:<name>` explicitly."},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: "Couldn't derive a channel name from the repo name. Please specify `channel:<name>` explicitly."},
+        gatewayLogger,
       )
       return
     }
@@ -338,7 +324,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   } else {
     const validationError = validateChannelName(rawChannelName)
     if (validationError !== null) {
-      await Effect.runPromise(editInteraction(interaction, {content: validationError}, gatewayLogger))
+      await editInteractionAsync(interaction, {content: validationError}, gatewayLogger)
       return
     }
     channelName = rawChannelName
@@ -352,27 +338,23 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       phase,
       errorKind: existingResult.error.message,
     })
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {content: 'Internal error checking existing bindings. Please try again.'},
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {content: 'Internal error checking existing bindings. Please try again.'},
+      gatewayLogger,
     )
     return
   }
   if (existingResult.data !== null) {
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {
-          content: [
-            `\`${owner}/${repo}\` is already set up in <#${existingResult.data.channelId}>.`,
-            `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
-          ].join(' '),
-        },
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {
+        content: [
+          `\`${owner}/${repo}\` is already set up in <#${existingResult.data.channelId}>.`,
+          `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
+        ].join(' '),
+      },
+      gatewayLogger,
     )
     return
   }
@@ -381,25 +363,21 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const authResult = await appClient.authForRepo(owner, repo)
   if (authResult.success === false) {
     if (authResult.error instanceof AppNotInstalledError) {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
+        },
+        gatewayLogger,
       )
     } else {
       // Do NOT surface authResult.error.message — it may contain tokens or internal details.
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
+        },
+        gatewayLogger,
       )
     }
     logger.warn('add-project: app auth failed', {
@@ -424,15 +402,13 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // Interaction window guard
   if (Date.now() - startTime > INTERACTION_WINDOW_MS) {
     logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo})
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {
-          content:
-            'The operation took too long and the interaction window expired. Clone may have started — check workspace. Retry the command.',
-        },
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {
+        content:
+          'The operation took too long and the interaction window expired. Clone may have started — check workspace. Retry the command.',
+      },
+      gatewayLogger,
     )
     return
   }
@@ -451,15 +427,13 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     if (errorKind === 'clone-error') {
       const code = cloneResult.error.code
       if (code === 'enospc' || code === 'disk-full') {
-        await Effect.runPromise(
-          editInteraction(
-            interaction,
-            {
-              content:
-                'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
-            },
-            gatewayLogger,
-          ),
+        await editInteractionAsync(
+          interaction,
+          {
+            content:
+              'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
+          },
+          gatewayLogger,
         )
         return
       } else if (code === 'repo-exists') {
@@ -472,22 +446,18 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         try {
           existing = await bindingsStore.getBindingByRepo(owner, repo)
         } catch {
-          await Effect.runPromise(
-            editInteraction(
-              interaction,
-              {content: 'Internal error checking existing bindings. Please retry in a moment.'},
-              gatewayLogger,
-            ),
+          await editInteractionAsync(
+            interaction,
+            {content: 'Internal error checking existing bindings. Please retry in a moment.'},
+            gatewayLogger,
           )
           return
         }
         if (existing.success === false) {
-          await Effect.runPromise(
-            editInteraction(
-              interaction,
-              {content: 'Internal error checking existing bindings. Please retry in a moment.'},
-              gatewayLogger,
-            ),
+          await editInteractionAsync(
+            interaction,
+            {content: 'Internal error checking existing bindings. Please retry in a moment.'},
+            gatewayLogger,
           )
           return
         }
@@ -496,17 +466,15 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           // Include the same recovery guidance as the PRE_FLIGHT already-bound path:
           // if the workspace was recreated, the user can repair the missing checkout
           // by @mentioning fro-bot in the bound channel.
-          await Effect.runPromise(
-            editInteraction(
-              interaction,
-              {
-                content: [
-                  `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
-                  `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
-                ].join(' '),
-              },
-              gatewayLogger,
-            ),
+          await editInteractionAsync(
+            interaction,
+            {
+              content: [
+                `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
+                `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
+              ].join(' '),
+            },
+            gatewayLogger,
           )
           return
         }
@@ -519,42 +487,34 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         // fall through — do NOT return
       } else {
         // Do NOT surface the internal code — it may confuse users and leaks implementation details.
-        await Effect.runPromise(
-          editInteraction(
-            interaction,
-            {content: `Clone failed. Check workspace-agent logs for details and retry.`},
-            gatewayLogger,
-          ),
+        await editInteractionAsync(
+          interaction,
+          {content: `Clone failed. Check workspace-agent logs for details and retry.`},
+          gatewayLogger,
         )
         return
       }
     } else if (errorKind === 'timeout') {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'},
+        gatewayLogger,
       )
       return
     } else if (errorKind === 'response-mismatch') {
       logger.error('add-project: response-mismatch from workspace agent', {correlationId, phase, owner, repo})
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: 'Internal error: workspace agent returned unexpected response. Contact operator.'},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: 'Internal error: workspace agent returned unexpected response. Contact operator.'},
+        gatewayLogger,
       )
       return
     } else {
       // Do NOT surface the internal errorKind — it leaks implementation details.
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: `Clone failed. Check workspace-agent connectivity and retry.`},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: `Clone failed. Check workspace-agent connectivity and retry.`},
+        gatewayLogger,
       )
       return
     }
@@ -584,14 +544,12 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       phase,
       workspacePath,
     })
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {
-          content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
-        },
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {
+        content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
+      },
+      gatewayLogger,
     )
     return
   }
@@ -599,12 +557,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // Interaction window guard
   if (Date.now() - startTime > INTERACTION_WINDOW_MS) {
     logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo, workspacePath})
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {content: `Interaction window expired. The clone is preserved — retry the command.`},
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {content: `Interaction window expired. The clone is preserved — retry the command.`},
+      gatewayLogger,
     )
     return
   }
@@ -623,31 +579,25 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     })
 
     if (errorKind === 'collision-exhausted') {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `Couldn't find an available channel name after 10 attempts. Specify \`channel:<name>\` explicitly.`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Couldn't find an available channel name after 10 attempts. Specify \`channel:<name>\` explicitly.`,
+        },
+        gatewayLogger,
       )
     } else if (errorKind === 'permission-denied') {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`},
+        gatewayLogger,
       )
     } else {
       // Do NOT surface channelResult.error.message — it may contain internal Discord API details.
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {content: `Failed to create channel. Check fro-bot's permissions and retry.`},
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {content: `Failed to create channel. Check fro-bot's permissions and retry.`},
+        gatewayLogger,
       )
     }
     return
@@ -695,14 +645,12 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
 
     if ('code' in error && error.code === 'BINDING_EXISTS_ERROR') {
       // Concurrent setup raced past PRE_FLIGHT
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
+        },
+        gatewayLogger,
       )
     } else if ('code' in error && error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
       // TypeScript narrows error to PartialWriteError via the discriminant above.
@@ -715,24 +663,20 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         primaryKey: 'primaryKey' in error ? error.primaryKey : undefined,
         indexKey: 'indexKey' in error ? error.indexKey : undefined,
       })
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
+        },
+        gatewayLogger,
       )
     } else {
-      await Effect.runPromise(
-        editInteraction(
-          interaction,
-          {
-            content: `Failed to write binding. Channel #${channel.name} was created. Retry the command — pre-flight will detect the existing channel.`,
-          },
-          gatewayLogger,
-        ),
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Failed to write binding. Channel #${channel.name} was created. Retry the command — pre-flight will detect the existing channel.`,
+        },
+        gatewayLogger,
       )
     }
     return
@@ -753,9 +697,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   phase = 'READY'
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName: channel.name, outcome: 'start'})
 
-  await Effect.runPromise(
-    editInteraction(interaction, {content: `✅ Ready — try @fro-bot in #${channel.name}`}, gatewayLogger),
-  )
+  await editInteractionAsync(interaction, {content: `✅ Ready — try @fro-bot in #${channel.name}`}, gatewayLogger)
 
   // Post welcome message in the new channel.
   // channel.send is a Message/Thread surface send — use sendMessage from io.ts.
@@ -786,14 +728,12 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       channelName: channel.name,
       err: welcomeResult.error.message,
     })
-    await Effect.runPromise(
-      editInteraction(
-        interaction,
-        {
-          content: `✅ Channel #${channel.name} created and bound to \`${owner}/${repo}\`, but couldn't post the welcome message — verify fro-bot has **Send Messages** in #${channel.name}.`,
-        },
-        gatewayLogger,
-      ),
+    await editInteractionAsync(
+      interaction,
+      {
+        content: `✅ Channel #${channel.name} created and bound to \`${owner}/${repo}\`, but couldn't post the welcome message — verify fro-bot has **Send Messages** in #${channel.name}.`,
+      },
+      gatewayLogger,
     )
     return
   }
