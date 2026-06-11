@@ -1,9 +1,10 @@
 ---
 title: "refactor: Shared guild-command pipeline (makeGuildCommand)"
 type: refactor
-status: active
+status: completed
 date: 2026-06-10
 deepened: 2026-06-10
+completed: 2026-06-10
 ---
 
 # refactor: Shared guild-command pipeline (makeGuildCommand)
@@ -55,17 +56,17 @@ Pipeline canonical order: `preDefer` hook (rate limit; immediate ephemeral reply
 
 ## Implementation Units
 
-- [ ] **Unit 1: `makeGuildCommand` factory + tests**
+- [x] **Unit 1: `makeGuildCommand` factory + tests**
   - New `packages/gateway/src/discord/commands/guild-command.ts`: spec type (`{name, authorize, work, preDefer?, denialCopy?, serverOnlyCopy?}`), the pipeline `Effect`, shared catchAll, scoped logger construction.
   - TDD: tests pin ordering (guard → defer → auth → work), denial path edits deferred reply, catchAll edits-then-refails on work failure, preDefer short-circuit, guild-null immediate ephemeral reply, fail-closed auth errors.
   - Gate: new tests + `tsc` + lint green.
 
-- [ ] **Unit 2: migrate `clear-queue` + `force-release-lock`** (after Unit 1)
+- [x] **Unit 2: migrate `clear-queue` + `force-release-lock`** (after Unit 1)
   - Rewrite both subcommand executors in `fro-bot.ts` as `makeGuildCommand` specs; delete the hand-rolled skeletons and `force-release-lock`'s local catchAll (now pipeline-owned).
   - Behavior contract: every existing test in `fro-bot.test.ts` (defer/auth/guild-null/outcome mapping/catchAll) passes unchanged or with mechanical-only updates; `clear-queue` gains a catchAll test.
   - Gate: full `fro-bot.test.ts` + dispatch-path tests in `index.test.ts` green.
 
-- [ ] **Unit 3: migrate `add-project` entry** (after Unit 2)
+- [x] **Unit 3: migrate `add-project` entry** (after Unit 2)
   - Map add-project's entry checks onto the pipeline slots: `preDefer` = rate limit; guild-null guard moves pre-defer (delta 2); `authorize` = bot-permission gate + `userIsAuthorized`; shutdown gate becomes the first step of `work`; the phase orchestration body becomes the work function unchanged.
   - Update add-project tests for guard-before-defer ordering; add the gained-catchAll test.
   - Owns the Verification grep: assert no hand-rolled `deferReply` entry skeletons remain in the three migrated commands outside `guild-command.ts` (add as a small structural test or a verification step in this unit).

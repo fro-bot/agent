@@ -624,3 +624,47 @@ describe('makeGuildCommand — scoped log context', () => {
     expect(meta?.command).toBe('my-command')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Structural: no hand-rolled deferReply in migrated command files
+// ---------------------------------------------------------------------------
+
+describe('structural: guild-command.ts is the only permitted deferReply site', () => {
+  it('migrated command files contain no hand-rolled deferReply calls', async () => {
+    // #given — the three migrated guild commands; guild-command.ts is the only permitted site.
+    // ping.ts has no deferReply by design (no guild/defer/auth skeleton).
+    // This assertion fails if a future edit re-introduces a hand-rolled deferReply in any
+    // migrated command, bypassing the pipeline's ownership of the interaction lifecycle.
+    const {readFileSync} = await import('node:fs')
+    const {fileURLToPath} = await import('node:url')
+    const path = await import('node:path')
+
+    const thisDir = path.dirname(fileURLToPath(import.meta.url))
+
+    const migratedFiles = ['fro-bot.ts', 'add-project.ts']
+    const violations: string[] = []
+
+    for (const filename of migratedFiles) {
+      const absPath = path.join(thisDir, filename)
+      const content = readFileSync(absPath, 'utf8')
+      for (const [i, line] of content.split('\n').entries()) {
+        const trimmed = line.trimStart()
+        // Skip line comments
+        if (trimmed.startsWith('//')) continue
+        if (line.includes('.deferReply(')) {
+          violations.push(`${filename}:${i + 1}: ${line.trim()}`)
+        }
+      }
+    }
+
+    if (violations.length > 0) {
+      throw new Error(
+        `Hand-rolled deferReply calls found in migrated command files.\n` +
+          `guild-command.ts is the only permitted deferReply site.\n\n` +
+          `Violations:\n${violations.map(v => `  ${v}`).join('\n')}`,
+      )
+    }
+
+    expect(violations).toHaveLength(0)
+  })
+})
