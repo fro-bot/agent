@@ -663,30 +663,113 @@ describe('makeGuildCommand — scoped log context', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Structural: no hand-rolled deferReply in migrated command files
+// Auth defect (escaped promise rejection) → internal-error edit + re-fails
+// ---------------------------------------------------------------------------
+
+describe('makeGuildCommand — auth defect (escaped promise rejection)', () => {
+  it('authorize returning Effect.promise that rejects → internal-error edit + re-fails with auth error', async () => {
+    // #given — authorize escapes as a defect (promise rejection inside Effect.promise).
+    // The outer catchAllCause must normalize this defect to a typed failure so the
+    // reply-edit path fires — the user must not be left at "thinking…".
+    const authError = new Error('auth exploded')
+    const authorize = vi.fn().mockReturnValue(
+      // Effect.promise with a rejecting async fn produces a Die cause (defect),
+      // not a typed Fail — this is the latent failure mode the fix closes.
+      Effect.promise(async () => {
+        throw authError
+      }),
+    )
+    const work = vi.fn()
+    const spec: GuildCommandSpec = {name: 'test-cmd', authorize, work}
+    const deps = makeDeps()
+    const executor = makeGuildCommand(spec, deps)
+    const {interaction, editReply} = makeInteraction()
+
+    // #when
+    const result = await Effect.runPromise(Effect.either(executor(interaction)))
+
+    // #then — deferred reply IS edited with the internal-error copy
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
+
+    // #and — Effect re-fails (the defect is squashed to a typed Error)
+    expect(result._tag).toBe('Left')
+    const leftError = (result as {_tag: 'Left'; left: unknown}).left as Error
+    expect(leftError.message).toBe('auth exploded')
+
+    // #and — work never ran (auth failed before it)
+    expect(work).not.toHaveBeenCalled()
+  })
+
+  it('fiber interrupt during work does NOT trigger the internal-error edit (interrupt propagates cleanly)', async () => {
+    // #given — work never completes; the fiber is interrupted externally.
+    // The catchAllCause interrupt guard must still bypass the reply-edit path.
+    const work = vi.fn().mockReturnValue(Effect.never)
+    const authorize = vi.fn().mockReturnValue(Effect.succeed({authorized: true as const}))
+    const spec: GuildCommandSpec = {name: 'test-cmd', authorize, work}
+    const deps = makeDeps()
+    const executor = makeGuildCommand(spec, deps)
+    const {interaction, editReply} = makeInteraction()
+
+    // #when — fork the pipeline, interrupt the fiber, await its exit
+    const exit = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.fork(executor(interaction))
+        yield* Fiber.interrupt(fiber)
+        return yield* Fiber.await(fiber)
+      }),
+    )
+
+    // #then — exit is a failure with an interrupted cause (not a typed Error failure)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(Exit.isFailure(exit) && Cause.isInterrupted(exit.cause)).toBe(true)
+    // #and — editReply was NOT called with the internal-error copy
+    const internalErrorCalls = (editReply.mock.calls as unknown[][]).filter(
+      call =>
+        typeof (call[0] as {content?: string}).content === 'string' &&
+        (call[0] as {content: string}).content.toLowerCase().includes('internal error'),
+    )
+    expect(internalErrorCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Structural: no hand-rolled deferReply in any command file except guild-command.ts
 // ---------------------------------------------------------------------------
 
 describe('structural: guild-command.ts is the only permitted deferReply site', () => {
-  it('migrated command files contain no hand-rolled deferReply calls', async () => {
-    // #given — the three migrated guild commands; guild-command.ts is the only permitted site.
-    // ping.ts has no deferReply by design (no guild/defer/auth skeleton).
-    // This assertion fails if a future edit re-introduces a hand-rolled deferReply in any
-    // migrated command, bypassing the pipeline's ownership of the interaction lifecycle.
-    const {readFileSync} = await import('node:fs')
+  it('all command files except guild-command.ts contain no hand-rolled deferReply calls', async () => {
+    // #given — glob the commands directory for all *.ts files (excluding *.test.ts).
+    // guild-command.ts is the only permitted deferReply site; every other file is scanned.
+    // This catches future commands/*.ts files that hand-roll deferReply, bypassing the
+    // pipeline's ownership of the interaction lifecycle.
+    const {readFileSync, readdirSync} = await import('node:fs')
     const {fileURLToPath} = await import('node:url')
     const path = await import('node:path')
 
     const thisDir = path.dirname(fileURLToPath(import.meta.url))
 
-    const migratedFiles = ['fro-bot.ts', 'add-project.ts']
+    // Discover all *.ts files in the commands directory, excluding test files.
+    const allFiles = readdirSync(thisDir).filter(
+      (f): f is string => typeof f === 'string' && f.endsWith('.ts') && !f.endsWith('.test.ts'),
+    )
+
+    // guild-command.ts is the only permitted deferReply site — allowlist it explicitly.
+    const scanTargets = allFiles.filter(f => f !== 'guild-command.ts')
+
+    // Non-vacuousness: the scan must cover at least one file so a future empty-directory
+    // situation doesn't silently pass.
+    expect(scanTargets.length).toBeGreaterThan(0)
+
     const violations: string[] = []
 
-    for (const filename of migratedFiles) {
+    for (const filename of scanTargets) {
       const absPath = path.join(thisDir, filename)
       const content = readFileSync(absPath, 'utf8')
       for (const [i, line] of content.split('\n').entries()) {
         const trimmed = line.trimStart()
-        // Skip line comments
+        // Skip line comments — a commented-out deferReply is not a live call.
         if (trimmed.startsWith('//')) continue
         if (line.includes('.deferReply(')) {
           violations.push(`${filename}:${i + 1}: ${line.trim()}`)
@@ -696,12 +779,32 @@ describe('structural: guild-command.ts is the only permitted deferReply site', (
 
     if (violations.length > 0) {
       throw new Error(
-        `Hand-rolled deferReply calls found in migrated command files.\n` +
+        `Hand-rolled deferReply calls found outside guild-command.ts.\n` +
           `guild-command.ts is the only permitted deferReply site.\n\n` +
           `Violations:\n${violations.map(v => `  ${v}`).join('\n')}`,
       )
     }
 
     expect(violations).toHaveLength(0)
+  })
+
+  it('non-vacuousness: scan helper flags synthetic content containing .deferReply(', async () => {
+    // #given — a synthetic line that contains .deferReply( (not a comment)
+    // This verifies the scan logic itself is not broken — if the helper were
+    // accidentally skipping all lines, this test would catch it.
+    const syntheticContent = 'await interaction.deferReply({ ephemeral: true })'
+    const violations: string[] = []
+
+    for (const [i, line] of syntheticContent.split('\n').entries()) {
+      const trimmed = line.trimStart()
+      if (trimmed.startsWith('//')) continue
+      if (line.includes('.deferReply(')) {
+        violations.push(`synthetic:${i + 1}: ${line.trim()}`)
+      }
+    }
+
+    // #then — the scan correctly flagged the synthetic violation
+    expect(violations).toHaveLength(1)
+    expect(violations[0]).toContain('.deferReply(')
   })
 })
