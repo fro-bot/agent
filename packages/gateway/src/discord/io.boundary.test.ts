@@ -117,7 +117,12 @@ interface RawSendViolation {
  *
  * Skips:
  * - Lines whose first non-whitespace characters are `//` (line comments)
- * - Lines that match an excluded pattern (deferReply, sendTyping)
+ *
+ * Exclusion matching is per-occurrence, not per-line:
+ * - Excluded-pattern matches (deferReply, sendTyping) are stripped from the
+ *   line text before testing RAW_SEND_PATTERNS, so a same-line combination
+ *   like `await i.deferReply(); await i.reply({...})` is still flagged for
+ *   the `.reply(` occurrence that remains after stripping `.deferReply(`.
  */
 function scanContent(content: string, filePath: string): RawSendViolation[] {
   const violations: RawSendViolation[] = []
@@ -129,12 +134,17 @@ function scanContent(content: string, filePath: string): RawSendViolation[] {
     // Skip line comments
     if (trimmed.startsWith('//')) continue
 
-    // Skip lines that are ACKs/typing (not content sends)
-    if (EXCLUDED_PATTERNS.some(p => p.test(line))) continue
+    // Strip excluded-pattern occurrences (ACKs/typing) before testing for raw sends.
+    // This is per-occurrence: only the matched substrings are removed, so a line
+    // containing both .deferReply( and .reply( still gets flagged for .reply(.
+    let effectiveLine = line
+    for (const excluded of EXCLUDED_PATTERNS) {
+      effectiveLine = effectiveLine.replace(excluded, '')
+    }
 
-    // Check for raw content-send patterns
+    // Check for raw content-send patterns in the stripped line
     for (const pattern of RAW_SEND_PATTERNS) {
-      if (pattern.test(line)) {
+      if (pattern.test(effectiveLine)) {
         violations.push({
           file: filePath,
           line: i + 1,
@@ -259,6 +269,23 @@ describe('io.ts boundary enforcement: no raw Discord content-sends bypass io.ts'
 
     // #then — sendTyping is excluded; no violation
     expect(violations).toHaveLength(0)
+  })
+
+  it('self-test (non-vacuousness): same-line deferReply + reply is flagged for the reply occurrence', () => {
+    // #given — a single line containing both an excluded ACK and a raw content send.
+    // The old per-line exclusion would skip this entire line; per-occurrence must flag it.
+    const fixtureContent = [
+      'async function handle(interaction: SomeInteraction) {',
+      "  await interaction.deferReply({ephemeral: true}); await interaction.reply({content: 'hello'})",
+      '}',
+    ].join('\n')
+
+    // #when
+    const violations = scanContent(fixtureContent, 'discord/commands/some-command.ts')
+
+    // #then — .reply( survives after .deferReply( is stripped; scanner must flag it
+    expect(violations.length).toBeGreaterThan(0)
+    expect(violations[0]?.text).toContain('.reply(')
   })
 
   it('self-test: scanner does NOT flag io.ts helper names (sendMessage, editMessage, etc.)', () => {

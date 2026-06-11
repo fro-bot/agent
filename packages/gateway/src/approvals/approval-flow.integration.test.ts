@@ -608,9 +608,9 @@ describe('approval flow — cross-seam integration', () => {
     expect(registry.has(req.requestID)).toBe(false)
   })
 
-  // ── Unit 4: onDeadlineSettled callback ──────────────────────────────────
+  // ── onDeadlineSettled callback ──────────────────────────────────────────
 
-  it('unit 4: onDeadlineSettled callback is invoked when deadline fires on open entry', async () => {
+  it('onDeadlineSettled callback is invoked when deadline fires on open entry', async () => {
     // #given — registry with a short deadline and an onDeadlineSettled callback
     const logger = makeLogger()
     const registry = createApprovalRegistry({logger})

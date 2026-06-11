@@ -523,7 +523,7 @@ describe('makeGatewayProgram', () => {
     }
   })
 
-  // ── Approval mode propagation (Unit 2) ──────────────────────────────────
+  // ── Approval mode propagation ────────────────────────────────────────────
   //
   // These tests fire the messageCreate handler with a fake mention message and
   // assert that handleMention receives deps.run.approvalMode matching the config.

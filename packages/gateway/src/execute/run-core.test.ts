@@ -163,7 +163,7 @@ function sessionIdleEvent(sessionID: string): object {
 
 /**
  * Factory: `message.part.updated` with a reasoning part carrying an `id`.
- * Used to register a reasoning partID in the suppression set (Unit 2 / R5).
+ * Used to register a reasoning partID in the suppression set.
  */
 function reasoningPartUpdatedEvent(partId: string, sessionID = 'sess-123'): object {
   return {
@@ -1245,11 +1245,11 @@ describe('runOpenCodeCore', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Unit 2: Reasoning suppression (R5 regression) + tool summarizer wiring
+  // Reasoning suppression + tool summarizer wiring
   // ---------------------------------------------------------------------------
 
-  describe('reasoning suppression — R5 regression (partID correlation)', () => {
-    it('(R5 critical) reasoning part registers its id; subsequent deltas with that partID → sink receives nothing', async () => {
+  describe('reasoning suppression regression (partID correlation)', () => {
+    it('reasoning part registers its id; subsequent deltas with that partID → sink receives nothing', async () => {
       // #given — reasoning part arrives first, then its deltas
       const sink = makeSink()
       const handle = makeHandle({
@@ -1345,7 +1345,7 @@ describe('runOpenCodeCore', () => {
     })
   })
 
-  describe('tool summarizer wiring — Unit 2 (replaces raw 🔧 format)', () => {
+  describe('tool summarizer wiring (replaces raw 🔧 format)', () => {
     it('edit tool via message.part.updated → sink receives summary line, NOT raw 🔧 format', async () => {
       // #given — edit tool with filePath and newString/oldString
       const sink = makeSink()
@@ -1916,10 +1916,10 @@ describe('runOpenCodeCore', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Unit 3: onActivity and onBusy hooks
+  // onActivity and onBusy hooks
   // ---------------------------------------------------------------------------
 
-  describe('onActivity and onBusy hooks (Unit 3)', () => {
+  describe('onActivity and onBusy hooks', () => {
     it('onBusy(true) called after prompt is sent successfully', async () => {
       // #given
       const onBusy = vi.fn()
