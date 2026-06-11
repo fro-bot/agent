@@ -25,6 +25,12 @@
  * The io.ts helper NAMES (`sendMessage`, `editMessage`, `replyInteraction`,
  * `editInteraction`) do NOT contain the raw method-call substrings being scanned
  * (`.send(`, `.edit(`, `.reply(`, `.editReply(`) so they cannot produce false positives.
+ *
+ * Second describe block — allowlisted files keep their own mention guards:
+ * Pins that each content-sending allowlisted file still carries at least as many
+ * `allowedMentions:{parse:[]}` guards as it has raw content-send call sites.
+ * A future edit that silently drops a guard would fail this check even though the
+ * main boundary test (which only scans non-allowlisted files) would not notice.
  */
 
 import {globSync, readFileSync} from 'node:fs'
@@ -287,5 +293,131 @@ describe('io.ts boundary enforcement: no raw Discord content-sends bypass io.ts'
 
     // #then — comment lines are skipped; no violation
     expect(violations).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Allowlisted-file guard coverage
+// ---------------------------------------------------------------------------
+
+/**
+ * Count occurrences of `allowedMentions: {parse: []}` (whitespace-tolerant) in a
+ * file's content. Skips line comments so a commented-out guard is not counted.
+ *
+ * Why whitespace-tolerant: formatters may normalise spacing around the colon or
+ * inside the braces; the regex must survive those variations without false negatives.
+ */
+function countMentionGuards(content: string): number {
+  // Matches `allowedMentions` followed by optional whitespace, a colon, optional
+  // whitespace, `{`, optional whitespace, `parse`, optional whitespace, `:`,
+  // optional whitespace, `[`, optional whitespace, `]`.
+  const guardPattern = /allowedMentions\s*:\s*\{\s*parse\s*:\s*\[\s*\]/
+  let count = 0
+  for (const line of content.split('\n')) {
+    if (line.trimStart().startsWith('//')) continue
+    if (guardPattern.test(line)) count++
+  }
+  return count
+}
+
+/**
+ * Read an allowlisted source file and return its content.
+ * Path is relative to gatewaySrcRoot (same convention as ALLOWLISTED_FILES).
+ */
+function readAllowlistedFile(relPath: string): string {
+  return readFileSync(path.join(gatewaySrcRoot, relPath), 'utf8')
+}
+
+describe('allowlisted files keep their own mention guards', () => {
+  // ── Content-sending allowlisted files ──────────────────────────────────────
+  //
+  // Each of these files was deliberately excluded from the io.ts migration
+  // because they already carry their own `allowedMentions:{parse:[]}` guards.
+  // These tests pin that the guards are still present and cover every raw send
+  // site — so a future edit that silently drops a guard is caught here even
+  // though the main boundary test only scans non-allowlisted files.
+
+  it('presence.ts: allowedMentions guards >= raw content-send sites', () => {
+    // #given — the presence.ts source (1 raw .send call, 1 guard at time of writing)
+    const content = readAllowlistedFile('discord/presence.ts')
+
+    // #when — count raw sends and guards
+    const rawSendCount = scanContent(content, 'discord/presence.ts').length
+    const guardCount = countMentionGuards(content)
+
+    // #then — every send site must be covered by a guard
+    expect(guardCount).toBeGreaterThanOrEqual(rawSendCount)
+    // Non-vacuousness: there must be at least one raw send to guard
+    expect(rawSendCount).toBeGreaterThan(0)
+  })
+
+  it('status-message.ts: allowedMentions guards >= raw content-send sites', () => {
+    // #given — status-message.ts (3 raw send/edit calls, 3 guards at time of writing:
+    //          safePost → .send, safeEdit → .edit, terminalEdit → .edit)
+    const content = readAllowlistedFile('discord/status-message.ts')
+
+    // #when
+    const rawSendCount = scanContent(content, 'discord/status-message.ts').length
+    const guardCount = countMentionGuards(content)
+
+    // #then
+    expect(guardCount).toBeGreaterThanOrEqual(rawSendCount)
+    expect(rawSendCount).toBeGreaterThan(0)
+  })
+
+  it('execute/recovery.ts: allowedMentions guards >= raw content-send sites', () => {
+    // #given — recovery.ts (1 raw .send call, 1 guard at time of writing)
+    const content = readAllowlistedFile('execute/recovery.ts')
+
+    // #when
+    const rawSendCount = scanContent(content, 'execute/recovery.ts').length
+    const guardCount = countMentionGuards(content)
+
+    // #then
+    expect(guardCount).toBeGreaterThanOrEqual(rawSendCount)
+    expect(rawSendCount).toBeGreaterThan(0)
+  })
+
+  // ── Reaction-only allowlisted file ─────────────────────────────────────────
+  //
+  // reactions.ts is allowlisted because it uses the reaction API (.react /
+  // .users.remove), NOT because it sends content. It must contain ZERO raw
+  // content-send call sites — if a content send ever appears here it should
+  // route through io.ts instead.
+
+  it('reactions.ts: contains ZERO raw content-send call sites (reaction API only)', () => {
+    // #given — reactions.ts source
+    const content = readAllowlistedFile('discord/reactions.ts')
+
+    // #when — scan for raw content-send patterns
+    const violations = scanContent(content, 'discord/reactions.ts')
+
+    // #then — no content sends; this file is allowlisted for the reaction API only
+    expect(violations).toHaveLength(0)
+  })
+
+  // ── Non-vacuousness self-test ───────────────────────────────────────────────
+  //
+  // Verifies that the guard-counting logic would actually flag a file that has
+  // a raw content send WITHOUT a corresponding allowedMentions guard — i.e. the
+  // guard-coverage check is not trivially passing because countMentionGuards
+  // always returns a large number.
+
+  it('self-test: guard-coverage check WOULD flag a raw send without allowedMentions', () => {
+    // #given — a synthetic file with one raw .send call and NO allowedMentions guard
+    const fixtureContent = [
+      '// some-allowlisted-file.ts',
+      'async function postNote(thread: SomeThread) {',
+      "  await thread.send({content: 'The previous task was interrupted.'})",
+      '}',
+    ].join('\n')
+
+    // #when — count raw sends and guards in the fixture
+    const rawSendCount = scanContent(fixtureContent, 'discord/some-allowlisted-file.ts').length
+    const guardCount = countMentionGuards(fixtureContent)
+
+    // #then — the fixture has a send but no guard; coverage check would fail
+    expect(rawSendCount).toBeGreaterThan(0)
+    expect(guardCount).toBeLessThan(rawSendCount)
   })
 })
