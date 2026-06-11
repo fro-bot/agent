@@ -279,9 +279,9 @@ describe('createDiscordStreamSink', () => {
     })
   })
 
-  // ── Unit 4: markVisibleOutputSent — approval status prevents _(no output)_ ──
+  // ── markVisibleOutputSent — approval status prevents _(no output)_ ──────
 
-  // ── Unit 1: hasVisibleOutput() — read-only predicate for visible-output state ──
+  // ── hasVisibleOutput() — read-only predicate for visible-output state ────
 
   describe('hasVisibleOutput()', () => {
     it('returns false on a newly created sink', () => {

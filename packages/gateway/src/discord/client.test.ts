@@ -5,7 +5,7 @@ import type {Client} from 'discord.js'
 import {GatewayIntentBits} from 'discord.js'
 import {beforeAll, describe, expect, it, vi} from 'vitest'
 
-import {createDiscordClient, DEFAULT_INTENTS} from './client.js'
+import {createDiscordClient, DEFAULT_INTENTS, withLogContext} from './client.js'
 import {validateTokenIsFake} from './test-token-guard.js'
 
 // discord.js Client constructor makes no network calls — safe to instantiate in tests.
@@ -116,5 +116,98 @@ describe('createDiscordClient', () => {
       GatewayIntentBits.GuildMembers,
     ]
     expectClientIntents(client, expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// withLogContext
+// ---------------------------------------------------------------------------
+
+describe('withLogContext', () => {
+  it('merges context into every warn call', () => {
+    // #given
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const scoped = withLogContext(base, {command: 'add-project'})
+
+    // #when
+    scoped.warn({op: 'editInteraction', err: 'token expired'}, 'io: editInteraction failed')
+
+    // #then — context is merged into the metadata object
+    expect(base.warn).toHaveBeenCalledOnce()
+    const [ctx, msg] = (base.warn as ReturnType<typeof vi.fn>).mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx.command).toBe('add-project')
+    expect(ctx.op).toBe('editInteraction')
+    expect(ctx.err).toBe('token expired')
+    expect(msg).toBe('io: editInteraction failed')
+  })
+
+  it('merges context into every error call', () => {
+    // #given
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const scoped = withLogContext(base, {command: 'clear-queue'})
+
+    // #when
+    scoped.error({err: 'something bad'}, 'fatal error')
+
+    // #then
+    const [ctx] = (base.error as ReturnType<typeof vi.fn>).mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx.command).toBe('clear-queue')
+    expect(ctx.err).toBe('something bad')
+  })
+
+  it('merges context into every info call', () => {
+    // #given
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const scoped = withLogContext(base, {interaction: 'approval-button'})
+
+    // #when
+    scoped.info({channelId: 'ch-1'}, 'button handled')
+
+    // #then
+    const [ctx] = (base.info as ReturnType<typeof vi.fn>).mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx.interaction).toBe('approval-button')
+    expect(ctx.channelId).toBe('ch-1')
+  })
+
+  it('merges context into every debug call', () => {
+    // #given
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const scoped = withLogContext(base, {command: 'force-release-lock'})
+
+    // #when
+    scoped.debug({detail: 'x'}, 'debug msg')
+
+    // #then
+    const [ctx] = (base.debug as ReturnType<typeof vi.fn>).mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx.command).toBe('force-release-lock')
+    expect(ctx.detail).toBe('x')
+  })
+
+  it('caller meta wins on key collision (caller meta overrides context)', () => {
+    // #given — context has {command: 'add-project'}, caller passes {command: 'override'}
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const scoped = withLogContext(base, {command: 'add-project'})
+
+    // #when — caller meta has the same key
+    scoped.warn({command: 'override', op: 'replyInteraction'}, 'msg')
+
+    // #then — caller meta wins
+    const [ctx] = (base.warn as ReturnType<typeof vi.fn>).mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx.command).toBe('override')
+  })
+
+  it('does not mutate the base logger or the context object', () => {
+    // #given
+    const base = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const context = {command: 'add-project'}
+    const scoped = withLogContext(base, context)
+
+    // #when
+    scoped.warn({extra: 'data'}, 'msg')
+
+    // #then — context object is unchanged
+    expect(context).toEqual({command: 'add-project'})
+    // #and — base logger methods are the same references (not replaced)
+    expect(scoped).not.toBe(base)
   })
 })

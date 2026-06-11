@@ -1,9 +1,11 @@
 import type {ChatInputCommandInteraction, SlashCommandBuilder} from 'discord.js'
+import type {GatewayLogger} from '../client.js'
 import type {FroBotDeps} from './fro-bot.js'
 
 import {REST, Routes} from 'discord.js'
 import {Effect} from 'effect'
 
+import {replyInteraction} from '../io.js'
 import {createFroBotCommand} from './fro-bot.js'
 
 export interface SlashCommand {
@@ -18,6 +20,26 @@ export interface SlashCommand {
  */
 export function getCommandRegistry(deps: FroBotDeps): SlashCommand[] {
   return [createFroBotCommand(deps)]
+}
+
+// ---------------------------------------------------------------------------
+// Minimal console-backed logger for the unknown-command ack path.
+// This is the only place in dispatchCommand that lacks an injected logger.
+// TODO(future): plumb a logger Effect.Service through dispatchCommand so
+// we can stop using bare console.warn here. The unknown-command ack path
+// is the only place in the gateway that does this; eliminating it
+// completes the structured-logging story.
+// ---------------------------------------------------------------------------
+
+const DISPATCH_LOGGER: GatewayLogger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warn: (ctx, msg) => {
+    console.warn(JSON.stringify({level: 'warn', ...ctx, msg}))
+  },
+  error: (ctx, msg) => {
+    console.error(JSON.stringify({level: 'error', ...ctx, msg}))
+  },
 }
 
 /**
@@ -44,32 +66,33 @@ export function dispatchCommand(
 
   if (command === undefined) {
     return Effect.gen(function* () {
-      yield* Effect.tryPromise({
-        try: async () =>
-          interaction.reply({
-            content: `Unknown command: \`${commandName}\``,
-            ephemeral: true,
-          }),
-        catch: (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
-      }).pipe(
-        Effect.tapError(err =>
-          Effect.sync(() => {
-            // TODO(future): plumb a logger Effect.Service through dispatchCommand so
-            // we can stop using bare console.warn here. The unknown-command ack path
-            // is the only place in the gateway that does this; eliminating it
-            // completes the structured-logging story.
-            // Log the ack failure but don't propagate it — the unknown-command error
-            // is the meaningful signal for the caller. We can't pass a logger Effect.Service
-            // through dispatchCommand without changing its signature, so use console.warn
-            // directly here. This is the only place in dispatchCommand that does so.
-
-            console.warn(
-              JSON.stringify({level: 'warn', msg: 'ack failed for unknown command', commandName, err: String(err)}),
-            )
-          }),
-        ),
-        Effect.catchAll(() => Effect.void),
+      // Attempt to ack the unknown command ephemerally so the user sees a response
+      // instead of "This interaction failed". replyInteraction never fails as an Effect
+      // (errors are caught and returned as Result) — check the Result to log ack failures.
+      const ackResult = yield* replyInteraction(
+        interaction,
+        {
+          content: `Unknown command: \`${commandName}\``,
+          ephemeral: true,
+        },
+        DISPATCH_LOGGER,
       )
+      if (ackResult.success === false) {
+        // Log the ack failure but don't propagate it — the unknown-command error
+        // is the meaningful signal for the caller. We can't pass a logger Effect.Service
+        // through dispatchCommand without changing its signature, so use console.warn
+        // directly here. This is the only place in dispatchCommand that does so.
+        // TODO(future): plumb a logger Effect.Service through dispatchCommand so
+        // we can stop using bare console.warn here.
+        console.warn(
+          JSON.stringify({
+            level: 'warn',
+            msg: 'ack failed for unknown command',
+            commandName,
+            err: String(ackResult.error),
+          }),
+        )
+      }
       return yield* Effect.fail(new Error(`Unknown command: ${commandName}`))
     })
   }
