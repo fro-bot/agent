@@ -1,4 +1,6 @@
 ---
+title: Effect failure-channel discipline for fail-soft boundaries
+category: best-practices
 module: gateway
 date: 2026-06-10
 problem_type: best_practice
