@@ -128,7 +128,7 @@ function toolSuccessEvent(callID: string, structured: object | null = null, sess
 }
 
 /**
- * `message.part.updated` with partType:'tool' — OpenCode 1.15.13 contract.
+ * `message.part.updated` with partType:'tool' — current OpenCode event contract (tool progress via message.part.updated).
  * The session ID is embedded in the part (mirrors streaming.ts:242 guard).
  */
 function partUpdatedToolEvent(tool: string, status: string, state: object, sessionID = 'sess-123'): object {
@@ -557,7 +557,7 @@ describe('runOpenCodeCore', () => {
     })
   })
 
-  describe('tool call progress (message.part.updated — OpenCode 1.15.13 contract)', () => {
+  describe('tool call progress (message.part.updated — current OpenCode event contract)', () => {
     it('appends a progress line for a bash tool using input.command (side-effecting command)', async () => {
       // #given — bash summarizer renders the command inline (not the tool name)
       // Uses a side-effecting command (pnpm build) so it is not hidden by read-only bash filtering

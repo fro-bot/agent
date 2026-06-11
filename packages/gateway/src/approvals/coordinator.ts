@@ -5,7 +5,7 @@
  * run-core registers a pending request on `permission.asked` and settles it on
  * `permission.replied` — the authoritative settlement signal.
  *
- * Verified against the installed SDK @ 1.14.41:
+ * Verified against the installed SDK:
  * - `permission.asked`   → `properties.id` IS the requestID; carries
  *   `sessionID`, `permission` (gate category), `patterns`, optional `metadata`.
  * - `permission.replied` → `properties.requestID` + `properties.reply`
@@ -33,7 +33,7 @@ import type {GatewayLogger} from '../discord/client.js'
 // Types
 // ---------------------------------------------------------------------------
 
-/** Reply verbs accepted by the OpenCode permission reply endpoint @ 1.14.41. */
+/** Reply verbs accepted by the OpenCode permission reply endpoint. */
 export type PermissionReply = 'once' | 'always' | 'reject'
 
 /** Parsed `permission.asked` payload — the request awaiting a decision. */

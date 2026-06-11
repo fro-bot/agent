@@ -3422,7 +3422,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
     // #then — wait() was called with correct params; completion came from v2 module, not client.v2
     const waitCall = waitFn.mock.calls.at(0)
-    expect(waitCall?.[0]).toEqual({sessionID: 'ses_123', directory: '/workspace'})
+    expect(waitCall?.[0]).toEqual({sessionID: 'ses_123'})
     expect(waitCall?.[1].signal).toBeInstanceOf(AbortSignal)
     expect(result.success).toBe(true)
     // poll should NOT have been the completion authority (status was always busy)
