@@ -5,7 +5,7 @@ import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
 import { disposeInstance as runDisposers } from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Context, Deferred, Duration, Effect, Exit, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Layer, Schema, Scope } from "effect"
 import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import { InstanceBootstrap as InstanceBootstrapGraph } from "./bootstrap"
@@ -17,8 +17,16 @@ export interface LoadInput {
   project?: Project.Info
 }
 
+export class ReentrantLoadError extends Schema.TaggedErrorClass<ReentrantLoadError>()(
+  "InstanceStore.ReentrantLoadError",
+  {
+    directory: Schema.String,
+  },
+) {}
+
 export interface Interface {
   readonly load: (input: LoadInput) => Effect.Effect<InstanceContext>
+  readonly loadPluginClient: (input: LoadInput) => Effect.Effect<InstanceContext, ReentrantLoadError>
   readonly reload: (input: LoadInput) => Effect.Effect<InstanceContext>
   readonly dispose: (ctx: InstanceContext) => Effect.Effect<void>
   readonly disposeDirectory: (directory: string) => Effect.Effect<void>
@@ -105,12 +113,20 @@ export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootst
       return true
     })
 
-    const load = (input: LoadInput): Effect.Effect<InstanceContext> => {
+    const waitForEntry = (directory: string, pluginClient: boolean, entry: Entry) =>
+      Effect.gen(function* () {
+        if (pluginClient && !(yield* Deferred.isDone(entry.deferred))) {
+          return yield* new ReentrantLoadError({ directory })
+        }
+        return yield* Deferred.await(entry.deferred)
+      })
+
+    const loadInternal = (input: LoadInput, pluginClient: boolean): Effect.Effect<InstanceContext, ReentrantLoadError> => {
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const existing = cache.get(directory)
-          if (existing) return yield* restore(Deferred.await(existing.deferred))
+          if (existing) return yield* restore(waitForEntry(directory, pluginClient, existing))
 
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
@@ -122,6 +138,11 @@ export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootst
         }),
       ).pipe(Effect.withSpan("InstanceStore.load"))
     }
+
+    const load = (input: LoadInput): Effect.Effect<InstanceContext> => loadInternal(input, false).pipe(Effect.orDie)
+
+    const loadPluginClient = (input: LoadInput): Effect.Effect<InstanceContext, ReentrantLoadError> =>
+      loadInternal(input, true)
 
     const reload = (input: LoadInput): Effect.Effect<InstanceContext> => {
       const directory = FSUtil.resolve(input.directory)
@@ -193,6 +214,7 @@ export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootst
 
     return Service.of({
       load,
+      loadPluginClient,
       reload,
       dispose,
       disposeDirectory,
