@@ -89,4 +89,24 @@ export const CONSOLE_GATEWAY_LOGGER: GatewayLogger = Object.freeze({
   error: (ctx: Record<string, unknown>, msg: string) => console.error(JSON.stringify({level: 'error', ...ctx, msg})),
 })
 
+/**
+ * Returns a `GatewayLogger` whose every method merges `context` into the
+ * metadata object of every call: `base.warn({...context, ...meta}, msg)`.
+ *
+ * Caller meta wins on key collision — the spread order is `{...context, ...meta}`
+ * so a caller that passes `{command: 'override'}` overrides the scoped context.
+ *
+ * Use at command surfaces to attach a `{command}` or `{interaction}` field to
+ * every log line emitted by io.ts helpers, without threading extra parameters
+ * through every call site.
+ */
+export function withLogContext(base: GatewayLogger, context: Readonly<Record<string, unknown>>): GatewayLogger {
+  return {
+    debug: (meta: Record<string, unknown>, msg: string) => base.debug({...context, ...meta}, msg),
+    info: (meta: Record<string, unknown>, msg: string) => base.info({...context, ...meta}, msg),
+    warn: (meta: Record<string, unknown>, msg: string) => base.warn({...context, ...meta}, msg),
+    error: (meta: Record<string, unknown>, msg: string) => base.error({...context, ...meta}, msg),
+  }
+}
+
 export {DEFAULT_INTENTS}

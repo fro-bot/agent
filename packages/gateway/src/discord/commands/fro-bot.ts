@@ -23,6 +23,7 @@ import type {SlashCommand} from './index.js'
 import {PermissionFlagsBits, SlashCommandBuilder} from 'discord.js'
 import {Effect} from 'effect'
 
+import {withLogContext} from '../client.js'
 import {editInteraction, editInteractionAsync, replyInteraction, replyInteractionAsync} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
@@ -159,6 +160,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
  * unaffected — it holds the concurrency slot, not the queue.
  */
 function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBotDeps): Effect.Effect<void, Error> {
+  const log = withLogContext(deps.gatewayLogger, {command: 'clear-queue'})
   return Effect.tryPromise({
     try: async () => {
       // Fail closed: command must be used inside a server (guild).
@@ -169,7 +171,7 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
         await replyInteractionAsync(
           interaction,
           {content: 'This command must be used in a server.', ephemeral: true},
-          deps.gatewayLogger,
+          log,
         )
         return
       }
@@ -179,13 +181,9 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
       // acks the interaction before any await, matching the add-project pattern.
       await interaction.deferReply({ephemeral: true})
 
-      const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, deps.gatewayLogger)
+      const authorized = await userIsAuthorized(guild, interaction.user.id, deps.triggerRoleId, log)
       if (authorized === false) {
-        await editInteractionAsync(
-          interaction,
-          {content: 'You do not have permission to clear the queue.'},
-          deps.gatewayLogger,
-        )
+        await editInteractionAsync(interaction, {content: 'You do not have permission to clear the queue.'}, log)
         return
       }
 
@@ -194,7 +192,7 @@ function executeClearQueue(interaction: ChatInputCommandInteraction, deps: FroBo
       await editInteractionAsync(
         interaction,
         {content: `Cleared ${dropped} queued task(s). The running task will finish.`},
-        deps.gatewayLogger,
+        log,
       )
     },
     catch: error => (error instanceof Error ? error : new Error(String(error))),
@@ -226,17 +224,14 @@ function executeForceReleaseLock(
   interaction: ChatInputCommandInteraction,
   deps: FroBotDeps,
 ): Effect.Effect<void, Error> {
+  const log = withLogContext(deps.gatewayLogger, {command: 'force-release-lock'})
   return Effect.gen(function* () {
     // Fail closed: command must be used inside a server (guild).
     // Guard is synchronous (no await before it) so a plain reply is safe here
     // — we haven't consumed the 3 s interaction window yet.
     const guild = interaction.guild
     if (guild === null) {
-      yield* replyInteraction(
-        interaction,
-        {content: 'This command must be used in a server.', ephemeral: true},
-        deps.gatewayLogger,
-      )
+      yield* replyInteraction(interaction, {content: 'This command must be used in a server.', ephemeral: true}, log)
       return
     }
 
@@ -254,7 +249,7 @@ function executeForceReleaseLock(
     const member = yield* Effect.tryPromise({
       try: async () =>
         guild.members.fetch(interaction.user.id).catch((error: unknown) => {
-          deps.gatewayLogger.warn(
+          log.warn(
             {
               channelId: interaction.channelId,
               err: error instanceof Error ? error.message : String(error),
@@ -269,7 +264,7 @@ function executeForceReleaseLock(
       yield* editInteraction(
         interaction,
         {content: 'You do not have permission to force-release a lock (ManageChannels required).'},
-        deps.gatewayLogger,
+        log,
       )
       return
     }
@@ -281,11 +276,11 @@ function executeForceReleaseLock(
       catch: error => (error instanceof Error ? error : new Error(String(error))),
     })
     if (bindingResult.success === false) {
-      deps.gatewayLogger.error({channelId, err: bindingResult.error.message}, 'force-release-lock: binding store error')
+      log.error({channelId, err: bindingResult.error.message}, 'force-release-lock: binding store error')
       yield* editInteraction(
         interaction,
         {content: 'Something went wrong looking up this channel. Please try again.'},
-        deps.gatewayLogger,
+        log,
       )
       return
     }
@@ -294,7 +289,7 @@ function executeForceReleaseLock(
       yield* editInteraction(
         interaction,
         {content: 'No repo is bound to this channel. Use `/fro-bot add-project` first.'},
-        deps.gatewayLogger,
+        log,
       )
       return
     }
@@ -305,7 +300,7 @@ function executeForceReleaseLock(
     // Narrow logger adapter — runtime coordination functions take a narrow
     // {debug} logger; adapt the gateway logger inline (same pattern as run.ts).
     const coordLogger: CoordinationLogger = {
-      debug: (msg: string, ctx?: Record<string, unknown>) => deps.gatewayLogger.debug(ctx ?? {}, msg),
+      debug: (msg: string, ctx?: Record<string, unknown>) => log.debug(ctx ?? {}, msg),
     }
 
     // Call the dead-run-verified force-release Effect and map the typed outcome
@@ -334,7 +329,7 @@ function executeForceReleaseLock(
           yield* editInteraction(
             interaction,
             {content: `✅ Lock released for \`${repoSlug}\`.${holderInfo}${ageInfo}`},
-            deps.gatewayLogger,
+            log,
           )
           break
         }
@@ -350,7 +345,7 @@ function executeForceReleaseLock(
             {
               content: `🔒 Lock for \`${repoSlug}\` is held by an active run — not released.${holderInfo}${ageInfo}${heartbeatInfo}`,
             },
-            deps.gatewayLogger,
+            log,
           )
           break
         }
@@ -359,7 +354,7 @@ function executeForceReleaseLock(
           yield* editInteraction(
             interaction,
             {content: `ℹ️ No lock found for \`${repoSlug}\` — nothing to release.`},
-            deps.gatewayLogger,
+            log,
           )
           break
         }
@@ -370,7 +365,7 @@ function executeForceReleaseLock(
             {
               content: `⚠️ The lock for \`${repoSlug}\` changed just now (re-acquired between read and delete). Try again.`,
             },
-            deps.gatewayLogger,
+            log,
           )
           break
         }
@@ -379,7 +374,7 @@ function executeForceReleaseLock(
           yield* editInteraction(
             interaction,
             {content: `❌ An error occurred while checking the lock for \`${repoSlug}\`. Please try again.`},
-            deps.gatewayLogger,
+            log,
           )
           break
         }
@@ -387,12 +382,8 @@ function executeForceReleaseLock(
         default: {
           // Exhaustiveness guard — TypeScript will catch unhandled outcomes at compile time.
           const exhaustiveCheck: never = outcome
-          deps.gatewayLogger.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
-          yield* editInteraction(
-            interaction,
-            {content: 'An internal error occurred. Please try again.'},
-            deps.gatewayLogger,
-          )
+          log.error({outcome: exhaustiveCheck, repo: repoSlug}, 'force-release-lock: unhandled outcome')
+          yield* editInteraction(interaction, {content: 'An internal error occurred. Please try again.'}, log)
         }
       }
     }).pipe(
@@ -406,11 +397,7 @@ function executeForceReleaseLock(
       // then re-fail with the original error — the deferred reply is never left hanging.
       Effect.catchAll(err =>
         Effect.gen(function* () {
-          yield* editInteraction(
-            interaction,
-            {content: 'An internal error occurred. Please try again.'},
-            deps.gatewayLogger,
-          )
+          yield* editInteraction(interaction, {content: 'An internal error occurred. Please try again.'}, log)
           return yield* Effect.fail(err)
         }),
       ),

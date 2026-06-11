@@ -22,6 +22,7 @@ import {Effect} from 'effect'
 import {AppNotInstalledError} from '../../github/app-client.js'
 import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
+import {withLogContext} from '../client.js'
 import {editInteractionAsync, replyInteractionAsync, sendMessage} from '../io.js'
 
 // ---------------------------------------------------------------------------
@@ -216,8 +217,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const correlationId = interaction.id
   const startTime = Date.now()
 
-  // Adapt the message-first logger to GatewayLogger (context-first) for io.ts helpers.
-  const gatewayLogger = makeGatewayLoggerAdapter(logger)
+  // Adapt the message-first logger to GatewayLogger (context-first) for io.ts helpers,
+  // then scope it with {command: 'add-project'} so every io.ts warn/error log carries
+  // command context — no more context-free "io: editInteraction failed" lines.
+  const gatewayLogger = withLogContext(makeGatewayLoggerAdapter(logger), {command: 'add-project'})
 
   // ---------------------------------------------------------------------------
   // Rate limit check (before deferReply — fast path)
@@ -487,19 +490,28 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         // fall through — do NOT return
       } else {
         // Do NOT surface the internal code — it may confuse users and leaks implementation details.
-        await editInteractionAsync(
+        const cloneFailResult = await editInteractionAsync(
           interaction,
           {content: `Clone failed. Check workspace-agent logs for details and retry.`},
           gatewayLogger,
         )
+        if (cloneFailResult.success === false) {
+          gatewayLogger.error(
+            {err: cloneFailResult.error.message},
+            'add-project: failed to deliver final status to user',
+          )
+        }
         return
       }
     } else if (errorKind === 'timeout') {
-      await editInteractionAsync(
+      const timeoutResult = await editInteractionAsync(
         interaction,
         {content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'},
         gatewayLogger,
       )
+      if (timeoutResult.success === false) {
+        gatewayLogger.error({err: timeoutResult.error.message}, 'add-project: failed to deliver final status to user')
+      }
       return
     } else if (errorKind === 'response-mismatch') {
       logger.error('add-project: response-mismatch from workspace agent', {correlationId, phase, owner, repo})
@@ -697,7 +709,16 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   phase = 'READY'
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName: channel.name, outcome: 'start'})
 
-  await editInteractionAsync(interaction, {content: `✅ Ready — try @fro-bot in #${channel.name}`}, gatewayLogger)
+  const readyResult = await editInteractionAsync(
+    interaction,
+    {content: `✅ Ready — try @fro-bot in #${channel.name}`},
+    gatewayLogger,
+  )
+  if (readyResult.success === false) {
+    // Token expiry after a long clone is the realistic failure mode here.
+    // Escalate to ERROR so operators can see the user never got the success confirmation.
+    gatewayLogger.error({err: readyResult.error.message}, 'add-project: failed to deliver final status to user')
+  }
 
   // Post welcome message in the new channel.
   // channel.send is a Message/Thread surface send — use sendMessage from io.ts.

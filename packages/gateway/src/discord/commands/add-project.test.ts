@@ -19,6 +19,14 @@ import {__resetShuttingDownForTests} from '../../shutdown.js'
 import {executeAddProject} from './add-project.js'
 
 // ---------------------------------------------------------------------------
+// Helper: extract all error() calls from a logger
+// ---------------------------------------------------------------------------
+
+function allErrorCalls(logger: AddProjectDeps['logger']): [string, Record<string, unknown> | undefined][] {
+  return (logger.error as ReturnType<typeof vi.fn>).mock.calls as [string, Record<string, unknown> | undefined][]
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1350,6 +1358,151 @@ describe('executeAddProject', () => {
       expect(calls1[0]?.[0]?.repo).toBe('testrepo')
       expect(calls2[0]?.[0]?.owner).toBe('testowner')
       expect(calls2[0]?.[0]?.repo).toBe('testrepo')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // ERROR escalation: post-clone final editInteractionAsync failures
+  // -------------------------------------------------------------------------
+
+  describe('READY: post-clone success editInteractionAsync failure → ERROR log with command context', () => {
+    it('logs at ERROR with {command: "add-project"} and err when final success editReply fails', async () => {
+      // #given — all phases succeed but the final "✅ Ready" editReply fails (token expired)
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      // editReply fails on the final READY edit (the "✅ Ready" call)
+      // We need to make editReply fail only on the last call (the READY one).
+      // The READY editReply is the first one after binding succeeds.
+      // We'll make editReply reject on all calls after binding write to isolate the READY edit.
+      let editCallCount = 0
+      const editReply = vi.fn().mockImplementation(async () => {
+        editCallCount++
+        // The READY edit is the first editReply after all pre-flight/clone/channel/binding phases.
+        // In the happy path, there's only one editReply call (the READY one).
+        // We make it fail on the last call.
+        if (editCallCount >= 1) throw tokenExpiredError
+        return undefined
+      })
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const logger = makeLogger()
+      const deps = makeDeps({logger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — logger.error was called with command context
+      const errorCalls = allErrorCalls(logger)
+      const relevantError = errorCalls.find(([, meta]) => meta?.command === 'add-project')
+      expect(relevantError).toBeDefined()
+      // #and — the error call includes {err} field
+      expect(relevantError?.[1]?.err).toBeDefined()
+      // #and — the message names what was lost
+      expect(relevantError?.[0]).toMatch(/final status|add-project/)
+    })
+  })
+
+  describe('CLONING: clone-failure editInteractionAsync failure → ERROR log with command context', () => {
+    it('logs at ERROR with {command: "add-project"} when clone-failure editReply fails (token expired)', async () => {
+      // #given — clone fails with a generic clone-error; the editReply for that failure also fails
+      const userId = uniqueUserId()
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'clone-failed'}))
+
+      // Make editReply always fail (simulating token expiry after long clone)
+      const editReply = vi.fn().mockRejectedValue(tokenExpiredError)
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const guild = makeGuild()
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const logger = makeLogger()
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone}), logger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — logger.error was called with command context on the post-clone failure edit
+      const errorCalls = allErrorCalls(logger)
+      const relevantError = errorCalls.find(([, meta]) => meta?.command === 'add-project')
+      expect(relevantError).toBeDefined()
+      expect(relevantError?.[1]?.err).toBeDefined()
+      expect(relevantError?.[0]).toMatch(/final status|add-project/)
+    })
+  })
+
+  describe('scoped logger: io.ts warn logs include command context when invoked through withLogContext', () => {
+    it('warn log from editInteractionAsync includes {command: "add-project"} when editReply fails', async () => {
+      // #given — editReply fails; the io.ts helper will warn; the scoped logger merges command context
+      const userId = uniqueUserId()
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      const editReply = vi.fn().mockRejectedValue(tokenExpiredError)
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const guild = makeGuild()
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const logger = makeLogger()
+      const deps = makeDeps({logger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — at least one warn call includes {command: 'add-project'}
+      const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [string, Record<string, unknown>][]
+      // The warn is emitted by the GatewayLogger adapter (context-first), so check the meta arg
+      // The adapter calls logger.warn(msg, ctx) — check second arg for command context
+      const hasCommandContext = warnCalls.some(([, meta]) => meta?.command === 'add-project')
+      expect(hasCommandContext).toBe(true)
     })
   })
 })

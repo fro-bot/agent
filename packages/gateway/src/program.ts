@@ -17,7 +17,7 @@ import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
-import {createDiscordClient} from './discord/client.js'
+import {createDiscordClient, withLogContext} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {editInteractionAsync} from './discord/io.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
@@ -210,6 +210,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
         // eslint-disable-next-line no-void
         void (async () => {
+          const buttonLog = withLogContext(logger, {interaction: 'approval-button'})
           try {
             // Defer FIRST — acks the interaction within Discord's 3 s window before
             // any REST calls (guild.members.fetch inside userIsAuthorized can be slow).
@@ -220,12 +221,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             // Auth: reuse the same authorization gate as the mention path.
             const guild = interaction.guild
             if (guild === null) {
-              await editInteractionAsync(interaction, {content: 'Not authorized to approve.'}, logger)
+              await editInteractionAsync(interaction, {content: 'Not authorized to approve.'}, buttonLog)
               return
             }
-            const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, logger)
+            const authorized = await userIsAuthorized(guild, interaction.user.id, config.triggerRoleId, buttonLog)
             if (authorized === false) {
-              await editInteractionAsync(interaction, {content: 'Not authorized to approve.'}, logger)
+              await editInteractionAsync(interaction, {content: 'Not authorized to approve.'}, buttonLog)
               return
             }
 
@@ -250,11 +251,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                       ? 'Already decided.'
                       : 'Failed to record decision, try again.'
 
-            await editInteractionAsync(interaction, {content: ackContent}, logger)
+            await editInteractionAsync(interaction, {content: ackContent}, buttonLog)
           } catch (error: unknown) {
             logger.error({err: String(error)}, 'button: unexpected error handling approval interaction')
             // editInteraction catches internally and returns a Result — never throws.
-            await editInteractionAsync(interaction, {content: 'Failed to record decision, try again.'}, logger)
+            await editInteractionAsync(interaction, {content: 'Failed to record decision, try again.'}, buttonLog)
           }
         })()
         return
