@@ -1,6 +1,7 @@
 ---
 title: Discord slash command orchestration — permission checks, bootstrap wiring, and token safety
 date: 2026-05-27
+last_updated: 2026-06-10
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -59,11 +60,12 @@ function botHasRequiredPermissions(appPermissions: PermissionsBitField | null): 
   )
 }
 
-// Call site:
+// Call site — all Discord content sends go through discord/io.ts helpers
+// (mention-safe by default; enforced by io.boundary.test.ts):
 if (botHasRequiredPermissions(interaction.appPermissions) === false) {
-  await interaction.editReply({
+  await editInteractionAsync(interaction, {
     content: `fro-bot needs **Manage Channels** and **Send Messages**. Re-invite at: ${installUrl}`,
-  })
+  }, log)
   return
 }
 ```
@@ -75,22 +77,34 @@ The command was refactored to receive its dependencies through a factory (`creat
 The fix is an integration-level test that builds the **real** registry and dispatches a **real** interaction:
 
 ```ts
-export function createFroBotCommand(deps: AddProjectDeps): SlashCommand {
-  const execute = (interaction: ChatInputCommandInteraction): Effect.Effect<void, Error> => {
-    const subcommand = interaction.options.getSubcommand(true)
-    if (subcommand === 'add-project') return executeAddProject(interaction, deps)
-    return Effect.fail(new Error(`Unknown subcommand: ${subcommand}`))
-  }
-  return {data, execute}
-}
-
 // Test the dispatch seam, not just executeAddProject:
 const registry = getCommandRegistry(makeMockDeps())
 await Effect.runPromise(dispatchCommand(mockInteraction, registry))
 expect(mockDeps.workspaceClient.clone).toHaveBeenCalled()
 ```
 
-`getCommandRegistry` and `dispatchCommand` live in `packages/gateway/src/discord/commands/index.ts`; the factory and bootstrap wiring are in `commands/fro-bot.ts` and `program.ts` respectively.
+`getCommandRegistry` and `dispatchCommand` live in `packages/gateway/src/discord/commands/index.ts`; the parent-command factory is in `commands/fro-bot.ts` and bootstrap wiring is in `program.ts`.
+
+### 2a. The orchestration skeleton is now owned by `makeGuildCommand`
+
+The per-command hand-rolled sequence (`deferReply → guild-null guard → auth → editReply`) is now owned by the shared `makeGuildCommand` pipeline (`packages/gateway/src/discord/commands/guild-command.ts`). New guild commands supply a `GuildCommandSpec` with `{authorize, work, preDefer?}` instead of hand-rolling the skeleton:
+
+```ts
+// packages/gateway/src/discord/commands/add-project.ts
+export function buildAddProjectSpec(deps: AddProjectDeps): {
+  readonly preDefer: (ctx: PreDeferCtx) => Effect.Effect<PreDeferSignal, never>
+  readonly authorize: (ctx: GuildCommandCtx) => Effect.Effect<AuthDecision, never>
+  readonly work: (ctx: GuildCommandCtx) => Effect.Effect<void, Error>
+} { /* ... */ }
+
+// Wired in executeAddProject:
+const executor = makeGuildCommand(
+  {name: 'add-project', preDefer, authorize, work, serverOnlyCopy: '...'},
+  deps,
+)
+```
+
+The underlying WHY is unchanged: `deferReply` must fire before any REST calls to beat the 3-second interaction-token window. That sequencing is now guaranteed by the pipeline rather than each command author. A structural test in `guild-command.test.ts` scans every `commands/*.ts` file (excluding `guild-command.ts`) and fails the suite if any hand-rolled `.deferReply(` call is found.
 
 ### 3. Installation access token (IAT) handling across an HTTP boundary
 
@@ -143,21 +157,23 @@ Accepted v1 fallout and boundaries:
 - **Shutdown gating**: new invocations are refused during drain (after `deferReply` so Discord gets its mandatory ack). In-flight runs that are hard-cut during a process restart are healed by the next retry via the resume path.
 
 ```ts
-// Resume only on CONFIRMED absent binding — store errors do NOT resume:
+// Resume only on CONFIRMED absent binding — store errors do NOT resume.
+// All Discord content sends go through discord/io.ts helpers (editInteractionAsync
+// / editInteraction) — mention-safe by default; enforced by io.boundary.test.ts.
 let existing: Awaited<ReturnType<typeof bindingsStore.getBindingByRepo>>
 try {
   existing = await bindingsStore.getBindingByRepo(owner, repo)
 } catch {
-  await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+  await editInteractionAsync(interaction, {content: 'Internal error checking existing bindings. Please retry in a moment.'}, log)
   return
 }
 if (existing.success === false) {
-  await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+  await editInteractionAsync(interaction, {content: 'Internal error checking existing bindings. Please retry in a moment.'}, log)
   return
 }
 if (existing.data !== null) {
   // Already bound — redirect.
-  await interaction.editReply({content: `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`})
+  await editInteractionAsync(interaction, {content: `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`}, log)
   return
 }
 // Confirmed absent binding — resume from CREATING_CHANNEL.
@@ -166,9 +182,9 @@ workspacePath = workspaceRepoPath(owner, repo)
 
 // Partial-write recovery names both keys for manual cleanup:
 if (error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
-  await interaction.editReply({
+  await editInteractionAsync(interaction, {
     content: `Partial write: primary written, index failed. Manual S3 cleanup:\n- Primary: \`${error.primaryKey}\`\n- Index: \`${error.indexKey}\``,
-  })
+  }, log)
 }
 ```
 
