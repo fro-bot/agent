@@ -19,14 +19,6 @@ import {__resetShuttingDownForTests} from '../../shutdown.js'
 import {executeAddProject} from './add-project.js'
 
 // ---------------------------------------------------------------------------
-// Helper: extract all error() calls from a logger
-// ---------------------------------------------------------------------------
-
-function allErrorCalls(logger: AddProjectDeps['logger']): [string, Record<string, unknown> | undefined][] {
-  return (logger.error as ReturnType<typeof vi.fn>).mock.calls as [string, Record<string, unknown> | undefined][]
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -171,6 +163,15 @@ function makeWorkspaceClient(overrides?: {clone?: ReturnType<typeof vi.fn>}): Wo
   } as unknown as WorkspaceClient
 }
 
+function makeGatewayLogger() {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+}
+
 function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
   return {
     bindingsStore: makeBindingsStore(),
@@ -178,6 +179,7 @@ function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
     workspaceClient: makeWorkspaceClient(),
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: makeLogger(),
+    gatewayLogger: makeGatewayLogger(),
     ...overrides,
   }
 }
@@ -1404,20 +1406,23 @@ describe('executeAddProject', () => {
         reply,
       } as unknown as ChatInputCommandInteraction
 
-      const logger = makeLogger()
-      const deps = makeDeps({logger})
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({gatewayLogger})
 
       // #when
       await run(interaction, deps)
 
-      // #then — logger.error was called with command context
-      const errorCalls = allErrorCalls(logger)
-      const relevantError = errorCalls.find(([, meta]) => meta?.command === 'add-project')
+      // #then — gatewayLogger.error was called with command context (pipeline scopes log to {command: 'add-project'})
+      const errorCalls = (gatewayLogger.error as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const relevantError = errorCalls.find(([meta]) => meta?.command === 'add-project')
       expect(relevantError).toBeDefined()
       // #and — the error call includes {err} field
-      expect(relevantError?.[1]?.err).toBeDefined()
+      expect(relevantError?.[0]?.err).toBeDefined()
       // #and — the message names what was lost
-      expect(relevantError?.[0]).toMatch(/final status|add-project/)
+      expect(relevantError?.[1]).toMatch(/final status|add-project/)
     })
   })
 
@@ -1450,24 +1455,27 @@ describe('executeAddProject', () => {
         reply,
       } as unknown as ChatInputCommandInteraction
 
-      const logger = makeLogger()
-      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone}), logger})
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone}), gatewayLogger})
 
       // #when
       await run(interaction, deps)
 
-      // #then — logger.error was called with command context on the post-clone failure edit
-      const errorCalls = allErrorCalls(logger)
-      const relevantError = errorCalls.find(([, meta]) => meta?.command === 'add-project')
+      // #then — gatewayLogger.error was called with command context (pipeline scopes log to {command: 'add-project'})
+      const errorCalls = (gatewayLogger.error as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const relevantError = errorCalls.find(([meta]) => meta?.command === 'add-project')
       expect(relevantError).toBeDefined()
-      expect(relevantError?.[1]?.err).toBeDefined()
-      expect(relevantError?.[0]).toMatch(/final status|add-project/)
+      expect(relevantError?.[0]?.err).toBeDefined()
+      expect(relevantError?.[1]).toMatch(/final status|add-project/)
     })
   })
 
   describe('scoped logger: io.ts warn logs include command context when invoked through withLogContext', () => {
     it('warn log from editInteractionAsync includes {command: "add-project"} when editReply fails', async () => {
-      // #given — editReply fails; the io.ts helper will warn; the scoped logger merges command context
+      // #given — editReply fails; the io.ts helper will warn; the pipeline-scoped logger merges command context
       const userId = uniqueUserId()
       const tokenExpiredError = new Error('Unknown interaction (token expired)')
       const editReply = vi.fn().mockRejectedValue(tokenExpiredError)
@@ -1491,18 +1499,49 @@ describe('executeAddProject', () => {
         reply,
       } as unknown as ChatInputCommandInteraction
 
-      const logger = makeLogger()
-      const deps = makeDeps({logger})
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({gatewayLogger})
 
       // #when
       await run(interaction, deps)
 
-      // #then — at least one warn call includes {command: 'add-project'}
-      const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [string, Record<string, unknown>][]
-      // The warn is emitted by the GatewayLogger adapter (context-first), so check the meta arg
-      // The adapter calls logger.warn(msg, ctx) — check second arg for command context
-      const hasCommandContext = warnCalls.some(([, meta]) => meta?.command === 'add-project')
+      // #then — at least one warn call on gatewayLogger includes {command: 'add-project'}
+      // The pipeline builds withLogContext(deps.gatewayLogger, {command: 'add-project'}), so every
+      // log call from ctx.log carries command context in the first (meta) argument.
+      const warnCalls = (gatewayLogger.warn as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const hasCommandContext = warnCalls.some(([meta]) => meta?.command === 'add-project')
       expect(hasCommandContext).toBe(true)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Pipeline catchAll: infrastructure failure → deferred reply edited, then re-fails
+  // -------------------------------------------------------------------------
+
+  describe('pipeline catchAll: infrastructure failure in work edits deferred reply then re-fails', () => {
+    it('unexpected throw inside phase body → editReply with internal-error copy, Effect re-fails', async () => {
+      // #given — bindingsStore.getBindingByRepo throws unexpectedly (infra failure, not a Result error)
+      // This simulates an unhandled exception escaping the phase body, which the pipeline catchAll catches.
+      const userId = uniqueUserId()
+      const infraError = new Error('S3 socket hang up')
+      const getBindingByRepo = vi.fn().mockRejectedValue(infraError)
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when — must resolve (catchAll edits reply and re-fails; Effect.runPromise rejects on re-fail)
+      const result = await Effect.runPromise(Effect.either(executeAddProject(interaction, deps)))
+
+      // #then — Effect failed (re-failed after editing reply)
+      expect(result._tag).toBe('Left')
+      // #and — editReply was called with the internal-error copy
+      expect(editReply).toHaveBeenCalled()
+      const replyContent = lastEditReplyContent(editReply)
+      expect(replyContent).toMatch(/internal error|please try again/i)
+      // #and — the original error is preserved in the re-fail
+      expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('S3 socket hang up')
     })
   })
 })

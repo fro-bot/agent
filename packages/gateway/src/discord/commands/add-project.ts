@@ -15,6 +15,7 @@ import type {BindingsStore} from '../../bindings/store.js'
 import type {AppClient} from '../../github/app-client.js'
 import type {WorkspaceClient} from '../../workspace-api/client.js'
 import type {GatewayLogger} from '../client.js'
+import type {AuthDecision, GuildCommandCtx, GuildCommandDeps, PreDeferCtx, PreDeferSignal} from './guild-command.js'
 
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
@@ -22,8 +23,8 @@ import {Effect} from 'effect'
 import {AppNotInstalledError} from '../../github/app-client.js'
 import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
-import {withLogContext} from '../client.js'
 import {editInteractionAsync, replyInteractionAsync, sendMessage} from '../io.js'
+import {makeGuildCommand} from './guild-command.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,7 +32,7 @@ import {editInteractionAsync, replyInteractionAsync, sendMessage} from '../io.js
 
 export type AddProjectPhase = 'PRE_FLIGHT' | 'CLONING' | 'CREATING_CHANNEL' | 'WRITING_BINDING' | 'READY' | 'FAILED'
 
-export interface AddProjectDeps {
+export interface AddProjectDeps extends GuildCommandDeps {
   readonly bindingsStore: BindingsStore
   readonly appClient: AppClient
   readonly workspaceClient: WorkspaceClient
@@ -180,16 +181,88 @@ async function userIsAuthorized(guild: Guild, userId: string, logger: AddProject
 const INTERACTION_WINDOW_MS = 14 * 60 * 1000
 
 // ---------------------------------------------------------------------------
-// Logger adapter — adapts AddProjectDeps.logger (message-first) to GatewayLogger (context-first)
+// Pipeline spec builder
 // ---------------------------------------------------------------------------
 
-function makeGatewayLoggerAdapter(logger: AddProjectDeps['logger']): GatewayLogger {
-  return {
-    debug: () => undefined, // AddProjectDeps.logger has no debug level
-    info: (ctx, msg) => logger.info(msg, ctx),
-    warn: (ctx, msg) => logger.warn(msg, ctx),
-    error: (ctx, msg) => logger.error(msg, ctx),
+/**
+ * Build the `makeGuildCommand` spec for `/fro-bot add-project`.
+ *
+ * Entry sequence (pipeline-owned):
+ *   preDefer (rate-limit check) → guild-null guard (pipeline) → deferReply → authorize → work
+ *
+ * The phase orchestration body (clone/channel/binding phases) is the work function.
+ */
+export function buildAddProjectSpec(deps: AddProjectDeps): {
+  readonly preDefer: (ctx: PreDeferCtx) => Effect.Effect<PreDeferSignal, never>
+  readonly authorize: (ctx: GuildCommandCtx) => Effect.Effect<AuthDecision, never>
+  readonly work: (ctx: GuildCommandCtx) => Effect.Effect<void, Error>
+} {
+  const preDefer = (ctx: PreDeferCtx): Effect.Effect<PreDeferSignal, never> => {
+    const userId = ctx.interaction.user.id
+    const rateCheck = checkRateLimit(userId)
+    if (rateCheck.allowed === true) {
+      return Effect.succeed({proceed: true as const})
+    }
+    const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
+    return Effect.promise(async () => {
+      await replyInteractionAsync(
+        ctx.interaction,
+        {
+          content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
+          ephemeral: true,
+        },
+        ctx.log,
+      )
+      return {proceed: false as const}
+    })
   }
+
+  const authorize = (ctx: GuildCommandCtx): Effect.Effect<AuthDecision, never> => {
+    return Effect.promise(async () => {
+      // Shutdown gate — must precede any auth REST calls (guild.members.fetch).
+      // Refusing here avoids a misleading permission-denial if the fetch fails
+      // during draining shutdown. The user sees a restart message, not a denial.
+      const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
+      if (shuttingDownCheck() === true) {
+        return {
+          authorized: false as const,
+          copy: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.',
+        }
+      }
+
+      // Bot-permission gate: ManageChannels + SendMessages required.
+      if (botHasRequiredPermissions(ctx.interaction.appPermissions) === false) {
+        ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: missing bot permissions')
+        return {
+          authorized: false as const,
+          copy: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${deps.installUrl}`,
+        }
+      }
+
+      // User authorization gate: invoking user must hold guild-level ManageChannels.
+      // setDefaultMemberPermissions is NOT used — it would gate the entire /fro-bot parent
+      // command (including /ping). This is a scoped runtime check per subcommand.
+      const authorized = await userIsAuthorized(ctx.guild, ctx.interaction.user.id, deps.logger)
+      if (authorized === false) {
+        ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: unauthorized user')
+        return {
+          authorized: false as const,
+          copy: 'You need the **Manage Channels** permission to use this command.',
+        }
+      }
+
+      return {authorized: true as const}
+    })
+  }
+
+  const work = (ctx: GuildCommandCtx): Effect.Effect<void, Error> => {
+    return Effect.tryPromise({
+      try: async () => runAddProjectPhases(ctx.interaction, ctx.guild, ctx.log, deps),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+  }
+
+  return {preDefer, authorize, work}
 }
 
 // ---------------------------------------------------------------------------
@@ -206,92 +279,29 @@ export function executeAddProject(
   interaction: ChatInputCommandInteraction,
   deps: AddProjectDeps,
 ): Effect.Effect<void, Error> {
-  return Effect.tryPromise({
-    try: async () => runAddProject(interaction, deps),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
+  const {preDefer, authorize, work} = buildAddProjectSpec(deps)
+  const executor = makeGuildCommand(
+    {name: 'add-project', preDefer, authorize, work, serverOnlyCopy: 'This command can only be used in a server.'},
+    deps,
+  )
+  return executor(interaction)
 }
 
-async function runAddProject(interaction: ChatInputCommandInteraction, deps: AddProjectDeps): Promise<void> {
+async function runAddProjectPhases(
+  interaction: ChatInputCommandInteraction,
+  guild: Guild,
+  log: GatewayLogger,
+  deps: AddProjectDeps,
+): Promise<void> {
   const {bindingsStore, appClient, workspaceClient, installUrl, logger} = deps
   const correlationId = interaction.id
   const startTime = Date.now()
-
-  // Adapt the message-first logger to GatewayLogger (context-first) for io.ts helpers,
-  // then scope it with {command: 'add-project'} so every io.ts warn/error log carries
-  // command context — no more context-free "io: editInteraction failed" lines.
-  const gatewayLogger = withLogContext(makeGatewayLoggerAdapter(logger), {command: 'add-project'})
-
-  // ---------------------------------------------------------------------------
-  // Rate limit check (before deferReply — fast path)
-  // ---------------------------------------------------------------------------
-  const userId = interaction.user.id
-  const rateCheck = checkRateLimit(userId)
-  if (!rateCheck.allowed) {
-    const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
-    await replyInteractionAsync(
-      interaction,
-      {
-        content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
-        ephemeral: true,
-      },
-      gatewayLogger,
-    )
-    return
-  }
 
   // ---------------------------------------------------------------------------
   // PRE_FLIGHT
   // ---------------------------------------------------------------------------
   let phase: AddProjectPhase = 'PRE_FLIGHT'
   logger.info('add-project phase', {correlationId, phase, outcome: 'start'})
-
-  // Defer reply (ephemeral — setup thread is operationally sensitive)
-  await interaction.deferReply({ephemeral: true})
-
-  // Shutdown gate — placed after deferReply so Discord gets its mandatory ack (<3s).
-  // Refuse new work during draining shutdown; resume (Part 1) heals any hard-killed run.
-  const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
-  if (shuttingDownCheck() === true) {
-    await editInteractionAsync(
-      interaction,
-      {content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.'},
-      gatewayLogger,
-    )
-    return
-  }
-
-  const guild = interaction.guild
-  if (guild === null) {
-    await editInteractionAsync(interaction, {content: 'This command can only be used in a server.'}, gatewayLogger)
-    return
-  }
-
-  // Check bot permissions
-  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
-    logger.warn('add-project: missing bot permissions', {correlationId, phase})
-    await editInteractionAsync(
-      interaction,
-      {
-        content: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${installUrl}`,
-      },
-      gatewayLogger,
-    )
-    return
-  }
-
-  // Runtime authorization check — invoking user must hold ManageChannels.
-  // setDefaultMemberPermissions is NOT used — it would gate the entire /fro-bot parent
-  // command (including /ping). This is a scoped runtime check per subcommand.
-  if ((await userIsAuthorized(guild, interaction.user.id, logger)) === false) {
-    logger.warn('add-project: unauthorized user', {correlationId, phase})
-    await editInteractionAsync(
-      interaction,
-      {content: 'You need the **Manage Channels** permission to use this command.'},
-      gatewayLogger,
-    )
-    return
-  }
 
   // Parse and validate URL
   const rawUrl = interaction.options.getString('url', true)
@@ -300,7 +310,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     await editInteractionAsync(
       interaction,
       {content: 'Invalid GitHub URL. Expected format: `https://github.com/owner/repo`'},
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -319,7 +329,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       await editInteractionAsync(
         interaction,
         {content: "Couldn't derive a channel name from the repo name. Please specify `channel:<name>` explicitly."},
-        gatewayLogger,
+        log,
       )
       return
     }
@@ -327,7 +337,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   } else {
     const validationError = validateChannelName(rawChannelName)
     if (validationError !== null) {
-      await editInteractionAsync(interaction, {content: validationError}, gatewayLogger)
+      await editInteractionAsync(interaction, {content: validationError}, log)
       return
     }
     channelName = rawChannelName
@@ -344,7 +354,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     await editInteractionAsync(
       interaction,
       {content: 'Internal error checking existing bindings. Please try again.'},
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -357,7 +367,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
         ].join(' '),
       },
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -371,7 +381,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
         },
-        gatewayLogger,
+        log,
       )
     } else {
       // Do NOT surface authResult.error.message — it may contain tokens or internal details.
@@ -380,7 +390,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
         },
-        gatewayLogger,
+        log,
       )
     }
     logger.warn('add-project: app auth failed', {
@@ -411,7 +421,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         content:
           'The operation took too long and the interaction window expired. Clone may have started — check workspace. Retry the command.',
       },
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -436,7 +446,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
             content:
               'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
           },
-          gatewayLogger,
+          log,
         )
         return
       } else if (code === 'repo-exists') {
@@ -452,7 +462,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           await editInteractionAsync(
             interaction,
             {content: 'Internal error checking existing bindings. Please retry in a moment.'},
-            gatewayLogger,
+            log,
           )
           return
         }
@@ -460,7 +470,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           await editInteractionAsync(
             interaction,
             {content: 'Internal error checking existing bindings. Please retry in a moment.'},
-            gatewayLogger,
+            log,
           )
           return
         }
@@ -477,7 +487,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
                 `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
               ].join(' '),
             },
-            gatewayLogger,
+            log,
           )
           return
         }
@@ -493,13 +503,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         const cloneFailResult = await editInteractionAsync(
           interaction,
           {content: `Clone failed. Check workspace-agent logs for details and retry.`},
-          gatewayLogger,
+          log,
         )
         if (cloneFailResult.success === false) {
-          gatewayLogger.error(
-            {err: cloneFailResult.error.message},
-            'add-project: failed to deliver final status to user',
-          )
+          log.error({err: cloneFailResult.error.message}, 'add-project: failed to deliver final status to user')
         }
         return
       }
@@ -507,10 +514,10 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       const timeoutResult = await editInteractionAsync(
         interaction,
         {content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'},
-        gatewayLogger,
+        log,
       )
       if (timeoutResult.success === false) {
-        gatewayLogger.error({err: timeoutResult.error.message}, 'add-project: failed to deliver final status to user')
+        log.error({err: timeoutResult.error.message}, 'add-project: failed to deliver final status to user')
       }
       return
     } else if (errorKind === 'response-mismatch') {
@@ -518,7 +525,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       await editInteractionAsync(
         interaction,
         {content: 'Internal error: workspace agent returned unexpected response. Contact operator.'},
-        gatewayLogger,
+        log,
       )
       return
     } else {
@@ -526,7 +533,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       await editInteractionAsync(
         interaction,
         {content: `Clone failed. Check workspace-agent connectivity and retry.`},
-        gatewayLogger,
+        log,
       )
       return
     }
@@ -550,7 +557,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName, outcome: 'start'})
 
   // Defensive permission re-check
-  if (!botHasRequiredPermissions(interaction.appPermissions)) {
+  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
     logger.warn('add-project: permissions revoked between pre-flight and channel creation', {
       correlationId,
       phase,
@@ -561,7 +568,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       {
         content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
       },
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -572,7 +579,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     await editInteractionAsync(
       interaction,
       {content: `Interaction window expired. The clone is preserved — retry the command.`},
-      gatewayLogger,
+      log,
     )
     return
   }
@@ -596,20 +603,20 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `Couldn't find an available channel name after 10 attempts. Specify \`channel:<name>\` explicitly.`,
         },
-        gatewayLogger,
+        log,
       )
     } else if (errorKind === 'permission-denied') {
       await editInteractionAsync(
         interaction,
         {content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`},
-        gatewayLogger,
+        log,
       )
     } else {
       // Do NOT surface channelResult.error.message — it may contain internal Discord API details.
       await editInteractionAsync(
         interaction,
         {content: `Failed to create channel. Check fro-bot's permissions and retry.`},
-        gatewayLogger,
+        log,
       )
     }
     return
@@ -662,7 +669,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
         },
-        gatewayLogger,
+        log,
       )
     } else if ('code' in error && error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
       // TypeScript narrows error to PartialWriteError via the discriminant above.
@@ -680,7 +687,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
         },
-        gatewayLogger,
+        log,
       )
     } else {
       await editInteractionAsync(
@@ -688,7 +695,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         {
           content: `Failed to write binding. Channel #${channel.name} was created. Retry the command — pre-flight will detect the existing channel.`,
         },
-        gatewayLogger,
+        log,
       )
     }
     return
@@ -712,12 +719,12 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const readyResult = await editInteractionAsync(
     interaction,
     {content: `✅ Ready — try @fro-bot in #${channel.name}`},
-    gatewayLogger,
+    log,
   )
   if (readyResult.success === false) {
     // Token expiry after a long clone is the realistic failure mode here.
     // Escalate to ERROR so operators can see the user never got the success confirmation.
-    gatewayLogger.error({err: readyResult.error.message}, 'add-project: failed to deliver final status to user')
+    log.error({err: readyResult.error.message}, 'add-project: failed to deliver final status to user')
   }
 
   // Post welcome message in the new channel.
@@ -737,7 +744,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         },
       ],
     },
-    gatewayLogger,
+    log,
   )
 
   if (welcomeResult.success === false) {
@@ -754,7 +761,7 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       {
         content: `✅ Channel #${channel.name} created and bound to \`${owner}/${repo}\`, but couldn't post the welcome message — verify fro-bot has **Send Messages** in #${channel.name}.`,
       },
-      gatewayLogger,
+      log,
     )
     return
   }
