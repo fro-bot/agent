@@ -418,6 +418,44 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 })
 
 // ---------------------------------------------------------------------------
+// /fro-bot clear-queue — infra-failure path (pipeline catchAll)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot clear-queue — infra-failure path', () => {
+  it('queue.clear throws → editReply called with internal-error copy AND Effect ends in failure', async () => {
+    // #given — queue.clear throws an unexpected infra error
+    const infraError = new Error('queue storage unavailable')
+    const queue: ChannelQueue<RunTask> = {
+      enqueue: vi.fn().mockReturnValue('queued'),
+      pendingCount: vi.fn().mockReturnValue(0),
+      takeNext: vi.fn().mockReturnValue(undefined),
+      clear: vi.fn().mockImplementation(() => {
+        throw infraError
+      }),
+    }
+    const deps = makeDeps({queue})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-infra-fail')
+
+    // #when — run via Effect.either so we can assert on both the reply AND the failure
+    const result = await Effect.runPromise(Effect.either(cmd.execute(interaction)))
+
+    // #then — deferReply was called (pipeline deferred before work)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+
+    // #and — the deferred reply was edited (not left hanging at "thinking…")
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+
+    // #and — the error still propagates (dispatchCommand-level logger sees it)
+    expect(result._tag).toBe('Left')
+    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('queue storage unavailable')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // /fro-bot force-release-lock — tests
 // ---------------------------------------------------------------------------
 
