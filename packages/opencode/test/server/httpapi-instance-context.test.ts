@@ -13,8 +13,10 @@ import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
 import { InstanceRef, WorkspaceRef } from "../../src/effect/instance-ref"
 import { InstanceLayer } from "../../src/project/instance-layer"
+import { InstanceStore } from "../../src/project/instance-store"
 import { Project } from "../../src/project/project"
 import { Session } from "../../src/session/session"
+import { PLUGIN_CLIENT_HEADER } from "../../src/server/plugin-client"
 import { disposeMiddleware, markInstanceForDisposal } from "../../src/server/routes/instance/httpapi/lifecycle"
 import {
   InstanceContextMiddleware,
@@ -169,6 +171,36 @@ describe("HttpApi instance context middleware", () => {
         projectID: project.project.id,
         workspaceID: null,
       })
+    }),
+  )
+
+  it.live("maps plugin client re-entry while loading to conflict", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = InstanceStore.Service.of({
+        load: () => Effect.die("unexpected normal load"),
+        loadPluginClient: () => Effect.fail(new InstanceStore.ReentrantLoadError({ directory: dir })),
+        reload: () => Effect.die("unexpected reload"),
+        dispose: () => Effect.void,
+        disposeDirectory: () => Effect.void,
+        disposeAll: () => Effect.void,
+        provide: (_input, effect) => effect,
+      } satisfies InstanceStore.Interface)
+      const routes = HttpApiBuilder.layer(ProbeApi).pipe(
+        Layer.provide(probeHandlers),
+        Layer.provide(instanceContextTestLayer),
+        Layer.provide(Layer.succeed(InstanceStore.Service, store)),
+        Layer.provide(Layer.mock(Session.Service)({})),
+      )
+      yield* HttpRouter.serve(routes).pipe(Layer.build)
+
+      const response = yield* HttpClientRequest.get(`/probe?directory=${encodeURIComponent(dir)}`).pipe(
+        HttpClientRequest.setHeader(PLUGIN_CLIENT_HEADER, "1"),
+        HttpClient.execute,
+      )
+
+      expect(response.status).toBe(409)
+      expect(yield* response.text).toContain("Plugin client request cannot enter instance")
     }),
   )
 
