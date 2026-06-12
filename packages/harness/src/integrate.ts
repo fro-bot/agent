@@ -66,7 +66,9 @@ export interface IntegrationAdapters {
   fetchRef: (workDir: string, remoteUrl: string, fetchRef: string, localRef: string) => Promise<void>
   /**
    * Capture the resolved upstream SHA of the most recently fetched ref.
-   * Called immediately after fetchRef to record each ref's actual tip SHA.
+   * MUST be called directly after the matching fetchRef and before any further
+   * fetch: the real adapter reads FETCH_HEAD, which is overwritten by the next
+   * fetch, so reordering or parallelizing the fetch loop would mis-attribute SHAs.
    * Returns null on failure — the caller falls back to integrationCommit for that ref.
    */
   captureRefSha: (workDir: string) => Promise<string | null>

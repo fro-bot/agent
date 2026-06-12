@@ -32,12 +32,14 @@ export function redactSecrets(text: string): string {
   // Redact GitHub token shapes (prefix + non-whitespace run).
   // Order matters: github_pat_ must come before the shorter ghs_/ghp_/etc. prefixes
   // to avoid a partial match leaving "github_pat_" with the suffix redacted separately.
-  let result = text.replaceAll(/\bgithub_pat_\S+/g, REDACTED)
-  result = result.replaceAll(/\bghp_\S+/g, REDACTED)
-  result = result.replaceAll(/\bgho_\S+/g, REDACTED)
-  result = result.replaceAll(/\bghu_\S+/g, REDACTED)
-  result = result.replaceAll(/\bghs_\S+/g, REDACTED)
-  result = result.replaceAll(/\bghr_\S+/g, REDACTED)
+  // No leading word boundary: the prefix is already a strong anchor, and omitting it
+  // keeps redaction fail-safe for tokens glued to a preceding character.
+  let result = text.replaceAll(/github_pat_\S+/g, REDACTED)
+  result = result.replaceAll(/ghp_\S+/g, REDACTED)
+  result = result.replaceAll(/gho_\S+/g, REDACTED)
+  result = result.replaceAll(/ghu_\S+/g, REDACTED)
+  result = result.replaceAll(/ghs_\S+/g, REDACTED)
+  result = result.replaceAll(/ghr_\S+/g, REDACTED)
 
   // Redact URL credentials: scheme://user:secret@host → scheme://[REDACTED]@host
   // Use a greedy match up to the last '@' before the host (stops at whitespace).
