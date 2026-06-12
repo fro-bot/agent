@@ -14,6 +14,8 @@ import type {ChatInputCommandInteraction, Guild, PermissionsBitField} from 'disc
 import type {BindingsStore} from '../../bindings/store.js'
 import type {AppClient} from '../../github/app-client.js'
 import type {WorkspaceClient} from '../../workspace-api/client.js'
+import type {GatewayLogger} from '../client.js'
+import type {AuthDecision, GuildCommandCtx, GuildCommandDeps, PreDeferCtx, PreDeferSignal} from './guild-command.js'
 
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
@@ -21,6 +23,8 @@ import {Effect} from 'effect'
 import {AppNotInstalledError} from '../../github/app-client.js'
 import {workspaceRepoPath} from '../../workspace-api/client.js'
 import {createChannelWithCollisionSuffix} from '../channels.js'
+import {editInteractionAsync, replyInteractionAsync, sendMessage} from '../io.js'
+import {makeGuildCommand} from './guild-command.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,7 +32,7 @@ import {createChannelWithCollisionSuffix} from '../channels.js'
 
 export type AddProjectPhase = 'PRE_FLIGHT' | 'CLONING' | 'CREATING_CHANNEL' | 'WRITING_BINDING' | 'READY' | 'FAILED'
 
-export interface AddProjectDeps {
+export interface AddProjectDeps extends GuildCommandDeps {
   readonly bindingsStore: BindingsStore
   readonly appClient: AppClient
   readonly workspaceClient: WorkspaceClient
@@ -177,6 +181,91 @@ async function userIsAuthorized(guild: Guild, userId: string, logger: AddProject
 const INTERACTION_WINDOW_MS = 14 * 60 * 1000
 
 // ---------------------------------------------------------------------------
+// Pipeline spec builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the `makeGuildCommand` spec for `/fro-bot add-project`.
+ *
+ * Entry sequence (pipeline-owned):
+ *   preDefer (rate-limit check) → guild-null guard (pipeline) → deferReply → authorize → work
+ *
+ * The phase orchestration body (clone/channel/binding phases) is the work function.
+ */
+export function buildAddProjectSpec(deps: AddProjectDeps): {
+  readonly preDefer: (ctx: PreDeferCtx) => Effect.Effect<PreDeferSignal, never>
+  readonly authorize: (ctx: GuildCommandCtx) => Effect.Effect<AuthDecision, never>
+  readonly work: (ctx: GuildCommandCtx) => Effect.Effect<void, Error>
+} {
+  const preDefer = (ctx: PreDeferCtx): Effect.Effect<PreDeferSignal, never> => {
+    const userId = ctx.interaction.user.id
+    const rateCheck = checkRateLimit(userId)
+    if (rateCheck.allowed === true) {
+      return Effect.succeed({proceed: true as const})
+    }
+    const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
+    return Effect.promise(async () => {
+      await replyInteractionAsync(
+        ctx.interaction,
+        {
+          content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
+          ephemeral: true,
+        },
+        ctx.log,
+      )
+      return {proceed: false as const}
+    })
+  }
+
+  const authorize = (ctx: GuildCommandCtx): Effect.Effect<AuthDecision, never> => {
+    return Effect.promise(async () => {
+      // Shutdown gate — must precede any auth REST calls (guild.members.fetch).
+      // Refusing here avoids a misleading permission-denial if the fetch fails
+      // during draining shutdown. The user sees a restart message, not a denial.
+      const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
+      if (shuttingDownCheck() === true) {
+        return {
+          authorized: false as const,
+          copy: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.',
+        }
+      }
+
+      // Bot-permission gate: ManageChannels + SendMessages required.
+      if (botHasRequiredPermissions(ctx.interaction.appPermissions) === false) {
+        ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: missing bot permissions')
+        return {
+          authorized: false as const,
+          copy: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${deps.installUrl}`,
+        }
+      }
+
+      // User authorization gate: invoking user must hold guild-level ManageChannels.
+      // setDefaultMemberPermissions is NOT used — it would gate the entire /fro-bot parent
+      // command (including /ping). This is a scoped runtime check per subcommand.
+      const authorized = await userIsAuthorized(ctx.guild, ctx.interaction.user.id, deps.logger)
+      if (authorized === false) {
+        ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: unauthorized user')
+        return {
+          authorized: false as const,
+          copy: 'You need the **Manage Channels** permission to use this command.',
+        }
+      }
+
+      return {authorized: true as const}
+    })
+  }
+
+  const work = (ctx: GuildCommandCtx): Effect.Effect<void, Error> => {
+    return Effect.tryPromise({
+      try: async () => runAddProjectPhases(ctx.interaction, ctx.guild, ctx.log, deps),
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+  }
+
+  return {preDefer, authorize, work}
+}
+
+// ---------------------------------------------------------------------------
 // Main orchestration
 // ---------------------------------------------------------------------------
 
@@ -190,30 +279,23 @@ export function executeAddProject(
   interaction: ChatInputCommandInteraction,
   deps: AddProjectDeps,
 ): Effect.Effect<void, Error> {
-  return Effect.tryPromise({
-    try: async () => runAddProject(interaction, deps),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
+  const {preDefer, authorize, work} = buildAddProjectSpec(deps)
+  const executor = makeGuildCommand(
+    {name: 'add-project', preDefer, authorize, work, serverOnlyCopy: 'This command can only be used in a server.'},
+    deps,
+  )
+  return executor(interaction)
 }
 
-async function runAddProject(interaction: ChatInputCommandInteraction, deps: AddProjectDeps): Promise<void> {
+async function runAddProjectPhases(
+  interaction: ChatInputCommandInteraction,
+  guild: Guild,
+  log: GatewayLogger,
+  deps: AddProjectDeps,
+): Promise<void> {
   const {bindingsStore, appClient, workspaceClient, installUrl, logger} = deps
   const correlationId = interaction.id
   const startTime = Date.now()
-
-  // ---------------------------------------------------------------------------
-  // Rate limit check (before deferReply — fast path)
-  // ---------------------------------------------------------------------------
-  const userId = interaction.user.id
-  const rateCheck = checkRateLimit(userId)
-  if (!rateCheck.allowed) {
-    const retryAfterSec = Math.ceil(rateCheck.retryAfterMs / 1000)
-    await interaction.reply({
-      content: `You're doing that too fast. Try again in ${retryAfterSec} seconds.`,
-      ephemeral: true,
-    })
-    return
-  }
 
   // ---------------------------------------------------------------------------
   // PRE_FLIGHT
@@ -221,52 +303,15 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   let phase: AddProjectPhase = 'PRE_FLIGHT'
   logger.info('add-project phase', {correlationId, phase, outcome: 'start'})
 
-  // Defer reply (ephemeral — setup thread is operationally sensitive)
-  await interaction.deferReply({ephemeral: true})
-
-  // Shutdown gate — placed after deferReply so Discord gets its mandatory ack (<3s).
-  // Refuse new work during draining shutdown; resume (Part 1) heals any hard-killed run.
-  const shuttingDownCheck = deps.isShuttingDown ?? (() => false)
-  if (shuttingDownCheck() === true) {
-    await interaction.editReply({
-      content: 'fro-bot is restarting. Please try `/fro-bot add-project` again in a moment.',
-    })
-    return
-  }
-
-  const guild = interaction.guild
-  if (guild === null) {
-    await interaction.editReply({content: 'This command can only be used in a server.'})
-    return
-  }
-
-  // Check bot permissions
-  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
-    logger.warn('add-project: missing bot permissions', {correlationId, phase})
-    await interaction.editReply({
-      content: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${installUrl}`,
-    })
-    return
-  }
-
-  // Runtime authorization check — invoking user must hold ManageChannels.
-  // setDefaultMemberPermissions is NOT used — it would gate the entire /fro-bot parent
-  // command (including /ping). This is a scoped runtime check per subcommand.
-  if ((await userIsAuthorized(guild, interaction.user.id, logger)) === false) {
-    logger.warn('add-project: unauthorized user', {correlationId, phase})
-    await interaction.editReply({
-      content: 'You need the **Manage Channels** permission to use this command.',
-    })
-    return
-  }
-
   // Parse and validate URL
   const rawUrl = interaction.options.getString('url', true)
   const parsed = parseGitHubUrl(rawUrl)
   if (parsed === null) {
-    await interaction.editReply({
-      content: 'Invalid GitHub URL. Expected format: `https://github.com/owner/repo`',
-    })
+    await editInteractionAsync(
+      interaction,
+      {content: 'Invalid GitHub URL. Expected format: `https://github.com/owner/repo`'},
+      log,
+    )
     return
   }
 
@@ -281,16 +326,18 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   if (rawChannelName === null) {
     const derived = deriveChannelName(repo)
     if (derived === null) {
-      await interaction.editReply({
-        content: "Couldn't derive a channel name from the repo name. Please specify `channel:<name>` explicitly.",
-      })
+      await editInteractionAsync(
+        interaction,
+        {content: "Couldn't derive a channel name from the repo name. Please specify `channel:<name>` explicitly."},
+        log,
+      )
       return
     }
     channelName = derived
   } else {
     const validationError = validateChannelName(rawChannelName)
     if (validationError !== null) {
-      await interaction.editReply({content: validationError})
+      await editInteractionAsync(interaction, {content: validationError}, log)
       return
     }
     channelName = rawChannelName
@@ -304,16 +351,24 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
       phase,
       errorKind: existingResult.error.message,
     })
-    await interaction.editReply({content: 'Internal error checking existing bindings. Please try again.'})
+    await editInteractionAsync(
+      interaction,
+      {content: 'Internal error checking existing bindings. Please try again.'},
+      log,
+    )
     return
   }
   if (existingResult.data !== null) {
-    await interaction.editReply({
-      content: [
-        `\`${owner}/${repo}\` is already set up in <#${existingResult.data.channelId}>.`,
-        `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
-      ].join(' '),
-    })
+    await editInteractionAsync(
+      interaction,
+      {
+        content: [
+          `\`${owner}/${repo}\` is already set up in <#${existingResult.data.channelId}>.`,
+          `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existingResult.data.channelId}> — it will repair the missing checkout automatically.`,
+        ].join(' '),
+      },
+      log,
+    )
     return
   }
 
@@ -321,14 +376,22 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   const authResult = await appClient.authForRepo(owner, repo)
   if (authResult.success === false) {
     if (authResult.error instanceof AppNotInstalledError) {
-      await interaction.editReply({
-        content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `The fro-bot GitHub App is not installed on \`${owner}/${repo}\`. Install it at: ${authResult.error.installUrl}`,
+        },
+        log,
+      )
     } else {
       // Do NOT surface authResult.error.message — it may contain tokens or internal details.
-      await interaction.editReply({
-        content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `GitHub App authentication failed. Check that the fro-bot GitHub App is installed on \`${owner}/${repo}\` and retry.`,
+        },
+        log,
+      )
     }
     logger.warn('add-project: app auth failed', {
       correlationId,
@@ -352,10 +415,14 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   // Interaction window guard
   if (Date.now() - startTime > INTERACTION_WINDOW_MS) {
     logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo})
-    await interaction.editReply({
-      content:
-        'The operation took too long and the interaction window expired. Clone may have started — check workspace. Retry the command.',
-    })
+    await editInteractionAsync(
+      interaction,
+      {
+        content:
+          'The operation took too long and the interaction window expired. Clone may have started — check workspace. Retry the command.',
+      },
+      log,
+    )
     return
   }
 
@@ -373,10 +440,14 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     if (errorKind === 'clone-error') {
       const code = cloneResult.error.code
       if (code === 'enospc' || code === 'disk-full') {
-        await interaction.editReply({
-          content:
-            'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
-        })
+        await editInteractionAsync(
+          interaction,
+          {
+            content:
+              'The workspace volume is out of space. Free disk by removing unused repos under `/workspace/repos` and retry.',
+          },
+          log,
+        )
         return
       } else if (code === 'repo-exists') {
         // repo-exists means the workspace-agent completed the clone atomically (temp dir renamed
@@ -388,11 +459,19 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         try {
           existing = await bindingsStore.getBindingByRepo(owner, repo)
         } catch {
-          await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+          await editInteractionAsync(
+            interaction,
+            {content: 'Internal error checking existing bindings. Please retry in a moment.'},
+            log,
+          )
           return
         }
         if (existing.success === false) {
-          await interaction.editReply({content: 'Internal error checking existing bindings. Please retry in a moment.'})
+          await editInteractionAsync(
+            interaction,
+            {content: 'Internal error checking existing bindings. Please retry in a moment.'},
+            log,
+          )
           return
         }
         if (existing.data !== null) {
@@ -400,12 +479,16 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           // Include the same recovery guidance as the PRE_FLIGHT already-bound path:
           // if the workspace was recreated, the user can repair the missing checkout
           // by @mentioning fro-bot in the bound channel.
-          await interaction.editReply({
-            content: [
-              `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
-              `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
-            ].join(' '),
-          })
+          await editInteractionAsync(
+            interaction,
+            {
+              content: [
+                `\`${owner}/${repo}\` is already set up in <#${existing.data.channelId}>.`,
+                `If the workspace was recently recreated and the checkout is missing, @mention fro-bot in <#${existing.data.channelId}> — it will repair the missing checkout automatically.`,
+              ].join(' '),
+            },
+            log,
+          )
           return
         }
         // Clone exists but no binding — a prior run failed after CLONING. Resume from CREATING_CHANNEL.
@@ -417,23 +500,41 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         // fall through — do NOT return
       } else {
         // Do NOT surface the internal code — it may confuse users and leaks implementation details.
-        await interaction.editReply({
-          content: `Clone failed. Check workspace-agent logs for details and retry.`,
-        })
+        const cloneFailResult = await editInteractionAsync(
+          interaction,
+          {content: `Clone failed. Check workspace-agent logs for details and retry.`},
+          log,
+        )
+        if (cloneFailResult.success === false) {
+          log.error({err: cloneFailResult.error.message}, 'add-project: failed to deliver final status to user')
+        }
         return
       }
     } else if (errorKind === 'timeout') {
-      await interaction.editReply({content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'})
+      const timeoutResult = await editInteractionAsync(
+        interaction,
+        {content: 'Clone timed out (5 minutes). The repo may be very large. Retry.'},
+        log,
+      )
+      if (timeoutResult.success === false) {
+        log.error({err: timeoutResult.error.message}, 'add-project: failed to deliver final status to user')
+      }
       return
     } else if (errorKind === 'response-mismatch') {
       logger.error('add-project: response-mismatch from workspace agent', {correlationId, phase, owner, repo})
-      await interaction.editReply({
-        content: 'Internal error: workspace agent returned unexpected response. Contact operator.',
-      })
+      await editInteractionAsync(
+        interaction,
+        {content: 'Internal error: workspace agent returned unexpected response. Contact operator.'},
+        log,
+      )
       return
     } else {
       // Do NOT surface the internal errorKind — it leaks implementation details.
-      await interaction.editReply({content: `Clone failed. Check workspace-agent connectivity and retry.`})
+      await editInteractionAsync(
+        interaction,
+        {content: `Clone failed. Check workspace-agent connectivity and retry.`},
+        log,
+      )
       return
     }
   } else {
@@ -456,24 +557,30 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName, outcome: 'start'})
 
   // Defensive permission re-check
-  if (!botHasRequiredPermissions(interaction.appPermissions)) {
+  if (botHasRequiredPermissions(interaction.appPermissions) === false) {
     logger.warn('add-project: permissions revoked between pre-flight and channel creation', {
       correlationId,
       phase,
       workspacePath,
     })
-    await interaction.editReply({
-      content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
-    })
+    await editInteractionAsync(
+      interaction,
+      {
+        content: `fro-bot lost **Manage Channels** permission. The clone is preserved — re-grant permissions and retry the command.`,
+      },
+      log,
+    )
     return
   }
 
   // Interaction window guard
   if (Date.now() - startTime > INTERACTION_WINDOW_MS) {
     logger.warn('add-project: interaction window exhausted', {correlationId, phase, owner, repo, workspacePath})
-    await interaction.editReply({
-      content: `Interaction window expired. The clone is preserved — retry the command.`,
-    })
+    await editInteractionAsync(
+      interaction,
+      {content: `Interaction window expired. The clone is preserved — retry the command.`},
+      log,
+    )
     return
   }
 
@@ -491,18 +598,26 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
     })
 
     if (errorKind === 'collision-exhausted') {
-      await interaction.editReply({
-        content: `Couldn't find an available channel name after 10 attempts. Specify \`channel:<name>\` explicitly.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Couldn't find an available channel name after 10 attempts. Specify \`channel:<name>\` explicitly.`,
+        },
+        log,
+      )
     } else if (errorKind === 'permission-denied') {
-      await interaction.editReply({
-        content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {content: `fro-bot lacks permission to create channels. Re-invite at: ${installUrl}`},
+        log,
+      )
     } else {
       // Do NOT surface channelResult.error.message — it may contain internal Discord API details.
-      await interaction.editReply({
-        content: `Failed to create channel. Check fro-bot's permissions and retry.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {content: `Failed to create channel. Check fro-bot's permissions and retry.`},
+        log,
+      )
     }
     return
   }
@@ -549,9 +664,13 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
 
     if ('code' in error && error.code === 'BINDING_EXISTS_ERROR') {
       // Concurrent setup raced past PRE_FLIGHT
-      await interaction.editReply({
-        content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `\`${owner}/${repo}\` was bound by a concurrent request. Channel #${channel.name} was created by this request — manual cleanup may be needed.`,
+        },
+        log,
+      )
     } else if ('code' in error && error.code === 'BINDING_PARTIAL_WRITE_ERROR') {
       // TypeScript narrows error to PartialWriteError via the discriminant above.
       // Log the S3 keys for operator recovery; do NOT surface them in the Discord reply.
@@ -563,13 +682,21 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
         primaryKey: 'primaryKey' in error ? error.primaryKey : undefined,
         indexKey: 'indexKey' in error ? error.indexKey : undefined,
       })
-      await interaction.editReply({
-        content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Partial write error: the binding was partially saved. Please contact the operator to complete the setup for \`${owner}/${repo}\`.`,
+        },
+        log,
+      )
     } else {
-      await interaction.editReply({
-        content: `Failed to write binding. Channel #${channel.name} was created. Retry the command — pre-flight will detect the existing channel.`,
-      })
+      await editInteractionAsync(
+        interaction,
+        {
+          content: `Failed to write binding. Channel #${channel.name} was created. Retry the command — pre-flight will detect the existing channel.`,
+        },
+        log,
+      )
     }
     return
   }
@@ -589,13 +716,22 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
   phase = 'READY'
   logger.info('add-project phase', {correlationId, phase, owner, repo, channelName: channel.name, outcome: 'start'})
 
-  await interaction.editReply({
-    content: `✅ Ready — try @fro-bot in #${channel.name}`,
-  })
+  const readyResult = await editInteractionAsync(
+    interaction,
+    {content: `✅ Ready — try @fro-bot in #${channel.name}`},
+    log,
+  )
+  if (readyResult.success === false) {
+    // Token expiry after a long clone is the realistic failure mode here.
+    // Escalate to ERROR so operators can see the user never got the success confirmation.
+    log.error({err: readyResult.error.message}, 'add-project: failed to deliver final status to user')
+  }
 
-  // Post welcome message in the new channel
-  try {
-    await channel.send({
+  // Post welcome message in the new channel.
+  // channel.send is a Message/Thread surface send — use sendMessage from io.ts.
+  const welcomeResult = await sendMessage(
+    channel,
+    {
       embeds: [
         {
           title: `Bound to ${owner}/${repo}`,
@@ -607,19 +743,26 @@ async function runAddProject(interaction: ChatInputCommandInteraction, deps: Add
           color: 0x57f287, // success-green
         },
       ],
-    })
-  } catch (welcomeError) {
+    },
+    log,
+  )
+
+  if (welcomeResult.success === false) {
     logger.warn('add-project: welcome message post failed', {
       correlationId,
       phase,
       owner,
       repo,
       channelName: channel.name,
-      err: welcomeError instanceof Error ? welcomeError.message : String(welcomeError),
+      err: welcomeResult.error.message,
     })
-    await interaction.editReply({
-      content: `✅ Channel #${channel.name} created and bound to \`${owner}/${repo}\`, but couldn't post the welcome message — verify fro-bot has **Send Messages** in #${channel.name}.`,
-    })
+    await editInteractionAsync(
+      interaction,
+      {
+        content: `✅ Channel #${channel.name} created and bound to \`${owner}/${repo}\`, but couldn't post the welcome message — verify fro-bot has **Send Messages** in #${channel.name}.`,
+      },
+      log,
+    )
     return
   }
 

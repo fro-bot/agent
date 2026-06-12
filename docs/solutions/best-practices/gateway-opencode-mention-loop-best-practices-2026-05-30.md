@@ -1,6 +1,7 @@
 ---
 title: Gateway OpenCode mention-loop best practices
 date: 2026-05-30
+last_updated: 2026-06-10
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -104,20 +105,38 @@ stale run before releasing**. A stale run-state whose lease already expired may 
 lock re-acquired by a newer, live run; releasing blindly deletes the newer run's lock and
 permits concurrent execution against the same repo. This was a P0.
 
+The canonical recovery entry point is `recoverStaleRuns` (`packages/gateway/src/execute/recovery.ts`),
+which calls the internal `recoverOneRun` helper per stale run. Both `getLockKey` and `getRunKey`
+are the exported key builders from `packages/runtime/src/coordination/lock.ts` and
+`packages/runtime/src/coordination/run-state.ts` respectively — never construct these keys
+ad-hoc. See also: `docs/solutions/best-practices/centralize-s3-key-identity-construction-2026-06-09.md`.
+
 ```ts
-// packages/gateway/src/execute/recovery.ts
+// packages/gateway/src/execute/recovery.ts (inside recoverOneRun)
+// Key builders from @fro-bot/runtime — single source of truth for key shape:
+const runKeyResult = getRunKey(coordinationConfig, identity, repo, run.run_id)
+const lockKeyResult = getLockKey(coordinationConfig, repo)
+
+// Only release the lock when it belongs to this stale run:
 const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
 if (lockFetch !== null) {
   if (lockFetch.runId === run.run_id) {
     await releaseLock(coordinationConfig, repo, lockFetch.etag, coordLogger)
   } else {
-    logger.warn({runId: run.run_id, repo, lockRunId: lockFetch.runId}, 'recovery: lock owned by another run — skip release')
+    logger.warn(
+      {runId: run.run_id, repo, lockRunId: lockFetch.runId},
+      'recovery: lock.run_id does not match stale run — skipping release (lock belongs to a different run)',
+    )
   }
 }
 ```
 
 An unparseable/missing `run_id` resolves to `null` → skip the release (fail safe: never delete
 a lock you cannot prove belongs to the stale run).
+
+`forceReleaseStaleLock` (`packages/runtime/src/coordination/lock.ts`) is the dual-signal
+(lease-expired + heartbeat-stale) variant used outside the startup sweep; it also calls
+`getLockKey` internally and guards the read→delete race with an `IfMatch` conditional delete.
 
 ### 4. Flush partial output on failure paths
 
@@ -126,13 +145,18 @@ timeout/error — so the most expensive failure (a 600s timeout) yields the leas
 Flush buffered output best-effort **in the catch path, before the coarse error reply**, in its
 own try/catch so a flush failure cannot mask the original error. Guard against double-post.
 
+The coarse user message is sent via `sendMessage` from `discord/io.ts` (the old `safeSend`/
+`safeReply` local helpers in `run.ts` have been deleted; all Discord content sends now go
+through `discord/io.ts`).
+
 ```ts
 // packages/gateway/src/execute/run.ts (catch path)
 if (sink !== null) {
   await sink.flush().catch((flushError: unknown) =>
     logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path'))
 }
-// ...then send the coarse, detail-free user message
+// ...then send the coarse, detail-free user message via sendMessage (discord/io.ts):
+await sendMessage(thread, {content: userMessage}, logger)
 ```
 
 ### 5. Bounded execution + guaranteed resource release

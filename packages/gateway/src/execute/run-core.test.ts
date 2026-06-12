@@ -128,7 +128,7 @@ function toolSuccessEvent(callID: string, structured: object | null = null, sess
 }
 
 /**
- * `message.part.updated` with partType:'tool' — OpenCode 1.15.13 contract.
+ * `message.part.updated` with partType:'tool' — current OpenCode event contract (tool progress via message.part.updated).
  * The session ID is embedded in the part (mirrors streaming.ts:242 guard).
  */
 function partUpdatedToolEvent(tool: string, status: string, state: object, sessionID = 'sess-123'): object {
@@ -163,7 +163,7 @@ function sessionIdleEvent(sessionID: string): object {
 
 /**
  * Factory: `message.part.updated` with a reasoning part carrying an `id`.
- * Used to register a reasoning partID in the suppression set (Unit 2 / R5).
+ * Used to register a reasoning partID in the suppression set.
  */
 function reasoningPartUpdatedEvent(partId: string, sessionID = 'sess-123'): object {
   return {
@@ -557,7 +557,7 @@ describe('runOpenCodeCore', () => {
     })
   })
 
-  describe('tool call progress (message.part.updated — OpenCode 1.15.13 contract)', () => {
+  describe('tool call progress (message.part.updated — current OpenCode event contract)', () => {
     it('appends a progress line for a bash tool using input.command (side-effecting command)', async () => {
       // #given — bash summarizer renders the command inline (not the tool name)
       // Uses a side-effecting command (pnpm build) so it is not hidden by read-only bash filtering
@@ -1245,11 +1245,11 @@ describe('runOpenCodeCore', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Unit 2: Reasoning suppression (R5 regression) + tool summarizer wiring
+  // Reasoning suppression + tool summarizer wiring
   // ---------------------------------------------------------------------------
 
-  describe('reasoning suppression — R5 regression (partID correlation)', () => {
-    it('(R5 critical) reasoning part registers its id; subsequent deltas with that partID → sink receives nothing', async () => {
+  describe('reasoning suppression regression (partID correlation)', () => {
+    it('reasoning part registers its id; subsequent deltas with that partID → sink receives nothing', async () => {
       // #given — reasoning part arrives first, then its deltas
       const sink = makeSink()
       const handle = makeHandle({
@@ -1345,7 +1345,7 @@ describe('runOpenCodeCore', () => {
     })
   })
 
-  describe('tool summarizer wiring — Unit 2 (replaces raw 🔧 format)', () => {
+  describe('tool summarizer wiring (replaces raw 🔧 format)', () => {
     it('edit tool via message.part.updated → sink receives summary line, NOT raw 🔧 format', async () => {
       // #given — edit tool with filePath and newString/oldString
       const sink = makeSink()
@@ -1916,10 +1916,10 @@ describe('runOpenCodeCore', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Unit 3: onActivity and onBusy hooks
+  // onActivity and onBusy hooks
   // ---------------------------------------------------------------------------
 
-  describe('onActivity and onBusy hooks (Unit 3)', () => {
+  describe('onActivity and onBusy hooks', () => {
     it('onBusy(true) called after prompt is sent successfully', async () => {
       // #given
       const onBusy = vi.fn()

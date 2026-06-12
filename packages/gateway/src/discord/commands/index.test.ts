@@ -139,8 +139,14 @@ describe('dispatchCommand', () => {
     expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toContain('nonexistent')
     // #and — Discord receives an ephemeral acknowledgement within the 3-second window
     // so the user sees an actual response instead of "This interaction failed"
-    const contentMatcher: unknown = expect.stringContaining('nonexistent')
-    expect(reply).toHaveBeenCalledExactlyOnceWith({content: contentMatcher, ephemeral: true})
+    // The helper always injects allowedMentions: {parse: []}
+    expect(reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        content: expect.stringContaining('nonexistent') as unknown as string,
+        ephemeral: true,
+        allowedMentions: {parse: []},
+      }),
+    )
   })
 
   it('still fails with the original error when the ephemeral ack itself fails', async () => {
@@ -172,12 +178,16 @@ describe('dispatchCommand', () => {
     // #when
     await Effect.runPromise(dispatchCommand(interaction, registry))
 
-    // #then
-    expect(reply).toHaveBeenCalledWith({content: 'pong', ephemeral: true})
+    // #then — helper always injects allowedMentions: {parse: []}
+    expect(reply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'pong', ephemeral: true, allowedMentions: {parse: []}}),
+    )
   })
 
   it('logs a console.warn when the ephemeral ack fails for an unknown command', async () => {
-    // #given a reply() that rejects so the ack-failure branch fires
+    // #given a reply() that rejects so the ack-failure branch fires.
+    // replyInteraction catches the error and returns err(Error) in the Result.
+    // dispatchCommand checks the Result and logs via console.warn.
     const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     try {
       const reply = vi.fn().mockRejectedValue(new Error('Token expired'))
@@ -190,10 +200,21 @@ describe('dispatchCommand', () => {
       // #then — Effect still fails with unknown-command (existing behavior preserved)
       expect(result._tag).toBe('Left')
 
-      // #and — console.warn captured the ack failure with the JSON payload shape
-      expect(consoleSpy).toHaveBeenCalledOnce()
-      const arg = consoleSpy.mock.calls[0]?.[0] as string
-      const parsed = JSON.parse(arg) as Record<string, unknown>
+      // #and — console.warn captured the ack failure with the JSON payload shape.
+      // Note: replyInteraction also logs via DISPATCH_LOGGER (which calls console.warn),
+      // so there may be 2 console.warn calls. The dispatchCommand-level log is the one
+      // with msg: 'ack failed for unknown command'.
+      const warnCalls = consoleSpy.mock.calls as [string][]
+      const dispatchWarnCall = warnCalls.find(([arg]) => {
+        try {
+          const parsed = JSON.parse(arg) as Record<string, unknown>
+          return parsed.msg === 'ack failed for unknown command'
+        } catch {
+          return false
+        }
+      })
+      expect(dispatchWarnCall).toBeDefined()
+      const parsed = JSON.parse((dispatchWarnCall as [string])[0]) as Record<string, unknown>
       expect(parsed.level).toBe('warn')
       expect(parsed.msg).toBe('ack failed for unknown command')
       expect(parsed.commandName).toBe('nonexistent')
@@ -204,8 +225,9 @@ describe('dispatchCommand', () => {
   })
 
   it('dispatches /fro-bot add-project to executeAddProject with injected deps', async () => {
-    // #given — registry built with mock deps; add-project will fail at rate-limit check
-    // because the interaction mock has no guild, but we just need to verify routing.
+    // #given — registry built with mock deps; guild is null to exercise the guild-null guard path.
+    // add-project uses the pipeline, which guards BEFORE defer.
+    // So guild-null → immediate ephemeral reply (interaction.reply), deferReply NOT called.
     const deps = makeMockDeps()
     const registry = getCommandRegistry(deps)
 
@@ -228,14 +250,15 @@ describe('dispatchCommand', () => {
       reply,
     } as unknown as ChatInputCommandInteraction
 
-    // #when — dispatch routes to add-project; it will fail at guild check (guild is null)
+    // #when — dispatch routes to add-project; guild-null guard fires pre-defer
     await Effect.runPromise(dispatchCommand(interaction, registry))
 
-    // #then — deferReply was called (PRE_FLIGHT started) and editReply was called with guild error
-    expect(deferReply).toHaveBeenCalledWith({ephemeral: true})
-    expect(editReply).toHaveBeenCalledWith(
+    // #then — immediate ephemeral reply (not deferred) with server-only message
+    expect(reply).toHaveBeenCalledWith(
       expect.objectContaining({content: expect.stringContaining('server') as unknown as string}),
     )
+    // #and — deferReply NOT called (guard fires before defer)
+    expect(deferReply).not.toHaveBeenCalled()
   })
 })
 
