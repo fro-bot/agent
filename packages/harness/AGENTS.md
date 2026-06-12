@@ -97,7 +97,7 @@ The integrate job maps it to an internal env var, writes it to a 0600 temp file,
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
-  --field base_version=1.15.13 \
+  --field base_version=<configured-base-release> \
   --field dry_run=true
 ```
 
@@ -105,7 +105,7 @@ gh workflow run harness-release.yaml \
 ```bash
 gh workflow run harness-release.yaml \
   --repo fro-bot/agent \
-  --field base_version=1.15.13
+  --field base_version=<configured-base-release>
 ```
 
 The publish job is additionally gated by the `npm-publish` GitHub environment (required reviewers).
