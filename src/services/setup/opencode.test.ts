@@ -385,4 +385,170 @@ describe('opencode', () => {
       expect(FALLBACK_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
     })
   })
+
+  describe('harness SHA256 verification', () => {
+    const HARNESS_VERSION = '1.17.3+harness.abc12345'
+    const ARCHIVE_FILENAME = 'opencode-linux-x64.tar.gz'
+    const ARCHIVE_PATH = '/tmp/opencode-linux-x64.tar.gz'
+    const CHECKSUMS_PATH = '/tmp/SHA256SUMS'
+    const VALID_HASH = 'a'.repeat(64)
+    const CHECKSUMS_CONTENT = `${VALID_HASH}  ${ARCHIVE_FILENAME}\n`
+
+    function createHarnessToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
+      return createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockImplementation(async (url: string) => {
+          if (url.endsWith('SHA256SUMS')) {
+            return Promise.resolve(CHECKSUMS_PATH)
+          }
+          return Promise.resolve(ARCHIVE_PATH)
+        }),
+        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
+        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/harness'),
+        ...overrides,
+      })
+    }
+
+    function createHarnessExecAdapter(checksumOutput: string): ExecAdapter {
+      return createMockExecAdapter({
+        getExecOutput: vi.fn().mockImplementation(async (cmd: string, _args?: string[]) => {
+          // shasum -a 256 <archivePath> → "<hash>  <filename>"
+          if (cmd === 'shasum' || cmd === 'sha256sum') {
+            return {exitCode: 0, stdout: `${VALID_HASH}  ${ARCHIVE_FILENAME}\n`, stderr: ''}
+          }
+          // cat <checksumsPath> → checksums file content
+          if (cmd === 'cat') {
+            return {exitCode: 0, stdout: checksumOutput, stderr: ''}
+          }
+          // file command for magic-byte check (should NOT be called for harness)
+          return {exitCode: 0, stdout: 'gzip compressed data', stderr: ''}
+        }),
+      })
+    }
+
+    it('happy path: harness version downloads SHA256SUMS and verifies matching hash', async () => {
+      // #given
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+
+      const mockToolCache = createHarnessToolCache()
+      const mockExec = createHarnessExecAdapter(CHECKSUMS_CONTENT)
+
+      // #when
+      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
+
+      // #then
+      expect(result.cached).toBe(false)
+      expect(result.version).toBe(HARNESS_VERSION)
+      // SHA256SUMS must have been downloaded (two downloadTool calls: archive + SHA256SUMS)
+      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(2)
+      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
+      expect(calls.some(([url]) => url.endsWith('SHA256SUMS'))).toBe(true)
+      // Extraction should proceed
+      expect(mockToolCache.extractTar).toHaveBeenCalled()
+    })
+
+    it('error: harness checksum mismatch → falls back to FALLBACK_VERSION (stock)', async () => {
+      // #given
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+
+      const WRONG_HASH = 'b'.repeat(64)
+      const mismatchChecksums = `${WRONG_HASH}  ${ARCHIVE_FILENAME}\n`
+
+      // Primary harness: returns mismatched checksum; fallback stock: succeeds
+      const mockToolCache = createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockImplementation(async (url: string) => {
+          if (url.includes('fro-bot') && url.endsWith('SHA256SUMS')) {
+            return Promise.resolve(CHECKSUMS_PATH)
+          }
+          if (url.includes('fro-bot')) {
+            return Promise.resolve(ARCHIVE_PATH)
+          }
+          // Stock fallback download
+          return Promise.resolve('/tmp/opencode-stock.tar.gz')
+        }),
+        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
+        cacheDir: vi.fn().mockResolvedValue(`/cached/opencode/${FALLBACK_VERSION}`),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockImplementation(async (cmd: string, _args?: string[]) => {
+          if (cmd === 'shasum' || cmd === 'sha256sum') {
+            return {exitCode: 0, stdout: `${VALID_HASH}  ${ARCHIVE_FILENAME}\n`, stderr: ''}
+          }
+          if (cmd === 'cat') {
+            return {exitCode: 0, stdout: mismatchChecksums, stderr: ''}
+          }
+          return {exitCode: 0, stdout: 'gzip compressed data', stderr: ''}
+        }),
+      })
+
+      // #when
+      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
+
+      // #then
+      expect(result.version).toBe(FALLBACK_VERSION)
+      // Warning logged for primary failure
+      expect(mockLogger.warning).toHaveBeenCalled()
+    })
+
+    it('error: harness SHA256SUMS download fails (404) → falls back to FALLBACK_VERSION', async () => {
+      // #given
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+
+      const mockToolCache = createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockImplementation(async (url: string) => {
+          if (url.endsWith('SHA256SUMS')) {
+            throw new Error('HTTP 404: Not Found')
+          }
+          if (url.includes('fro-bot')) {
+            return Promise.resolve(ARCHIVE_PATH)
+          }
+          // Stock fallback
+          return Promise.resolve('/tmp/opencode-stock.tar.gz')
+        }),
+        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
+        cacheDir: vi.fn().mockResolvedValue(`/cached/opencode/${FALLBACK_VERSION}`),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'gzip compressed data', stderr: ''}),
+      })
+
+      // #when
+      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
+
+      // #then
+      expect(result.version).toBe(FALLBACK_VERSION)
+      expect(mockLogger.warning).toHaveBeenCalled()
+    })
+
+    it('happy path: stock version uses magic-byte validateDownload only, no SHA256SUMS download', async () => {
+      // #given
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+
+      const mockToolCache = createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockResolvedValue('/tmp/opencode.tar.gz'),
+        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
+        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/1.17.3'),
+      })
+      const mockExec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'gzip compressed data', stderr: ''}),
+      })
+
+      // #when
+      const result = await installOpenCode('1.17.3', mockLogger, mockToolCache, mockExec)
+
+      // #then
+      expect(result.version).toBe('1.17.3')
+      // Only ONE downloadTool call (archive only, no SHA256SUMS)
+      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(1)
+      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
+      expect(calls.every(([url]) => !url.endsWith('SHA256SUMS'))).toBe(true)
+    })
+  })
 })

@@ -76,8 +76,82 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
 }
 
 /**
+ * Build the SHA256SUMS asset URL for a harness release.
+ *
+ * The SHA256SUMS file lives in the same release as the archive, at the same
+ * base URL but with filename `SHA256SUMS`. The `+` in the version tag is
+ * percent-encoded as `%2B` (same as in `buildDownloadUrl`).
+ */
+export function buildChecksumsUrl(version: string): string {
+  const rawTag = version.startsWith('v') ? version : `v${version}`
+  const encodedTag = rawTag.replaceAll('+', '%2B')
+  return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/SHA256SUMS`
+}
+
+/**
+ * Verify a harness archive against the release's SHA256SUMS file.
+ *
+ * Downloads the SHA256SUMS asset from the same release, reads it via `cat`,
+ * computes the archive's sha256 via `shasum -a 256`, and asserts the hashes
+ * match for this platform's asset filename. Throws on mismatch or missing line.
+ *
+ * This is ONLY called for harness versions — stock anomalyco/opencode releases
+ * do not publish a SHA256SUMS asset.
+ */
+async function verifyHarnessChecksum(
+  archivePath: string,
+  version: string,
+  platformInfo: PlatformInfo,
+  toolCache: ToolCacheAdapter,
+  execAdapter: ExecAdapter,
+  logger: Logger,
+): Promise<void> {
+  const checksumsUrl = buildChecksumsUrl(version)
+  logger.debug('Downloading SHA256SUMS for harness release', {url: checksumsUrl})
+
+  const checksumsPath = await toolCache.downloadTool(checksumsUrl)
+
+  // Read the checksums file
+  const {stdout: checksumsContent} = await execAdapter.getExecOutput('cat', [checksumsPath], {silent: true})
+
+  // Find the line for this platform's archive filename
+  const archiveFilename = `opencode-${platformInfo.os}-${platformInfo.arch}${platformInfo.ext}`
+  const matchingLine = checksumsContent
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line.endsWith(archiveFilename))
+
+  if (matchingLine === undefined || matchingLine.length === 0) {
+    throw new Error(`SHA256SUMS does not contain an entry for ${archiveFilename}`)
+  }
+
+  // SHA256SUMS format: "<hash>  <filename>"
+  const expectedHash = matchingLine.split(/\s+/)[0]
+  if (expectedHash === undefined || expectedHash.length === 0) {
+    throw new Error(`Could not parse hash from SHA256SUMS line: ${matchingLine}`)
+  }
+
+  // Compute the archive's sha256
+  const {stdout: shasumOutput} = await execAdapter.getExecOutput('shasum', ['-a', '256', archivePath], {silent: true})
+  // shasum output: "<hash>  <path>"
+  const actualHash = shasumOutput.trim().split(/\s+/)[0]
+  if (actualHash === undefined || actualHash.length === 0) {
+    throw new Error('Could not compute SHA256 of downloaded archive')
+  }
+
+  if (actualHash.toLowerCase() !== expectedHash.toLowerCase()) {
+    throw new Error(`SHA256 mismatch for ${archiveFilename}: expected ${expectedHash}, got ${actualHash}`)
+  }
+
+  logger.debug('Harness archive SHA256 verified', {filename: archiveFilename, hash: actualHash})
+}
+
+/**
  * Validate downloaded archive is not corrupted.
  * Uses `file` command on Unix to check file type.
+ *
+ * This is used for STOCK (anomalyco/opencode) downloads only. Harness downloads
+ * use `verifyHarnessChecksum` instead.
  */
 async function validateDownload(
   downloadPath: string,
@@ -133,11 +207,22 @@ export async function installOpenCode(
     const result = await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter)
     return result
   } catch (error) {
-    logger.warning('Primary version install failed, trying fallback', {
-      requestedVersion: version,
-      fallbackVersion,
-      error: toErrorMessage(error),
-    })
+    if (isHarnessVersion(version)) {
+      logger.warning(
+        'Harness OpenCode download failed (checksum mismatch, missing SHA256SUMS, or network error); falling back to stock OpenCode',
+        {
+          harnessVersion: version,
+          fallbackVersion,
+          error: toErrorMessage(error),
+        },
+      )
+    } else {
+      logger.warning('Primary version install failed, trying fallback', {
+        requestedVersion: version,
+        fallbackVersion,
+        error: toErrorMessage(error),
+      })
+    }
   }
 
   // Fallback to known stable version
@@ -165,9 +250,15 @@ async function downloadAndInstall(
   const downloadUrl = buildDownloadUrl(version, platformInfo)
   const downloadPath = await toolCache.downloadTool(downloadUrl)
 
-  const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter)
-  if (!isValid) {
-    throw new Error('Downloaded archive appears corrupted')
+  if (isHarnessVersion(version)) {
+    // Harness releases publish a SHA256SUMS asset — verify before extraction.
+    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, execAdapter, logger)
+  } else {
+    // Stock releases: use magic-byte check only (no SHA256SUMS asset exists).
+    const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter)
+    if (!isValid) {
+      throw new Error('Downloaded archive appears corrupted')
+    }
   }
 
   logger.info('Extracting OpenCode')
