@@ -178,7 +178,6 @@ async function tryCreateV2Client(
 async function startV2SessionWait(
   serverUrl: string | null | undefined,
   sessionId: string,
-  directory: string,
   activityTracker: ActivityTracker,
   logger: Logger,
   signal: AbortSignal,
@@ -187,7 +186,7 @@ async function startV2SessionWait(
   if (v2Client == null) return false
 
   try {
-    const response = await v2Client.v2.session.wait({sessionID: sessionId, directory}, {signal})
+    const response = await v2Client.v2.session.wait({sessionID: sessionId}, {signal})
     if (response.error != null) {
       logger.debug('v2.session.wait() returned error, relying on poll watchdog', {
         sessionId,
@@ -301,18 +300,11 @@ export async function runPromptAttempt(
       activityTracker,
     )
 
-    // Concurrently start v2.session.wait() if available (SDK 1.14.39+).
+    // Concurrently start v2.session.wait() if available (SDK v2 session-wait endpoint).
     // It is the authoritative completion signal — blocks until the agent loop is idle.
     // On success it marks activityTracker idle so the poller exits on its next tick.
     // On error/rejection it resolves false and we rely solely on the poller.
-    const waitPromise = startV2SessionWait(
-      serverUrl,
-      sessionId,
-      directory,
-      activityTracker,
-      logger,
-      waitAbortController.signal,
-    )
+    const waitPromise = startV2SessionWait(serverUrl, sessionId, activityTracker, logger, waitAbortController.signal)
 
     // Race: whichever settles first wins.
     // - wait() wins → marks activityTracker idle → return success immediately.

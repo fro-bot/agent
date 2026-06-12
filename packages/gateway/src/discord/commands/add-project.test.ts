@@ -163,6 +163,15 @@ function makeWorkspaceClient(overrides?: {clone?: ReturnType<typeof vi.fn>}): Wo
   } as unknown as WorkspaceClient
 }
 
+function makeGatewayLogger() {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+}
+
 function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
   return {
     bindingsStore: makeBindingsStore(),
@@ -170,6 +179,7 @@ function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
     workspaceClient: makeWorkspaceClient(),
     installUrl: 'https://github.com/apps/fro-bot-agent/installations/new',
     logger: makeLogger(),
+    gatewayLogger: makeGatewayLogger(),
     ...overrides,
   }
 }
@@ -209,6 +219,26 @@ describe('executeAddProject', () => {
       expect(lastEditReplyContent(editReply)).toContain('Ready')
       // Welcome message posted in channel
       expect(send).toHaveBeenCalledOnce()
+    })
+
+    it('all editReply calls include allowedMentions: {parse: []} (mention-safety guard)', async () => {
+      // #given — run through the full happy path
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({guild, userId})
+      const deps = makeDeps()
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — every editReply call must include allowedMentions: {parse: []}
+      // This asserts the io.ts helper always injects the mention-safety guard.
+      const calls = editReply.mock.calls as [{allowedMentions?: {parse: string[]}}][]
+      expect(calls.length).toBeGreaterThan(0)
+      for (const [arg] of calls) {
+        expect(arg?.allowedMentions).toEqual({parse: []})
+      }
     })
 
     it('canonicalizes Owner/Repo to lowercase before binding', async () => {
@@ -1330,6 +1360,188 @@ describe('executeAddProject', () => {
       expect(calls1[0]?.[0]?.repo).toBe('testrepo')
       expect(calls2[0]?.[0]?.owner).toBe('testowner')
       expect(calls2[0]?.[0]?.repo).toBe('testrepo')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // ERROR escalation: post-clone final editInteractionAsync failures
+  // -------------------------------------------------------------------------
+
+  describe('READY: post-clone success editInteractionAsync failure → ERROR log with command context', () => {
+    it('logs at ERROR with {command: "add-project"} and err when final success editReply fails', async () => {
+      // #given — all phases succeed but the final "✅ Ready" editReply fails (token expired)
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      // editReply fails on the final READY edit (the "✅ Ready" call)
+      // We need to make editReply fail only on the last call (the READY one).
+      // The READY editReply is the first one after binding succeeds.
+      // We'll make editReply reject on all calls after binding write to isolate the READY edit.
+      let editCallCount = 0
+      const editReply = vi.fn().mockImplementation(async () => {
+        editCallCount++
+        // The READY edit is the first editReply after all pre-flight/clone/channel/binding phases.
+        // In the happy path, there's only one editReply call (the READY one).
+        // We make it fail on the last call.
+        if (editCallCount >= 1) throw tokenExpiredError
+        return undefined
+      })
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({gatewayLogger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — gatewayLogger.error was called with command context (pipeline scopes log to {command: 'add-project'})
+      const errorCalls = (gatewayLogger.error as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const relevantError = errorCalls.find(([meta]) => meta?.command === 'add-project')
+      expect(relevantError).toBeDefined()
+      // #and — the error call includes {err} field
+      expect(relevantError?.[0]?.err).toBeDefined()
+      // #and — the message names what was lost
+      expect(relevantError?.[1]).toMatch(/final status|add-project/)
+    })
+  })
+
+  describe('CLONING: clone-failure editInteractionAsync failure → ERROR log with command context', () => {
+    it('logs at ERROR with {command: "add-project"} when clone-failure editReply fails (token expired)', async () => {
+      // #given — clone fails with a generic clone-error; the editReply for that failure also fails
+      const userId = uniqueUserId()
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      const clone = vi.fn().mockResolvedValue(err({kind: 'clone-error', code: 'clone-failed'}))
+
+      // Make editReply always fail (simulating token expiry after long clone)
+      const editReply = vi.fn().mockRejectedValue(tokenExpiredError)
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const guild = makeGuild()
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone}), gatewayLogger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — gatewayLogger.error was called with command context (pipeline scopes log to {command: 'add-project'})
+      const errorCalls = (gatewayLogger.error as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const relevantError = errorCalls.find(([meta]) => meta?.command === 'add-project')
+      expect(relevantError).toBeDefined()
+      expect(relevantError?.[0]?.err).toBeDefined()
+      expect(relevantError?.[1]).toMatch(/final status|add-project/)
+    })
+  })
+
+  describe('scoped logger: io.ts warn logs include command context when invoked through withLogContext', () => {
+    it('warn log from editInteractionAsync includes {command: "add-project"} when editReply fails', async () => {
+      // #given — editReply fails; the io.ts helper will warn; the pipeline-scoped logger merges command context
+      const userId = uniqueUserId()
+      const tokenExpiredError = new Error('Unknown interaction (token expired)')
+      const editReply = vi.fn().mockRejectedValue(tokenExpiredError)
+      const deferReply = vi.fn().mockResolvedValue(undefined)
+      const reply = vi.fn().mockResolvedValue(undefined)
+      const getString = vi.fn().mockImplementation((name: string, required?: boolean) => {
+        if (name === 'url') return 'https://github.com/testowner/testrepo'
+        if (name === 'channel') return null
+        return required === true ? '' : null
+      })
+      const guild = makeGuild()
+      const interaction = {
+        id: 'interaction-id',
+        user: {id: userId},
+        guild,
+        appPermissions: {has: vi.fn().mockReturnValue(true)},
+        client: {user: {id: 'bot-user-id'}},
+        options: {getString, getSubcommand: vi.fn().mockReturnValue('add-project')},
+        deferReply,
+        editReply,
+        reply,
+      } as unknown as ChatInputCommandInteraction
+
+      const gatewayLogger = makeGatewayLogger()
+      const deps = makeDeps({gatewayLogger})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — at least one warn call on gatewayLogger includes {command: 'add-project'}
+      // The pipeline builds withLogContext(deps.gatewayLogger, {command: 'add-project'}), so every
+      // log call from ctx.log carries command context in the first (meta) argument.
+      const warnCalls = (gatewayLogger.warn as ReturnType<typeof vi.fn>).mock.calls as [
+        Record<string, unknown>,
+        string,
+      ][]
+      const hasCommandContext = warnCalls.some(([meta]) => meta?.command === 'add-project')
+      expect(hasCommandContext).toBe(true)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Pipeline catchAll: infrastructure failure → deferred reply edited, then re-fails
+  // -------------------------------------------------------------------------
+
+  describe('pipeline catchAll: infrastructure failure in work edits deferred reply then re-fails', () => {
+    it('unexpected throw inside phase body → editReply with internal-error copy, Effect re-fails', async () => {
+      // #given — bindingsStore.getBindingByRepo throws unexpectedly (infra failure, not a Result error)
+      // This simulates an unhandled exception escaping the phase body, which the pipeline catchAll catches.
+      const userId = uniqueUserId()
+      const infraError = new Error('S3 socket hang up')
+      const getBindingByRepo = vi.fn().mockRejectedValue(infraError)
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when — must resolve (catchAll edits reply and re-fails; Effect.runPromise rejects on re-fail)
+      const result = await Effect.runPromise(Effect.either(executeAddProject(interaction, deps)))
+
+      // #then — Effect failed (re-failed after editing reply)
+      expect(result._tag).toBe('Left')
+      // #and — editReply was called with the internal-error copy
+      expect(editReply).toHaveBeenCalled()
+      const replyContent = lastEditReplyContent(editReply)
+      expect(replyContent).toMatch(/internal error|please try again/i)
+      // #and — the original error is preserved in the re-fail
+      expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('S3 socket hang up')
     })
   })
 })

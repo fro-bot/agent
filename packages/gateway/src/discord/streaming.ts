@@ -10,13 +10,14 @@
  * - All sends go to the thread; never to the parent channel.
  */
 
-import type {MessageMentionTypes} from 'discord.js'
 import type {GatewayLogger} from './client.js'
-
+import type {SendCapable} from './io.js'
 import {Buffer} from 'node:buffer'
-import {AttachmentBuilder} from 'discord.js'
 
+import {AttachmentBuilder} from 'discord.js'
+import {NOOP_GATEWAY_LOGGER} from './client.js'
 import {MAX_DISCORD_MESSAGE_LENGTH} from './constants.js'
+import {sendMessage} from './io.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,17 +39,11 @@ const LONG_OUTPUT_SUMMARY = '_(response too long — full output attached as a f
 /**
  * Minimal thread interface required by the sink. Typed narrowly so test doubles
  * don't need to implement the full `ThreadChannel` API.
+ *
+ * Uses `SendCapable` from `io.ts` (which accepts `MessageCreateOptions`) so that
+ * discord.js `ThreadChannel` is structurally assignable without casts.
  */
-export interface SinkThread {
-  readonly send: (options: SendOptions) => Promise<unknown>
-}
-
-/** Message payload shape passed to `thread.send`. */
-interface SendOptions {
-  readonly content?: string
-  readonly files?: AttachmentBuilder[]
-  readonly allowedMentions: {readonly parse: readonly MessageMentionTypes[]}
-}
+export type SinkThread = SendCapable
 
 /** Discriminated result of a flush attempt. */
 export type FlushResult =
@@ -61,24 +56,6 @@ export type FlushResult =
 /** Dependencies injected into the sink factory. */
 export interface StreamSinkDeps {
   readonly logger?: GatewayLogger
-}
-
-// ---------------------------------------------------------------------------
-// Internal helper — ALL Discord sends route through here
-// ---------------------------------------------------------------------------
-
-/**
- * The SINGLE send helper that enforces `allowedMentions: {parse: []}` on
- * every Discord write. No code in this module calls `thread.send` directly.
- *
- * Invariant: agent or interpolated text can NEVER ping `@everyone`, roles, or
- * users. Asserted at every call site in tests.
- */
-async function safeSend(thread: SinkThread, options: Omit<SendOptions, 'allowedMentions'>): Promise<void> {
-  await thread.send({
-    ...options,
-    allowedMentions: {parse: []},
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -146,11 +123,12 @@ export interface DiscordStreamSink {
 /**
  * Create a `DiscordStreamSink` bound to `thread`.
  *
- * All sends are routed through `safeSend`, which hardcodes
- * `allowedMentions: {parse: []}`.
+ * All sends are routed through `sendMessage` from `discord/io.ts`, which
+ * hardcodes `allowedMentions: {parse: []}`.
  */
 export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps = {}): DiscordStreamSink {
   const {logger} = deps
+  const ioLogger = logger ?? NOOP_GATEWAY_LOGGER
   let buffer = ''
   let visibleOutputSent = false
   let pendingVisibleOutput = 0
@@ -184,6 +162,7 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
 
   const flush = async (): Promise<FlushResult> => {
     const text = buffer
+    const sendTarget: SendCapable = thread
 
     // Empty / whitespace — check if visible output was already sent outside the buffer
     if (text.trim().length === 0) {
@@ -195,40 +174,40 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
         return {kind: 'skipped-visible'}
       }
       // Genuinely empty run → post the "no output" fallback
-      try {
-        await safeSend(thread, {content: EMPTY_OUTPUT_MESSAGE})
-        return {kind: 'empty'}
-      } catch (sendError) {
-        const message = sendError instanceof Error ? sendError.message : String(sendError)
-        logger?.warn({err: message}, 'streaming sink: empty-output send failed')
-        return {kind: 'error', message}
+      const emptyResult = await sendMessage(sendTarget, {content: EMPTY_OUTPUT_MESSAGE}, ioLogger)
+      if (emptyResult.success === false) {
+        return {kind: 'error', message: emptyResult.error.message}
       }
+      return {kind: 'empty'}
     }
 
     // Long output → summary line + .md attachment fallback
     if (text.length > DISCORD_MESSAGE_CHAR_LIMIT) {
-      try {
-        const attachment = new AttachmentBuilder(Buffer.from(text, 'utf-8'), {name: 'response.md'})
-        await safeSend(thread, {content: LONG_OUTPUT_SUMMARY, files: [attachment]})
-        visibleOutputSent = true
-        return {kind: 'attachment', charCount: text.length}
-      } catch (sendError) {
-        const message = sendError instanceof Error ? sendError.message : String(sendError)
-        logger?.warn({err: message}, 'streaming sink: attachment send failed')
-        return {kind: 'error', message}
+      // AttachmentBuilder construction is inside the sendMessage call so any sync
+      // throw (e.g. invalid buffer) is caught by sendMessage's try/catch, preserving
+      // flush()'s never-throws contract.
+      const attachResult = await sendMessage(
+        sendTarget,
+        {
+          content: LONG_OUTPUT_SUMMARY,
+          files: [new AttachmentBuilder(Buffer.from(text, 'utf-8'), {name: 'response.md'})],
+        },
+        ioLogger,
+      )
+      if (attachResult.success === false) {
+        return {kind: 'error', message: attachResult.error.message}
       }
+      visibleOutputSent = true
+      return {kind: 'attachment', charCount: text.length}
     }
 
     // Short output → single message
-    try {
-      await safeSend(thread, {content: text})
-      visibleOutputSent = true
-      return {kind: 'sent', charCount: text.length}
-    } catch (sendError) {
-      const message = sendError instanceof Error ? sendError.message : String(sendError)
-      logger?.warn({err: message}, 'streaming sink: text send failed')
-      return {kind: 'error', message}
+    const sendResult = await sendMessage(sendTarget, {content: text}, ioLogger)
+    if (sendResult.success === false) {
+      return {kind: 'error', message: sendResult.error.message}
     }
+    visibleOutputSent = true
+    return {kind: 'sent', charCount: text.length}
   }
 
   return {append, flush, buffered, markVisibleOutputSent, markVisibleOutputPending, hasVisibleOutput}

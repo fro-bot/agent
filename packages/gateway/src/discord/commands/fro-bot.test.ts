@@ -182,8 +182,10 @@ describe('createFroBotCommand — dispatch', () => {
     // #when
     await Effect.runPromise(cmd.execute(interaction))
 
-    // #then — reply was called with pong
-    expect(reply).toHaveBeenCalledWith({content: 'pong', ephemeral: true})
+    // #then — reply was called with pong; helper always injects allowedMentions: {parse: []}
+    expect(reply).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'pong', ephemeral: true, allowedMentions: {parse: []}}),
+    )
   })
 
   it('returns Effect.fail for an unknown subcommand', async () => {
@@ -412,6 +414,44 @@ describe('/fro-bot clear-queue — authorization gate', () => {
 
     // #then — queue.clear was called (ManageChannels fallback authorized)
     expect(queue.clear).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot clear-queue — infra-failure path (pipeline catchAll)
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot clear-queue — infra-failure path', () => {
+  it('queue.clear throws → editReply called with internal-error copy AND Effect ends in failure', async () => {
+    // #given — queue.clear throws an unexpected infra error
+    const infraError = new Error('queue storage unavailable')
+    const queue: ChannelQueue<RunTask> = {
+      enqueue: vi.fn().mockReturnValue('queued'),
+      pendingCount: vi.fn().mockReturnValue(0),
+      takeNext: vi.fn().mockReturnValue(undefined),
+      clear: vi.fn().mockImplementation(() => {
+        throw infraError
+      }),
+    }
+    const deps = makeDeps({queue})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, deferReply, editReply} = makeInteraction('clear-queue', 'ch-infra-fail')
+
+    // #when — run via Effect.either so we can assert on both the reply AND the failure
+    const result = await Effect.runPromise(Effect.either(cmd.execute(interaction)))
+
+    // #then — deferReply was called (pipeline deferred before work)
+    expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+
+    // #and — the deferred reply was edited (not left hanging at "thinking…")
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.content).toMatch(/internal error|please try again/i)
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+
+    // #and — the error still propagates (dispatchCommand-level logger sees it)
+    expect(result._tag).toBe('Left')
+    expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('queue storage unavailable')
   })
 })
 
@@ -675,6 +715,32 @@ describe('/fro-bot force-release-lock — no binding', () => {
 // /fro-bot force-release-lock — outcome → reply mapping
 // ---------------------------------------------------------------------------
 
+describe('/fro-bot force-release-lock — allowedMentions guard', () => {
+  it('all outcome editReply calls include allowedMentions: {parse: []} (mention-safety guard)', async () => {
+    // #given — released outcome (holder ID in content — must not be parsed as a mention)
+    const forceReleaseStaleLock = makeForceReleaseStaleLockMock({
+      outcome: 'released',
+      holderId: 'holder-abc',
+      runId: 'run-xyz',
+      lockAgeMs: 120_000,
+      heartbeatAgeMs: 90_000,
+    })
+    const guild = makeFrlGuild({hasRole: false, hasManageChannels: true})
+    const bindingsStore = makeBindingsStore()
+    const deps = makeFrlDeps({forceReleaseStaleLock, bindingsStore})
+    const cmd = createFroBotCommand(deps)
+    const {interaction, editReply} = makeInteraction('force-release-lock', 'ch-test-123', guild)
+
+    // #when
+    await Effect.runPromise(cmd.execute(interaction))
+
+    // #then — editReply was called with allowedMentions: {parse: []} (injected by io.ts helper)
+    expect(editReply).toHaveBeenCalledOnce()
+    const replyArg = editReply.mock.calls[0]?.[0] as {content: string; allowedMentions?: unknown}
+    expect(replyArg.allowedMentions).toEqual({parse: []})
+  })
+})
+
 describe('/fro-bot force-release-lock — outcome mapping', () => {
   it('released → ephemeral confirmation with holder info', async () => {
     // #given — forceReleaseStaleLock returns released
@@ -881,6 +947,29 @@ describe('/fro-bot force-release-lock — infra-failure path', () => {
     // #and — the error still propagates (dispatchCommand-level logger sees it)
     expect(result._tag).toBe('Left')
     expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('adapter capability missing')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /fro-bot clear-queue — dispatch integration
+// ---------------------------------------------------------------------------
+
+describe('/fro-bot clear-queue — dispatch integration', () => {
+  it('dispatches clear-queue through getCommandRegistry + dispatchCommand', async () => {
+    // #given — real registry + dispatch path; authorized user with ManageChannels
+    const queue = makeQueue(0)
+    const guild = makeGuild({hasRole: false, hasManageChannels: true})
+    const deps = makeDeps({queue})
+    const registry = getCommandRegistry(deps)
+    const {interaction} = makeInteraction('clear-queue', 'ch-dispatch-test', guild)
+
+    // #when — dispatch through the real registry
+    const result = await Effect.runPromise(Effect.either(dispatchCommand(interaction, registry)))
+
+    // #then — dispatch resolves (not an unknown-command failure)
+    expect(result._tag).toBe('Right')
+    // #and — queue.clear was called (command ran end-to-end)
+    expect(queue.clear).toHaveBeenCalledOnce()
   })
 })
 
