@@ -2897,7 +2897,6 @@ describe('processEventStream', () => {
 
 interface TestWaitParams {
   readonly sessionID: string
-  readonly directory: string
 }
 
 interface TestWaitOptions {
