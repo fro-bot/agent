@@ -21,6 +21,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
+import {formatPipelineError} from './format-error.js'
 import {resolveSources} from './sources.js'
 
 // Re-export so callers that previously imported from integrate.ts still work.
@@ -63,6 +64,12 @@ export interface IntegrationAdapters {
   fetchTags: (workDir: string) => Promise<void>
   /** Fetch a single integration ref into a local tracking ref. */
   fetchRef: (workDir: string, remoteUrl: string, fetchRef: string, localRef: string) => Promise<void>
+  /**
+   * Capture the resolved upstream SHA of the most recently fetched ref.
+   * Called immediately after fetchRef to record each ref's actual tip SHA.
+   * Returns null on failure — the caller falls back to integrationCommit for that ref.
+   */
+  captureRefSha: (workDir: string) => Promise<string | null>
   /** Create/reset the integration branch to the release tag. */
   createBranch: (workDir: string, branch: string, tag: string) => Promise<void>
   /** Run the LLM merge via opencode run. */
@@ -191,6 +198,14 @@ export function makeRealAdapters(): IntegrationAdapters {
       await gitExec(['fetch', remoteUrl, `${fetchRef}:${localRef}`], workDir)
     },
 
+    captureRefSha: async workDir => {
+      try {
+        return await gitExec(['rev-parse', 'FETCH_HEAD'], workDir)
+      } catch {
+        return null
+      }
+    },
+
     createBranch: async (workDir, branch, tag) => {
       // Reset or create the integration branch at the release tag.
       try {
@@ -306,37 +321,43 @@ export async function runIntegration(
   try {
     sources = resolveSources(integrationRefs, `https://github.com/${releaseRepo}.git`)
   } catch (error) {
-    return {ok: false, error: `Resolve sources failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Resolve sources failed: ${formatPipelineError(error)}`}
   }
 
   // Step 1: Clone the release repo.
   try {
     await adapters.cloneRepo(`https://github.com/${releaseRepo}.git`, workDir)
   } catch (error) {
-    return {ok: false, error: `Clone failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Clone failed: ${formatPipelineError(error)}`}
   }
 
   // Step 2: Fetch tags.
   try {
     await adapters.fetchTags(workDir)
   } catch (error) {
-    return {ok: false, error: `Fetch tags failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Fetch tags failed: ${formatPipelineError(error)}`}
   }
 
-  // Step 3: Fetch each integration ref.
+  // Step 3: Fetch each integration ref and capture its resolved upstream SHA.
+  // resolvedShas[i] holds the tip SHA for sources[i]; null means capture failed (fallback to integrationCommit).
+  const resolvedShas: (string | null)[] = []
   for (const source of sources) {
     try {
       await adapters.fetchRef(workDir, source.repo, source.fetchRef, source.fetch)
     } catch (error) {
-      return {ok: false, error: `Fetch ref ${source.label} failed: ${errorMessage(error)}`}
+      return {ok: false, error: `Fetch ref ${source.label} failed: ${formatPipelineError(error)}`}
     }
+    // Capture the resolved SHA immediately after fetch while FETCH_HEAD is fresh.
+    // Failure is non-fatal: we fall back to integrationCommit for this ref in the manifest.
+    const sha = await adapters.captureRefSha(workDir)
+    resolvedShas.push(sha)
   }
 
   // Step 4: Create/reset the integration branch at the release tag.
   try {
     await adapters.createBranch(workDir, branch, tag)
   } catch (error) {
-    return {ok: false, error: `Create branch ${branch} at ${tag} failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Create branch ${branch} at ${tag} failed: ${formatPipelineError(error)}`}
   }
 
   // Step 5: Run the LLM merge (only when there are refs to merge).
@@ -345,13 +366,13 @@ export async function runIntegration(
     try {
       prompt = await renderPrompt(promptPath, workDir, baseVersion, releaseRepo, sources)
     } catch (error) {
-      return {ok: false, error: `Render merge prompt failed: ${errorMessage(error)}`}
+      return {ok: false, error: `Render merge prompt failed: ${formatPipelineError(error)}`}
     }
 
     try {
       await adapters.runMerge(workDir, opencodeBin, agent, model, prompt)
     } catch (error) {
-      return {ok: false, error: `LLM merge failed: ${errorMessage(error)}`}
+      return {ok: false, error: `LLM merge failed: ${formatPipelineError(error)}`}
     }
 
     // Step 5.5: Commit the integrated working tree so HEAD contains the merge.
@@ -360,21 +381,21 @@ export async function runIntegration(
     try {
       await adapters.commitIntegration(workDir, `integrate: apply LLM merge onto v${baseVersion}`)
     } catch (error) {
-      return {ok: false, error: `Commit integration failed: ${errorMessage(error)}`}
+      return {ok: false, error: `Commit integration failed: ${formatPipelineError(error)}`}
     }
 
     // Step 6: Build the native CLI.
     try {
       await adapters.buildCli(workDir, baseVersion, channel)
     } catch (error) {
-      return {ok: false, error: `Build CLI failed: ${errorMessage(error)}`}
+      return {ok: false, error: `Build CLI failed: ${formatPipelineError(error)}`}
     }
 
     // Step 7: Verify --version matches the base.
     try {
       await adapters.verifyVersion(workDir, baseVersion)
     } catch (error) {
-      return {ok: false, error: `Version verification failed: ${errorMessage(error)}`}
+      return {ok: false, error: `Version verification failed: ${formatPipelineError(error)}`}
     }
   }
 
@@ -383,16 +404,20 @@ export async function runIntegration(
   try {
     integrationCommit = await adapters.getCommitSha(workDir)
   } catch (error) {
-    return {ok: false, error: `Get commit SHA failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Get commit SHA failed: ${formatPipelineError(error)}`}
   }
 
   // Step 9: Build the provenance manifest and freeze it.
-  // Per-ref SHA resolution is tracked separately; all refs share the integration commit for now.
+  // Each ref's resolvedSha is its actual upstream tip captured during the fetch loop.
+  // Falls back to integrationCommit only when capture failed for that ref.
   const manifest: ProvenanceManifest = {
     baseVersion,
     integrationRefs: sources.map((s, i) => ({
       ref: integrationRefs[i] ?? s.label,
-      resolvedSha: integrationCommit,
+      resolvedSha:
+        resolvedShas[i] !== null && resolvedShas[i] !== undefined && resolvedShas[i].length > 0
+          ? resolvedShas[i]
+          : integrationCommit,
     })),
     integrationCommit,
     buildSha: 'dev', // replaced by the per-platform build job at publish time
@@ -401,13 +426,8 @@ export async function runIntegration(
   try {
     await writeProvenanceManifest(workDir, manifest)
   } catch (error) {
-    return {ok: false, error: `Write provenance manifest failed: ${errorMessage(error)}`}
+    return {ok: false, error: `Write provenance manifest failed: ${formatPipelineError(error)}`}
   }
 
   return {ok: true, manifest}
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message
-  return String(err)
 }

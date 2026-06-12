@@ -20,6 +20,7 @@ import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync} 
 import os from 'node:os'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
+import {formatPipelineError} from './format-error.js'
 import {makeRealAdapters, runIntegration} from './integrate.js'
 
 // ---------------------------------------------------------------------------
@@ -243,8 +244,7 @@ export async function cmdIntegrate(
     console.error(`[integrate] ${result.error}`)
     return 1
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    console.error(`[integrate] ${msg}`)
+    console.error(`[integrate] ${formatPipelineError(error)}`)
     return 1
   }
 }

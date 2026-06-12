@@ -3,6 +3,7 @@ import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 import {formatProvenance, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary} from './resolve-binary.js'
+import {buildHarnessVersion} from './version.js'
 
 // #region provenance
 
@@ -172,6 +173,74 @@ describe('probeBinary', () => {
     // #then — node --version returns something like "v24.x.x"
     expect(typeof result).toBe('string')
     expect(result).not.toBeNull()
+  })
+})
+
+// #endregion
+
+// #region doctor version-form (U3)
+
+// Mirror the cmdDoctor logic for computing expectedVersion from provenance.
+// Extracted to outer scope to satisfy unicorn/consistent-function-scoping.
+function computeDoctorExpectedVersion(base: string, commit: string | null): string {
+  if (commit !== null && commit.length > 0) {
+    return buildHarnessVersion(base, commit)
+  }
+  return base
+}
+
+describe('doctor version-form: expected version computation', () => {
+  // These tests verify the logic that cmdDoctor uses to compute expectedVersion
+  // from provenance. The logic is: when integrationCommit is present, expect
+  // buildHarnessVersion(baseVersion, integrationCommit); else bare baseVersion.
+  // We test the logic directly via buildHarnessVersion since cmdDoctor is not exported.
+
+  it('suffixed form: integrationCommit present → expected is base+harness.short8', () => {
+    // #given — provenance with an integration commit (built binary scenario)
+    const baseVersion = '1.17.3'
+    const integrationCommit = 'ed359558abcdef12'
+
+    // #when — compute expected version as cmdDoctor does
+    const expectedVersion = computeDoctorExpectedVersion(baseVersion, integrationCommit)
+
+    // #then — expected is the suffixed form
+    expect(expectedVersion).toBe(`${baseVersion}+harness.${integrationCommit.slice(0, 8)}`)
+    // A binary reporting this version would pass the doctor check
+    expect(expectedVersion).toBe('1.17.3+harness.ed359558')
+  })
+
+  it('bare-base form: no integrationCommit (dev scaffold) → expected is bare baseVersion', () => {
+    // #given — provenance with no integration commit (dev scaffold)
+    const baseVersion = '1.17.3'
+
+    // #when
+    const expectedVersion = computeDoctorExpectedVersion(baseVersion, null)
+
+    // #then — expected is the bare base version
+    expect(expectedVersion).toBe(baseVersion)
+    expect(expectedVersion).toBe('1.17.3')
+  })
+
+  it('mismatch: binary reports different base → version strings differ', () => {
+    // #given — provenance says 1.17.3, binary reports 1.17.2
+    const baseVersion = '1.17.3'
+    const integrationCommit = 'ed359558abcdef12'
+    const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
+    const binaryReportedVersion = '1.17.2+harness.ed359558'
+
+    // #then — mismatch detected (doctor would fail)
+    expect(binaryReportedVersion !== expectedVersion).toBe(true)
+  })
+
+  it('mismatch: binary reports bare base when suffixed form expected → version strings differ', () => {
+    // #given — built binary should report suffixed form but reports bare base
+    const baseVersion = '1.17.3'
+    const integrationCommit = 'ed359558abcdef12'
+    const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
+    const binaryReportedVersion = baseVersion // bare base (stock upstream binary)
+
+    // #then — mismatch detected (doctor would fail)
+    expect(binaryReportedVersion !== expectedVersion).toBe(true)
   })
 })
 

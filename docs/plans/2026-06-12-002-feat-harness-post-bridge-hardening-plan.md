@@ -70,7 +70,7 @@ The harness LLM-merge pipeline works but has four verified gaps (confirmed again
 
 ## Implementation Units
 
-- [ ] **Unit 1: Merge-agent sandbox (R1)**
+- [x] **Unit 1: Merge-agent sandbox (R1)** — **DROPPED after ce:review.** Two findings, both verified at source: (1) the deny-by-default config was inverted — OpenCode permission eval uses `findLast` (`core/src/permission.ts:102`), so `'*':'deny'` last denied every tool; (2) bash is advisory-only (`core/src/tool/bash.ts:141`), so the `git`/`bun` the merge requires cannot be sandboxed in-config at all. Decisively: `runMerge`/`buildSandboxConfig` live in the standalone `harness integrate` CLI, which the production release pipeline does NOT use — `harness-release.yaml` dispatches `fro-bot.yaml` to run the merge in the Fro Bot action (its own permission/auth model). The sandbox guarded a non-production path with a broken, unsandboxable mechanism, so it was removed rather than fixed. The real merge-agent isolation concern (#775 item 1a) belongs to the `fro-bot.yaml` integrate job — assessed separately. R1 is withdrawn; R2-R5 stand.
 
 **Goal:** Run the LLM merge under a restrictive permission policy scoped to the merge clone, so spawned tools cannot read the host credential path or reach the network beyond the merge fetch.
 
@@ -96,7 +96,7 @@ The harness LLM-merge pipeline works but has four verified gaps (confirmed again
 
 **Verification:** The merge run is configured deny-by-default outside the clone; unit tests assert the config is written with the scoped shape; live egress/credential-isolation proof is deferred to the next real harness dispatch.
 
-- [ ] **Unit 2: Shared error redactor (R2)**
+- [x] **Unit 2: Shared error redactor (R2)**
 
 **Goal:** Route integrate/opencode failure messages through one single-line, length-capped, secret-redacting formatter.
 
@@ -122,7 +122,7 @@ The harness LLM-merge pipeline works but has four verified gaps (confirmed again
 
 **Verification:** All `runIntegration` failure messages pass through the formatter; tests prove no known secret shape survives.
 
-- [ ] **Unit 3: harness doctor version form (R3)**
+- [x] **Unit 3: harness doctor version form (R3)**
 
 **Goal:** `harness doctor` accepts the `<base>+harness.<short8>` form for built binaries.
 
@@ -146,7 +146,7 @@ The harness LLM-merge pipeline works but has four verified gaps (confirmed again
 
 **Verification:** Doctor passes against a correctly-built suffixed binary and still fails on a true mismatch.
 
-- [ ] **Unit 4: Per-ref provenance SHA (R4)**
+- [x] **Unit 4: Per-ref provenance SHA (R4)**
 
 **Goal:** Record each carried ref's actual upstream SHA in the provenance manifest.
 
@@ -170,7 +170,7 @@ The harness LLM-merge pipeline works but has four verified gaps (confirmed again
 
 **Verification:** Manifest shows distinct per-ref upstream SHAs for a multi-carry run; `integrate.test.ts` asserts distinctness.
 
-- [ ] **Unit 5: Clean-snapshot guarantee tests (R5)**
+- [x] **Unit 5: Clean-snapshot guarantee tests (R5)**
 
 **Goal:** Lock the handoff invariants with tests.
 
