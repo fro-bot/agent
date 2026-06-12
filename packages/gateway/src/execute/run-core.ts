@@ -378,9 +378,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         if (deltaText != null) sink.append(deltaText)
       }
     } else if (eventType === 'message.part.updated') {
-      // OpenCode 1.15.13 contract: tool lifecycle arrives via message.part.updated
-      // (partType:'tool', state.status:'completed'). session.next.tool.called/success
-      // no longer fire on 1.15.13 — this branch handles the new contract.
+      // Current OpenCode event contract: tool lifecycle arrives via
+      // message.part.updated (partType:'tool', state.status:'completed').
+      // session.next.tool.called/success no longer fire — this branch handles the current contract.
       const part = getObjectProperty(eventPayload, 'part')
       const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
       if (eventSessionID === sessionId) {
