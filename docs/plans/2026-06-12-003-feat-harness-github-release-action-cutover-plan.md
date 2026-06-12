@@ -22,7 +22,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 - R1. Harness-release workflow creates a GitHub Release tagged `v<base>+harness.<short8>` with generic glibc assets (`opencode-{linux-x64,linux-arm64}.tar.gz`, `opencode-{darwin-x64,darwin-arm64}.zip`), archive root = `opencode`.
 - R2. New `release-binaries` job: `needs: build`, `contents: write`, no `id-token`; isolated from build and npm publish.
 - R3. Action downloads from `fro-bot/agent` harness releases; `getLatestVersion()` bypasses stock-latest for harness pins.
-- R4. `DEFAULT_OPENCODE_VERSION` becomes `1.17.3+harness.<short8>` (single shared constant).
+- R4. The action gains the *capability* to consume a harness pin (`1.17.3+harness.<short8>`). **The actual flip of `DEFAULT_OPENCODE_VERSION` is a post-merge follow-up** — no `fro-bot/agent` release with `opencode-*` assets exists until this PR's `release-binaries` job runs after merge. This PR keeps the stock `1.17.3` default; a one-line follow-up flips it once the first harness release is published (matches the manual-bump model).
 - R5. npm version becomes prerelease `<base>-harness.<short8>` across all 5 packages, `latest` dist-tag set to it.
 - R6. Pre-removal verification gate for the npm trusted-publisher environment binding; remove `environment: npm-publish` only if safe, else keep + document.
 - R7. Workspace Dockerfile untouched — stays on stock `anomalyco/opencode` until C2.

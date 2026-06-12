@@ -609,7 +609,6 @@ jobs:
     # !cancelled() prevents running if the workflow was manually cancelled.
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') && needs.release-binaries.result == 'success' }}
     runs-on: ubuntu-24.04
-    environment: npm-publish # Maintainer-gated environment with required reviewers.
 
     # id-token: write is scoped to the publish job ONLY.
     # The build job (which runs untrusted LLM-merge + upstream build code) must
