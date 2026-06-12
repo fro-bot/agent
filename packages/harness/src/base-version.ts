@@ -5,4 +5,4 @@
  * The cap stays at 1.15.13 until a reviewed bump PR raises it.
  * Do not change this value without running the full integration pipeline.
  */
-export const HARNESS_BASE_VERSION = '1.15.13'
+export const HARNESS_BASE_VERSION = '1.17.3'
