@@ -1,7 +1,14 @@
 import type {ExecAdapter, Logger, PlatformInfo, ToolCacheAdapter} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {buildDownloadUrl, FALLBACK_VERSION, getPlatformInfo, installOpenCode} from './opencode.js'
+import {
+  buildDownloadUrl,
+  FALLBACK_VERSION,
+  getLatestVersion,
+  getPlatformInfo,
+  installOpenCode,
+  isHarnessVersion,
+} from './opencode.js'
 
 // Mock tool-cache adapter
 function createMockToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
@@ -141,6 +148,99 @@ describe('opencode', () => {
 
       // #then
       expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.1.1/opencode-linux-x64.tar.gz')
+    })
+
+    it('builds correct stock URL for 1.17.3 linux-x64 (unchanged)', () => {
+      // #given
+      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
+
+      // #when
+      const url = buildDownloadUrl('1.17.3', info)
+
+      // #then
+      expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.17.3/opencode-linux-x64.tar.gz')
+    })
+
+    it('builds harness URL for linux-x64 with %2B-encoded tag', () => {
+      // #given
+      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
+
+      // #when
+      const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
+
+      // #then
+      expect(url).toBe(
+        'https://github.com/fro-bot/agent/releases/download/v1.17.3%2Bharness.abc12345/opencode-linux-x64.tar.gz',
+      )
+    })
+
+    it('builds harness URL for darwin-arm64 with %2B-encoded tag', () => {
+      // #given
+      const info: PlatformInfo = {os: 'darwin', arch: 'arm64', ext: '.zip'}
+
+      // #when
+      const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
+
+      // #then
+      expect(url).toBe(
+        'https://github.com/fro-bot/agent/releases/download/v1.17.3%2Bharness.abc12345/opencode-darwin-arm64.zip',
+      )
+    })
+  })
+
+  describe('isHarnessVersion', () => {
+    it('returns true for a version containing +harness.', () => {
+      // #given / #when / #then
+      expect(isHarnessVersion('1.17.3+harness.abc12345')).toBe(true)
+    })
+
+    it('returns true for a harness version with v prefix', () => {
+      // #given / #when / #then
+      expect(isHarnessVersion('v1.17.3+harness.abc12345')).toBe(true)
+    })
+
+    it('returns false for a plain stock version', () => {
+      // #given / #when / #then
+      expect(isHarnessVersion('1.17.3')).toBe(false)
+    })
+
+    it('returns false for a hyphen-form version (npm form, not binary form)', () => {
+      // #given / #when / #then
+      expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(false)
+    })
+
+    it('returns false for latest', () => {
+      // #given / #when / #then
+      expect(isHarnessVersion('latest')).toBe(false)
+    })
+  })
+
+  describe('getLatestVersion', () => {
+    it('does not fetch anomalyco/opencode latest when given a harness pin', async () => {
+      // #given
+      // A harness pin must never trigger the stock latest fetch — the guard returns the pin unchanged.
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+
+      // #when
+      const result = await getLatestVersion(mockLogger, '1.17.3+harness.abc12345')
+
+      // #then
+      expect(result).toBe('1.17.3+harness.abc12345')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('fetches anomalyco/opencode latest when no pin is provided', async () => {
+      // #given
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(new Response(JSON.stringify({tag_name: 'v2.0.0'}), {status: 200}))
+
+      // #when
+      const result = await getLatestVersion(mockLogger)
+
+      // #then
+      expect(result).toBe('2.0.0')
+      expect(fetchSpy).toHaveBeenCalledWith('https://api.github.com/repos/anomalyco/opencode/releases/latest')
     })
   })
 

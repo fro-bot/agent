@@ -7,9 +7,22 @@ import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
+const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/download'
 
 /** Known stable version for fallback when latest fails */
 export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
+
+/**
+ * Returns true when the version string is a harness-pinned build.
+ *
+ * Harness versions use the `+harness.<sha>` build-metadata suffix (semver §10),
+ * e.g. `1.17.3+harness.abc12345`. The `+` form is the binary/release form used
+ * by fro-bot/agent releases. The npm-compatible hyphen form (`1.17.3-harness.x`)
+ * is intentionally NOT treated as a harness version here.
+ */
+export function isHarnessVersion(version: string): boolean {
+  return version.includes('+harness.')
+}
 
 /**
  * Get platform information for binary downloads.
@@ -41,10 +54,24 @@ export function getPlatformInfo(): PlatformInfo {
 
 /**
  * Build download URL for OpenCode binary.
+ *
+ * Harness-pinned versions (containing `+harness.`) are routed to the
+ * fro-bot/agent releases. The `+` in the version tag MUST be percent-encoded
+ * as `%2B` in the URL path segment — GitHub stores the tag URL-encoded and a
+ * raw `+` is misread as a space. Stock versions route to anomalyco/opencode
+ * with no encoding changes.
  */
 export function buildDownloadUrl(version: string, info: PlatformInfo): string {
-  const versionTag = version.startsWith('v') ? version : `v${version}`
   const filename = `opencode-${info.os}-${info.arch}${info.ext}`
+
+  if (isHarnessVersion(version)) {
+    // Percent-encode `+` in the version tag for the URL path segment.
+    const rawTag = version.startsWith('v') ? version : `v${version}`
+    const encodedTag = rawTag.replaceAll('+', '%2B')
+    return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/${filename}`
+  }
+
+  const versionTag = version.startsWith('v') ? version : `v${version}`
   return `${DOWNLOAD_BASE_URL}/${versionTag}/${filename}`
 }
 
@@ -156,8 +183,31 @@ async function downloadAndInstall(
 
 /**
  * Fetch latest OpenCode version from GitHub API.
+ *
+ * This function is the STOCK-latest resolver — it only makes sense for
+ * anomalyco/opencode stock releases. It must never be called with a harness
+ * pin, because harness versions are already fully-qualified and have no
+ * "latest" concept on the stock release feed.
+ *
+ * Guard: if `pinnedVersion` is provided and is a harness pin, return it
+ * unchanged without fetching. This covers any future call-site that might
+ * inadvertently pass a harness pin through the "resolve latest" path.
+ *
+ * Current call-site analysis (setup.ts ~line 43): `getLatestVersion` is only
+ * called when `version === 'latest'`. A harness pin like `1.17.3+harness.x`
+ * never equals `'latest'`, so the guard is a belt-and-suspenders safety net.
+ *
+ * @param logger - Logger instance for diagnostics.
+ * @param pinnedVersion - Optional already-resolved version; if harness-pinned,
+ *   returned immediately without a network call.
  */
-export async function getLatestVersion(logger: Logger): Promise<string> {
+export async function getLatestVersion(logger: Logger, pinnedVersion?: string): Promise<string> {
+  // Guard: harness pins are fully-qualified — never route them to stock latest.
+  if (pinnedVersion !== undefined && isHarnessVersion(pinnedVersion)) {
+    logger.debug('Skipping stock latest fetch for harness-pinned version', {version: pinnedVersion})
+    return pinnedVersion
+  }
+
   const response = await fetch('https://api.github.com/repos/anomalyco/opencode/releases/latest')
   if (!response.ok) {
     throw new Error(`Failed to fetch latest OpenCode version: ${response.statusText}`)
