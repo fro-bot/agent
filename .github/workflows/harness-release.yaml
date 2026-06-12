@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       base_version:
-        description: Base release version (e.g. 1.15.13)
+        description: Base release version (overrides harness.config.json base_version)
         required: true
         type: string
       dry_run:

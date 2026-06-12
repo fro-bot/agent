@@ -30,11 +30,11 @@
       extractVersionTemplate: '^v?(?<version>.*)$',
     },
     {
-      // Tracks the harness base release pin in packages/harness/src/base-version.ts.
-      // Capped at the same validated release as DEFAULT_OPENCODE_VERSION until a reviewed bump PR raises it.
+      // Tracks the harness base release pin in packages/harness/harness.config.json.
+      // Retargeted from the deleted base-version.ts sentinel to the canonical config source.
       customType: 'regex',
-      managerFilePatterns: ['/packages\\/harness\\/src\\/base-version\\.ts/'],
-      matchStrings: ["HARNESS_BASE_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      managerFilePatterns: ['/packages\\/harness\\/harness\\.config\\.json/'],
+      matchStrings: ['"base_version":\\s*"(?<currentValue>\\d+\\.\\d+\\.\\d+)"'],
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',

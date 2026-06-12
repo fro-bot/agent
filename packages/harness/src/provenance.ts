@@ -87,10 +87,10 @@ export function getProvenance(): Provenance {
     const raw = readFileSync(configPath, 'utf8')
     const parsed: unknown = JSON.parse(raw)
     if (!isValidHarnessConfig(parsed)) {
-      // Malformed config — fall through to hardcoded placeholder.
+      // Malformed config — fall through to the unknown-version placeholder.
       throw new Error('Invalid harness.config.json shape')
     }
-    const baseVersion = parsed.base_version ?? '1.16.0'
+    const baseVersion = parsed.base_version ?? 'unknown'
     const integrationRefs: IntegrationRefRecord[] = (parsed.integrationRefs ?? []).map(ref => ({
       ref,
       resolvedSha: 'dev',
@@ -106,7 +106,7 @@ export function getProvenance(): Provenance {
   }
 
   return {
-    baseVersion: '1.16.0',
+    baseVersion: 'unknown',
     integrationRefs: [],
     integrationCommit: null,
     buildSha: 'dev',
