@@ -138,10 +138,10 @@ importers:
     dependencies:
       '@hono/node-server':
         specifier: 1.19.14
-        version: 1.19.14(hono@4.12.23)
+        version: 1.19.14(hono@4.12.25)
       hono:
-        specifier: 4.12.23
-        version: 4.12.23
+        specifier: 4.12.25
+        version: 4.12.25
     devDependencies:
       vitest:
         specifier: 4.1.8
@@ -154,7 +154,7 @@ importers:
         version: link:../runtime
       '@hono/node-server':
         specifier: 1.19.14
-        version: 1.19.14(hono@4.12.23)
+        version: 1.19.14(hono@4.12.25)
       discord.js:
         specifier: 14.26.4
         version: 14.26.4
@@ -162,8 +162,8 @@ importers:
         specifier: 3.21.3
         version: 3.21.3
       hono:
-        specifier: 4.12.23
-        version: 4.12.23
+        specifier: 4.12.25
+        version: 4.12.25
 
   packages/harness: {}
 
@@ -2536,8 +2536,8 @@ packages:
   highlight.js@10.7.3:
     resolution: {integrity: sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==}
 
-  hono@4.12.23:
-    resolution: {integrity: sha512-eIaZ9qDgu7XV0pxOCrg7/WhnQ6Ivm22UcxhXx/A3dcbqbbYgBEkc6e/J/s7j2tS96zoB0S9VBdLwQNCWwUo4LA==}
+  hono@4.12.25:
+    resolution: {integrity: sha512-2NFaIyNVgJmBs/ecmtGzlmluTFs5cHEWGTdu0t1HBwYzoGXOL5nUQBRMXsXWla5i4KkG//QMzVP88m1+I3fdAQ==}
     engines: {node: '>=16.9.0'}
 
   hook-std@4.0.0:
@@ -5173,9 +5173,9 @@ snapshots:
 
   '@gar/promise-retry@1.0.3': {}
 
-  '@hono/node-server@1.19.14(hono@4.12.23)':
+  '@hono/node-server@1.19.14(hono@4.12.25)':
     dependencies:
-      hono: 4.12.23
+      hono: 4.12.25
 
   '@humanfs/core@0.19.2':
     dependencies:
@@ -7272,7 +7272,7 @@ snapshots:
 
   highlight.js@10.7.3: {}
 
-  hono@4.12.23: {}
+  hono@4.12.25: {}
 
   hook-std@4.0.0: {}
 
