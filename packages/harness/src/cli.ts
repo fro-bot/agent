@@ -16,6 +16,7 @@ import process from 'node:process'
 import {cmdIntegrate} from './integrate-command.js'
 import {formatProvenance, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary} from './resolve-binary.js'
+import {buildHarnessVersion} from './version.js'
 
 function printUsage(): void {
   console.log(`harness — patched OpenCode binary (Fro Bot integration)
@@ -97,10 +98,16 @@ function cmdDoctor(): number {
 
   console.log(`  binary version:     ${version}`)
 
-  // Verify binary version matches provenance baseVersion when we have a built artifact.
-  if (binary.isBuilt && version !== p.baseVersion) {
+  // Verify binary version matches provenance when we have a built artifact.
+  // Built binaries self-report "<base>+harness.<short8>" (via buildHarnessVersion).
+  // When integrationCommit is present, expect the suffixed form; otherwise bare base.
+  const expectedVersion =
+    p.integrationCommit !== null && p.integrationCommit.length > 0
+      ? buildHarnessVersion(p.baseVersion, p.integrationCommit)
+      : p.baseVersion
+  if (binary.isBuilt && version !== expectedVersion) {
     console.error(
-      `\n[FAIL] Binary version mismatch: binary reports '${version}', provenance expects '${p.baseVersion}'.`,
+      `\n[FAIL] Binary version mismatch: binary reports '${version}', provenance expects '${expectedVersion}'.`,
     )
     console.error('       Reinstall @fro.bot/harness or check the platform package version.')
     return 1
