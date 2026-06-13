@@ -265,9 +265,17 @@ export function resolveTargetDirSuffix(abi: 'musl' | null, baseline: boolean): s
  * Patches the upstream build.ts singleFlag filter in-place to honor
  * OPENCODE_TARGET_ABI and OPENCODE_TARGET_BASELINE env vars for explicit target selection.
  *
- * The patch is MINIMAL and LOCAL to the singleFlag filter block (R12).
- * It replaces the unconditional `if (item.abi !== undefined) { return false }` guard
- * with a conditional that allows the target through when the env vars match.
+ * The patch replaces the ENTIRE baseline+abi+return-true block (lines 122-133 in upstream
+ * build.ts) with a single coherent block that:
+ *   - When OPENCODE_TARGET_ABI is set: selects ONLY the target matching {abi, baseline},
+ *     rejecting the default glibc target (no abi) AND wrong baseline variants.
+ *   - When OPENCODE_TARGET_ABI is NOT set: preserves original behavior exactly.
+ *
+ * This fixes two bugs in the prior patch:
+ *   1. The baseline gate (avx2===false → return baselineFlag) was hit BEFORE the abi gate,
+ *      so a baseline-musl target was rejected at line 124 before reaching the patched abi block.
+ *   2. The default glibc target (no abi, no avx2) was not suppressed when an explicit musl
+ *      target was requested, causing the glibc linux-x64 binary to build instead.
  *
  * The patch hook string is: `OPENCODE_TARGET_ABI` — used by the R11 guard to assert
  * the patch landed before building.
@@ -279,40 +287,62 @@ export function patchBuildTs(buildTsPath: string): void {
 
   const original = readFileSync(buildTsPath, 'utf8')
 
-  // The exact text we're replacing — the unconditional musl skip in the singleFlag filter.
-  // This matches build.ts lines ~128-131 (verified against .slim/clonedeps source).
-  const TARGET_ORIGINAL = `      // also skip abi-specific builds for the same reason
+  // The exact text we're replacing — the ENTIRE baseline+abi+return-true block in the
+  // singleFlag filter. Spans lines 122-133 in upstream build.ts (verified against
+  // .slim/clonedeps/repos/anomalyco__opencode/packages/opencode/script/build.ts).
+  const TARGET_ORIGINAL = `      // When building for the current platform, prefer a single native binary by default.
+      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+      if (item.avx2 === false) {
+        return baselineFlag
+      }
+
+      // also skip abi-specific builds for the same reason
       if (item.abi !== undefined) {
         return false
-      }`
+      }
 
-  // The replacement: honor OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars
-  // for explicit target selection. When these env vars are set, the filter selects
-  // the target that matches them instead of unconditionally skipping musl/baseline.
-  // The loop body already handles abi/baseline correctly — only the filter needs this hook.
-  const TARGET_REPLACEMENT = `      // also skip abi-specific builds for the same reason,
-      // UNLESS an explicit target is requested via OPENCODE_TARGET_ABI env var.
+      return true`
+
+  // The replacement: when OPENCODE_TARGET_ABI is set, drive the ENTIRE selection from the
+  // explicit target spec — honoring both the baseline gate (avx2===false) and the abi gate,
+  // AND suppressing the default glibc target (no abi) so only the requested {abi, baseline}
+  // target survives. When OPENCODE_TARGET_ABI is NOT set, original behavior is preserved.
+  // OPENCODE_TARGET_ABI
+  const TARGET_REPLACEMENT = `      // When building for the current platform, prefer a single native binary by default.
+      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+      // OPENCODE_TARGET_ABI: when set, the harness selects the explicit {abi, baseline} target.
       // This hook is injected by the harness build-platform.ts for musl/baseline targets.
-      // OPENCODE_TARGET_ABI
+      const _harnessTargetAbi = process.env["OPENCODE_TARGET_ABI"]
+      const _harnessTargetBaseline = process.env["OPENCODE_TARGET_BASELINE"] === "true"
+      if (_harnessTargetAbi !== undefined) {
+        // Explicit target mode: select ONLY the target matching {abi, baseline}.
+        // Reject the default glibc target (no abi) — it would otherwise build instead of musl.
+        if (item.abi !== _harnessTargetAbi) {
+          return false
+        }
+        // Honor the baseline flag: avx2===false means baseline; must match OPENCODE_TARGET_BASELINE.
+        if ((item.avx2 === false) !== _harnessTargetBaseline) {
+          return false
+        }
+        return true
+      }
+
+      // Original behavior (no explicit target): prefer a single native binary by default.
+      if (item.avx2 === false) {
+        return baselineFlag
+      }
+
+      // also skip abi-specific builds for the same reason
       if (item.abi !== undefined) {
-        const targetAbi = process.env["OPENCODE_TARGET_ABI"]
-        const targetBaseline = process.env["OPENCODE_TARGET_BASELINE"] === "true"
-        if (targetAbi === undefined || item.abi !== targetAbi) {
-          return false
-        }
-        // When targeting musl, also match the baseline flag
-        if (item.avx2 === false && !targetBaseline) {
-          return false
-        }
-        if (item.avx2 !== false && targetBaseline) {
-          return false
-        }
-      }`
+        return false
+      }
+
+      return true`
 
   if (!original.includes(TARGET_ORIGINAL)) {
     throw new Error(
       `[build-platform] build.ts patch target not found — upstream build.ts shape may have changed. ` +
-        `Expected to find the singleFlag musl-skip block. Refusing to build with an unpatched build.ts.`,
+        `Expected to find the singleFlag baseline+abi+return-true block. Refusing to build with an unpatched build.ts.`,
     )
   }
 
@@ -320,7 +350,6 @@ export function patchBuildTs(buildTsPath: string): void {
   writeFileSync(buildTsPath, patched, 'utf8')
   console.log(`[build-platform] build.ts patched successfully.`)
 }
-
 /**
  * R11 guard: asserts the patch hook landed in the patched build.ts.
  * Throws if the hook string is absent — meaning the patch silently failed.

@@ -724,21 +724,30 @@ describe('patchBuildTs: build.ts patch mechanism', () => {
   const mockedReadFileSync = vi.mocked(readFileSync)
   const mockedWriteFileSync = vi.mocked(writeFileSync)
 
-  // The exact singleFlag musl-skip block from upstream build.ts (lines ~128-131).
-  // This is the patch target — must match what patchBuildTs looks for.
-  const PATCH_TARGET = `      // also skip abi-specific builds for the same reason
+  // The exact baseline+abi+return-true block from upstream build.ts (lines 122-133).
+  // This is the NEW patch target — spans BOTH the baseline gate AND the abi gate.
+  // Must match what patchBuildTs looks for exactly (whitespace included).
+  const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
+      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+      if (item.avx2 === false) {
+        return baselineFlag
+      }
+
+      // also skip abi-specific builds for the same reason
       if (item.abi !== undefined) {
         return false
-      }`
+      }
+
+      return true`
 
   afterEach(() => {
     vi.restoreAllMocks()
     vi.clearAllMocks()
   })
 
-  it('patches the singleFlag musl-skip block and adds the OPENCODE_TARGET_ABI hook', () => {
+  it('patches the singleFlag baseline+abi block and adds the OPENCODE_TARGET_ABI hook', () => {
     // #given — readFileSync returns a fake build.ts with the patch target
-    const fakeContent = `// preamble\n${PATCH_TARGET}\n// postamble`
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
     mockedReadFileSync.mockImplementation(() => fakeContent)
     let writtenContent = ''
     mockedWriteFileSync.mockImplementation((_path, data) => {
@@ -751,10 +760,50 @@ describe('patchBuildTs: build.ts patch mechanism', () => {
     // #then — the hook marker is present in the written content
     expect(writtenContent).toContain('OPENCODE_TARGET_ABI')
     expect(writtenContent).toContain('process.env["OPENCODE_TARGET_ABI"]')
-    // The original unconditional return false is gone
-    expect(writtenContent).not.toContain(
-      '// also skip abi-specific builds for the same reason\n      if (item.abi !== undefined) {\n        return false\n      }',
-    )
+    // The original unconditional baseline gate is preserved in the fallback path
+    expect(writtenContent).toContain('return baselineFlag')
+    // The original unconditional abi skip is preserved in the fallback path
+    expect(writtenContent).toContain('if (item.abi !== undefined)')
+  })
+
+  it('patched filter rejects default glibc target when OPENCODE_TARGET_ABI is set', () => {
+    // #given — readFileSync returns a fake build.ts with the patch target
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
+    mockedReadFileSync.mockImplementation(() => fakeContent)
+    let writtenContent = ''
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      writtenContent = data as string
+    })
+
+    // #when
+    patchBuildTs('/fake/build.ts')
+
+    // #then — the patched content contains the explicit-target-mode block that:
+    // 1. Checks item.abi !== _harnessTargetAbi (rejects glibc target with no abi)
+    expect(writtenContent).toContain('if (item.abi !== _harnessTargetAbi)')
+    // 2. Honors the baseline flag via avx2===false comparison
+    expect(writtenContent).toContain('(item.avx2 === false) !== _harnessTargetBaseline')
+    // 3. Returns true only when both abi and baseline match
+    expect(writtenContent).toContain('return true')
+    // 4. The original baseline gate is preserved in the fallback path (no env var set)
+    expect(writtenContent).toContain('return baselineFlag')
+  })
+
+  it('patched filter honors OPENCODE_TARGET_BASELINE at the avx2 gate', () => {
+    // #given — readFileSync returns a fake build.ts with the patch target
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
+    mockedReadFileSync.mockImplementation(() => fakeContent)
+    let writtenContent = ''
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      writtenContent = data as string
+    })
+
+    // #when
+    patchBuildTs('/fake/build.ts')
+
+    // #then — the patched content reads OPENCODE_TARGET_BASELINE and compares avx2===false
+    expect(writtenContent).toContain('process.env["OPENCODE_TARGET_BASELINE"] === "true"')
+    expect(writtenContent).toContain('item.avx2 === false')
   })
 
   it('throws when the patch target is not found in build.ts', () => {
@@ -895,10 +944,19 @@ describe('runUpstreamBuild: musl/baseline target env vars', () => {
     // #given — musl build; simulate the patch read/write cycle via stateful mocks.
     // patchBuildTs reads the file (gets PATCH_TARGET), writes the patched content.
     // assertPatchLanded reads the file again (must get the patched content with the hook).
-    const PATCH_TARGET = `      // also skip abi-specific builds for the same reason
+    // PATCH_TARGET must match the NEW TARGET_ORIGINAL (the full baseline+abi+return-true block).
+    const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
+      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+      if (item.avx2 === false) {
+        return baselineFlag
+      }
+
+      // also skip abi-specific builds for the same reason
       if (item.abi !== undefined) {
         return false
-      }`
+      }
+
+      return true`
     // Stateful mock: tracks what was last written so assertPatchLanded sees the patched content.
     let fileContent = PATCH_TARGET
     mockedReadFileSync.mockImplementation(() => fileContent)
@@ -924,10 +982,19 @@ describe('runUpstreamBuild: musl/baseline target env vars', () => {
 
   it('sets OPENCODE_TARGET_ABI=musl and OPENCODE_TARGET_BASELINE=true when abi=musl and baseline=true', () => {
     // #given — musl baseline build; stateful mock simulates the patch read/write cycle.
-    const PATCH_TARGET = `      // also skip abi-specific builds for the same reason
+    // PATCH_TARGET must match the NEW TARGET_ORIGINAL (the full baseline+abi+return-true block).
+    const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
+      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+      if (item.avx2 === false) {
+        return baselineFlag
+      }
+
+      // also skip abi-specific builds for the same reason
       if (item.abi !== undefined) {
         return false
-      }`
+      }
+
+      return true`
     let fileContent = PATCH_TARGET
     mockedReadFileSync.mockImplementation(() => fileContent)
     mockedWriteFileSync.mockImplementation((_path, data) => {
