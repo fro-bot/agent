@@ -834,7 +834,9 @@ jobs:
               fi
               echo "Publishing ${PKG_NAME}@${NPM_VERSION}..."
               # OIDC trusted publishing: no token, provenance is automatic.
-              npm publish "${PKG_DIR}"
+              # --tag latest is required: npm refuses to publish a prerelease version
+              # without an explicit tag, and harness IS the latest line.
+              npm publish "${PKG_DIR}" --tag latest
             done
           done
 
@@ -871,23 +873,10 @@ jobs:
             # OIDC trusted publishing: no token, provenance is automatic.
             # Use a directory-anchored publish so npm does not parse the path as a
             # github: package spec (npm publish <path> needs ./ or cd into the dir).
-            (cd packages/harness && npm publish .)
+            # --tag latest is required: npm refuses to publish a prerelease version
+            # without an explicit tag, and it sets the latest line directly.
+            (cd packages/harness && npm publish . --tag latest)
           fi
-
-      - name: Tag @fro.bot/harness as latest on npm
-        # Prereleases are NOT tagged latest by default — npm only auto-tags latest
-        # for non-prerelease versions. We must set it explicitly after publish.
-        # Platform packages (@fro.bot/harness-{linux,darwin}-{x64,arm64}) are
-        # optional dependencies resolved by npm automatically; only the main package
-        # needs the latest dist-tag for `bunx @fro.bot/harness` to resolve correctly.
-        if: steps.params.outputs.dry_run != 'true'
-        env:
-          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
-        run: |
-          set -euo pipefail
-          echo "Tagging @fro.bot/harness@${NPM_VERSION} as latest..."
-          npm dist-tag add "@fro.bot/harness@${NPM_VERSION}" latest
-          echo "dist-tag latest → ${NPM_VERSION}"
 
       - name: Dry run summary
         if: steps.params.outputs.dry_run == 'true'
