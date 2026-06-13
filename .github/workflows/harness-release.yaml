@@ -554,6 +554,9 @@ jobs:
         if: steps.params.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job has no repo checkout, so gh cannot infer the repo from a .git
+          # directory. GH_REPO points all gh release subcommands at the right repo.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.params.outputs.release_tag }}
           BASE_VERSION: ${{ steps.params.outputs.base_version }}
           SHORT_SHA: ${{ steps.params.outputs.short_sha }}
