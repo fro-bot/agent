@@ -892,3 +892,126 @@ jobs:
           echo "  npm version:        ${NPM_VERSION}"
           echo "  release tag:        ${RELEASE_TAG}"
           echo "  No packages were published to npm."
+
+  # ---------------------------------------------------------------------------
+  # Sync default version — opens a PR bumping DEFAULT_OPENCODE_VERSION in
+  # packages/runtime/src/shared/constants.ts to the just-published harness
+  # build version, with rebuilt action dist/, so future harness releases flow
+  # into the action default automatically.
+  #
+  # Replaces Renovate tracking for the harness version (Renovate can't order
+  # +harness.<sha> tags). Runs only after a successful real publish; never on
+  # dry-run. The release is already done — this job is best-effort.
+  # ---------------------------------------------------------------------------
+  sync-default-version:
+    name: sync-default-version (bump DEFAULT_OPENCODE_VERSION)
+    needs: [prepare-integrate, build, publish]
+    # Only run after a real successful publish. Never on dry-run.
+    # The release is already done; this job failing does not affect it.
+    if: ${{ needs.publish.result == 'success' && inputs.dry_run != 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true # Best-effort: release already succeeded.
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout harness repo
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        # Do NOT use persist-credentials: false — peter-evans/create-pull-request
+        # needs the default GITHUB_TOKEN credential to push the branch.
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup
+        with:
+          install-dependencies: 'true'
+
+      - name: Compute NEW_VERSION and check idempotency
+        id: version
+        env:
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ needs.build.outputs.integration_commit }}
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
+          NEW_VERSION="${BASE_VERSION}+harness.${SHORT_SHA}"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed NEW_VERSION: ${NEW_VERSION}"
+
+          # Idempotency guard: if the constant already equals NEW_VERSION, skip.
+          CONSTANTS_FILE="packages/runtime/src/shared/constants.ts"
+          CURRENT=$(node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('${CONSTANTS_FILE}', 'utf8');
+            const m = src.match(/DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/);
+            process.stdout.write(m ? m[1] : '');
+          ")
+          echo "Current DEFAULT_OPENCODE_VERSION: '${CURRENT}'"
+
+          if [ "${CURRENT}" = "${NEW_VERSION}" ]; then
+            echo "Already at ${NEW_VERSION} — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Sanitize '+' → '-' for the git branch name (refs cannot contain '+').
+          BRANCH_SUFFIX="${NEW_VERSION//+/-}"
+          echo "branch_suffix=${BRANCH_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Update DEFAULT_OPENCODE_VERSION in constants.ts
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          CONSTANTS_FILE="packages/runtime/src/shared/constants.ts"
+
+          # Precise replacement: only touches the DEFAULT_OPENCODE_VERSION literal.
+          node -e "
+            const fs = require('fs');
+            const newVersion = process.env.NEW_VERSION;
+            let src = fs.readFileSync('${CONSTANTS_FILE}', 'utf8');
+            const updated = src.replace(
+              /(DEFAULT_OPENCODE_VERSION\s*=\s*')[^']+(')/,
+              '\$1' + newVersion + '\$2'
+            );
+            if (updated === src) {
+              console.error('ERROR: replacement pattern did not match — constant not updated');
+              process.exit(1);
+            }
+            fs.writeFileSync('${CONSTANTS_FILE}', updated);
+            console.log('Updated DEFAULT_OPENCODE_VERSION to: ' + newVersion);
+          "
+
+      - name: Rebuild action dist (pnpm build)
+        if: steps.version.outputs.skip != 'true'
+        run: pnpm build
+
+      - name: Open PR via peter-evans/create-pull-request
+        if: steps.version.outputs.skip != 'true'
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
+        with:
+          # Branch name uses branch_suffix ('+' already replaced with '-' in the version step).
+          branch: harness/sync-default-${{ steps.version.outputs.branch_suffix }}
+          commit-message: 'feat(action): default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
+          title: 'feat(action): default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
+          body: |
+            ## Automated harness version bump
+
+            This PR was opened automatically after publishing the harness release
+            `${{ steps.version.outputs.new_version }}` to npm and GitHub Releases.
+
+            **Changes:**
+            - Bumps `DEFAULT_OPENCODE_VERSION` in `packages/runtime/src/shared/constants.ts`
+              to `${{ steps.version.outputs.new_version }}`
+            - Rebuilds `dist/main.js` + `dist/post.js` to keep action dist in sync
+
+            Future harness releases will flow into the action default automatically
+            via this mechanism, replacing Renovate tracking (which cannot order
+            `+harness.<sha>` build-metadata tags).
+          base: main
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>

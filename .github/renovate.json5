@@ -22,9 +22,12 @@
       datasourceTemplate: 'npm',
     },
     {
+      // Tracks the stock OpenCode fallback pin (FALLBACK_VERSION in
+      // src/services/setup/opencode.ts). The action default is the harness
+      // build, maintained by harness-release.yaml on publish — not Renovate.
       customType: 'regex',
-      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
-      matchStrings: ["DEFAULT_OPENCODE_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
+      managerFilePatterns: ['/src\\/services\\/setup\\/opencode\\.ts/'],
+      matchStrings: ["FALLBACK_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',
