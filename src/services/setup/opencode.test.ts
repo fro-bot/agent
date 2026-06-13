@@ -341,9 +341,7 @@ describe('opencode', () => {
       // #given
       const converted = toolCacheVersion('1.17.3+harness.2c9cdbd2')
 
-      // #then — the converted string is NOT the same as the stock version
-      expect(converted).not.toBe('1.17.3')
-      // AND it preserves the full harness identity
+      // #then — preserves the full harness identity (and is therefore distinct from stock 1.17.3)
       expect(converted).toBe('1.17.3-harness.2c9cdbd2')
     })
   })

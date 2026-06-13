@@ -10,6 +10,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/download'
+const HARNESS_MARKER = '+harness.'
 
 /**
  * Known stable stock version for fallback when latest-fetch fails or for non-harness paths.
@@ -33,7 +34,7 @@ const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
  * is intentionally NOT treated as a harness version here.
  */
 export function isHarnessVersion(version: string): boolean {
-  return version.includes('+harness.')
+  return version.includes(HARNESS_MARKER)
 }
 
 /**
@@ -52,7 +53,7 @@ export function isHarnessVersion(version: string): boolean {
  * form.
  */
 export function toolCacheVersion(version: string): string {
-  return version.includes('+harness.') ? version.replace('+harness.', '-harness.') : version
+  return version.includes(HARNESS_MARKER) ? version.replace(HARNESS_MARKER, '-harness.') : version
 }
 
 /**

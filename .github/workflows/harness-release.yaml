@@ -917,10 +917,28 @@ jobs:
       pull-requests: write
 
     steps:
+      - id: get-app-token
+        name: Generate fro-bot app token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.APPLICATION_ID }}
+          private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+
+      - id: get-user-id
+        name: Get GitHub App User ID
+        env:
+          GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+        run: |
+          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          user_id=$(gh api "/users/${name}" --jq .id)
+          email="${user_id}+${name}@users.noreply.github.com"
+          echo "user-email=${email}" >> "$GITHUB_OUTPUT"
+          echo "user-name=${name}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout harness repo
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        # Do NOT use persist-credentials: false — peter-evans/create-pull-request
-        # needs the default GITHUB_TOKEN credential to push the branch.
+        with:
+          token: ${{ steps.get-app-token.outputs.token }}
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup
@@ -934,6 +952,16 @@ jobs:
           INTEGRATION_COMMIT: ${{ needs.build.outputs.integration_commit }}
         run: |
           set -euo pipefail
+
+          if ! printf '%s' "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "ERROR: invalid integration_commit: '${INTEGRATION_COMMIT}'" >&2
+            exit 1
+          fi
+
+          if ! printf '%s' "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: invalid base_version: '${BASE_VERSION}'" >&2
+            exit 1
+          fi
 
           SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
           NEW_VERSION="${BASE_VERSION}+harness.${SHORT_SHA}"
@@ -987,13 +1015,15 @@ jobs:
           "
 
       - name: Rebuild action dist (pnpm build)
+        id: build
         if: steps.version.outputs.skip != 'true'
         run: pnpm build
 
       - name: Open PR via peter-evans/create-pull-request
-        if: steps.version.outputs.skip != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.build.outcome == 'success'
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
         with:
+          token: ${{ steps.get-app-token.outputs.token }}
           # Branch name uses branch_suffix ('+' already replaced with '-' in the version step).
           branch: harness/sync-default-${{ steps.version.outputs.branch_suffix }}
           commit-message: 'feat(action): default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
@@ -1013,5 +1043,5 @@ jobs:
             via this mechanism, replacing Renovate tracking (which cannot order
             `+harness.<sha>` build-metadata tags).
           base: main
-          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
-          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
+          committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>

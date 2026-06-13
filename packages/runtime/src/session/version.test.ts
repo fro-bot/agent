@@ -77,6 +77,12 @@ describe('version', () => {
       expect(compareVersions('1.17.3+harness.a', '1.17.3+harness.b')).toBe(0)
     })
 
+    it('treats combined prerelease+build version as equal to a plain build-metadata version (both strip to base)', () => {
+      // #given one version has prerelease+build, the other has only build metadata
+      // both strip to 1.17.3, so comparison must return 0
+      expect(compareVersions('1.17.3-rc.1+harness.abc', '1.17.3+harness.xyz')).toBe(0)
+    })
+
     it('returns 0 for identical plain versions (regression)', () => {
       expect(compareVersions('1.17.3', '1.17.3')).toBe(0)
     })
@@ -98,6 +104,12 @@ describe('version', () => {
 
     it('returns plain version unchanged', () => {
       expect(baseVersion('1.2.0')).toBe('1.2.0')
+    })
+
+    it('strips both prerelease and build metadata (combined form)', () => {
+      // #given a version with both prerelease label and build metadata
+      // #when / #then — base strips both, returning only the numeric core
+      expect(baseVersion('1.17.3-rc.1+harness.abc')).toBe('1.17.3')
     })
   })
 
