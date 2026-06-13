@@ -3,6 +3,7 @@ import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import {EventEmitter} from 'node:events'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   buildChecksumsUrl,
@@ -552,6 +553,24 @@ describe('opencode', () => {
   describe('FALLBACK_VERSION', () => {
     it('is a valid semver version', () => {
       expect(FALLBACK_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
+    })
+
+    it('is not a harness version', () => {
+      expect(isHarnessVersion(FALLBACK_VERSION)).toBe(false)
+    })
+
+    it('is not equal to DEFAULT_OPENCODE_VERSION (no re-aliasing)', () => {
+      expect(FALLBACK_VERSION).not.toBe(DEFAULT_OPENCODE_VERSION)
+    })
+  })
+
+  describe('DEFAULT_OPENCODE_VERSION', () => {
+    it('equals the pinned harness build', () => {
+      expect(DEFAULT_OPENCODE_VERSION).toBe('1.17.3+harness.2c9cdbd2')
+    })
+
+    it('is a harness version', () => {
+      expect(isHarnessVersion(DEFAULT_OPENCODE_VERSION)).toBe(true)
     })
   })
 

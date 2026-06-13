@@ -5,15 +5,17 @@ import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import process from 'node:process'
 
-import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/download'
 
-/** Known stable version for fallback when latest fails */
-export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
+/**
+ * Known stable stock version for fallback when latest-fetch fails or for non-harness paths.
+ * This is a plain anomalyco/opencode release — not a harness build.
+ */
+export const FALLBACK_VERSION = '1.17.3'
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).

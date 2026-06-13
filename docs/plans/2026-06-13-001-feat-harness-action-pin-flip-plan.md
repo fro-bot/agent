@@ -104,6 +104,31 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** the existing fallback-is-semver test passes; default is the harness form.
 
+- [ ] **Unit 1b: Make compareVersions/isSqliteBackend build-metadata-safe**
+
+**Goal:** Prevent the harness `+harness.<sha>` suffix from breaking OpenCode version comparison, which gates SQLite cache persistence.
+
+**Requirements:** R1 (correctness of the flipped default)
+
+**Files:**
+- Modify: `packages/runtime/src/session/version.ts`
+- Test: the colocated version test (find `version.test.ts` or the session test that covers `compareVersions`/`isSqliteBackend`)
+
+**Approach:**
+- `compareVersions(a, b)` does `a.split('.').map(Number)`. For `'1.17.3+harness.2c9cdbd2'` this yields `[1, 17, NaN/null, ...]`, so `isSqliteBackend('1.17.3+harness.2c9cdbd2')` returns false — which would omit the SQLite session DB from cache save/restore in `src/services/cache/paths.ts:50,66`, causing silent session-state loss. **This is the severe bug the plan's X.Y.Z-assumption flag caught.**
+- Strip SemVer build metadata (and prerelease) before splitting: compare only the base `X.Y.Z`. e.g. take `version.split('+')[0].split('-')[0]` before `.split('.')`, or add a small `baseVersion(v)` helper. Apply inside `compareVersions` (covers all callers) or normalize at the `isSqliteBackend` boundary — implementer picks the cleanest, but it must make `isSqliteBackend('1.17.3+harness.<sha>')` behave identically to `isSqliteBackend('1.17.3')`.
+
+**Patterns to follow:** existing `version.ts` style; `isHarnessVersion`/build-metadata handling in `opencode.ts`.
+
+**Test scenarios:**
+- Happy path: `compareVersions('1.17.3+harness.2c9cdbd2', '1.2.0')` > 0 (base compared, suffix ignored).
+- Happy path: `isSqliteBackend('1.17.3+harness.2c9cdbd2') === true` (matches `isSqliteBackend('1.17.3')`).
+- Edge: `compareVersions('1.17.3+harness.a', '1.17.3+harness.b') === 0` (build metadata non-ordering — equal base).
+- Edge: `compareVersions('1.17.3', '1.17.3') === 0` (stock unchanged).
+- Regression: `isSqliteBackend('1.1.0')` still false, `isSqliteBackend('1.2.0')` still true (threshold intact).
+
+**Verification:** `isSqliteBackend` returns true for the harness default; SQLite cache paths are included; stock behavior unchanged.
+
 - [ ] **Unit 2: Tool-cache identity for harness versions**
 
 **Goal:** Prevent harness/stock collision in `@actions/tool-cache` by using a `-harness` cache identity.
