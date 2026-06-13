@@ -226,6 +226,19 @@ function licenseCollectorPlugin(): Plugin {
 // `+harness.<sha>` build-metadata suffix that a minifier could strip or collapse
 // against the stock fallback; this fails the build if the configured default does
 // not survive into the emitted bundle.
+
+/**
+ * Pure assertion: throws if `expected` is not present in any of the provided chunk contents.
+ * Exported for unit testing; the plugin calls this after reading chunks from disk.
+ */
+export function assertVersionPresent(expected: string, chunkContents: readonly string[]): void {
+  if (!chunkContents.some(c => c.includes(expected))) {
+    throw new Error(
+      `[default-version-invariant] DEFAULT_OPENCODE_VERSION '${expected}' is absent from every dist chunk — the bundler likely stripped its build metadata. Aborting to prevent shipping a silent stock default.`,
+    )
+  }
+}
+
 function defaultVersionInvariantPlugin(): Plugin {
   return {
     name: 'default-version-invariant',
@@ -237,14 +250,8 @@ function defaultVersionInvariantPlugin(): Plugin {
       }
       const expected = match[1]
       const chunks = (await readdir('dist')).filter(name => name.endsWith('.js'))
-      const found = await Promise.all(
-        chunks.map(async name => (await readFile(join('dist', name), 'utf8')).includes(expected)),
-      )
-      if (!found.some(Boolean)) {
-        throw new Error(
-          `[default-version-invariant] DEFAULT_OPENCODE_VERSION '${expected}' is absent from every dist chunk — the bundler likely stripped its build metadata. Aborting to prevent shipping a silent stock default.`,
-        )
-      }
+      const chunkContents = await Promise.all(chunks.map(async name => readFile(join('dist', name), 'utf8')))
+      assertVersionPresent(expected, chunkContents)
     },
   }
 }
