@@ -46,7 +46,7 @@
  */
 
 import {execFileSync, spawnSync} from 'node:child_process'
-import {cpSync, mkdirSync, readdirSync, statSync, writeFileSync} from 'node:fs'
+import {cpSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
@@ -86,6 +86,10 @@ export interface BuildArgs {
   readonly workDir: string
   readonly outDir: string
   readonly sourceTree: string | null
+  /** musl ABI variant — when set to 'musl', selects the musl target in build.ts */
+  readonly abi: 'musl' | null
+  /** When true, selects the baseline (avx2=false) target variant */
+  readonly baseline: boolean
 }
 
 export function parseArgs(argv: string[]): BuildArgs | null {
@@ -122,6 +126,17 @@ export function parseArgs(argv: string[]): BuildArgs | null {
   }
   const sourceTree = sourceTreeValue
 
+  // --abi: optional, only 'musl' is accepted (additive; glibc is the default when absent).
+  const abiRaw = flag('--abi')
+  if (abiRaw !== null && abiRaw !== 'musl') {
+    console.error(`[build-platform] --abi '${abiRaw}' is not supported. Only 'musl' is accepted.`)
+    return null
+  }
+  const abi = abiRaw === 'musl' ? 'musl' : null
+
+  // --baseline: optional boolean flag (presence = true).
+  const baseline = args.includes('--baseline')
+
   if (integrationCommit === null || baseVersion === null || platform === null || arch === null) {
     console.error('[build-platform] Missing required arguments.')
     console.error('  Required: --integration-commit, --base-version, --platform, --arch')
@@ -129,7 +144,7 @@ export function parseArgs(argv: string[]): BuildArgs | null {
     return null
   }
 
-  return {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree}
+  return {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree, abi, baseline}
 }
 
 function printHelp(): void {
@@ -142,6 +157,8 @@ Usage:
     --base-version <version>            Base release version (e.g. 1.15.13)
     --platform <linux|darwin>           Target OS (linux or darwin; no windows)
     --arch <x64|arm64>                  Target CPU arch
+    [--abi musl]                        ABI variant (only 'musl' accepted; omit for glibc default)
+    [--baseline]                        Select the baseline (avx2=false) target variant
     [--repo-url <url>]                  Upstream repo URL (default: anomalyco/opencode)
     [--work-dir <path>]                 Working directory for the clone (default: .harness-build-work)
     [--out-dir <path>]                  Output directory for the native binary (default: .harness-build-out)
@@ -155,6 +172,13 @@ Build-environment contract:
   - Built binary --version verified == OPENCODE_VERSION before emitting.
   - provenance.json written to packages/harness/ for the workflow assemble step.
   - Exits non-zero on any failure.
+
+Musl/baseline variants:
+  - --abi musl --baseline: selects linux-x64-baseline-musl (avx2=false, musl)
+  - --abi musl (no --baseline): selects linux-arm64-musl (arm64, musl)
+  - No flags: selects the default glibc target for the current platform/arch (unchanged behavior).
+  - The build.ts singleFlag filter is patched in-place in the source tree to honor
+    OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars before invoking build.ts.
 `)
 }
 
@@ -213,10 +237,159 @@ export function cloneAndCheckout(repoUrl: string, workDir: string, commit: strin
 }
 
 // ---------------------------------------------------------------------------
+// Target-name helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the dist dir suffix that upstream build.ts appends for musl/baseline variants.
+ *
+ * Upstream build.ts `name` computation (lines 146-155):
+ *   [pkg.name, os, arch, avx2===false ? 'baseline' : undefined, abi ?? undefined].filter(Boolean).join('-')
+ *
+ * So for our targets:
+ *   linux/x64 + baseline + musl → opencode-linux-x64-baseline-musl
+ *   linux/arm64 + musl (no baseline) → opencode-linux-arm64-musl
+ *   linux/x64 (glibc, no baseline) → opencode-linux-x64  (unchanged)
+ *
+ * Returns the suffix string to append after `opencode-<os>-<arch>`, e.g. '-baseline-musl'.
+ * Returns '' for the default glibc target.
+ */
+export function resolveTargetDirSuffix(abi: 'musl' | null, baseline: boolean): string {
+  const parts: string[] = []
+  if (baseline) parts.push('baseline')
+  if (abi !== null) parts.push(abi)
+  return parts.length > 0 ? `-${parts.join('-')}` : ''
+}
+
+/**
+ * Patches the upstream build.ts singleFlag filter in-place to honor
+ * OPENCODE_TARGET_ABI and OPENCODE_TARGET_BASELINE env vars for explicit target selection.
+ *
+ * The patch is MINIMAL and LOCAL to the singleFlag filter block (R12).
+ * It replaces the unconditional `if (item.abi !== undefined) { return false }` guard
+ * with a conditional that allows the target through when the env vars match.
+ *
+ * The patch hook string is: `OPENCODE_TARGET_ABI` — used by the R11 guard to assert
+ * the patch landed before building.
+ *
+ * @param buildTsPath - Absolute path to the integration-tree build.ts to patch.
+ */
+export function patchBuildTs(buildTsPath: string): void {
+  console.log(`[build-platform] Patching build.ts for explicit target selection: ${buildTsPath}`)
+
+  const original = readFileSync(buildTsPath, 'utf8')
+
+  // The exact text we're replacing — the unconditional musl skip in the singleFlag filter.
+  // This matches build.ts lines ~128-131 (verified against .slim/clonedeps source).
+  const TARGET_ORIGINAL = `      // also skip abi-specific builds for the same reason
+      if (item.abi !== undefined) {
+        return false
+      }`
+
+  // The replacement: honor OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars
+  // for explicit target selection. When these env vars are set, the filter selects
+  // the target that matches them instead of unconditionally skipping musl/baseline.
+  // The loop body already handles abi/baseline correctly — only the filter needs this hook.
+  const TARGET_REPLACEMENT = `      // also skip abi-specific builds for the same reason,
+      // UNLESS an explicit target is requested via OPENCODE_TARGET_ABI env var.
+      // This hook is injected by the harness build-platform.ts for musl/baseline targets.
+      // OPENCODE_TARGET_ABI
+      if (item.abi !== undefined) {
+        const targetAbi = process.env["OPENCODE_TARGET_ABI"]
+        const targetBaseline = process.env["OPENCODE_TARGET_BASELINE"] === "true"
+        if (targetAbi === undefined || item.abi !== targetAbi) {
+          return false
+        }
+        // When targeting musl, also match the baseline flag
+        if (item.avx2 === false && !targetBaseline) {
+          return false
+        }
+        if (item.avx2 !== false && targetBaseline) {
+          return false
+        }
+      }`
+
+  if (!original.includes(TARGET_ORIGINAL)) {
+    throw new Error(
+      `[build-platform] build.ts patch target not found — upstream build.ts shape may have changed. ` +
+        `Expected to find the singleFlag musl-skip block. Refusing to build with an unpatched build.ts.`,
+    )
+  }
+
+  const patched = original.replace(TARGET_ORIGINAL, TARGET_REPLACEMENT)
+  writeFileSync(buildTsPath, patched, 'utf8')
+  console.log(`[build-platform] build.ts patched successfully.`)
+}
+
+/**
+ * R11 guard: asserts the patch hook landed in the patched build.ts.
+ * Throws if the hook string is absent — meaning the patch silently failed.
+ */
+export function assertPatchLanded(buildTsPath: string): void {
+  const content = readFileSync(buildTsPath, 'utf8')
+  // The hook comment is the canonical marker — present iff the patch succeeded.
+  const HOOK_MARKER = 'OPENCODE_TARGET_ABI'
+  if (!content.includes(HOOK_MARKER)) {
+    throw new Error(
+      `[build-platform] R11 guard: patch hook '${HOOK_MARKER}' not found in ${buildTsPath} after patching. ` +
+        `The patch did not land. Refusing to build.`,
+    )
+  }
+  console.log(`[build-platform] R11 guard: patch hook confirmed in build.ts.`)
+}
+
+/**
+ * R11 guard: asserts the emitted binary is actually a musl binary (not glibc).
+ * Uses `file` to inspect the binary's ELF interpreter / linkage.
+ * Throws if the binary appears to be glibc-linked.
+ *
+ * musl statically-linked binaries show "statically linked" or reference "musl" in `file` output.
+ * glibc binaries reference "/lib64/ld-linux-x86-64.so.2" or similar glibc interpreter.
+ */
+export function assertMuslBinary(binaryPath: string): void {
+  console.log(`[build-platform] R11 guard: asserting musl linkage for ${binaryPath}`)
+
+  let fileOutput: string
+  try {
+    fileOutput = execFileSync('file', [binaryPath], {encoding: 'utf8', timeout: 10_000}).trim()
+  } catch (error) {
+    throw new Error(
+      `[build-platform] R11 guard: 'file' command failed on ${binaryPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+
+  console.log(`[build-platform] file output: ${fileOutput}`)
+
+  // glibc binaries reference the glibc dynamic linker (ld-linux-*.so or ld-linux-x86-64.so.2).
+  // musl binaries are either statically linked or reference the musl linker (ld-musl-*).
+  // Bun musl compile targets produce statically linked binaries.
+  const glibcPatterns = [/ld-linux-x86-64\.so/, /ld-linux-aarch64\.so/, /ld-linux\.so/, /interpreter \/lib.*ld-linux/]
+  for (const pattern of glibcPatterns) {
+    if (pattern.test(fileOutput)) {
+      throw new Error(
+        `[build-platform] R11 guard: binary at ${binaryPath} appears to be glibc-linked (file output: '${fileOutput}'). ` +
+          `A musl target was requested but the binary is not musl. ` +
+          `This means the build.ts patch did not correctly select the musl target.`,
+      )
+    }
+  }
+
+  console.log(`[build-platform] R11 guard: musl linkage confirmed (no glibc interpreter found).`)
+}
+
+// ---------------------------------------------------------------------------
 // Build invocation
 // ---------------------------------------------------------------------------
 
-export function runUpstreamBuild(workDir: string, baseVersion: string, integrationCommit: string): void {
+export function runUpstreamBuild(
+  workDir: string,
+  baseVersion: string,
+  integrationCommit: string,
+  abi: 'musl' | null,
+  baseline: boolean,
+): void {
   const opencodeVersion = buildHarnessVersion(baseVersion, integrationCommit)
   console.log(`[build-platform] Running upstream build in ${workDir}`)
   console.log(`[build-platform] Env: OPENCODE_CHANNEL=${OPENCODE_CHANNEL} OPENCODE_VERSION=${opencodeVersion}`)
@@ -242,14 +415,36 @@ export function runUpstreamBuild(workDir: string, baseVersion: string, integrati
     throw new Error(`Workspace install failed with exit code ${installResult.status ?? 'unknown'}`)
   }
 
+  // For musl/baseline targets, patch the upstream build.ts singleFlag filter to honor
+  // OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars (R12: minimal, local patch).
+  // The patch is applied in-place to the source tree before invoking build.ts.
+  const buildTsPath = path.join(workDir, 'packages', 'opencode', 'script', 'build.ts')
+  const buildEnv: Record<string, string> = {
+    ...process.env,
+    OPENCODE_CHANNEL,
+    OPENCODE_VERSION: opencodeVersion,
+  }
+
+  if (abi !== null || baseline) {
+    // Apply the ephemeral patch to the integration-tree build.ts.
+    patchBuildTs(buildTsPath)
+    // R11 guard: assert the patch hook landed before building.
+    assertPatchLanded(buildTsPath)
+
+    // Set env vars that the patched singleFlag filter reads to select the target.
+    if (abi !== null) {
+      buildEnv.OPENCODE_TARGET_ABI = abi
+    }
+    if (baseline) {
+      buildEnv.OPENCODE_TARGET_BASELINE = 'true'
+    }
+    console.log(`[build-platform] Musl/baseline target selected: abi=${abi ?? 'none'} baseline=${String(baseline)}`)
+  }
+
   const result = spawnSync('bun', ['./packages/opencode/script/build.ts', '--single'], {
     cwd: workDir, // NOTE: workDir (repo root) — build.ts does its own process.chdir to packages/opencode
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      OPENCODE_CHANNEL,
-      OPENCODE_VERSION: opencodeVersion,
-    },
+    env: buildEnv,
     timeout: 30 * 60 * 1000, // 30-minute hard timeout
   })
 
@@ -262,9 +457,18 @@ export function runUpstreamBuild(workDir: string, baseVersion: string, integrati
 // Binary resolution and version verification
 // ---------------------------------------------------------------------------
 
-function resolveBuiltBinaryPath(workDir: string, platform: string, arch: string): string {
-  // Upstream build.ts emits to: packages/opencode/dist/opencode-<os>-<arch>/bin/opencode
-  const name = `opencode-${platform}-${arch}`
+function resolveBuiltBinaryPath(
+  workDir: string,
+  platform: string,
+  arch: string,
+  abi: 'musl' | null,
+  baseline: boolean,
+): string {
+  // Upstream build.ts emits to: packages/opencode/dist/opencode-<os>-<arch>[suffix]/bin/opencode
+  // The suffix matches the `name` computation in build.ts (lines 146-155):
+  //   [pkg.name, os, arch, avx2===false ? 'baseline' : undefined, abi ?? undefined].filter(Boolean).join('-')
+  const suffix = resolveTargetDirSuffix(abi, baseline)
+  const name = `opencode-${platform}-${arch}${suffix}`
   const binary = 'opencode'
   return path.join(workDir, 'packages', 'opencode', 'dist', name, 'bin', binary)
 }
@@ -300,9 +504,19 @@ function verifyBuiltBinary(binaryPath: string, expectedVersion: string): void {
 // Output emission
 // ---------------------------------------------------------------------------
 
-function emitBinary(binaryPath: string, outDir: string, platform: string, arch: string): string {
+function emitBinary(
+  binaryPath: string,
+  outDir: string,
+  platform: string,
+  arch: string,
+  abi: 'musl' | null,
+  baseline: boolean,
+): string {
   mkdirSync(outDir, {recursive: true})
-  const destName = `opencode-${platform}-${arch}`
+  // The emitted out-dir name matches the upstream dist dir name so the release workflow
+  // and workspace Dockerfile can find the asset by its canonical name.
+  const suffix = resolveTargetDirSuffix(abi, baseline)
+  const destName = `opencode-${platform}-${arch}${suffix}`
   const destBinDir = path.join(outDir, destName, 'bin')
   mkdirSync(destBinDir, {recursive: true})
   const destPath = path.join(destBinDir, 'opencode')
@@ -357,7 +571,7 @@ export async function main(): Promise<void> {
     process.exit(1)
   }
 
-  const {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree} = args
+  const {integrationCommit, baseVersion, platform, arch, repoUrl, workDir, outDir, sourceTree, abi, baseline} = args
 
   // Derive the harness package directory (two levels up from this script).
   const harnessPackageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -366,6 +580,8 @@ export async function main(): Promise<void> {
   console.log(`  integration commit: ${integrationCommit}`)
   console.log(`  base version:       ${baseVersion}`)
   console.log(`  platform:           ${platform}/${arch}`)
+  console.log(`  abi:                ${abi ?? 'glibc (default)'}`)
+  console.log(`  baseline:           ${String(baseline)}`)
   if (sourceTree === null) {
     console.log(`  repo:               ${repoUrl}`)
     console.log(`  work dir:           ${workDir}`)
@@ -426,15 +642,17 @@ export async function main(): Promise<void> {
   //    OPENCODE_VERSION embeds the integration commit short SHA for binary self-reporting.
   //    Version derivation is pure-from-arg (buildHarnessVersion uses --integration-commit
   //    directly; no git rev-parse is invoked — works with no .git present).
+  //    For musl/baseline targets, runUpstreamBuild patches build.ts in-place and sets
+  //    OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars before invoking build.ts.
   try {
-    runUpstreamBuild(buildSourceDir, baseVersion, integrationCommit)
+    runUpstreamBuild(buildSourceDir, baseVersion, integrationCommit, abi, baseline)
   } catch (error) {
     console.error(`[build-platform] Build failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
   }
 
   // 4. Verify the built binary --version == OPENCODE_VERSION (build-environment contract).
-  const binaryPath = resolveBuiltBinaryPath(buildSourceDir, platform, arch)
+  const binaryPath = resolveBuiltBinaryPath(buildSourceDir, platform, arch, abi, baseline)
   const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
   try {
     verifyBuiltBinary(binaryPath, expectedVersion)
@@ -443,9 +661,22 @@ export async function main(): Promise<void> {
     process.exit(1)
   }
 
+  // 4a. R11 guard: for musl targets, assert the emitted binary is actually musl (not glibc).
+  //     This runs in the real publish path (not only dry-run) because the LLM-merge
+  //     integration commit differs per run, making a green dry-run non-authoritative.
+  if (abi === 'musl') {
+    try {
+      assertMuslBinary(binaryPath)
+    } catch (error) {
+      console.error(`[build-platform] R11 musl guard failed: ${error instanceof Error ? error.message : String(error)}`)
+      process.exit(1)
+    }
+  }
+
   // 5. Emit the binary to the output directory.
+  const suffix = resolveTargetDirSuffix(abi, baseline)
   try {
-    emitBinary(binaryPath, outDir, platform, arch)
+    emitBinary(binaryPath, outDir, platform, arch, abi, baseline)
   } catch (error) {
     console.error(`[build-platform] Emit failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
@@ -460,7 +691,7 @@ export async function main(): Promise<void> {
     process.exit(1)
   }
 
-  console.log(`[build-platform] Done. Binary ready at: ${outDir}/opencode-${platform}-${arch}/bin/opencode`)
+  console.log(`[build-platform] Done. Binary ready at: ${outDir}/opencode-${platform}-${arch}${suffix}/bin/opencode`)
 }
 
 // Only run when executed directly (not when imported by tests or other modules).

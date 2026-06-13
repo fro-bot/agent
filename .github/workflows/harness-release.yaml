@@ -200,7 +200,7 @@ jobs:
   # Windows is out of scope (linux x64/arm64 + darwin x64/arm64 only).
   # ---------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.platform }}/${{ matrix.arch }})
+    name: build (${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }})
     needs: [prepare-integrate, integrate]
     # Run when prepare-integrate succeeded AND integrate did not fail.
     # integrate.result is 'skipped' for empty carry → build runs.
@@ -212,18 +212,41 @@ jobs:
       fail-fast: true # All-or-nothing: one failure blocks the whole publish.
       matrix:
         include:
+          # --- glibc Linux (unchanged; used by the action download path) ---
           - platform: linux
             arch: x64
             runner: ubuntu-24.04
+            abi: ''
+            baseline: false
           - platform: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+            abi: ''
+            baseline: false
+          # --- musl Linux (additive; used by the workspace Dockerfile on Alpine) ---
+          # linux/x64 baseline-musl: avx2=false + musl — matches opencode-linux-x64-baseline-musl
+          - platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+            abi: musl
+            baseline: true
+          # linux/arm64 musl: arm64 + musl — matches opencode-linux-arm64-musl
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            abi: musl
+            baseline: false
+          # --- Darwin (unchanged) ---
           - platform: darwin
             arch: x64
             runner: macos-15-intel
+            abi: ''
+            baseline: false
           - platform: darwin
             arch: arm64
             runner: macos-15
+            abi: ''
+            baseline: false
 
     runs-on: ${{ matrix.runner }}
 
@@ -301,41 +324,71 @@ jobs:
 
           echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
 
-      - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
+      - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }}
         env:
           INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
           BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_BASELINE: ${{ matrix.baseline }}
         run: |
-          bun run packages/harness/scripts/build-platform.ts \
-            --integration-commit "$INTEGRATION_COMMIT" \
-            --base-version "$BASE_VERSION" \
-            --platform "$MATRIX_PLATFORM" \
-            --arch "$MATRIX_ARCH" \
-            --source-tree "$RUNNER_TEMP/integration-src" \
-            --work-dir "$RUNNER_TEMP/harness-build-work" \
-            --out-dir "$RUNNER_TEMP/harness-build-out"
+          set -euo pipefail
+          # Build the command with optional --abi and --baseline flags for musl/baseline targets.
+          # For glibc entries (abi=''), these flags are omitted — preserving existing behavior.
+          # Use an array to avoid SC2086 word-splitting issues with unquoted flag variables.
+          CMD=(bun run packages/harness/scripts/build-platform.ts
+            --integration-commit "$INTEGRATION_COMMIT"
+            --base-version "$BASE_VERSION"
+            --platform "$MATRIX_PLATFORM"
+            --arch "$MATRIX_ARCH")
+          if [ -n "${MATRIX_ABI}" ]; then
+            CMD+=(--abi "${MATRIX_ABI}")
+          fi
+          if [ "${MATRIX_BASELINE}" = "true" ]; then
+            CMD+=(--baseline)
+          fi
+          CMD+=(--source-tree "$RUNNER_TEMP/integration-src"
+            --work-dir "$RUNNER_TEMP/harness-build-work"
+            --out-dir "$RUNNER_TEMP/harness-build-out")
+          "${CMD[@]}"
 
-      - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
+      - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }})
         env:
           INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
           BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_BASELINE: ${{ matrix.baseline }}
         run: |
+          set -euo pipefail
+          # Compute the binary dir suffix matching build.ts name computation:
+          #   [pkg.name, os, arch, avx2===false ? 'baseline' : undefined, abi ?? undefined].join('-')
+          # Order: baseline before abi (e.g. -baseline-musl, not -musl-baseline).
+          SUFFIX=""
+          if [ "${MATRIX_BASELINE}" = "true" ]; then
+            SUFFIX="${SUFFIX}-baseline"
+          fi
+          if [ -n "${MATRIX_ABI}" ]; then
+            SUFFIX="${SUFFIX}-${MATRIX_ABI}"
+          fi
           bun run packages/harness/scripts/verify-binary.ts \
-            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH/bin/opencode" \
+            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH${SUFFIX}/bin/opencode" \
             --base-version "$BASE_VERSION" \
             --integration-commit "$INTEGRATION_COMMIT"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}/bin/opencode
+          # Artifact name encodes the full target identity (platform/arch/baseline/abi).
+          # Order matches upstream build.ts name computation: baseline before abi.
+          # Musl variants use a distinct name so they don't collide with glibc artifacts.
+          # e.g. harness-binary-linux-x64-baseline-musl, harness-binary-linux-arm64-musl
+          name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.baseline && '-baseline' || '' }}${{ matrix.abi != '' && format('-{0}', matrix.abi) || '' }}
+          path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.baseline && '-baseline' || '' }}${{ matrix.abi != '' && format('-{0}', matrix.abi) || '' }}/bin/opencode
           if-no-files-found: error
           retention-days: 1
 
