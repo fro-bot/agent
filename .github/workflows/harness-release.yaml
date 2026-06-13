@@ -461,7 +461,7 @@ jobs:
             echo "short_sha=${SHORT_SHA}"
           } >> "$GITHUB_OUTPUT"
 
-      # Download all four platform binaries (mirrors publish job's download steps).
+      # Download all six platform binaries (4 glibc + 2 musl/baseline for workspace).
       - name: Download linux/x64 binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -486,7 +486,22 @@ jobs:
           name: harness-binary-darwin-arm64
           path: /tmp/harness-binaries/darwin-arm64
 
-      - name: Existence gate — assert all 4 binaries are present and non-empty
+      - name: Download linux/x64-baseline-musl binary
+        # R9: additive musl asset for workspace (Alpine). Distinct artifact name avoids
+        # collision with the glibc linux-x64 artifact.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-x64-baseline-musl
+          path: /tmp/harness-binaries/linux-x64-baseline-musl
+
+      - name: Download linux/arm64-musl binary
+        # R9: additive musl asset for workspace (Alpine/arm64).
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-arm64-musl
+          path: /tmp/harness-binaries/linux-arm64-musl
+
+      - name: Existence gate — assert all 6 binaries are present and non-empty
         # R10: all-or-nothing. Fail immediately if any binary is missing or empty.
         # Covers transient artifact expiry and partial uploads.
         run: |
@@ -505,6 +520,18 @@ jobs:
                 echo "OK: ${BIN} ($(wc -c < "${BIN}") bytes)"
               fi
             done
+          done
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            if [ ! -f "${BIN}" ]; then
+              echo "ERROR: missing binary: ${BIN}" >&2
+              FAIL=1
+            elif [ ! -s "${BIN}" ]; then
+              echo "ERROR: binary is empty: ${BIN}" >&2
+              FAIL=1
+            else
+              echo "OK: ${BIN} ($(wc -c < "${BIN}") bytes)"
+            fi
           done
           if [ "${FAIL}" -ne 0 ]; then
             echo "FATAL: one or more platform binaries are missing or empty. Aborting release." >&2
@@ -545,10 +572,47 @@ jobs:
             echo "${TARGET}: pre-verified by build job on its native runner."
           done
 
+          # musl binaries: also pre-verified on their native runners by the build job.
+          for TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            echo "${TARGET}: pre-verified by build job on its native runner."
+          done
+
+      - name: Assert musl binaries are actually musl (R11 packaging-side libc check)
+        # R11: before packaging, verify each musl artifact is actually musl-linked.
+        # A silently-failed patch (LLM-merge non-determinism) could produce a glibc binary
+        # under a musl artifact name; this gate catches it before the asset is published.
+        # Uses `file` to inspect the ELF interpreter: musl binaries reference musl-libc,
+        # not the glibc ld-linux interpreter. Fails loud if glibc is detected.
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            chmod +x "${BIN}"
+            FILE_OUT=$(file "${BIN}")
+            echo "${MUSL_TARGET}: ${FILE_OUT}"
+            # glibc binaries reference the ld-linux interpreter (ld-linux-x86-64.so.2,
+            # ld-linux-aarch64.so.1, etc.). musl binaries reference musl-libc or are
+            # statically linked. Fail if the glibc interpreter is present.
+            if echo "${FILE_OUT}" | grep -qE 'ld-linux|ld\.so\.[0-9]'; then
+              echo "ERROR: ${MUSL_TARGET} binary appears to be glibc-linked (found glibc interpreter in 'file' output)." >&2
+              echo "  file output: ${FILE_OUT}" >&2
+              echo "  This indicates the build.ts musl patch did not take effect for this target." >&2
+              FAIL=1
+            else
+              echo "OK: ${MUSL_TARGET} does not reference glibc interpreter."
+            fi
+          done
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "FATAL: one or more musl artifacts failed the libc assertion. Aborting release." >&2
+            exit 1
+          fi
+
       - name: Repackage binaries into stock-OpenCode-shaped release assets
-        # R1: linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
+        # R1/R9: linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
         # Mirrors stock anomalyco/opencode asset naming so action consumers can use
         # the same download path with only the repo/tag changed.
+        # Musl assets use the same tar layout as glibc linux assets (binary at archive root).
         run: |
           set -euo pipefail
           ASSETS_DIR="/tmp/harness-release-assets"
@@ -587,23 +651,48 @@ jobs:
             echo "Verified archive root: ${MEMBERS}"
           done
 
+          # Musl/baseline assets: same tar layout as glibc linux assets.
+          # Binary at archive root named "opencode" so workspace `tar -xz -C /usr/local/bin`
+          # extracts directly to /usr/local/bin/opencode.
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            chmod +x "${BIN}"
+            ASSET="opencode-${MUSL_TARGET}.tar.gz"
+            tar -czf "${ASSET}" -C "/tmp/harness-binaries/${MUSL_TARGET}" opencode
+            echo "Created: ${ASSET}"
+            MEMBERS=$(tar -tzf "${ASSET}")
+            if ! echo "${MEMBERS}" | grep -qx 'opencode'; then
+              echo "ERROR: ${ASSET} archive root does not contain 'opencode' at root (got: ${MEMBERS})" >&2
+              exit 1
+            fi
+            echo "Verified archive root: ${MEMBERS}"
+          done
+
           echo "All assets created:"
           ls -lh "${ASSETS_DIR}"
 
       - name: Generate SHA256SUMS
-        # Aggregated checksum file over all 4 assets (de-facto standard for mise/aqua/local consumers).
+        # Aggregated checksum file over all 6 assets (R2/R9: musl assets included).
         # The action verifies its single platform asset against the matching line.
+        # The workspace Dockerfile verifies the musl asset against the matching line.
         run: |
           set -euo pipefail
           cd /tmp/harness-release-assets
-          sha256sum opencode-linux-x64.tar.gz opencode-linux-arm64.tar.gz opencode-darwin-x64.zip opencode-darwin-arm64.zip > SHA256SUMS
+          sha256sum \
+            opencode-linux-x64.tar.gz \
+            opencode-linux-arm64.tar.gz \
+            opencode-darwin-x64.zip \
+            opencode-darwin-arm64.zip \
+            opencode-linux-x64-baseline-musl.tar.gz \
+            opencode-linux-arm64-musl.tar.gz \
+            > SHA256SUMS
           echo "SHA256SUMS:"
           cat SHA256SUMS
 
       - name: Create GitHub Release
         # Guard: skip actual release creation in dry-run mode.
-        # All prior steps (existence gate, version check, repackage, checksums) still run
-        # so dry-run validates everything except the publish.
+        # All prior steps (existence gate, libc assertion, version check, repackage, checksums)
+        # still run so dry-run validates everything except the publish.
         if: steps.params.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -627,6 +716,8 @@ jobs:
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
               opencode-darwin-arm64.zip \
+              opencode-linux-x64-baseline-musl.tar.gz \
+              opencode-linux-arm64-musl.tar.gz \
               SHA256SUMS \
               --clobber
             echo "Assets re-uploaded (clobber) for: ${RELEASE_TAG}"
@@ -640,6 +731,8 @@ jobs:
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
               opencode-darwin-arm64.zip \
+              opencode-linux-x64-baseline-musl.tar.gz \
+              opencode-linux-arm64-musl.tar.gz \
               SHA256SUMS
             echo "GitHub Release created: ${RELEASE_TAG}"
           fi
