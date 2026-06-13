@@ -130,3 +130,43 @@ describe('buildHarnessReleaseTag', () => {
     expect(result).not.toContain('-harness.')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Round-trip: buildHarnessVersion output satisfies the harness predicate;
+// buildHarnessNpmVersion output does NOT (npm hyphen form ≠ binary form).
+// FIX 10: ensures the binary/release form and the npm form are correctly
+// distinguished by the action's isHarnessVersion predicate.
+// ---------------------------------------------------------------------------
+
+// Inline the predicate from src/services/setup/opencode.ts — same logic,
+// no cross-package import needed (the predicate is a one-liner).
+const isHarnessVersion = (v: string): boolean => v.includes('+harness.')
+
+describe('round-trip: buildHarnessVersion ↔ isHarnessVersion', () => {
+  it('buildHarnessVersion output satisfies isHarnessVersion (binary/release form)', () => {
+    // #given
+    const baseVersion = '1.17.3'
+    const integrationCommit = 'abc123456789abcd'
+
+    // #when
+    const binaryVersion = buildHarnessVersion(baseVersion, integrationCommit)
+
+    // #then — the binary form must be recognized as a harness version by the action
+    expect(isHarnessVersion(binaryVersion)).toBe(true)
+    expect(binaryVersion).toContain('+harness.')
+  })
+
+  it('buildHarnessNpmVersion output does NOT satisfy isHarnessVersion (npm hyphen form)', () => {
+    // #given
+    const baseVersion = '1.17.3'
+    const integrationCommit = 'abc123456789abcd'
+
+    // #when
+    const npmVersion = buildHarnessNpmVersion(baseVersion, integrationCommit)
+
+    // #then — the npm form uses a hyphen and must NOT be treated as a harness download version
+    expect(isHarnessVersion(npmVersion)).toBe(false)
+    expect(npmVersion).toContain('-harness.')
+    expect(npmVersion).not.toContain('+harness.')
+  })
+})

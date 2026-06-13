@@ -229,7 +229,6 @@ jobs:
 
     outputs:
       integration_commit: ${{ steps.fetch-integrate.outputs.integration_commit }}
-      build_sha: ${{ steps.emit-build-sha.outputs.build_sha }}
 
     # Build job: read-only. No id-token — the untrusted LLM-merge + upstream
     # build runs here and must not be able to publish or obtain OIDC tokens.
@@ -331,10 +330,6 @@ jobs:
             --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH/bin/opencode" \
             --base-version "$BASE_VERSION" \
             --integration-commit "$INTEGRATION_COMMIT"
-
-      - name: Emit build SHA
-        id: emit-build-sha
-        run: echo "build_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -566,17 +561,23 @@ jobs:
           set -euo pipefail
           cd /tmp/harness-release-assets
 
-          # Quote the tag — it contains '+' which some shells/tools misinterpret.
-          echo "Creating GitHub Release: ${RELEASE_TAG}"
-          gh release create "${RELEASE_TAG}" \
-            --title "${RELEASE_TAG}" \
-            --notes "Harness build of OpenCode ${BASE_VERSION} (integration ${SHORT_SHA})." \
-            opencode-linux-x64.tar.gz \
-            opencode-linux-arm64.tar.gz \
-            opencode-darwin-x64.zip \
-            opencode-darwin-arm64.zip \
-            SHA256SUMS
-          echo "GitHub Release created: ${RELEASE_TAG}"
+          # Idempotency guard: skip if the release already exists (re-run safety).
+          # Mirrors the npm `npm view` skip pattern used in the publish job.
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; skipping gh release create"
+          else
+            # Quote the tag — it contains '+' which some shells/tools misinterpret.
+            echo "Creating GitHub Release: ${RELEASE_TAG}"
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Harness build of OpenCode ${BASE_VERSION} (integration ${SHORT_SHA})." \
+              opencode-linux-x64.tar.gz \
+              opencode-linux-arm64.tar.gz \
+              opencode-darwin-x64.zip \
+              opencode-darwin-arm64.zip \
+              SHA256SUMS
+            echo "GitHub Release created: ${RELEASE_TAG}"
+          fi
 
       - name: Dry run summary
         if: steps.params.outputs.dry_run == 'true'

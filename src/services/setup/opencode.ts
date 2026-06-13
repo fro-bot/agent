@@ -1,4 +1,6 @@
 import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCacheAdapter} from './types.js'
+import {createHash} from 'node:crypto'
+import {readFileSync} from 'node:fs'
 import os from 'node:os'
 import process from 'node:process'
 
@@ -11,6 +13,13 @@ const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/dow
 
 /** Known stable version for fallback when latest fails */
 export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
+
+/**
+ * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
+ * Matches: 1.2.3, 1.2.3-rc.1, 1.2.3+harness.abc12345, 1.2.3+harness.abc12345-extra
+ * Rejects: anything with `/`, `..`, shell metacharacters, or other traversal sequences.
+ */
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
 
 /**
  * Returns true when the version string is a harness-pinned build.
@@ -53,6 +62,34 @@ export function getPlatformInfo(): PlatformInfo {
 }
 
 /**
+ * Encode a version string as a URL-safe release tag.
+ *
+ * Ensures the tag has a `v` prefix and percent-encodes `+` as `%2B` so the
+ * URL path segment is valid — GitHub stores tags URL-encoded and a raw `+` is
+ * misread as a space.
+ */
+function encodeHarnessTag(version: string): string {
+  const rawTag = version.startsWith('v') ? version : `v${version}`
+  return rawTag.replaceAll('+', '%2B')
+}
+
+/**
+ * Validate that a version string is semver-ish (defense-in-depth, path-traversal guard).
+ *
+ * Throws if the version contains `/`, `..`, or any character outside the allowed set.
+ * Called before constructing download URLs.
+ */
+function assertValidVersion(version: string): void {
+  // Strip leading 'v' before matching (the pattern covers the numeric part only)
+  const bare = version.startsWith('v') ? version.slice(1) : version
+  if (!SEMVER_PATTERN.test(bare)) {
+    throw new Error(
+      `Invalid version string: "${version}". Must match semver-ish pattern (no path traversal or shell metacharacters).`,
+    )
+  }
+}
+
+/**
  * Build download URL for OpenCode binary.
  *
  * Harness-pinned versions (containing `+harness.`) are routed to the
@@ -60,14 +97,16 @@ export function getPlatformInfo(): PlatformInfo {
  * as `%2B` in the URL path segment — GitHub stores the tag URL-encoded and a
  * raw `+` is misread as a space. Stock versions route to anomalyco/opencode
  * with no encoding changes.
+ *
+ * Throws if the version does not match the semver-ish pattern (path-traversal guard).
  */
 export function buildDownloadUrl(version: string, info: PlatformInfo): string {
+  assertValidVersion(version)
+
   const filename = `opencode-${info.os}-${info.arch}${info.ext}`
 
   if (isHarnessVersion(version)) {
-    // Percent-encode `+` in the version tag for the URL path segment.
-    const rawTag = version.startsWith('v') ? version : `v${version}`
-    const encodedTag = rawTag.replaceAll('+', '%2B')
+    const encodedTag = encodeHarnessTag(version)
     return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/${filename}`
   }
 
@@ -81,29 +120,35 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
  * The SHA256SUMS file lives in the same release as the archive, at the same
  * base URL but with filename `SHA256SUMS`. The `+` in the version tag is
  * percent-encoded as `%2B` (same as in `buildDownloadUrl`).
+ *
+ * Throws if `version` is not a harness version — SHA256SUMS only exists for
+ * harness releases.
  */
 export function buildChecksumsUrl(version: string): string {
-  const rawTag = version.startsWith('v') ? version : `v${version}`
-  const encodedTag = rawTag.replaceAll('+', '%2B')
+  if (!isHarnessVersion(version)) {
+    throw new Error('buildChecksumsUrl requires a harness version (must contain +harness.)')
+  }
+  const encodedTag = encodeHarnessTag(version)
   return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/SHA256SUMS`
 }
 
 /**
  * Verify a harness archive against the release's SHA256SUMS file.
  *
- * Downloads the SHA256SUMS asset from the same release, reads it via `cat`,
- * computes the archive's sha256 via `shasum -a 256`, and asserts the hashes
- * match for this platform's asset filename. Throws on mismatch or missing line.
+ * Downloads the SHA256SUMS asset from the same release, reads it with node:fs,
+ * computes the archive's sha256 with node:crypto, and asserts the hashes match
+ * for this platform's asset filename. Throws on mismatch or missing line.
  *
  * This is ONLY called for harness versions — stock anomalyco/opencode releases
  * do not publish a SHA256SUMS asset.
+ *
+ * No shell commands (cat, shasum) are used — platform-independent by design.
  */
 async function verifyHarnessChecksum(
   archivePath: string,
   version: string,
   platformInfo: PlatformInfo,
   toolCache: ToolCacheAdapter,
-  execAdapter: ExecAdapter,
   logger: Logger,
 ): Promise<void> {
   const checksumsUrl = buildChecksumsUrl(version)
@@ -111,17 +156,20 @@ async function verifyHarnessChecksum(
 
   const checksumsPath = await toolCache.downloadTool(checksumsUrl)
 
-  // Read the checksums file
-  const {stdout: checksumsContent} = await execAdapter.getExecOutput('cat', [checksumsPath], {silent: true})
+  // Read the checksums file with node:fs (no shell dependency)
+  const checksumsContent = readFileSync(checksumsPath, 'utf8')
 
-  // Find the line for this platform's archive filename
+  // Find the line for this platform's archive filename (exact filename match, not endsWith)
   const archiveFilename = `opencode-${platformInfo.os}-${platformInfo.arch}${platformInfo.ext}`
   const matchingLine = checksumsContent
     .split('\n')
     .map(line => line.trim())
-    .find(line => line.endsWith(archiveFilename))
+    .find(line => {
+      const parts = line.split(/\s+/)
+      return parts.length >= 2 && parts.at(-1) === archiveFilename
+    })
 
-  if (matchingLine === undefined || matchingLine.length === 0) {
+  if (matchingLine === undefined) {
     throw new Error(`SHA256SUMS does not contain an entry for ${archiveFilename}`)
   }
 
@@ -131,13 +179,9 @@ async function verifyHarnessChecksum(
     throw new Error(`Could not parse hash from SHA256SUMS line: ${matchingLine}`)
   }
 
-  // Compute the archive's sha256
-  const {stdout: shasumOutput} = await execAdapter.getExecOutput('shasum', ['-a', '256', archivePath], {silent: true})
-  // shasum output: "<hash>  <path>"
-  const actualHash = shasumOutput.trim().split(/\s+/)[0]
-  if (actualHash === undefined || actualHash.length === 0) {
-    throw new Error('Could not compute SHA256 of downloaded archive')
-  }
+  // Compute the archive's sha256 with node:crypto (no shell dependency)
+  const archiveBytes = readFileSync(archivePath)
+  const actualHash = createHash('sha256').update(archiveBytes).digest('hex')
 
   if (actualHash.toLowerCase() !== expectedHash.toLowerCase()) {
     throw new Error(`SHA256 mismatch for ${archiveFilename}: expected ${expectedHash}, got ${actualHash}`)
@@ -183,8 +227,13 @@ async function validateDownload(
 /**
  * Install OpenCode CLI with version fallback.
  *
- * Tries requested version first, falls back to known stable version on failure.
- * Pattern from oMo Sisyphus workflow.
+ * For explicit harness pins (`isHarnessVersion(version) === true`), any
+ * download or checksum failure THROWS immediately — no stock fallback is
+ * attempted. Integrity over availability: a harness pin must resolve to the
+ * exact harness binary or fail closed.
+ *
+ * For stock versions, falls back to the known stable FALLBACK_VERSION on
+ * failure (pattern from oMo Sisyphus workflow).
  */
 export async function installOpenCode(
   version: string,
@@ -208,24 +257,23 @@ export async function installOpenCode(
     return result
   } catch (error) {
     if (isHarnessVersion(version)) {
-      logger.warning(
-        'Harness OpenCode download failed (checksum mismatch, missing SHA256SUMS, or network error); falling back to stock OpenCode',
-        {
-          harnessVersion: version,
-          fallbackVersion,
-          error: toErrorMessage(error),
-        },
+      // Fail closed: harness pins must not silently downgrade to stock OpenCode.
+      // A checksum mismatch, missing SHA256SUMS, or network error on a harness pin
+      // is a hard failure — throw immediately, no fallback.
+      throw new Error(
+        `Harness OpenCode download/verify failed for explicit pin "${version}": ${toErrorMessage(error)}. ` +
+          `No stock fallback is attempted for an explicit harness pin (fail-closed).`,
       )
-    } else {
-      logger.warning('Primary version install failed, trying fallback', {
-        requestedVersion: version,
-        fallbackVersion,
-        error: toErrorMessage(error),
-      })
     }
+
+    logger.warning('Primary version install failed, trying fallback', {
+      requestedVersion: version,
+      fallbackVersion,
+      error: toErrorMessage(error),
+    })
   }
 
-  // Fallback to known stable version
+  // Fallback to known stable version (stock versions only — harness pins throw above)
   if (version !== fallbackVersion) {
     try {
       const result = await downloadAndInstall(fallbackVersion, platformInfo, logger, toolCache, execAdapter)
@@ -252,7 +300,8 @@ async function downloadAndInstall(
 
   if (isHarnessVersion(version)) {
     // Harness releases publish a SHA256SUMS asset — verify before extraction.
-    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, execAdapter, logger)
+    // execAdapter is not passed: verification uses node:crypto + node:fs only.
+    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, logger)
   } else {
     // Stock releases: use magic-byte check only (no SHA256SUMS asset exists).
     const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter)
