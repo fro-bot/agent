@@ -674,7 +674,7 @@ jobs:
       # cause rename/rename conflicts that -Xtheirs cannot resolve.
       - name: Reset `${{ env.RELEASE_BRANCH }}` to last release tag
         run: |
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | grep -vF '+harness' | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           echo "Resetting ${{ env.RELEASE_BRANCH }} to ${last_tag}"
           git reset --hard "${last_tag}"
       - if: ${{ github.event_name == 'pull_request' }}
@@ -699,7 +699,7 @@ jobs:
         name: Generate PR Body
         run: |
           VERSION="${{ steps.release-preview.outputs.next_version }}"
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | grep -vF '+harness' | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           COMMIT_LIST=$(git log "${last_tag}..HEAD" --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
           TITLE_SUFFIX=": v${VERSION}"
