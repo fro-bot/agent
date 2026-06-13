@@ -340,19 +340,285 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Assemble + publish — all-or-nothing across the matrix.
-  # Runs only after ALL platform builds succeed (fail-fast: true above).
+  # Release binaries — repackage the 4 per-platform build artifacts into
+  # stock-OpenCode-shaped GitHub Release assets and create the GitHub Release.
+  # Isolated from build (contents: read) and publish (id-token: write).
+  # Runs only after ALL platform builds succeed.
   # ---------------------------------------------------------------------------
-  publish:
-    name: publish (all-or-nothing)
+  release-binaries:
+    name: release-binaries (package + GitHub Release)
     needs: [prepare-integrate, integrate, build]
-    # Run when build succeeded and integrate did not fail (defense-in-depth).
-    # build success already implies integrate didn't fail (build wouldn't have run),
-    # but the explicit check makes the gate clear and guards against future refactors.
+    # Mirror the publish job's if-guard: build must succeed and integrate must not fail.
     # !cancelled() prevents running if the workflow was manually cancelled.
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     runs-on: ubuntu-24.04
-    environment: npm-publish # Maintainer-gated environment with required reviewers.
+
+    permissions:
+      contents: write # Required for gh release create.
+      # No id-token: write — this job must not be able to obtain OIDC tokens.
+
+    steps:
+      - name: Resolve params
+        id: params
+        env:
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          PREPARE_BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREPARE_BASE_VERSION}" ]; then
+            # workflow_dispatch path: prepare-integrate resolved the version.
+            BASE_VERSION="${PREPARE_BASE_VERSION}"
+            DRY_RUN="${INPUT_DRY_RUN}"
+          else
+            # Tag-triggered path: parse harness-v<version> tag.
+            TAG="${GITHUB_REF_NAME}"
+            BASE_VERSION="${TAG#harness-v}"
+            DRY_RUN="false"
+          fi
+
+          # Integration commit is resolved once by the build job and passed via job output.
+          # This avoids a TOCTOU race where a force-push between build and release could
+          # cause the release to use a different commit than build verified.
+          INTEGRATION_COMMIT="${{ needs.build.outputs.integration_commit }}"
+
+          # Validate base_version: must be a semver-ish string (no shell metacharacters).
+          if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
+            echo "ERROR: base_version '${BASE_VERSION}' does not match expected semver format" >&2
+            exit 1
+          fi
+
+          # Validate integration_commit: must be a hex SHA (7–40 chars).
+          if ! echo "${INTEGRATION_COMMIT}" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "ERROR: integration_commit '${INTEGRATION_COMMIT}' does not match expected SHA format" >&2
+            exit 1
+          fi
+
+          # Derive the GitHub Release tag.
+          # Mirrors the publish job's "Resolve params" derivation.
+          SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
+          RELEASE_TAG="v${BASE_VERSION}+harness.${SHORT_SHA}"
+
+          {
+            echo "integration_commit=${INTEGRATION_COMMIT}"
+            echo "base_version=${BASE_VERSION}"
+            echo "dry_run=${DRY_RUN}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "short_sha=${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Download all four platform binaries (mirrors publish job's download steps).
+      - name: Download linux/x64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-x64
+          path: /tmp/harness-binaries/linux-x64
+
+      - name: Download linux/arm64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-arm64
+          path: /tmp/harness-binaries/linux-arm64
+
+      - name: Download darwin/x64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-darwin-x64
+          path: /tmp/harness-binaries/darwin-x64
+
+      - name: Download darwin/arm64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-darwin-arm64
+          path: /tmp/harness-binaries/darwin-arm64
+
+      - name: Existence gate — assert all 4 binaries are present and non-empty
+        # R10: all-or-nothing. Fail immediately if any binary is missing or empty.
+        # Covers transient artifact expiry and partial uploads.
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for PLATFORM in linux darwin; do
+            for ARCH in x64 arm64; do
+              BIN="/tmp/harness-binaries/${PLATFORM}-${ARCH}/opencode"
+              if [ ! -f "${BIN}" ]; then
+                echo "ERROR: missing binary: ${BIN}" >&2
+                FAIL=1
+              elif [ ! -s "${BIN}" ]; then
+                echo "ERROR: binary is empty: ${BIN}" >&2
+                FAIL=1
+              else
+                echo "OK: ${BIN} ($(wc -c < "${BIN}") bytes)"
+              fi
+            done
+          done
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "FATAL: one or more platform binaries are missing or empty. Aborting release." >&2
+            exit 1
+          fi
+
+      - name: Operational integrity — verify each binary reports the expected version
+        # R9: operational integrity. Each binary must self-report "<base>+harness.<short8>".
+        # A stray stock binary reports bare "<base>" and fails this check.
+        # Note: darwin binaries cannot be executed on ubuntu; skip --version for darwin.
+        # The build job already ran verify-binary.ts on the native runner for all platforms.
+        # Here we re-verify linux binaries (executable on ubuntu) as an additional gate.
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          SHORT_SHA: ${{ steps.params.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${BASE_VERSION}+harness.${SHORT_SHA}"
+          echo "Expected version: ${EXPECTED_VERSION}"
+
+          for ARCH in x64 arm64; do
+            BIN="/tmp/harness-binaries/linux-${ARCH}/opencode"
+            chmod +x "${BIN}"
+            ACTUAL=$(timeout 30 "${BIN}" --version 2>&1 | tr -d '\n' || true)
+            echo "linux-${ARCH} --version: '${ACTUAL}'"
+            if [ "${ACTUAL}" != "${EXPECTED_VERSION}" ]; then
+              echo "ERROR: linux-${ARCH} binary version mismatch." >&2
+              echo "  expected: '${EXPECTED_VERSION}'" >&2
+              echo "  actual:   '${ACTUAL}'" >&2
+              exit 1
+            fi
+            echo "OK: linux-${ARCH} version verified."
+          done
+
+          # darwin binaries are not executable on ubuntu; the build job's verify-binary.ts
+          # already ran on the native macOS runners. Mark them as pre-verified.
+          for ARCH in x64 arm64; do
+            echo "darwin-${ARCH}: pre-verified by build job on native macOS runner."
+          done
+
+      - name: Repackage binaries into stock-OpenCode-shaped release assets
+        # R1: linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
+        # Mirrors stock anomalyco/opencode asset naming so action consumers can use
+        # the same download path with only the repo/tag changed.
+        run: |
+          set -euo pipefail
+          ASSETS_DIR="/tmp/harness-release-assets"
+          mkdir -p "${ASSETS_DIR}"
+          cd "${ASSETS_DIR}"
+
+          for ARCH in x64 arm64; do
+            BIN="/tmp/harness-binaries/linux-${ARCH}/opencode"
+            chmod +x "${BIN}"
+            ASSET="opencode-linux-${ARCH}.tar.gz"
+            # -C to the directory containing the binary so the archive root is "opencode".
+            tar -czf "${ASSET}" -C "/tmp/harness-binaries/linux-${ARCH}" opencode
+            echo "Created: ${ASSET}"
+            # Verify archive root contains "opencode".
+            MEMBERS=$(tar -tzf "${ASSET}")
+            if ! echo "${MEMBERS}" | grep -qx 'opencode'; then
+              echo "ERROR: ${ASSET} archive root does not contain 'opencode' at root (got: ${MEMBERS})" >&2
+              exit 1
+            fi
+            echo "Verified archive root: ${MEMBERS}"
+          done
+
+          for ARCH in x64 arm64; do
+            BIN="/tmp/harness-binaries/darwin-${ARCH}/opencode"
+            chmod +x "${BIN}"
+            ASSET="opencode-darwin-${ARCH}.zip"
+            # -j (junk paths) flattens so the binary is at the archive root.
+            zip -j "${ASSET}" "${BIN}"
+            echo "Created: ${ASSET}"
+            # Verify archive root contains "opencode".
+            MEMBERS=$(unzip -Z1 "${ASSET}")
+            if ! echo "${MEMBERS}" | grep -qx 'opencode'; then
+              echo "ERROR: ${ASSET} archive root does not contain 'opencode' at root (got: ${MEMBERS})" >&2
+              exit 1
+            fi
+            echo "Verified archive root: ${MEMBERS}"
+          done
+
+          echo "All assets created:"
+          ls -lh "${ASSETS_DIR}"
+
+      - name: Generate SHA256SUMS
+        # Aggregated checksum file over all 4 assets (de-facto standard for mise/aqua/local consumers).
+        # The action verifies its single platform asset against the matching line.
+        run: |
+          set -euo pipefail
+          cd /tmp/harness-release-assets
+          sha256sum opencode-linux-x64.tar.gz opencode-linux-arm64.tar.gz opencode-darwin-x64.zip opencode-darwin-arm64.zip > SHA256SUMS
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        # Guard: skip actual release creation in dry-run mode.
+        # All prior steps (existence gate, version check, repackage, checksums) still run
+        # so dry-run validates everything except the publish.
+        if: steps.params.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.params.outputs.release_tag }}
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          SHORT_SHA: ${{ steps.params.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          cd /tmp/harness-release-assets
+
+          # Idempotency guard: if the release already exists, re-upload all assets
+          # with --clobber so a partial prior run (created release but missed assets)
+          # is repaired. If the release does not exist, create it with all assets.
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; ensuring all assets are present (clobber upload)."
+            gh release upload "${RELEASE_TAG}" \
+              opencode-linux-x64.tar.gz \
+              opencode-linux-arm64.tar.gz \
+              opencode-darwin-x64.zip \
+              opencode-darwin-arm64.zip \
+              SHA256SUMS \
+              --clobber
+            echo "Assets re-uploaded (clobber) for: ${RELEASE_TAG}"
+          else
+            # Quote the tag — it contains '+' which some shells/tools misinterpret.
+            echo "Creating GitHub Release: ${RELEASE_TAG}"
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Harness build of OpenCode ${BASE_VERSION} (integration ${SHORT_SHA})." \
+              opencode-linux-x64.tar.gz \
+              opencode-linux-arm64.tar.gz \
+              opencode-darwin-x64.zip \
+              opencode-darwin-arm64.zip \
+              SHA256SUMS
+            echo "GitHub Release created: ${RELEASE_TAG}"
+          fi
+
+      - name: Dry run summary
+        if: steps.params.outputs.dry_run == 'true'
+        env:
+          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+          RELEASE_TAG: ${{ steps.params.outputs.release_tag }}
+        run: |
+          echo "DRY RUN: repackage + integrity checks passed for all platforms."
+          echo "  base version:       ${BASE_VERSION}"
+          echo "  integration commit: ${INTEGRATION_COMMIT}"
+          echo "  release tag:        ${RELEASE_TAG}"
+          echo "  No GitHub Release was created."
+          echo "  Assets that would be uploaded:"
+          ls -lh /tmp/harness-release-assets/
+
+  # ---------------------------------------------------------------------------
+  # Assemble + publish — all-or-nothing across the matrix.
+  # Runs only after ALL platform builds succeed (fail-fast: true above).
+  # Sequenced after release-binaries so npm 'latest' never moves without a
+  # successful GitHub Release (prevents bunx resolving a binary-less version).
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish (all-or-nothing)
+    needs: [prepare-integrate, integrate, build, release-binaries]
+    # Run when build succeeded and integrate did not fail (defense-in-depth).
+    # build success already implies integrate didn't fail (build wouldn't have run),
+    # but the explicit check makes the gate clear and guards against future refactors.
+    # release-binaries must also succeed so npm latest never moves without a GitHub Release.
+    # !cancelled() prevents running if the workflow was manually cancelled.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') && needs.release-binaries.result == 'success' }}
+    runs-on: ubuntu-24.04
 
     # id-token: write is scoped to the publish job ONLY.
     # The build job (which runs untrusted LLM-merge + upstream build code) must
@@ -432,10 +698,20 @@ jobs:
             exit 1
           fi
 
+          # Derive the npm prerelease version and GitHub Release tag.
+          # npm strips SemVer build metadata (§10), so npm uses a prerelease hyphen;
+          # the GitHub Release tag uses build metadata (plus) to match the binary's
+          # self-reported version from buildHarnessVersion().
+          SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
+          NPM_VERSION="${BASE_VERSION}-harness.${SHORT_SHA}"
+          RELEASE_TAG="v${BASE_VERSION}+harness.${SHORT_SHA}"
+
           {
             echo "integration_commit=${INTEGRATION_COMMIT}"
             echo "base_version=${BASE_VERSION}"
             echo "dry_run=${DRY_RUN}"
+            echo "npm_version=${NPM_VERSION}"
+            echo "release_tag=${RELEASE_TAG}"
           } >> "$GITHUB_OUTPUT"
 
       # Download all four platform binaries.
@@ -467,6 +743,7 @@ jobs:
         env:
           BASE_VERSION: ${{ steps.params.outputs.base_version }}
           INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
         run: |
           set -euo pipefail
           PUBLISH_DIR="/tmp/harness-publish"
@@ -483,12 +760,12 @@ jobs:
               chmod +x "${BIN_DIR}/opencode"
 
               # Write the per-platform package.json (mirrors OpenCode's model).
-              # BASE_VERSION and PKG_NAME are shell variables (not workflow-expression
+              # NPM_VERSION and PKG_NAME are shell variables (not workflow-expression
               # interpolation), so they are safe from injection — validated above.
               cat > "${PKG_DIR}/package.json" <<EOF
           {
             "name": "${PKG_NAME}",
-            "version": "${BASE_VERSION}",
+            "version": "${NPM_VERSION}",
             "description": "Native binary for @fro.bot/harness on ${PLATFORM}/${ARCH}",
             "license": "MIT",
             "repository": {
@@ -507,7 +784,7 @@ jobs:
               # Copy LICENSE.
               cp packages/harness/LICENSE "${PKG_DIR}/LICENSE"
 
-              echo "Assembled: ${PKG_NAME}@${BASE_VERSION}"
+              echo "Assembled: ${PKG_NAME}@${NPM_VERSION}"
             done
           done
 
@@ -539,7 +816,7 @@ jobs:
       - name: Publish per-platform packages to npm (trusted publishing)
         if: steps.params.outputs.dry_run != 'true'
         env:
-          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
         run: |
           set -euo pipefail
           PUBLISH_DIR="/tmp/harness-publish"
@@ -548,11 +825,11 @@ jobs:
             for ARCH in x64 arm64; do
               PKG_DIR="${PUBLISH_DIR}/${PLATFORM}-${ARCH}"
               PKG_NAME="@fro.bot/harness-${PLATFORM}-${ARCH}"
-              if npm view "${PKG_NAME}@${BASE_VERSION}" version >/dev/null 2>&1; then
-                echo "Already published: ${PKG_NAME}@${BASE_VERSION}; skipping"
+              if npm view "${PKG_NAME}@${NPM_VERSION}" version >/dev/null 2>&1; then
+                echo "Already published: ${PKG_NAME}@${NPM_VERSION}; skipping"
                 continue
               fi
-              echo "Publishing ${PKG_NAME}@${BASE_VERSION}..."
+              echo "Publishing ${PKG_NAME}@${NPM_VERSION}..."
               # OIDC trusted publishing: no token, provenance is automatic.
               npm publish "${PKG_DIR}"
             done
@@ -561,44 +838,65 @@ jobs:
       - name: Publish main @fro.bot/harness package to npm (trusted publishing)
         if: steps.params.outputs.dry_run != 'true'
         env:
-          BASE_VERSION: ${{ steps.params.outputs.base_version }}
+          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
         run: |
           set -euo pipefail
           # Inject version + optionalDependencies before publish.
           # Source package.json intentionally omits optionalDependencies so the
           # workspace pnpm-lock.yaml stays clean (packages don't exist on npm yet).
           # We inject them here so the PUBLISHED package.json has them.
-          # BASE_VERSION is passed via env (not interpolated into the script body).
+          # NPM_VERSION is passed via env (not interpolated into the script body).
+          # All 5 packages use the identical prerelease string so optionalDependencies
+          # exact-match resolution works correctly.
           node -e "
             const fs = require('fs');
-            const baseVersion = process.env.BASE_VERSION;
+            const npmVersion = process.env.NPM_VERSION;
             const pkg = JSON.parse(fs.readFileSync('packages/harness/package.json', 'utf8'));
-            pkg.version = baseVersion;
+            pkg.version = npmVersion;
             pkg.optionalDependencies = {
-              '@fro.bot/harness-linux-x64': baseVersion,
-              '@fro.bot/harness-linux-arm64': baseVersion,
-              '@fro.bot/harness-darwin-x64': baseVersion,
-              '@fro.bot/harness-darwin-arm64': baseVersion,
+              '@fro.bot/harness-linux-x64': npmVersion,
+              '@fro.bot/harness-linux-arm64': npmVersion,
+              '@fro.bot/harness-darwin-x64': npmVersion,
+              '@fro.bot/harness-darwin-arm64': npmVersion,
             };
             fs.writeFileSync('packages/harness/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
-          if npm view "@fro.bot/harness@${BASE_VERSION}" version >/dev/null 2>&1; then
-            echo "Already published: @fro.bot/harness@${BASE_VERSION}; skipping"
+          if npm view "@fro.bot/harness@${NPM_VERSION}" version >/dev/null 2>&1; then
+            echo "Already published: @fro.bot/harness@${NPM_VERSION}; skipping"
           else
-            echo "Publishing @fro.bot/harness@${BASE_VERSION}..."
+            echo "Publishing @fro.bot/harness@${NPM_VERSION}..."
             # OIDC trusted publishing: no token, provenance is automatic.
             # Use a directory-anchored publish so npm does not parse the path as a
             # github: package spec (npm publish <path> needs ./ or cd into the dir).
             (cd packages/harness && npm publish .)
           fi
 
+      - name: Tag @fro.bot/harness as latest on npm
+        # Prereleases are NOT tagged latest by default — npm only auto-tags latest
+        # for non-prerelease versions. We must set it explicitly after publish.
+        # Platform packages (@fro.bot/harness-{linux,darwin}-{x64,arm64}) are
+        # optional dependencies resolved by npm automatically; only the main package
+        # needs the latest dist-tag for `bunx @fro.bot/harness` to resolve correctly.
+        if: steps.params.outputs.dry_run != 'true'
+        env:
+          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          echo "Tagging @fro.bot/harness@${NPM_VERSION} as latest..."
+          npm dist-tag add "@fro.bot/harness@${NPM_VERSION}" latest
+          echo "dist-tag latest → ${NPM_VERSION}"
+
       - name: Dry run summary
         if: steps.params.outputs.dry_run == 'true'
         env:
           BASE_VERSION: ${{ steps.params.outputs.base_version }}
           INTEGRATION_COMMIT: ${{ steps.params.outputs.integration_commit }}
+          NPM_VERSION: ${{ steps.params.outputs.npm_version }}
+          RELEASE_TAG: ${{ steps.params.outputs.release_tag }}
         run: |
           echo "DRY RUN: build + verify passed for all platforms."
           echo "  base version:       ${BASE_VERSION}"
           echo "  integration commit: ${INTEGRATION_COMMIT}"
+          echo "  npm version:        ${NPM_VERSION}"
+          echo "  release tag:        ${RELEASE_TAG}"
           echo "  No packages were published to npm."

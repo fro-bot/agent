@@ -38,6 +38,17 @@ Each per-platform package contains only that platform's native binary. The main 
 
 The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `pnpm-lock.yaml` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
+Harness builds target **linux and darwin only** (x64 + arm64); Windows is unsupported.
+
+## Distribution Channels and Versioning
+
+The harness is distributed through **two channels** from one release run:
+
+- **npm** — for local `bunx @fro.bot/harness` / `mise` use. Published as a SemVer **prerelease**: `<base>-harness.<short8>` (e.g. `1.17.3-harness.ed359558`), with the `latest` dist-tag set explicitly (prereleases are not `latest` by default).
+- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode). The release is tagged with SemVer **build metadata**: `v<base>+harness.<short8>`, carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
+
+The `-` (npm) vs `+` (GitHub) asymmetry is forced by npm: npm strips SemVer build metadata on publish, so `+harness.<sha>` would collapse to the bare base version. The binary self-reports the `+harness.<short8>` form (`harness --version`).
+
 ## Integrate→Build Bridge
 
 The release workflow connects the LLM merge to the per-platform build matrix via a **pushed git ref**. The merge runs through the Fro Bot workflow (which already installs OpenCode and provisions auth); the merged tree is pushed to a throwaway ref the build matrix fetches.
