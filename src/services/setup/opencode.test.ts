@@ -13,6 +13,7 @@ import {
   getPlatformInfo,
   installOpenCode,
   isHarnessVersion,
+  toolCacheVersion,
 } from './opencode.js'
 
 // ---------------------------------------------------------------------------
@@ -315,6 +316,38 @@ describe('opencode', () => {
     })
   })
 
+  describe('toolCacheVersion', () => {
+    it('converts +harness. build-metadata to -harness. prerelease form', () => {
+      // #given / #when / #then
+      expect(toolCacheVersion('1.17.3+harness.2c9cdbd2')).toBe('1.17.3-harness.2c9cdbd2')
+    })
+
+    it('leaves a plain stock version unchanged', () => {
+      // #given / #when / #then
+      expect(toolCacheVersion('1.17.3')).toBe('1.17.3')
+    })
+
+    it('leaves an already-prerelease hyphen form unchanged (no double-convert)', () => {
+      // #given / #when / #then
+      expect(toolCacheVersion('1.17.3-harness.x')).toBe('1.17.3-harness.x')
+    })
+
+    it('leaves "latest" unchanged', () => {
+      // #given / #when / #then
+      expect(toolCacheVersion('latest')).toBe('latest')
+    })
+
+    it('proves no collision: converted form is distinct from stock 1.17.3', () => {
+      // #given
+      const converted = toolCacheVersion('1.17.3+harness.2c9cdbd2')
+
+      // #then — the converted string is NOT the same as the stock version
+      expect(converted).not.toBe('1.17.3')
+      // AND it preserves the full harness identity
+      expect(converted).toBe('1.17.3-harness.2c9cdbd2')
+    })
+  })
+
   describe('getLatestVersion', () => {
     it('does not fetch anomalyco/opencode latest when given a harness pin', async () => {
       // #given
@@ -359,6 +392,27 @@ describe('opencode', () => {
       expect(result.cached).toBe(true)
       expect(result.path).toBe('/cached/opencode/1.0.0')
       expect(result.version).toBe('1.0.0')
+      expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('tool-cache collision guard: find is called with -harness. form for a harness version', async () => {
+      // #given — harness version must use the prerelease form at the find call site
+      // to avoid semver.clean() stripping build-metadata and colliding with stock 1.17.3
+      const HARNESS_VERSION = '1.17.3+harness.2c9cdbd2'
+      const mockToolCache = createMockToolCache({
+        find: vi.fn().mockReturnValue('/cached/opencode/harness'),
+      })
+      const mockExec = createMockExecAdapter()
+
+      // #when
+      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
+
+      // #then — cache hit path; version in result keeps the raw +harness. form
+      expect(result.cached).toBe(true)
+      expect(result.version).toBe(HARNESS_VERSION)
+      // find must have been called with the converted -harness. form
+      expect(mockToolCache.find).toHaveBeenCalledWith('opencode', '1.17.3-harness.2c9cdbd2', expect.any(String))
+      // download must NOT have been called (cache hit)
       expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
     })
 
@@ -632,6 +686,18 @@ describe('opencode', () => {
       // No exec calls for shasum or cat — streaming node:crypto path only
       expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('shasum', expect.anything(), expect.anything())
       expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('cat', expect.anything(), expect.anything())
+      // tool-cache collision guard: cacheDir must be called with the -harness. prerelease form,
+      // NOT the raw +harness. build-metadata form (which semver.clean() would strip to '1.17.3')
+      expect(mockToolCache.cacheDir).toHaveBeenCalledWith(
+        expect.any(String),
+        'opencode',
+        '1.17.3-harness.abc12345',
+        'x64',
+      )
+      // Download URL must still use the raw +harness. form (percent-encoded in URL)
+      const downloadCalls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
+      const archiveCall = downloadCalls.find(([url]) => !url.endsWith('SHA256SUMS'))
+      expect(archiveCall?.[0]).toContain('%2Bharness.')
     })
 
     it('exact filename match: decoy line with prefix does not match real archive filename', async () => {

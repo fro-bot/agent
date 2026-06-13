@@ -37,6 +37,25 @@ export function isHarnessVersion(version: string): boolean {
 }
 
 /**
+ * Convert a version string to a form safe for @actions/tool-cache.
+ *
+ * `@actions/tool-cache` passes the version through `semver.clean()` internally
+ * (find, cacheDir, _createToolPath). `semver.clean('1.17.3+harness.2c9cdbd2')`
+ * strips build-metadata and returns `'1.17.3'` — colliding with a stock 1.17.3
+ * cache entry. Converting the `+harness.` build-metadata marker to `-harness.`
+ * (a prerelease segment) preserves the full identity:
+ * `semver.clean('1.17.3-harness.2c9cdbd2') === '1.17.3-harness.2c9cdbd2'`.
+ *
+ * Only the `+harness.` marker is converted — all other version forms are
+ * returned unchanged. Use this ONLY at tool-cache call sites (find, cacheDir).
+ * Download URLs, checksums, return values, and logs must keep the raw `+harness.`
+ * form.
+ */
+export function toolCacheVersion(version: string): string {
+  return version.includes('+harness.') ? version.replace('+harness.', '-harness.') : version
+}
+
+/**
  * Get platform information for binary downloads.
  */
 export function getPlatformInfo(): PlatformInfo {
@@ -259,7 +278,7 @@ export async function installOpenCode(
   const platformInfo = getPlatformInfo()
 
   // Check cache first
-  const cachedPath = toolCache.find(TOOL_NAME, version, platformInfo.arch)
+  const cachedPath = toolCache.find(TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
   if (cachedPath.length > 0) {
     logger.info('OpenCode found in cache', {version, path: cachedPath})
     return {path: cachedPath, version, cached: true}
@@ -329,7 +348,7 @@ async function downloadAndInstall(
     platformInfo.ext === '.zip' ? await toolCache.extractZip(downloadPath) : await toolCache.extractTar(downloadPath)
 
   logger.info('Caching OpenCode')
-  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, version, platformInfo.arch)
+  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
 
   logger.info('OpenCode installed', {version, path: toolPath})
   return {path: toolPath, version, cached: false}
