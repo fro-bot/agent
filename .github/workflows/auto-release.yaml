@@ -72,10 +72,10 @@ jobs:
         id: semantic-release
         name: Semantic Release
         run: |
-          before_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          before_tag=$(git tag --list 'v*' --sort=-version:refname | grep -vF '+harness' | head -1)
           export GITHUB_REF=refs/heads/release GITHUB_SHA=$(git rev-parse HEAD) GITHUB_EVENT_NAME=push
           pnpm semantic-release --ci false
-          after_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          after_tag=$(git tag --list 'v*' --sort=-version:refname | grep -vF '+harness' | head -1)
           if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
             echo "new-release-version=${after_tag#v}" >> "$GITHUB_OUTPUT"
           fi

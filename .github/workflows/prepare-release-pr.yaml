@@ -71,7 +71,7 @@ jobs:
       - name: Reset to last release tag and merge `main`
         run: |
           set -euo pipefail
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           echo "Resetting to ${last_tag}"
           git reset --hard "${last_tag}"
           git fetch origin main
@@ -102,7 +102,7 @@ jobs:
         name: Generate PR body
         run: |
           VERSION="${{ steps.release-preview.outputs.next_version }}"
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | grep -vF '+harness' | head -1)
           COMMIT_LIST=$(git log "${last_tag}..HEAD" --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
           cat > /tmp/pr-body.md <<EOF

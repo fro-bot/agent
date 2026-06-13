@@ -79,6 +79,10 @@ function resolveReleaseTypeForParsedCommit(parsed: ParsedCommit): ReleaseType {
   return 'none'
 }
 
+export function filterHarnessTags(tags: readonly string[]): readonly string[] {
+  return tags.filter(tag => !tag.includes('+harness'))
+}
+
 export function analyzeReleaseType(messages: readonly string[]): ReleaseType {
   let highest: ReleaseType = 'none'
 
