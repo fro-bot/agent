@@ -1,6 +1,7 @@
 import type {ExecAdapter, Logger, PlatformInfo, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
+import {EventEmitter} from 'node:events'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
@@ -17,8 +18,13 @@ import {
 // ESM-compatible fs mock: vi.mock hoists to the top of the module so the
 // mocked version is in place before opencode.ts imports node:fs.
 // Individual tests set fsState.readFileSyncImpl to control readFileSync output.
+// Individual tests set fsState.createReadStreamImpl to control createReadStream output.
 // ---------------------------------------------------------------------------
-const fsState: {readFileSyncImpl: ((path: unknown) => Buffer | string) | null} = {readFileSyncImpl: null}
+
+const fsState: {
+  readFileSyncImpl: ((path: unknown) => Buffer | string) | null
+  createReadStreamImpl: ((path: unknown) => Buffer) | null
+} = {readFileSyncImpl: null, createReadStreamImpl: null}
 
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs')>()
@@ -37,6 +43,21 @@ vi.mock('node:fs', async importOriginal => {
         return actual.readFileSync(path as string, encoding as BufferEncoding)
       }
       return actual.readFileSync(path as string)
+    },
+    createReadStream: (path: unknown) => {
+      const emitter = new EventEmitter()
+      // Emit asynchronously so listeners can be attached before events fire
+      setImmediate(() => {
+        if (fsState.createReadStreamImpl === null) {
+          // No mock impl: emit error so tests that forget to set it fail loudly
+          emitter.emit('error', new Error(`createReadStream mock not configured for path: ${String(path)}`))
+          return
+        }
+        const bytes = fsState.createReadStreamImpl(path)
+        emitter.emit('data', bytes)
+        emitter.emit('end')
+      })
+      return emitter
     },
   }
 })
@@ -72,12 +93,14 @@ describe('opencode', () => {
     originalPlatform = process.platform
     originalArch = process.arch
     fsState.readFileSyncImpl = null
+    fsState.createReadStreamImpl = null
   })
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', {value: originalPlatform})
     Object.defineProperty(process, 'arch', {value: originalArch})
     fsState.readFileSyncImpl = null
+    fsState.createReadStreamImpl = null
     vi.restoreAllMocks()
   })
 
@@ -254,6 +277,13 @@ describe('opencode', () => {
     it('throws for the npm hyphen form (not a harness download version)', () => {
       // #given / #when / #then
       expect(() => buildChecksumsUrl('1.17.3-harness.abc12345')).toThrow(/requires a harness version/)
+    })
+
+    it('throws for a version containing path traversal (../) — semver guard', () => {
+      // #given — a traversal-containing string that also contains +harness. to bypass the isHarnessVersion check
+      // assertValidVersion must fire BEFORE isHarnessVersion so traversal is rejected regardless
+      // #when / #then
+      expect(() => buildChecksumsUrl('../evil+harness.abc12345')).toThrow(/Invalid version string/)
     })
   })
 
@@ -470,12 +500,13 @@ describe('opencode', () => {
         }),
       })
 
-      // Control readFileSync via the module-level mock state
+      // SHA256SUMS via readFileSync; archive bytes via createReadStream (streaming path)
       fsState.readFileSyncImpl = (path: unknown) => {
         if (path === CHECKSUMS_PATH) return mismatchChecksums
-        // Archive bytes — will hash to something that does NOT match WRONG_HASH
-        return Buffer.from('fake-archive-bytes')
+        return Buffer.alloc(0)
       }
+      // Archive bytes — will hash to something that does NOT match WRONG_HASH
+      fsState.createReadStreamImpl = (_path: unknown) => Buffer.from('fake-archive-bytes')
 
       const mockExec = createMockExecAdapter()
 
@@ -545,8 +576,8 @@ describe('opencode', () => {
       })
     }
 
-    it('happy path: harness version downloads SHA256SUMS and verifies hash via node:crypto (no exec calls)', async () => {
-      // #given — FIX 1: hash computed via node:crypto, no shasum/cat exec calls
+    it('happy path: harness version downloads SHA256SUMS and verifies hash via streaming node:crypto (no exec calls)', async () => {
+      // #given — hash computed via streaming createReadStream + node:crypto, no shasum/cat exec calls
       Object.defineProperty(process, 'platform', {value: 'linux'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
@@ -557,9 +588,12 @@ describe('opencode', () => {
       const mockToolCache = createHarnessToolCache()
       const mockExec = createMockExecAdapter()
 
-      // Control readFileSync via the module-level mock state
+      // SHA256SUMS is still read via readFileSync (it's tiny); archive is streamed via createReadStream
       fsState.readFileSyncImpl = (path: unknown) => {
         if (path === CHECKSUMS_PATH) return checksums
+        return Buffer.alloc(0)
+      }
+      fsState.createReadStreamImpl = (path: unknown) => {
         if (path === ARCHIVE_PATH) return archiveBytes
         return Buffer.alloc(0)
       }
@@ -576,13 +610,13 @@ describe('opencode', () => {
       expect(calls.some(([url]) => url.endsWith('SHA256SUMS'))).toBe(true)
       // Extraction should proceed
       expect(mockToolCache.extractTar).toHaveBeenCalled()
-      // No exec calls for shasum or cat — node:crypto path only
+      // No exec calls for shasum or cat — streaming node:crypto path only
       expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('shasum', expect.anything(), expect.anything())
       expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('cat', expect.anything(), expect.anything())
     })
 
     it('exact filename match: decoy line with prefix does not match real archive filename', async () => {
-      // #given — FIX 7: exact filename match, not endsWith
+      // #given — exact filename match, not endsWith
       Object.defineProperty(process, 'platform', {value: 'linux'})
       Object.defineProperty(process, 'arch', {value: 'x64'})
 
@@ -596,8 +630,12 @@ describe('opencode', () => {
       const mockToolCache = createHarnessToolCache()
       const mockExec = createMockExecAdapter()
 
+      // SHA256SUMS via readFileSync; archive bytes via createReadStream
       fsState.readFileSyncImpl = (path: unknown) => {
         if (path === CHECKSUMS_PATH) return checksums
+        return Buffer.alloc(0)
+      }
+      fsState.createReadStreamImpl = (path: unknown) => {
         if (path === ARCHIVE_PATH) return archiveBytes
         return Buffer.alloc(0)
       }

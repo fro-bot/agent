@@ -1,6 +1,7 @@
+import type {Buffer} from 'node:buffer'
 import type {ExecAdapter, Logger, OpenCodeInstallResult, PlatformInfo, ToolCacheAdapter} from './types.js'
 import {createHash} from 'node:crypto'
-import {readFileSync} from 'node:fs'
+import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import process from 'node:process'
 
@@ -125,6 +126,7 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
  * harness releases.
  */
 export function buildChecksumsUrl(version: string): string {
+  assertValidVersion(version)
   if (!isHarnessVersion(version)) {
     throw new Error('buildChecksumsUrl requires a harness version (must contain +harness.)')
   }
@@ -179,9 +181,19 @@ async function verifyHarnessChecksum(
     throw new Error(`Could not parse hash from SHA256SUMS line: ${matchingLine}`)
   }
 
-  // Compute the archive's sha256 with node:crypto (no shell dependency)
-  const archiveBytes = readFileSync(archivePath)
-  const actualHash = createHash('sha256').update(archiveBytes).digest('hex')
+  // Compute the archive's sha256 with node:crypto via streaming (no shell dependency, no full-file buffer)
+  const hash = createHash('sha256')
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(archivePath)
+    stream.on('error', reject)
+    stream.on('data', (chunk: string | Buffer) => {
+      hash.update(chunk)
+    })
+    stream.on('end', () => {
+      resolve()
+    })
+  })
+  const actualHash = hash.digest('hex')
 
   if (actualHash.toLowerCase() !== expectedHash.toLowerCase()) {
     throw new Error(`SHA256 mismatch for ${archiveFilename}: expected ${expectedHash}, got ${actualHash}`)

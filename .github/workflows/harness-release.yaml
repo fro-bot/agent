@@ -561,10 +561,19 @@ jobs:
           set -euo pipefail
           cd /tmp/harness-release-assets
 
-          # Idempotency guard: skip if the release already exists (re-run safety).
-          # Mirrors the npm `npm view` skip pattern used in the publish job.
+          # Idempotency guard: if the release already exists, re-upload all assets
+          # with --clobber so a partial prior run (created release but missed assets)
+          # is repaired. If the release does not exist, create it with all assets.
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Release ${RELEASE_TAG} already exists; skipping gh release create"
+            echo "Release ${RELEASE_TAG} already exists; ensuring all assets are present (clobber upload)."
+            gh release upload "${RELEASE_TAG}" \
+              opencode-linux-x64.tar.gz \
+              opencode-linux-arm64.tar.gz \
+              opencode-darwin-x64.zip \
+              opencode-darwin-arm64.zip \
+              SHA256SUMS \
+              --clobber
+            echo "Assets re-uploaded (clobber) for: ${RELEASE_TAG}"
           else
             # Quote the tag — it contains '+' which some shells/tools misinterpret.
             echo "Creating GitHub Release: ${RELEASE_TAG}"
