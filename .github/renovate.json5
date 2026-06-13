@@ -81,8 +81,8 @@
       datasourceTemplate: 'npm',
     },
     {
-      // Workspace executor image bakes the OpenCode CLI; keep its ARG in step
-      // with DEFAULT_OPENCODE_VERSION so the baked binary cannot drift.
+      // Workspace executor image bakes stock OpenCode; track its ARG against
+      // anomalyco/opencode (independent of the action's harness default).
       customType: 'regex',
       managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
       matchStrings: ['ARG OPENCODE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],

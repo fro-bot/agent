@@ -221,6 +221,34 @@ function licenseCollectorPlugin(): Plugin {
   }
 }
 
+// Guard: the action is code-split, so the OpenCode default version literal can
+// land in a shared chunk rather than main.js. A harness default carries a
+// `+harness.<sha>` build-metadata suffix that a minifier could strip or collapse
+// against the stock fallback; this fails the build if the configured default does
+// not survive into the emitted bundle.
+function defaultVersionInvariantPlugin(): Plugin {
+  return {
+    name: 'default-version-invariant',
+    async writeBundle() {
+      const constantsSource = await readFile('packages/runtime/src/shared/constants.ts', 'utf8')
+      const match = /DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/.exec(constantsSource)
+      if (match?.[1] == null) {
+        throw new Error('[default-version-invariant] could not read DEFAULT_OPENCODE_VERSION from source')
+      }
+      const expected = match[1]
+      const chunks = (await readdir('dist')).filter(name => name.endsWith('.js'))
+      const found = await Promise.all(
+        chunks.map(async name => (await readFile(join('dist', name), 'utf8')).includes(expected)),
+      )
+      if (!found.some(Boolean)) {
+        throw new Error(
+          `[default-version-invariant] DEFAULT_OPENCODE_VERSION '${expected}' is absent from every dist chunk — the bundler likely stripped its build metadata. Aborting to prevent shipping a silent stock default.`,
+        )
+      }
+    },
+  }
+}
+
 export default defineConfig({
   entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
   fixedExtension: false,
@@ -228,7 +256,7 @@ export default defineConfig({
   minify: true,
   // Source maps roughly triple committed dist/ size and the action never reads them.
   sourcemap: false,
-  plugins: [licenseCollectorPlugin(), escapeHiddenUnicodePlugin()],
+  plugins: [licenseCollectorPlugin(), escapeHiddenUnicodePlugin(), defaultVersionInvariantPlugin()],
   noExternal: id => {
     if (id.startsWith('@bfra.me/es')) return true
     if (id.startsWith('@actions/')) return true
