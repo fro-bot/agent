@@ -346,7 +346,7 @@ jobs:
   # Runs only after ALL platform builds succeed.
   # ---------------------------------------------------------------------------
   release-binaries:
-    name: release-binaries (package + GitHub Release)
+    name: Release Binaries
     needs: [prepare-integrate, integrate, build]
     # Mirror the publish job's if-guard: build must succeed and integrate must not fail.
     # !cancelled() prevents running if the workflow was manually cancelled.
@@ -458,12 +458,14 @@ jobs:
             exit 1
           fi
 
-      - name: Operational integrity — verify each binary reports the expected version
-        # R9: operational integrity. Each binary must self-report "<base>+harness.<short8>".
-        # A stray stock binary reports bare "<base>" and fails this check.
-        # Note: darwin binaries cannot be executed on ubuntu; skip --version for darwin.
-        # The build job already ran verify-binary.ts on the native runner for all platforms.
-        # Here we re-verify linux binaries (executable on ubuntu) as an additional gate.
+      - name: Operational integrity — verify the native binary reports the expected version
+        # R9: operational integrity. The binary must self-report "<base>+harness.<short8>";
+        # a stray stock binary reports bare "<base>" and fails this check.
+        # Only the binary matching THIS runner's architecture (ubuntu-24.04 = linux-x64) can
+        # be executed here — cross-arch (linux-arm64) and cross-OS (darwin) binaries cannot
+        # run on an x64 Linux runner. Every binary was already version-verified on its own
+        # native runner by the build job's verify-binary.ts, so this is an additional gate
+        # on the one binary we can natively execute.
         env:
           BASE_VERSION: ${{ steps.params.outputs.base_version }}
           SHORT_SHA: ${{ steps.params.outputs.short_sha }}
@@ -472,24 +474,22 @@ jobs:
           EXPECTED_VERSION="${BASE_VERSION}+harness.${SHORT_SHA}"
           echo "Expected version: ${EXPECTED_VERSION}"
 
-          for ARCH in x64 arm64; do
-            BIN="/tmp/harness-binaries/linux-${ARCH}/opencode"
-            chmod +x "${BIN}"
-            ACTUAL=$(timeout 30 "${BIN}" --version 2>&1 | tr -d '\n' || true)
-            echo "linux-${ARCH} --version: '${ACTUAL}'"
-            if [ "${ACTUAL}" != "${EXPECTED_VERSION}" ]; then
-              echo "ERROR: linux-${ARCH} binary version mismatch." >&2
-              echo "  expected: '${EXPECTED_VERSION}'" >&2
-              echo "  actual:   '${ACTUAL}'" >&2
-              exit 1
-            fi
-            echo "OK: linux-${ARCH} version verified."
-          done
+          BIN="/tmp/harness-binaries/linux-x64/opencode"
+          chmod +x "${BIN}"
+          ACTUAL=$(timeout 30 "${BIN}" --version 2>&1 | tr -d '\n' || true)
+          echo "linux-x64 --version: '${ACTUAL}'"
+          if [ "${ACTUAL}" != "${EXPECTED_VERSION}" ]; then
+            echo "ERROR: linux-x64 binary version mismatch." >&2
+            echo "  expected: '${EXPECTED_VERSION}'" >&2
+            echo "  actual:   '${ACTUAL}'" >&2
+            exit 1
+          fi
+          echo "OK: linux-x64 version verified."
 
-          # darwin binaries are not executable on ubuntu; the build job's verify-binary.ts
-          # already ran on the native macOS runners. Mark them as pre-verified.
-          for ARCH in x64 arm64; do
-            echo "darwin-${ARCH}: pre-verified by build job on native macOS runner."
+          # linux-arm64 and both darwin binaries cannot execute on this x64 Linux runner;
+          # the build job already ran verify-binary.ts for each on its native runner.
+          for TARGET in linux-arm64 darwin-x64 darwin-arm64; do
+            echo "${TARGET}: pre-verified by build job on its native runner."
           done
 
       - name: Repackage binaries into stock-OpenCode-shaped release assets
