@@ -5,15 +5,18 @@ import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import process from 'node:process'
 
-import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/download'
+const HARNESS_MARKER = '+harness.'
 
-/** Known stable version for fallback when latest fails */
-export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
+/**
+ * Known stable stock version for fallback when latest-fetch fails or for non-harness paths.
+ * This is a plain anomalyco/opencode release — not a harness build.
+ */
+export const FALLBACK_VERSION = '1.17.3'
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
@@ -31,7 +34,26 @@ const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
  * is intentionally NOT treated as a harness version here.
  */
 export function isHarnessVersion(version: string): boolean {
-  return version.includes('+harness.')
+  return version.includes(HARNESS_MARKER)
+}
+
+/**
+ * Convert a version string to a form safe for @actions/tool-cache.
+ *
+ * `@actions/tool-cache` passes the version through `semver.clean()` internally
+ * (find, cacheDir, _createToolPath). `semver.clean('1.17.3+harness.2c9cdbd2')`
+ * strips build-metadata and returns `'1.17.3'` — colliding with a stock 1.17.3
+ * cache entry. Converting the `+harness.` build-metadata marker to `-harness.`
+ * (a prerelease segment) preserves the full identity:
+ * `semver.clean('1.17.3-harness.2c9cdbd2') === '1.17.3-harness.2c9cdbd2'`.
+ *
+ * Only the `+harness.` marker is converted — all other version forms are
+ * returned unchanged. Use this ONLY at tool-cache call sites (find, cacheDir).
+ * Download URLs, checksums, return values, and logs must keep the raw `+harness.`
+ * form.
+ */
+export function toolCacheVersion(version: string): string {
+  return version.includes(HARNESS_MARKER) ? version.replace(HARNESS_MARKER, '-harness.') : version
 }
 
 /**
@@ -257,7 +279,7 @@ export async function installOpenCode(
   const platformInfo = getPlatformInfo()
 
   // Check cache first
-  const cachedPath = toolCache.find(TOOL_NAME, version, platformInfo.arch)
+  const cachedPath = toolCache.find(TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
   if (cachedPath.length > 0) {
     logger.info('OpenCode found in cache', {version, path: cachedPath})
     return {path: cachedPath, version, cached: true}
@@ -327,7 +349,7 @@ async function downloadAndInstall(
     platformInfo.ext === '.zip' ? await toolCache.extractZip(downloadPath) : await toolCache.extractTar(downloadPath)
 
   logger.info('Caching OpenCode')
-  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, version, platformInfo.arch)
+  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
 
   logger.info('OpenCode installed', {version, path: toolPath})
   return {path: toolPath, version, cached: false}

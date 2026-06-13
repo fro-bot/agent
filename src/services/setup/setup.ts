@@ -16,7 +16,7 @@ import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
-import {FALLBACK_VERSION, getLatestVersion, installOpenCode} from './opencode.js'
+import {FALLBACK_VERSION, getLatestVersion, installOpenCode, toolCacheVersion} from './opencode.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
@@ -84,7 +84,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     let omoSlimError: string | null = null
 
     if (toolsCacheResult.hit) {
-      const cachedPath = toolCache.find('opencode', version)
+      const cachedPath = toolCache.find('opencode', toolCacheVersion(version))
       if (cachedPath.length > 0) {
         opencodeResult = {path: cachedPath, version, cached: true}
         logger.info('Tools cache hit, using cached OpenCode CLI', {version, omoVersion})

@@ -10,8 +10,10 @@
 #   - 9200 (OpenCode bearer-token proxy) — sandbox-net reachable (gateway attaches here)
 #   - 54321 (raw OpenCode SDK server) — loopback (127.0.0.1) ONLY, never exposed
 #
-# OPENCODE_VERSION tracks DEFAULT_OPENCODE_VERSION and SYSTEMATIC_VERSION tracks
-# DEFAULT_SYSTEMATIC_VERSION in packages/runtime/src/shared/constants.ts.
+# OPENCODE_VERSION pins stock OpenCode for the workspace image (Renovate-tracked
+# against anomalyco/opencode, independent of the action's harness default).
+# SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
+# packages/runtime/src/shared/constants.ts.
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
 FROM node:24.16.0-alpine@sha256:fb71d01345f11b708a3553c66e7c74074f2d506400ea81973343d915cb64eef0 AS build
