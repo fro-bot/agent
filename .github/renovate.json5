@@ -81,12 +81,21 @@
       datasourceTemplate: 'npm',
     },
     {
-      // Workspace executor image bakes stock OpenCode; track its ARG against
-      // anomalyco/opencode (independent of the action's harness default).
+      // Workspace executor image bakes the harness OpenCode binary from
+      // fro-bot/agent releases. The version is in the form
+      // <base>+harness.<sha> (e.g. 1.17.3+harness.2c9cdbd2).
+      //
+      // Renovate CANNOT reliably order +harness.<sha> tags: build-metadata
+      // has no defined ordering in semver, and the SHA suffix is non-monotonic.
+      // This manager is VISIBILITY-ONLY — it surfaces the current pin in the
+      // Renovate dependency dashboard but will not produce clean auto-bump PRs.
+      // The workspace pin is bumped manually (or by the harness-release workflow)
+      // and is intentionally independent of the action's harness default.
+      // Do not couple this to the action's DEFAULT_OPENCODE_VERSION self-update.
       customType: 'regex',
       managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
-      matchStrings: ['ARG OPENCODE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
-      depNameTemplate: 'anomalyco/opencode',
+      matchStrings: ['ARG OPENCODE_VERSION=(?<currentValue>[^\\s]+)'],
+      depNameTemplate: 'fro-bot/agent',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',
     },
