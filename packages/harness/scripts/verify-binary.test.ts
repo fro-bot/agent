@@ -110,6 +110,28 @@ describe('parseArgs: --abi flag', () => {
     expect(result).toBeNull()
   })
 
+  it('returns null when --abi is present but has no value (last arg)', () => {
+    // #given — --abi is the last arg with no following value
+    const argv = [...BASE_ARGV, '--abi']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail with clear error, not silently treat as glibc
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --abi is present but followed by another flag (no value)', () => {
+    // #given — --abi is followed by another flag token (no value)
+    const argv = [...BASE_ARGV, '--abi', '--binary']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail-closed
+    expect(result).toBeNull()
+  })
+
   it('parses all fields correctly with --abi musl', () => {
     // #given
     const argv = [...BASE_ARGV, '--abi', 'musl']
@@ -150,7 +172,6 @@ describe('main(): musl path', () => {
 
   it('exits 0 without calling execFileSync when --abi musl and binary exists', () => {
     // #given — musl binary exists (12 MB)
-    vi.stubEnv('', '')
     process.argv = [
       'bun',
       'verify-binary.ts',

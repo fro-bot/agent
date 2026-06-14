@@ -129,7 +129,14 @@ export function parseArgs(argv: string[]): BuildArgs | null {
   const sourceTree = sourceTreeValue
 
   // --abi: optional, only 'musl' is accepted (additive; glibc is the default when absent).
+  // Presence-without-value check: if --abi is in args but flag() returned null, the value is missing.
+  const abiPresent = args.includes('--abi')
   const abiRaw = flag('--abi')
+  if (abiPresent && (abiRaw === null || abiRaw === '')) {
+    console.error('[build-platform] --abi requires a value: --abi musl')
+    console.error('Run with --help for usage.')
+    return null
+  }
   if (abiRaw !== null && abiRaw !== 'musl') {
     console.error(`[build-platform] --abi '${abiRaw}' is not supported. Only 'musl' is accepted.`)
     return null
@@ -143,6 +150,18 @@ export function parseArgs(argv: string[]): BuildArgs | null {
     console.error('[build-platform] Missing required arguments.')
     console.error('  Required: --integration-commit, --base-version, --platform, --arch')
     printHelp()
+    return null
+  }
+
+  // Cross-validation: --baseline and --abi musl are linux-only; --baseline is x64-only.
+  if ((baseline || abi !== null) && platform !== 'linux') {
+    console.error(
+      `[build-platform] --baseline and --abi musl are only supported for --platform linux (got: ${platform}).`,
+    )
+    return null
+  }
+  if (baseline && arch !== 'x64') {
+    console.error(`[build-platform] --baseline is only supported for --arch x64 (got: ${arch}).`)
     return null
   }
 
@@ -279,20 +298,23 @@ export function resolveTargetDirSuffix(abi: 'musl' | null, baseline: boolean): s
  *   2. The default glibc target (no abi, no avx2) was not suppressed when an explicit musl
  *      target was requested, causing the glibc linux-x64 binary to build instead.
  *
- * The patch hook string is: `OPENCODE_TARGET_ABI` — used by the R11 guard to assert
+ * The patch hook string is: `OPENCODE_TARGET_ABI` — used by the patch-landed guard to assert
  * the patch landed before building.
  *
  * @param buildTsPath - Absolute path to the integration-tree build.ts to patch.
  */
-export function patchBuildTs(buildTsPath: string): void {
-  console.log(`[build-platform] Patching build.ts for explicit target selection: ${buildTsPath}`)
+// ---------------------------------------------------------------------------
+// Patch constants — exported for test deduplication
+// ---------------------------------------------------------------------------
 
-  const original = readFileSync(buildTsPath, 'utf8')
-
-  // The exact text we're replacing — the ENTIRE baseline+abi+return-true block in the
-  // singleFlag filter. Spans lines 122-133 in upstream build.ts (verified against
-  // .slim/clonedeps/repos/anomalyco__opencode/packages/opencode/script/build.ts).
-  const TARGET_ORIGINAL = `      // When building for the current platform, prefer a single native binary by default.
+/**
+ * The exact baseline+abi+return-true block from upstream build.ts (lines 122-133).
+ * Verified against anomalyco/opencode v1.17.3's singleFlag filter block.
+ * Must be re-diffed if clonedeps is bumped to a new upstream version.
+ *
+ * @see .slim/clonedeps/repos/anomalyco__opencode/packages/opencode/script/build.ts
+ */
+export const TARGET_ORIGINAL = `      // When building for the current platform, prefer a single native binary by default.
       // Baseline binaries require additional Bun artifacts and can be flaky to download.
       if (item.avx2 === false) {
         return baselineFlag
@@ -305,12 +327,14 @@ export function patchBuildTs(buildTsPath: string): void {
 
       return true`
 
-  // The replacement: when OPENCODE_TARGET_ABI is set, drive the ENTIRE selection from the
-  // explicit target spec — honoring both the baseline gate (avx2===false) and the abi gate,
-  // AND suppressing the default glibc target (no abi) so only the requested {abi, baseline}
-  // target survives. When OPENCODE_TARGET_ABI is NOT set, original behavior is preserved.
-  // OPENCODE_TARGET_ABI
-  const TARGET_REPLACEMENT = `      // When building for the current platform, prefer a single native binary by default.
+/**
+ * The replacement block: when OPENCODE_TARGET_ABI is set, drives the ENTIRE selection from the
+ * explicit target spec — honoring both the baseline gate (avx2===false) and the abi gate,
+ * AND suppressing the default glibc target (no abi) so only the requested {abi, baseline}
+ * target survives. When OPENCODE_TARGET_ABI is NOT set, original behavior is preserved.
+ * OPENCODE_TARGET_ABI
+ */
+export const TARGET_REPLACEMENT = `      // When building for the current platform, prefer a single native binary by default.
       // Baseline binaries require additional Bun artifacts and can be flaky to download.
       // OPENCODE_TARGET_ABI: when set, the harness selects the explicit {abi, baseline} target.
       // This hook is injected by the harness build-platform.ts for musl/baseline targets.
@@ -341,6 +365,11 @@ export function patchBuildTs(buildTsPath: string): void {
 
       return true`
 
+export function patchBuildTs(buildTsPath: string): void {
+  console.log(`[build-platform] Patching build.ts for explicit target selection: ${buildTsPath}`)
+
+  const original = readFileSync(buildTsPath, 'utf8')
+
   if (!original.includes(TARGET_ORIGINAL)) {
     throw new Error(
       `[build-platform] build.ts patch target not found — upstream build.ts shape may have changed. ` +
@@ -353,7 +382,7 @@ export function patchBuildTs(buildTsPath: string): void {
   console.log(`[build-platform] build.ts patched successfully.`)
 }
 /**
- * R11 guard: asserts the patch hook landed in the patched build.ts.
+ * Guard: asserts the patch hook landed in the patched build.ts.
  * Throws if the hook string is absent — meaning the patch silently failed.
  */
 export function assertPatchLanded(buildTsPath: string): void {
@@ -362,30 +391,38 @@ export function assertPatchLanded(buildTsPath: string): void {
   const HOOK_MARKER = 'OPENCODE_TARGET_ABI'
   if (!content.includes(HOOK_MARKER)) {
     throw new Error(
-      `[build-platform] R11 guard: patch hook '${HOOK_MARKER}' not found in ${buildTsPath} after patching. ` +
+      `[build-platform] Guard: patch hook '${HOOK_MARKER}' not found in ${buildTsPath} after patching. ` +
         `The patch did not land. Refusing to build.`,
     )
   }
-  console.log(`[build-platform] R11 guard: patch hook confirmed in build.ts.`)
+  console.log(`[build-platform] Guard: patch hook confirmed in build.ts.`)
 }
 
 /**
- * R11 guard: asserts the emitted binary is actually a musl binary (not glibc).
+ * Guard: asserts the emitted binary is actually a musl binary (not glibc).
  * Uses `file` to inspect the binary's ELF interpreter / linkage.
- * Throws if the binary appears to be glibc-linked.
  *
- * musl statically-linked binaries show "statically linked" or reference "musl" in `file` output.
- * glibc binaries reference "/lib64/ld-linux-x86-64.so.2" or similar glibc interpreter.
+ * Positive assertions (all must pass):
+ *   - Output contains 'ELF' (not a text file, wrong format, or corrupt binary).
+ *   - Output contains the expected architecture string:
+ *       x64   → 'x86-64'
+ *       arm64 → 'aarch64'
+ *   - Output contains 'statically linked' OR 'musl' (Bun musl builds are statically linked).
+ *
+ * Negative assertion (must NOT be present):
+ *   - glibc dynamic linker patterns (ld-linux-*.so) → throws if found.
+ *
+ * Throws on any assertion failure.
  */
-export function assertMuslBinary(binaryPath: string): void {
-  console.log(`[build-platform] R11 guard: asserting musl linkage for ${binaryPath}`)
+export function assertMuslBinary(binaryPath: string, arch: 'x64' | 'arm64'): void {
+  console.log(`[build-platform] Asserting musl linkage for ${binaryPath} (arch: ${arch})`)
 
   let fileOutput: string
   try {
     fileOutput = execFileSync('file', [binaryPath], {encoding: 'utf8', timeout: 10_000}).trim()
   } catch (error) {
     throw new Error(
-      `[build-platform] R11 guard: 'file' command failed on ${binaryPath}: ${
+      `[build-platform] 'file' command failed on ${binaryPath}: ${
         error instanceof Error ? error.message : String(error)
       }`,
     )
@@ -393,21 +430,49 @@ export function assertMuslBinary(binaryPath: string): void {
 
   console.log(`[build-platform] file output: ${fileOutput}`)
 
-  // glibc binaries reference the glibc dynamic linker (ld-linux-*.so or ld-linux-x86-64.so.2).
-  // musl binaries are either statically linked or reference the musl linker (ld-musl-*).
-  // Bun musl compile targets produce statically linked binaries.
+  // Positive assertion 1: must be an ELF binary.
+  if (!fileOutput.includes('ELF')) {
+    throw new Error(
+      `[build-platform] Binary at ${binaryPath} is not an ELF binary (file output: '${fileOutput}'). ` +
+        `Expected an ELF executable for a musl target.`,
+    )
+  }
+
+  // Positive assertion 2: must match the expected architecture.
+  const archString = arch === 'x64' ? 'x86-64' : 'aarch64'
+  if (!fileOutput.includes(archString)) {
+    throw new Error(
+      `[build-platform] Binary at ${binaryPath} does not match expected architecture '${archString}' ` +
+        `(arch: ${arch}, file output: '${fileOutput}'). Architecture mismatch.`,
+    )
+  }
+
+  // Negative assertion: glibc binaries reference the glibc dynamic linker (ld-linux-*.so).
+  // Check this before the "statically linked or musl" positive check so glibc binaries
+  // get a clear, specific error message rather than the generic "not musl-linked" message.
   const glibcPatterns = [/ld-linux-x86-64\.so/, /ld-linux-aarch64\.so/, /ld-linux\.so/, /interpreter \/lib.*ld-linux/]
   for (const pattern of glibcPatterns) {
     if (pattern.test(fileOutput)) {
       throw new Error(
-        `[build-platform] R11 guard: binary at ${binaryPath} appears to be glibc-linked (file output: '${fileOutput}'). ` +
+        `[build-platform] Binary at ${binaryPath} appears to be glibc-linked (file output: '${fileOutput}'). ` +
           `A musl target was requested but the binary is not musl. ` +
           `This means the build.ts patch did not correctly select the musl target.`,
       )
     }
   }
 
-  console.log(`[build-platform] R11 guard: musl linkage confirmed (no glibc interpreter found).`)
+  // Positive assertion 3: must be statically linked or reference musl.
+  // Bun musl compile targets produce statically linked binaries.
+  if (!fileOutput.includes('statically linked') && !fileOutput.includes('musl')) {
+    throw new Error(
+      `[build-platform] Binary at ${binaryPath} is neither statically linked nor musl-linked ` +
+        `(file output: '${fileOutput}'). A musl target was requested but the binary does not show musl linkage.`,
+    )
+  }
+
+  console.log(
+    `[build-platform] Musl linkage verified (ELF, ${archString}, statically linked / musl, no glibc interpreter).`,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +512,8 @@ export function runUpstreamBuild(
   }
 
   // For musl/baseline targets, patch the upstream build.ts singleFlag filter to honor
-  // OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars (R12: minimal, local patch).
+  // OPENCODE_TARGET_ABI / OPENCODE_TARGET_BASELINE env vars.
+  // Build-time mutation of the checked-out source tree only — no credentials/push/OIDC.
   // The patch is applied in-place to the source tree before invoking build.ts.
   const buildTsPath = path.join(workDir, 'packages', 'opencode', 'script', 'build.ts')
   const buildEnv: Record<string, string> = {
@@ -459,7 +525,7 @@ export function runUpstreamBuild(
   if (abi !== null || baseline) {
     // Apply the ephemeral patch to the integration-tree build.ts.
     patchBuildTs(buildTsPath)
-    // R11 guard: assert the patch hook landed before building.
+    // Guard: assert the patch hook landed before building.
     assertPatchLanded(buildTsPath)
 
     // Set env vars that the patched singleFlag filter reads to select the target.
@@ -707,14 +773,21 @@ export async function main(): Promise<void> {
     process.exit(1)
   }
 
-  // 4a. R11 guard: for musl targets, assert the emitted binary is actually musl (not glibc).
+  // 4a. Musl linkage guard: for musl targets, assert the emitted binary is actually musl (not glibc).
   //     This runs in the real publish path (not only dry-run) because the LLM-merge
   //     integration commit differs per run, making a green dry-run non-authoritative.
   if (abi === 'musl') {
+    const typedArch = arch === 'x64' || arch === 'arm64' ? arch : null
+    if (typedArch === null) {
+      console.error(`[build-platform] Musl linkage guard: unsupported arch '${arch}' for musl assertion.`)
+      process.exit(1)
+    }
     try {
-      assertMuslBinary(binaryPath)
+      assertMuslBinary(binaryPath, typedArch)
     } catch (error) {
-      console.error(`[build-platform] R11 musl guard failed: ${error instanceof Error ? error.message : String(error)}`)
+      console.error(
+        `[build-platform] Musl linkage guard failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
       process.exit(1)
     }
   }

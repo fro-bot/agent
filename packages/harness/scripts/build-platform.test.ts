@@ -36,6 +36,7 @@ import {
   patchBuildTs,
   resolveTargetDirSuffix,
   runUpstreamBuild,
+  TARGET_ORIGINAL,
   verifyBuiltBinary,
 } from './build-platform.js'
 
@@ -711,6 +712,78 @@ describe('parseArgs: --abi and --baseline flags', () => {
     // #then
     expect(result).toBeNull()
   })
+
+  it('returns null when --abi is present but has no value (last arg)', () => {
+    // #given — --abi is the last arg with no following value
+    const argv = [...BASE_ARGV, '--abi']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail with clear error, not silently treat as glibc
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --abi is present but followed by another flag (no value)', () => {
+    // #given — --abi is followed by another flag token (no value)
+    const argv = [...BASE_ARGV, '--abi', '--baseline']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail-closed
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --baseline is used with non-linux platform', () => {
+    // #given — --baseline on darwin is not supported
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'darwin',
+      '--arch',
+      'x64',
+      '--abi',
+      'musl',
+      '--baseline',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --baseline is used with arm64 arch', () => {
+    // #given — --baseline on arm64 is not supported (x64-only)
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'linux',
+      '--arch',
+      'arm64',
+      '--abi',
+      'musl',
+      '--baseline',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -725,21 +798,10 @@ describe('patchBuildTs: build.ts patch mechanism', () => {
   const mockedReadFileSync = vi.mocked(readFileSync)
   const mockedWriteFileSync = vi.mocked(writeFileSync)
 
-  // The exact baseline+abi+return-true block from upstream build.ts (lines 122-133).
-  // This is the NEW patch target — spans BOTH the baseline gate AND the abi gate.
-  // Must match what patchBuildTs looks for exactly (whitespace included).
-  const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
-      if (item.avx2 === false) {
-        return baselineFlag
-      }
-
-      // also skip abi-specific builds for the same reason
-      if (item.abi !== undefined) {
-        return false
-      }
-
-      return true`
+  // Use the exported TARGET_ORIGINAL constant — single source of truth.
+  // Matches anomalyco/opencode v1.17.3's singleFlag filter block (lines 122-133).
+  // Must be re-diffed if clonedeps is bumped to a new upstream version.
+  const PATCH_TARGET = TARGET_ORIGINAL
 
   afterEach(() => {
     vi.restoreAllMocks()
@@ -833,10 +895,10 @@ describe('patchBuildTs: build.ts patch mechanism', () => {
 })
 
 // ---------------------------------------------------------------------------
-// assertMuslBinary — R11 musl linkage guard
+// assertMuslBinary — musl linkage guard (positive + negative assertions)
 // ---------------------------------------------------------------------------
 
-describe('assertMuslBinary: R11 musl linkage guard', () => {
+describe('assertMuslBinary: musl linkage guard', () => {
   const mockedExecFileSync = vi.mocked(execFileSync)
 
   beforeEach(() => {
@@ -848,25 +910,53 @@ describe('assertMuslBinary: R11 musl linkage guard', () => {
     vi.clearAllMocks()
   })
 
-  it('does not throw when file output shows statically linked (musl)', () => {
-    // #given — Bun musl compile produces a statically linked binary
+  // -------------------------------------------------------------------------
+  // Happy paths: valid musl binaries
+  // -------------------------------------------------------------------------
+
+  it('does not throw for statically linked x64 musl binary', () => {
+    // #given — Bun musl compile produces a statically linked x86-64 binary
     mockedExecFileSync.mockReturnValue(
       '/tmp/opencode: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped\n',
     )
 
     // #when / #then — must not throw
-    expect(() => assertMuslBinary('/tmp/opencode')).not.toThrow()
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
   })
 
-  it('does not throw when file output shows musl linker', () => {
+  it('does not throw for statically linked arm64 musl binary', () => {
+    // #given — Bun musl compile produces a statically linked aarch64 binary
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).not.toThrow()
+  })
+
+  it('does not throw when file output shows musl linker (x64)', () => {
     // #given — binary references musl dynamic linker
     mockedExecFileSync.mockReturnValue(
       '/tmp/opencode: ELF 64-bit LSB executable, x86-64, interpreter /lib/ld-musl-x86_64.so.1, stripped\n',
     )
 
     // #when / #then — must not throw
-    expect(() => assertMuslBinary('/tmp/opencode')).not.toThrow()
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
   })
+
+  it('does not throw when file output shows musl linker (arm64)', () => {
+    // #given — binary references musl dynamic linker for aarch64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, interpreter /lib/ld-musl-aarch64.so.1, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).not.toThrow()
+  })
+
+  // -------------------------------------------------------------------------
+  // Negative assertions: glibc binaries must throw
+  // -------------------------------------------------------------------------
 
   it('throws when file output shows glibc x86-64 interpreter', () => {
     // #given — glibc binary
@@ -875,7 +965,7 @@ describe('assertMuslBinary: R11 musl linkage guard', () => {
     )
 
     // #when / #then — must throw with clear message
-    expect(() => assertMuslBinary('/tmp/opencode')).toThrow('glibc-linked')
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('glibc-linked')
   })
 
   it('throws when file output shows glibc aarch64 interpreter', () => {
@@ -885,7 +975,39 @@ describe('assertMuslBinary: R11 musl linkage guard', () => {
     )
 
     // #when / #then — must throw
-    expect(() => assertMuslBinary('/tmp/opencode')).toThrow('glibc-linked')
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).toThrow('glibc-linked')
+  })
+
+  // -------------------------------------------------------------------------
+  // Positive assertions: non-ELF and wrong-arch must throw (FIX 1)
+  // -------------------------------------------------------------------------
+
+  it('throws when file output shows non-ELF ASCII text (stale text file)', () => {
+    // #given — stale text file, not a binary
+    mockedExecFileSync.mockReturnValue('/tmp/opencode: ASCII text\n')
+
+    // #when / #then — must throw (not an ELF binary)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('not an ELF binary')
+  })
+
+  it('throws when file output shows wrong architecture (arm64 binary checked as x64)', () => {
+    // #given — arm64 binary but we expect x64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must throw (architecture mismatch)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('Architecture mismatch')
+  })
+
+  it('throws when file output shows wrong architecture (x64 binary checked as arm64)', () => {
+    // #given — x64 binary but we expect arm64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must throw (architecture mismatch)
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).toThrow('Architecture mismatch')
   })
 
   it('throws when file command itself fails', () => {
@@ -895,7 +1017,7 @@ describe('assertMuslBinary: R11 musl linkage guard', () => {
     })
 
     // #when / #then — must throw
-    expect(() => assertMuslBinary('/tmp/opencode')).toThrow("'file' command failed")
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow("'file' command failed")
   })
 })
 
@@ -943,23 +1065,10 @@ describe('runUpstreamBuild: musl/baseline target env vars', () => {
 
   it('sets OPENCODE_TARGET_ABI=musl when abi is musl', () => {
     // #given — musl build; simulate the patch read/write cycle via stateful mocks.
-    // patchBuildTs reads the file (gets PATCH_TARGET), writes the patched content.
+    // patchBuildTs reads the file (gets TARGET_ORIGINAL), writes the patched content.
     // assertPatchLanded reads the file again (must get the patched content with the hook).
-    // PATCH_TARGET must match the NEW TARGET_ORIGINAL (the full baseline+abi+return-true block).
-    const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
-      if (item.avx2 === false) {
-        return baselineFlag
-      }
-
-      // also skip abi-specific builds for the same reason
-      if (item.abi !== undefined) {
-        return false
-      }
-
-      return true`
     // Stateful mock: tracks what was last written so assertPatchLanded sees the patched content.
-    let fileContent = PATCH_TARGET
+    let fileContent = TARGET_ORIGINAL
     mockedReadFileSync.mockImplementation(() => fileContent)
     mockedWriteFileSync.mockImplementation((_path, data) => {
       fileContent = data as string
@@ -983,20 +1092,7 @@ describe('runUpstreamBuild: musl/baseline target env vars', () => {
 
   it('sets OPENCODE_TARGET_ABI=musl and OPENCODE_TARGET_BASELINE=true when abi=musl and baseline=true', () => {
     // #given — musl baseline build; stateful mock simulates the patch read/write cycle.
-    // PATCH_TARGET must match the NEW TARGET_ORIGINAL (the full baseline+abi+return-true block).
-    const PATCH_TARGET = `      // When building for the current platform, prefer a single native binary by default.
-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
-      if (item.avx2 === false) {
-        return baselineFlag
-      }
-
-      // also skip abi-specific builds for the same reason
-      if (item.abi !== undefined) {
-        return false
-      }
-
-      return true`
-    let fileContent = PATCH_TARGET
+    let fileContent = TARGET_ORIGINAL
     mockedReadFileSync.mockImplementation(() => fileContent)
     mockedWriteFileSync.mockImplementation((_path, data) => {
       fileContent = data as string

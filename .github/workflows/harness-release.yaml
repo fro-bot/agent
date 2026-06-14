@@ -209,7 +209,7 @@ jobs:
     # !cancelled() prevents running if the workflow was manually cancelled.
     if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     strategy:
-      fail-fast: true # All-or-nothing: one failure blocks the whole publish.
+      fail-fast: false # Allow completed builds to survive a flaky musl failure; the existence gate enforces all-or-nothing after all builds finish.
       matrix:
         include:
           # --- glibc Linux (unchanged; used by the action download path) ---
@@ -492,7 +492,7 @@ jobs:
           path: /tmp/harness-binaries/darwin-arm64
 
       - name: Download linux/x64-baseline-musl binary
-        # R9: additive musl asset for workspace (Alpine). Distinct artifact name avoids
+        # Additive musl asset for workspace (Alpine). Distinct artifact name avoids
         # collision with the glibc linux-x64 artifact.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -500,14 +500,14 @@ jobs:
           path: /tmp/harness-binaries/linux-x64-baseline-musl
 
       - name: Download linux/arm64-musl binary
-        # R9: additive musl asset for workspace (Alpine/arm64).
+        # Additive musl asset for workspace (Alpine/arm64).
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: harness-binary-linux-arm64-musl
           path: /tmp/harness-binaries/linux-arm64-musl
 
       - name: Existence gate — assert all 6 binaries are present and non-empty
-        # R10: all-or-nothing. Fail immediately if any binary is missing or empty.
+        # All-or-nothing: fail immediately if any binary is missing or empty.
         # Covers transient artifact expiry and partial uploads.
         run: |
           set -euo pipefail
@@ -544,7 +544,7 @@ jobs:
           fi
 
       - name: Operational integrity — verify the native binary reports the expected version
-        # R9: operational integrity. The binary must self-report "<base>+harness.<short8>";
+        # Operational integrity: the binary must self-report "<base>+harness.<short8>";
         # a stray stock binary reports bare "<base>" and fails this check.
         # Only the binary matching THIS runner's architecture (ubuntu-24.04 = linux-x64) can
         # be executed here — cross-arch (linux-arm64) and cross-OS (darwin) binaries cannot
@@ -582,12 +582,13 @@ jobs:
             echo "${TARGET}: pre-verified by build job on its native runner."
           done
 
-      - name: Assert musl binaries are actually musl (R11 packaging-side libc check)
-        # R11: before packaging, verify each musl artifact is actually musl-linked.
+      - name: libc linkage check — assert musl binaries are actually musl
+        # Before packaging, verify each musl artifact is actually musl-linked.
         # A silently-failed patch (LLM-merge non-determinism) could produce a glibc binary
         # under a musl artifact name; this gate catches it before the asset is published.
-        # Uses `file` to inspect the ELF interpreter: musl binaries reference musl-libc,
-        # not the glibc ld-linux interpreter. Fails loud if glibc is detected.
+        # Uses `file` to inspect the ELF interpreter with positive + negative assertions:
+        #   Positive: must be ELF, must match expected arch, must be statically linked or musl.
+        #   Negative: must NOT reference the glibc ld-linux interpreter.
         run: |
           set -euo pipefail
           FAIL=0
@@ -596,17 +597,45 @@ jobs:
             chmod +x "${BIN}"
             FILE_OUT=$(file "${BIN}")
             echo "${MUSL_TARGET}: ${FILE_OUT}"
-            # glibc binaries reference the ld-linux interpreter (ld-linux-x86-64.so.2,
-            # ld-linux-aarch64.so.1, etc.). musl binaries reference musl-libc or are
-            # statically linked. Fail if the glibc interpreter is present.
-            if echo "${FILE_OUT}" | grep -qE 'ld-linux|ld\.so\.[0-9]'; then
+
+            # Determine expected architecture string for this target.
+            case "${MUSL_TARGET}" in
+              linux-x64-baseline-musl) EXPECTED_ARCH="x86-64" ;;
+              linux-arm64-musl)        EXPECTED_ARCH="aarch64" ;;
+              *)                       EXPECTED_ARCH="" ;;
+            esac
+
+            # Positive assertion 1: must be an ELF binary.
+            if ! echo "${FILE_OUT}" | grep -q 'ELF'; then
+              echo "ERROR: ${MUSL_TARGET} is not an ELF binary (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Positive assertion 2: must match expected architecture.
+            if [ -n "${EXPECTED_ARCH}" ] && ! echo "${FILE_OUT}" | grep -q "${EXPECTED_ARCH}"; then
+              echo "ERROR: ${MUSL_TARGET} does not match expected architecture '${EXPECTED_ARCH}' (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Positive assertion 3: must be statically linked or reference musl.
+            if ! echo "${FILE_OUT}" | grep -qE 'statically linked|musl'; then
+              echo "ERROR: ${MUSL_TARGET} is neither statically linked nor musl-linked (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Negative assertion: must NOT reference the glibc ld-linux interpreter.
+            if echo "${FILE_OUT}" | grep -qE 'ld-linux'; then
               echo "ERROR: ${MUSL_TARGET} binary appears to be glibc-linked (found glibc interpreter in 'file' output)." >&2
               echo "  file output: ${FILE_OUT}" >&2
               echo "  This indicates the build.ts musl patch did not take effect for this target." >&2
               FAIL=1
-            else
-              echo "OK: ${MUSL_TARGET} does not reference glibc interpreter."
+              continue
             fi
+
+            echo "OK: ${MUSL_TARGET} — ELF, ${EXPECTED_ARCH}, statically linked / musl, no glibc interpreter."
           done
           if [ "${FAIL}" -ne 0 ]; then
             echo "FATAL: one or more musl artifacts failed the libc assertion. Aborting release." >&2
@@ -614,7 +643,7 @@ jobs:
           fi
 
       - name: Repackage binaries into stock-OpenCode-shaped release assets
-        # R1/R9: linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
+        # linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
         # Mirrors stock anomalyco/opencode asset naming so action consumers can use
         # the same download path with only the repo/tag changed.
         # Musl assets use the same tar layout as glibc linux assets (binary at archive root).
@@ -677,7 +706,7 @@ jobs:
           ls -lh "${ASSETS_DIR}"
 
       - name: Generate SHA256SUMS
-        # Aggregated checksum file over all 6 assets (R2/R9: musl assets included).
+        # Aggregated checksum file over all 6 assets (musl assets included).
         # The action verifies its single platform asset against the matching line.
         # The workspace Dockerfile verifies the musl asset against the matching line.
         run: |

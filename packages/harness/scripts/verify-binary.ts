@@ -77,7 +77,15 @@ export function parseArgs(argv: string[]): VerifyArgs | null {
   const binaryPath = flag('--binary')
   const baseVersion = flag('--base-version')
   const integrationCommit = flag('--integration-commit')
+
+  // Presence-without-value check: if --abi is in args but flag() returned null, the value is missing.
+  const abiPresent = args.includes('--abi')
   const abiRaw = flag('--abi')
+  if (abiPresent && (abiRaw === null || abiRaw === '')) {
+    console.error('[verify-binary] --abi requires a value: --abi musl')
+    console.error('Run with --help for usage.')
+    return null
+  }
 
   if (binaryPath === null || baseVersion === null) {
     console.error('[verify-binary] Missing required arguments.')
