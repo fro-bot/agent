@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest'
-import {analyzeReleaseType, computeNextVersion} from './preview.js'
+import {analyzeReleaseType, computeNextVersion, filterHarnessTags} from './preview.js'
 
 describe('analyzeReleaseType', () => {
   it('returns patch for fix commit', () => {
@@ -166,5 +166,62 @@ describe('computeNextVersion', () => {
 
     // #then
     expect(result).toBeNull()
+  })
+})
+
+describe('filterHarnessTags', () => {
+  it('removes tags containing +harness', () => {
+    // #given
+    const tags = ['v1.17.3+harness.87250603', 'v0.62.0', 'v0.61.0']
+
+    // #when
+    const result = filterHarnessTags(tags)
+
+    // #then
+    expect(result).toEqual(['v0.62.0', 'v0.61.0'])
+  })
+
+  it('returns the latest clean SemVer tag first when harness tags sort highest', () => {
+    // #given — simulates git tag --sort=-version:refname output where +harness sorts above clean tags
+    const tags = ['v1.17.3+harness.87250603', 'v0.62.0', 'v0.61.0']
+
+    // #when
+    const result = filterHarnessTags(tags)
+
+    // #then — first element is the latest clean tag, not the harness tag
+    expect(result[0]).toBe('v0.62.0')
+  })
+
+  it('keeps all tags when none contain +harness', () => {
+    // #given
+    const tags = ['v0.62.0', 'v0.61.0', 'v0.60.0']
+
+    // #when
+    const result = filterHarnessTags(tags)
+
+    // #then
+    expect(result).toEqual(['v0.62.0', 'v0.61.0', 'v0.60.0'])
+  })
+
+  it('returns empty array when all tags are harness tags', () => {
+    // #given
+    const tags = ['v1.17.3+harness.87250603', 'v1.16.0+harness.aabbccdd']
+
+    // #when
+    const result = filterHarnessTags(tags)
+
+    // #then
+    expect(result).toEqual([])
+  })
+
+  it('returns empty array for empty input', () => {
+    // #given
+    const tags: readonly string[] = []
+
+    // #when
+    const result = filterHarnessTags(tags)
+
+    // #then
+    expect(result).toEqual([])
   })
 })
