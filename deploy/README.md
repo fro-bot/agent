@@ -273,7 +273,21 @@ The raw OpenCode SDK server binds to loopback (`127.0.0.1:54321`) only and is ne
 
 ### Workspace executor image
 
-The workspace image builds the workspace agent and bakes the OpenCode CLI (pinned to match `DEFAULT_OPENCODE_VERSION`), so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
+The workspace image builds the workspace agent and bakes the OpenCode CLI, so the container serves repo clones and hosts an OpenCode server. `deploy/secrets/workspace-opencode-token` is required (the bearer proxy and the gateway share it).
+
+#### Harness OpenCode binary
+
+The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
+
+The version is pinned in `deploy/workspace.Dockerfile` as `ARG OPENCODE_VERSION=<base>+harness.<sha>` (e.g. `1.17.3+harness.2c9cdbd2`). The Dockerfile downloads the musl variant for the target architecture, verifies its SHA256 against the release's `SHA256SUMS` file, and aborts the image build if the hash does not match or the checksum file is missing — there is no fallback to a cached or stock binary.
+
+**The workspace pin and the action default advance together.** The `harness-release` workflow opens an auto-PR that bumps both `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and `DEFAULT_OPENCODE_VERSION` in `packages/runtime/src/shared/constants.ts` to the same new harness build. Merging that PR is the gate — not merging holds both surfaces at the prior build.
+
+**To bump the workspace to a newer harness release:** merge the auto-PR opened by the `harness-release` workflow. Both the action default and the workspace image advance together.
+
+**Rollback / hold procedure:** to hold or roll back the workspace independently, manually edit `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and rebuild the workspace image. Note that a manually pinned value will be overwritten the next time an auto-PR for a new harness release is merged — do not merge the next auto-PR until you are ready to advance. As a last resort, you can pin to a prior stock musl release from `anomalyco/opencode` (note: stock releases do not publish `SHA256SUMS`, so you would need to remove the checksum verification step temporarily).
+
+> **⚠️ BREAK-GLASS ONLY — removing checksum verification drops the fail-closed integrity guarantee.** Without it, the image build will accept any binary served at the download URL — including a tampered or substituted one. This must be treated as a temporary incident measure only: document the incident, revert the checksum step as soon as the harness release is available, and do not merge any auto-PR that advances `OPENCODE_VERSION` while verification is disabled.
 
 Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
 
