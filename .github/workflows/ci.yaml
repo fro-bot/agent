@@ -427,7 +427,15 @@ jobs:
             exit 1
           fi
           # Prove the opencode binary is on PATH and runs (musl compatibility).
-          docker exec "$cid" opencode --version
+          # Also confirm the binary is the harness build (+harness.<sha>), not stock OpenCode.
+          oc_version="$(docker exec "$cid" opencode --version)"
+          echo "opencode --version: ${oc_version}"
+          if ! echo "${oc_version}" | grep -qF "+harness."; then
+            echo "REGRESSION: opencode --version output does not contain '+harness.' — workspace may be running stock OpenCode"
+            echo "Got: ${oc_version}"
+            exit 1
+          fi
+          echo "OK: harness build confirmed (${oc_version})"
           # Auth absent (no secret mounted) → fail-soft: boots, logs auth: absent.
           echo "$logs" | grep -q "auth: absent"
           # No model/provider overlay → base config stands: Systematic plugin baked,
@@ -442,7 +450,7 @@ jobs:
           # NOTE: This proves the entrypoint VALIDATES and WRITES the credential
           # file with correct perms — NOT that the credential authenticates or
           # that a model-backed turn completes. A real provider turn needs live
-          # credentials and is covered by manual deploy validation (plan R4).
+          # credentials and is covered by manual end-to-end mention-loop validation against a deployed workspace.
           printf '{"anthropic":{"type":"api","key":"sk-dummy-not-real"}}' > /tmp/auth.json
           cid="$(docker run -d \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
@@ -612,6 +620,40 @@ jobs:
           echo "$logs" | grep -q "auth: absent"
           docker exec "$cid" sh -c '! test -f /root/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
+      - name: Checksum fail-closed negative test (bogus version → build must abort)
+        run: |
+          # Negative test: prove the Dockerfile's SHA256SUMS verification is fail-closed.
+          # Use a version that passes the <base>+harness.<sha> format guard but has
+          # no corresponding release — the asset download or SHA256SUMS fetch will
+          # 404/fail, and the build must exit non-zero.
+          #
+          # --no-cache: prevents a false-pass via layer cache reuse from a prior build.
+          # Secondary guard: capture stderr and assert the failure is specifically the
+          # download/checksum path (curl 404, SHA256SUMS missing entry, or hash mismatch),
+          # not an unrelated stage-1 failure (e.g. network/apk). A stage-1 failure would
+          # still satisfy the primary assertion but would not prove fail-closed behaviour.
+          bogus_version="1.17.3+harness.deadbeef"
+          build_args=(
+            --no-cache
+            --build-arg "OPENCODE_VERSION=${bogus_version}"
+            -f deploy/workspace.Dockerfile
+            -t fro-bot-workspace:bogus-checksum-test
+            .
+          )
+          build_output="$(docker build "${build_args[@]}" 2>&1)" && {
+            echo "REGRESSION: docker build succeeded with bogus version '${bogus_version}' — SHA256SUMS fail-closed check is broken"
+            exit 1
+          }
+          echo "--- docker build output (expected failure) ---"
+          echo "${build_output}"
+          # Secondary guard: confirm the failure is in the download/checksum path.
+          # Acceptable signals: curl exit/error, %2B URL 404, or Dockerfile error strings.
+          if echo "${build_output}" | grep -qiE \
+            'curl|SHA256SUMS does not contain|does not match expected|%2B|404'; then
+            echo "OK: docker build correctly aborted for bogus version '${bogus_version}' — failure is in the download/checksum path (fail-closed verified)"
+          else
+            echo "::warning::Checksum negative test: docker build failed for bogus version '${bogus_version}' but the failure signal is NOT in the expected download/checksum path (curl/SHA256SUMS/hash-mismatch). Fail-closed still holds — the build aborted — but the failure may be a stage-1 (network/apk) issue rather than the checksum path. Investigate if this recurs. Build output is printed above."
+          fi
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
@@ -674,7 +716,7 @@ jobs:
       # cause rename/rename conflicts that -Xtheirs cannot resolve.
       - name: Reset `${{ env.RELEASE_BRANCH }}` to last release tag
         run: |
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           echo "Resetting ${{ env.RELEASE_BRANCH }} to ${last_tag}"
           git reset --hard "${last_tag}"
       - if: ${{ github.event_name == 'pull_request' }}
@@ -699,7 +741,7 @@ jobs:
         name: Generate PR Body
         run: |
           VERSION="${{ steps.release-preview.outputs.next_version }}"
-          last_tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           COMMIT_LIST=$(git log "${last_tag}..HEAD" --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
           TITLE_SUFFIX=": v${VERSION}"

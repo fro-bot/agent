@@ -107,6 +107,24 @@ describe('buildToolsCacheKey', () => {
     expect(key).toBe('opencode-tools-Linux-disabled-oc-latest-sys-2.1.0')
     expect(key).not.toContain('-omo-')
   })
+
+  it('preserves raw +harness.<sha> build-metadata in the cache key for harness versions', () => {
+    // #given a harness OpenCode version with +harness.<sha> build-metadata suffix
+    const os = 'Linux'
+    const opencodeVersion = '1.17.3+harness.2c9cdbd2'
+    const omoVersion = '3.5.5'
+    const systematicVersion = '2.1.0'
+    const cacheMode: CacheMode = 'enabled'
+
+    // #when building the cache key
+    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+
+    // #then the raw +harness.<sha> form is embedded verbatim in the key (NOT the -harness. identity form
+    // used by toolCache.find/cacheDir — the cache KEY intentionally uses the raw semver metadata so
+    // harness builds never collide with stock builds of the same base version)
+    expect(key).toContain('+harness.2c9cdbd2')
+    expect(key).toBe('opencode-tools-Linux-enabled-oc-1.17.3+harness.2c9cdbd2-omo-3.5.5-sys-2.1.0')
+  })
 })
 
 describe('buildToolsRestoreKeys', () => {

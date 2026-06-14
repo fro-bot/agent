@@ -8,7 +8,7 @@ import process from 'node:process'
 // --experimental-strip-types / --experimental-transform-types.
 // The test file (preview.test.ts) uses .js because it runs under
 // Vitest with bundler module resolution. Both are correct for their runtime.
-import {analyzeReleaseType, computeNextVersion} from './preview.ts'
+import {analyzeReleaseType, computeNextVersion, filterHarnessTags} from './preview.ts'
 
 const COMMIT_SEPARATOR = '---COMMIT_SEPARATOR---'
 
@@ -65,10 +65,12 @@ function resolveFromTag(overrideTag: string | null): string {
   }
 
   const tagsOutput = runGit('tag', '--list', 'v*', '--sort=-version:refname')
-  const latestTag = tagsOutput
-    .split('\n')
-    .map(tag => tag.trim())
-    .find(tag => tag.length > 0)
+  const latestTag = filterHarnessTags(
+    tagsOutput
+      .split('\n')
+      .map(tag => tag.trim())
+      .filter(tag => tag.length > 0),
+  )[0]
   if (latestTag === undefined) {
     throw new Error("No git tag matching pattern 'v*' was found")
   }

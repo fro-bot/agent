@@ -19,28 +19,43 @@
 
 import type {BuildArgs} from './build-platform.js'
 import {execFileSync, spawnSync} from 'node:child_process'
-import {readdirSync, readFileSync, statSync} from 'node:fs'
+import {readdirSync, readFileSync, statSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {HARNESS_BUN_VERSION} from '../src/bun-version.js'
 import {buildHarnessVersion} from '../src/version.js'
-import {cloneAndCheckout, enforceBunVersion, main, parseArgs, runUpstreamBuild} from './build-platform.js'
+import {
+  assertMuslBinary,
+  assertPatchLanded,
+  cloneAndCheckout,
+  enforceBunVersion,
+  main,
+  parseArgs,
+  patchBuildTs,
+  resolveTargetDirSuffix,
+  runUpstreamBuild,
+  TARGET_ORIGINAL,
+  verifyBuiltBinary,
+} from './build-platform.js'
 
 // ---------------------------------------------------------------------------
 // Drift guard
 // ---------------------------------------------------------------------------
 
 describe('drift guard: harness-release.yaml bun-version literals', () => {
-  it('all bun-version occurrences in harness-release.yaml equal HARNESS_BUN_VERSION', () => {
+  it('all bun-version occurrences in harness-release.yaml equal HARNESS_BUN_VERSION', async () => {
     // #given — resolve the workflow file relative to this test file (scripts/ → repo root)
     const thisDir = path.dirname(fileURLToPath(import.meta.url))
     const repoRoot = path.resolve(thisDir, '..', '..', '..')
     const workflowPath = path.join(repoRoot, '.github', 'workflows', 'harness-release.yaml')
 
-    // #when
-    const content = readFileSync(workflowPath, 'utf8')
+    // #when — use the REAL readFileSync (not the vi.mock'd one) to read the workflow file.
+    // vi.mock('node:fs') is hoisted and intercepts the module-level import, so we use
+    // vi.importActual to get the real node:fs module and bypass the mock.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs')
+    const content = realFs.readFileSync(workflowPath, 'utf8')
     const matches = [...content.matchAll(/bun-version:\s*(\d+\.\d+\.\d+)/g)]
 
     // #then — there must be at least one occurrence (sanity check)
@@ -78,6 +93,7 @@ vi.mock('node:fs', async importOriginal => {
     readdirSync: vi.fn(),
     mkdirSync: vi.fn(),
     cpSync: vi.fn(),
+    readFileSync: vi.fn(),
     writeFileSync: vi.fn(),
   }
 })
@@ -572,8 +588,8 @@ describe('runUpstreamBuild: version derivation is pure-from-arg', () => {
     const integrationCommit = 'deadbeef12345678'
     const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
 
-    // #when
-    runUpstreamBuild('/some/source-tree', baseVersion, integrationCommit)
+    // #when — glibc default (abi=null, baseline=false)
+    runUpstreamBuild('/some/source-tree', baseVersion, integrationCommit, null, false)
 
     // #then — no git rev-parse call
     const gitRevParseCalls = mockedSpawnSync.mock.calls.filter(
@@ -592,6 +608,544 @@ describe('runUpstreamBuild: version derivation is pure-from-arg', () => {
     const buildEnv = (bunBuildCalls[0]?.[2] as {env?: Record<string, string>} | undefined)?.env
     expect(buildEnv?.OPENCODE_VERSION).toBe(expectedVersion)
     expect(expectedVersion).toBe(`${baseVersion}+harness.${integrationCommit.slice(0, 8)}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveTargetDirSuffix — target-name/dir resolution
+// ---------------------------------------------------------------------------
+
+describe('resolveTargetDirSuffix: target dir suffix computation', () => {
+  it('returns empty string for glibc default (no abi, no baseline)', () => {
+    // #given / #when / #then
+    expect(resolveTargetDirSuffix(null, false)).toBe('')
+  })
+
+  it('returns -musl for arm64 musl (no baseline)', () => {
+    // #given / #when / #then — linux-arm64-musl
+    expect(resolveTargetDirSuffix('musl', false)).toBe('-musl')
+  })
+
+  it('returns -baseline-musl for x64 baseline musl', () => {
+    // #given / #when / #then — linux-x64-baseline-musl
+    expect(resolveTargetDirSuffix('musl', true)).toBe('-baseline-musl')
+  })
+
+  it('returns -baseline for baseline-only (no abi)', () => {
+    // #given / #when / #then — e.g. linux-x64-baseline (avx2=false, glibc)
+    expect(resolveTargetDirSuffix(null, true)).toBe('-baseline')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseArgs — abi and baseline flags
+// ---------------------------------------------------------------------------
+
+describe('parseArgs: --abi and --baseline flags', () => {
+  const BASE_ARGV = [
+    'bun',
+    'build-platform.ts',
+    '--integration-commit',
+    'abc12345def67890',
+    '--base-version',
+    '1.15.13',
+    '--platform',
+    'linux',
+    '--arch',
+    'x64',
+  ]
+
+  it('parses --abi musl into BuildArgs.abi', () => {
+    // #given
+    const argv = [...BASE_ARGV, '--abi', 'musl']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect((result as BuildArgs).abi).toBe('musl')
+    expect((result as BuildArgs).baseline).toBe(false)
+  })
+
+  it('parses --baseline into BuildArgs.baseline', () => {
+    // #given
+    const argv = [...BASE_ARGV, '--abi', 'musl', '--baseline']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect((result as BuildArgs).abi).toBe('musl')
+    expect((result as BuildArgs).baseline).toBe(true)
+  })
+
+  it('defaults abi to null and baseline to false when flags are absent', () => {
+    // #given — no --abi or --baseline
+    const result = parseArgs(BASE_ARGV)
+
+    // #then
+    expect(result).not.toBeNull()
+    expect((result as BuildArgs).abi).toBeNull()
+    expect((result as BuildArgs).baseline).toBe(false)
+  })
+
+  it('rejects unknown abi values', () => {
+    // #given — unsupported abi
+    const argv = [...BASE_ARGV, '--abi', 'glibc']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must return null (unsupported abi)
+    expect(result).toBeNull()
+  })
+
+  it('rejects abi value of "gnu"', () => {
+    // #given — 'gnu' is not a valid --abi value (only 'musl' is accepted)
+    const argv = [...BASE_ARGV, '--abi', 'gnu']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --abi is present but has no value (last arg)', () => {
+    // #given — --abi is the last arg with no following value
+    const argv = [...BASE_ARGV, '--abi']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail with clear error, not silently treat as glibc
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --abi is present but followed by another flag (no value)', () => {
+    // #given — --abi is followed by another flag token (no value)
+    const argv = [...BASE_ARGV, '--abi', '--baseline']
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — must fail-closed
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --baseline is used with non-linux platform', () => {
+    // #given — --baseline on darwin is not supported
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'darwin',
+      '--arch',
+      'x64',
+      '--abi',
+      'musl',
+      '--baseline',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --baseline is used with arm64 arch', () => {
+    // #given — --baseline on arm64 is not supported (x64-only)
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'linux',
+      '--arch',
+      'arm64',
+      '--abi',
+      'musl',
+      '--baseline',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
+
+  it('returns null when --abi musl is used with --platform darwin', () => {
+    // #given — --abi musl on darwin is not supported (linux-only); exercises the abi !== null branch
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'darwin',
+      '--arch',
+      'x64',
+      '--abi',
+      'musl',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// patchBuildTs + assertPatchLanded — patch mechanism
+// ---------------------------------------------------------------------------
+
+describe('patchBuildTs: build.ts patch mechanism', () => {
+  // patchBuildTs and assertPatchLanded use readFileSync/writeFileSync from node:fs,
+  // which are mocked globally. We control the mock to simulate file reads/writes
+  // without touching the real filesystem.
+
+  const mockedReadFileSync = vi.mocked(readFileSync)
+  const mockedWriteFileSync = vi.mocked(writeFileSync)
+
+  // Use the exported TARGET_ORIGINAL constant — single source of truth.
+  // Matches anomalyco/opencode v1.17.3's singleFlag filter block (lines 122-133).
+  // Must be re-diffed if clonedeps is bumped to a new upstream version.
+  const PATCH_TARGET = TARGET_ORIGINAL
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+  })
+
+  it('patches the singleFlag baseline+abi block and adds the OPENCODE_TARGET_ABI hook', () => {
+    // #given — readFileSync returns a fake build.ts with the patch target
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
+    mockedReadFileSync.mockImplementation(() => fakeContent)
+    let writtenContent = ''
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      writtenContent = data as string
+    })
+
+    // #when
+    patchBuildTs('/fake/build.ts')
+
+    // #then — the hook marker is present in the written content
+    expect(writtenContent).toContain('OPENCODE_TARGET_ABI')
+    expect(writtenContent).toContain('process.env["OPENCODE_TARGET_ABI"]')
+    // The original unconditional baseline gate is preserved in the fallback path
+    expect(writtenContent).toContain('return baselineFlag')
+    // The original unconditional abi skip is preserved in the fallback path
+    expect(writtenContent).toContain('if (item.abi !== undefined)')
+  })
+
+  it('patched filter rejects default glibc target when OPENCODE_TARGET_ABI is set', () => {
+    // #given — readFileSync returns a fake build.ts with the patch target
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
+    mockedReadFileSync.mockImplementation(() => fakeContent)
+    let writtenContent = ''
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      writtenContent = data as string
+    })
+
+    // #when
+    patchBuildTs('/fake/build.ts')
+
+    // #then — the patched content contains the explicit-target-mode block that:
+    // 1. Checks item.abi !== _harnessTargetAbi (rejects glibc target with no abi)
+    expect(writtenContent).toContain('if (item.abi !== _harnessTargetAbi)')
+    // 2. Honors the baseline flag via avx2===false comparison
+    expect(writtenContent).toContain('(item.avx2 === false) !== _harnessTargetBaseline')
+    // 3. Returns true only when both abi and baseline match
+    expect(writtenContent).toContain('return true')
+    // 4. The original baseline gate is preserved in the fallback path (no env var set)
+    expect(writtenContent).toContain('return baselineFlag')
+  })
+
+  it('patched filter honors OPENCODE_TARGET_BASELINE at the avx2 gate', () => {
+    // #given — readFileSync returns a fake build.ts with the patch target
+    const fakeContent = `// preamble\n${PATCH_TARGET}\n    })\n  : allTargets`
+    mockedReadFileSync.mockImplementation(() => fakeContent)
+    let writtenContent = ''
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      writtenContent = data as string
+    })
+
+    // #when
+    patchBuildTs('/fake/build.ts')
+
+    // #then — the patched content reads OPENCODE_TARGET_BASELINE and compares avx2===false
+    expect(writtenContent).toContain('process.env["OPENCODE_TARGET_BASELINE"] === "true"')
+    expect(writtenContent).toContain('item.avx2 === false')
+  })
+
+  it('throws when the patch target is not found in build.ts', () => {
+    // #given — readFileSync returns content WITHOUT the expected patch target
+    mockedReadFileSync.mockImplementation(() => '// no singleFlag filter here\nconsole.log("hello")')
+
+    // #when / #then — must throw
+    expect(() => patchBuildTs('/fake/build.ts')).toThrow('patch target not found')
+  })
+
+  it('assertPatchLanded passes when the hook marker is present', () => {
+    // #given — readFileSync returns content with the hook marker
+    mockedReadFileSync.mockImplementation(() => '// OPENCODE_TARGET_ABI hook is here\nconsole.log("patched")')
+
+    // #when / #then — must not throw
+    expect(() => assertPatchLanded('/fake/build.ts')).not.toThrow()
+  })
+
+  it('assertPatchLanded throws when the hook marker is absent', () => {
+    // #given — readFileSync returns content without the hook marker
+    mockedReadFileSync.mockImplementation(() => '// no hook here\nconsole.log("hello")')
+
+    // #when / #then — must throw
+    expect(() => assertPatchLanded('/fake/build.ts')).toThrow('patch hook')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertMuslBinary — musl linkage guard (positive + negative assertions)
+// ---------------------------------------------------------------------------
+
+describe('assertMuslBinary: musl linkage guard', () => {
+  const mockedExecFileSync = vi.mocked(execFileSync)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+  })
+
+  // -------------------------------------------------------------------------
+  // Happy paths: valid musl binaries
+  // -------------------------------------------------------------------------
+
+  it('does not throw for statically linked x64 musl binary', () => {
+    // #given — Bun musl compile produces a statically linked x86-64 binary
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
+  })
+
+  it('does not throw for statically linked arm64 musl binary', () => {
+    // #given — Bun musl compile produces a statically linked aarch64 binary
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).not.toThrow()
+  })
+
+  it('does not throw for a static-pie linked musl binary', () => {
+    // #given — some file(1) versions report static-PIE musl binaries as 'static-pie linked'
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, stripped\n',
+    )
+
+    // #when / #then — must not throw (static-pie is a valid musl linkage form)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
+  })
+
+  it('does not throw when file output shows musl linker (x64)', () => {
+    // #given — binary references musl dynamic linker
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, x86-64, interpreter /lib/ld-musl-x86_64.so.1, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
+  })
+
+  it('does not throw when file output shows musl linker (arm64)', () => {
+    // #given — binary references musl dynamic linker for aarch64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, interpreter /lib/ld-musl-aarch64.so.1, stripped\n',
+    )
+
+    // #when / #then — must not throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).not.toThrow()
+  })
+
+  // -------------------------------------------------------------------------
+  // Negative assertions: glibc binaries must throw
+  // -------------------------------------------------------------------------
+
+  it('throws when file output shows glibc x86-64 interpreter', () => {
+    // #given — glibc binary
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, x86-64, interpreter /lib64/ld-linux-x86-64.so.2, stripped\n',
+    )
+
+    // #when / #then — must throw with clear message
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('glibc-linked')
+  })
+
+  it('throws when file output shows glibc aarch64 interpreter', () => {
+    // #given — glibc arm64 binary
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, interpreter /lib/ld-linux-aarch64.so.1, stripped\n',
+    )
+
+    // #when / #then — must throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).toThrow('glibc-linked')
+  })
+
+  // -------------------------------------------------------------------------
+  // Positive assertions: non-ELF and wrong-arch must throw (FIX 1)
+  // -------------------------------------------------------------------------
+
+  it('throws when file output shows non-ELF ASCII text (stale text file)', () => {
+    // #given — stale text file, not a binary
+    mockedExecFileSync.mockReturnValue('/tmp/opencode: ASCII text\n')
+
+    // #when / #then — must throw (not an ELF binary)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('not an ELF binary')
+  })
+
+  it('throws when file output shows wrong architecture (arm64 binary checked as x64)', () => {
+    // #given — arm64 binary but we expect x64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must throw (architecture mismatch)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow('Architecture mismatch')
+  })
+
+  it('throws when file output shows wrong architecture (x64 binary checked as arm64)', () => {
+    // #given — x64 binary but we expect arm64
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped\n',
+    )
+
+    // #when / #then — must throw (architecture mismatch)
+    expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).toThrow('Architecture mismatch')
+  })
+
+  it('throws when file command itself fails', () => {
+    // #given — file command throws
+    mockedExecFileSync.mockImplementation(() => {
+      throw new Error('file: command not found')
+    })
+
+    // #when / #then — must throw
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).toThrow("'file' command failed")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// runUpstreamBuild — musl/baseline target selection
+// ---------------------------------------------------------------------------
+
+describe('runUpstreamBuild: musl/baseline target env vars', () => {
+  const mockedSpawnSync = vi.mocked(spawnSync)
+  const mockedReadFileSync = vi.mocked(readFileSync)
+  const mockedWriteFileSync = vi.mocked(writeFileSync)
+
+  beforeEach(() => {
+    mockedSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+  })
+
+  it('does NOT set OPENCODE_TARGET_ABI when abi is null (glibc default)', () => {
+    // #given — glibc build (no abi, no baseline)
+    runUpstreamBuild('/some/source-tree', '1.15.13', 'deadbeef12345678', null, false)
+
+    // #then — build.ts invoked without OPENCODE_TARGET_ABI
+    const bunBuildCalls = mockedSpawnSync.mock.calls.filter(
+      call =>
+        call[0] === 'bun' &&
+        Array.isArray(call[1]) &&
+        call[1].some((a: unknown) => typeof a === 'string' && a.includes('build.ts')),
+    )
+    expect(bunBuildCalls.length).toBeGreaterThan(0)
+    const buildEnv = (bunBuildCalls[0]?.[2] as {env?: Record<string, string>} | undefined)?.env
+    expect(buildEnv?.OPENCODE_TARGET_ABI).toBeUndefined()
+    expect(buildEnv?.OPENCODE_TARGET_BASELINE).toBeUndefined()
+  })
+
+  it('sets OPENCODE_TARGET_ABI=musl when abi is musl', () => {
+    // #given — musl build; simulate the patch read/write cycle via stateful mocks.
+    // patchBuildTs reads the file (gets TARGET_ORIGINAL), writes the patched content.
+    // assertPatchLanded reads the file again (must get the patched content with the hook).
+    // Stateful mock: tracks what was last written so assertPatchLanded sees the patched content.
+    let fileContent = TARGET_ORIGINAL
+    mockedReadFileSync.mockImplementation(() => fileContent)
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      fileContent = data as string
+    })
+
+    // #when
+    runUpstreamBuild('/some/source-tree', '1.15.13', 'deadbeef12345678', 'musl', false)
+
+    // #then — build.ts invoked with OPENCODE_TARGET_ABI=musl
+    const bunBuildCalls = mockedSpawnSync.mock.calls.filter(
+      call =>
+        call[0] === 'bun' &&
+        Array.isArray(call[1]) &&
+        call[1].some((a: unknown) => typeof a === 'string' && a.includes('build.ts')),
+    )
+    expect(bunBuildCalls.length).toBeGreaterThan(0)
+    const buildEnv = (bunBuildCalls[0]?.[2] as {env?: Record<string, string>} | undefined)?.env
+    expect(buildEnv?.OPENCODE_TARGET_ABI).toBe('musl')
+    expect(buildEnv?.OPENCODE_TARGET_BASELINE).toBeUndefined()
+  })
+
+  it('sets OPENCODE_TARGET_ABI=musl and OPENCODE_TARGET_BASELINE=true when abi=musl and baseline=true', () => {
+    // #given — musl baseline build; stateful mock simulates the patch read/write cycle.
+    let fileContent = TARGET_ORIGINAL
+    mockedReadFileSync.mockImplementation(() => fileContent)
+    mockedWriteFileSync.mockImplementation((_path, data) => {
+      fileContent = data as string
+    })
+
+    // #when
+    runUpstreamBuild('/some/source-tree', '1.15.13', 'deadbeef12345678', 'musl', true)
+
+    // #then
+    const bunBuildCalls = mockedSpawnSync.mock.calls.filter(
+      call =>
+        call[0] === 'bun' &&
+        Array.isArray(call[1]) &&
+        call[1].some((a: unknown) => typeof a === 'string' && a.includes('build.ts')),
+    )
+    expect(bunBuildCalls.length).toBeGreaterThan(0)
+    const buildEnv = (bunBuildCalls[0]?.[2] as {env?: Record<string, string>} | undefined)?.env
+    expect(buildEnv?.OPENCODE_TARGET_ABI).toBe('musl')
+    expect(buildEnv?.OPENCODE_TARGET_BASELINE).toBe('true')
   })
 })
 
@@ -635,5 +1189,134 @@ describe('cloneAndCheckout: backward-compat', () => {
       call => call[0] === 'git' && Array.isArray(call[1]) && call[1].includes('clone'),
     )
     expect(gitCloneCalls.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// verifyBuiltBinary — musl execution skip + glibc execution
+// ---------------------------------------------------------------------------
+
+describe('verifyBuiltBinary: musl skip vs glibc execution', () => {
+  const mockedExecFileSync = vi.mocked(execFileSync)
+  const mockedSpawnSync = vi.mocked(spawnSync)
+
+  const BINARY_PATH = '/tmp/dist/opencode-linux-x64-baseline-musl/bin/opencode'
+  const EXPECTED_VERSION = '1.15.13+harness.abc12345'
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Default: binary exists (test -f returns 0)
+    mockedSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+  })
+
+  // -------------------------------------------------------------------------
+  // musl target: existence checked, --version NOT executed
+  // -------------------------------------------------------------------------
+
+  it('musl target: does not call execFileSync (no --version execution)', () => {
+    // #given — musl target; binary exists (spawnSync test -f returns 0)
+
+    // #when
+    verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')
+
+    // #then — execFileSync was NOT called (no --version execution)
+    expect(mockedExecFileSync).not.toHaveBeenCalled()
+  })
+
+  it('musl target: does not throw when binary exists', () => {
+    // #given — musl target; binary exists
+
+    // #when / #then — must not throw
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')).not.toThrow()
+  })
+
+  it('musl target: throws when binary does not exist', () => {
+    // #given — musl target; binary missing (test -f returns non-zero)
+    mockedSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+
+    // #when / #then — must throw with "not found" message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')).toThrow('Built binary not found at')
+  })
+
+  // -------------------------------------------------------------------------
+  // glibc target: existence checked + --version executed + version asserted
+  // -------------------------------------------------------------------------
+
+  it('glibc target: calls execFileSync with --version', () => {
+    // #given — glibc target (abi=null); binary exists; --version returns expected version
+    mockedExecFileSync.mockReturnValue(`${EXPECTED_VERSION}\n`)
+
+    // #when
+    verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)
+
+    // #then — execFileSync was called with the binary and --version
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      BINARY_PATH,
+      ['--version'],
+      expect.objectContaining({encoding: 'utf8'}),
+    )
+  })
+
+  it('glibc target: does not throw when --version matches expected version', () => {
+    // #given — glibc target; --version returns exact expected version
+    mockedExecFileSync.mockReturnValue(`${EXPECTED_VERSION}\n`)
+
+    // #when / #then — must not throw
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).not.toThrow()
+  })
+
+  it('glibc target: throws on version mismatch', () => {
+    // #given — glibc target; --version returns wrong version
+    mockedExecFileSync.mockReturnValue('1.0.0-wrong\n')
+
+    // #when / #then — must throw with version mismatch message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Version mismatch')
+  })
+
+  it('glibc target: throws when --version execution fails (ENOENT)', () => {
+    // #given — glibc target; execFileSync throws (binary not executable or missing loader)
+    mockedExecFileSync.mockImplementation(() => {
+      const err = new Error('ENOENT: no such file or directory, posix_spawn') as NodeJS.ErrnoException
+      err.code = 'ENOENT'
+      throw err
+    })
+
+    // #when / #then — must throw with "Binary --version failed" message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Binary --version failed')
+  })
+
+  it('glibc target: throws when binary does not exist', () => {
+    // #given — glibc target; binary missing (test -f returns non-zero)
+    mockedSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+
+    // #when / #then — must throw before attempting --version
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Built binary not found at')
+    expect(mockedExecFileSync).not.toHaveBeenCalled()
   })
 })
