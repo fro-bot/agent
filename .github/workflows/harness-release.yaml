@@ -1152,18 +1152,28 @@ jobs:
           echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Computed NEW_VERSION: ${NEW_VERSION}"
 
-          # Idempotency guard: if the constant already equals NEW_VERSION, skip.
+          # Idempotency guard: skip ONLY IF BOTH constants.ts AND the Dockerfile already equal NEW_VERSION.
+          # Checking both prevents a partial-update scenario where constants.ts was bumped but the
+          # Dockerfile step failed (continue-on-error:true), which would otherwise freeze the Dockerfile.
           CONSTANTS_FILE="packages/runtime/src/shared/constants.ts"
+          DOCKERFILE="deploy/workspace.Dockerfile"
           CURRENT=$(node -e "
             const fs = require('fs');
             const src = fs.readFileSync('${CONSTANTS_FILE}', 'utf8');
             const m = src.match(/DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/);
             process.stdout.write(m ? m[1] : '');
           ")
-          echo "Current DEFAULT_OPENCODE_VERSION: '${CURRENT}'"
+          CURRENT_DOCKERFILE=$(node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('${DOCKERFILE}', 'utf8');
+            const m = src.match(/ARG OPENCODE_VERSION=(\S+)/);
+            process.stdout.write(m ? m[1] : '');
+          ")
+          echo "Current DEFAULT_OPENCODE_VERSION (constants.ts): '${CURRENT}'"
+          echo "Current ARG OPENCODE_VERSION (Dockerfile): '${CURRENT_DOCKERFILE}'"
 
-          if [ "${CURRENT}" = "${NEW_VERSION}" ]; then
-            echo "Already at ${NEW_VERSION} — nothing to do."
+          if [ "${CURRENT}" = "${NEW_VERSION}" ] && [ "${CURRENT_DOCKERFILE}" = "${NEW_VERSION}" ]; then
+            echo "Both constants.ts and Dockerfile already at ${NEW_VERSION} — nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -1199,6 +1209,7 @@ jobs:
           "
 
       - name: Update OPENCODE_VERSION in the workspace Dockerfile
+        id: dockerfile
         if: steps.version.outputs.skip != 'true'
         env:
           NEW_VERSION: ${{ steps.version.outputs.new_version }}
@@ -1231,7 +1242,7 @@ jobs:
         run: pnpm build
 
       - name: Open PR via peter-evans/create-pull-request
-        if: steps.version.outputs.skip != 'true' && steps.build.outcome == 'success'
+        if: steps.version.outputs.skip != 'true' && steps.build.outcome == 'success' && steps.dockerfile.outcome == 'success'
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
         with:
           token: ${{ steps.get-app-token.outputs.token }}

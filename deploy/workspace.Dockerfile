@@ -11,7 +11,8 @@
 #   - 54321 (raw OpenCode SDK server) — loopback (127.0.0.1) ONLY, never exposed
 #
 # OPENCODE_VERSION pins the harness OpenCode build for the workspace image
-# (from fro-bot/agent releases, independent of the action's harness default).
+# (from fro-bot/agent releases, bumped in lockstep with the action default by
+# the harness-release workflow; the merge gate on the auto-PR is the control).
 # SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
 # packages/runtime/src/shared/constants.ts.
 
@@ -39,8 +40,8 @@ WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
 # OPENCODE_VERSION is the harness build of OpenCode (fro-bot/agent releases),
-# in the form <base>+harness.<sha>. The workspace pin is independent of the
-# action's harness default and can be bumped or rolled back separately.
+# in the form <base>+harness.<sha>. Bumped in lockstep with the action default
+# by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.17.3+harness.94c10df9
 ARG SYSTEMATIC_VERSION=2.31.0
 
@@ -70,7 +71,7 @@ RUN apk add --no-cache git ca-certificates libgcc libstdc++ ripgrep curl
 # failure, hash mismatch, missing entry, or partial download aborts the build
 # immediately with no fallback (no cached binary, no stock fallback, no retry).
 ARG TARGETARCH
-RUN set -eu \
+RUN set -euo pipefail \
     # Validate the version string before interpolation (defense-in-depth:
     # rejects path traversal, shell metacharacters, and unexpected forms).
     && case "${OPENCODE_VERSION}" in \
@@ -89,8 +90,9 @@ RUN set -eu \
     && encoded_version="${OPENCODE_VERSION//+/%2B}" \
     && base_url="https://github.com/fro-bot/agent/releases/download/v${encoded_version}" \
     # Download the asset archive and the SHA256SUMS file for this release.
-    && curl -fsSL -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
-    && curl -fsSL -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
+    # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
+    && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
     # Verify the asset's SHA256 against the SHA256SUMS entry — fail closed on any mismatch.
     && expected_hash="$(grep "  ${oc_asset}.tar.gz$" /tmp/SHA256SUMS | awk '{print $1}')" \
     && if [ -z "${expected_hash}" ]; then \

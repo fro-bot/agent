@@ -427,7 +427,7 @@ jobs:
             exit 1
           fi
           # Prove the opencode binary is on PATH and runs (musl compatibility).
-          # R8: assert the harness build is installed, not stock OpenCode.
+          # Also confirm the binary is the harness build (+harness.<sha>), not stock OpenCode.
           oc_version="$(docker exec "$cid" opencode --version)"
           echo "opencode --version: ${oc_version}"
           if ! echo "${oc_version}" | grep -qF "+harness."; then
@@ -450,7 +450,7 @@ jobs:
           # NOTE: This proves the entrypoint VALIDATES and WRITES the credential
           # file with correct perms — NOT that the credential authenticates or
           # that a model-backed turn completes. A real provider turn needs live
-          # credentials and is covered by manual deploy validation (plan R4).
+          # credentials and is covered by manual end-to-end mention-loop validation against a deployed workspace.
           printf '{"anthropic":{"type":"api","key":"sk-dummy-not-real"}}' > /tmp/auth.json
           cid="$(docker run -d \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
@@ -622,17 +622,41 @@ jobs:
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
       - name: Checksum fail-closed negative test (bogus version → build must abort)
         run: |
-          # R10: prove the Dockerfile's SHA256SUMS verification is fail-closed.
+          # Negative test: prove the Dockerfile's SHA256SUMS verification is fail-closed.
           # Use a version that passes the <base>+harness.<sha> format guard but has
           # no corresponding release — the asset download or SHA256SUMS fetch will
           # 404/fail, and the build must exit non-zero.
+          #
+          # --no-cache: prevents a false-pass via layer cache reuse from a prior build.
+          # Secondary guard: capture stderr and assert the failure is specifically the
+          # download/checksum path (curl 404, SHA256SUMS missing entry, or hash mismatch),
+          # not an unrelated stage-1 failure (e.g. network/apk). A stage-1 failure would
+          # still satisfy the primary assertion but would not prove fail-closed behaviour.
           bogus_version="1.17.3+harness.deadbeef"
-          build_args=(--build-arg "OPENCODE_VERSION=${bogus_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:bogus-checksum-test .)
-          if docker build "${build_args[@]}" 2>&1; then
+          build_args=(
+            --no-cache
+            --build-arg "OPENCODE_VERSION=${bogus_version}"
+            -f deploy/workspace.Dockerfile
+            -t fro-bot-workspace:bogus-checksum-test
+            .
+          )
+          build_output="$(docker build "${build_args[@]}" 2>&1)" && {
             echo "REGRESSION: docker build succeeded with bogus version '${bogus_version}' — SHA256SUMS fail-closed check is broken"
             exit 1
+          }
+          echo "--- docker build output (expected failure) ---"
+          echo "${build_output}"
+          # Secondary guard: confirm the failure is in the download/checksum path.
+          # Acceptable signals: curl exit/error, %2B URL 404, or Dockerfile error strings.
+          if echo "${build_output}" | grep -qiE \
+            'curl|SHA256SUMS does not contain|does not match expected|%2B|404'; then
+            echo "OK: docker build correctly aborted for bogus version '${bogus_version}' — failure is in the download/checksum path (fail-closed verified)"
+          else
+            echo "WARNING: docker build failed for bogus version '${bogus_version}' but the failure signal is NOT in the expected download/checksum path."
+            echo "This may indicate a stage-1 (network/apk) failure rather than a checksum-path failure — investigate before treating this as a pass."
+            echo "Build output above for diagnosis."
+            exit 1
           fi
-          echo "OK: docker build correctly aborted for bogus version '${bogus_version}' (fail-closed verified)"
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
