@@ -958,6 +958,16 @@ describe('assertMuslBinary: musl linkage guard', () => {
     expect(() => assertMuslBinary('/tmp/opencode', 'arm64')).not.toThrow()
   })
 
+  it('does not throw for a static-pie linked musl binary', () => {
+    // #given — some file(1) versions report static-PIE musl binaries as 'static-pie linked'
+    mockedExecFileSync.mockReturnValue(
+      '/tmp/opencode: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, stripped\n',
+    )
+
+    // #when / #then — must not throw (static-pie is a valid musl linkage form)
+    expect(() => assertMuslBinary('/tmp/opencode', 'x64')).not.toThrow()
+  })
+
   it('does not throw when file output shows musl linker (x64)', () => {
     // #given — binary references musl dynamic linker
     mockedExecFileSync.mockReturnValue(
