@@ -995,6 +995,358 @@ echo "  single-file-no-docker-test output (stderr+stdout combined):"
 echo "${SINGLE_NODOCK_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# TEST 20 — Negative: sidecar attached to [sandbox-net, shadow-egress]
+#           must be rejected by the global non-internal-attachment invariant.
+#
+# This is the core #814 bypass class: a service bridges sandbox-net to a
+# non-internal network that mitmproxy is NOT on.  The old per-mitmproxy-net
+# loop would miss this; the new global allowlist must catch it.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 20: global invariant rejects sidecar on [sandbox-net, shadow-egress] ---"
+
+SHADOW_EGRESS_COMPOSE="${TMPDIR_TEST}/compose-shadow-egress.yaml"
+cat > "${SHADOW_EGRESS_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+  leakproxy:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+      - shadow-egress
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  shadow-egress: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SHADOW_EGRESS_OUTPUT=""
+SHADOW_EGRESS_EXIT=0
+SHADOW_EGRESS_OUTPUT="$(COMPOSE_FILE="${SHADOW_EGRESS_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SHADOW_EGRESS_EXIT=$?
+
+if [[ "${SHADOW_EGRESS_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${SHADOW_EGRESS_EXIT}) for sidecar on shadow-egress"
+else
+  fail "validate-stack.sh exited ZERO for sidecar on shadow-egress — global invariant did NOT fire"
+fi
+
+if echo "${SHADOW_EGRESS_OUTPUT}" | grep -q "leakproxy"; then
+  pass "failure message names the offending service 'leakproxy'"
+else
+  fail "failure message does not name 'leakproxy' — output: ${SHADOW_EGRESS_OUTPUT}"
+fi
+
+if echo "${SHADOW_EGRESS_OUTPUT}" | grep -q "shadow-egress"; then
+  pass "failure message names the offending network 'shadow-egress'"
+else
+  fail "failure message does not name 'shadow-egress' — output: ${SHADOW_EGRESS_OUTPUT}"
+fi
+
+echo ""
+echo "  shadow-egress-test output (stderr+stdout combined):"
+echo "${SHADOW_EGRESS_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 21 — Negative: sidecar attached to [sandbox-net, gateway-net]
+#           must be rejected — only gateway may join gateway-net.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 21: global invariant rejects sidecar on [sandbox-net, gateway-net] ---"
+
+GATEWAY_NET_SIDECAR_COMPOSE="${TMPDIR_TEST}/compose-gateway-net-sidecar.yaml"
+cat > "${GATEWAY_NET_SIDECAR_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+  sidecar:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+      - gateway-net
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+GATEWAY_NET_SIDECAR_OUTPUT=""
+GATEWAY_NET_SIDECAR_EXIT=0
+GATEWAY_NET_SIDECAR_OUTPUT="$(COMPOSE_FILE="${GATEWAY_NET_SIDECAR_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || GATEWAY_NET_SIDECAR_EXIT=$?
+
+if [[ "${GATEWAY_NET_SIDECAR_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${GATEWAY_NET_SIDECAR_EXIT}) for sidecar on gateway-net"
+else
+  fail "validate-stack.sh exited ZERO for sidecar on gateway-net — global invariant did NOT fire"
+fi
+
+if echo "${GATEWAY_NET_SIDECAR_OUTPUT}" | grep -q "sidecar"; then
+  pass "failure message names the offending service 'sidecar'"
+else
+  fail "failure message does not name 'sidecar' — output: ${GATEWAY_NET_SIDECAR_OUTPUT}"
+fi
+
+if echo "${GATEWAY_NET_SIDECAR_OUTPUT}" | grep -q "gateway-net"; then
+  pass "failure message names the offending network 'gateway-net'"
+else
+  fail "failure message does not name 'gateway-net' — output: ${GATEWAY_NET_SIDECAR_OUTPUT}"
+fi
+
+echo ""
+echo "  gateway-net-sidecar-test output (stderr+stdout combined):"
+echo "${GATEWAY_NET_SIDECAR_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 22 — Negative: shadow-egress declared with no service attached
+#           must be rejected by the drift check (raw-YAML path).
+#
+# The drift check fails any declared non-internal network not in
+# {egress-net, gateway-net}, even if no service has joined it yet.
+# This prevents the hole from being introduced by declaration alone.
+#
+# NOTE: `docker compose config` drops unused networks from its normalized
+# output, so the drift check for declared-but-unused networks only fires
+# via the raw-YAML fallback (no docker in PATH).  This test strips docker
+# from PATH to exercise that path.  When a service IS attached to the
+# unknown network, docker compose config keeps it and the drift check fires
+# in both paths (see TEST 20 which also triggers the drift check message).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 22: drift check rejects shadow-egress declared with no service (raw-YAML path, no docker) ---"
+
+DRIFT_COMPOSE="${TMPDIR_TEST}/compose-drift.yaml"
+cat > "${DRIFT_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  shadow-egress: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  DRIFT_OUTPUT=""
+  DRIFT_EXIT=0
+  DRIFT_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${DRIFT_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || DRIFT_EXIT=$?
+
+  if [[ "${DRIFT_EXIT}" -ne 0 ]]; then
+    pass "drift check exited non-zero (${DRIFT_EXIT}) for shadow-egress declared with no service (raw-YAML path)"
+  else
+    fail "drift check exited ZERO for shadow-egress declared with no service (raw-YAML path) — drift check did NOT fire"
+  fi
+
+  if echo "${DRIFT_OUTPUT}" | grep -q "shadow-egress"; then
+    pass "drift-check failure message names 'shadow-egress'"
+  else
+    fail "drift-check failure message does not name 'shadow-egress' — output: ${DRIFT_OUTPUT}"
+  fi
+
+  if echo "${DRIFT_OUTPUT}" | grep -qi "unknown non-internal\|only egress-net"; then
+    pass "drift-check failure message indicates unknown non-internal network"
+  else
+    fail "drift-check failure message missing expected text — output: ${DRIFT_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  drift-check-test output (stderr+stdout combined):"
+  echo "${DRIFT_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: drift check (raw-YAML path): PyYAML not available — install python3-yaml/PyYAML to run this test."
+  echo "        (docker compose config drops unused networks, so the raw-YAML path is required for this case)"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 23 — Positive: mitmproxy→egress-net + gateway→gateway-net only
+#           (the exact allowlisted pairs) must pass.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 23: global invariant accepts allowlisted pairs mitmproxy→egress-net + gateway→gateway-net ---"
+
+ALLOWLIST_COMPOSE="${TMPDIR_TEST}/compose-allowlist.yaml"
+cat > "${ALLOWLIST_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+ALLOWLIST_OUTPUT=""
+ALLOWLIST_EXIT=0
+ALLOWLIST_OUTPUT="$(COMPOSE_FILE="${ALLOWLIST_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || ALLOWLIST_EXIT=$?
+
+if [[ "${ALLOWLIST_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for allowlisted pairs mitmproxy→egress-net + gateway→gateway-net"
+else
+  fail "validate-stack.sh exited non-zero (${ALLOWLIST_EXIT}) for allowlisted pairs — output: ${ALLOWLIST_OUTPUT}"
+fi
+
+if echo "${ALLOWLIST_OUTPUT}" | grep -q "allowlisted pairs"; then
+  pass "output confirms allowlisted pairs check passed"
+else
+  fail "output does not confirm allowlisted pairs check — output: ${ALLOWLIST_OUTPUT}"
+fi
+
+echo ""
+echo "  allowlist-pairs-test output (stderr+stdout combined):"
+echo "${ALLOWLIST_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 24 — Multi-file override (#814 literal repro): base compose + override
+#           that adds a leakproxy sidecar on [sandbox-net, shadow-egress].
+#
+# This is the exact bypass class from issue #814: the override introduces a
+# service on a non-internal network that mitmproxy is NOT on.  The old guard
+# would miss it; the new global allowlist must catch it via docker compose
+# merge semantics.
+#
+# REQUIRES docker compose for authoritative multi-file merge.  The raw-YAML
+# fallback fail-closes on multi-file input (see TEST 16), so this test MUST
+# run through real docker compose config.  Hard-skip with a visible notice
+# when docker is absent — do NOT let it silently pass via the raw-YAML path.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 24: multi-file override (#814 repro) — leakproxy sidecar on shadow-egress (docker-gated) ---"
+
+MULTI814_BASE_COMPOSE="${TMPDIR_TEST}/compose-814-base.yaml"
+cat > "${MULTI814_BASE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+MULTI814_OVERRIDE_COMPOSE="${TMPDIR_TEST}/compose-814-override.yaml"
+cat > "${MULTI814_OVERRIDE_COMPOSE}" <<'YAML'
+services:
+  leakproxy:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+      - shadow-egress
+
+networks:
+  shadow-egress: {}
+YAML
+
+if command -v docker &>/dev/null; then
+  MULTI814_OUTPUT=""
+  MULTI814_EXIT=0
+  MULTI814_OUTPUT="$(COMPOSE_FILE="${MULTI814_BASE_COMPOSE}:${MULTI814_OVERRIDE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || MULTI814_EXIT=$?
+
+  if [[ "${MULTI814_EXIT}" -ne 0 ]]; then
+    pass "multi-file #814 repro: validate-stack.sh exited non-zero (${MULTI814_EXIT}) — leakproxy/shadow-egress bypass caught"
+  else
+    fail "multi-file #814 repro: validate-stack.sh exited ZERO — override-merged topology violation was NOT caught"
+  fi
+
+  if echo "${MULTI814_OUTPUT}" | grep -q "leakproxy"; then
+    pass "multi-file #814 repro: failure message names 'leakproxy'"
+  else
+    fail "multi-file #814 repro: failure message does not name 'leakproxy' — output: ${MULTI814_OUTPUT}"
+  fi
+
+  if echo "${MULTI814_OUTPUT}" | grep -q "shadow-egress"; then
+    pass "multi-file #814 repro: failure message names 'shadow-egress'"
+  else
+    fail "multi-file #814 repro: failure message does not name 'shadow-egress' — output: ${MULTI814_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  multi-file-814-repro output (stderr+stdout combined):"
+  echo "${MULTI814_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: multi-file #814 repro: docker not in PATH — this test requires docker compose for authoritative"
+  echo "        multi-file merge semantics; raw-YAML fallback fail-closes on multi-file input (see TEST 16)."
+  echo "        Install docker compose to run this test."
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
