@@ -456,7 +456,7 @@ jobs:
           # Derive the GitHub Release tag.
           # Mirrors the publish job's "Resolve params" derivation.
           SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
-          RELEASE_TAG="v${BASE_VERSION}+harness.${SHORT_SHA}"
+          RELEASE_TAG="${BASE_VERSION}+harness.${SHORT_SHA}"
 
           {
             echo "integration_commit=${INTEGRATION_COMMIT}"
@@ -887,7 +887,7 @@ jobs:
           # self-reported version from buildHarnessVersion().
           SHORT_SHA="${INTEGRATION_COMMIT:0:8}"
           NPM_VERSION="${BASE_VERSION}-harness.${SHORT_SHA}"
-          RELEASE_TAG="v${BASE_VERSION}+harness.${SHORT_SHA}"
+          RELEASE_TAG="${BASE_VERSION}+harness.${SHORT_SHA}"
 
           {
             echo "integration_commit=${INTEGRATION_COMMIT}"

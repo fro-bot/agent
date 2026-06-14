@@ -219,30 +219,44 @@ describe('opencode', () => {
       expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.17.3/opencode-linux-x64.tar.gz')
     })
 
-    it('builds harness URL for linux-x64 with %2B-encoded tag', () => {
+    it('builds harness URL for linux-x64 with non-v tag and %2B-encoded +', () => {
       // #given
       const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
 
       // #when
       const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
 
-      // #then
+      // #then — harness tags are NON-v-prefixed; stock tags keep their v-prefix
       expect(url).toBe(
-        'https://github.com/fro-bot/agent/releases/download/v1.17.3%2Bharness.abc12345/opencode-linux-x64.tar.gz',
+        'https://github.com/fro-bot/agent/releases/download/1.17.3%2Bharness.abc12345/opencode-linux-x64.tar.gz',
       )
     })
 
-    it('builds harness URL for darwin-arm64 with %2B-encoded tag', () => {
+    it('builds harness URL for darwin-arm64 with non-v tag and %2B-encoded +', () => {
       // #given
       const info: PlatformInfo = {os: 'darwin', arch: 'arm64', ext: '.zip'}
 
       // #when
       const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
 
-      // #then
+      // #then — harness tags are NON-v-prefixed; stock tags keep their v-prefix
       expect(url).toBe(
-        'https://github.com/fro-bot/agent/releases/download/v1.17.3%2Bharness.abc12345/opencode-darwin-arm64.zip',
+        'https://github.com/fro-bot/agent/releases/download/1.17.3%2Bharness.abc12345/opencode-darwin-arm64.zip',
       )
+    })
+
+    it('stock download uses v-prefix; harness download does NOT — paths differ correctly', () => {
+      // #given — regression guard: the two paths must diverge on the v-prefix
+      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
+
+      // #when
+      const stockUrl = buildDownloadUrl('1.17.3', info)
+      const harnessUrl = buildDownloadUrl('1.17.3+harness.abc12345', info)
+
+      // #then — stock keeps v-prefix; harness has no v-prefix
+      expect(stockUrl).toContain('/releases/download/v1.17.3/')
+      expect(harnessUrl).toContain('/releases/download/1.17.3%2Bharness.')
+      expect(harnessUrl).not.toContain('/releases/download/v1.17.3%2Bharness.')
     })
 
     it('rejects a version containing path traversal (../) — semver guard', () => {
@@ -263,12 +277,12 @@ describe('opencode', () => {
   })
 
   describe('buildChecksumsUrl', () => {
-    it('returns correct %2B-encoded SHA256SUMS URL for a harness version', () => {
+    it('returns correct non-v %2B-encoded SHA256SUMS URL for a harness version', () => {
       // #given / #when
       const url = buildChecksumsUrl('1.17.3+harness.abc12345')
 
-      // #then
-      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/v1.17.3%2Bharness.abc12345/SHA256SUMS')
+      // #then — harness release tags are NON-v-prefixed
+      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/1.17.3%2Bharness.abc12345/SHA256SUMS')
     })
 
     it('throws for a stock (non-harness) version', () => {
