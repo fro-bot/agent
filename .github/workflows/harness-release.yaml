@@ -375,10 +375,15 @@ jobs:
           if [ -n "${MATRIX_ABI}" ]; then
             SUFFIX="${SUFFIX}-${MATRIX_ABI}"
           fi
-          bun run packages/harness/scripts/verify-binary.ts \
-            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH${SUFFIX}/bin/opencode" \
-            --base-version "$BASE_VERSION" \
-            --integration-commit "$INTEGRATION_COMMIT"
+          # Use an array to avoid SC2086 word-splitting issues with unquoted flag variables.
+          CMD=(bun run packages/harness/scripts/verify-binary.ts
+            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH${SUFFIX}/bin/opencode"
+            --base-version "$BASE_VERSION"
+            --integration-commit "$INTEGRATION_COMMIT")
+          if [ -n "${MATRIX_ABI}" ]; then
+            CMD+=(--abi "${MATRIX_ABI}")
+          fi
+          "${CMD[@]}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
