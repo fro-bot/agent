@@ -218,6 +218,15 @@ function layer(result: "continue" | "compact") {
   )
 }
 
+function blockingProcessor(ready: Deferred.Deferred<void>) {
+  return Layer.succeed(
+    SessionProcessorModule.SessionProcessor.Service,
+    SessionProcessorModule.SessionProcessor.Service.of({
+      create: () => Effect.sync(() => Deferred.doneUnsafe(ready, Effect.void)).pipe(Effect.andThen(Effect.never)),
+    }),
+  )
+}
+
 function cfg(compaction?: ConfigV1.Info["compaction"]) {
   const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
   return TestConfig.layer({
@@ -235,6 +244,7 @@ const deps = Layer.mergeAll(
   RuntimeFlags.layer({ experimentalEventSystem: true }),
   Database.defaultLayer,
   EventV2Bridge.defaultLayer,
+  SessionStatus.layer.pipe(Layer.provide(EventV2Bridge.defaultLayer)),
 )
 
 const env = Layer.mergeAll(
@@ -259,6 +269,7 @@ type CompactionProcessOptions = {
   result?: "continue" | "compact"
   llm?: Layer.Layer<LLM.Service>
   plugin?: Layer.Layer<Plugin.Service>
+  processor?: Layer.Layer<SessionProcessorModule.SessionProcessor.Service>
   provider?: ReturnType<typeof ProviderTest.fake>
   config?: Layer.Layer<Config.Service>
 }
@@ -270,8 +281,10 @@ function withCompaction(options?: CompactionProcessOptions) {
 function compactionProcessLayer(options?: CompactionProcessOptions) {
   const events = EventV2Bridge.defaultLayer
   const status = SessionStatus.layer.pipe(Layer.provide(events))
-  const processor = options?.llm
-    ? SessionProcessorModule.SessionProcessor.layer.pipe(
+  const processor = options?.processor
+    ? options.processor
+    : options?.llm
+      ? SessionProcessorModule.SessionProcessor.layer.pipe(
         Layer.provide(summary),
         Layer.provide(Image.defaultLayer),
         Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
@@ -376,6 +389,37 @@ function autocontinue(enabled: boolean) {
         return output
       })
     },
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  })
+}
+
+function chatHookOrder(order: string[], inputs: Array<{ name: string; input: unknown }>) {
+  return Layer.mock(Plugin.Service)({
+    trigger: <Name extends string, Input, Output>(name: Name, input: Input, output: Output) =>
+      Effect.sync(() => {
+        if (name === "experimental.chat.system.transform") {
+          order.push("system")
+          inputs.push({ name, input })
+        }
+        if (name === "experimental.chat.messages.transform") {
+          order.push("messages")
+          inputs.push({ name, input })
+        }
+        return output
+      }),
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  })
+}
+
+function failingChatHook(name: string) {
+  return Layer.mock(Plugin.Service)({
+    trigger: <Name extends string, Input, Output>(hook: Name, _input: Input, output: Output) =>
+      Effect.sync(() => {
+        if (hook === name) throw new Error(`${name} failed`)
+        return output
+      }),
     list: () => Effect.succeed([]),
     init: () => Effect.void,
   })
@@ -879,31 +923,93 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "marks summary message as errored on compact result",
-    Effect.gen(function* () {
-      const ssn = yield* SessionNs.Service
-      const session = yield* ssn.create({})
-      const msg = yield* createUserMessage(session.id, "hello")
-      const msgs = yield* ssn.messages({ sessionID: session.id })
+    "fires system transform before messages transform during compaction",
+    () => {
+      const order: string[] = []
+      const inputs: Array<{ name: string; input: unknown }> = []
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
 
-      const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
-        messages: msgs,
-        sessionID: session.id,
-        auto: false,
-      })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
 
-      const summary = (yield* ssn.messages({ sessionID: session.id })).find(
-        (msg) => msg.info.role === "assistant" && msg.info.summary,
-      )
+        expect(result).toBe("continue")
+        expect(order).toEqual(["system", "messages"])
+        expect(inputs.find((item) => item.name === "experimental.chat.messages.transform")?.input).toMatchObject({
+          sessionID: session.id,
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        })
+      }).pipe(withCompaction({ plugin: chatHookOrder(order, inputs) }))
+    },
+  )
 
-      expect(result).toBe("stop")
-      expect(summary?.info.role).toBe("assistant")
-      if (summary?.info.role === "assistant") {
-        expect(summary.info.finish).toBe("error")
-        expect(JSON.stringify(summary.info.error)).toContain("Session too large to compact")
-      }
-    }).pipe(withCompaction({ result: "compact" })),
+  itCompaction.instance(
+    "records summary error when chat transform fails before compaction stream",
+    () =>
+      Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const status = yield* SessionStatus.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )?.info
+        expect(result).toBe("stop")
+        expect(summary?.role).toBe("assistant")
+        if (summary?.role === "assistant") {
+          expect(JSON.stringify(summary.error)).toContain("experimental.chat.system.transform failed")
+          expect(summary.finish).toBe("error")
+          expect(summary.time.completed).toBeNumber()
+        }
+        expect((yield* status.get(session.id)).type).toBe("idle")
+      }).pipe(withCompaction({ plugin: failingChatHook("experimental.chat.system.transform") })),
+  )
+
+  itCompaction.instance(
+    "records summary error when messages transform fails before compaction stream",
+    () =>
+      Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const status = yield* SessionStatus.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )?.info
+        expect(result).toBe("stop")
+        expect(summary?.role).toBe("assistant")
+        if (summary?.role === "assistant") {
+          expect(JSON.stringify(summary.error)).toContain("experimental.chat.messages.transform failed")
+          expect(summary.finish).toBe("error")
+          expect(summary.time.completed).toBeNumber()
+        }
+        expect((yield* status.get(session.id)).type).toBe("idle")
+      }).pipe(withCompaction({ plugin: failingChatHook("experimental.chat.messages.transform") })),
   )
 
   it.instance(
@@ -1272,6 +1378,7 @@ describe("session.compaction.process", () => {
         const ready = yield* Deferred.make<void>()
         return yield* Effect.gen(function* () {
           const ssn = yield* SessionNs.Service
+          const status = yield* SessionStatus.Service
           const session = yield* ssn.create({})
           const msg = yield* createUserMessage(session.id, "hello")
           const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -1292,7 +1399,42 @@ describe("session.compaction.process", () => {
           expect(Exit.isFailure(exit)).toBe(true)
           if (Exit.isFailure(exit)) expect(Cause.hasInterrupts(exit.cause)).toBe(true)
           expect(all.some((msg) => msg.info.role === "assistant" && msg.info.summary)).toBe(false)
+          expect((yield* status.get(session.id)).type).toBe("idle")
         }).pipe(withCompaction({ plugin: plugin(ready) }))
+      }),
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "does not leave a summary assistant when interrupted during processor creation",
+    () =>
+      Effect.gen(function* () {
+        const ready = yield* Deferred.make<void>()
+        return yield* Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const status = yield* SessionStatus.Service
+          const session = yield* ssn.create({})
+          const msg = yield* createUserMessage(session.id, "hello")
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          const fiber = yield* SessionCompaction.use
+            .process({
+              parentID: msg.id,
+              messages: msgs,
+              sessionID: session.id,
+              auto: false,
+            })
+            .pipe(Effect.forkChild)
+
+          yield* Deferred.await(ready).pipe(Effect.timeout("1 second"))
+          yield* Fiber.interrupt(fiber)
+          const exit = yield* Fiber.await(fiber).pipe(Effect.timeout("250 millis"))
+          const all = yield* ssn.messages({ sessionID: session.id })
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+          expect(all.some((msg) => msg.info.role === "assistant" && msg.info.summary)).toBe(false)
+          expect((yield* status.get(session.id)).type).toBe("idle")
+        }).pipe(withCompaction({ processor: blockingProcessor(ready) }))
       }),
     { git: true },
   )
