@@ -337,7 +337,14 @@ volumes:
   workspace-repos:
 
 networks:
-  # External-facing network for gateway ↔ Discord/S3
+  # External-facing network for the gateway service.
+  # The gateway attaches here as a deliberate trusted first-party exception: it must
+  # reach Discord, GitHub, and object storage directly. This is an explicit TCB
+  # decision — the gateway is trusted code under operator control, not the untrusted
+  # workspace. The containment guarantee is that the WORKSPACE reaches the internet
+  # only via mitmproxy; the gateway is not subject to that constraint.
+  # Forward constraint: never give the workspace a gateway endpoint that performs
+  # caller-directed outbound requests. If that changes, revisit the topology.
   gateway-net:
     driver: bridge
   # Isolated sandbox: workspace + mitmproxy receive side only.
@@ -346,7 +353,8 @@ networks:
   sandbox-net:
     driver: bridge
     internal: true
-  # mitmproxy's upstream leg only. No other service joins this network.
-  # Containment invariant: workspace → sandbox-net → mitmproxy → egress-net → internet.
+  # mitmproxy's upstream leg. Only mitmproxy joins this network.
+  # Workspace containment invariant: workspace → sandbox-net → mitmproxy → egress-net → internet.
+  # (The gateway reaches the internet via gateway-net, not egress-net — see gateway-net comment above.)
   egress-net:
     driver: bridge

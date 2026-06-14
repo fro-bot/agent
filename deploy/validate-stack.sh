@@ -30,8 +30,10 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #      network (its upstream leg to the internet).
 #   4. workspace is attached to NO non-internal network — it cannot reach the
 #      internet directly, even if a new network is added to the compose file.
-#   5. egress-net has EXACTLY ONE attached service (mitmproxy) — no other
-#      service may join the internet-capable network.
+#   5. Only allowlisted (service, network) pairs may attach to any non-internal
+#      network: {mitmproxy→egress-net, gateway→gateway-net}. Any other service
+#      on any non-internal network fails closed. Unknown non-internal network
+#      declarations also fail (drift check).
 #   6. workspace mounts the named volume 'workspace-repos' at exactly
 #      '/workspace/repos' — repo checkouts must survive container recreation.
 #
@@ -220,23 +222,33 @@ if "workspace" not in network_mode_services and workspace_egress_nets:
     )
 
 # ------------------------------------------------------------------
-# Invariant 5: each non-internal network that mitmproxy uses must have
-# EXACTLY ONE attached service (mitmproxy itself).
-# (mitmproxy_egress_nets is empty when mitmproxy has network_mode, so
-# this loop is a no-op in that case — no explicit skip needed)
+# Invariant 5: only allowlisted (service, network) pairs may attach to
+# any non-internal network.  The allowlist is the minimal trusted set:
+#   mitmproxy → egress-net  (the workspace's only internet chokepoint)
+#   gateway   → gateway-net (trusted first-party TCB; see deploy/README.md)
+# Any other service on any non-internal network fails closed, including
+# services on non-internal networks that mitmproxy is not on.
+# Services that declare network_mode are already rejected by Invariant 1b.
 # ------------------------------------------------------------------
-for egress_net in mitmproxy_egress_nets:
-    attached = [
-        svc for svc, spec in services.items()
-        if egress_net in service_networks(svc)
-    ]
-    if attached != ["mitmproxy"] and set(attached) != {"mitmproxy"}:
-        others = [s for s in attached if s != "mitmproxy"]
-        failures.append(
-            f"FAIL: non-internal network '{egress_net}' has unexpected service(s) "
-            f"attached: {others!r}. Only mitmproxy may join the internet-capable "
-            "network — adding other services breaks the containment boundary."
-        )
+allowed_non_internal_attachments = {("mitmproxy", "egress-net"), ("gateway", "gateway-net")}
+for svc in sorted(services):
+    if svc in network_mode_services:
+        continue
+    for net in sorted(service_networks(svc) & non_internal_nets):
+        if (svc, net) not in allowed_non_internal_attachments:
+            failures.append(
+                f"FAIL: service '{svc}' attached to non-internal network '{net}'; "
+                f"only these (service, network) pairs are permitted: {sorted(allowed_non_internal_attachments)!r}"
+            )
+
+# Drift check: fail any declared non-internal network not in the known set,
+# so a shadow egress network cannot be introduced even before a service joins it.
+allowed_non_internal_nets = {"egress-net", "gateway-net"}
+for net in sorted(non_internal_nets - allowed_non_internal_nets):
+    failures.append(
+        f"FAIL: unknown non-internal network '{net}' declared; "
+        "only egress-net/gateway-net are permitted"
+    )
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'
@@ -320,7 +332,7 @@ print(f"    workspace networks: {sorted(workspace_nets)!r}  ✓")
 print(f"    mitmproxy networks: {sorted(mitmproxy_nets)!r}  ✓")
 print(f"    mitmproxy egress leg(s): {sorted(mitmproxy_egress_nets)!r}  ✓")
 print("    workspace has no direct egress  ✓")
-print("    egress network(s) have exactly one attached service (mitmproxy)  ✓")
+print(f"    non-internal network attachments: only allowlisted pairs {sorted(allowed_non_internal_attachments)!r}  ✓")
 print(f"    workspace mounts {REQUIRED_SOURCE!r} at {REQUIRED_TARGET!r}  ✓")
 PYEOF
 
