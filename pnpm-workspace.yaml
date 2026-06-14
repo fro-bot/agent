@@ -10,6 +10,9 @@ autoInstallPeers: true
 
 ignoreWorkspaceRootCheck: true
 
+minimumReleaseAgeExclude:
+  - '@opencode-ai/sdk@1.17.6'
+
 onlyBuiltDependencies:
   - esbuild
   - simple-git-hooks
