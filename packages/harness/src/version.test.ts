@@ -89,12 +89,12 @@ describe('buildHarnessNpmVersion', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildHarnessReleaseTag', () => {
-  it('exact output for known base + commit → v<baseVersion>+harness.<shortSha>', () => {
+  it('exact output for known base + commit → <baseVersion>+harness.<shortSha>', () => {
     // #given / #when
     const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef1234567890abcdef1234567890')
 
     // #then
-    expect(result).toBe('v1.17.3+harness.ed359558')
+    expect(result).toBe('1.17.3+harness.ed359558')
   })
 
   it('full 40-char SHA truncates to first 8 chars', () => {
@@ -105,7 +105,7 @@ describe('buildHarnessReleaseTag', () => {
     const result = buildHarnessReleaseTag('1.17.3', fullSha)
 
     // #then
-    expect(result).toBe('v1.17.3+harness.abcdef12')
+    expect(result).toBe('1.17.3+harness.abcdef12')
     expect(result.split('+harness.')[1]).toBe(fullSha.slice(0, 8))
   })
 
@@ -117,15 +117,15 @@ describe('buildHarnessReleaseTag', () => {
     const result = buildHarnessReleaseTag('1.17.3', shortCommit)
 
     // #then
-    expect(result).toBe('v1.17.3+harness.ed359558')
+    expect(result).toBe('1.17.3+harness.ed359558')
   })
 
-  it('is v-prefixed with build-metadata plus separator (not prerelease hyphen)', () => {
+  it('is NOT v-prefixed and uses build-metadata plus separator (not prerelease hyphen)', () => {
     // #given / #when
     const result = buildHarnessReleaseTag('1.17.3', 'ed359558abcdef12')
 
-    // #then — GitHub tag uses v-prefix + build metadata (+), NOT prerelease (-)
-    expect(result).toMatch(/^v/)
+    // #then — non-v so it stays out of the product `v${version}` tag space; build metadata (+), NOT prerelease (-)
+    expect(result).not.toMatch(/^v/)
     expect(result).toContain('+harness.')
     expect(result).not.toContain('-harness.')
   })
