@@ -655,6 +655,17 @@ jobs:
             echo "::warning::Checksum negative test: docker build failed for bogus version '${bogus_version}' but the failure signal is NOT in the expected download/checksum path (curl/SHA256SUMS/hash-mismatch). Fail-closed still holds — the build aborted — but the failure may be a stage-1 (network/apk) issue rather than the checksum path. Investigate if this recurs. Build output is printed above."
           fi
 
+      - name: Live egress containment smoke
+        run: |
+          # Proves the workspace's only internet path is mitmproxy:
+          #   (a) direct internet request (no proxy) → fails (sandbox-net is internal:true)
+          #   (b) non-allowlisted host through mitmproxy → 403
+          #   (c) allowlisted host through mitmproxy → 200, AND mitmproxy logs the flow
+          # The workspace image carries the mitmproxy CA trust + proxy env via its
+          # entrypoint; an arbitrary container would not and the HTTPS 200 case would
+          # fail for the wrong reason (TLS error, not a routing failure).
+          WORKSPACE_IMAGE=fro-bot-workspace:smoke bash deploy/egress-smoke.sh
+
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}
     name: Dependency Review
