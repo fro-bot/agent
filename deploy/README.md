@@ -287,6 +287,8 @@ The version is pinned in `deploy/workspace.Dockerfile` as `ARG OPENCODE_VERSION=
 
 **Rollback / hold procedure:** to hold or roll back the workspace independently, manually edit `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and rebuild the workspace image. Note that a manually pinned value will be overwritten the next time an auto-PR for a new harness release is merged — do not merge the next auto-PR until you are ready to advance. As a last resort, you can pin to a prior stock musl release from `anomalyco/opencode` (note: stock releases do not publish `SHA256SUMS`, so you would need to remove the checksum verification step temporarily).
 
+> **⚠️ BREAK-GLASS ONLY — removing checksum verification drops the fail-closed integrity guarantee.** Without it, the image build will accept any binary served at the download URL — including a tampered or substituted one. This must be treated as a temporary incident measure only: document the incident, revert the checksum step as soon as the harness release is available, and do not merge any auto-PR that advances `OPENCODE_VERSION` while verification is disabled.
+
 Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
 
 #### Model and provider configuration

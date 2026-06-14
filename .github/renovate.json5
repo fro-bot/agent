@@ -81,13 +81,6 @@
       datasourceTemplate: 'npm',
     },
     {
-      // NOTE: deploy/workspace.Dockerfile's ARG OPENCODE_VERSION (the harness
-      // OpenCode build, form <base>+harness.<sha>) is deliberately NOT tracked by
-      // Renovate — build-metadata tags have no defined semver ordering and the SHA
-      // suffix is non-monotonic, so Renovate cannot produce clean bumps. It is
-      // bumped by the harness-release workflow's sync-default-version job, which
-      // advances the action default and the workspace ARG together to the same
-      // build. Merging that auto-PR is the gate.
       // Workspace executor image bakes the Systematic plugin config; keep its
       // ARG in step with DEFAULT_SYSTEMATIC_VERSION.
       customType: 'regex',

@@ -94,7 +94,7 @@ RUN set -euo pipefail \
     && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
     && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
     # Verify the asset's SHA256 against the SHA256SUMS entry — fail closed on any mismatch.
-    && expected_hash="$(grep "  ${oc_asset}.tar.gz$" /tmp/SHA256SUMS | awk '{print $1}')" \
+    && expected_hash="$(awk -v f="${oc_asset}.tar.gz" '$2 == f {print $1}' /tmp/SHA256SUMS)" \
     && if [ -z "${expected_hash}" ]; then \
          echo "SHA256SUMS does not contain an entry for ${oc_asset}.tar.gz" >&2; exit 1; \
        fi \
