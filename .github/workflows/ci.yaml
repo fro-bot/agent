@@ -656,6 +656,7 @@ jobs:
           fi
 
       - name: Live egress containment smoke
+        timeout-minutes: 8
         run: |
           # Proves the workspace's only internet path is mitmproxy:
           #   (a) direct internet request (no proxy) → fails (sandbox-net is internal:true)

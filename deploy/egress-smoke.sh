@@ -85,6 +85,7 @@ services:
     networks:
       - sandbox-net
       - egress-net
+    restart: unless-stopped
     healthcheck:
       test: [CMD-SHELL, test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem]
       interval: 5s
@@ -180,19 +181,43 @@ fi
 # ---------------------------------------------------------------------------
 # Probe (b): non-allowlisted host through mitmproxy → expect 403.
 # example.com is not in the allowlist; mitmproxy short-circuits with 403.
+#
+# Retry policy: retry ONLY on transport/connectivity failures (curl non-zero
+# exit) or transient server errors (5xx/429). A definitive but WRONG status
+# (any 2xx/3xx — meaning the block failed) is NEVER retried: that is a real
+# containment failure and must fail immediately to preserve the test's teeth.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- probe (b): blocked host (example.com) through mitmproxy → expect 403 ---"
 probe_b_exit=0
 probe_b_output=""
-probe_b_output="$(docker compose -p "${COMPOSE_PROJECT}" -f "${SMOKE_DIR}/compose.yaml" exec -T \
-  workspace \
-  sh -c 'curl -sv --max-time 15 --proxy http://mitmproxy:8080 https://example.com/ 2>&1')" || probe_b_exit=$?
+probe_b_status=""
+for _attempt in 1 2 3; do
+  probe_b_exit=0
+  probe_b_output=""
+  probe_b_output="$(docker compose -p "${COMPOSE_PROJECT}" -f "${SMOKE_DIR}/compose.yaml" exec -T \
+    workspace \
+    sh -c 'curl -sv --max-time 15 --proxy http://mitmproxy:8080 https://example.com/ 2>&1')" || probe_b_exit=$?
+  # Extract the HTTP status code from curl verbose output (last "< HTTP/... NNN" line).
+  probe_b_status="$(echo "${probe_b_output}" | grep -oE '< HTTP/[0-9.]+ [0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+  if [ "${probe_b_status}" = "403" ]; then
+    break  # definitive correct result — stop retrying
+  elif [ -n "${probe_b_status}" ] && [ "${probe_b_status}" != "429" ] && \
+       ! echo "${probe_b_status}" | grep -qE '^5[0-9][0-9]$'; then
+    # Definitive WRONG status (2xx/3xx/4xx≠403): containment failure — fail immediately, no retry.
+    break
+  fi
+  # Transport error (curl exit non-zero, no status) or 5xx/429 — transient; retry with backoff.
+  if [ "${_attempt}" -lt 3 ]; then
+    echo "  probe (b) attempt ${_attempt} transient (exit=${probe_b_exit} status=${probe_b_status:-none}), retrying in 3s..."
+    sleep 3
+  fi
+done
 
-if echo "${probe_b_output}" | grep -q "403"; then
+if [ "${probe_b_status}" = "403" ]; then
   pass "probe (b): mitmproxy returned 403 for non-allowlisted host example.com"
 else
-  fail "probe (b): expected 403 from mitmproxy for example.com, got: exit=${probe_b_exit} output=${probe_b_output}"
+  fail "probe (b): expected 403 from mitmproxy for example.com, got: exit=${probe_b_exit} status=${probe_b_status:-none} output=${probe_b_output}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -200,19 +225,43 @@ fi
 # api.github.com is in the static allowlist. The request succeeds only because
 # it routes through mitmproxy (the workspace has no direct internet path).
 # We then assert mitmproxy logged the allowed flow — this is the routing proof.
+#
+# Retry policy: retry ONLY on transport errors (curl non-zero exit) or
+# transient server errors (5xx/429). A definitive but WRONG status (anything
+# other than 200) is NEVER retried: that is a real routing/allowlist failure
+# and must fail immediately to preserve the test's teeth.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- probe (c): allowlisted host (api.github.com) through mitmproxy → expect 200 + log ---"
 probe_c_exit=0
 probe_c_output=""
-probe_c_output="$(docker compose -p "${COMPOSE_PROJECT}" -f "${SMOKE_DIR}/compose.yaml" exec -T \
-  workspace \
-  sh -c 'curl -fsS --max-time 30 https://api.github.com/zen 2>&1')" || probe_c_exit=$?
+probe_c_status=""
+for _attempt in 1 2 3; do
+  probe_c_exit=0
+  probe_c_output=""
+  probe_c_output="$(docker compose -p "${COMPOSE_PROJECT}" -f "${SMOKE_DIR}/compose.yaml" exec -T \
+    workspace \
+    sh -c 'curl -sv --max-time 30 https://api.github.com/zen 2>&1')" || probe_c_exit=$?
+  # Extract the HTTP status code from curl verbose output (last "< HTTP/... NNN" line).
+  probe_c_status="$(echo "${probe_c_output}" | grep -oE '< HTTP/[0-9.]+ [0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)"
+  if [ "${probe_c_status}" = "200" ]; then
+    break  # definitive correct result — stop retrying
+  elif [ -n "${probe_c_status}" ] && [ "${probe_c_status}" != "429" ] && \
+       ! echo "${probe_c_status}" | grep -qE '^5[0-9][0-9]$'; then
+    # Definitive WRONG status (3xx/4xx≠429): routing/allowlist failure — fail immediately, no retry.
+    break
+  fi
+  # Transport error (curl exit non-zero, no status) or 5xx/429 — transient; retry with backoff.
+  if [ "${_attempt}" -lt 3 ]; then
+    echo "  probe (c) attempt ${_attempt} transient (exit=${probe_c_exit} status=${probe_c_status:-none}), retrying in 3s..."
+    sleep 3
+  fi
+done
 
-if [ "${probe_c_exit}" -eq 0 ] && [ -n "${probe_c_output}" ]; then
-  pass "probe (c): allowlisted host api.github.com returned 200 (body: ${probe_c_output})"
+if [ "${probe_c_status}" = "200" ]; then
+  pass "probe (c): allowlisted host api.github.com returned 200"
 else
-  fail "probe (c): expected 200 from api.github.com via mitmproxy, got: exit=${probe_c_exit} output=${probe_c_output}"
+  fail "probe (c): expected 200 from api.github.com via mitmproxy, got: exit=${probe_c_exit} status=${probe_c_status:-none} output=${probe_c_output}"
 fi
 
 # Assert mitmproxy logged the allowed flow — proves routing, not just isolation.

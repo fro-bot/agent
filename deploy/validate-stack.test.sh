@@ -1347,6 +1347,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST 25 — Negative: gateway attached to [sandbox-net, egress-net] must be
+#           rejected — the allowlist binds the PAIR (service, network), not
+#           just the network.  gateway is only allowed on gateway-net; attaching
+#           it to egress-net is a violation even though egress-net itself is
+#           allowlisted for mitmproxy.
+#
+#           This proves the guard checks the (service, network) pair, not just
+#           the network name.  The failure message must name BOTH 'gateway' and
+#           'egress-net' to confirm the pair binding is enforced.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 25: guard rejects gateway attached to [sandbox-net, egress-net] (wrong pair) ---"
+
+GW_EGRESS_COMPOSE="${TMPDIR_TEST}/compose-gw-egress.yaml"
+cat > "${GW_EGRESS_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+GW_EGRESS_OUTPUT=""
+GW_EGRESS_EXIT=0
+GW_EGRESS_OUTPUT="$(COMPOSE_FILE="${GW_EGRESS_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || GW_EGRESS_EXIT=$?
+
+if [[ "${GW_EGRESS_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${GW_EGRESS_EXIT}) for gateway attached to egress-net"
+else
+  fail "validate-stack.sh exited ZERO for gateway on egress-net — pair-binding guard did NOT fire"
+fi
+
+# The failure message must name BOTH 'gateway' AND 'egress-net' to prove the
+# allowlist binds the pair, not just the network.
+if echo "${GW_EGRESS_OUTPUT}" | grep -q "gateway"; then
+  pass "failure message names 'gateway'"
+else
+  fail "failure message does not name 'gateway' — output: ${GW_EGRESS_OUTPUT}"
+fi
+
+if echo "${GW_EGRESS_OUTPUT}" | grep -q "egress-net"; then
+  pass "failure message names 'egress-net'"
+else
+  fail "failure message does not name 'egress-net' — output: ${GW_EGRESS_OUTPUT}"
+fi
+
+echo ""
+echo "  gateway-egress-net-test output (stderr+stdout combined):"
+echo "${GW_EGRESS_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
