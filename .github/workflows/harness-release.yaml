@@ -1198,6 +1198,33 @@ jobs:
             console.log('Updated DEFAULT_OPENCODE_VERSION to: ' + newVersion);
           "
 
+      - name: Update OPENCODE_VERSION in the workspace Dockerfile
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          DOCKERFILE="deploy/workspace.Dockerfile"
+
+          # Precise replacement: only touches the ARG OPENCODE_VERSION default.
+          # The workspace executor runs the same harness build as the action, so it
+          # advances in lockstep here; the merge gate on this PR is the rollback valve.
+          node -e "
+            const fs = require('fs');
+            const newVersion = process.env.NEW_VERSION;
+            let src = fs.readFileSync('${DOCKERFILE}', 'utf8');
+            const updated = src.replace(
+              /(ARG OPENCODE_VERSION=)\S+/,
+              '\$1' + newVersion
+            );
+            if (updated === src) {
+              console.error('ERROR: replacement pattern did not match — workspace ARG not updated');
+              process.exit(1);
+            }
+            fs.writeFileSync('${DOCKERFILE}', updated);
+            console.log('Updated workspace OPENCODE_VERSION to: ' + newVersion);
+          "
+
       - name: Rebuild action dist (pnpm build)
         id: build
         if: steps.version.outputs.skip != 'true'
@@ -1210,8 +1237,8 @@ jobs:
           token: ${{ steps.get-app-token.outputs.token }}
           # Branch name uses branch_suffix ('+' already replaced with '-' in the version step).
           branch: harness/sync-default-${{ steps.version.outputs.branch_suffix }}
-          commit-message: 'feat(action): default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
-          title: 'feat(action): default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
+          commit-message: 'feat: default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
+          title: 'feat: default to OpenCode harness build ${{ steps.version.outputs.new_version }}'
           body: |
             ## Automated harness version bump
 
@@ -1220,12 +1247,17 @@ jobs:
 
             **Changes:**
             - Bumps `DEFAULT_OPENCODE_VERSION` in `packages/runtime/src/shared/constants.ts`
-              to `${{ steps.version.outputs.new_version }}`
+              (the action default) to `${{ steps.version.outputs.new_version }}`
+            - Bumps `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile`
+              (the workspace executor) to the same build, so both surfaces run the
+              same patched OpenCode
             - Rebuilds `dist/main.js` + `dist/post.js` to keep action dist in sync
 
-            Future harness releases will flow into the action default automatically
-            via this mechanism, replacing Renovate tracking (which cannot order
-            `+harness.<sha>` build-metadata tags).
+            Future harness releases flow into both the action default and the
+            workspace image automatically via this mechanism, replacing Renovate
+            tracking (which cannot order `+harness.<sha>` build-metadata tags).
+            Merging this PR is the gate; not merging holds both surfaces at the
+            prior build.
           base: main
           author: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
           committer: ${{ steps.get-user-id.outputs.user-name }} <${{ steps.get-user-id.outputs.user-email }}>
