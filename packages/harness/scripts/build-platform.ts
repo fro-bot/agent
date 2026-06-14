@@ -461,9 +461,14 @@ export function assertMuslBinary(binaryPath: string, arch: 'x64' | 'arm64'): voi
     }
   }
 
-  // Positive assertion 3: must be statically linked or reference musl.
-  // Bun musl compile targets produce statically linked binaries.
-  if (!fileOutput.includes('statically linked') && !fileOutput.includes('musl')) {
+  // Positive assertion 3: must be statically linked, static-pie linked, or reference musl.
+  // Bun musl compile targets produce statically linked binaries. Some `file` versions report
+  // static-PIE musl binaries as "static-pie linked" rather than "statically linked".
+  if (
+    !fileOutput.includes('statically linked') &&
+    !fileOutput.includes('static-pie linked') &&
+    !fileOutput.includes('musl')
+  ) {
     throw new Error(
       `[build-platform] Binary at ${binaryPath} is neither statically linked nor musl-linked ` +
         `(file output: '${fileOutput}'). A musl target was requested but the binary does not show musl linkage.`,

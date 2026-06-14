@@ -784,6 +784,30 @@ describe('parseArgs: --abi and --baseline flags', () => {
     // #then — cross-validation must reject
     expect(result).toBeNull()
   })
+
+  it('returns null when --abi musl is used with --platform darwin', () => {
+    // #given — --abi musl on darwin is not supported (linux-only); exercises the abi !== null branch
+    const argv = [
+      'bun',
+      'build-platform.ts',
+      '--integration-commit',
+      'abc12345def67890',
+      '--base-version',
+      '1.15.13',
+      '--platform',
+      'darwin',
+      '--arch',
+      'x64',
+      '--abi',
+      'musl',
+    ]
+
+    // #when
+    const result = parseArgs(argv)
+
+    // #then — cross-validation must reject
+    expect(result).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------
