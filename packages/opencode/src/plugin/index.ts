@@ -20,7 +20,7 @@ import { AzureAuthPlugin } from "./azure"
 import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Option } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { errorMessage } from "@/util/error"
@@ -31,6 +31,7 @@ import type { WorkspaceAdapter } from "@/control-plane/types"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
+import { PLUGIN_CLIENT_HEADER, PluginClientRuntime } from "@/server/plugin-client"
 
 type State = {
   hooks: Hooks[]
@@ -120,6 +121,28 @@ async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks:
   }
 }
 
+function pluginClientReentryResponse(directory: string) {
+  return new Response(`Plugin client request cannot enter instance ${directory} while its plugins are still loading`, {
+    status: 409,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  })
+}
+
+function serverFetch(
+  server: { url?: URL; Default: () => { app: { fetch(request: Request): Response | Promise<Response> } } },
+  directory: string,
+  isBootstrapping: () => boolean,
+  runtime?: Context.Service.Shape<typeof PluginClientRuntime>,
+) {
+  return async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    if (isBootstrapping()) return pluginClientReentryResponse(directory)
+    if (runtime) return runtime.fetch(request)
+
+    return server.Default().app.fetch(request)
+  }
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -136,13 +159,18 @@ export const layer = Layer.effect(
           bridge.fork(events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() }))
         }
 
-        const { Server } = yield* Effect.promise(() => import("../server/server"))
+        const { Server } = yield* Effect.promise(() => import("@/server/server"))
+        const clientRuntime = Option.getOrUndefined(yield* Effect.serviceOption(PluginClientRuntime))
 
+        let bootstrapping = true
         const client = createOpencodeClient({
           baseUrl: "http://localhost:4096",
           directory: ctx.directory,
-          headers: ServerAuth.headers(),
-          fetch: async (...args) => Server.Default().app.fetch(...args),
+          headers: {
+            ...ServerAuth.headers(),
+            [PLUGIN_CLIENT_HEADER]: "1",
+          },
+          fetch: serverFetch(Server, ctx.directory, () => bootstrapping, clientRuntime),
         })
         const cfg = yield* config.get()
         const input: PluginInput = {
@@ -156,7 +184,7 @@ export const layer = Layer.effect(
             },
           },
           get serverUrl(): URL {
-            return Server.url ?? new URL("http://localhost:4096")
+            return clientRuntime?.url() ?? new URL("http://localhost:4096")
           },
           // @ts-expect-error
           $: typeof Bun === "undefined" ? undefined : Bun.$,
@@ -246,6 +274,7 @@ export const layer = Layer.effect(
             Effect.ignore,
           )
         }
+        bootstrapping = false
 
         const unsubscribe = yield* events.listen((event) => {
           if (event.location?.directory !== ctx.directory) return Effect.void

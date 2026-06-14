@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { Context, Effect, Exit, Layer, Scope } from "effect"
 import net from "node:net"
+import path from "node:path"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Server } from "../../src/server/server"
 import { PtyPaths } from "../../src/server/routes/instance/httpapi/groups/pty"
 import { withTimeout } from "../../src/util/timeout"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
+import { TestLLMServer } from "../lib/llm-server"
+import { testProviderConfig } from "../lib/test-provider"
 
 const original = {
   OPENCODE_SERVER_PASSWORD: Flag.OPENCODE_SERVER_PASSWORD,
@@ -45,6 +49,14 @@ async function startNoAuthListener() {
 
 function authorization() {
   return `Basic ${btoa(`${auth.username}:${auth.password}`)}`
+}
+
+function directoryHeaders(dir: string) {
+  return { authorization: authorization(), "x-opencode-directory": dir }
+}
+
+function jsonHeaders(dir: string) {
+  return { ...directoryHeaders(dir), "content-type": "application/json" }
 }
 
 function socketURL(listener: Awaited<ReturnType<typeof startListener>>, id: string, dir: string, ticket?: string) {
@@ -165,6 +177,177 @@ async function openPtySocket(listener: Awaited<ReturnType<typeof startListener>>
 }
 
 describe("HttpApi Server.listen", () => {
+  test("routes plugin client calls through the live listener without reloading plugins", async () => {
+    await using tmp = await tmpdir({
+      config: { formatter: false, lsp: false, plugin: ["./server-plugin.js"] },
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "server-plugin.js"),
+          `import { appendFileSync } from "node:fs";
+export default {
+  id: "listener-default-share-probe",
+  async server(input) {
+    appendFileSync(${JSON.stringify(path.join(dir, "plugin-loads.log"))}, input.directory + "\\n");
+    globalThis.__opencodeListenerRuntimeProbe = async () => {
+      try {
+        const result = await input.client.config.get();
+        await Bun.write(${JSON.stringify(path.join(dir, "plugin-client-result.json"))}, JSON.stringify({ ok: !result.error, error: result.error }));
+      } catch (error) {
+        await Bun.write(${JSON.stringify(path.join(dir, "plugin-client-result.json"))}, JSON.stringify({ ok: false, error: String(error) }));
+      }
+    };
+    return {};
+  },
+};
+`,
+        )
+      },
+    })
+    const listener = await startListener()
+    try {
+      const listenerResponse = await fetch(new URL("/config", listener.url), { headers: directoryHeaders(tmp.path) })
+      expect(listenerResponse.status).toBe(200)
+      await listenerResponse.text()
+      const probe = (globalThis as any).__opencodeListenerRuntimeProbe as (() => Promise<void>) | undefined
+      expect(typeof probe).toBe("function")
+      await withTimeout(probe!(), 2_000, "timed out waiting for plugin client request")
+
+      expect((await Bun.file(path.join(tmp.path, "plugin-loads.log")).text()).trim().split("\n")).toEqual([tmp.path])
+      expect(JSON.parse(await Bun.file(path.join(tmp.path, "plugin-client-result.json")).text())).toMatchObject({ ok: true })
+    } finally {
+      delete (globalThis as any).__opencodeListenerRuntimeProbe
+      await stop(listener, "timed out cleaning up shared instance listener").catch(() => undefined)
+    }
+  })
+
+  test("rejects plugin client re-entry while plugins are loading", async () => {
+    await using tmp = await tmpdir({
+      config: { formatter: false, lsp: false, plugin: ["./server-plugin.js"] },
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "server-plugin.js"),
+          `export default {
+  id: "plugin-client-reentry-probe",
+  async server(input) {
+    try {
+      const result = await input.client.config.get();
+      await Bun.write(${JSON.stringify(path.join(dir, "plugin-client-result.json"))}, JSON.stringify({ ok: !result.error, error: result.error }));
+    } catch (error) {
+      await Bun.write(${JSON.stringify(path.join(dir, "plugin-client-result.json"))}, JSON.stringify({ ok: false, error: String(error) }));
+    }
+    return {};
+  },
+};
+`,
+        )
+      },
+    })
+    const listener = await startListener()
+    try {
+      const response = await withTimeout(
+        fetch(new URL("/config", listener.url), { headers: directoryHeaders(tmp.path) }),
+        5_000,
+        "timed out waiting for plugin re-entry guarded request",
+      )
+      expect(response.status).toBe(200)
+      const result = JSON.parse(await Bun.file(path.join(tmp.path, "plugin-client-result.json")).text()) as {
+        ok?: boolean
+        error?: unknown
+      }
+      expect(result.ok).toBe(false)
+      expect(JSON.stringify(result.error)).toContain("Plugin client request cannot enter instance")
+    } finally {
+      await stop(listener, "timed out cleaning up plugin re-entry listener").catch(() => undefined)
+    }
+  })
+
+  test("clears the active listener URL when the listener stops", async () => {
+    const listener = await startListener()
+    expect(Server.url?.toString()).toBe(listener.url.toString())
+    await stop(listener, "timed out stopping listener for url cleanup test")
+    expect(Server.url).toBeUndefined()
+  })
+
+  test("shares promptAsync runner state through plugin client live-listener calls", async () => {
+    const scope = Scope.makeUnsafe()
+    const context = await Effect.runPromise(Layer.buildWithMemoMap(TestLLMServer.layer, Layer.makeMemoMapUnsafe(), scope))
+    const llm = Context.get(context, TestLLMServer)
+    await using tmp = await tmpdir({
+      config: {
+        ...testProviderConfig(llm.url),
+        plugin: ["./server-plugin.js"],
+        permission: { repro_wait: "allow" },
+      },
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "server-plugin.js"),
+          `export default {
+  id: "prompt-async-runner-probe",
+  async server(input) {
+    return {
+      tool: {
+        repro_wait: {
+          description: "Trigger a plugin-origin promptAsync while the current tool execution remains active.",
+          async execute(_args, context) {
+            const result = await input.client.session.promptAsync({
+              sessionID: context.sessionID,
+              model: { providerID: "test", modelID: "test-model" },
+              agent: "build",
+              parts: [{ type: "text", text: "PLUGIN_PROMPT_ASYNC_RUNNER_PROBE" }],
+            });
+            await Bun.write(${JSON.stringify(path.join(dir, "plugin-prompt-result.json"))}, JSON.stringify(result));
+            return new Promise(() => {});
+          },
+        },
+      },
+    };
+  },
+};
+`,
+        )
+      },
+    })
+    const listener = await startListener()
+    try {
+      await Effect.runPromise(llm.tool("repro_wait", {}))
+      const sessionResponse = await fetch(new URL("/session", listener.url), {
+        method: "POST",
+        headers: jsonHeaders(tmp.path),
+        body: JSON.stringify({ title: "runner state sharing" }),
+      })
+      expect(sessionResponse.status).toBe(200)
+      const session = (await sessionResponse.json()) as { id: string }
+      const payload = {
+        model: { providerID: "test", modelID: "test-model" },
+        agent: "build",
+        parts: [{ type: "text", text: "first" }],
+      }
+      const first = await fetch(new URL(`/session/${session.id}/prompt_async`, listener.url), {
+        method: "POST",
+        headers: jsonHeaders(tmp.path),
+        body: JSON.stringify(payload),
+      })
+      expect(first.status).toBe(204)
+      await withTimeout(Effect.runPromise(llm.wait(1)), 5_000, "timed out waiting for first LLM request")
+      await withTimeout(
+        Bun.file(path.join(tmp.path, "plugin-prompt-result.json")).exists().then(async function wait(
+          exists,
+        ): Promise<void> {
+          if (exists) return
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          return wait(await Bun.file(path.join(tmp.path, "plugin-prompt-result.json")).exists())
+        }),
+        5_000,
+        "timed out waiting for plugin prompt_async call",
+      )
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      expect(await Effect.runPromise(llm.calls)).toBe(1)
+    } finally {
+      await stop(listener, "timed out cleaning up prompt_async listener").catch(() => undefined)
+      await Effect.runPromise(Scope.close(scope, Exit.void).pipe(Effect.ignore))
+    }
+  })
+
   testPty("serves HTTP routes and upgrades PTY websocket through Server.listen", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startListener()
