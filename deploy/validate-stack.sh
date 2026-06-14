@@ -25,6 +25,16 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 # Invariants checked:
 #   1. sandbox-net is internal:true — no direct internet gateway for any
 #      container on this network.
+#   1b. NO service may declare network_mode — bypasses the network-attachment
+#      model entirely (host/shared networking).
+#   1c. NO service may declare extra_hosts with a host-gateway value — gives
+#      the container the Docker host's bridge IP, enabling egress relay around
+#      mitmproxy via any host-bound proxy/tunnel.
+#   1d. NO service may declare cap_add with NET_ADMIN or NET_RAW — enables
+#      raw-socket/routing manipulation used to build VPN tunnels that bypass
+#      mitmproxy.
+#   1e. NO service may map the /dev/net/tun device — the TUN/TAP interface
+#      used by VPN clients to construct egress tunnels around mitmproxy.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -249,6 +259,93 @@ for net in sorted(non_internal_nets - allowed_non_internal_nets):
         f"FAIL: unknown non-internal network '{net}' declared; "
         "only egress-net/gateway-net are permitted"
     )
+
+# ------------------------------------------------------------------
+# Invariant 1c: NO service may declare extra_hosts with a host-gateway mapping.
+#
+# extra_hosts: ["proxy.local:host-gateway"] gives the container the Docker
+# host's bridge IP.  If the host runs any forward proxy/SOCKS/tunnel bound
+# to 0.0.0.0, the workspace can relay egress around mitmproxy.  Reject any
+# extra_hosts entry whose value is "host-gateway" on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of "name=value" strings.
+# Raw-YAML fallback shape: list of "name:value" strings OR a dict {name: value}.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _extra_hosts = _svc_cfg.get("extra_hosts") or []
+    if isinstance(_extra_hosts, dict):
+        # Raw-YAML dict form: {hostname: value}
+        _extra_hosts_items = list(_extra_hosts.values())
+    else:
+        # Normalized list form: ["name=value", ...] or raw-YAML ["name:value", ...]
+        _extra_hosts_items = []
+        for _entry in _extra_hosts:
+            if isinstance(_entry, dict):
+                # Possible future dict-list form
+                _extra_hosts_items.append(_entry.get("ip") or _entry.get("value") or "")
+            elif isinstance(_entry, str):
+                # Split on first '=' (normalized) or first ':' (raw YAML)
+                if "=" in _entry:
+                    _extra_hosts_items.append(_entry.split("=", 1)[1])
+                elif ":" in _entry:
+                    _extra_hosts_items.append(_entry.split(":", 1)[1])
+    for _val in _extra_hosts_items:
+        if str(_val).strip() == "host-gateway":
+            failures.append(
+                f"FAIL: service '{_svc}' declares extra_hosts with value 'host-gateway' — "
+                "host-gateway gives the container the Docker host's bridge IP and can relay "
+                "workspace egress around mitmproxy. Remove the host-gateway extra_hosts entry."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1d: NO service may declare cap_add with NET_ADMIN or NET_RAW.
+#
+# NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
+# Combined with a VPN client image and /dev/net/tun, they can build a tunnel
+# that bypasses mitmproxy.  Reject either capability on ANY service.
+# ------------------------------------------------------------------
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW"}
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _cap_add = _svc_cfg.get("cap_add") or []
+    for _cap in _cap_add:
+        if str(_cap).upper() in _BANNED_CAPS:
+            failures.append(
+                f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
+                "NET_ADMIN and NET_RAW enable raw-socket/routing manipulation that can "
+                "tunnel workspace egress around mitmproxy and are not permitted."
+            )
+
+# ------------------------------------------------------------------
+# Invariant 1e: NO service may map the /dev/net/tun device.
+#
+# /dev/net/tun is the kernel TUN/TAP interface used by VPN clients to build
+# tunnels.  Combined with NET_ADMIN/NET_RAW, it provides a complete egress
+# bypass path.  Reject any device mapping whose host path is /dev/net/tun
+# on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of dicts {source, target, permissions}.
+# Raw-YAML fallback shape: list of "host:container[:perms]" strings.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _devices = _svc_cfg.get("devices") or []
+    for _dev in _devices:
+        if isinstance(_dev, dict):
+            _host_path = _dev.get("source") or ""
+        elif isinstance(_dev, str):
+            _host_path = _dev.split(":")[0]
+        else:
+            _host_path = ""
+        if str(_host_path).strip() == "/dev/net/tun":
+            failures.append(
+                f"FAIL: service '{_svc}' maps device '/dev/net/tun' — "
+                "the TUN/TAP interface enables VPN tunnel construction that can bypass "
+                "mitmproxy egress containment and is not permitted."
+            )
+            break
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'

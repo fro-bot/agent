@@ -495,4 +495,10 @@ workspace → sandbox-net (internal:true) → mitmproxy → egress-net → inter
 - mitmproxy is dual-homed: it receives workspace traffic on `sandbox-net` and dials allowlisted upstream hosts via `egress-net` (a dedicated non-internal network). Only mitmproxy joins `egress-net`.
 - The gateway is dual-homed on `gateway-net` (non-internal) and `sandbox-net`. It reaches Discord, GitHub, and object storage directly via `gateway-net` — **not** through mitmproxy. This is a deliberate trusted first-party exception: the gateway is operator-controlled code, not the untrusted workspace. The containment guarantee is that **the workspace reaches the internet only via mitmproxy**; the gateway is explicitly outside that constraint.
 
+The compose topology guard (`deploy/validate-stack.sh`) enforces this model statically. In addition to the network-attachment allowlist and the blanket `network_mode` ban, the guard rejects the following egress-weakening keys on **any** service, because each can relay or tunnel workspace egress around mitmproxy:
+
+- `extra_hosts` with a `host-gateway` value — gives the container the Docker host's bridge IP, enabling relay via any host-bound proxy or tunnel.
+- `cap_add: NET_ADMIN` or `cap_add: NET_RAW` — enables raw-socket and routing-table manipulation used to build VPN tunnels.
+- `devices: /dev/net/tun` — the kernel TUN/TAP interface used by VPN clients to construct egress tunnels.
+
 **Forward constraint:** never give the workspace a gateway endpoint that performs caller-directed outbound requests. The only workspace-reachable HTTP ingress on the gateway is the HMAC/replay-gated `POST /v1/announce` endpoint, which posts a fixed embed — it does not perform arbitrary outbound requests on behalf of the caller. If a new workspace-reachable gateway endpoint is added that performs caller-directed outbound, the topology must be revisited. A CI pinning test enforces this: it asserts the gateway's HTTP ingress surface is exactly `{POST /v1/announce}` and fails if a new route is added without a deliberate review.

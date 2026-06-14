@@ -1418,6 +1418,307 @@ echo "  gateway-egress-net-test output (stderr+stdout combined):"
 echo "${GW_EGRESS_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# TEST 26 — Negative: extra_hosts with host-gateway must be rejected.
+#
+# extra_hosts: ["proxy.local:host-gateway"] gives the container the Docker
+# host's bridge IP.  If the host runs any forward proxy/SOCKS/tunnel bound
+# to 0.0.0.0, the workspace can relay egress around mitmproxy.
+# The failure message must name the service and mention 'host-gateway'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 26: guard rejects extra_hosts with host-gateway mapping ---"
+
+EXTRA_HOSTS_HG_COMPOSE="${TMPDIR_TEST}/compose-extra-hosts-hg.yaml"
+cat > "${EXTRA_HOSTS_HG_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    extra_hosts:
+      - "proxy.local:host-gateway"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+EXTRA_HOSTS_HG_OUTPUT=""
+EXTRA_HOSTS_HG_EXIT=0
+EXTRA_HOSTS_HG_OUTPUT="$(COMPOSE_FILE="${EXTRA_HOSTS_HG_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_HOSTS_HG_EXIT=$?
+
+if [[ "${EXTRA_HOSTS_HG_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${EXTRA_HOSTS_HG_EXIT}) for extra_hosts host-gateway"
+else
+  fail "validate-stack.sh exited ZERO for extra_hosts host-gateway — guard did NOT fire"
+fi
+
+if echo "${EXTRA_HOSTS_HG_OUTPUT}" | grep -q "workspace"; then
+  pass "extra_hosts host-gateway failure message names the service 'workspace'"
+else
+  fail "extra_hosts host-gateway failure message does not name 'workspace' — output: ${EXTRA_HOSTS_HG_OUTPUT}"
+fi
+
+if echo "${EXTRA_HOSTS_HG_OUTPUT}" | grep -q "host-gateway"; then
+  pass "extra_hosts host-gateway failure message mentions 'host-gateway'"
+else
+  fail "extra_hosts host-gateway failure message does not mention 'host-gateway' — output: ${EXTRA_HOSTS_HG_OUTPUT}"
+fi
+
+echo ""
+echo "  extra-hosts-hg-test output (stderr+stdout combined):"
+echo "${EXTRA_HOSTS_HG_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 27 — Negative: cap_add with NET_ADMIN must be rejected.
+#
+# NET_ADMIN enables routing-table and network-interface manipulation.
+# Combined with /dev/net/tun and a VPN client image, it can build a tunnel
+# that bypasses mitmproxy.  The failure message must name the service and
+# mention 'NET_ADMIN'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 27: guard rejects cap_add NET_ADMIN ---"
+
+CAP_ADD_NET_ADMIN_COMPOSE="${TMPDIR_TEST}/compose-cap-add-net-admin.yaml"
+cat > "${CAP_ADD_NET_ADMIN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_ADD_NET_ADMIN_OUTPUT=""
+CAP_ADD_NET_ADMIN_EXIT=0
+CAP_ADD_NET_ADMIN_OUTPUT="$(COMPOSE_FILE="${CAP_ADD_NET_ADMIN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_ADD_NET_ADMIN_EXIT=$?
+
+if [[ "${CAP_ADD_NET_ADMIN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_ADD_NET_ADMIN_EXIT}) for cap_add NET_ADMIN"
+else
+  fail "validate-stack.sh exited ZERO for cap_add NET_ADMIN — guard did NOT fire"
+fi
+
+if echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add NET_ADMIN failure message names the service 'workspace'"
+else
+  fail "cap_add NET_ADMIN failure message does not name 'workspace' — output: ${CAP_ADD_NET_ADMIN_OUTPUT}"
+fi
+
+if echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | grep -q "NET_ADMIN"; then
+  pass "cap_add NET_ADMIN failure message mentions 'NET_ADMIN'"
+else
+  fail "cap_add NET_ADMIN failure message does not mention 'NET_ADMIN' — output: ${CAP_ADD_NET_ADMIN_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-add-net-admin-test output (stderr+stdout combined):"
+echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 28 — Negative: cap_add with NET_RAW must be rejected.
+#
+# NET_RAW enables raw-socket access (ICMP, packet injection).  Covers the
+# second banned capability alongside NET_ADMIN.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 28: guard rejects cap_add NET_RAW ---"
+
+CAP_ADD_NET_RAW_COMPOSE="${TMPDIR_TEST}/compose-cap-add-net-raw.yaml"
+cat > "${CAP_ADD_NET_RAW_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - NET_RAW
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_ADD_NET_RAW_OUTPUT=""
+CAP_ADD_NET_RAW_EXIT=0
+CAP_ADD_NET_RAW_OUTPUT="$(COMPOSE_FILE="${CAP_ADD_NET_RAW_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_ADD_NET_RAW_EXIT=$?
+
+if [[ "${CAP_ADD_NET_RAW_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_ADD_NET_RAW_EXIT}) for cap_add NET_RAW"
+else
+  fail "validate-stack.sh exited ZERO for cap_add NET_RAW — guard did NOT fire"
+fi
+
+if echo "${CAP_ADD_NET_RAW_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add NET_RAW failure message names the service 'workspace'"
+else
+  fail "cap_add NET_RAW failure message does not name 'workspace' — output: ${CAP_ADD_NET_RAW_OUTPUT}"
+fi
+
+if echo "${CAP_ADD_NET_RAW_OUTPUT}" | grep -q "NET_RAW"; then
+  pass "cap_add NET_RAW failure message mentions 'NET_RAW'"
+else
+  fail "cap_add NET_RAW failure message does not mention 'NET_RAW' — output: ${CAP_ADD_NET_RAW_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-add-net-raw-test output (stderr+stdout combined):"
+echo "${CAP_ADD_NET_RAW_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 29 — Negative: devices mapping /dev/net/tun must be rejected.
+#
+# /dev/net/tun is the kernel TUN/TAP interface used by VPN clients.  Combined
+# with NET_ADMIN/NET_RAW, it provides a complete egress bypass path.
+# The failure message must name the service and mention '/dev/net/tun'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 29: guard rejects devices mapping /dev/net/tun ---"
+
+DEVICES_TUN_COMPOSE="${TMPDIR_TEST}/compose-devices-tun.yaml"
+cat > "${DEVICES_TUN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+DEVICES_TUN_OUTPUT=""
+DEVICES_TUN_EXIT=0
+DEVICES_TUN_OUTPUT="$(COMPOSE_FILE="${DEVICES_TUN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || DEVICES_TUN_EXIT=$?
+
+if [[ "${DEVICES_TUN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${DEVICES_TUN_EXIT}) for devices /dev/net/tun"
+else
+  fail "validate-stack.sh exited ZERO for devices /dev/net/tun — guard did NOT fire"
+fi
+
+if echo "${DEVICES_TUN_OUTPUT}" | grep -q "workspace"; then
+  pass "devices /dev/net/tun failure message names the service 'workspace'"
+else
+  fail "devices /dev/net/tun failure message does not name 'workspace' — output: ${DEVICES_TUN_OUTPUT}"
+fi
+
+if echo "${DEVICES_TUN_OUTPUT}" | grep -q "/dev/net/tun"; then
+  pass "devices /dev/net/tun failure message mentions '/dev/net/tun'"
+else
+  fail "devices /dev/net/tun failure message does not mention '/dev/net/tun' — output: ${DEVICES_TUN_OUTPUT}"
+fi
+
+echo ""
+echo "  devices-tun-test output (stderr+stdout combined):"
+echo "${DEVICES_TUN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 30 — Positive: benign extra_hosts (non-host-gateway) must NOT be rejected.
+#
+# extra_hosts: ["db:10.0.0.5"] is a legitimate static host entry that does not
+# grant host-network access.  The guard must not over-reject benign extra_hosts.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 30: guard accepts benign extra_hosts (non-host-gateway value) ---"
+
+EXTRA_HOSTS_BENIGN_COMPOSE="${TMPDIR_TEST}/compose-extra-hosts-benign.yaml"
+cat > "${EXTRA_HOSTS_BENIGN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    extra_hosts:
+      - "db:10.0.0.5"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+EXTRA_HOSTS_BENIGN_OUTPUT=""
+EXTRA_HOSTS_BENIGN_EXIT=0
+EXTRA_HOSTS_BENIGN_OUTPUT="$(COMPOSE_FILE="${EXTRA_HOSTS_BENIGN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_HOSTS_BENIGN_EXIT=$?
+
+if [[ "${EXTRA_HOSTS_BENIGN_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for benign extra_hosts (db:10.0.0.5) — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${EXTRA_HOSTS_BENIGN_EXIT}) for benign extra_hosts — over-rejection: ${EXTRA_HOSTS_BENIGN_OUTPUT}"
+fi
+
+echo ""
+echo "  extra-hosts-benign-test output (stderr+stdout combined):"
+echo "${EXTRA_HOSTS_BENIGN_OUTPUT}" | sed 's/^/    /'
+
+# NOTE: TEST 2 (above) already asserts that the real deploy/compose.yaml passes
+# the topology guard (exit zero).  No duplicate test is added here.
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
