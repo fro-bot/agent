@@ -10,6 +10,9 @@ autoInstallPeers: true
 
 ignoreWorkspaceRootCheck: true
 
+# Allow this specific, deliberately-upgraded SDK release past the
+# minimum-release-age supply-chain gate. Safe to remove once the version
+# ages past the cutoff.
 minimumReleaseAgeExclude:
   - '@opencode-ai/sdk@1.17.6'
 
