@@ -25,6 +25,19 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 # Invariants checked:
 #   1. sandbox-net is internal:true — no direct internet gateway for any
 #      container on this network.
+#   1b. NO service may declare network_mode — bypasses the network-attachment
+#      model entirely (host/shared networking).
+#   1c. NO service may declare extra_hosts with a host-gateway value — gives
+#      the container the Docker host's bridge IP, enabling egress relay around
+#      mitmproxy via any host-bound proxy/tunnel.
+#   1d. NO service may declare cap_add with NET_ADMIN or NET_RAW — enables
+#      raw-socket/routing manipulation used to build VPN tunnels that bypass
+#      mitmproxy.  CAP_ prefix and case variants are normalized before checking.
+#   1e. NO service may map the /dev/net/tun device — the TUN/TAP interface
+#      used by VPN clients to construct egress tunnels around mitmproxy.
+#      Path normalization catches //, /./ and similar variants.
+#   1f. NO service may declare privileged: true — grants ALL capabilities and
+#      ALL host devices, nullifying Invariants 1d and 1e entirely.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -249,6 +262,149 @@ for net in sorted(non_internal_nets - allowed_non_internal_nets):
         f"FAIL: unknown non-internal network '{net}' declared; "
         "only egress-net/gateway-net are permitted"
     )
+
+# ------------------------------------------------------------------
+# Invariant 1c: NO service may declare extra_hosts with a host-gateway mapping.
+#
+# extra_hosts: ["proxy.local:host-gateway"] gives the container the Docker
+# host's bridge IP.  If the host runs any forward proxy/SOCKS/tunnel bound
+# to 0.0.0.0, the workspace can relay egress around mitmproxy.  Reject any
+# extra_hosts entry whose value is "host-gateway" on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of "name=value" strings.
+# Raw-YAML fallback shape: list of "name:value" strings OR a dict {name: value}.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _extra_hosts = _svc_cfg.get("extra_hosts") or []
+    if isinstance(_extra_hosts, dict):
+        # Raw-YAML dict form: {hostname: value}
+        _extra_hosts_items = list(_extra_hosts.values())
+    else:
+        # Scalar-string guard: a bare string (e.g. extra_hosts: "proxy.local:host-gateway")
+        # would be iterated character-by-character without this wrap.
+        if isinstance(_extra_hosts, str):
+            _extra_hosts = [_extra_hosts]
+        # Normalized list form: ["name=value", ...] or raw-YAML ["name:value", ...]
+        _extra_hosts_items = []
+        for _entry in _extra_hosts:
+            if isinstance(_entry, dict):
+                # Possible future dict-list form
+                _extra_hosts_items.append(_entry.get("ip") or _entry.get("value") or "")
+            elif isinstance(_entry, str):
+                # Split on first '=' (normalized) or first ':' (raw YAML)
+                if "=" in _entry:
+                    _extra_hosts_items.append(_entry.split("=", 1)[1])
+                elif ":" in _entry:
+                    _extra_hosts_items.append(_entry.split(":", 1)[1])
+    for _val in _extra_hosts_items:
+        if str(_val).strip() == "host-gateway":
+            failures.append(
+                f"FAIL: service '{_svc}' declares extra_hosts with value 'host-gateway' — "
+                "host-gateway gives the container the Docker host's bridge IP and can relay "
+                "workspace egress around mitmproxy. Remove the host-gateway extra_hosts entry."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1d: NO service may declare cap_add with NET_ADMIN or NET_RAW.
+#
+# NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
+# Combined with a VPN client image and /dev/net/tun, they can build a tunnel
+# that bypasses mitmproxy.  Reject either capability on ANY service.
+#
+# Normalization: Docker Compose may preserve the CAP_ prefix (e.g.
+# CAP_NET_ADMIN) or lowercase variants (cap_net_admin) from raw YAML.
+# Strip a leading CAP_ prefix and uppercase before checking the banned set
+# so all forms are caught.
+#
+# Scalar-string guard: if cap_add is a bare string (not a list), wrap it
+# into a single-element list before iterating so scalar YAML values are
+# not silently missed by character-iteration.
+# ------------------------------------------------------------------
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW"}
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _cap_add = _svc_cfg.get("cap_add") or []
+    if isinstance(_cap_add, str):
+        _cap_add = [_cap_add]
+    for _cap in _cap_add:
+        _cap_norm = str(_cap).strip().upper()
+        if _cap_norm.startswith("CAP_"):
+            _cap_norm = _cap_norm[4:]
+        if _cap_norm in _BANNED_CAPS:
+            failures.append(
+                f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
+                "NET_ADMIN and NET_RAW enable raw-socket/routing manipulation that can "
+                "tunnel workspace egress around mitmproxy and are not permitted."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1e: NO service may map the /dev/net/tun device.
+#
+# /dev/net/tun is the kernel TUN/TAP interface used by VPN clients to build
+# tunnels.  Combined with NET_ADMIN/NET_RAW, it provides a complete egress
+# bypass path.  Reject any device mapping whose host path resolves to
+# /dev/net/tun on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of dicts {source, target, permissions}.
+# Raw-YAML fallback shape: list of "host:container[:perms]" strings.
+#
+# Path normalization: collapse multiple leading slashes to one (POSIX treats
+# // as implementation-defined, but Docker normalizes it to /), then apply
+# os.path.normpath to collapse /./ and similar segments.  This catches
+# //dev/net/tun, /dev/./net/tun, /dev/net/./tun, etc.
+#
+# Scalar-string guard: if devices is a bare string (not a list), wrap it
+# into a single-element list before iterating.
+# ------------------------------------------------------------------
+import re as _re
+
+def _norm_dev_path(p):
+    """Normalize a device host path: collapse leading // to /, then normpath."""
+    p = _re.sub(r'^/+', '/', str(p).strip())
+    return os.path.normpath(p)
+
+_TUN_PATH = _norm_dev_path("/dev/net/tun")
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _devices = _svc_cfg.get("devices") or []
+    if isinstance(_devices, str):
+        _devices = [_devices]
+    for _dev in _devices:
+        if isinstance(_dev, dict):
+            _host_path = _dev.get("source") or ""
+        elif isinstance(_dev, str):
+            _host_path = _dev.split(":")[0]
+        else:
+            _host_path = ""
+        if _norm_dev_path(_host_path) == _TUN_PATH:
+            failures.append(
+                f"FAIL: service '{_svc}' maps device '/dev/net/tun' — "
+                "the TUN/TAP interface enables VPN tunnel construction that can bypass "
+                "mitmproxy egress containment and is not permitted."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1f: NO service may declare privileged: true.
+#
+# privileged: true grants the container ALL Linux capabilities (including
+# NET_ADMIN and NET_RAW) plus access to ALL host devices (including
+# /dev/net/tun).  It nullifies Invariants 1d and 1e entirely.  Reject
+# any service that declares privileged as boolean True or the string "true".
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _privileged = _svc_cfg.get("privileged")
+    if _privileged is True or str(_privileged).lower() == "true":
+        failures.append(
+            f"FAIL: service '{_svc}' declares privileged: true — "
+            "privileged mode grants all Linux capabilities (including NET_ADMIN and NET_RAW) "
+            "and access to all host devices (including /dev/net/tun), bypassing the egress "
+            "containment controls enforced by Invariants 1d and 1e. Remove privileged: true."
+        )
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'

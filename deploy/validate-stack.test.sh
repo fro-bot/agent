@@ -1418,6 +1418,760 @@ echo "  gateway-egress-net-test output (stderr+stdout combined):"
 echo "${GW_EGRESS_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# TEST 26 — Negative: extra_hosts with host-gateway must be rejected.
+#
+# extra_hosts: ["proxy.local:host-gateway"] gives the container the Docker
+# host's bridge IP.  If the host runs any forward proxy/SOCKS/tunnel bound
+# to 0.0.0.0, the workspace can relay egress around mitmproxy.
+# The failure message must name the service and mention 'host-gateway'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 26: guard rejects extra_hosts with host-gateway mapping ---"
+
+EXTRA_HOSTS_HG_COMPOSE="${TMPDIR_TEST}/compose-extra-hosts-hg.yaml"
+cat > "${EXTRA_HOSTS_HG_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    extra_hosts:
+      - "proxy.local:host-gateway"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+EXTRA_HOSTS_HG_OUTPUT=""
+EXTRA_HOSTS_HG_EXIT=0
+EXTRA_HOSTS_HG_OUTPUT="$(COMPOSE_FILE="${EXTRA_HOSTS_HG_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_HOSTS_HG_EXIT=$?
+
+if [[ "${EXTRA_HOSTS_HG_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${EXTRA_HOSTS_HG_EXIT}) for extra_hosts host-gateway"
+else
+  fail "validate-stack.sh exited ZERO for extra_hosts host-gateway — guard did NOT fire"
+fi
+
+if echo "${EXTRA_HOSTS_HG_OUTPUT}" | grep -q "workspace"; then
+  pass "extra_hosts host-gateway failure message names the service 'workspace'"
+else
+  fail "extra_hosts host-gateway failure message does not name 'workspace' — output: ${EXTRA_HOSTS_HG_OUTPUT}"
+fi
+
+if echo "${EXTRA_HOSTS_HG_OUTPUT}" | grep -q "host-gateway"; then
+  pass "extra_hosts host-gateway failure message mentions 'host-gateway'"
+else
+  fail "extra_hosts host-gateway failure message does not mention 'host-gateway' — output: ${EXTRA_HOSTS_HG_OUTPUT}"
+fi
+
+echo ""
+echo "  extra-hosts-hg-test output (stderr+stdout combined):"
+echo "${EXTRA_HOSTS_HG_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 27 — Negative: cap_add with NET_ADMIN must be rejected.
+#
+# NET_ADMIN enables routing-table and network-interface manipulation.
+# Combined with /dev/net/tun and a VPN client image, it can build a tunnel
+# that bypasses mitmproxy.  The failure message must name the service and
+# mention 'NET_ADMIN'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 27: guard rejects cap_add NET_ADMIN ---"
+
+CAP_ADD_NET_ADMIN_COMPOSE="${TMPDIR_TEST}/compose-cap-add-net-admin.yaml"
+cat > "${CAP_ADD_NET_ADMIN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_ADD_NET_ADMIN_OUTPUT=""
+CAP_ADD_NET_ADMIN_EXIT=0
+CAP_ADD_NET_ADMIN_OUTPUT="$(COMPOSE_FILE="${CAP_ADD_NET_ADMIN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_ADD_NET_ADMIN_EXIT=$?
+
+if [[ "${CAP_ADD_NET_ADMIN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_ADD_NET_ADMIN_EXIT}) for cap_add NET_ADMIN"
+else
+  fail "validate-stack.sh exited ZERO for cap_add NET_ADMIN — guard did NOT fire"
+fi
+
+if echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add NET_ADMIN failure message names the service 'workspace'"
+else
+  fail "cap_add NET_ADMIN failure message does not name 'workspace' — output: ${CAP_ADD_NET_ADMIN_OUTPUT}"
+fi
+
+if echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | grep -q "NET_ADMIN"; then
+  pass "cap_add NET_ADMIN failure message mentions 'NET_ADMIN'"
+else
+  fail "cap_add NET_ADMIN failure message does not mention 'NET_ADMIN' — output: ${CAP_ADD_NET_ADMIN_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-add-net-admin-test output (stderr+stdout combined):"
+echo "${CAP_ADD_NET_ADMIN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 28 — Negative: cap_add with NET_RAW must be rejected.
+#
+# NET_RAW enables raw-socket access (ICMP, packet injection).  Covers the
+# second banned capability alongside NET_ADMIN.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 28: guard rejects cap_add NET_RAW ---"
+
+CAP_ADD_NET_RAW_COMPOSE="${TMPDIR_TEST}/compose-cap-add-net-raw.yaml"
+cat > "${CAP_ADD_NET_RAW_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - NET_RAW
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_ADD_NET_RAW_OUTPUT=""
+CAP_ADD_NET_RAW_EXIT=0
+CAP_ADD_NET_RAW_OUTPUT="$(COMPOSE_FILE="${CAP_ADD_NET_RAW_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_ADD_NET_RAW_EXIT=$?
+
+if [[ "${CAP_ADD_NET_RAW_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_ADD_NET_RAW_EXIT}) for cap_add NET_RAW"
+else
+  fail "validate-stack.sh exited ZERO for cap_add NET_RAW — guard did NOT fire"
+fi
+
+if echo "${CAP_ADD_NET_RAW_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add NET_RAW failure message names the service 'workspace'"
+else
+  fail "cap_add NET_RAW failure message does not name 'workspace' — output: ${CAP_ADD_NET_RAW_OUTPUT}"
+fi
+
+if echo "${CAP_ADD_NET_RAW_OUTPUT}" | grep -q "NET_RAW"; then
+  pass "cap_add NET_RAW failure message mentions 'NET_RAW'"
+else
+  fail "cap_add NET_RAW failure message does not mention 'NET_RAW' — output: ${CAP_ADD_NET_RAW_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-add-net-raw-test output (stderr+stdout combined):"
+echo "${CAP_ADD_NET_RAW_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 29 — Negative: devices mapping /dev/net/tun must be rejected.
+#
+# /dev/net/tun is the kernel TUN/TAP interface used by VPN clients.  Combined
+# with NET_ADMIN/NET_RAW, it provides a complete egress bypass path.
+# The failure message must name the service and mention '/dev/net/tun'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 29: guard rejects devices mapping /dev/net/tun ---"
+
+DEVICES_TUN_COMPOSE="${TMPDIR_TEST}/compose-devices-tun.yaml"
+cat > "${DEVICES_TUN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+DEVICES_TUN_OUTPUT=""
+DEVICES_TUN_EXIT=0
+DEVICES_TUN_OUTPUT="$(COMPOSE_FILE="${DEVICES_TUN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || DEVICES_TUN_EXIT=$?
+
+if [[ "${DEVICES_TUN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${DEVICES_TUN_EXIT}) for devices /dev/net/tun"
+else
+  fail "validate-stack.sh exited ZERO for devices /dev/net/tun — guard did NOT fire"
+fi
+
+if echo "${DEVICES_TUN_OUTPUT}" | grep -q "workspace"; then
+  pass "devices /dev/net/tun failure message names the service 'workspace'"
+else
+  fail "devices /dev/net/tun failure message does not name 'workspace' — output: ${DEVICES_TUN_OUTPUT}"
+fi
+
+if echo "${DEVICES_TUN_OUTPUT}" | grep -q "/dev/net/tun"; then
+  pass "devices /dev/net/tun failure message mentions '/dev/net/tun'"
+else
+  fail "devices /dev/net/tun failure message does not mention '/dev/net/tun' — output: ${DEVICES_TUN_OUTPUT}"
+fi
+
+echo ""
+echo "  devices-tun-test output (stderr+stdout combined):"
+echo "${DEVICES_TUN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 30 — Positive: benign extra_hosts (non-host-gateway) must NOT be rejected.
+#
+# extra_hosts: ["db:10.0.0.5"] is a legitimate static host entry that does not
+# grant host-network access.  The guard must not over-reject benign extra_hosts.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 30: guard accepts benign extra_hosts (non-host-gateway value) ---"
+
+EXTRA_HOSTS_BENIGN_COMPOSE="${TMPDIR_TEST}/compose-extra-hosts-benign.yaml"
+cat > "${EXTRA_HOSTS_BENIGN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    extra_hosts:
+      - "db:10.0.0.5"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+EXTRA_HOSTS_BENIGN_OUTPUT=""
+EXTRA_HOSTS_BENIGN_EXIT=0
+EXTRA_HOSTS_BENIGN_OUTPUT="$(COMPOSE_FILE="${EXTRA_HOSTS_BENIGN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_HOSTS_BENIGN_EXIT=$?
+
+if [[ "${EXTRA_HOSTS_BENIGN_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for benign extra_hosts (db:10.0.0.5) — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${EXTRA_HOSTS_BENIGN_EXIT}) for benign extra_hosts — over-rejection: ${EXTRA_HOSTS_BENIGN_OUTPUT}"
+fi
+
+echo ""
+echo "  extra-hosts-benign-test output (stderr+stdout combined):"
+echo "${EXTRA_HOSTS_BENIGN_OUTPUT}" | sed 's/^/    /'
+
+# NOTE: TEST 2 (above) already asserts that the real deploy/compose.yaml passes
+# the topology guard (exit zero).  No duplicate test is added here.
+
+# ---------------------------------------------------------------------------
+# TEST 31 — Negative: privileged: true must be rejected (Invariant 1f).
+#
+# privileged: true grants ALL Linux capabilities (including NET_ADMIN and
+# NET_RAW) and access to ALL host devices (including /dev/net/tun), nullifying
+# Invariants 1d and 1e.  The failure message must name the service and mention
+# 'privileged'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 31: guard rejects privileged: true (Invariant 1f) ---"
+
+PRIVILEGED_COMPOSE="${TMPDIR_TEST}/compose-privileged.yaml"
+cat > "${PRIVILEGED_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    privileged: true
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+PRIVILEGED_OUTPUT=""
+PRIVILEGED_EXIT=0
+PRIVILEGED_OUTPUT="$(COMPOSE_FILE="${PRIVILEGED_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || PRIVILEGED_EXIT=$?
+
+if [[ "${PRIVILEGED_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${PRIVILEGED_EXIT}) for privileged: true"
+else
+  fail "validate-stack.sh exited ZERO for privileged: true — Invariant 1f did NOT fire"
+fi
+
+if echo "${PRIVILEGED_OUTPUT}" | grep -q "workspace"; then
+  pass "privileged: true failure message names the service 'workspace'"
+else
+  fail "privileged: true failure message does not name 'workspace' — output: ${PRIVILEGED_OUTPUT}"
+fi
+
+if echo "${PRIVILEGED_OUTPUT}" | grep -qi "privileged"; then
+  pass "privileged: true failure message mentions 'privileged'"
+else
+  fail "privileged: true failure message does not mention 'privileged' — output: ${PRIVILEGED_OUTPUT}"
+fi
+
+echo ""
+echo "  privileged-true-test output (stderr+stdout combined):"
+echo "${PRIVILEGED_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 32 — Negative: cap_add: [CAP_NET_ADMIN] must be rejected (CAP_ prefix bypass).
+#
+# Docker Compose may preserve the CAP_ prefix from raw YAML or its own
+# normalization.  The old check `str(_cap).upper() in {"NET_ADMIN","NET_RAW"}`
+# would miss "CAP_NET_ADMIN" → "CAP_NET_ADMIN" not in set.  The fixed guard
+# strips the CAP_ prefix before checking.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 32: guard rejects cap_add: [CAP_NET_ADMIN] (CAP_ prefix bypass) ---"
+
+CAP_PREFIX_COMPOSE="${TMPDIR_TEST}/compose-cap-prefix.yaml"
+cat > "${CAP_PREFIX_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - CAP_NET_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_PREFIX_OUTPUT=""
+CAP_PREFIX_EXIT=0
+CAP_PREFIX_OUTPUT="$(COMPOSE_FILE="${CAP_PREFIX_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_PREFIX_EXIT=$?
+
+if [[ "${CAP_PREFIX_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_PREFIX_EXIT}) for cap_add: [CAP_NET_ADMIN]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [CAP_NET_ADMIN] — CAP_ prefix bypass NOT caught"
+fi
+
+if echo "${CAP_PREFIX_OUTPUT}" | grep -q "workspace"; then
+  pass "CAP_NET_ADMIN failure message names the service 'workspace'"
+else
+  fail "CAP_NET_ADMIN failure message does not name 'workspace' — output: ${CAP_PREFIX_OUTPUT}"
+fi
+
+if echo "${CAP_PREFIX_OUTPUT}" | grep -q "CAP_NET_ADMIN"; then
+  pass "CAP_NET_ADMIN failure message mentions 'CAP_NET_ADMIN'"
+else
+  fail "CAP_NET_ADMIN failure message does not mention 'CAP_NET_ADMIN' — output: ${CAP_PREFIX_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-prefix-test output (stderr+stdout combined):"
+echo "${CAP_PREFIX_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 33 — Negative: cap_add: [cap_net_admin] must be rejected (lowercase bypass).
+#
+# Raw YAML may contain lowercase capability names.  The old check uppercased
+# but did not strip the CAP_ prefix, so "cap_net_admin" → "CAP_NET_ADMIN"
+# which is NOT in {"NET_ADMIN","NET_RAW"}.  The fixed guard normalizes both
+# case and prefix.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 33: guard rejects cap_add: [cap_net_admin] (lowercase bypass) ---"
+
+CAP_LOWER_COMPOSE="${TMPDIR_TEST}/compose-cap-lower.yaml"
+cat > "${CAP_LOWER_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - cap_net_admin
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_LOWER_OUTPUT=""
+CAP_LOWER_EXIT=0
+CAP_LOWER_OUTPUT="$(COMPOSE_FILE="${CAP_LOWER_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_LOWER_EXIT=$?
+
+if [[ "${CAP_LOWER_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_LOWER_EXIT}) for cap_add: [cap_net_admin]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [cap_net_admin] — lowercase bypass NOT caught"
+fi
+
+if echo "${CAP_LOWER_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_net_admin failure message names the service 'workspace'"
+else
+  fail "cap_net_admin failure message does not name 'workspace' — output: ${CAP_LOWER_OUTPUT}"
+fi
+
+if echo "${CAP_LOWER_OUTPUT}" | grep -qi "cap_net_admin\|NET_ADMIN"; then
+  pass "cap_net_admin failure message mentions the capability"
+else
+  fail "cap_net_admin failure message does not mention the capability — output: ${CAP_LOWER_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-lower-test output (stderr+stdout combined):"
+echo "${CAP_LOWER_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 34 — Negative: devices: ["//dev/net/tun:/dev/net/tun"] must be rejected
+#           (double-slash path normalization bypass).
+#
+# Docker normalizes device paths via filepath.Clean, so //dev/net/tun resolves
+# to /dev/net/tun at runtime.  The old literal == "/dev/net/tun" check missed
+# the double-slash form.  The fixed guard uses os.path.normpath.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 34: guard rejects devices: [\"//dev/net/tun:/dev/net/tun\"] (double-slash path) ---"
+
+DEVICES_DSLASH_COMPOSE="${TMPDIR_TEST}/compose-devices-dslash.yaml"
+cat > "${DEVICES_DSLASH_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    devices:
+      - "//dev/net/tun:/dev/net/tun"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+DEVICES_DSLASH_OUTPUT=""
+DEVICES_DSLASH_EXIT=0
+DEVICES_DSLASH_OUTPUT="$(COMPOSE_FILE="${DEVICES_DSLASH_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || DEVICES_DSLASH_EXIT=$?
+
+if [[ "${DEVICES_DSLASH_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${DEVICES_DSLASH_EXIT}) for devices //dev/net/tun"
+else
+  fail "validate-stack.sh exited ZERO for devices //dev/net/tun — double-slash bypass NOT caught"
+fi
+
+if echo "${DEVICES_DSLASH_OUTPUT}" | grep -q "workspace"; then
+  pass "//dev/net/tun failure message names the service 'workspace'"
+else
+  fail "//dev/net/tun failure message does not name 'workspace' — output: ${DEVICES_DSLASH_OUTPUT}"
+fi
+
+if echo "${DEVICES_DSLASH_OUTPUT}" | grep -q "/dev/net/tun"; then
+  pass "//dev/net/tun failure message mentions '/dev/net/tun'"
+else
+  fail "//dev/net/tun failure message does not mention '/dev/net/tun' — output: ${DEVICES_DSLASH_OUTPUT}"
+fi
+
+echo ""
+echo "  devices-dslash-test output (stderr+stdout combined):"
+echo "${DEVICES_DSLASH_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 35 — Negative: devices: ["/dev/./net/tun:/dev/net/tun"] must be rejected
+#           (/./ segment path normalization bypass).
+#
+# /dev/./net/tun resolves to /dev/net/tun via filepath.Clean at runtime.
+# The old literal check missed this form.  The fixed guard uses os.path.normpath.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 35: guard rejects devices: [\"/dev/./net/tun:/dev/net/tun\"] (/./ segment path) ---"
+
+DEVICES_DOT_COMPOSE="${TMPDIR_TEST}/compose-devices-dot.yaml"
+cat > "${DEVICES_DOT_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    devices:
+      - "/dev/./net/tun:/dev/net/tun"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+DEVICES_DOT_OUTPUT=""
+DEVICES_DOT_EXIT=0
+DEVICES_DOT_OUTPUT="$(COMPOSE_FILE="${DEVICES_DOT_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || DEVICES_DOT_EXIT=$?
+
+if [[ "${DEVICES_DOT_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${DEVICES_DOT_EXIT}) for devices /dev/./net/tun"
+else
+  fail "validate-stack.sh exited ZERO for devices /dev/./net/tun — /./ bypass NOT caught"
+fi
+
+if echo "${DEVICES_DOT_OUTPUT}" | grep -q "workspace"; then
+  pass "/dev/./net/tun failure message names the service 'workspace'"
+else
+  fail "/dev/./net/tun failure message does not name 'workspace' — output: ${DEVICES_DOT_OUTPUT}"
+fi
+
+if echo "${DEVICES_DOT_OUTPUT}" | grep -q "/dev/net/tun"; then
+  pass "/dev/./net/tun failure message mentions '/dev/net/tun'"
+else
+  fail "/dev/./net/tun failure message does not mention '/dev/net/tun' — output: ${DEVICES_DOT_OUTPUT}"
+fi
+
+echo ""
+echo "  devices-dot-test output (stderr+stdout combined):"
+echo "${DEVICES_DOT_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 36 — Negative: cap_add: NET_ADMIN (scalar string, not list) must be
+#           rejected (scalar bypass).
+#
+# YAML allows `cap_add: NET_ADMIN` (scalar) instead of `cap_add: [NET_ADMIN]`
+# (list).  The old `for _cap in _cap_add:` would iterate characters of the
+# string "NET_ADMIN" and silently miss the violation.  The fixed guard wraps
+# scalar strings into a single-element list before iterating.
+#
+# NOTE: docker compose config normalizes scalar cap_add to a list, so this
+# bypass only fires via the raw-YAML fallback path (no docker in PATH).
+# This test strips docker from PATH and requires PyYAML.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 36: guard rejects cap_add: NET_ADMIN (scalar string, not list) via raw-YAML path ---"
+
+CAP_SCALAR_COMPOSE="${TMPDIR_TEST}/compose-cap-scalar.yaml"
+cat > "${CAP_SCALAR_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add: NET_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  CAP_SCALAR_OUTPUT=""
+  CAP_SCALAR_EXIT=0
+  CAP_SCALAR_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${CAP_SCALAR_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SCALAR_EXIT=$?
+
+  if [[ "${CAP_SCALAR_EXIT}" -ne 0 ]]; then
+    pass "validate-stack.sh exited non-zero (${CAP_SCALAR_EXIT}) for scalar cap_add: NET_ADMIN"
+  else
+    fail "validate-stack.sh exited ZERO for scalar cap_add: NET_ADMIN — scalar bypass NOT caught"
+  fi
+
+  if echo "${CAP_SCALAR_OUTPUT}" | grep -q "workspace"; then
+    pass "scalar cap_add failure message names the service 'workspace'"
+  else
+    fail "scalar cap_add failure message does not name 'workspace' — output: ${CAP_SCALAR_OUTPUT}"
+  fi
+
+  if echo "${CAP_SCALAR_OUTPUT}" | grep -qi "NET_ADMIN"; then
+    pass "scalar cap_add failure message mentions 'NET_ADMIN'"
+  else
+    fail "scalar cap_add failure message does not mention 'NET_ADMIN' — output: ${CAP_SCALAR_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  cap-scalar-test output (stderr+stdout combined):"
+  echo "${CAP_SCALAR_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: scalar cap_add test: PyYAML not available — install python3-yaml/PyYAML to run this test."
+  echo "        (docker compose config normalizes scalar cap_add to a list; raw-YAML path required for this bypass)"
+fi
+
+# ---------------------------------------------------------------------------
+# TEST 37 — Negative: extra_hosts dict form {proxy.local: host-gateway} must
+#           be rejected (raw-YAML dict form).
+#
+# Raw YAML allows extra_hosts as a mapping: {proxy.local: host-gateway}.
+# The guard handles this via the dict branch.  This test exercises that path
+# via the raw-YAML fallback (no docker in PATH) and requires PyYAML.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 37: guard rejects extra_hosts dict form {proxy.local: host-gateway} via raw-YAML path ---"
+
+EXTRA_HOSTS_DICT_COMPOSE="${TMPDIR_TEST}/compose-extra-hosts-dict.yaml"
+cat > "${EXTRA_HOSTS_DICT_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    extra_hosts:
+      proxy.local: host-gateway
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  EXTRA_HOSTS_DICT_OUTPUT=""
+  EXTRA_HOSTS_DICT_EXIT=0
+  EXTRA_HOSTS_DICT_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${EXTRA_HOSTS_DICT_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || EXTRA_HOSTS_DICT_EXIT=$?
+
+  if [[ "${EXTRA_HOSTS_DICT_EXIT}" -ne 0 ]]; then
+    pass "validate-stack.sh exited non-zero (${EXTRA_HOSTS_DICT_EXIT}) for extra_hosts dict {proxy.local: host-gateway}"
+  else
+    fail "validate-stack.sh exited ZERO for extra_hosts dict form — dict bypass NOT caught"
+  fi
+
+  if echo "${EXTRA_HOSTS_DICT_OUTPUT}" | grep -q "workspace"; then
+    pass "extra_hosts dict failure message names the service 'workspace'"
+  else
+    fail "extra_hosts dict failure message does not name 'workspace' — output: ${EXTRA_HOSTS_DICT_OUTPUT}"
+  fi
+
+  if echo "${EXTRA_HOSTS_DICT_OUTPUT}" | grep -q "host-gateway"; then
+    pass "extra_hosts dict failure message mentions 'host-gateway'"
+  else
+    fail "extra_hosts dict failure message does not mention 'host-gateway' — output: ${EXTRA_HOSTS_DICT_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  extra-hosts-dict-test output (stderr+stdout combined):"
+  echo "${EXTRA_HOSTS_DICT_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: extra_hosts dict test: PyYAML not available — install python3-yaml/PyYAML to run this test."
+  echo "        (docker compose config normalizes dict extra_hosts to list form; raw-YAML path required)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
