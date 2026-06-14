@@ -427,7 +427,15 @@ jobs:
             exit 1
           fi
           # Prove the opencode binary is on PATH and runs (musl compatibility).
-          docker exec "$cid" opencode --version
+          # R8: assert the harness build is installed, not stock OpenCode.
+          oc_version="$(docker exec "$cid" opencode --version)"
+          echo "opencode --version: ${oc_version}"
+          if ! echo "${oc_version}" | grep -qF "+harness."; then
+            echo "REGRESSION: opencode --version output does not contain '+harness.' — workspace may be running stock OpenCode"
+            echo "Got: ${oc_version}"
+            exit 1
+          fi
+          echo "OK: harness build confirmed (${oc_version})"
           # Auth absent (no secret mounted) → fail-soft: boots, logs auth: absent.
           echo "$logs" | grep -q "auth: absent"
           # No model/provider overlay → base config stands: Systematic plugin baked,
@@ -612,6 +620,19 @@ jobs:
           echo "$logs" | grep -q "auth: absent"
           docker exec "$cid" sh -c '! test -f /root/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
+      - name: Checksum fail-closed negative test (bogus version → build must abort)
+        run: |
+          # R10: prove the Dockerfile's SHA256SUMS verification is fail-closed.
+          # Use a version that passes the <base>+harness.<sha> format guard but has
+          # no corresponding release — the asset download or SHA256SUMS fetch will
+          # 404/fail, and the build must exit non-zero.
+          bogus_version="1.17.3+harness.deadbeef"
+          build_args=(--build-arg "OPENCODE_VERSION=${bogus_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:bogus-checksum-test .)
+          if docker build "${build_args[@]}" 2>&1; then
+            echo "REGRESSION: docker build succeeded with bogus version '${bogus_version}' — SHA256SUMS fail-closed check is broken"
+            exit 1
+          fi
+          echo "OK: docker build correctly aborted for bogus version '${bogus_version}' (fail-closed verified)"
 
   dependency-review:
     if: ${{ github.event_name == 'pull_request' }}

@@ -83,7 +83,7 @@
     {
       // Workspace executor image bakes the harness OpenCode binary from
       // fro-bot/agent releases. The version is in the form
-      // <base>+harness.<sha> (e.g. 1.17.3+harness.2c9cdbd2).
+      // <base>+harness.<sha> (e.g. 1.17.3+harness.94c10df9).
       //
       // Renovate CANNOT reliably order +harness.<sha> tags: build-metadata
       // has no defined ordering in semver, and the SHA suffix is non-monotonic.
