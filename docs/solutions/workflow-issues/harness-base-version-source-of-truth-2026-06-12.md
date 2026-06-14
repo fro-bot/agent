@@ -1,6 +1,7 @@
 ---
 title: "Duplicate Version Sources Cause Silently-Missed Bumps"
 date: 2026-06-12
+last_updated: 2026-06-14
 problem_type: workflow_issue
 component: tooling
 severity: medium
@@ -46,6 +47,8 @@ Three structural rules:
 1. **Eliminate the duplicate.** A vestigial constant nothing imports is not a convenience; it is a second source that will drift. Delete it.
 2. **Point automation at the consumed source.** A Renovate `customManager` must match the exact file the build reads. Renovate custom managers fail **silently** — a non-matching `managerFilePatterns` or `matchStrings` produces no PR, no error, no log. A wrongly-targeted manager looks healthy while tracking nothing.
 3. **Inventory every version site.** If a tool maintains a "managed versions" list, an un-inventoried site is a blind spot that drifts unnoticed. The inventory must be complete, including config-JSON sites that aren't TypeScript constants.
+
+> **Exception (added 2026-06-14): when the consumed source can't be Renovate-tracked.** "Point automation at the consumed source" assumes Renovate *can* order that source. It can't order SemVer **build-metadata** versions like `1.17.3+harness.<sha>` (build metadata has no defined ordering; the SHA suffix is non-monotonic). For the OpenCode harness build the action default (`DEFAULT_OPENCODE_VERSION`) and the workspace `OPENCODE_VERSION` ARG are those un-orderable versions, so they were deliberately moved *off* Renovate onto a release-job coupled bump that writes both files at publish time — guarded by a dual-source idempotency check so a partial failure can't freeze one file. The single-source thesis still holds (one writer owns the value); the *writer* is the release job rather than Renovate. See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4.
 
 When a fallback is genuinely needed (e.g. config unreadable), use an honest sentinel like `"unknown"` — never a hardcoded version literal, which is just another copy waiting to drift.
 
