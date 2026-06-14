@@ -12,6 +12,7 @@ import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
 import { PublicApi } from "./routes/instance/httpapi/public"
 import type { CorsOptions } from "./cors"
 import { lazy } from "@/util/lazy"
+import { PluginClientRuntime } from "./plugin-client"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -36,6 +37,7 @@ type ListenOptions = CorsOptions & {
 }
 type ListenerState = {
   scope: Scope.Scope
+  binding: ListenerBinding
   server: Context.Service.Shape<typeof HttpServer.HttpServer>
   http: ListenerServer
   websockets: WebSocketTracker.Interface
@@ -67,7 +69,7 @@ export async function openapi() {
   return OpenApi.fromApi(PublicApi)
 }
 
-export let url: URL
+export let url: URL | undefined
 
 export async function listen(opts: ListenOptions): Promise<Listener> {
   const listener = await Effect.runPromise(listenEffect(opts))
@@ -84,6 +86,7 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
     const state = yield* startWithPortFallback(opts)
     const address = yield* tcpAddress(state)
     const listenerUrl = makeURL(opts.hostname, address.port)
+    state.binding.url = makeClientURL(opts.hostname, address.port)
     url = listenerUrl
 
     const unpublishMdns = yield* setupMdns(opts, address.port, state.scope)
@@ -92,12 +95,12 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
       hostname: opts.hostname,
       port: address.port,
       url: listenerUrl,
-      stop: yield* makeStop(state, unpublishMdns),
+      stop: yield* makeStop(state, unpublishMdns, listenerUrl),
     }
   },
 )
 
-function listenerLayer(opts: ListenOptions, port: number) {
+function listenerLayer(opts: ListenOptions, port: number, binding: ListenerBinding) {
   return HttpRouter.serve(HttpApiApp.createRoutes(opts), {
     middleware: disposeMiddleware,
     disableLogger: true,
@@ -105,6 +108,21 @@ function listenerLayer(opts: ListenOptions, port: number) {
   }).pipe(
     Layer.provideMerge(WebSocketTracker.layer),
     Layer.provideMerge(serverLayer({ port, hostname: opts.hostname })),
+    Layer.provide(
+      Layer.succeed(
+        PluginClientRuntime,
+        PluginClientRuntime.of({
+          url: () => binding.url,
+          fetch: (request) => {
+            if (!binding.url) {
+              return new Response("OpenCode listener is not ready for plugin client requests", { status: 503 })
+            }
+            const source = new URL(request.url, "http://localhost")
+            return fetch(new Request(new URL(`${source.pathname}${source.search}`, binding.url), request))
+          },
+        }),
+      ),
+    ),
     // Install a fresh `ConfigProvider` per listener so `Config.string(...)`
     // reads reflect the current `process.env`. Effect's default
     // `ConfigProvider` snapshots `process.env` on first read and caches the
@@ -115,20 +133,26 @@ function listenerLayer(opts: ListenOptions, port: number) {
 }
 
 function startWithPortFallback(opts: ListenOptions) {
-  if (opts.port !== 0) return startListener(opts, opts.port)
+  const binding: ListenerBinding = {}
+  if (opts.port !== 0) return startListener(opts, opts.port, binding)
   // Match the legacy listener port-resolution behavior: explicit `0` prefers
   // 4096 first, then any free port.
-  return startListener(opts, 4096).pipe(Effect.catch(() => startListener(opts, 0)))
+  return startListener(opts, 4096, binding).pipe(Effect.catch(() => startListener(opts, 0, binding)))
 }
 
-function startListener(opts: ListenOptions, port: number) {
+type ListenerBinding = {
+  url?: URL
+}
+
+function startListener(opts: ListenOptions, port: number, binding: ListenerBinding) {
   const scope = Scope.makeUnsafe()
-  return Layer.buildWithMemoMap(listenerLayer(opts, port), Layer.makeMemoMapUnsafe(), scope).pipe(
+  return Layer.buildWithMemoMap(listenerLayer(opts, port, binding), Layer.makeMemoMapUnsafe(), scope).pipe(
     Effect.provide(HttpApiApp.context),
     Effect.onError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)),
     Effect.map(
       (ctx): ListenerState => ({
         scope,
+        binding,
         server: Context.get(ctx, HttpServer.HttpServer),
         http: Context.get(ctx, ListenerServerService),
         websockets: Context.get(ctx, WebSocketTracker.Service),
@@ -152,6 +176,10 @@ function makeURL(hostname: string, port: number) {
   return result
 }
 
+function makeClientURL(hostname: string, port: number) {
+  return makeURL(hostname === "0.0.0.0" ? "127.0.0.1" : hostname === "::" ? "::1" : hostname, port)
+}
+
 function setupMdns(opts: ListenOptions, port: number, scope: Scope.Scope) {
   return Effect.gen(function* () {
     const publish =
@@ -169,7 +197,7 @@ function setupMdns(opts: ListenOptions, port: number, scope: Scope.Scope) {
   })
 }
 
-function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>) {
+function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>, listenerUrl: URL) {
   return Effect.gen(function* () {
     const forceCloseOnce = yield* Effect.cached(forceClose(state).pipe(Effect.ignore))
     const closeScopeOnce = yield* Effect.cached(Scope.close(state.scope, Exit.void).pipe(Effect.ignore))
@@ -179,6 +207,7 @@ function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>) {
         yield* unpublishMdns
         if (close) yield* forceCloseOnce
         yield* closeScopeOnce
+        if (url?.toString() === listenerUrl.toString()) url = undefined
       })
   })
 }
