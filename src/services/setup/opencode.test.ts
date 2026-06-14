@@ -617,8 +617,12 @@ describe('opencode', () => {
   })
 
   describe('DEFAULT_OPENCODE_VERSION', () => {
-    it('equals the pinned harness build', () => {
-      expect(DEFAULT_OPENCODE_VERSION).toBe('1.17.3+harness.2c9cdbd2')
+    it('is a harness build pinned to a base version plus an integration commit', () => {
+      // Assert the SHAPE, not a specific commit: the self-update release workflow
+      // bumps the integration SHA on every harness release, so pinning an exact
+      // value here would break every legitimate bump. The invariant is the form
+      // `<major.minor.patch>+harness.<short-sha>`.
+      expect(DEFAULT_OPENCODE_VERSION).toMatch(/^\d+\.\d+\.\d+\+harness\.[0-9a-f]{7,}$/)
     })
 
     it('is a harness version', () => {

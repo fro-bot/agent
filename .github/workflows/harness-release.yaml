@@ -200,7 +200,7 @@ jobs:
   # Windows is out of scope (linux x64/arm64 + darwin x64/arm64 only).
   # ---------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.platform }}/${{ matrix.arch }})
+    name: build (${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }})
     needs: [prepare-integrate, integrate]
     # Run when prepare-integrate succeeded AND integrate did not fail.
     # integrate.result is 'skipped' for empty carry → build runs.
@@ -209,21 +209,44 @@ jobs:
     # !cancelled() prevents running if the workflow was manually cancelled.
     if: ${{ !cancelled() && needs.prepare-integrate.result == 'success' && (needs.integrate.result == 'success' || needs.integrate.result == 'skipped') }}
     strategy:
-      fail-fast: true # All-or-nothing: one failure blocks the whole publish.
+      fail-fast: false # Allow completed builds to survive a flaky musl failure; the existence gate enforces all-or-nothing after all builds finish.
       matrix:
         include:
+          # --- glibc Linux (unchanged; used by the action download path) ---
           - platform: linux
             arch: x64
             runner: ubuntu-24.04
+            abi: ''
+            baseline: false
           - platform: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+            abi: ''
+            baseline: false
+          # --- musl Linux (additive; used by the workspace Dockerfile on Alpine) ---
+          # linux/x64 baseline-musl: avx2=false + musl — matches opencode-linux-x64-baseline-musl
+          - platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+            abi: musl
+            baseline: true
+          # linux/arm64 musl: arm64 + musl — matches opencode-linux-arm64-musl
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            abi: musl
+            baseline: false
+          # --- Darwin (unchanged) ---
           - platform: darwin
             arch: x64
             runner: macos-15-intel
+            abi: ''
+            baseline: false
           - platform: darwin
             arch: arm64
             runner: macos-15
+            abi: ''
+            baseline: false
 
     runs-on: ${{ matrix.runner }}
 
@@ -301,41 +324,76 @@ jobs:
 
           echo "integration_commit=${INTEGRATION_COMMIT}" >> "$GITHUB_OUTPUT"
 
-      - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}
+      - name: Build native binary for ${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }}
         env:
           INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
           BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
           RUNNER_TEMP: ${{ runner.temp }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_BASELINE: ${{ matrix.baseline }}
         run: |
-          bun run packages/harness/scripts/build-platform.ts \
-            --integration-commit "$INTEGRATION_COMMIT" \
-            --base-version "$BASE_VERSION" \
-            --platform "$MATRIX_PLATFORM" \
-            --arch "$MATRIX_ARCH" \
-            --source-tree "$RUNNER_TEMP/integration-src" \
-            --work-dir "$RUNNER_TEMP/harness-build-work" \
-            --out-dir "$RUNNER_TEMP/harness-build-out"
-
-      - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }})
-        env:
-          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
-          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
-          RUNNER_TEMP: ${{ runner.temp }}
-          MATRIX_PLATFORM: ${{ matrix.platform }}
-          MATRIX_ARCH: ${{ matrix.arch }}
-        run: |
-          bun run packages/harness/scripts/verify-binary.ts \
-            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH/bin/opencode" \
-            --base-version "$BASE_VERSION" \
+          set -euo pipefail
+          # Build the command with optional --abi and --baseline flags for musl/baseline targets.
+          # For glibc entries (abi=''), these flags are omitted — preserving existing behavior.
+          # Use an array to avoid SC2086 word-splitting issues with unquoted flag variables.
+          CMD=(bun run packages/harness/scripts/build-platform.ts
             --integration-commit "$INTEGRATION_COMMIT"
+            --base-version "$BASE_VERSION"
+            --platform "$MATRIX_PLATFORM"
+            --arch "$MATRIX_ARCH")
+          if [ -n "${MATRIX_ABI}" ]; then
+            CMD+=(--abi "${MATRIX_ABI}")
+          fi
+          if [ "${MATRIX_BASELINE}" = "true" ]; then
+            CMD+=(--baseline)
+          fi
+          CMD+=(--source-tree "$RUNNER_TEMP/integration-src"
+            --work-dir "$RUNNER_TEMP/harness-build-work"
+            --out-dir "$RUNNER_TEMP/harness-build-out")
+          "${CMD[@]}"
+
+      - name: Verify binary (${{ matrix.platform }}/${{ matrix.arch }}${{ matrix.abi != '' && format('/{0}', matrix.abi) || '' }}${{ matrix.baseline && '/baseline' || '' }})
+        env:
+          INTEGRATION_COMMIT: ${{ steps.fetch-integrate.outputs.integration_commit }}
+          BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_BASELINE: ${{ matrix.baseline }}
+        run: |
+          set -euo pipefail
+          # Compute the binary dir suffix matching build.ts name computation:
+          #   [pkg.name, os, arch, avx2===false ? 'baseline' : undefined, abi ?? undefined].join('-')
+          # Order: baseline before abi (e.g. -baseline-musl, not -musl-baseline).
+          SUFFIX=""
+          if [ "${MATRIX_BASELINE}" = "true" ]; then
+            SUFFIX="${SUFFIX}-baseline"
+          fi
+          if [ -n "${MATRIX_ABI}" ]; then
+            SUFFIX="${SUFFIX}-${MATRIX_ABI}"
+          fi
+          # Use an array to avoid SC2086 word-splitting issues with unquoted flag variables.
+          CMD=(bun run packages/harness/scripts/verify-binary.ts
+            --binary "$RUNNER_TEMP/harness-build-out/opencode-$MATRIX_PLATFORM-$MATRIX_ARCH${SUFFIX}/bin/opencode"
+            --base-version "$BASE_VERSION"
+            --integration-commit "$INTEGRATION_COMMIT")
+          if [ -n "${MATRIX_ABI}" ]; then
+            CMD+=(--abi "${MATRIX_ABI}")
+          fi
+          "${CMD[@]}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}/bin/opencode
+          # Artifact name encodes the full target identity (platform/arch/baseline/abi).
+          # Order matches upstream build.ts name computation: baseline before abi.
+          # Musl variants use a distinct name so they don't collide with glibc artifacts.
+          # e.g. harness-binary-linux-x64-baseline-musl, harness-binary-linux-arm64-musl
+          name: harness-binary-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.baseline && '-baseline' || '' }}${{ matrix.abi != '' && format('-{0}', matrix.abi) || '' }}
+          path: ${{ runner.temp }}/harness-build-out/opencode-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.baseline && '-baseline' || '' }}${{ matrix.abi != '' && format('-{0}', matrix.abi) || '' }}/bin/opencode
           if-no-files-found: error
           retention-days: 1
 
@@ -408,7 +466,7 @@ jobs:
             echo "short_sha=${SHORT_SHA}"
           } >> "$GITHUB_OUTPUT"
 
-      # Download all four platform binaries (mirrors publish job's download steps).
+      # Download all six platform binaries (4 glibc + 2 musl/baseline for workspace).
       - name: Download linux/x64 binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -433,8 +491,23 @@ jobs:
           name: harness-binary-darwin-arm64
           path: /tmp/harness-binaries/darwin-arm64
 
-      - name: Existence gate — assert all 4 binaries are present and non-empty
-        # R10: all-or-nothing. Fail immediately if any binary is missing or empty.
+      - name: Download linux/x64-baseline-musl binary
+        # Additive musl asset for workspace (Alpine). Distinct artifact name avoids
+        # collision with the glibc linux-x64 artifact.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-x64-baseline-musl
+          path: /tmp/harness-binaries/linux-x64-baseline-musl
+
+      - name: Download linux/arm64-musl binary
+        # Additive musl asset for workspace (Alpine/arm64).
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: harness-binary-linux-arm64-musl
+          path: /tmp/harness-binaries/linux-arm64-musl
+
+      - name: Existence gate — assert all 6 binaries are present and non-empty
+        # All-or-nothing: fail immediately if any binary is missing or empty.
         # Covers transient artifact expiry and partial uploads.
         run: |
           set -euo pipefail
@@ -453,13 +526,25 @@ jobs:
               fi
             done
           done
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            if [ ! -f "${BIN}" ]; then
+              echo "ERROR: missing binary: ${BIN}" >&2
+              FAIL=1
+            elif [ ! -s "${BIN}" ]; then
+              echo "ERROR: binary is empty: ${BIN}" >&2
+              FAIL=1
+            else
+              echo "OK: ${BIN} ($(wc -c < "${BIN}") bytes)"
+            fi
+          done
           if [ "${FAIL}" -ne 0 ]; then
             echo "FATAL: one or more platform binaries are missing or empty. Aborting release." >&2
             exit 1
           fi
 
       - name: Operational integrity — verify the native binary reports the expected version
-        # R9: operational integrity. The binary must self-report "<base>+harness.<short8>";
+        # Operational integrity: the binary must self-report "<base>+harness.<short8>";
         # a stray stock binary reports bare "<base>" and fails this check.
         # Only the binary matching THIS runner's architecture (ubuntu-24.04 = linux-x64) can
         # be executed here — cross-arch (linux-arm64) and cross-OS (darwin) binaries cannot
@@ -492,10 +577,76 @@ jobs:
             echo "${TARGET}: pre-verified by build job on its native runner."
           done
 
+          # musl binaries: also pre-verified on their native runners by the build job.
+          for TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            echo "${TARGET}: pre-verified by build job on its native runner."
+          done
+
+      - name: libc linkage check — assert musl binaries are actually musl
+        # Before packaging, verify each musl artifact is actually musl-linked.
+        # A silently-failed patch (LLM-merge non-determinism) could produce a glibc binary
+        # under a musl artifact name; this gate catches it before the asset is published.
+        # Uses `file` to inspect the ELF interpreter with positive + negative assertions:
+        #   Positive: must be ELF, must match expected arch, must be statically linked or musl.
+        #   Negative: must NOT reference the glibc ld-linux interpreter.
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            chmod +x "${BIN}"
+            FILE_OUT=$(file "${BIN}")
+            echo "${MUSL_TARGET}: ${FILE_OUT}"
+
+            # Determine expected architecture string for this target.
+            case "${MUSL_TARGET}" in
+              linux-x64-baseline-musl) EXPECTED_ARCH="x86-64" ;;
+              linux-arm64-musl)        EXPECTED_ARCH="aarch64" ;;
+              *)                       EXPECTED_ARCH="" ;;
+            esac
+
+            # Positive assertion 1: must be an ELF binary.
+            if ! echo "${FILE_OUT}" | grep -q 'ELF'; then
+              echo "ERROR: ${MUSL_TARGET} is not an ELF binary (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Positive assertion 2: must match expected architecture.
+            if [ -n "${EXPECTED_ARCH}" ] && ! echo "${FILE_OUT}" | grep -q "${EXPECTED_ARCH}"; then
+              echo "ERROR: ${MUSL_TARGET} does not match expected architecture '${EXPECTED_ARCH}' (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Positive assertion 3: must be statically linked or reference musl.
+            if ! echo "${FILE_OUT}" | grep -qE 'statically linked|musl'; then
+              echo "ERROR: ${MUSL_TARGET} is neither statically linked nor musl-linked (file output: ${FILE_OUT})" >&2
+              FAIL=1
+              continue
+            fi
+
+            # Negative assertion: must NOT reference the glibc ld-linux interpreter.
+            if echo "${FILE_OUT}" | grep -qE 'ld-linux'; then
+              echo "ERROR: ${MUSL_TARGET} binary appears to be glibc-linked (found glibc interpreter in 'file' output)." >&2
+              echo "  file output: ${FILE_OUT}" >&2
+              echo "  This indicates the build.ts musl patch did not take effect for this target." >&2
+              FAIL=1
+              continue
+            fi
+
+            echo "OK: ${MUSL_TARGET} — ELF, ${EXPECTED_ARCH}, statically linked / musl, no glibc interpreter."
+          done
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "FATAL: one or more musl artifacts failed the libc assertion. Aborting release." >&2
+            exit 1
+          fi
+
       - name: Repackage binaries into stock-OpenCode-shaped release assets
-        # R1: linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
+        # linux → .tar.gz, darwin → .zip; binary at archive root named "opencode".
         # Mirrors stock anomalyco/opencode asset naming so action consumers can use
         # the same download path with only the repo/tag changed.
+        # Musl assets use the same tar layout as glibc linux assets (binary at archive root).
         run: |
           set -euo pipefail
           ASSETS_DIR="/tmp/harness-release-assets"
@@ -534,23 +685,48 @@ jobs:
             echo "Verified archive root: ${MEMBERS}"
           done
 
+          # Musl/baseline assets: same tar layout as glibc linux assets.
+          # Binary at archive root named "opencode" so workspace `tar -xz -C /usr/local/bin`
+          # extracts directly to /usr/local/bin/opencode.
+          for MUSL_TARGET in linux-x64-baseline-musl linux-arm64-musl; do
+            BIN="/tmp/harness-binaries/${MUSL_TARGET}/opencode"
+            chmod +x "${BIN}"
+            ASSET="opencode-${MUSL_TARGET}.tar.gz"
+            tar -czf "${ASSET}" -C "/tmp/harness-binaries/${MUSL_TARGET}" opencode
+            echo "Created: ${ASSET}"
+            MEMBERS=$(tar -tzf "${ASSET}")
+            if ! echo "${MEMBERS}" | grep -qx 'opencode'; then
+              echo "ERROR: ${ASSET} archive root does not contain 'opencode' at root (got: ${MEMBERS})" >&2
+              exit 1
+            fi
+            echo "Verified archive root: ${MEMBERS}"
+          done
+
           echo "All assets created:"
           ls -lh "${ASSETS_DIR}"
 
       - name: Generate SHA256SUMS
-        # Aggregated checksum file over all 4 assets (de-facto standard for mise/aqua/local consumers).
+        # Aggregated checksum file over all 6 assets (musl assets included).
         # The action verifies its single platform asset against the matching line.
+        # The workspace Dockerfile verifies the musl asset against the matching line.
         run: |
           set -euo pipefail
           cd /tmp/harness-release-assets
-          sha256sum opencode-linux-x64.tar.gz opencode-linux-arm64.tar.gz opencode-darwin-x64.zip opencode-darwin-arm64.zip > SHA256SUMS
+          sha256sum \
+            opencode-linux-x64.tar.gz \
+            opencode-linux-arm64.tar.gz \
+            opencode-darwin-x64.zip \
+            opencode-darwin-arm64.zip \
+            opencode-linux-x64-baseline-musl.tar.gz \
+            opencode-linux-arm64-musl.tar.gz \
+            > SHA256SUMS
           echo "SHA256SUMS:"
           cat SHA256SUMS
 
       - name: Create GitHub Release
         # Guard: skip actual release creation in dry-run mode.
-        # All prior steps (existence gate, version check, repackage, checksums) still run
-        # so dry-run validates everything except the publish.
+        # All prior steps (existence gate, libc assertion, version check, repackage, checksums)
+        # still run so dry-run validates everything except the publish.
         if: steps.params.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -574,6 +750,8 @@ jobs:
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
               opencode-darwin-arm64.zip \
+              opencode-linux-x64-baseline-musl.tar.gz \
+              opencode-linux-arm64-musl.tar.gz \
               SHA256SUMS \
               --clobber
             echo "Assets re-uploaded (clobber) for: ${RELEASE_TAG}"
@@ -587,6 +765,8 @@ jobs:
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
               opencode-darwin-arm64.zip \
+              opencode-linux-x64-baseline-musl.tar.gz \
+              opencode-linux-arm64-musl.tar.gz \
               SHA256SUMS
             echo "GitHub Release created: ${RELEASE_TAG}"
           fi
@@ -908,7 +1088,11 @@ jobs:
     needs: [prepare-integrate, build, publish]
     # Only run after a real successful publish. Never on dry-run.
     # The release is already done; this job failing does not affect it.
-    if: ${{ needs.publish.result == 'success' && inputs.dry_run != 'true' }}
+    # dry_run is a boolean input: compare against the boolean `true`, NOT the
+    # string 'true'. A boolean-vs-string `!=` coerces numerically ('true' → NaN),
+    # so `inputs.dry_run != 'true'` is always truthy and would run on dry-runs.
+    # For tag-triggered releases inputs.dry_run is null, which is also != true.
+    if: ${{ needs.publish.result == 'success' && inputs.dry_run != true }}
     runs-on: ubuntu-24.04
     continue-on-error: true # Best-effort: release already succeeded.
 
