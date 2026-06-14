@@ -13,11 +13,15 @@ This project manages external CLI tools through a **single-source-of-truth versi
 
 | Tool | Constant | User-facing input | Renovate datasource |
 | --- | --- | --- | --- |
-| OpenCode | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | `github-releases` (`anomalyco/opencode`) |
+| OpenCode (action default) | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | _Release-job coupled — NOT Renovate (see below)_ |
+| OpenCode (action fallback) | `FALLBACK_VERSION` in `src/services/setup/opencode.ts` | _(internal only)_ | `github-releases` (`anomalyco/opencode`) |
+| OpenCode (workspace image) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
 | oMo | `DEFAULT_OMO_VERSION` | `omo-version` | `npm` (`oh-my-openagent`) |
 | Bun | `DEFAULT_BUN_VERSION` | _(internal only)_ | `github-releases` (`oven-sh/bun`, extract `bun-v` prefix) |
 | Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 | OpenCode (harness base) | `base_version` in `packages/harness/harness.config.json` | _(internal only — config-JSON, not a TS constant)_ | `github-releases` (`anomalyco/opencode`) |
+
+**Release-job coupled sites (not Renovate-tracked):** `DEFAULT_OPENCODE_VERSION` and the workspace `ARG OPENCODE_VERSION` hold the harness build version (`<base>+harness.<sha>`). Renovate cannot order SemVer build-metadata tags, so both are bumped together by `harness-release.yaml`'s `sync-default-version` job at publish time (one auto-PR, dual-source idempotency guard). Do not add Renovate `customManager` entries for these — they would be dropped. See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4 and `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md`.
 
 ## Quick Start
 
