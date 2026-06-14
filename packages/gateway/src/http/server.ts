@@ -58,11 +58,14 @@ export interface AnnounceServerConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Build and start the Hono server for POST /v1/announce.
+ * Build the Hono application for the announce server.
  *
- * Returns the @hono/node-server handle. Call `.close(cb)` during shutdown.
+ * Exported separately from createAnnounceServer so the route inventory can be
+ * inspected in tests without binding a port. This is the authoritative place
+ * where HTTP routes are registered — any new route added here is immediately
+ * visible to the ingress-pin test.
  */
-export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceServerConfig): ServerType {
+export function buildAnnounceApp(deps: AnnounceServerDeps, config: AnnounceServerConfig): Hono {
   const replayCache = deps.replayCache ?? createReplayCache({clock: deps.clock})
   const rateLimiter = deps.rateLimiter ?? createRateLimiter({clock: deps.clock})
   const checkShuttingDown = deps.isShuttingDown ?? (() => false)
@@ -131,5 +134,15 @@ export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceS
 
   app.notFound(c => c.json({error: 'not-found'}, 404))
 
+  return app
+}
+
+/**
+ * Build and start the Hono server for POST /v1/announce.
+ *
+ * Returns the @hono/node-server handle. Call `.close(cb)` during shutdown.
+ */
+export function createAnnounceServer(deps: AnnounceServerDeps, config: AnnounceServerConfig): ServerType {
+  const app = buildAnnounceApp(deps, config)
   return serve({fetch: app.fetch, port: config.httpPort})
 }
