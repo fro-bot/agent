@@ -85,14 +85,15 @@ export function getPlatformInfo(): PlatformInfo {
 }
 
 /**
- * Encode a version string as a URL-safe release tag.
+ * Encode a harness version string as a URL-safe release tag.
  *
- * Ensures the tag has a `v` prefix and percent-encodes `+` as `%2B` so the
- * URL path segment is valid — GitHub stores tags URL-encoded and a raw `+` is
+ * Harness release tags are NON-v-prefixed (e.g. `1.17.3+harness.<sha>`).
+ * Strips any leading `v` and percent-encodes `+` as `%2B` so the URL path
+ * segment is valid — GitHub stores tags URL-encoded and a raw `+` is
  * misread as a space.
  */
 function encodeHarnessTag(version: string): string {
-  const rawTag = version.startsWith('v') ? version : `v${version}`
+  const rawTag = version.startsWith('v') ? version.slice(1) : version
   return rawTag.replaceAll('+', '%2B')
 }
 

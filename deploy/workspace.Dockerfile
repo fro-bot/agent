@@ -88,7 +88,7 @@ RUN set -euo pipefail \
        esac \
     # Encode '+' as '%2B' for the URL path segment (GitHub tag URL encoding).
     && encoded_version="${OPENCODE_VERSION//+/%2B}" \
-    && base_url="https://github.com/fro-bot/agent/releases/download/v${encoded_version}" \
+    && base_url="https://github.com/fro-bot/agent/releases/download/${encoded_version}" \
     # Download the asset archive and the SHA256SUMS file for this release.
     # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
     && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
