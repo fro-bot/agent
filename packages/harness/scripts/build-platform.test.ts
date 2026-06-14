@@ -36,6 +36,7 @@ import {
   patchBuildTs,
   resolveTargetDirSuffix,
   runUpstreamBuild,
+  verifyBuiltBinary,
 } from './build-platform.js'
 
 // ---------------------------------------------------------------------------
@@ -1058,5 +1059,134 @@ describe('cloneAndCheckout: backward-compat', () => {
       call => call[0] === 'git' && Array.isArray(call[1]) && call[1].includes('clone'),
     )
     expect(gitCloneCalls.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// verifyBuiltBinary — musl execution skip + glibc execution
+// ---------------------------------------------------------------------------
+
+describe('verifyBuiltBinary: musl skip vs glibc execution', () => {
+  const mockedExecFileSync = vi.mocked(execFileSync)
+  const mockedSpawnSync = vi.mocked(spawnSync)
+
+  const BINARY_PATH = '/tmp/dist/opencode-linux-x64-baseline-musl/bin/opencode'
+  const EXPECTED_VERSION = '1.15.13+harness.abc12345'
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Default: binary exists (test -f returns 0)
+    mockedSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+  })
+
+  // -------------------------------------------------------------------------
+  // musl target: existence checked, --version NOT executed
+  // -------------------------------------------------------------------------
+
+  it('musl target: does not call execFileSync (no --version execution)', () => {
+    // #given — musl target; binary exists (spawnSync test -f returns 0)
+
+    // #when
+    verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')
+
+    // #then — execFileSync was NOT called (no --version execution)
+    expect(mockedExecFileSync).not.toHaveBeenCalled()
+  })
+
+  it('musl target: does not throw when binary exists', () => {
+    // #given — musl target; binary exists
+
+    // #when / #then — must not throw
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')).not.toThrow()
+  })
+
+  it('musl target: throws when binary does not exist', () => {
+    // #given — musl target; binary missing (test -f returns non-zero)
+    mockedSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+
+    // #when / #then — must throw with "not found" message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, 'musl')).toThrow('Built binary not found at')
+  })
+
+  // -------------------------------------------------------------------------
+  // glibc target: existence checked + --version executed + version asserted
+  // -------------------------------------------------------------------------
+
+  it('glibc target: calls execFileSync with --version', () => {
+    // #given — glibc target (abi=null); binary exists; --version returns expected version
+    mockedExecFileSync.mockReturnValue(`${EXPECTED_VERSION}\n`)
+
+    // #when
+    verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)
+
+    // #then — execFileSync was called with the binary and --version
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      BINARY_PATH,
+      ['--version'],
+      expect.objectContaining({encoding: 'utf8'}),
+    )
+  })
+
+  it('glibc target: does not throw when --version matches expected version', () => {
+    // #given — glibc target; --version returns exact expected version
+    mockedExecFileSync.mockReturnValue(`${EXPECTED_VERSION}\n`)
+
+    // #when / #then — must not throw
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).not.toThrow()
+  })
+
+  it('glibc target: throws on version mismatch', () => {
+    // #given — glibc target; --version returns wrong version
+    mockedExecFileSync.mockReturnValue('1.0.0-wrong\n')
+
+    // #when / #then — must throw with version mismatch message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Version mismatch')
+  })
+
+  it('glibc target: throws when --version execution fails (ENOENT)', () => {
+    // #given — glibc target; execFileSync throws (binary not executable or missing loader)
+    mockedExecFileSync.mockImplementation(() => {
+      const err = new Error('ENOENT: no such file or directory, posix_spawn') as NodeJS.ErrnoException
+      err.code = 'ENOENT'
+      throw err
+    })
+
+    // #when / #then — must throw with "Binary --version failed" message
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Binary --version failed')
+  })
+
+  it('glibc target: throws when binary does not exist', () => {
+    // #given — glibc target; binary missing (test -f returns non-zero)
+    mockedSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: '',
+      pid: 1,
+      output: [],
+      signal: null,
+    })
+
+    // #when / #then — must throw before attempting --version
+    expect(() => verifyBuiltBinary(BINARY_PATH, EXPECTED_VERSION, null)).toThrow('Built binary not found at')
+    expect(mockedExecFileSync).not.toHaveBeenCalled()
   })
 })

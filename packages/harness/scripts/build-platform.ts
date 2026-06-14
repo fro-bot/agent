@@ -17,7 +17,9 @@
  *     The version string embeds the integration commit short SHA so the binary
  *     self-reports it. The upstream build bakes OPENCODE_VERSION into the binary
  *     via the `define: { OPENCODE_VERSION: ... }` field in build.ts.
- *   - Built binary --version is verified == OPENCODE_VERSION before emitting.
+ *   - Built binary --version is verified == OPENCODE_VERSION before emitting (glibc targets only;
+ *     musl targets skip execution — cannot run musl binary on glibc runner — and rely on
+ *     assertMuslBinary() file-based linkage check instead).
  *   - provenance.json is written to packages/harness/ for the workflow assemble step.
  *
  * Integration commit embedding mechanism:
@@ -502,12 +504,27 @@ function resolveBuiltBinaryPath(
   return path.join(workDir, 'packages', 'opencode', 'dist', name, 'bin', binary)
 }
 
-function verifyBuiltBinary(binaryPath: string, expectedVersion: string): void {
+export function verifyBuiltBinary(binaryPath: string, expectedVersion: string, abi: 'musl' | null): void {
   console.log(`[build-platform] Verifying binary: ${binaryPath} --version`)
 
   const binaryExists = spawnSync('test', ['-f', binaryPath]).status === 0
   if (!binaryExists) {
     throw new Error(`Built binary not found at: ${binaryPath}`)
+  }
+
+  if (abi === 'musl') {
+    // musl binaries cannot execute on a glibc runner (posix_spawn ENOENT — no compatible loader).
+    // Upstream build.ts guards its own smoke test the same way (build.ts:201-202):
+    //   if (item.os === process.platform && item.arch === process.arch && !item.abi)
+    // Skip --version execution for musl targets; correctness is proven by:
+    //   (a) binary exists (checked above), and
+    //   (b) assertMuslBinary() (file-based libc check) which runs immediately after this call.
+    // The version string is baked at compile time via OPENCODE_VERSION define — we trust the build.
+    console.log(
+      `[build-platform] Skipping --version execution for musl target (cannot run musl binary on glibc runner). ` +
+        `Existence confirmed; musl linkage will be verified by assertMuslBinary().`,
+    )
+    return
   }
 
   let actual: string
@@ -684,7 +701,7 @@ export async function main(): Promise<void> {
   const binaryPath = resolveBuiltBinaryPath(buildSourceDir, platform, arch, abi, baseline)
   const expectedVersion = buildHarnessVersion(baseVersion, integrationCommit)
   try {
-    verifyBuiltBinary(binaryPath, expectedVersion)
+    verifyBuiltBinary(binaryPath, expectedVersion, abi)
   } catch (error) {
     console.error(`[build-platform] Verification failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
