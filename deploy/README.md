@@ -484,7 +484,7 @@ If `WORKSPACE_EGRESS_HOSTS` is unset or empty, no extra hosts are added (fail-cl
 
 ### Egress topology
 
-The containment model is:
+The workspace containment model is:
 
 ```
 workspace → sandbox-net (internal:true) → mitmproxy → egress-net → internet
@@ -493,4 +493,6 @@ workspace → sandbox-net (internal:true) → mitmproxy → egress-net → inter
 - `sandbox-net` is `internal: true` — no container on this network has a host gateway or direct internet access.
 - The workspace is attached to `sandbox-net` only. It has zero direct egress.
 - mitmproxy is dual-homed: it receives workspace traffic on `sandbox-net` and dials allowlisted upstream hosts via `egress-net` (a dedicated non-internal network). Only mitmproxy joins `egress-net`.
-- The gateway is dual-homed on `gateway-net` (external) and `sandbox-net`. Its own egress also routes through mitmproxy (`HTTPS_PROXY=http://mitmproxy:8080`), which is why Discord and the GitHub/object-store hosts it needs are in the static allowlist. The topology guard intentionally does not constrain the gateway's networks — only the workspace is held to sandbox-net-only.
+- The gateway is dual-homed on `gateway-net` (non-internal) and `sandbox-net`. It reaches Discord, GitHub, and object storage directly via `gateway-net` — **not** through mitmproxy. This is a deliberate trusted first-party exception: the gateway is operator-controlled code, not the untrusted workspace. The containment guarantee is that **the workspace reaches the internet only via mitmproxy**; the gateway is explicitly outside that constraint.
+
+**Forward constraint:** never give the workspace a gateway endpoint that performs caller-directed outbound requests. The only workspace-reachable HTTP ingress on the gateway is the HMAC/replay-gated `POST /v1/announce` endpoint, which posts a fixed embed — it does not perform arbitrary outbound requests on behalf of the caller. If a new workspace-reachable gateway endpoint is added that performs caller-directed outbound, the topology must be revisited. A CI pinning test enforces this: it asserts the gateway's HTTP ingress surface is exactly `{POST /v1/announce}` and fails if a new route is added without a deliberate review.
