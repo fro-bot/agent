@@ -502,7 +502,7 @@ The compose topology guard (`deploy/validate-stack.sh`) enforces this model stat
 - `devices: /dev/net/tun` — the kernel TUN/TAP interface used by VPN clients to construct egress tunnels.
 - `privileged: true` — grants all Linux capabilities and all host devices, nullifying the `cap_add` and `devices` controls entirely.
 - `device_cgroup_rules` with any device-grant rule — a cgroup allow rule (e.g. `c 10:200 rwm`) grants device access by major:minor number independent of the `devices:` mapping; combined with `mknod` inside the container, it can restore tunnel capability.
-- `pid_mode: host` — shares the host PID namespace; with sufficient capability a container process can `nsenter` into host namespaces and escape `internal: true` network isolation entirely.
+- `pid: host` — shares the host PID namespace; with sufficient capability a container process can `nsenter` into host namespaces and escape `internal: true` network isolation entirely.
 - `sysctls` enabling IP forwarding (`net.ipv4.ip_forward=1` or `net.ipv6.conf.<iface>.forwarding=1`) — turns the container into a router that can relay traffic between network interfaces, bypassing the mitmproxy chokepoint.
 - `security_opt: seccomp:unconfined` or `security_opt: apparmor:unconfined` — disables kernel confinement profiles (seccomp syscall filter or AppArmor MAC), unblocking operations that aid egress bypass.
 

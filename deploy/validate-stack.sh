@@ -321,23 +321,33 @@ for _svc in sorted(services.keys()):
             break
 
 # ------------------------------------------------------------------
-# Invariant 1d: NO service may declare cap_add with NET_ADMIN or NET_RAW.
+# Invariant 1d: NO service may declare cap_add with NET_ADMIN, NET_RAW,
+# SYS_MODULE, SYS_ADMIN, or ALL.
 #
 # NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
 # Combined with a VPN client image and /dev/net/tun, they can build a tunnel
-# that bypasses mitmproxy.  Reject either capability on ANY service.
+# that bypasses mitmproxy.
+#
+# SYS_MODULE allows loading kernel modules (init_module/finit_module syscalls
+# are permitted by Docker's default seccomp profile when CAP_SYS_MODULE is
+# present) — an attacker can load a tunnel kernel module to bypass mitmproxy.
+#
+# SYS_ADMIN enables the nsenter namespace-escape chain (ioctl NS_GET_PARENT +
+# setns into the host network namespace), escaping sandbox-net isolation.
+#
+# ALL grants every Linux capability including all of the above — same
+# supersetting threat as privileged:true.
 #
 # Normalization: Docker Compose may preserve the CAP_ prefix (e.g.
 # CAP_NET_ADMIN) or lowercase variants (cap_net_admin) from raw YAML.
 # Strip a leading CAP_ prefix and uppercase before checking the banned set
-# so all forms are caught.  ALL is included because it grants every capability
-# including NET_ADMIN and NET_RAW — same supersetting threat as privileged:true.
+# so all forms are caught.
 #
 # Scalar-string guard: if cap_add is a bare string (not a list), wrap it
 # into a single-element list before iterating so scalar YAML values are
 # not silently missed by character-iteration.
 # ------------------------------------------------------------------
-_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "ALL"}
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "ALL"}
 for _svc in sorted(services.keys()):
     _svc_cfg = services.get(_svc) or {}
     _cap_add = _svc_cfg.get("cap_add") or []
@@ -350,9 +360,10 @@ for _svc in sorted(services.keys()):
         if _cap_norm in _BANNED_CAPS:
             failures.append(
                 f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
-                "NET_ADMIN, NET_RAW, and ALL enable raw-socket/routing manipulation that can "
-                "tunnel workspace egress around mitmproxy and are not permitted. "
-                "(ALL grants every capability including NET_ADMIN and NET_RAW.)"
+                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and ALL enable raw-socket/routing "
+                "manipulation, kernel module loading, or namespace escape that can tunnel "
+                "workspace egress around mitmproxy and are not permitted. "
+                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, and SYS_ADMIN.)"
             )
             break
 
@@ -486,9 +497,14 @@ for _svc in sorted(services.keys()):
 # Invariant 1i: NO service may declare an IP-forwarding sysctl set to an
 # enabling value.
 #
-# net.ipv4.ip_forward=1 and net.ipv6.conf.<iface>.forwarding=1 enable
-# container-as-router behavior, allowing the container to relay traffic
-# between network interfaces and bypass the mitmproxy chokepoint.
+# net.ipv4.ip_forward=1, net.ipv4.conf.all.forwarding=1,
+# net.ipv4.conf.<iface>.forwarding=1, and net.ipv6.conf.<iface>.forwarding=1
+# all enable container-as-router behavior, allowing the container to relay
+# traffic between network interfaces and bypass the mitmproxy chokepoint.
+#
+# The Linux kernel aliases net.ipv4.conf.all.forwarding and
+# net.ipv4.conf.<iface>.forwarding to the same forwarding behavior as
+# net.ipv4.ip_forward — all three forms must be rejected.
 #
 # Normalized shape (docker compose config JSON): dict {name: value}.
 # Raw-YAML fallback shape: dict {name: value} OR list of "name=value" strings.
@@ -500,6 +516,7 @@ for _svc in sorted(services.keys()):
 import re as _re_sysctl
 
 _IPV6_FWD_RE = _re_sysctl.compile(r'^net\.ipv6\.conf\.[^.]+\.forwarding$')
+_IPV4_CONF_FWD_RE = _re_sysctl.compile(r'^net\.ipv4\.conf\.[^.]+\.forwarding$')
 
 def _is_enabling_sysctl_value(v):
     """Return True if the sysctl value enables forwarding."""
@@ -521,7 +538,7 @@ for _svc in sorted(services.keys()):
         _sysctls = _sysctls_dict
     for _sysctl_key, _sysctl_val in (_sysctls or {}).items():
         _k = str(_sysctl_key).strip()
-        if (_k == "net.ipv4.ip_forward" or _IPV6_FWD_RE.match(_k)) and _is_enabling_sysctl_value(_sysctl_val):
+        if (_k == "net.ipv4.ip_forward" or _IPV4_CONF_FWD_RE.match(_k) or _IPV6_FWD_RE.match(_k)) and _is_enabling_sysctl_value(_sysctl_val):
             failures.append(
                 f"FAIL: service '{_svc}' declares sysctl '{_k}={_sysctl_val}' — "
                 "enabling IP forwarding turns the container into a router that can "
@@ -531,37 +548,47 @@ for _svc in sorted(services.keys()):
             break
 
 # ------------------------------------------------------------------
-# Invariant 1j: NO service may declare a confinement-disabling security_opt.
+# Invariant 1j: NO service may declare a confinement-weakening security_opt
+# for seccomp or apparmor.
 #
-# seccomp:unconfined disables the seccomp syscall filter, unblocking
-# operations otherwise restricted that aid egress bypass.
-# apparmor:unconfined disables the AppArmor MAC profile, similarly
-# relaxing kernel confinement.
-# label:* and no-new-privileges:* are allowed (the latter strengthens
-# confinement).
+# seccomp:unconfined disables the seccomp syscall filter entirely.
+# apparmor:unconfined disables the AppArmor MAC profile entirely.
+# A custom profile path (e.g. seccomp=/path/to/profile.json or
+# seccomp:/path/to/profile.json) replaces the default Docker seccomp profile
+# with an operator-supplied one that may be permissive — this is equally
+# dangerous because the workspace has no legitimate need for a custom profile.
+#
+# Rule: reject any security_opt entry matching
+#   ^(seccomp|apparmor)[:=](?!default$).+
+# i.e. any seccomp/apparmor value that is NOT the literal "default".
+# The implicit default (no seccomp/apparmor key at all) and the explicit
+# ":default" form are both allowed.  label:* and no-new-privileges:* are
+# always allowed (the latter strengthens confinement).
 #
 # Normalized shape: list of strings like "seccomp:unconfined",
-# "apparmor:unconfined", "label:disable", "no-new-privileges:true".
+# "apparmor:unconfined", "seccomp=/path/to/profile.json",
+# "label:disable", "no-new-privileges:true".
 # Raw-YAML fallback shape: same list, or a bare scalar string.
 #
 # Scalar-string guard: wrap a bare string into a single-element list.
-# Normalization: strip whitespace, lowercase, tolerate = separator.
+# Normalization: strip whitespace; check is case-insensitive on the prefix.
 # ------------------------------------------------------------------
-_BANNED_SECURITY_OPTS = {"seccomp:unconfined", "apparmor:unconfined",
-                         "seccomp=unconfined", "apparmor=unconfined"}
+_SECOPT_CUSTOM_RE = _re_sysctl.compile(r'^(seccomp|apparmor)[:=](?!default$).+', _re_sysctl.IGNORECASE)
 for _svc in sorted(services.keys()):
     _svc_cfg = services.get(_svc) or {}
     _sec_opts = _svc_cfg.get("security_opt") or []
     if isinstance(_sec_opts, str):
         _sec_opts = [_sec_opts]
     for _opt in _sec_opts:
-        _opt_norm = str(_opt).strip().lower()
-        if _opt_norm in _BANNED_SECURITY_OPTS:
+        _opt_s = str(_opt).strip()
+        if _SECOPT_CUSTOM_RE.match(_opt_s):
             failures.append(
                 f"FAIL: service '{_svc}' declares security_opt '{_opt}' — "
-                "seccomp:unconfined and apparmor:unconfined disable kernel confinement "
-                "profiles, unblocking syscalls and operations that aid egress bypass. "
-                "Remove the unconfined security_opt entry."
+                "custom or unconfined seccomp/apparmor profiles weaken kernel confinement: "
+                "seccomp:unconfined/apparmor:unconfined disable the filter entirely, and "
+                "a custom profile path replaces the default Docker profile with one that "
+                "may permit dangerous syscalls. Only the implicit default profile is allowed. "
+                "Remove the seccomp/apparmor security_opt entry."
             )
             break
 

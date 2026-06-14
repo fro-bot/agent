@@ -2832,6 +2832,531 @@ echo "${SECOPT_NNP_OUTPUT}" | sed 's/^/    /'
 # TEST 2 serves as the positive control for all of Invariants 1g-1j as well.
 
 # ---------------------------------------------------------------------------
+# TEST 49 — Negative: cap_add: [SYS_MODULE] must be rejected (Invariant 1d).
+#
+# SYS_MODULE allows loading kernel modules.  Docker's default seccomp profile
+# permits init_module/finit_module when CAP_SYS_MODULE is present, enabling
+# an attacker to load a tunnel kernel module and bypass mitmproxy.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 49: guard rejects cap_add: [SYS_MODULE] (module-load bypass) ---"
+
+CAP_SYS_MODULE_COMPOSE="${TMPDIR_TEST}/compose-cap-sys-module.yaml"
+cat > "${CAP_SYS_MODULE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - SYS_MODULE
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_SYS_MODULE_OUTPUT=""
+CAP_SYS_MODULE_EXIT=0
+CAP_SYS_MODULE_OUTPUT="$(COMPOSE_FILE="${CAP_SYS_MODULE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SYS_MODULE_EXIT=$?
+
+if [[ "${CAP_SYS_MODULE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_SYS_MODULE_EXIT}) for cap_add: [SYS_MODULE]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [SYS_MODULE] — module-load bypass NOT caught"
+fi
+
+if echo "${CAP_SYS_MODULE_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add SYS_MODULE failure message names the service 'workspace'"
+else
+  fail "cap_add SYS_MODULE failure message does not name 'workspace' — output: ${CAP_SYS_MODULE_OUTPUT}"
+fi
+
+if echo "${CAP_SYS_MODULE_OUTPUT}" | grep -qi "SYS_MODULE"; then
+  pass "cap_add SYS_MODULE failure message mentions 'SYS_MODULE'"
+else
+  fail "cap_add SYS_MODULE failure message does not mention 'SYS_MODULE' — output: ${CAP_SYS_MODULE_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-sys-module-test output (stderr+stdout combined):"
+echo "${CAP_SYS_MODULE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 50 — Negative: cap_add: [SYS_ADMIN] must be rejected (Invariant 1d).
+#
+# SYS_ADMIN enables the nsenter namespace-escape chain (ioctl NS_GET_PARENT +
+# setns into the host network namespace), escaping sandbox-net isolation.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 50: guard rejects cap_add: [SYS_ADMIN] (namespace-escape bypass) ---"
+
+CAP_SYS_ADMIN_COMPOSE="${TMPDIR_TEST}/compose-cap-sys-admin.yaml"
+cat > "${CAP_SYS_ADMIN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - SYS_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_SYS_ADMIN_OUTPUT=""
+CAP_SYS_ADMIN_EXIT=0
+CAP_SYS_ADMIN_OUTPUT="$(COMPOSE_FILE="${CAP_SYS_ADMIN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SYS_ADMIN_EXIT=$?
+
+if [[ "${CAP_SYS_ADMIN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_SYS_ADMIN_EXIT}) for cap_add: [SYS_ADMIN]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [SYS_ADMIN] — namespace-escape bypass NOT caught"
+fi
+
+if echo "${CAP_SYS_ADMIN_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add SYS_ADMIN failure message names the service 'workspace'"
+else
+  fail "cap_add SYS_ADMIN failure message does not name 'workspace' — output: ${CAP_SYS_ADMIN_OUTPUT}"
+fi
+
+if echo "${CAP_SYS_ADMIN_OUTPUT}" | grep -qi "SYS_ADMIN"; then
+  pass "cap_add SYS_ADMIN failure message mentions 'SYS_ADMIN'"
+else
+  fail "cap_add SYS_ADMIN failure message does not mention 'SYS_ADMIN' — output: ${CAP_SYS_ADMIN_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-sys-admin-test output (stderr+stdout combined):"
+echo "${CAP_SYS_ADMIN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 51 — Negative: cap_add: [CAP_SYS_ADMIN] must be rejected (CAP_ prefix
+#           normalization, Invariant 1d).
+#
+# Docker Compose or raw YAML may preserve the CAP_ prefix.  The guard strips
+# CAP_ before checking the banned set, so CAP_SYS_ADMIN → SYS_ADMIN is caught.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 51: guard rejects cap_add: [CAP_SYS_ADMIN] (CAP_ prefix normalization) ---"
+
+CAP_CAP_SYS_ADMIN_COMPOSE="${TMPDIR_TEST}/compose-cap-cap-sys-admin.yaml"
+cat > "${CAP_CAP_SYS_ADMIN_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - CAP_SYS_ADMIN
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_CAP_SYS_ADMIN_OUTPUT=""
+CAP_CAP_SYS_ADMIN_EXIT=0
+CAP_CAP_SYS_ADMIN_OUTPUT="$(COMPOSE_FILE="${CAP_CAP_SYS_ADMIN_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_CAP_SYS_ADMIN_EXIT=$?
+
+if [[ "${CAP_CAP_SYS_ADMIN_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_CAP_SYS_ADMIN_EXIT}) for cap_add: [CAP_SYS_ADMIN]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [CAP_SYS_ADMIN] — CAP_ prefix bypass NOT caught"
+fi
+
+if echo "${CAP_CAP_SYS_ADMIN_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add CAP_SYS_ADMIN failure message names the service 'workspace'"
+else
+  fail "cap_add CAP_SYS_ADMIN failure message does not name 'workspace' — output: ${CAP_CAP_SYS_ADMIN_OUTPUT}"
+fi
+
+if echo "${CAP_CAP_SYS_ADMIN_OUTPUT}" | grep -qi "CAP_SYS_ADMIN\|SYS_ADMIN"; then
+  pass "cap_add CAP_SYS_ADMIN failure message mentions the capability"
+else
+  fail "cap_add CAP_SYS_ADMIN failure message does not mention the capability — output: ${CAP_CAP_SYS_ADMIN_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-cap-sys-admin-test output (stderr+stdout combined):"
+echo "${CAP_CAP_SYS_ADMIN_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 52 — Negative: sysctls: {net.ipv4.conf.all.forwarding: 1} must be
+#           rejected (Invariant 1i, IPv4 per-interface alias).
+#
+# The Linux kernel aliases net.ipv4.conf.all.forwarding to the same forwarding
+# behavior as net.ipv4.ip_forward.  The guard must catch this form.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 52: guard rejects sysctls: {net.ipv4.conf.all.forwarding: 1} (IPv4 conf.all alias) ---"
+
+SYSCTL_IPV4_CONF_ALL_COMPOSE="${TMPDIR_TEST}/compose-sysctl-ipv4-conf-all.yaml"
+cat > "${SYSCTL_IPV4_CONF_ALL_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    sysctls:
+      net.ipv4.conf.all.forwarding: 1
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SYSCTL_IPV4_CONF_ALL_OUTPUT=""
+SYSCTL_IPV4_CONF_ALL_EXIT=0
+SYSCTL_IPV4_CONF_ALL_OUTPUT="$(COMPOSE_FILE="${SYSCTL_IPV4_CONF_ALL_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SYSCTL_IPV4_CONF_ALL_EXIT=$?
+
+if [[ "${SYSCTL_IPV4_CONF_ALL_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${SYSCTL_IPV4_CONF_ALL_EXIT}) for sysctls net.ipv4.conf.all.forwarding=1"
+else
+  fail "validate-stack.sh exited ZERO for sysctls net.ipv4.conf.all.forwarding=1 — IPv4 conf.all alias NOT caught"
+fi
+
+if echo "${SYSCTL_IPV4_CONF_ALL_OUTPUT}" | grep -q "workspace"; then
+  pass "sysctls ipv4.conf.all failure message names the service 'workspace'"
+else
+  fail "sysctls ipv4.conf.all failure message does not name 'workspace' — output: ${SYSCTL_IPV4_CONF_ALL_OUTPUT}"
+fi
+
+if echo "${SYSCTL_IPV4_CONF_ALL_OUTPUT}" | grep -q "net.ipv4.conf.all.forwarding"; then
+  pass "sysctls ipv4.conf.all failure message mentions 'net.ipv4.conf.all.forwarding'"
+else
+  fail "sysctls ipv4.conf.all failure message does not mention the sysctl — output: ${SYSCTL_IPV4_CONF_ALL_OUTPUT}"
+fi
+
+echo ""
+echo "  sysctl-ipv4-conf-all-test output (stderr+stdout combined):"
+echo "${SYSCTL_IPV4_CONF_ALL_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 53 — Negative: sysctls: {net.ipv4.conf.eth0.forwarding: 1} must be
+#           rejected (Invariant 1i, IPv4 per-interface form).
+#
+# net.ipv4.conf.<iface>.forwarding enables forwarding on a specific interface.
+# The guard must catch any single-segment interface name (e.g. eth0, ens3).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 53: guard rejects sysctls: {net.ipv4.conf.eth0.forwarding: 1} (IPv4 per-iface) ---"
+
+SYSCTL_IPV4_CONF_IFACE_COMPOSE="${TMPDIR_TEST}/compose-sysctl-ipv4-conf-iface.yaml"
+cat > "${SYSCTL_IPV4_CONF_IFACE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    sysctls:
+      net.ipv4.conf.eth0.forwarding: 1
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SYSCTL_IPV4_CONF_IFACE_OUTPUT=""
+SYSCTL_IPV4_CONF_IFACE_EXIT=0
+SYSCTL_IPV4_CONF_IFACE_OUTPUT="$(COMPOSE_FILE="${SYSCTL_IPV4_CONF_IFACE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SYSCTL_IPV4_CONF_IFACE_EXIT=$?
+
+if [[ "${SYSCTL_IPV4_CONF_IFACE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${SYSCTL_IPV4_CONF_IFACE_EXIT}) for sysctls net.ipv4.conf.eth0.forwarding=1"
+else
+  fail "validate-stack.sh exited ZERO for sysctls net.ipv4.conf.eth0.forwarding=1 — IPv4 per-iface NOT caught"
+fi
+
+if echo "${SYSCTL_IPV4_CONF_IFACE_OUTPUT}" | grep -q "workspace"; then
+  pass "sysctls ipv4.conf.eth0 failure message names the service 'workspace'"
+else
+  fail "sysctls ipv4.conf.eth0 failure message does not name 'workspace' — output: ${SYSCTL_IPV4_CONF_IFACE_OUTPUT}"
+fi
+
+if echo "${SYSCTL_IPV4_CONF_IFACE_OUTPUT}" | grep -q "net.ipv4.conf.eth0.forwarding"; then
+  pass "sysctls ipv4.conf.eth0 failure message mentions 'net.ipv4.conf.eth0.forwarding'"
+else
+  fail "sysctls ipv4.conf.eth0 failure message does not mention the sysctl — output: ${SYSCTL_IPV4_CONF_IFACE_OUTPUT}"
+fi
+
+echo ""
+echo "  sysctl-ipv4-conf-iface-test output (stderr+stdout combined):"
+echo "${SYSCTL_IPV4_CONF_IFACE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 54 — Negative: security_opt: ["seccomp=/path/to/profile.json"] must be
+#           rejected (Invariant 1j, custom seccomp profile path).
+#
+# A custom seccomp profile path replaces Docker's default seccomp profile with
+# an operator-supplied one that may be permissive, bypassing the default
+# profile's protections.  The guard must reject any seccomp/apparmor value
+# that is not the literal "default".
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 54: guard rejects security_opt: [\"seccomp=/path/to/profile.json\"] (custom profile path) ---"
+
+SECOPT_CUSTOM_PATH_COMPOSE="${TMPDIR_TEST}/compose-secopt-custom-path.yaml"
+cat > "${SECOPT_CUSTOM_PATH_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    security_opt:
+      - "seccomp=/path/to/profile.json"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SECOPT_CUSTOM_PATH_OUTPUT=""
+SECOPT_CUSTOM_PATH_EXIT=0
+SECOPT_CUSTOM_PATH_OUTPUT="$(COMPOSE_FILE="${SECOPT_CUSTOM_PATH_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SECOPT_CUSTOM_PATH_EXIT=$?
+
+if [[ "${SECOPT_CUSTOM_PATH_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${SECOPT_CUSTOM_PATH_EXIT}) for security_opt: [\"seccomp=/path/to/profile.json\"]"
+else
+  fail "validate-stack.sh exited ZERO for security_opt seccomp=/path — custom profile bypass NOT caught"
+fi
+
+if echo "${SECOPT_CUSTOM_PATH_OUTPUT}" | grep -q "workspace"; then
+  pass "security_opt custom-path failure message names the service 'workspace'"
+else
+  fail "security_opt custom-path failure message does not name 'workspace' — output: ${SECOPT_CUSTOM_PATH_OUTPUT}"
+fi
+
+if echo "${SECOPT_CUSTOM_PATH_OUTPUT}" | grep -qi "seccomp"; then
+  pass "security_opt custom-path failure message mentions 'seccomp'"
+else
+  fail "security_opt custom-path failure message does not mention 'seccomp' — output: ${SECOPT_CUSTOM_PATH_OUTPUT}"
+fi
+
+echo ""
+echo "  secopt-custom-path-test output (stderr+stdout combined):"
+echo "${SECOPT_CUSTOM_PATH_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 55 — Positive: security_opt: ["seccomp:default"] must NOT be rejected
+#           (Invariant 1j positive control — explicit default allowed).
+#
+# seccomp:default explicitly requests Docker's default seccomp profile, which
+# is the same as not specifying seccomp at all.  The guard allows the literal
+# value "default" for both seccomp and apparmor.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 55: guard accepts security_opt: [\"seccomp:default\"] (explicit default allowed) ---"
+
+SECOPT_DEFAULT_COMPOSE="${TMPDIR_TEST}/compose-secopt-default.yaml"
+cat > "${SECOPT_DEFAULT_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    security_opt:
+      - "seccomp:default"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SECOPT_DEFAULT_OUTPUT=""
+SECOPT_DEFAULT_EXIT=0
+SECOPT_DEFAULT_OUTPUT="$(COMPOSE_FILE="${SECOPT_DEFAULT_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SECOPT_DEFAULT_EXIT=$?
+
+if [[ "${SECOPT_DEFAULT_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for security_opt: [\"seccomp:default\"] — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${SECOPT_DEFAULT_EXIT}) for seccomp:default — over-rejection: ${SECOPT_DEFAULT_OUTPUT}"
+fi
+
+echo ""
+echo "  secopt-default-test output (stderr+stdout combined):"
+echo "${SECOPT_DEFAULT_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 56 — Positive: security_opt: ["label:disable"] must NOT be rejected
+#           (Invariant 1j positive control — label:* always allowed).
+#
+# label:* entries control SELinux label assignment and are not seccomp/apparmor
+# confinement controls.  The guard must not over-reject them.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 56: guard accepts security_opt: [\"label:disable\"] (label:* always allowed) ---"
+
+SECOPT_LABEL_COMPOSE="${TMPDIR_TEST}/compose-secopt-label.yaml"
+cat > "${SECOPT_LABEL_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    security_opt:
+      - "label:disable"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+SECOPT_LABEL_OUTPUT=""
+SECOPT_LABEL_EXIT=0
+SECOPT_LABEL_OUTPUT="$(COMPOSE_FILE="${SECOPT_LABEL_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || SECOPT_LABEL_EXIT=$?
+
+if [[ "${SECOPT_LABEL_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for security_opt: [\"label:disable\"] — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${SECOPT_LABEL_EXIT}) for label:disable — over-rejection: ${SECOPT_LABEL_OUTPUT}"
+fi
+
+echo ""
+echo "  secopt-label-test output (stderr+stdout combined):"
+echo "${SECOPT_LABEL_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 57 — Positive: cap_add: [SYS_TIME] must NOT be rejected
+#           (Invariant 1d positive control — benign capability allowed).
+#
+# SYS_TIME allows setting the system clock.  It is not in the banned set and
+# must not be over-rejected.  This confirms the guard is not a blanket cap_add
+# ban but targets only the specific dangerous capabilities.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 57: guard accepts cap_add: [SYS_TIME] (benign capability, not banned) ---"
+
+CAP_SYS_TIME_COMPOSE="${TMPDIR_TEST}/compose-cap-sys-time.yaml"
+cat > "${CAP_SYS_TIME_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - SYS_TIME
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_SYS_TIME_OUTPUT=""
+CAP_SYS_TIME_EXIT=0
+CAP_SYS_TIME_OUTPUT="$(COMPOSE_FILE="${CAP_SYS_TIME_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SYS_TIME_EXIT=$?
+
+if [[ "${CAP_SYS_TIME_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for cap_add: [SYS_TIME] — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${CAP_SYS_TIME_EXIT}) for cap_add: [SYS_TIME] — over-rejection: ${CAP_SYS_TIME_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-sys-time-test output (stderr+stdout combined):"
+echo "${CAP_SYS_TIME_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
