@@ -1059,7 +1059,11 @@ jobs:
     needs: [prepare-integrate, build, publish]
     # Only run after a real successful publish. Never on dry-run.
     # The release is already done; this job failing does not affect it.
-    if: ${{ needs.publish.result == 'success' && inputs.dry_run != 'true' }}
+    # dry_run is a boolean input: compare against the boolean `true`, NOT the
+    # string 'true'. A boolean-vs-string `!=` coerces numerically ('true' → NaN),
+    # so `inputs.dry_run != 'true'` is always truthy and would run on dry-runs.
+    # For tag-triggered releases inputs.dry_run is null, which is also != true.
+    if: ${{ needs.publish.result == 'success' && inputs.dry_run != true }}
     runs-on: ubuntu-24.04
     continue-on-error: true # Best-effort: release already succeeded.
 
