@@ -245,6 +245,100 @@ describe('DEFAULT_SENSITIVE_FIELDS', () => {
   })
 })
 
+describe('cache key exemptions — must NOT be redacted', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sink.debug.mockReset()
+    sink.info.mockReset()
+    sink.warning.mockReset()
+    sink.error.mockReset()
+  })
+
+  it('does not redact saveKey', () => {
+    const input = {saveKey: 'opencode-storage-github-owner-repo-main-Linux-12345'}
+    const result = redactSensitiveFields(input)
+    expect(result.saveKey).toBe('opencode-storage-github-owner-repo-main-Linux-12345')
+  })
+
+  it('does not redact primaryKey', () => {
+    const input = {primaryKey: 'opencode-storage-github-owner-repo-main-Linux'}
+    const result = redactSensitiveFields(input)
+    expect(result.primaryKey).toBe('opencode-storage-github-owner-repo-main-Linux')
+  })
+
+  it('does not redact restoreKeys', () => {
+    const input = {
+      restoreKeys: ['opencode-storage-github-owner-repo-main-Linux', 'opencode-storage-github-owner-repo-main'],
+    }
+    const result = redactSensitiveFields(input)
+    expect(result.restoreKeys).toEqual([
+      'opencode-storage-github-owner-repo-main-Linux',
+      'opencode-storage-github-owner-repo-main',
+    ])
+  })
+
+  it('does not redact restoredKey', () => {
+    const input = {restoredKey: 'opencode-storage-github-owner-repo-main-Linux'}
+    const result = redactSensitiveFields(input)
+    expect(result.restoredKey).toBe('opencode-storage-github-owner-repo-main-Linux')
+  })
+
+  it('does not redact cacheKey', () => {
+    const input = {cacheKey: 'opencode-storage-github-owner-repo-main-Linux'}
+    const result = redactSensitiveFields(input)
+    expect(result.cacheKey).toBe('opencode-storage-github-owner-repo-main-Linux')
+  })
+
+  it('does not redact key (cache key field)', () => {
+    const input = {key: 'opencode-storage-github-owner-repo-main-Linux'}
+    const result = redactSensitiveFields(input)
+    expect(result.key).toBe('opencode-storage-github-owner-repo-main-Linux')
+  })
+
+  it('still redacts token (regression guard — exemption did not over-broaden)', () => {
+    const input = {token: 'ghp_secret123'}
+    const result = redactSensitiveFields(input)
+    expect(result.token).toBe('[REDACTED]')
+  })
+
+  it('still redacts apikey (regression guard)', () => {
+    const input = {apikey: 'sk-secret456'}
+    const result = redactSensitiveFields(input)
+    expect(result.apikey).toBe('[REDACTED]')
+  })
+
+  it('still redacts access_token (regression guard)', () => {
+    const input = {access_token: 'gho_secret789'}
+    const result = redactSensitiveFields(input)
+    expect(result.access_token).toBe('[REDACTED]')
+  })
+
+  it('still redacts secret (regression guard)', () => {
+    const input = {secret: 'my-secret-value'}
+    const result = redactSensitiveFields(input)
+    expect(result.secret).toBe('[REDACTED]')
+  })
+
+  it('still redacts private_key (regression guard)', () => {
+    const input = {private_key: '-----BEGIN RSA PRIVATE KEY-----'}
+    const result = redactSensitiveFields(input)
+    expect(result.private_key).toBe('[REDACTED]')
+  })
+
+  it('cache key fields appear unredacted in logger output', () => {
+    const logger = createLogger({}, sink)
+    logger.info('Saving cache', {
+      saveKey: 'opencode-storage-github-owner-repo-main-Linux-12345',
+      primaryKey: 'opencode-storage-github-owner-repo-main-Linux',
+    })
+    const mockCalls = sink.info.mock.calls
+    const loggedArg = mockCalls[0]?.[0] as string
+    const parsed = JSON.parse(loggedArg) as Record<string, unknown>
+    expect(parsed.saveKey).toBe('opencode-storage-github-owner-repo-main-Linux-12345')
+    expect(parsed.primaryKey).toBe('opencode-storage-github-owner-repo-main-Linux')
+  })
+})
+
 describe('createLogger with sensitive field filtering', () => {
   beforeEach(() => {
     vi.clearAllMocks()

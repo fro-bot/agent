@@ -607,7 +607,7 @@ describe('button interaction handler (approval flow)', () => {
       register: vi.fn(),
       has: vi.fn().mockReturnValue(false),
       pending: vi.fn().mockReturnValue([]),
-      handleButtonDecision: vi.fn().mockResolvedValue('ok'),
+      handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
       attachMessage: vi.fn(),
       markMessagePostFailed: vi.fn(),
@@ -711,11 +711,11 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then — no auth check, no registry interaction, no reply
-    expect(fakeRegistry.handleButtonDecision).not.toHaveBeenCalled()
+    expect(fakeRegistry.handleDecision).not.toHaveBeenCalled()
     expect(interaction.reply).not.toHaveBeenCalled()
   })
 
-  it('authorized approve click → handleButtonDecision called with decision=once, ephemeral Approved.', async () => {
+  it('authorized approve click → handleDecision called with decision=once, ephemeral Approved.', async () => {
     // #given
     const {interactionHandler, fakeRegistry} = await runAndCaptureHandler()
     const {parseApprovalCustomId} = await import('./discord/approvals.js')
@@ -723,7 +723,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('ok')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('ok')
 
     const interaction = makeFakeButtonInteraction({customId: 'fb-approve:req-abc'})
 
@@ -732,11 +732,11 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then — registry called with correct params
-    expect(fakeRegistry.handleButtonDecision).toHaveBeenCalledWith({
+    expect(fakeRegistry.handleDecision).toHaveBeenCalledWith({
       requestID: 'req-abc',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-decider',
+      actor: {kind: 'discord-user', userId: 'user-decider'},
     })
 
     // #and — deferred then edited with approved ack
@@ -793,7 +793,7 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then — no registry call
-    expect(fakeRegistry.handleButtonDecision).not.toHaveBeenCalled()
+    expect(fakeRegistry.handleDecision).not.toHaveBeenCalled()
 
     // #and — deferReply was called first (interaction acked)
     expect(interaction.deferReply).toHaveBeenCalledWith({ephemeral: true})
@@ -814,7 +814,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('ok')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('ok')
 
     const interaction = makeFakeButtonInteraction({customId: 'fb-deny:req-abc'})
 
@@ -823,7 +823,7 @@ describe('button interaction handler (approval flow)', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then — decision is reject
-    expect(fakeRegistry.handleButtonDecision).toHaveBeenCalledWith(expect.objectContaining({decision: 'reject'}))
+    expect(fakeRegistry.handleDecision).toHaveBeenCalledWith(expect.objectContaining({decision: 'reject'}))
 
     // #and — deferred then edited with denied ack
     // editInteraction always injects allowedMentions: {parse: []}
@@ -841,7 +841,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('channel-mismatch')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('channel-mismatch')
 
     const interaction = makeFakeButtonInteraction()
 
@@ -863,7 +863,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('not-found')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('not-found')
 
     const interaction = makeFakeButtonInteraction()
 
@@ -885,7 +885,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('already-claimed')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('already-claimed')
 
     const interaction = makeFakeButtonInteraction()
 
@@ -907,7 +907,7 @@ describe('button interaction handler (approval flow)', () => {
 
     const {userIsAuthorized} = await import('./discord/mentions.js')
     vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
-    vi.mocked(fakeRegistry.handleButtonDecision).mockResolvedValueOnce('reply-failed')
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('reply-failed')
 
     const interaction = makeFakeButtonInteraction()
 

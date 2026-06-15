@@ -37,8 +37,25 @@ export const DEFAULT_SENSITIVE_FIELDS: readonly string[] = [
 
 const REDACTED = '[REDACTED]'
 
+// Cache key field names that must never be redacted even though they contain 'key'.
+// Exact lowercased name match — does NOT exempt partial matches like apikey or secret_key.
+// INVARIANT: every field name here must only ever carry a non-secret identifier (cache
+// keys, object-store keys). Never log a secret value under one of these field names —
+// in particular the bare `key` field, which is exempted globally.
+const EXEMPT_FIELD_NAMES: ReadonlySet<string> = new Set([
+  'savekey',
+  'primarykey',
+  'restorekeys',
+  'restoredkey',
+  'cachekey',
+  'key',
+])
+
 function isSensitiveField(fieldName: string, sensitivePatterns: readonly string[]): boolean {
   const lowerFieldName = fieldName.toLowerCase()
+  if (EXEMPT_FIELD_NAMES.has(lowerFieldName)) {
+    return false
+  }
   return sensitivePatterns.some(pattern => lowerFieldName.includes(pattern.toLowerCase()))
 }
 

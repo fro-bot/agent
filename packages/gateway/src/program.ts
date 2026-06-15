@@ -231,11 +231,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             }
 
             const decision = parsed.action === 'approve' ? ('once' as const) : ('reject' as const)
-            const outcome = await approvalRegistry.handleButtonDecision({
+            const outcome = await approvalRegistry.handleDecision({
               requestID: parsed.requestID,
-              channelID: interaction.channelId,
+              approvalScopeId: interaction.channelId,
               decision,
-              decidedBy: interaction.user.id,
+              actor: {kind: 'discord-user', userId: interaction.user.id},
             })
 
             const ackContent =

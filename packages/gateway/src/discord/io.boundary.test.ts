@@ -72,6 +72,26 @@ const ALLOWLISTED_FILES: readonly string[] = [
   // Deliberately-excluded best-effort site: recovery interruption note.
   // Already sets allowedMentions:{parse:[]} and catches; same firm scope boundary.
   'execute/recovery.ts',
+
+  // Transport-neutral execution engine.
+  // Uses `replySink.send(...)` which is the transport-neutral ReplySink interface,
+  // NOT a raw Discord `.send()` call. The `allowedMentions:{parse:[]}` guard is
+  // enforced by the Discord adapter's ReplySink implementation in `runMention`,
+  // not at the call site in the engine. The `.send(` pattern here is a method call
+  // on the sink interface, not on a Discord Thread/Message object.
+  'execute/run.ts',
+
+  // Transport-neutral type definitions.
+  // Contains `.send(` only in JSDoc block comments (not line comments) describing
+  // the ReplySink interface contract. No runtime Discord calls here.
+  'execute/launch-types.ts',
+
+  // Discord approval transport.
+  // Uses `replySink.send(...)` which is the transport-neutral ReplySink interface,
+  // NOT a raw Discord `.send()` call. The `allowedMentions:{parse:[]}` guard is
+  // enforced by the Discord adapter's ReplySink implementation in `runMention`.
+  // Also uses `editMessage(postedMessage, ...)` which IS the io.ts helper (not raw).
+  'approvals/discord-transport.ts',
 ]
 
 // ---------------------------------------------------------------------------
