@@ -197,7 +197,72 @@ describe('buildLogicalKey', () => {
     const result = buildLogicalKey(context)
 
     // #then
-    expect(result).toEqual({key: 'schedule-898cd73a', entityType: 'schedule', entityId: '898cd73a'})
+    expect(result).toEqual({
+      key: 'schedule-898cd73a-1001',
+      entityType: 'schedule',
+      entityId: '898cd73a-1001',
+    })
+  })
+
+  it('schedule key includes both cron hash and runId', () => {
+    // #given
+    const context = createTriggerContext({
+      eventType: 'schedule',
+      action: '0 0 * * *',
+      target: null,
+      runId: 9999,
+    })
+
+    // #when
+    const result = buildLogicalKey(context)
+
+    // #then — format is schedule-<8hex>-<runId>
+    expect(result?.key).toMatch(/^schedule-[0-9a-f]{8}-9999$/)
+    expect(result?.entityId).toMatch(/^[0-9a-f]{8}-9999$/)
+  })
+
+  it('same cron + same runId produces the same schedule key (rerun resumes)', () => {
+    // #given
+    const context1 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 42})
+    const context2 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 42})
+
+    // #when
+    const key1 = buildLogicalKey(context1)
+    const key2 = buildLogicalKey(context2)
+
+    // #then
+    expect(key1).toEqual(key2)
+  })
+
+  it('same cron + different runId produces different schedule keys (new run = fresh session)', () => {
+    // #given
+    const context1 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 100})
+    const context2 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 200})
+
+    // #when
+    const key1 = buildLogicalKey(context1)
+    const key2 = buildLogicalKey(context2)
+
+    // #then
+    expect(key1?.key).not.toEqual(key2?.key)
+    expect(key1?.entityId).not.toEqual(key2?.entityId)
+  })
+
+  it('missing schedule expression falls back to context.action for hash, still appends runId', () => {
+    // #given — raw event has no schedule expression, action is used as hash seed
+    const context = createTriggerContext({
+      eventType: 'schedule',
+      action: 'fallback-action',
+      target: null,
+      runId: 77,
+    })
+
+    // #when
+    const result = buildLogicalKey(context)
+
+    // #then — key still has runId appended
+    expect(result?.key).toMatch(/^schedule-[0-9a-f]{8}-77$/)
+    expect(result?.entityType).toBe('schedule')
   })
 
   it('builds workflow dispatch key from runId', () => {

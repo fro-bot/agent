@@ -1,11 +1,12 @@
 ---
 type: subsystem
-last-updated: "2026-06-07"
-updated-by: "cbc7008"
+last-updated: "2026-06-14"
+updated-by: "7065ca0"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
   - packages/runtime/src/session/prune.ts
+  - packages/runtime/src/session/logical-key.ts
   - packages/runtime/src/session/writeback.ts
   - packages/runtime/src/session/types.ts
   - packages/runtime/src/session/discovery.ts
@@ -116,6 +117,12 @@ The search module (`packages/runtime/src/session/search.ts`) provides two capabi
 
 During the session-prep phase of each run (see [[Execution Lifecycle]]), the system searches for sessions related to the current issue or PR. Matching excerpts are injected into the prompt as "Relevant Prior Work," giving the agent a lightweight summary of past interactions.
 
+## Logical Session Keys
+
+Continuity depends on each run resolving to a stable _logical session key_ derived from the triggering context (`packages/runtime/src/session/logical-key.ts`). For entity-bound events — issue comments, PR reviews, and the like — the key is built from the issue or PR identity, so a follow-up comment resumes the same thread the agent was already working in.
+
+Time-based triggers are subtler. Earlier, `schedule` runs keyed their logical session on the cron expression alone. Every scheduled run therefore resumed one ever-growing thread. As that single session's history bloated, the agent would read it, conclude the work was already done, and exit without making any tool calls — reporting success while silently doing nothing. To fix this, the schedule key now appends the workflow run ID to the cron-derived hash. Each scheduled run starts a fresh thread, while same-run reruns (which share a run ID) still resume correctly. The trade-off is deliberate: scheduled maintenance tasks are expected to be idempotent against the repository state they inspect, not against an accumulating conversation, so cross-run memory still flows through [run summary writeback](#run-summary-writeback) and `searchSessions` rather than through a shared thread.
+
 ## Pruning
 
 Without pruning, the storage directory would grow unboundedly. The pruning module (`packages/runtime/src/session/prune.ts`) uses a dual-condition retention policy:
@@ -126,6 +133,8 @@ A session is kept if **either**:
 - Its index is within the maximum session count (default: 50, configurable via the `session-retention` input).
 
 This "age OR count" approach prevents both unbounded growth (count limit) and premature deletion of recent sessions (age limit). When a parent session is pruned, its child sessions are cascade-deleted to avoid orphans.
+
+One exception exists for the legacy aggregate schedule session created before per-run keying. The count-based floor would otherwise keep that single bloated session alive indefinitely as long as it stayed within the recent-count window. Pruning recognizes the legacy title shape (`fro-bot: schedule-<8 hex>`, with no run-ID suffix) and force-expires it once it has aged past the cutoff, regardless of the count floor — clearing the stale thread that the keying fix was designed to retire.
 
 ## Run Summary Writeback
 
