@@ -58,6 +58,11 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #      (shared memory, semaphores, message queues), enabling lateral-movement
 #      within the host trust boundary.  ipc: service:<x>/container:<x>/
 #      shareable/private are not host-namespace escapes and are not rejected.
+#   1l. NO service may declare userns_mode: host — disables user-namespace
+#      remapping; when the daemon runs with --userns-remap, container-root is
+#      normally mapped to an unprivileged host UID, but userns_mode: host opts
+#      out, making container-root equivalent to host-root and amplifying any
+#      capability escape into a full host-root compromise.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -628,6 +633,34 @@ for _svc in sorted(services.keys()):
             "message queues); combined with SYS_PTRACE or other capabilities it "
             "enables host-process inspection and lateral-movement within the host "
             "trust boundary. Remove ipc: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1l: NO service may declare userns_mode: host.
+#
+# userns_mode: host disables user-namespace remapping for the container.
+# When the Docker daemon is configured with --userns-remap (user namespace
+# remapping), container-root is mapped to an unprivileged host UID.
+# Setting userns_mode: host opts the container out of that remapping,
+# making container-root equivalent to host-root.  Combined with any
+# capability escape or privileged operation, this amplifies the blast
+# radius: what would have been a remapped-UID escape becomes a full
+# host-root compromise.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _userns = _svc_cfg.get("userns_mode")
+    if _userns is not None and str(_userns).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares userns_mode: host — "
+            "userns_mode: host disables user-namespace remapping; when the Docker "
+            "daemon runs with --userns-remap, container-root is normally mapped to "
+            "an unprivileged host UID, but userns_mode: host opts out of that "
+            "remapping, making container-root equivalent to host-root and amplifying "
+            "any capability escape into a full host-root compromise. Remove userns_mode: host."
         )
 
 # ------------------------------------------------------------------

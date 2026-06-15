@@ -3599,6 +3599,290 @@ echo "${IPC_SERVICE_OUTPUT}" | sed 's/^/    /'
 # for Invariants 1k and the SYS_PTRACE addition to 1d as well.
 
 # ---------------------------------------------------------------------------
+# TEST 62 — Negative: userns_mode: host must be rejected (Invariant 1l).
+#
+# userns_mode: host disables user-namespace remapping; when the Docker daemon
+# runs with --userns-remap, container-root is normally mapped to an
+# unprivileged host UID.  userns_mode: host opts out, making container-root
+# equivalent to host-root and amplifying any capability escape.
+# The failure message must name the service and mention userns_mode:host.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 62: guard rejects userns_mode: host (Invariant 1l) ---"
+
+USERNS_HOST_COMPOSE="${TMPDIR_TEST}/compose-userns-host.yaml"
+cat > "${USERNS_HOST_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    userns_mode: host
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+USERNS_HOST_OUTPUT=""
+USERNS_HOST_EXIT=0
+USERNS_HOST_OUTPUT="$(COMPOSE_FILE="${USERNS_HOST_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || USERNS_HOST_EXIT=$?
+
+if [[ "${USERNS_HOST_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${USERNS_HOST_EXIT}) for userns_mode: host"
+else
+  fail "validate-stack.sh exited ZERO for userns_mode: host — Invariant 1l did NOT fire"
+fi
+
+if echo "${USERNS_HOST_OUTPUT}" | grep -q "workspace"; then
+  pass "userns_mode:host failure message names the service 'workspace'"
+else
+  fail "userns_mode:host failure message does not name 'workspace' — output: ${USERNS_HOST_OUTPUT}"
+fi
+
+if echo "${USERNS_HOST_OUTPUT}" | grep -qi "userns_mode"; then
+  pass "userns_mode:host failure message mentions 'userns_mode'"
+else
+  fail "userns_mode:host failure message does not mention 'userns_mode' — output: ${USERNS_HOST_OUTPUT}"
+fi
+
+echo ""
+echo "  userns-host-test output (stderr+stdout combined):"
+echo "${USERNS_HOST_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 63 — Positive: ipc: none must NOT be rejected (Invariant 1k positive
+#           control — non-host IPC mode allowed).
+#
+# ipc: none disables IPC namespace sharing entirely (the container gets its
+# own private IPC namespace with no sharing).  It is not a host-namespace
+# escape and must not be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 63: guard accepts ipc: none (non-host IPC mode, positive control) ---"
+
+IPC_NONE_COMPOSE="${TMPDIR_TEST}/compose-ipc-none.yaml"
+cat > "${IPC_NONE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    ipc: none
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+IPC_NONE_OUTPUT=""
+IPC_NONE_EXIT=0
+IPC_NONE_OUTPUT="$(COMPOSE_FILE="${IPC_NONE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || IPC_NONE_EXIT=$?
+
+if [[ "${IPC_NONE_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for ipc: none — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${IPC_NONE_EXIT}) for ipc: none — over-rejection: ${IPC_NONE_OUTPUT}"
+fi
+
+echo ""
+echo "  ipc-none-test output (stderr+stdout combined):"
+echo "${IPC_NONE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 64 — Positive: ipc: shareable must NOT be rejected (Invariant 1k
+#           positive control — non-host IPC mode allowed).
+#
+# ipc: shareable makes the container's IPC namespace shareable with other
+# containers (via ipc: container:<x>), but does NOT share the host IPC
+# namespace.  It is not a host-namespace escape and must not be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 64: guard accepts ipc: shareable (non-host IPC mode, positive control) ---"
+
+IPC_SHAREABLE_COMPOSE="${TMPDIR_TEST}/compose-ipc-shareable.yaml"
+cat > "${IPC_SHAREABLE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    ipc: shareable
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+IPC_SHAREABLE_OUTPUT=""
+IPC_SHAREABLE_EXIT=0
+IPC_SHAREABLE_OUTPUT="$(COMPOSE_FILE="${IPC_SHAREABLE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || IPC_SHAREABLE_EXIT=$?
+
+if [[ "${IPC_SHAREABLE_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for ipc: shareable — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${IPC_SHAREABLE_EXIT}) for ipc: shareable — over-rejection: ${IPC_SHAREABLE_OUTPUT}"
+fi
+
+echo ""
+echo "  ipc-shareable-test output (stderr+stdout combined):"
+echo "${IPC_SHAREABLE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 65 — Negative: ipc: HOST (uppercase) must be rejected (case
+#           normalization — Invariant 1k).
+#
+# The guard normalizes via .strip().lower() before comparing, so uppercase
+# "HOST" must be caught the same as lowercase "host".
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 65: guard rejects ipc: HOST (uppercase — case normalization, Invariant 1k) ---"
+
+IPC_HOST_UPPER_COMPOSE="${TMPDIR_TEST}/compose-ipc-host-upper.yaml"
+cat > "${IPC_HOST_UPPER_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    ipc: HOST
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+IPC_HOST_UPPER_OUTPUT=""
+IPC_HOST_UPPER_EXIT=0
+IPC_HOST_UPPER_OUTPUT="$(COMPOSE_FILE="${IPC_HOST_UPPER_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || IPC_HOST_UPPER_EXIT=$?
+
+if [[ "${IPC_HOST_UPPER_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${IPC_HOST_UPPER_EXIT}) for ipc: HOST (uppercase)"
+else
+  fail "validate-stack.sh exited ZERO for ipc: HOST (uppercase) — case normalization did NOT fire"
+fi
+
+if echo "${IPC_HOST_UPPER_OUTPUT}" | grep -qi "ipc"; then
+  pass "ipc:HOST uppercase failure message mentions 'ipc'"
+else
+  fail "ipc:HOST uppercase failure message does not mention 'ipc' — output: ${IPC_HOST_UPPER_OUTPUT}"
+fi
+
+echo ""
+echo "  ipc-host-upper-test output (stderr+stdout combined):"
+echo "${IPC_HOST_UPPER_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 66 — Negative: cap_add as a scalar string (not a list) must be
+#           rejected (scalar-string guard — Invariant 1d).
+#
+# Raw YAML allows cap_add to be written as a bare scalar string instead of
+# a list.  The guard wraps a bare string into a single-element list before
+# checking, so "cap_add: SYS_PTRACE" (scalar) must be caught the same as
+# "cap_add: [SYS_PTRACE]" (list).
+#
+# docker compose config rejects scalar cap_add as invalid schema, so this
+# test exercises the raw-YAML fallback path.  Gated on PyYAML availability
+# (same as TEST 22 which also requires the raw-YAML path).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 66: guard rejects cap_add: SYS_PTRACE as scalar string (scalar guard, Invariant 1d, raw-YAML path) ---"
+
+CAP_SCALAR_COMPOSE="${TMPDIR_TEST}/compose-cap-scalar.yaml"
+cat > "${CAP_SCALAR_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add: SYS_PTRACE
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  CAP_SCALAR_OUTPUT=""
+  CAP_SCALAR_EXIT=0
+  CAP_SCALAR_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${CAP_SCALAR_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SCALAR_EXIT=$?
+
+  if [[ "${CAP_SCALAR_EXIT}" -ne 0 ]]; then
+    pass "validate-stack.sh exited non-zero (${CAP_SCALAR_EXIT}) for cap_add: SYS_PTRACE (scalar string, raw-YAML path)"
+  else
+    fail "validate-stack.sh exited ZERO for cap_add: SYS_PTRACE (scalar string, raw-YAML path) — scalar guard did NOT fire"
+  fi
+
+  if echo "${CAP_SCALAR_OUTPUT}" | grep -qi "SYS_PTRACE\|cap_add"; then
+    pass "scalar cap_add failure message mentions SYS_PTRACE or cap_add"
+  else
+    fail "scalar cap_add failure message does not mention SYS_PTRACE or cap_add — output: ${CAP_SCALAR_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  cap-scalar-test output (stderr+stdout combined):"
+  echo "${CAP_SCALAR_OUTPUT}" | sed 's/^/    /'
+else
+  echo "  SKIP: scalar cap_add (raw-YAML path): PyYAML not available — install python3-yaml/PyYAML to run this test."
+  echo "        (docker compose config rejects scalar cap_add as invalid schema; raw-YAML path is required)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
