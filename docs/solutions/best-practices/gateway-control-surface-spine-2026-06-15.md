@@ -98,6 +98,8 @@ All three are correctness/security regressions that tests written *after* the re
 
 ### 1) Public front door + private inner primitive
 
+The request/deps shapes below are illustrative — see `launch-types.ts` for the canonical signatures.
+
 ```ts
 // PUBLIC: owns queue + concurrency cap + FIFO handoff. The only way in.
 export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDeps): Promise<void> {
