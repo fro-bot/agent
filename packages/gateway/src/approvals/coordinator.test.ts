@@ -275,7 +275,7 @@ describe('createPermissionCoordinator', () => {
     sharedRegistry.register({
       requestID: 'per_A',
       sessionID: 'ses_A',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       directory: '/ws/a',
       request: reqA,
       effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
@@ -285,7 +285,7 @@ describe('createPermissionCoordinator', () => {
     sharedRegistry.register({
       requestID: 'per_B',
       sessionID: 'ses_B',
-      channelID: 'chan_2',
+      approvalScopeId: 'chan_2',
       directory: '/ws/b',
       request: reqB,
       effects: {postReply: vi.fn().mockResolvedValue({ok: true})},

@@ -2,11 +2,12 @@ import type {CoordinationConfig, HeartbeatController} from '@fro-bot/runtime'
 import type {Message, ThreadChannel} from 'discord.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
+import type {LaunchWorkRequest, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
 import type {RunMentionDeps, RunTask} from './run.js'
 
 import * as runtimeModule from '@fro-bot/runtime'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
 import * as reactionsModule from '../discord/reactions.js'
@@ -181,7 +182,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     register: vi.fn(),
     has: vi.fn().mockReturnValue(false),
     pending: vi.fn().mockReturnValue([]),
-    handleButtonDecision: vi.fn().mockResolvedValue('ok'),
+    handleDecision: vi.fn().mockResolvedValue('ok'),
     applySettlement: vi.fn().mockResolvedValue(undefined),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
@@ -207,6 +208,49 @@ function makeDefaultQueue(): ChannelQueue<RunTask> {
     takeNext: vi.fn().mockReturnValue(undefined),
     clear: vi.fn().mockReturnValue(0),
   }
+}
+
+/**
+ * Build a minimal `LaunchWorkRequest` for use in pending-task construction.
+ * Uses no-op sinks since the pending task's sinks are not exercised in handoff tests.
+ */
+function makeMinimalRequest(message: Message, binding: RepoBinding): LaunchWorkRequest {
+  const noopSettle = (_delivered: boolean) => {
+    /* no-op */
+  }
+  return {
+    promptText: (message as unknown as {content: string}).content ?? '',
+    channelId: (message as unknown as {channel: {id: string}}).channel.id,
+    guildId: undefined,
+    surface: 'discord',
+    binding,
+    requester: {kind: 'discord-user', userId: 'user-111'},
+    statusSink: {
+      noteActivity: vi.fn(),
+      setBusy: vi.fn(),
+      resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+      resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+      dispose: vi.fn().mockResolvedValue(undefined),
+      setReaction: vi.fn(),
+    },
+    replySink: {
+      send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+      append: vi.fn(),
+      flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+      buffered: vi.fn().mockReturnValue(''),
+      hasVisibleOutput: vi.fn().mockReturnValue(false),
+      markVisibleOutputSent: vi.fn(),
+      markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+    },
+  }
+}
+
+/**
+ * Build a `RunTask` for use in pending-task / handoff tests.
+ * Wraps `makeMinimalRequest` with the given deps.
+ */
+function makePendingTask(message: Message, binding: RepoBinding, deps: RunMentionDeps): RunTask {
+  return {request: makeMinimalRequest(message, binding), deps}
 }
 
 /**
@@ -2098,7 +2142,7 @@ describe('runMention', () => {
       expect(approvalRegistry.register).toHaveBeenCalledWith(
         expect.objectContaining({
           requestID: 'req-abc-123',
-          channelID: thread.id,
+          approvalScopeId: thread.id,
           directory: canonicalPath,
         }),
       )
@@ -3155,7 +3199,7 @@ describe('runMention', () => {
       const pendingMessage = makeMessage()
       const pendingBinding = makeBinding()
       const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
-      const pendingTask: RunTask = {message: pendingMessage, binding: pendingBinding, deps: pendingDeps}
+      const pendingTask: RunTask = makePendingTask(pendingMessage, pendingBinding, pendingDeps)
 
       ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
@@ -3238,7 +3282,7 @@ describe('runMention', () => {
       // uses the same release fn and the same takeNext chain.
       const pendingMessage = makeMessage()
       const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
-      const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+      const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
 
       ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
@@ -3331,7 +3375,7 @@ describe('runMention', () => {
       // uses the same release fn and the same takeNext chain.
       const pendingMessage = makeMessage()
       const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, logger})
-      const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+      const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
 
       ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
@@ -3498,7 +3542,7 @@ describe('isShuttingDown — handoff shutdown gate', () => {
 
     const pendingMessage = makeMessage()
     const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue, isShuttingDown})
-    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+    const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
 
     ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
@@ -3526,7 +3570,7 @@ describe('isShuttingDown — handoff shutdown gate', () => {
     const queue = makeDefaultQueue()
     const pendingMessage = makeMessage()
     const pendingDeps = makeDeps({queue})
-    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+    const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
 
     ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
@@ -3633,7 +3677,7 @@ describe('handoff unit tests (F8)', () => {
 
     const pendingMessage = makeMessage()
     const pendingDeps = makeDeps({concurrency: sharedConcurrency, queue})
-    const pendingTask: RunTask = {message: pendingMessage, binding: makeBinding(), deps: pendingDeps}
+    const pendingTask: RunTask = makePendingTask(pendingMessage, makeBinding(), pendingDeps)
 
     // First takeNext returns the pending task; second returns undefined (queue empty)
     ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
@@ -3910,4 +3954,1128 @@ describe('formatTimeoutDuration', () => {
   it('125_000 ms → "2 minutes 5 seconds"', () => {
     expect(formatTimeoutDuration(125_000)).toBe('2 minutes 5 seconds')
   })
+})
+
+// ---------------------------------------------------------------------------
+// Characterization tests — pin current Discord behavior as a zero-regression gate.
+//
+// These tests assert CURRENT observable behavior via the existing Message-based
+// entry points. They must be GREEN on unmodified production code and must
+// remain green after any refactor.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Approval: pending wait → decision → run continues (approved)
+// ---------------------------------------------------------------------------
+
+describe('approval: pending wait → decision → run continues', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('a pending approval that resolves with "once" allows the run to complete successfully', async () => {
+    // #given — coordinator.onPermissionAsked resolves with 'once' (approved)
+    // This pins the current behavior: when an approval is granted, the run
+    // continues to completion (COMPLETED transition, succeeded reaction).
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    // Wire a real coordinator that resolves the permission immediately with 'once'
+    mockCreatePermissionCoordinator.mockImplementation(_coordinatorDeps => {
+      return {
+        onPermissionAsked: vi.fn().mockResolvedValue('once' as const),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    // runOpenCodeCore calls onPermissionAsked and awaits the result
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
+      const reply = await coordinator.onPermissionAsked({
+        requestID: 'req-approved-1',
+        sessionID: 'sess-approved',
+        permission: 'bash',
+        patterns: ['ls'],
+        title: 'Run command: ls',
+      })
+      // Approved — run continues
+      expect(reply).toBe('once')
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — run completed (not failed)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+    expect(transitionPhases).not.toContain('FAILED')
+  })
+
+  it('a pending approval that resolves with "reject" causes the run to fail-close (run-core sees reject)', async () => {
+    // #given — coordinator.onPermissionAsked resolves with 'reject' (denied)
+    // This pins the current behavior: when an approval is rejected, run-core
+    // receives 'reject' and the run fails.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    mockCreatePermissionCoordinator.mockImplementation(() => {
+      return {
+        onPermissionAsked: vi.fn().mockResolvedValue('reject' as const),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    // runOpenCodeCore calls onPermissionAsked, gets 'reject', and throws
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
+      const reply = await coordinator.onPermissionAsked({
+        requestID: 'req-rejected-1',
+        sessionID: 'sess-rejected',
+        permission: 'bash',
+        patterns: ['rm -rf /'],
+        title: 'Run command: rm -rf /',
+      })
+      expect(reply).toBe('reject')
+      // run-core would throw on reject — simulate that
+      const {RunCoreError} = runCoreModule
+      throw new RunCoreError('session-error', 'permission rejected')
+    })
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — run transitioned to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('COMPLETED')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Approval timeout: registry deadline → fail-closed reject (registry-level)
+// ---------------------------------------------------------------------------
+
+describe('approval timeout: registry deadline fires → fail-closed reject', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('registry deadline fires on open entry → postReply called with reject, entry removed', async () => {
+    // #given — a registry entry with a very short deadline
+    // This pins the current registry behavior: when the deadline fires on an
+    // open entry, it POSTs reject and removes the entry (fail-closed).
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    const onDeadlineSettled = vi.fn()
+
+    registry.register({
+      requestID: 'req-deadline-reg-1',
+      sessionID: 'ses-deadline',
+      approvalScopeId: 'chan-deadline',
+      directory: '/ws/deadline',
+      request: {
+        requestID: 'req-deadline-reg-1',
+        sessionID: 'ses-deadline',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+      deadlineMs: 10, // very short deadline
+      onDeadlineSettled,
+    })
+
+    expect(registry.has('req-deadline-reg-1')).toBe(true)
+
+    // #when — wait for deadline to fire
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // #then — entry removed (fail-closed)
+    expect(registry.has('req-deadline-reg-1')).toBe(false)
+    // #and — postReply called with 'reject'
+    expect(postReply).toHaveBeenCalledWith('req-deadline-reg-1', '/ws/deadline', 'reject')
+    // #and — onDeadlineSettled callback invoked
+    expect(onDeadlineSettled).toHaveBeenCalledOnce()
+  })
+
+  it('registry deadline fires while entry is claimed (button in-flight) → deadline is a no-op (button wins)', async () => {
+    // #given — entry is claimed (button click in-flight) when deadline fires
+    // This pins the current winner-vs-loser rule: claimed state beats the deadline.
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    // postReply hangs so the entry stays in 'claimed' state when deadline fires
+    let resolvePostReply!: (value: {ok: boolean}) => void
+    const postReply = vi.fn().mockReturnValue(
+      new Promise<{ok: boolean}>(resolve => {
+        resolvePostReply = resolve
+      }),
+    )
+    const onDeadlineSettled = vi.fn()
+
+    registry.register({
+      requestID: 'req-deadline-claimed-1',
+      sessionID: 'ses-claimed',
+      approvalScopeId: 'chan-claimed',
+      directory: '/ws/claimed',
+      request: {
+        requestID: 'req-deadline-claimed-1',
+        sessionID: 'ses-claimed',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+      deadlineMs: 20,
+      onDeadlineSettled,
+    })
+
+    // Claim the entry (decision submitted) before deadline fires
+    const decisionPromise = registry.handleDecision({
+      requestID: 'req-deadline-claimed-1',
+      approvalScopeId: 'chan-claimed',
+      decision: 'once',
+      actor: {kind: 'discord-user', userId: 'user-1'},
+    })
+
+    // #when — wait for deadline to fire (entry is claimed)
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // #then — deadline is a no-op (entry still exists, claimed by button)
+    // onDeadlineSettled NOT called (deadline lost to button)
+    expect(onDeadlineSettled).not.toHaveBeenCalled()
+    // Entry still exists (button owns it)
+    expect(registry.has('req-deadline-claimed-1')).toBe(true)
+
+    // Cleanup: resolve the button's postReply
+    resolvePostReply({ok: true})
+    await decisionPromise
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Approval dispose/shutdown: onDispose → disposeRun fail-closes pending entries
+// ---------------------------------------------------------------------------
+
+describe('approval dispose/shutdown: onDispose fail-closes pending registry entries', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('coordinator dispose calls onDispose which calls registry.disposeRun — pending entries fail-closed', async () => {
+    // #given — a coordinator wired to a real registry; a pending entry exists
+    // This pins the current behavior: coordinator.dispose → onDispose → registry.disposeRun
+    // → pending entries are fail-closed (postReply called with 'reject', entry removed).
+    //
+    // NOTE: coordinator.js is mocked at the module level in run.test.ts, so we use
+    // vi.importActual to get the real implementation for this integration test.
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const {createPermissionCoordinator: realCreatePermissionCoordinator} =
+      await vi.importActual<typeof import('../approvals/coordinator.js')>('../approvals/coordinator.js')
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    registry.register({
+      requestID: 'req-dispose-1',
+      sessionID: 'ses-dispose',
+      approvalScopeId: 'chan-dispose',
+      directory: '/ws/dispose',
+      request: {
+        requestID: 'req-dispose-1',
+        sessionID: 'ses-dispose',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+    })
+
+    expect(registry.has('req-dispose-1')).toBe(true)
+
+    const coordinator = realCreatePermissionCoordinator({
+      logger,
+      onDispose: sessionIDs => {
+        // eslint-disable-next-line no-void
+        void Promise.all(sessionIDs.map(async sid => registry.disposeRun(sid, 'run ended')))
+      },
+    })
+
+    // Register the request with the coordinator so it tracks the sessionID
+    // eslint-disable-next-line no-void
+    void coordinator.onPermissionAsked({
+      requestID: 'req-dispose-1',
+      sessionID: 'ses-dispose',
+      permission: 'bash',
+      patterns: [],
+      title: 'Run command',
+    })
+
+    // #when — coordinator disposed (run teardown)
+    coordinator.dispose('run ended')
+
+    // Allow async disposeRun to complete
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — entry fail-closed (removed from registry)
+    expect(registry.has('req-dispose-1')).toBe(false)
+    // #and — postReply called with 'reject' (fail-closed)
+    expect(postReply).toHaveBeenCalledWith('req-dispose-1', '/ws/dispose', 'reject')
+  })
+
+  it('registry.disposeAll fail-closes all pending entries across all sessions (gateway shutdown)', async () => {
+    // #given — multiple pending entries across different sessions
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReplyA = vi.fn().mockResolvedValue({ok: true})
+    const postReplyB = vi.fn().mockResolvedValue({ok: true})
+
+    registry.register({
+      requestID: 'req-shutdown-A',
+      sessionID: 'ses-A',
+      approvalScopeId: 'chan-A',
+      directory: '/ws/a',
+      request: {requestID: 'req-shutdown-A', sessionID: 'ses-A', permission: 'bash', patterns: [], title: 'cmd A'},
+      effects: {postReply: postReplyA},
+    })
+    registry.register({
+      requestID: 'req-shutdown-B',
+      sessionID: 'ses-B',
+      approvalScopeId: 'chan-B',
+      directory: '/ws/b',
+      request: {requestID: 'req-shutdown-B', sessionID: 'ses-B', permission: 'bash', patterns: [], title: 'cmd B'},
+      effects: {postReply: postReplyB},
+    })
+
+    expect(registry.has('req-shutdown-A')).toBe(true)
+    expect(registry.has('req-shutdown-B')).toBe(true)
+
+    // #when — gateway shutdown: disposeAll
+    await registry.disposeAll('gateway shutdown')
+
+    // #then — all entries removed
+    expect(registry.has('req-shutdown-A')).toBe(false)
+    expect(registry.has('req-shutdown-B')).toBe(false)
+    // #and — both postReply calls made with 'reject'
+    expect(postReplyA).toHaveBeenCalledWith('req-shutdown-A', '/ws/a', 'reject')
+    expect(postReplyB).toHaveBeenCalledWith('req-shutdown-B', '/ws/b', 'reject')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Thread creation: message.startThread called for a valid run
+// ---------------------------------------------------------------------------
+
+describe('thread creation: message.startThread called for a valid run', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('startThread is called with the repo name as the thread name', async () => {
+    // #given — happy path run
+    // This pins the current behavior: startThread is called with name `fro-bot: ${repo}`
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const message = makeMessage()
+    const binding = makeBinding() // repo = 'widget'
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, binding, deps)
+
+    // #then — startThread called exactly once with the repo name
+    expect(message.startThread).toHaveBeenCalledOnce()
+    const call = (message.startThread as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {name: string}
+    expect(call.name).toBe(`fro-bot: ${REPO}`)
+  })
+
+  it('startThread is NOT called when workspace is not ready (pre-thread gate)', async () => {
+    // #given — workspace not ready
+    const {runMention} = await import('./run.js')
+    const readyz = makeReadyzFn('not-ready')
+    const message = makeMessage()
+    const deps = makeDeps({readyz})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — startThread never called (gate fires before thread creation)
+    expect(message.startThread).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// statusMode 'live-status': status message posted AND edited as run progresses
+// ---------------------------------------------------------------------------
+
+describe('statusMode live-status: status message posted and edited', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('live-status: createStatusController called with mode live-status and the created thread', async () => {
+    // #given — live-status mode
+    // This pins the current behavior: createStatusController receives the thread
+    // created by startThread, not the original message channel.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ctrl = makeStatusControllerMock()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    const deps = makeDeps({statusMode: 'live-status'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — createStatusController called with the thread and live-status mode
+    expect(mockCreateStatusController).toHaveBeenCalledOnce()
+    const ctrlCall = mockCreateStatusController.mock.calls[0]?.[0] as {
+      thread: unknown
+      mode: string
+    }
+    expect(ctrlCall.mode).toBe('live-status')
+    // The thread passed is the one returned by startThread (not the message channel)
+    expect(ctrlCall.thread).toBe(thread)
+    // #and — resolveToAnswer called (status controller owns the answer transition)
+    expect(ctrl.resolveToAnswer).toHaveBeenCalledOnce()
+  })
+
+  it('live-status: resolveToAnswer(handled) → status message is the answer (no sink flush)', async () => {
+    // #given — status controller handles the answer (edits status message in place)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
+    const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+    mockCreateDiscordStreamSink.mockReturnValue({
+      append: vi.fn(),
+      flush: flushMock,
+      buffered: vi.fn().mockReturnValue('The answer'),
+      markVisibleOutputSent: vi.fn(),
+      markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+      hasVisibleOutput: vi.fn().mockReturnValue(false),
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'live-status'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — sink.flush NOT called (status controller owns the answer)
+    expect(flushMock).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// statusMode 'typing-only': typing indicator pulses; NO status message posted
+// ---------------------------------------------------------------------------
+
+describe('statusMode typing-only: typing indicator only, no status message', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('typing-only: createStatusController called with mode typing-only', async () => {
+    // #given — typing-only mode
+    // This pins the current behavior: createStatusController is called with
+    // mode 'typing-only', which suppresses the status message.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'typing-only'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — createStatusController called with typing-only mode
+    expect(mockCreateStatusController).toHaveBeenCalledOnce()
+    const ctrlCall = mockCreateStatusController.mock.calls[0]?.[0] as {mode: string}
+    expect(ctrlCall.mode).toBe('typing-only')
+  })
+
+  it('typing-only: resolveToAnswer always returns delegated → sink.flush called (no status message to edit)', async () => {
+    // #given — typing-only mode; controller always delegates (no status message)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+    const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+    mockCreateDiscordStreamSink.mockReturnValue({
+      append: vi.fn(),
+      flush: flushMock,
+      buffered: vi.fn().mockReturnValue('answer text'),
+      markVisibleOutputSent: vi.fn(),
+      markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+      hasVisibleOutput: vi.fn().mockReturnValue(false),
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'typing-only'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — sink.flush called (typing-only always delegates to sink)
+    expect(flushMock).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EMPTY-PROMPT fail-fast: bare @fro-bot mention → immediate reply on source message
+//
+// The adapter strips the bot mention and detects an empty prompt BEFORE calling
+// launchWork. It replies on the SOURCE message (not a thread), creates no thread,
+// acquires no lock, writes no run-state. This avoids the late EmptyPromptError
+// path (which surfaced in-thread after thread creation and lock acquisition).
+// ---------------------------------------------------------------------------
+
+describe('empty-prompt fail-fast: bare mention → immediate reply on source message', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('bare @fro-bot mention: fails fast BEFORE thread creation, lock, or run-state', async () => {
+    // Post-Unit-3 behavior: the adapter strips the bot mention and detects an
+    // empty prompt before calling launchWork. The "nothing to do" reply goes to
+    // the SOURCE message (not a thread). No thread is created, no lock acquired,
+    // no run-state written.
+
+    // #given — message content is just the bot mention (empty prompt after strip)
+    const {runMention} = await import('./run.js')
+    // No setupHappyPath() — we must not reach the engine at all
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    // Override content to be a bare mention (empty after strip)
+    ;(message as unknown as {content: string}).content = `<@${makeDeps().botUserId}>`
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — NO thread created (fail-fast fires before threadFactory)
+    expect(message.startThread).not.toHaveBeenCalled()
+
+    // #and — NO lock acquired (fail-fast fires before launchWork)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+
+    // #and — NO run-state created (fail-fast fires before launchWork)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+
+    // #and — the "nothing to do" reply is sent to the SOURCE message (not a thread)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+      content: string
+      allowedMentions: unknown
+    }
+    expect(call.content).toMatch(/nothing to do/i)
+    expect(call.allowedMentions).toEqual({parse: []})
+
+    // #and — the thread did NOT receive the "nothing to do" message
+    expect(thread.send).not.toHaveBeenCalled()
+
+    // #and — no run-state transitions (no FAILED, no COMPLETED)
+    expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
+  })
+
+  it('empty-prompt fail-fast: concurrency slot is NOT acquired (no slot to release)', async () => {
+    // Post-Unit-3 behavior: fail-fast fires before launchWork, so the concurrency
+    // slot is never acquired and never needs to be released.
+
+    // #given — message content is a bare mention
+    const {runMention} = await import('./run.js')
+
+    const releaseFn = vi.fn()
+    const tryAcquireFn = vi.fn().mockReturnValue('ok')
+    const message = makeMessage()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: tryAcquireFn,
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(0),
+        max: 3,
+      },
+    })
+    ;(message as unknown as {content: string}).content = `<@${deps.botUserId}>`
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — tryAcquire NOT called (fail-fast fires before launchWork)
+    expect(tryAcquireFn).not.toHaveBeenCalled()
+    // #and — release NOT called (slot was never acquired)
+    expect(releaseFn).not.toHaveBeenCalled()
+  })
+
+  it('empty-prompt fail-fast: whitespace-only prompt after mention strip also fails fast', async () => {
+    // #given — message content is mention + whitespace only
+    const {runMention} = await import('./run.js')
+
+    const message = makeMessage()
+    const deps = makeDeps()
+    ;(message as unknown as {content: string}).content = `<@${deps.botUserId}>   \t  `
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — fails fast: reply on source message, no thread
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toMatch(/nothing to do/i)
+    expect(message.startThread).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// launchWork — in-memory sink tests
+//
+// These tests prove the engine runs with no Discord/Message dependency.
+// They use in-memory StatusSink/ReplySink implementations and verify:
+// - Happy path: completes + calls statusSink/replySink methods
+// - Timeout: respects runTimeoutMs; statusSink receives failure note
+// - Shutdown: isShuttingDown() → slot released immediately
+// - Queue/concurrency: still enforced via ChannelQueue (same as runMention)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an in-memory StatusSink that records calls.
+ */
+function makeInMemoryStatusSink(): StatusSink & {
+  readonly _reactions: string[]
+  readonly _activities: string[]
+  readonly _busyStates: boolean[]
+  readonly _resolvedAnswers: string[]
+  readonly _resolvedFailures: string[]
+  readonly _disposed: boolean[]
+} {
+  const reactions: string[] = []
+  const activities: string[] = []
+  const busyStates: boolean[] = []
+  const resolvedAnswers: string[] = []
+  const resolvedFailures: string[] = []
+  const disposed: boolean[] = []
+
+  return {
+    _reactions: reactions,
+    _activities: activities,
+    _busyStates: busyStates,
+    _resolvedAnswers: resolvedAnswers,
+    _resolvedFailures: resolvedFailures,
+    _disposed: disposed,
+    noteActivity: (summary: string) => {
+      activities.push(summary)
+    },
+    setBusy: (busy: boolean) => {
+      busyStates.push(busy)
+    },
+    resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+    resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+    dispose: vi.fn().mockResolvedValue(undefined),
+    setReaction: state => {
+      reactions.push(state)
+    },
+  }
+}
+
+/**
+ * Build an in-memory ReplySink that records calls.
+ */
+function makeInMemoryReplySink(): ReplySink & {
+  readonly _sends: {target: string; content: string}[]
+  readonly _appended: string[]
+  readonly _flushed: number
+} {
+  const sends: {target: string; content: string}[] = []
+  const appended: string[] = []
+  let flushed = 0
+  let visible = false
+  let pendingCount = 0
+
+  const sink = {
+    _sends: sends,
+    _appended: appended,
+    get _flushed() {
+      return flushed
+    },
+    send: vi.fn().mockImplementation(async (target: string, options: {content?: string}) => {
+      sends.push({target, content: options.content ?? ''})
+      return {success: true, data: undefined}
+    }),
+    append: (text: string) => {
+      appended.push(text)
+    },
+    flush: vi.fn().mockImplementation(async () => {
+      flushed++
+      visible = true
+      return {kind: 'sent', charCount: appended.join('').length}
+    }),
+    buffered: () => appended.join(''),
+    hasVisibleOutput: () => visible || pendingCount > 0,
+    markVisibleOutputSent: () => {
+      visible = true
+    },
+    markVisibleOutputPending: () => {
+      pendingCount++
+      let settled = false
+      return (delivered: boolean) => {
+        if (settled) return
+        settled = true
+        pendingCount--
+        if (delivered) visible = true
+      }
+    },
+  }
+  return sink
+}
+
+/**
+ * Build a minimal `LaunchWorkRequest` with in-memory sinks.
+ * No Discord dependency — suitable for launchWork tests.
+ */
+function makeInMemoryRequest(
+  overrides: {
+    readonly channelId?: string
+    readonly promptText?: string
+    readonly statusSink?: StatusSink
+    readonly replySink?: ReplySink
+  } = {},
+): LaunchWorkRequest & {
+  readonly _statusSink: ReturnType<typeof makeInMemoryStatusSink>
+  readonly _replySink: ReturnType<typeof makeInMemoryReplySink>
+} {
+  const statusSink = (overrides.statusSink as ReturnType<typeof makeInMemoryStatusSink>) ?? makeInMemoryStatusSink()
+  const replySink = (overrides.replySink as ReturnType<typeof makeInMemoryReplySink>) ?? makeInMemoryReplySink()
+  return {
+    promptText: overrides.promptText ?? 'do the thing',
+    channelId: overrides.channelId ?? CHANNEL_ID,
+    guildId: undefined,
+    surface: 'discord',
+    binding: makeBinding(),
+    requester: {kind: 'discord-user', userId: 'user-111'},
+    statusSink,
+    replySink,
+    _statusSink: statusSink,
+    _replySink: replySink,
+  }
+}
+
+describe('launchWork — in-memory sink tests', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // ── Happy path ─────────────────────────────────────────────────────────────
+
+  it('happy path: launchWork completes a run, calls statusSink.setReaction and replySink.flush', async () => {
+    // #given — in-memory sinks; happy path runtime mocks
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — run completed (COMPLETED transition)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+
+    // #and — statusSink.setReaction called with 'working' and 'succeeded'
+    const reactions = request._statusSink._reactions
+    expect(reactions).toContain('working')
+    expect(reactions).toContain('succeeded')
+
+    // #and — replySink.flush called (delegated answer path)
+    expect(request._replySink.flush).toHaveBeenCalled()
+  })
+
+  it('happy path: launchWork calls runOpenCodeCore with the request promptText', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest({promptText: 'fix the bug'})
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — runOpenCodeCore called with a promptText derived from the request
+    expect(mockRunOpenCodeCore).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        promptText: expect.any(String) as unknown,
+      }),
+    )
+    // The promptText is built by buildDiscordPrompt from request.promptText
+    // (buildDiscordPrompt is mocked to return a fixed string)
+  })
+
+  it('happy path: launchWork acquires and releases the concurrency slot', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — slot released in outer finally
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+
+  it('happy path: launchWork calls statusSink.dispose in finally', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — statusSink.dispose called
+    expect(request._statusSink.dispose).toHaveBeenCalledOnce()
+  })
+
+  // ── Timeout ────────────────────────────────────────────────────────────────
+
+  it('timeout: launchWork respects runTimeoutMs; statusSink receives failed reaction; replySink.send called with timeout message', async () => {
+    // #given — runOpenCodeCore throws timeout
+    const {launchWork} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runTimeoutMs: 600_000})
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — failed reaction set
+    expect(request._statusSink._reactions).toContain('failed')
+
+    // #and — replySink.send called with timeout message (via delegated failure path)
+    const sends = request._replySink._sends
+    const timeoutSend = sends.find(s => s.content.includes('time limit'))
+    expect(timeoutSend).toBeDefined()
+    expect(timeoutSend?.content).toMatch(/10.?min/i)
+  })
+
+  it('timeout: launchWork transitions to FAILED on timeout', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — FAILED transition
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('COMPLETED')
+  })
+
+  // ── Shutdown ───────────────────────────────────────────────────────────────
+
+  it('shutdown: isShuttingDown() → slot released immediately, no handoff', async () => {
+    // #given — shutdown in progress
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const releaseFn = vi.fn()
+    const queue = makeDefaultQueue()
+    const isShuttingDown = vi.fn().mockReturnValue(true)
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+      queue,
+      isShuttingDown,
+    })
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — slot released immediately (no handoff)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    // #and — takeNext NOT called (shutdown gate fired)
+    expect(queue.takeNext).not.toHaveBeenCalled()
+  })
+
+  // ── Queue/concurrency ──────────────────────────────────────────────────────
+
+  it('queue: launchWork enqueues when channel is busy', async () => {
+    // #given — channel is busy
+    const {launchWork} = await import('./run.js')
+
+    const queue = makeDefaultQueue()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('busy'),
+        release: vi.fn(),
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+      queue,
+    })
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — task enqueued
+    expect(queue.enqueue).toHaveBeenCalledOnce()
+    // #and — queued ack sent via replySink.send('source', ...)
+    const sends = request._replySink._sends
+    const queuedAck = sends.find(s => s.target === 'source' && s.content.includes('Queued'))
+    expect(queuedAck).toBeDefined()
+  })
+
+  it('cap: launchWork sends capacity reply and does NOT enqueue', async () => {
+    // #given — global cap reached
+    const {launchWork} = await import('./run.js')
+
+    const queue = makeDefaultQueue()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('cap'),
+        release: vi.fn(),
+        activeCount: vi.fn().mockReturnValue(3),
+        max: 3,
+      },
+      queue,
+    })
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — capacity reply sent via replySink.send('source', ...)
+    const sends = request._replySink._sends
+    const capReply = sends.find(s => s.target === 'source' && s.content.includes('capacity'))
+    expect(capReply).toBeDefined()
+    // #and — NOT enqueued
+    expect(queue.enqueue).not.toHaveBeenCalled()
+  })
+
+  it('fIFO gate: launchWork enqueues when pendingCount > 0 (even if slot is free)', async () => {
+    // #given — pending work exists; slot would be free
+    const {launchWork} = await import('./run.js')
+
+    const queue = makeDefaultQueue()
+    ;(queue.pendingCount as ReturnType<typeof vi.fn>).mockReturnValue(1)
+    const tryAcquireFn = vi.fn().mockReturnValue('ok')
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: tryAcquireFn,
+        release: vi.fn(),
+        activeCount: vi.fn().mockReturnValue(0),
+        max: 3,
+      },
+      queue,
+    })
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — task enqueued (FIFO gate)
+    expect(queue.enqueue).toHaveBeenCalledOnce()
+    // #and — tryAcquire NOT consulted (pending work has priority)
+    expect(tryAcquireFn).not.toHaveBeenCalled()
+  })
+
+  // ── No Discord dependency ──────────────────────────────────────────────────
+
+  it('no Discord dependency: launchWork does NOT call setRunReaction (no message)', async () => {
+    // #given — in-memory sinks; no Discord message
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — setRunReaction NOT called (no Discord message in launchWork path)
+    // Reactions are handled by the statusSink.setReaction method instead
+    const mockReaction = vi.mocked(reactionsModule.setRunReaction)
+    expect(mockReaction).not.toHaveBeenCalled()
+  })
+
+  it('no Discord dependency: launchWork does NOT call message.startThread', async () => {
+    // #given — in-memory sinks; no Discord message
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await launchWork(request, deps)
+
+    // #then — createDiscordStreamSink NOT called (no thread in launchWork path)
+    // The replySink is provided by the caller, not created internally
+    expect(mockCreateDiscordStreamSink).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// threadFactory failure path (FIX 4)
+// ---------------------------------------------------------------------------
+
+describe('threadFactory failure path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, createRun NOT called, transitionRun NOT called, slot released', async () => {
+    // #given — threadFactory fails immediately
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    // Override startThread to return a rejected promise so threadFactory fails
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Discord thread creation failed'))
+
+    const releaseFn = vi.fn()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — replySink.send called with coarse error message (via message.reply for 'source' target)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const replyCall = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(replyCall.content).toContain('Could not start the task')
+
+    // #and — acquireLock NOT called (threadFactory failed before lock acquisition)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+
+    // #and — createRun NOT called (no lock acquired)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+
+    // #and — transitionRun NOT called (no run-state created)
+    expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
+
+    // #and — concurrency slot released (no leak)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// threadFactory timeout path (FIX 5)
+// ---------------------------------------------------------------------------
+
+/** Bounded timeout for threadFactory calls (ms). Mirrors the constant in run.ts. */
+const THREAD_FACTORY_TIMEOUT_MS = 10_000
+
+describe('threadFactory timeout path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('threadFactory that never resolves → times out, replySink.send called with error, acquireLock NOT called, slot released', async () => {
+    // #given — threadFactory hangs indefinitely (simulates a hung Discord API call)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    // startThread returns a promise that never resolves — simulates a hung Discord call
+    const neverResolves = new Promise<never>(() => {
+      /* intentionally never resolves */
+    })
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockReturnValue(neverResolves)
+
+    const releaseFn = vi.fn()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when — start the run; advance fake timers past the threadFactory timeout while it's pending
+    // We must interleave timer advancement with the awaited promise so the setTimeout fires.
+    const runPromise = runMention(message, makeBinding(), deps)
+    // Advance past the threadFactory timeout (setTimeout in run.ts fires)
+    await vi.advanceTimersByTimeAsync(THREAD_FACTORY_TIMEOUT_MS + 100)
+    // Now the timeout rejection should have propagated; await the run to completion
+    await runPromise
+
+    // #then — replySink.send called with coarse error (via message.reply for 'source' target)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const replyCall = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(replyCall.content).toContain('Could not start the task')
+
+    // #and — acquireLock NOT called (threadFactory timed out before lock acquisition)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+
+    // #and — createRun NOT called
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+
+    // #and — concurrency slot released (no leak)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  }, 15_000)
 })

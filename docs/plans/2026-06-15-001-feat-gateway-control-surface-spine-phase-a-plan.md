@@ -3,6 +3,7 @@ title: 'feat: Gateway control surface spine — Phase A (transport-agnostic exec
 type: feat
 status: active
 date: 2026-06-15
+deepened: 2026-06-15
 origin: docs/brainstorms/2026-06-15-gateway-control-surface-spine-requirements.md
 ---
 
@@ -78,7 +79,12 @@ The consequence: the dashboard cannot launch work, the operator cannot approve a
 
 ## Key Technical Decisions
 
+> **Plan vetted against current source (Oracle, main `0fa4ed32`).** The seam direction is sound, but the original anchors predated recent gateway churn (Discord `io.ts` refactor #858, serial queue #850, status controller #843, operator commands #854/#859). The decisions and units below incorporate that vetting. Line numbers are indicative, not authoritative — implementers verify against current source.
+
+- **`launchWork` is the public, queue-and-cap-preserving front door (decision).** `launchWork(request, deps)` acquires the per-channel slot / enqueues / respects the global concurrency cap exactly as `runMention` does today, then drives the long post-acquire pipeline via a **private inner primitive** (e.g. `executeWorkOnHeldSlot(task)`). A future web caller goes through the front door and **cannot bypass** the per-channel FIFO, global cap, or shutdown handoff. The inner primitive is internal-only and is never exported as a "core" that dodges the queue. This is the load-bearing correction: `startRun` today assumes the channel slot is already held and owns atomic handoff/release in its outer `finally` (`run.ts:726-764`), draining via `queue.takeNext(channelId)` — exposing that inner body directly would be a concurrency footgun.
 - **`LaunchWorkRequest` carries sinks, not a `Message`.** The engine receives `StatusSink` and `ReplySink` interfaces rather than a raw Discord `Message`. The Discord adapter constructs concrete implementations of these interfaces from the `Message` and passes them in. This is the minimal seam: the engine's logic is unchanged, only its input contract changes.
+- **Empty-prompt behavior IS changing in Phase A (deliberate, accepted).** Today a bare `@fro-bot` mention proceeds through thread creation, lock acquisition, and run-state setup before `buildDiscordPrompt` throws `EmptyPromptError` late in the engine (`prompt.ts:110-114`), so the "nothing to do" failure surfaces *in-thread* after churn. The Discord adapter will strip the mention and detect an empty prompt **before** calling `launchWork`, failing fast with no thread/lock/run-state churn. This is a small, intentional UX improvement and a documented exception to "zero Discord behavior change" — characterize the current behavior first, then assert the new fail-fast behavior. (This is the only accepted Discord behavior delta in Phase A.)
+- **Generalize the approval registry/coordinator names now, for Phase B readiness (decision).** Rename Discord-shaped registry terms to transport-neutral ones in Phase A: `channelID` → `approvalScopeId`, `handleButtonDecision` → `handleDecision`, `decidedBy: string` → a typed actor/operator identity. Extract the Discord approval transport from the `run.ts` `onPending` closure (`run.ts:396-536`) and the `program.ts` button handler (`program.ts:205-260`). This makes Phase B a clean plug-in rather than inheriting Discord-shaped names to rename later. No web auth/listener in Phase A.
 - **`runMention` stays as the Discord entry point, becomes a thin adapter.** It does not disappear — it maps `Message` → `LaunchWorkRequest` and calls `launchWork`. The `ChannelQueue<RunTask>` continues to work; `RunTask` carries a `LaunchWorkRequest` (or the sinks) rather than a raw `Message` where feasible, keeping the change minimal.
 - **Approval coordinator: the transport seam is the `onPending` + `onReplied` + `onDispose` deps callbacks, not a single render hook.** `PermissionCoordinatorDeps.onPending` (`coordinator.ts:94`) is the render-and-register hook — its doc states it "renders the Discord approval embed here **AND registers the entry in the approval registry** (including deadlineMs)." Render and registry-registration are coupled in this one callback, so the transport-neutral generalization must preserve that coupling (a transport renders its UI *and* registers the entry together), not split them. The decision-intake path is `onPermissionReplied`/`onReplied` → `registry.confirmReply`; teardown is `onDispose` → `registry.disposeRun` (fail-close). The public coordinator surface (`onPermissionAsked`/`onPermissionReplied`, `coordinator.ts:72`/`:78`) and the pure parsers (`parsePermissionRequest`/`parsePermissionReply`) are unchanged. Generalizing means a Discord transport supplies `onPending`/`onReplied`/`onDispose` implementations (embed + button wiring), and a future web transport supplies its own (notification + HTTP callback) — both reusing the same registry and fail-closed settlement.
 - **One gate, no parallel path (R5).** The registry owns pending state and settlement. Any new transport plugs into the same registry via the `onPending`/`onReplied`/`onDispose` callbacks — it cannot create a parallel registry or bypass the fail-closed timeout/restart semantics.
@@ -144,6 +150,26 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
 ## Implementation Units
 
+- [ ] **Unit 0: Characterization tests pinning current Discord behavior (mandatory)**
+
+  **Goal:** Lock the current `runMention → startRun` and approval behaviors with tests that pass before AND after the refactor — the zero-regression gate. This is not optional; the engine has many edge behaviors (queue/cap, thread creation, live-status vs typing-only, reactions, approval waiting/timeout, empty-prompt) that a seam extraction can silently break.
+
+  **Requirements:** R2, R3, R6 (guards the zero-change contract)
+
+  **Dependencies:** None
+
+  **Files:**
+  - Test: `packages/gateway/src/execute/run.test.ts` (extend), `packages/gateway/src/approvals/coordinator.test.ts` (extend)
+
+  **Approach:**
+  - Pin, via the existing Discord `Message`-based entry points, the observable behaviors that must not change: per-channel queue scope + global concurrency cap + FIFO handoff; thread creation (`message.startThread`); reactions lifecycle (working/awaiting/succeeded/failed); `statusMode: 'live-status'` (status message posted+edited) vs `'typing-only'` (typing pulse, no status message); approval waiting → button decision → settle; approval timeout → fail-closed reject; shutdown handoff.
+  - **Capture current empty-prompt behavior explicitly** (bare mention → late `EmptyPromptError` surfaced in-thread) so the deliberate Phase-A change (fail-fast in adapter) is a visible, reviewed diff, not a silent regression.
+
+  **Test scenarios:**
+  - Characterization: each behavior above asserted against the current code path; all green on unmodified `main`.
+
+  **Verification:** the new characterization tests pass on current `main` before any refactor; they remain the regression gate through Units 2–4.
+
 - [ ] **Unit 1: Define transport-neutral types — `LaunchWorkRequest`, `StatusSink`, `ReplySink`**
 
   **Goal:** Establish the typed interface contract that the engine will accept and the Discord adapter will implement. No runtime behavior changes in this unit.
@@ -156,7 +182,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   - Create: `packages/gateway/src/execute/launch-types.ts` (or `packages/gateway/src/execute/types.ts` if a types file already exists — check first)
 
   **Approach:**
-  - Read `packages/gateway/src/execute/run.ts` lines 1–100 to inventory exactly what `startRun` reads from `RunTask.message` (prompt text extraction, `botUserId` mention-strip, status-reply calls, typing indicator). These reads define the `StatusSink`/`ReplySink` interface surface.
+  - Inventory **every** `message` read across the full `startRun` body (`run.ts:184-765`) and `runMention` (`run.ts:805-834`) — NOT just lines 1–100. Oracle's verified coupling list (current `main`): `message.channel.id` for queue/concurrency scope (`run.ts:205`, `:807`); pre-thread failure/queue/cap reply acks via `sendMessage(message, …)` (`:229`, `:252`, `:264`, `:793-803`, `:822`); thread creation `message.startThread(...)` (`:259-268`); source-message reactions `setRunReaction(message, …)` (`:370`, `:465`, `:574`, `:635`); prompt text `message.content` (`:376-382`); status/typing via `createStatusController({thread, mode})` (`:347-351`) and `createDiscordStreamSink(thread)` (`:375`). These reads define the sink/request interface surface. Note: lock + run-state are written with `surface: 'discord'` (`:273`, `:300`) — Phase A introduces a transport-neutral surface/source identifier so a future web run is not a fake Discord thread.
   - Define `LaunchWorkRequest` with: prompt text (string), source metadata (channel/guild IDs for logging), `RepoBinding`, requester identity (Discord user ID or future operator identity as a discriminated union), `StatusSink`, `ReplySink`.
   - Define `StatusSink` interface: the methods the engine calls to post/update status progress (e.g., `update(text: string): Promise<void>`, `setTyping(): Promise<void>`).
   - Define `ReplySink` interface: the method the engine calls to deliver final output (e.g., `send(content: string, options?: ReplyOptions): Promise<void>`).
@@ -165,10 +191,10 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   **Patterns to follow:** existing `RunMentionDeps` and `RunTask` type shapes in `run.ts`; `Result<T, E>` from `@bfra.me/es`; discriminated union patterns used elsewhere in the gateway.
 
   **Test scenarios:**
-  - Types-only unit: no runtime behavior. Verification is `pnpm check-types` clean and the type shapes satisfy the constraints (e.g., a Discord `Message`-based implementation satisfies `StatusSink`/`ReplySink` structurally).
+  - Types-only unit: no runtime behavior. Verification is `pnpm --filter @fro-bot/gateway check-types` clean and the type shapes satisfy the constraints (e.g., a Discord `Message`-based implementation satisfies `StatusSink`/`ReplySink` structurally).
   - Structural: a mock object implementing `StatusSink` compiles without cast; a mock `LaunchWorkRequest` with a Discord requester identity compiles; a future web requester identity shape also compiles (discriminated union covers both).
 
-  **Verification:** `pnpm check-types` clean; the new types file exports `LaunchWorkRequest`, `StatusSink`, `ReplySink`; no `any` or `@ts-ignore`; the Discord `Message`-derived implementations in Unit 3 satisfy the interfaces structurally.
+  **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; the new types file exports `LaunchWorkRequest`, `StatusSink`, `ReplySink`; no `any` or `@ts-ignore`; the Discord `Message`-derived implementations in Unit 3 satisfy the interfaces structurally.
 
 - [ ] **Unit 2: Extract `launchWork` core from `startRun`**
 
@@ -176,7 +202,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Requirements:** R1, R6
 
-  **Dependencies:** Unit 1
+  **Dependencies:** Unit 0 (characterization gate), Unit 1
 
   **Files:**
   - Modify: `packages/gateway/src/execute/run.ts` (extract `launchWork`, update `startRun`/`RunTask`)
@@ -198,7 +224,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   - Queue/concurrency: `runMention` still enqueues via `ChannelQueue<RunTask>`; a second concurrent mention for the same channel is queued, not dropped.
   - Characterization regression: the existing Discord-path tests (via `runMention`) still pass unchanged after the refactor.
 
-  **Verification:** `pnpm check-types` clean; `pnpm test` passes (existing `run.test.ts` + new `launchWork` tests); `launchWork` is exported and accepts `LaunchWorkRequest` + in-memory sinks; no Discord import in `launchWork`'s own logic.
+  **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; `pnpm --filter @fro-bot/gateway test` passes (existing `run.test.ts` + new `launchWork` tests); `launchWork` is exported and accepts `LaunchWorkRequest` + in-memory sinks; no Discord import in `launchWork`'s own logic.
 
 - [ ] **Unit 3: Make `runMention` a thin Discord adapter**
 
@@ -206,19 +232,19 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Requirements:** R2, R3
 
-  **Dependencies:** Units 1, 2
+  **Dependencies:** Unit 0 (characterization gate), Units 1, 2
 
   **Files:**
   - Modify: `packages/gateway/src/execute/run.ts` (the `runMention` function and the Discord sink implementations)
   - Test: `packages/gateway/src/execute/run.test.ts` (Discord adapter behavior tests)
 
   **Approach:**
-  - **Characterization-first:** verify the characterization tests from Unit 2 cover the Discord-path behavior (status message posted/edited, mention stripped via `botUserId`, queue/concurrency, reactions). These must pass before and after this unit.
-  - Implement `DiscordStatusSink` and `DiscordReplySink` (or inline implementations) that wrap the existing live-status/typing message flow. The `statusMode: 'live-status' | 'typing-only'` logic moves into `DiscordStatusSink`.
-  - `runMention` extracts prompt text from `message.content` (stripping the bot mention via `botUserId`), constructs the `LaunchWorkRequest` with the Discord sinks, and calls `launchWork` (or enqueues a `RunTask` carrying the `LaunchWorkRequest`).
-  - The `Message` object is no longer passed into `launchWork` or `startRun` — it is consumed entirely in the adapter.
+  - **Characterization-first:** the Unit 0 characterization tests cover the Discord-path behavior (status message posted/edited, mention stripped via `botUserId`, queue/concurrency, reactions). These must pass before and after this unit (except the deliberate empty-prompt delta below).
+  - **Adapt the existing `StatusController` and `DiscordStreamSink` — do NOT reimplement `statusMode`.** The status controller (`packages/gateway/src/discord/status-message.ts`, `createStatusController`) already owns `live-status` vs `typing-only` (typing pulse in both modes, status-message suppression in `typing-only`, final-answer/failure delegation). The `DiscordStatusSink` wraps/adapts `createStatusController` over the new interface; it does not re-derive the mode logic. The `DiscordReplySink` delegates to the `io.ts` safe-send boundary (`sendMessage`/`editMessage`) and the existing `createDiscordStreamSink` — never raw `message.reply`/`thread.send` (preserves the `allowedMentions:{parse:[]}` + fail-soft invariants the `io.ts`/boundary tests enforce).
+  - `runMention` extracts prompt text from `message.content`, strips the bot mention via `botUserId`, and **fails fast on an empty prompt before calling `launchWork`** (the accepted behavior change — see KTD; no thread/lock/run-state churn). On a non-empty prompt it constructs the `LaunchWorkRequest` with the Discord sinks and enqueues via `launchWork`'s front door.
+  - The `Message` object is consumed entirely in the adapter — it is not passed into the inner execution primitive. Reactions and thread creation are driven through adapter-provided sink/lifecycle hooks, not by handing the engine a raw `Message`.
 
-  **Patterns to follow:** existing `runMention` mention-strip logic; `statusMode` branching in `run.ts`; `discord/io.ts` `StatusSink`/`ReplySink` Discord implementations (if applicable from the io.ts refactor).
+  **Patterns to follow:** existing `runMention` mention-strip logic; the `createStatusController` mode handling in `status-message.ts` (adapt, don't reimplement); the `discord/io.ts` safe-send boundary (`sendMessage`/`editMessage`, `SendCapable`/`ReplyCapable`) — note `io.ts` does NOT already define `StatusSink`/`ReplySink`, so those are net-new in Unit 1; the Discord sink implementations delegate to `io.ts` for safety invariants.
 
   **Test scenarios:**
   - Happy path: `runMention` with a real Discord `Message` mock calls `launchWork` with a `LaunchWorkRequest` whose prompt text has the bot mention stripped; the `StatusSink` posts a status message; the `ReplySink` sends the final output.
@@ -229,7 +255,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   - Reactions: existing reaction behavior (if any) is preserved.
   - Regression: the Discord user experience is identical to pre-refactor (status message content, timing, error messages unchanged).
 
-  **Verification:** `pnpm check-types` clean; `pnpm test` passes; `runMention` no longer passes a `Message` into `launchWork`/`startRun`; the Discord sink implementations satisfy `StatusSink`/`ReplySink` structurally; characterization tests pass.
+  **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; `pnpm --filter @fro-bot/gateway test` passes; `runMention` no longer passes a `Message` into `launchWork`/`startRun`; the Discord sink implementations satisfy `StatusSink`/`ReplySink` structurally; characterization tests pass.
 
 - [ ] **Unit 4: Generalize the approval coordinator seam**
 
@@ -240,12 +266,15 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   **Dependencies:** Units 1, 2, 3 (the `LaunchWorkRequest` + sinks pattern is established; the coordinator is wired via `approvalRegistry` in `RunMentionDeps`)
 
   **Files:**
-  - Modify: `packages/gateway/src/approvals/coordinator.ts` (generalize the `onPending`/`onReplied`/`onDispose` deps callbacks; the public `onPermissionAsked`/`onPermissionReplied` surface stays)
-  - Modify (if needed): `packages/gateway/src/approvals/registry.ts` (verify fail-closed settlement is unchanged)
-  - Test: `packages/gateway/src/approvals/coordinator.test.ts` (new tests for non-Discord render+register and decision intake)
+  - Modify: `packages/gateway/src/approvals/registry.ts` (generalize Discord-shaped names — `channelID` → `approvalScopeId`, `handleButtonDecision` → `handleDecision`, `decidedBy: string` → typed actor identity; fail-closed settlement logic unchanged)
+  - Modify: `packages/gateway/src/execute/run.ts` (extract the Discord approval transport from the `onPending` closure at `:396-536`)
+  - Modify: `packages/gateway/src/approvals/coordinator.ts` (the coordinator is already mostly generic; confirm the `onPending`/`onReplied`/`onDispose` deps contract and the deprecated `onSettled` at `:109-114` — preserve or deliberately remove with its tests, don't leave it dangling)
+  - Modify: `packages/gateway/src/program.ts` (the Discord button decision handler at `:205-260` — point it at the renamed `handleDecision`)
+  - Test: `packages/gateway/src/approvals/coordinator.test.ts` + `registry.test.ts` (non-Discord render+register and decision intake; renamed-API tests; preserve `onSettled` coverage or update it)
 
   **Approach:**
-  - Read `coordinator.ts` in full to confirm the current callback contract. Verified seam (do not look for `onRequest` — it does not exist):
+  - The real Discord coupling for approvals is NOT in `coordinator.ts` (already mostly generic) — it lives in the `run.ts` `onPending` closure (`:396-536`, renders the embed + registers), the `program.ts` button handler (`:205-260`, intakes the decision), and the Discord-shaped registry names. Extract a Discord approval *transport* from the `run.ts` closure so a future web transport can supply its own render+register/decision/teardown without a parallel registry. Generalize the registry names (KTD) so the decision path is `handleDecision({approvalScopeId, actor, ...})`, not `handleButtonDecision({channelID})`.
+  - Read `coordinator.ts` in full to confirm the current callback contract. Verified seam (do not look for `onRequest` — it does not exist; note the deprecated `onSettled` at `:109-114`):
     - `PermissionCoordinatorDeps.onPending` (`coordinator.ts:94`) — renders the approval UI **and registers the entry in the approval registry** (including `deadlineMs`); render and registration are coupled in this one hook.
     - `PermissionCoordinatorDeps.onReplied` — forwards the decision to `registry.confirmReply`.
     - `PermissionCoordinatorDeps.onDispose` — calls `registry.disposeRun(sessionID, reason)` to fail-close on teardown.
@@ -265,7 +294,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
   - One gate: two concurrent requests from different transports both settle via the same registry; neither bypasses fail-closed semantics or creates a parallel registry.
   - `parsePermissionRequest`/`parsePermissionReply` unchanged: existing parse tests still pass.
 
-  **Verification:** `pnpm check-types` clean; `pnpm test` passes; a non-Discord transport renders+registers and settles via the same registry; fail-closed timeout/dispose behavior preserved and tested; `parsePermissionRequest`/`parsePermissionReply` tests unchanged; no reference to a nonexistent `onRequest`.
+  **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; `pnpm --filter @fro-bot/gateway test` passes; a non-Discord transport renders+registers and settles via the same registry; fail-closed timeout/dispose behavior preserved and tested; `parsePermissionRequest`/`parsePermissionReply` tests unchanged; no reference to a nonexistent `onRequest`.
 
 ## System-Wide Impact
 
@@ -273,7 +302,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 - **Error propagation:** unchanged — the engine's error handling (timeout, shutdown, run failure) is preserved; errors are surfaced via `StatusSink`/`ReplySink` to the transport, not thrown into the queue.
 - **State lifecycle:** no persistence changes. The registry's in-memory pending state and fail-closed settlement are unchanged.
 - **API surface parity:** `runMention` signature is unchanged (it is the Discord entry point); `launchWork` is a new export. The approval coordinator's `onPending`/`onReplied`/`onDispose` deps-callback contracts change shape (generalized), but the Discord implementations are updated in the same PR.
-- **Sequencing:** Unit 1 (types) → Unit 2 (engine extraction) → Unit 3 (Discord adapter) → Unit 4 (approval seam). Units 2 and 3 both modify `run.ts` and are serial. Unit 4 modifies `coordinator.ts` and can run in parallel with Units 2–3 after Unit 1, but is logically cleaner after Unit 3 (the full `LaunchWorkRequest` pattern is established).
+- **Sequencing:** Unit 0 (characterization gate) → Unit 1 (types) → Unit 2 (engine extraction + front-door/inner split) → Unit 3 (Discord adapter, empty-prompt fail-fast) → Unit 4 (approval transport extraction + registry rename). Units 2, 3, and 4 all modify `run.ts` (Unit 4 extracts the `onPending` closure from it), so they are serial, not parallel. Unit 0 must be green on unmodified `main` before any refactor begins.
 - **Unchanged invariants:** Discord user experience (status message, typing indicator, queue behavior, reactions, approval button flow), ingress-pin constraint (`server.ts` has exactly one `serve()`), `parsePermissionRequest`/`parsePermissionReply` pure parsing, registry fail-closed settlement, `ChannelQueue<RunTask>` concurrency model.
 
 ## Risks & Dependencies
@@ -332,7 +361,7 @@ This section exists because the origin brainstorm (`docs/brainstorms/2026-06-15-
 - After Phase A merges: update `packages/gateway/AGENTS.md` to reflect that the transport-agnostic execution primitive now exists (`launchWork`) and that the approval coordinator's `onPending`/`onReplied`/`onDispose` callbacks are the approved extension points for new transports. Remove or update the "deferred until a non-Discord caller exists" note.
 - The `launchWork` function and the `StatusSink`/`ReplySink` interfaces should be documented with JSDoc comments explaining the transport-neutral contract and the Discord adapter pattern, so future implementers (Phase B) know exactly what to implement.
 - No infra changes in Phase A. Phase B requires coordination with `marcusrbrown/infra` on the deploy topology before any new listener lands.
-- Verification commands (pnpm repo): `pnpm bootstrap`, `pnpm check-types`, `pnpm lint`, `pnpm test`. All must pass before merge.
+- Verification commands — **gateway-scoped** (the root `pnpm check-types`/`lint`/`test` scripts filter runtime/action/harness only and do NOT cover the gateway package): `pnpm --filter @fro-bot/gateway check-types`, `pnpm --filter @fro-bot/gateway lint`, `pnpm --filter @fro-bot/gateway test`, `pnpm --filter @fro-bot/gateway build`. All must pass before merge. (`pnpm bootstrap` first if deps changed.)
 
 ## Sources & References
 

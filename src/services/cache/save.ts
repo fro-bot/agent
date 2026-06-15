@@ -23,6 +23,44 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Returns true if there is any real cacheable content: either storagePath has files,
+ * or any SQLite DB-family file (opencode.db, opencode.db-wal, opencode.db-shm) exists
+ * and is non-empty in cachePaths.
+ *
+ * OpenCode 1.17.x persists sessions in opencode.db at path.dirname(storagePath), NOT
+ * inside storagePath itself. Without this check the old guard would return false on every
+ * real run, skipping the cache save and breaking session continuity.
+ *
+ * WAL mode note: server.close() sends proc.kill() without awaiting a checkpoint, so a
+ * valid session can have opencode.db at 0 bytes with all data still in opencode.db-wal.
+ * We must treat any non-empty DB-family file as sufficient evidence of cacheable content.
+ */
+async function hasCacheableContent(storagePath: string, cachePaths: readonly string[]): Promise<boolean> {
+  if (await directoryHasContent(storagePath)) {
+    return true
+  }
+
+  // Check all three SQLite DB-family files — any non-empty one is sufficient.
+  // buildSaveCachePaths already includes wal/shm only when they exist on disk, so
+  // checking cachePaths membership is the right gate (avoids redundant stat calls).
+  const dbFamilyBasenames = new Set(['opencode.db', 'opencode.db-wal', 'opencode.db-shm'])
+  const dbFamilyPaths = cachePaths.filter(p => dbFamilyBasenames.has(path.basename(p)))
+
+  for (const dbPath of dbFamilyPaths) {
+    try {
+      const stat = await fs.stat(dbPath)
+      if (stat.size > 0) {
+        return true
+      }
+    } catch {
+      // file missing or inaccessible — not cacheable from this source
+    }
+  }
+
+  return false
+}
+
 export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   const {
     components,
@@ -48,8 +86,8 @@ export async function saveCache(options: SaveCacheOptions): Promise<boolean> {
   try {
     await deleteAuthJson(authPath, storagePath, logger)
 
-    const storageExists = await directoryHasContent(storagePath)
-    if (storageExists === false) {
+    const hasContent = await hasCacheableContent(storagePath, cachePaths)
+    if (hasContent === false) {
       logger.info('No storage content to cache')
       return false
     }

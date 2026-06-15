@@ -605,6 +605,237 @@ describe('saveCache', () => {
     expect(result).toBe(false)
   })
 
+  // --- SQLite-backend regression tests (OpenCode 1.17.x) ---
+
+  it('proceeds with save when storage is empty but opencode.db exists and is non-empty (SQLite backend)', async () => {
+    // #given storagePath is empty (no session files) but opencode.db exists at dirname(storagePath)
+    // This reproduces the production regression: OpenCode 1.17.x writes sessions to opencode.db,
+    // not to storage/, so the old guard incorrectly returned false and skipped the cache save.
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'sqlite-session-data')
+    // storagePath itself is NOT created — simulating a fresh run where only the DB exists
+
+    const saveCacheSpy = vi.fn<CacheAdapter['saveCache']>(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then save proceeds (DB content is sufficient) and cacheAdapter.saveCache is called
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db'))
+  })
+
+  it('proceeds with save when storage is empty but opencode.db exists (storage dir created by writeStorageVersion)', async () => {
+    // #given storagePath is empty, opencode.db exists — verifies writeStorageVersion still runs
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'sqlite-session-data')
+
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: createMockCacheAdapter({saveResult: 1}),
+    }
+
+    // #when saving cache
+    await saveCache(options)
+
+    // #then writeStorageVersion ran: storagePath exists and .version file is present
+    const versionContent = await fs.readFile(path.join(storagePath, '.version'), 'utf8')
+    expect(versionContent).toBe('1')
+  })
+
+  it('returns false when storage is empty AND opencode.db is absent (genuinely empty)', async () => {
+    // #given storagePath does not exist and no opencode.db — truly nothing to cache
+    const saveCacheSpy = vi.fn(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then returns false — no content from either source; adapter never called
+    expect(result).toBe(false)
+    expect(saveCacheSpy).not.toHaveBeenCalled()
+  })
+
+  it('returns false when storage is empty AND opencode.db exists but is zero-size', async () => {
+    // #given storagePath does not exist and opencode.db is zero bytes — treat as no content
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), '')
+
+    const saveCacheSpy = vi.fn(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then returns false — zero-size DB is not real content; adapter never called
+    expect(result).toBe(false)
+    expect(saveCacheSpy).not.toHaveBeenCalled()
+  })
+
+  it('proceeds with save when storage is empty but opencode.db-wal is non-empty (WAL-only session)', async () => {
+    // #given storagePath is empty, opencode.db is 0 bytes, but opencode.db-wal has data
+    // This reproduces the WAL-only gap: server.close() sends proc.kill() without awaiting
+    // a WAL checkpoint, so all session data may live in the WAL file while the main db is empty.
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), '') // zero-size main db
+    await fs.writeFile(path.join(dbDir, 'opencode.db-wal'), 'wal-session-data') // non-empty WAL
+
+    const saveCacheSpy = vi.fn<CacheAdapter['saveCache']>(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then save proceeds — WAL content is sufficient; cacheAdapter.saveCache is called
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-wal'))
+  })
+
+  it('proceeds with save when storage is empty but opencode.db-shm is non-empty (SHM-only)', async () => {
+    // #given storagePath is empty, opencode.db is 0 bytes, but opencode.db-shm has data
+    // Unusual but symmetric with WAL: any non-empty DB-family file counts as cacheable.
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), '') // zero-size main db
+    await fs.writeFile(path.join(dbDir, 'opencode.db-shm'), 'shm-header-data') // non-empty SHM
+
+    const saveCacheSpy = vi.fn<CacheAdapter['saveCache']>(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then save proceeds — SHM content is sufficient; cacheAdapter.saveCache is called
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    const capturedPaths = saveCacheSpy.mock.calls[0]?.[0]
+    expect(capturedPaths).toContain(path.join(dbDir, 'opencode.db-shm'))
+  })
+
+  it('returns false when storage empty AND all DB-family files absent or zero-size (genuinely empty, all variants)', async () => {
+    // #given storagePath does not exist, opencode.db is zero, wal/shm absent — truly nothing
+    const dbDir = path.dirname(storagePath)
+    await fs.mkdir(dbDir, {recursive: true})
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), '') // zero-size
+    // opencode.db-wal and opencode.db-shm are NOT created
+
+    const saveCacheSpy = vi.fn(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.17.6',
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then returns false — no non-empty DB-family file; adapter never called
+    expect(result).toBe(false)
+    expect(saveCacheSpy).not.toHaveBeenCalled()
+  })
+
+  it('still saves when storagePath has content (legacy non-SQLite backend)', async () => {
+    // #given storagePath has session files (legacy behavior must still work)
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'legacy session data')
+
+    const saveCacheSpy = vi.fn(async () => 1)
+    const options: SaveCacheOptions = {
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {
+        restoreCache: async () => undefined,
+        saveCache: saveCacheSpy,
+      },
+    }
+
+    // #when saving cache
+    const result = await saveCache(options)
+
+    // #then save proceeds as before
+    expect(result).toBe(true)
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+  })
+
   it('handles "already exists" error gracefully', async () => {
     // #given storage with content and "already exists" error
     await fs.mkdir(storagePath, {recursive: true})
