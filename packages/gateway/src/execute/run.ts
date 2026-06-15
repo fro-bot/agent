@@ -291,6 +291,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           }),
         ])
       } catch (threadError) {
+        // If the timeout fired, threadFactory may still resolve later — after the engine has
+        // already aborted and released the concurrency slot. That late resolution is intentionally
+        // abandoned: the created thread/sinks are orphaned, but the user sees a clean failure
+        // and can retry. This is the safe outcome for a slow-but-not-dead Discord API call.
         logger.error(
           {channelId, repo, err: threadError instanceof Error ? threadError.message : String(threadError)},
           'run: threadFactory threw or timed out — aborting',
@@ -761,6 +765,10 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   // calling launchWork, but this guard ensures any future caller (e.g. a web
   // transport) cannot enter the engine with an empty prompt and hit the late
   // EmptyPromptError path (which would churn thread/lock/run-state before failing).
+  //
+  // Note: this is NOT the only gate. buildDiscordPrompt independently re-strips
+  // leading mentions via botUserId and throws EmptyPromptError for the
+  // non-leading-mention edge case. Both checks are intentional and complementary.
   if (request.promptText.trim().length === 0) {
     await request.replySink.send('source', {content: 'Nothing to do — please include a task in your message.'})
     return

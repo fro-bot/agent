@@ -160,6 +160,10 @@ export function createDiscordApprovalOnPending(
     // round-trip has not completed yet. settle(true) on success promotes to
     // permanently delivered; settle(false) on failure retracts the claim.
     const settleWaitingStatus = replySink.markVisibleOutputPending()
+    // ReplySink.send must not reject — the Discord impl is fail-soft (sendMessage never rejects).
+    // A non-fail-soft transport (e.g. a future web transport) must add a .catch() here that
+    // calls settleWaitingStatus(false) and releases the pending claim, or the rejection will
+    // surface as an unhandled rejection inside onPending.
     // eslint-disable-next-line no-void
     void replySink.send('thread', {content: 'Waiting for tool approval\u2026'}).then(result => {
       // replySink.send returns unknown; cast to check success (one documented cast).
@@ -188,6 +192,8 @@ export function createDiscordApprovalOnPending(
     // it's a clean Discord concern). Widen ReplySink.send to return a typed
     // result when a web transport needs the posted message reference.
     const settleEmbed = replySink.markVisibleOutputPending()
+    // Same contract as above: ReplySink.send must not reject. A non-fail-soft transport
+    // must add a .catch() that calls settleEmbed(false) and releases the pending claim.
     // eslint-disable-next-line no-void
     void replySink
       .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]})
