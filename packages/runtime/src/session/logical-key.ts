@@ -50,7 +50,7 @@ export function buildLogicalKey(context: TriggerContext): LogicalSessionKey | nu
     const hashSeed =
       scheduleExpression != null && scheduleExpression.trim().length > 0 ? scheduleExpression : context.action
     const hash = buildScheduleHash(hashSeed ?? 'default')
-    return buildEntityKey('schedule', hash)
+    return buildEntityKey('schedule', `${hash}-${context.runId}`)
   }
 
   if (context.eventType === 'workflow_dispatch') {

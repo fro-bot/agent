@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-07"
-updated-by: "cbc7008"
+last-updated: "2026-06-14"
+updated-by: "7065ca0"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -37,7 +37,7 @@ The `runSetup()` orchestrator follows a **mode-gated** sequence based on the `en
 
 3. **Restore tools cache** — Checks for a cached bundle of previously installed tools, keyed by version, OS, and mode. A cache hit skips download steps entirely. The disabled-mode cache excludes Bun and `~/.config/opencode` paths to prevent stale oMo config from being restored.
 
-4. **Install OpenCode CLI** — Downloads the platform-appropriate release binary, extracts it, verifies it (`--version`), and registers it in the GitHub Actions tool cache. The platform mapping handles Linux x64/arm64 and macOS x64/arm64.
+4. **Install OpenCode CLI** — Downloads the platform-appropriate release binary, extracts it, verifies it (`--version`), and registers it in the GitHub Actions tool cache. The platform mapping handles Linux x64/arm64 and macOS x64/arm64. The download source depends on whether the target is a stock OpenCode release or a [harness build](#harness-builds) — harness builds are fetched from `fro-bot/agent` releases and verified against a published `SHA256SUMS` manifest.
 
 5. **Build CI config** — Assembles the `OPENCODE_CONFIG_CONTENT` environment variable, which configures OpenCode for CI operation. This includes disabling auto-updates, injecting the Systematic plugin, and pinning `default_agent` to `"build"`.
 
@@ -82,6 +82,22 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `systematic-version`). The pinned defaults are updated via Renovate-managed PRs.
 
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (for example `1.17.6+harness.13169873`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+
+## Harness Builds
+
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.6`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.6+harness.13169873`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+
+The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
+
+- **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases. Because harness release tags are non-`v`-prefixed and GitHub stores tags URL-encoded, the `+` in the version is percent-encoded as `%2B` when building the download path. Stock versions keep their conventional `v`-prefixed upstream URL.
+
+- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters.
+
+- **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build-metadata and would collapse a harness build onto a stock cache entry of the same base version. To preserve identity, the `+harness.` marker is rewritten to a `-harness.` prerelease segment (`toolCacheVersion()`) _only_ at tool-cache call sites. Download URLs, checksums, logs, and return values keep the raw `+harness.` form. This guarantees a harness build and a stock build of the same base version never share a cache slot.
+
+If the `latest` resolution path or a non-harness flow needs a fallback, the setup module falls back to a known-good stock version rather than a harness build.
+
 ## Configuration Assembly
 
 The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in a headless CI environment:
@@ -112,7 +128,7 @@ Enabled-mode key:
 opencode-tools-enabled-{opencodeVersion}-{omoVersion}-{systematicVersion}-{os}
 ```
 
-On a cache hit, the module verifies the binary is actually present in the tool cache before trusting it — cache hits where the binary is missing fall through to a fresh install. This cache typically saves 10-20 seconds per run.
+On a cache hit, the module verifies the binary is actually present in the tool cache before trusting it — cache hits where the binary is missing fall through to a fresh install. The lookup uses the tool-cache-safe form of the version (see [Harness Builds](#harness-builds)), so a harness build never reuses a stock binary's cache entry. This cache typically saves 10-20 seconds per run.
 
 ## Security
 

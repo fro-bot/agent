@@ -25,6 +25,49 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 # Invariants checked:
 #   1. sandbox-net is internal:true — no direct internet gateway for any
 #      container on this network.
+#   1b. NO service may declare network_mode — bypasses the network-attachment
+#      model entirely (host/shared networking).
+#   1c. NO service may declare extra_hosts with a host-gateway value — gives
+#      the container the Docker host's bridge IP, enabling egress relay around
+#      mitmproxy via any host-bound proxy/tunnel.
+#   1d. NO service may declare cap_add with NET_ADMIN, NET_RAW, SYS_MODULE,
+#      SYS_ADMIN, SYS_PTRACE, or ALL — enables raw-socket/routing manipulation,
+#      kernel module loading, namespace escape, or host-process tracing (SYS_PTRACE
+#      enables ptrace(2) on host processes, dangerous with shared namespaces).
+#      ALL grants every capability including NET_ADMIN and NET_RAW.
+#      CAP_ prefix and case variants are normalized before checking.
+#   1e. NO service may map the /dev/net/tun device — the TUN/TAP interface
+#      used by VPN clients to construct egress tunnels around mitmproxy.
+#      Path normalization catches //, /./ and similar variants.
+#   1f. NO service may declare privileged: true — grants ALL capabilities and
+#      ALL host devices, nullifying Invariants 1d and 1e entirely.
+#   1g. NO service may declare device_cgroup_rules with any device-grant rule —
+#      a cgroup allow rule (e.g. "c 10:200 rwm") grants device access by
+#      major:minor independent of a devices: mapping; combined with mknod it
+#      restores tunnel capability that Invariant 1e blocks.
+#   1h. NO service may declare pid: host — with sufficient capability a
+#      container can nsenter into host namespaces, escaping internal:true
+#      entirely.  pid: service:<x>/container:<x> is not rejected.
+#   1i. NO service may declare an IP-forwarding sysctl (net.ipv4.ip_forward or
+#      net.ipv6.conf.<iface>.forwarding) set to an enabling value — enables
+#      container-as-router behavior for relaying traffic.
+#   1j. NO service may declare a confinement-disabling security_opt
+#      (seccomp:unconfined or apparmor:unconfined) — relaxes kernel confinement
+#      and unblocks operations that aid egress bypass.
+#   1k. NO service may declare ipc: host — shares the host IPC namespace
+#      (shared memory, semaphores, message queues), enabling lateral-movement
+#      within the host trust boundary.  ipc: service:<x>/container:<x>/
+#      shareable/private are not host-namespace escapes and are not rejected.
+#   1l. NO service may declare userns_mode: host — disables user-namespace
+#      remapping; when the daemon runs with --userns-remap, container-root is
+#      normally mapped to an unprivileged host UID, but userns_mode: host opts
+#      out, making container-root equivalent to host-root and amplifying any
+#      capability escape into a full host-root compromise.
+#   1m. NO service may declare uts: host — shares the host UTS namespace
+#      (hostname and NIS domain name) with the container, disclosing the host
+#      identity; a compromised container can read (and with sufficient privilege
+#      write) the host hostname, leaking infrastructure topology and enabling
+#      hostname-based authentication bypasses.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -249,6 +292,410 @@ for net in sorted(non_internal_nets - allowed_non_internal_nets):
         f"FAIL: unknown non-internal network '{net}' declared; "
         "only egress-net/gateway-net are permitted"
     )
+
+# ------------------------------------------------------------------
+# Invariant 1c: NO service may declare extra_hosts with a host-gateway mapping.
+#
+# extra_hosts: ["proxy.local:host-gateway"] gives the container the Docker
+# host's bridge IP.  If the host runs any forward proxy/SOCKS/tunnel bound
+# to 0.0.0.0, the workspace can relay egress around mitmproxy.  Reject any
+# extra_hosts entry whose value is "host-gateway" on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of "name=value" strings.
+# Raw-YAML fallback shape: list of "name:value" strings OR a dict {name: value}.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _extra_hosts = _svc_cfg.get("extra_hosts") or []
+    if isinstance(_extra_hosts, dict):
+        # Raw-YAML dict form: {hostname: value}
+        _extra_hosts_items = list(_extra_hosts.values())
+    else:
+        # Scalar-string guard: a bare string (e.g. extra_hosts: "proxy.local:host-gateway")
+        # would be iterated character-by-character without this wrap.
+        if isinstance(_extra_hosts, str):
+            _extra_hosts = [_extra_hosts]
+        # Normalized list form: ["name=value", ...] or raw-YAML ["name:value", ...]
+        _extra_hosts_items = []
+        for _entry in _extra_hosts:
+            if isinstance(_entry, dict):
+                # Possible future dict-list form
+                _extra_hosts_items.append(_entry.get("ip") or _entry.get("value") or "")
+            elif isinstance(_entry, str):
+                # Split on first '=' (normalized) or first ':' (raw YAML)
+                if "=" in _entry:
+                    _extra_hosts_items.append(_entry.split("=", 1)[1])
+                elif ":" in _entry:
+                    _extra_hosts_items.append(_entry.split(":", 1)[1])
+    for _val in _extra_hosts_items:
+        if str(_val).strip() == "host-gateway":
+            failures.append(
+                f"FAIL: service '{_svc}' declares extra_hosts with value 'host-gateway' — "
+                "host-gateway gives the container the Docker host's bridge IP and can relay "
+                "workspace egress around mitmproxy. Remove the host-gateway extra_hosts entry."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1d: NO service may declare cap_add with NET_ADMIN, NET_RAW,
+# SYS_MODULE, SYS_ADMIN, SYS_PTRACE, or ALL.
+#
+# NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
+# Combined with a VPN client image and /dev/net/tun, they can build a tunnel
+# that bypasses mitmproxy.
+#
+# SYS_MODULE allows loading kernel modules (init_module/finit_module syscalls
+# are permitted by Docker's default seccomp profile when CAP_SYS_MODULE is
+# present) — an attacker can load a tunnel kernel module to bypass mitmproxy.
+#
+# SYS_ADMIN enables the nsenter namespace-escape chain (ioctl NS_GET_PARENT +
+# setns into the host network namespace), escaping sandbox-net isolation.
+#
+# SYS_PTRACE enables ptrace(2) on host processes; combined with shared
+# namespaces (e.g. ipc: host or pid: host) it enables host-process inspection
+# and lateral-movement within the host trust boundary.
+#
+# ALL grants every Linux capability including all of the above — same
+# supersetting threat as privileged:true.
+#
+# Normalization: Docker Compose may preserve the CAP_ prefix (e.g.
+# CAP_NET_ADMIN) or lowercase variants (cap_net_admin) from raw YAML.
+# Strip a leading CAP_ prefix and uppercase before checking the banned set
+# so all forms are caught.
+#
+# Scalar-string guard: if cap_add is a bare string (not a list), wrap it
+# into a single-element list before iterating so scalar YAML values are
+# not silently missed by character-iteration.
+# ------------------------------------------------------------------
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "SYS_PTRACE", "ALL"}
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _cap_add = _svc_cfg.get("cap_add") or []
+    if isinstance(_cap_add, str):
+        _cap_add = [_cap_add]
+    for _cap in _cap_add:
+        _cap_norm = str(_cap).strip().upper()
+        if _cap_norm.startswith("CAP_"):
+            _cap_norm = _cap_norm[4:]
+        if _cap_norm in _BANNED_CAPS:
+            failures.append(
+                f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
+                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, SYS_PTRACE, and ALL enable raw-socket/routing "
+                "manipulation, kernel module loading, namespace escape, or host-process tracing "
+                "that can tunnel workspace egress around mitmproxy or enable lateral-movement "
+                "within the host trust boundary and are not permitted. "
+                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and SYS_PTRACE.)"
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1e: NO service may map the /dev/net/tun device.
+#
+# /dev/net/tun is the kernel TUN/TAP interface used by VPN clients to build
+# tunnels.  Combined with NET_ADMIN/NET_RAW, it provides a complete egress
+# bypass path.  Reject any device mapping whose host path resolves to
+# /dev/net/tun on ANY service.
+#
+# Normalized shape (docker compose config JSON): list of dicts {source, target, permissions}.
+# Raw-YAML fallback shape: list of "host:container[:perms]" strings.
+#
+# Path normalization: collapse multiple leading slashes to one (POSIX treats
+# // as implementation-defined, but Docker normalizes it to /), then apply
+# os.path.normpath to collapse /./ and similar segments.  This catches
+# //dev/net/tun, /dev/./net/tun, /dev/net/./tun, etc.
+#
+# Scalar-string guard: if devices is a bare string (not a list), wrap it
+# into a single-element list before iterating.
+# ------------------------------------------------------------------
+import re as _re
+
+def _norm_dev_path(p):
+    """Normalize a device host path: collapse leading // to /, then normpath."""
+    p = _re.sub(r'^/+', '/', str(p).strip())
+    return os.path.normpath(p)
+
+_TUN_PATH = _norm_dev_path("/dev/net/tun")
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _devices = _svc_cfg.get("devices") or []
+    if isinstance(_devices, str):
+        _devices = [_devices]
+    for _dev in _devices:
+        if isinstance(_dev, dict):
+            _host_path = _dev.get("source") or ""
+        elif isinstance(_dev, str):
+            _host_path = _dev.split(":")[0]
+        else:
+            _host_path = ""
+        if _norm_dev_path(_host_path) == _TUN_PATH:
+            failures.append(
+                f"FAIL: service '{_svc}' maps device '/dev/net/tun' — "
+                "the TUN/TAP interface enables VPN tunnel construction that can bypass "
+                "mitmproxy egress containment and is not permitted."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1f: NO service may declare privileged: true.
+#
+# privileged: true grants the container ALL Linux capabilities (including
+# NET_ADMIN and NET_RAW) plus access to ALL host devices (including
+# /dev/net/tun).  It nullifies Invariants 1d and 1e entirely.  Reject
+# any service that declares privileged as boolean True or the string "true".
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _privileged = _svc_cfg.get("privileged")
+    if _privileged is True or str(_privileged).lower() == "true":
+        failures.append(
+            f"FAIL: service '{_svc}' declares privileged: true — "
+            "privileged mode grants all Linux capabilities (including NET_ADMIN and NET_RAW) "
+            "and access to all host devices (including /dev/net/tun), bypassing the egress "
+            "containment controls enforced by Invariants 1d and 1e. Remove privileged: true."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1g: NO service may declare device_cgroup_rules with any
+# device-grant (allow) rule.
+#
+# A cgroup device-allow rule (e.g. "c 10:200 rwm") grants the container
+# access to a device by major:minor number, independent of any devices:
+# mapping.  Combined with an in-container mknod, this restores tunnel
+# capability that Invariant 1e blocks (e.g. recreating /dev/net/tun via
+# major 10, minor 200).  The workspace stack has no legitimate device-grant
+# need, so any non-empty allow rule is rejected (broad/fail-closed).
+#
+# Normalized shape (docker compose config JSON): list of strings like
+# "c 10:200 rwm" or "a *:* rwm".
+# Raw-YAML fallback shape: same list of strings, or a bare scalar string.
+#
+# Scalar-string guard: wrap a bare string into a single-element list.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _dcgr = _svc_cfg.get("device_cgroup_rules") or []
+    if isinstance(_dcgr, str):
+        _dcgr = [_dcgr]
+    for _rule in _dcgr:
+        _rule_s = str(_rule).strip()
+        if _rule_s:
+            failures.append(
+                f"FAIL: service '{_svc}' declares device_cgroup_rules '{_rule_s}' — "
+                "device cgroup allow rules grant device access by major:minor number "
+                "independent of the devices: mapping; combined with mknod this can "
+                "restore tunnel capability bypassing the /dev/net/tun control "
+                "(Invariant 1e). Remove all device_cgroup_rules entries."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1h: NO service may declare pid: host.
+#
+# pid: host shares the host's PID namespace with the container.
+# With sufficient capability or privilege, a process inside the container
+# can nsenter into host namespaces, escaping the internal:true network
+# isolation entirely.  This is the most dangerous escalation when combined
+# with the (now-blocked) privileged: true.
+#
+# pid: service:<x> and pid: container:<x> share another container's PID
+# namespace (not the host's) and are not rejected here.
+#
+# Normalized shape (docker compose config JSON): scalar string "host" or
+# "service:<x>".  Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _pid = _svc_cfg.get("pid")
+    if _pid is not None and str(_pid).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares pid: host — "
+            "pid: host shares the host PID namespace; with sufficient capability "
+            "a container process can nsenter into host namespaces and escape the "
+            "internal:true network isolation. Remove pid: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1i: NO service may declare an IP-forwarding sysctl set to an
+# enabling value.
+#
+# net.ipv4.ip_forward=1, net.ipv4.conf.all.forwarding=1,
+# net.ipv4.conf.<iface>.forwarding=1, and net.ipv6.conf.<iface>.forwarding=1
+# all enable container-as-router behavior, allowing the container to relay
+# traffic between network interfaces and bypass the mitmproxy chokepoint.
+#
+# The Linux kernel aliases net.ipv4.conf.all.forwarding and
+# net.ipv4.conf.<iface>.forwarding to the same forwarding behavior as
+# net.ipv4.ip_forward — all three forms must be rejected.
+#
+# Normalized shape (docker compose config JSON): dict {name: value}.
+# Raw-YAML fallback shape: dict {name: value} OR list of "name=value" strings.
+# Compose normalizes list form to dict; we handle both defensively.
+#
+# Enabling values: integer 1, string "1", boolean True/"true".
+# Forwarding=0 and all other sysctls are not rejected.
+# ------------------------------------------------------------------
+import re as _re_sysctl
+
+_IPV6_FWD_RE = _re_sysctl.compile(r'^net\.ipv6\.conf\.[^.]+\.forwarding$')
+_IPV4_CONF_FWD_RE = _re_sysctl.compile(r'^net\.ipv4\.conf\.[^.]+\.forwarding$')
+
+def _is_enabling_sysctl_value(v):
+    """Return True if the sysctl value enables forwarding."""
+    if v is True:
+        return True
+    s = str(v).strip().lower()
+    return s in ("1", "true")
+
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _sysctls = _svc_cfg.get("sysctls") or {}
+    # Handle list-of-"name=value" strings (raw-YAML form)
+    if isinstance(_sysctls, list):
+        _sysctls_dict = {}
+        for _entry in _sysctls:
+            if isinstance(_entry, str) and "=" in _entry:
+                _k, _v = _entry.split("=", 1)
+                _sysctls_dict[_k.strip()] = _v.strip()
+        _sysctls = _sysctls_dict
+    for _sysctl_key, _sysctl_val in (_sysctls or {}).items():
+        _k = str(_sysctl_key).strip()
+        if (_k == "net.ipv4.ip_forward" or _IPV4_CONF_FWD_RE.match(_k) or _IPV6_FWD_RE.match(_k)) and _is_enabling_sysctl_value(_sysctl_val):
+            failures.append(
+                f"FAIL: service '{_svc}' declares sysctl '{_k}={_sysctl_val}' — "
+                "enabling IP forwarding turns the container into a router that can "
+                "relay traffic between network interfaces, bypassing the mitmproxy "
+                "egress chokepoint. Remove or disable the IP-forwarding sysctl."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1j: NO service may declare a confinement-weakening security_opt
+# for seccomp or apparmor.
+#
+# seccomp:unconfined disables the seccomp syscall filter entirely.
+# apparmor:unconfined disables the AppArmor MAC profile entirely.
+# A custom profile path (e.g. seccomp=/path/to/profile.json or
+# seccomp:/path/to/profile.json) replaces the default Docker seccomp profile
+# with an operator-supplied one that may be permissive — this is equally
+# dangerous because the workspace has no legitimate need for a custom profile.
+#
+# Rule: reject any security_opt entry matching
+#   ^(seccomp|apparmor)[:=](?!default$).+
+# i.e. any seccomp/apparmor value that is NOT the literal "default".
+# The implicit default (no seccomp/apparmor key at all) and the explicit
+# ":default" form are both allowed.  label:* and no-new-privileges:* are
+# always allowed (the latter strengthens confinement).
+#
+# Normalized shape: list of strings like "seccomp:unconfined",
+# "apparmor:unconfined", "seccomp=/path/to/profile.json",
+# "label:disable", "no-new-privileges:true".
+# Raw-YAML fallback shape: same list, or a bare scalar string.
+#
+# Scalar-string guard: wrap a bare string into a single-element list.
+# Normalization: strip whitespace; check is case-insensitive on the prefix.
+# ------------------------------------------------------------------
+_SECOPT_CUSTOM_RE = _re_sysctl.compile(r'^(seccomp|apparmor)[:=](?!default$).+', _re_sysctl.IGNORECASE)
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _sec_opts = _svc_cfg.get("security_opt") or []
+    if isinstance(_sec_opts, str):
+        _sec_opts = [_sec_opts]
+    for _opt in _sec_opts:
+        _opt_s = str(_opt).strip()
+        if _SECOPT_CUSTOM_RE.match(_opt_s):
+            failures.append(
+                f"FAIL: service '{_svc}' declares security_opt '{_opt}' — "
+                "custom or unconfined seccomp/apparmor profiles weaken kernel confinement: "
+                "seccomp:unconfined/apparmor:unconfined disable the filter entirely, and "
+                "a custom profile path replaces the default Docker profile with one that "
+                "may permit dangerous syscalls. Only the implicit default profile is allowed. "
+                "Remove the seccomp/apparmor security_opt entry."
+            )
+            break
+
+# ------------------------------------------------------------------
+# Invariant 1k: NO service may declare ipc: host.
+#
+# ipc: host shares the host IPC namespace (shared memory, semaphores,
+# message queues) with the container.  Combined with SYS_PTRACE or other
+# capabilities, a process inside the container can inspect host processes
+# that share IPC — a lateral-movement path within the host trust boundary.
+#
+# ipc: service:<x> and ipc: container:<x> share another container's IPC
+# namespace (not the host's) and are not rejected here.  ipc: shareable
+# and ipc: private are also not host-namespace escapes and are allowed.
+#
+# Normalized shape (docker compose config JSON): scalar string "host" or
+# "service:<x>".  Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _ipc = _svc_cfg.get("ipc")
+    if _ipc is not None and str(_ipc).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares ipc: host — "
+            "ipc: host shares the host IPC namespace (shared memory, semaphores, "
+            "message queues); combined with SYS_PTRACE or other capabilities it "
+            "enables host-process inspection and lateral-movement within the host "
+            "trust boundary. Remove ipc: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1l: NO service may declare userns_mode: host.
+#
+# userns_mode: host disables user-namespace remapping for the container.
+# When the Docker daemon is configured with --userns-remap (user namespace
+# remapping), container-root is mapped to an unprivileged host UID.
+# Setting userns_mode: host opts the container out of that remapping,
+# making container-root equivalent to host-root.  Combined with any
+# capability escape or privileged operation, this amplifies the blast
+# radius: what would have been a remapped-UID escape becomes a full
+# host-root compromise.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _userns = _svc_cfg.get("userns_mode")
+    if _userns is not None and str(_userns).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares userns_mode: host — "
+            "userns_mode: host disables user-namespace remapping; when the Docker "
+            "daemon runs with --userns-remap, container-root is normally mapped to "
+            "an unprivileged host UID, but userns_mode: host opts out of that "
+            "remapping, making container-root equivalent to host-root and amplifying "
+            "any capability escape into a full host-root compromise. Remove userns_mode: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1m: NO service may declare uts: host.
+#
+# uts: host shares the host UTS namespace with the container.  The UTS
+# namespace controls the hostname and NIS domain name visible inside the
+# container; sharing it with the host exposes the host's identity
+# (hostname, domain) to any process running in the container.  This is
+# an information-disclosure risk: a compromised container can read — and
+# with sufficient privilege write — the host's hostname, leaking
+# infrastructure topology and potentially enabling hostname-based
+# authentication bypasses.  Lower severity than PID/IPC/userns escapes
+# but completes host-namespace-key coverage.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _uts = _svc_cfg.get("uts")
+    if _uts is not None and str(_uts).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares uts: host — "
+            "uts: host shares the host UTS namespace (hostname and NIS domain name) "
+            "with the container, disclosing the host identity; a compromised container "
+            "can read (and with sufficient privilege write) the host hostname, leaking "
+            "infrastructure topology and enabling hostname-based authentication bypasses. "
+            "Remove uts: host."
+        )
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'

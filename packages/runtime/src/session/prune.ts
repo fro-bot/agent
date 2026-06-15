@@ -83,6 +83,21 @@ export async function pruneSessions(
     }
   }
 
+  // Strip count-floor immortality from stale legacy aggregate schedule sessions.
+  // Legacy sessions have title `fro-bot: schedule-<8hex>` (no trailing -<runId>).
+  // Run-scoped sessions (new format) have a numeric suffix and are excluded by the regex.
+  const legacySchedulePattern = /^fro-bot: schedule-[0-9a-f]{8}$/
+  for (const session of sortedSessions) {
+    if (
+      sessionsToKeep.has(session.id) &&
+      legacySchedulePattern.test(session.title) &&
+      session.time.updated < cutoffTime
+    ) {
+      sessionsToKeep.delete(session.id)
+      logger.info('Force-expiring stale legacy schedule session', {sessionId: session.id})
+    }
+  }
+
   const mainSessionsToPrune = sortedSessions.filter(s => !sessionsToKeep.has(s.id))
 
   const allSessionsToPrune = new Set<string>()
