@@ -30,10 +30,12 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #   1c. NO service may declare extra_hosts with a host-gateway value — gives
 #      the container the Docker host's bridge IP, enabling egress relay around
 #      mitmproxy via any host-bound proxy/tunnel.
-#   1d. NO service may declare cap_add with NET_ADMIN, NET_RAW, or ALL —
-#      enables raw-socket/routing manipulation used to build VPN tunnels that
-#      bypass mitmproxy.  ALL grants every capability including NET_ADMIN and
-#      NET_RAW.  CAP_ prefix and case variants are normalized before checking.
+#   1d. NO service may declare cap_add with NET_ADMIN, NET_RAW, SYS_MODULE,
+#      SYS_ADMIN, SYS_PTRACE, or ALL — enables raw-socket/routing manipulation,
+#      kernel module loading, namespace escape, or host-process tracing (SYS_PTRACE
+#      enables ptrace(2) on host processes, dangerous with shared namespaces).
+#      ALL grants every capability including NET_ADMIN and NET_RAW.
+#      CAP_ prefix and case variants are normalized before checking.
 #   1e. NO service may map the /dev/net/tun device — the TUN/TAP interface
 #      used by VPN clients to construct egress tunnels around mitmproxy.
 #      Path normalization catches //, /./ and similar variants.
@@ -52,6 +54,10 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #   1j. NO service may declare a confinement-disabling security_opt
 #      (seccomp:unconfined or apparmor:unconfined) — relaxes kernel confinement
 #      and unblocks operations that aid egress bypass.
+#   1k. NO service may declare ipc: host — shares the host IPC namespace
+#      (shared memory, semaphores, message queues), enabling lateral-movement
+#      within the host trust boundary.  ipc: service:<x>/container:<x>/
+#      shareable/private are not host-namespace escapes and are not rejected.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -322,7 +328,7 @@ for _svc in sorted(services.keys()):
 
 # ------------------------------------------------------------------
 # Invariant 1d: NO service may declare cap_add with NET_ADMIN, NET_RAW,
-# SYS_MODULE, SYS_ADMIN, or ALL.
+# SYS_MODULE, SYS_ADMIN, SYS_PTRACE, or ALL.
 #
 # NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
 # Combined with a VPN client image and /dev/net/tun, they can build a tunnel
@@ -334,6 +340,10 @@ for _svc in sorted(services.keys()):
 #
 # SYS_ADMIN enables the nsenter namespace-escape chain (ioctl NS_GET_PARENT +
 # setns into the host network namespace), escaping sandbox-net isolation.
+#
+# SYS_PTRACE enables ptrace(2) on host processes; combined with shared
+# namespaces (e.g. ipc: host or pid: host) it enables host-process inspection
+# and lateral-movement within the host trust boundary.
 #
 # ALL grants every Linux capability including all of the above — same
 # supersetting threat as privileged:true.
@@ -347,7 +357,7 @@ for _svc in sorted(services.keys()):
 # into a single-element list before iterating so scalar YAML values are
 # not silently missed by character-iteration.
 # ------------------------------------------------------------------
-_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "ALL"}
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "SYS_PTRACE", "ALL"}
 for _svc in sorted(services.keys()):
     _svc_cfg = services.get(_svc) or {}
     _cap_add = _svc_cfg.get("cap_add") or []
@@ -360,10 +370,11 @@ for _svc in sorted(services.keys()):
         if _cap_norm in _BANNED_CAPS:
             failures.append(
                 f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
-                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and ALL enable raw-socket/routing "
-                "manipulation, kernel module loading, or namespace escape that can tunnel "
-                "workspace egress around mitmproxy and are not permitted. "
-                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, and SYS_ADMIN.)"
+                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, SYS_PTRACE, and ALL enable raw-socket/routing "
+                "manipulation, kernel module loading, namespace escape, or host-process tracing "
+                "that can tunnel workspace egress around mitmproxy or enable lateral-movement "
+                "within the host trust boundary and are not permitted. "
+                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and SYS_PTRACE.)"
             )
             break
 
@@ -591,6 +602,33 @@ for _svc in sorted(services.keys()):
                 "Remove the seccomp/apparmor security_opt entry."
             )
             break
+
+# ------------------------------------------------------------------
+# Invariant 1k: NO service may declare ipc: host.
+#
+# ipc: host shares the host IPC namespace (shared memory, semaphores,
+# message queues) with the container.  Combined with SYS_PTRACE or other
+# capabilities, a process inside the container can inspect host processes
+# that share IPC — a lateral-movement path within the host trust boundary.
+#
+# ipc: service:<x> and ipc: container:<x> share another container's IPC
+# namespace (not the host's) and are not rejected here.  ipc: shareable
+# and ipc: private are also not host-namespace escapes and are allowed.
+#
+# Normalized shape (docker compose config JSON): scalar string "host" or
+# "service:<x>".  Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _ipc = _svc_cfg.get("ipc")
+    if _ipc is not None and str(_ipc).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares ipc: host — "
+            "ipc: host shares the host IPC namespace (shared memory, semaphores, "
+            "message queues); combined with SYS_PTRACE or other capabilities it "
+            "enables host-process inspection and lateral-movement within the host "
+            "trust boundary. Remove ipc: host."
+        )
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'

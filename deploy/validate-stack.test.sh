@@ -3357,6 +3357,248 @@ echo "  cap-sys-time-test output (stderr+stdout combined):"
 echo "${CAP_SYS_TIME_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# TEST 58 — Negative: ipc: host must be rejected (Invariant 1k).
+#
+# ipc: host shares the host IPC namespace (shared memory, semaphores,
+# message queues).  Combined with SYS_PTRACE or other capabilities it
+# enables host-process inspection and lateral-movement within the host
+# trust boundary.  The failure message must name the service and mention
+# 'ipc: host'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 58: guard rejects ipc: host (Invariant 1k) ---"
+
+IPC_HOST_COMPOSE="${TMPDIR_TEST}/compose-ipc-host.yaml"
+cat > "${IPC_HOST_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    ipc: host
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+IPC_HOST_OUTPUT=""
+IPC_HOST_EXIT=0
+IPC_HOST_OUTPUT="$(COMPOSE_FILE="${IPC_HOST_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || IPC_HOST_EXIT=$?
+
+if [[ "${IPC_HOST_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${IPC_HOST_EXIT}) for ipc: host"
+else
+  fail "validate-stack.sh exited ZERO for ipc: host — Invariant 1k did NOT fire"
+fi
+
+if echo "${IPC_HOST_OUTPUT}" | grep -q "workspace"; then
+  pass "ipc: host failure message names the service 'workspace'"
+else
+  fail "ipc: host failure message does not name 'workspace' — output: ${IPC_HOST_OUTPUT}"
+fi
+
+if echo "${IPC_HOST_OUTPUT}" | grep -qi "ipc.*host\|ipc: host"; then
+  pass "ipc: host failure message mentions 'ipc: host'"
+else
+  fail "ipc: host failure message does not mention 'ipc: host' — output: ${IPC_HOST_OUTPUT}"
+fi
+
+echo ""
+echo "  ipc-host-test output (stderr+stdout combined):"
+echo "${IPC_HOST_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 59 — Negative: cap_add: [SYS_PTRACE] must be rejected (Invariant 1d).
+#
+# SYS_PTRACE enables ptrace(2) on host processes; combined with shared
+# namespaces it enables host-process inspection and lateral-movement.
+# The failure message must name the service and mention 'SYS_PTRACE'.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 59: guard rejects cap_add: [SYS_PTRACE] (Invariant 1d) ---"
+
+CAP_SYS_PTRACE_COMPOSE="${TMPDIR_TEST}/compose-cap-sys-ptrace.yaml"
+cat > "${CAP_SYS_PTRACE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - SYS_PTRACE
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_SYS_PTRACE_OUTPUT=""
+CAP_SYS_PTRACE_EXIT=0
+CAP_SYS_PTRACE_OUTPUT="$(COMPOSE_FILE="${CAP_SYS_PTRACE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_SYS_PTRACE_EXIT=$?
+
+if [[ "${CAP_SYS_PTRACE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_SYS_PTRACE_EXIT}) for cap_add: [SYS_PTRACE]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [SYS_PTRACE] — Invariant 1d did NOT fire"
+fi
+
+if echo "${CAP_SYS_PTRACE_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add SYS_PTRACE failure message names the service 'workspace'"
+else
+  fail "cap_add SYS_PTRACE failure message does not name 'workspace' — output: ${CAP_SYS_PTRACE_OUTPUT}"
+fi
+
+if echo "${CAP_SYS_PTRACE_OUTPUT}" | grep -qi "SYS_PTRACE"; then
+  pass "cap_add SYS_PTRACE failure message mentions 'SYS_PTRACE'"
+else
+  fail "cap_add SYS_PTRACE failure message does not mention 'SYS_PTRACE' — output: ${CAP_SYS_PTRACE_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-sys-ptrace-test output (stderr+stdout combined):"
+echo "${CAP_SYS_PTRACE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 60 — Negative: cap_add: [CAP_SYS_PTRACE] must be rejected (CAP_ prefix
+#           normalization, Invariant 1d).
+#
+# Docker Compose or raw YAML may preserve the CAP_ prefix.  The guard strips
+# CAP_ before checking the banned set, so CAP_SYS_PTRACE → SYS_PTRACE is caught.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 60: guard rejects cap_add: [CAP_SYS_PTRACE] (CAP_ prefix normalization) ---"
+
+CAP_CAP_SYS_PTRACE_COMPOSE="${TMPDIR_TEST}/compose-cap-cap-sys-ptrace.yaml"
+cat > "${CAP_CAP_SYS_PTRACE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    cap_add:
+      - CAP_SYS_PTRACE
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+CAP_CAP_SYS_PTRACE_OUTPUT=""
+CAP_CAP_SYS_PTRACE_EXIT=0
+CAP_CAP_SYS_PTRACE_OUTPUT="$(COMPOSE_FILE="${CAP_CAP_SYS_PTRACE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || CAP_CAP_SYS_PTRACE_EXIT=$?
+
+if [[ "${CAP_CAP_SYS_PTRACE_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${CAP_CAP_SYS_PTRACE_EXIT}) for cap_add: [CAP_SYS_PTRACE]"
+else
+  fail "validate-stack.sh exited ZERO for cap_add: [CAP_SYS_PTRACE] — CAP_ prefix bypass NOT caught"
+fi
+
+if echo "${CAP_CAP_SYS_PTRACE_OUTPUT}" | grep -q "workspace"; then
+  pass "cap_add CAP_SYS_PTRACE failure message names the service 'workspace'"
+else
+  fail "cap_add CAP_SYS_PTRACE failure message does not name 'workspace' — output: ${CAP_CAP_SYS_PTRACE_OUTPUT}"
+fi
+
+if echo "${CAP_CAP_SYS_PTRACE_OUTPUT}" | grep -qi "CAP_SYS_PTRACE\|SYS_PTRACE"; then
+  pass "cap_add CAP_SYS_PTRACE failure message mentions the capability"
+else
+  fail "cap_add CAP_SYS_PTRACE failure message does not mention the capability — output: ${CAP_CAP_SYS_PTRACE_OUTPUT}"
+fi
+
+echo ""
+echo "  cap-cap-sys-ptrace-test output (stderr+stdout combined):"
+echo "${CAP_CAP_SYS_PTRACE_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST 61 — Positive: ipc: "service:mitmproxy" must NOT be rejected
+#           (Invariant 1k positive control — non-host IPC mode allowed).
+#
+# ipc: service:<x> shares another container's IPC namespace (not the host's)
+# and is not a host-namespace escape.  The guard must not over-reject it.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 61: guard accepts ipc: \"service:mitmproxy\" (non-host IPC mode, not rejected) ---"
+
+IPC_SERVICE_COMPOSE="${TMPDIR_TEST}/compose-ipc-service.yaml"
+cat > "${IPC_SERVICE_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    ipc: "service:mitmproxy"
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+IPC_SERVICE_OUTPUT=""
+IPC_SERVICE_EXIT=0
+IPC_SERVICE_OUTPUT="$(COMPOSE_FILE="${IPC_SERVICE_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || IPC_SERVICE_EXIT=$?
+
+if [[ "${IPC_SERVICE_EXIT}" -eq 0 ]]; then
+  pass "validate-stack.sh exited zero for ipc: \"service:mitmproxy\" — no over-rejection"
+else
+  fail "validate-stack.sh exited non-zero (${IPC_SERVICE_EXIT}) for ipc: service:mitmproxy — over-rejection: ${IPC_SERVICE_OUTPUT}"
+fi
+
+echo ""
+echo "  ipc-service-test output (stderr+stdout combined):"
+echo "${IPC_SERVICE_OUTPUT}" | sed 's/^/    /'
+
+# NOTE: TEST 2 (above) already asserts that the real deploy/compose.yaml passes
+# the topology guard (exit zero) — no duplicate test is added here for the new
+# invariants.  The real compose.yaml uses none of the newly-rejected keys
+# (ipc: host, cap_add: SYS_PTRACE), so TEST 2 serves as the positive control
+# for Invariants 1k and the SYS_PTRACE addition to 1d as well.
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
