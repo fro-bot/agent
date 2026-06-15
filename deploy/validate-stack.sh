@@ -63,6 +63,11 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #      normally mapped to an unprivileged host UID, but userns_mode: host opts
 #      out, making container-root equivalent to host-root and amplifying any
 #      capability escape into a full host-root compromise.
+#   1m. NO service may declare uts: host — shares the host UTS namespace
+#      (hostname and NIS domain name) with the container, disclosing the host
+#      identity; a compromised container can read (and with sufficient privilege
+#      write) the host hostname, leaking infrastructure topology and enabling
+#      hostname-based authentication bypasses.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -661,6 +666,35 @@ for _svc in sorted(services.keys()):
             "an unprivileged host UID, but userns_mode: host opts out of that "
             "remapping, making container-root equivalent to host-root and amplifying "
             "any capability escape into a full host-root compromise. Remove userns_mode: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1m: NO service may declare uts: host.
+#
+# uts: host shares the host UTS namespace with the container.  The UTS
+# namespace controls the hostname and NIS domain name visible inside the
+# container; sharing it with the host exposes the host's identity
+# (hostname, domain) to any process running in the container.  This is
+# an information-disclosure risk: a compromised container can read — and
+# with sufficient privilege write — the host's hostname, leaking
+# infrastructure topology and potentially enabling hostname-based
+# authentication bypasses.  Lower severity than PID/IPC/userns escapes
+# but completes host-namespace-key coverage.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _uts = _svc_cfg.get("uts")
+    if _uts is not None and str(_uts).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares uts: host — "
+            "uts: host shares the host UTS namespace (hostname and NIS domain name) "
+            "with the container, disclosing the host identity; a compromised container "
+            "can read (and with sufficient privilege write) the host hostname, leaking "
+            "infrastructure topology and enabling hostname-based authentication bypasses. "
+            "Remove uts: host."
         )
 
 # ------------------------------------------------------------------

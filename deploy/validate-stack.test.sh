@@ -3883,6 +3883,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# TEST 67 — Negative: uts: host must be rejected (Invariant 1m).
+#
+# uts: host shares the host UTS namespace (hostname and NIS domain name) with
+# the container, disclosing the host identity.  The failure message must name
+# the service and mention uts:host.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 67: guard rejects uts: host (Invariant 1m) ---"
+
+UTS_HOST_COMPOSE="${TMPDIR_TEST}/compose-uts-host.yaml"
+cat > "${UTS_HOST_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+    uts: host
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+UTS_HOST_OUTPUT=""
+UTS_HOST_EXIT=0
+UTS_HOST_OUTPUT="$(COMPOSE_FILE="${UTS_HOST_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || UTS_HOST_EXIT=$?
+
+if [[ "${UTS_HOST_EXIT}" -ne 0 ]]; then
+  pass "validate-stack.sh exited non-zero (${UTS_HOST_EXIT}) for uts: host"
+else
+  fail "validate-stack.sh exited ZERO for uts: host — Invariant 1m did NOT fire"
+fi
+
+if echo "${UTS_HOST_OUTPUT}" | grep -q "workspace"; then
+  pass "uts:host failure message names the service 'workspace'"
+else
+  fail "uts:host failure message does not name 'workspace' — output: ${UTS_HOST_OUTPUT}"
+fi
+
+if echo "${UTS_HOST_OUTPUT}" | grep -qi "uts"; then
+  pass "uts:host failure message mentions 'uts'"
+else
+  fail "uts:host failure message does not mention 'uts' — output: ${UTS_HOST_OUTPUT}"
+fi
+
+echo ""
+echo "  uts-host-test output (stderr+stdout combined):"
+echo "${UTS_HOST_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
