@@ -7,7 +7,7 @@ import type {ChannelQueue} from './queue.js'
 import type {RunMentionDeps, RunTask} from './run.js'
 
 import * as runtimeModule from '@fro-bot/runtime'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
 import * as reactionsModule from '../discord/reactions.js'
@@ -3957,12 +3957,11 @@ describe('formatTimeoutDuration', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Characterization tests — pin current Discord behavior as a zero-regression
-// gate for the Phase A refactor (Units 1–4).
+// Characterization tests — pin current Discord behavior as a zero-regression gate.
 //
 // These tests assert CURRENT observable behavior via the existing Message-based
 // entry points. They must be GREEN on unmodified production code and must
-// remain green after the refactor.
+// remain green after any refactor.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -4445,16 +4444,13 @@ describe('statusMode typing-only: typing indicator only, no status message', () 
 // ---------------------------------------------------------------------------
 // EMPTY-PROMPT fail-fast: bare @fro-bot mention → immediate reply on source message
 //
-// Phase A Unit 3 behavior (post-change): the adapter strips the bot mention and
-// detects an empty prompt BEFORE calling launchWork. It replies on the SOURCE
-// message (not a thread), creates no thread, acquires no lock, writes no run-state.
-//
-// This deliberately changes the Unit 0 baseline (which surfaced EmptyPromptError
-// late in-thread after thread creation and lock acquisition). The change is an
-// accepted Phase A behavior delta — see plan KTD.
+// The adapter strips the bot mention and detects an empty prompt BEFORE calling
+// launchWork. It replies on the SOURCE message (not a thread), creates no thread,
+// acquires no lock, writes no run-state. This avoids the late EmptyPromptError
+// path (which surfaced in-thread after thread creation and lock acquisition).
 // ---------------------------------------------------------------------------
 
-describe('empty-prompt fail-fast: bare mention → immediate reply on source message (post-Unit-3 behavior)', () => {
+describe('empty-prompt fail-fast: bare mention → immediate reply on source message', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -4552,7 +4548,7 @@ describe('empty-prompt fail-fast: bare mention → immediate reply on source mes
 })
 
 // ---------------------------------------------------------------------------
-// launchWork — in-memory sink tests (Unit 2)
+// launchWork — in-memory sink tests
 //
 // These tests prove the engine runs with no Discord/Message dependency.
 // They use in-memory StatusSink/ReplySink implementations and verify:
@@ -4684,7 +4680,7 @@ function makeInMemoryRequest(
   }
 }
 
-describe('launchWork — in-memory sink tests (Unit 2)', () => {
+describe('launchWork — in-memory sink tests', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -4968,4 +4964,118 @@ describe('launchWork — in-memory sink tests (Unit 2)', () => {
     // The replySink is provided by the caller, not created internally
     expect(mockCreateDiscordStreamSink).not.toHaveBeenCalled()
   })
+})
+
+// ---------------------------------------------------------------------------
+// threadFactory failure path (FIX 4)
+// ---------------------------------------------------------------------------
+
+describe('threadFactory failure path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, createRun NOT called, transitionRun NOT called, slot released', async () => {
+    // #given — threadFactory fails immediately
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    // Override startThread to return a rejected promise so threadFactory fails
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Discord thread creation failed'))
+
+    const releaseFn = vi.fn()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — replySink.send called with coarse error message (via message.reply for 'source' target)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const replyCall = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(replyCall.content).toContain('Could not start the task')
+
+    // #and — acquireLock NOT called (threadFactory failed before lock acquisition)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+
+    // #and — createRun NOT called (no lock acquired)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+
+    // #and — transitionRun NOT called (no run-state created)
+    expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
+
+    // #and — concurrency slot released (no leak)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// threadFactory timeout path (FIX 5)
+// ---------------------------------------------------------------------------
+
+/** Bounded timeout for threadFactory calls (ms). Mirrors the constant in run.ts. */
+const THREAD_FACTORY_TIMEOUT_MS = 10_000
+
+describe('threadFactory timeout path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('threadFactory that never resolves → times out, replySink.send called with error, acquireLock NOT called, slot released', async () => {
+    // #given — threadFactory hangs indefinitely (simulates a hung Discord API call)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    // startThread returns a promise that never resolves — simulates a hung Discord call
+    const neverResolves = new Promise<never>(() => {
+      /* intentionally never resolves */
+    })
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockReturnValue(neverResolves)
+
+    const releaseFn = vi.fn()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when — start the run; advance fake timers past the threadFactory timeout while it's pending
+    // We must interleave timer advancement with the awaited promise so the setTimeout fires.
+    const runPromise = runMention(message, makeBinding(), deps)
+    // Advance past the threadFactory timeout (setTimeout in run.ts fires)
+    await vi.advanceTimersByTimeAsync(THREAD_FACTORY_TIMEOUT_MS + 100)
+    // Now the timeout rejection should have propagated; await the run to completion
+    await runPromise
+
+    // #then — replySink.send called with coarse error (via message.reply for 'source' target)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const replyCall = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(replyCall.content).toContain('Could not start the task')
+
+    // #and — acquireLock NOT called (threadFactory timed out before lock acquisition)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+
+    // #and — createRun NOT called
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+
+    // #and — concurrency slot released (no leak)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  }, 15_000)
 })

@@ -7,8 +7,8 @@
  * work without knowing the transport. The Discord adapter (`runMention`) maps a
  * Discord `Message` → `LaunchWorkRequest`, constructs concrete `StatusSink` and
  * `ReplySink` implementations over the existing Discord live-status/typing flow,
- * and calls `launchWork`. A future web adapter (Phase B) will do the same with
- * SSE or WebSocket implementations.
+ * and calls `launchWork`. A future web adapter will do the same with SSE or
+ * WebSocket implementations.
  *
  * ## Sink contract
  *
@@ -24,7 +24,7 @@
  *   accepts `MessageContentOptions` from `discord/io.ts` so the Discord
  *   implementation needs no cast at the call site.
  *
- * ## Phase B implementers
+ * ## Adding a new transport
  *
  * To add a new transport:
  * 1. Implement `StatusSink` (typing/progress/reaction equivalents for your transport).
@@ -53,8 +53,8 @@ export interface DiscordRequesterIdentity {
 }
 
 /**
- * A future web operator who triggered the run via the control surface (Phase B).
- * Shape is intentionally minimal — Phase B will extend this with session/auth fields.
+ * A future web operator who triggered the run via the control surface.
+ * Shape is intentionally minimal — extend with session/auth fields when a web surface is added.
  */
 export interface WebOperatorIdentity {
   readonly kind: 'web-operator'
@@ -102,7 +102,7 @@ export type RunReactionState = 'working' | 'awaiting-approval' | 'succeeded' | '
  * ## Discord adapter pattern
  *
  * ```ts
- * // In the Discord adapter (Unit 3):
+ * // In the Discord adapter:
  * const statusController = createStatusController({ thread, mode: statusMode, logger })
  * const statusSink: StatusSink = {
  *   noteActivity: summary => statusController.noteActivity(summary),
@@ -114,7 +114,7 @@ export type RunReactionState = 'working' | 'awaiting-approval' | 'succeeded' | '
  * }
  * ```
  *
- * ## Phase B implementers
+ * ## Web transport implementers
  *
  * A web transport may implement `noteActivity` as an SSE push, `setBusy` as a
  * WebSocket heartbeat, and `setReaction` as a no-op or a status-badge update.
@@ -202,7 +202,7 @@ export interface StatusSink {
  * ## Discord adapter pattern
  *
  * ```ts
- * // In the Discord adapter (Unit 3):
+ * // In the Discord adapter:
  * const streamSink = createDiscordStreamSink(thread, { logger })
  * const replySink: ReplySink = {
  *   // Streaming output — delegate to DiscordStreamSink
@@ -217,7 +217,7 @@ export interface StatusSink {
  * }
  * ```
  *
- * ## Phase B implementers
+ * ## Web transport implementers
  *
  * A web transport may implement `append`/`flush` as SSE pushes, `buffered` as
  * an in-memory accumulator, and `send` as an HTTP response write. The engine
@@ -329,10 +329,10 @@ export type ReplySinkTarget = 'source' | 'thread'
  *
  * Carries everything the engine needs to execute a unit of work without
  * knowing the transport. The Discord adapter (`runMention`) constructs this
- * from a Discord `Message`; a future web adapter (Phase B) constructs it from
- * an authenticated HTTP request.
+ * from a Discord `Message`; a future web adapter constructs it from an
+ * authenticated HTTP request.
  *
- * ## Field derivation from `startRun` Message reads
+ * ## Field derivation from Discord Message reads
  *
  * | `Message` read in `run.ts`                        | → `LaunchWorkRequest` field      |
  * |---------------------------------------------------|----------------------------------|
@@ -349,7 +349,7 @@ export type ReplySinkTarget = 'source' | 'thread'
  * ## Usage
  *
  * ```ts
- * // Discord adapter (Unit 3):
+ * // Discord adapter:
  * const request: LaunchWorkRequest = {
  *   promptText: stripMention(message.content, deps.botUserId),
  *   channelId: message.channel.id,
@@ -369,8 +369,8 @@ export interface LaunchWorkRequest {
    *
    * Must be a fully-stripped, non-empty string. The Discord adapter strips the
    * bot mention via `botUserId` and fails fast on an empty result BEFORE calling
-   * `launchWork` (the accepted Phase A behavior change — see plan KTD). The engine
-   * does not re-strip or re-validate the prompt.
+   * `launchWork`. The engine also validates at the front door. Neither re-strips
+   * nor re-validates the prompt text beyond the empty check.
    *
    * Derived from `message.content` (`:376-382` in `run.ts`).
    */
@@ -415,10 +415,11 @@ export interface LaunchWorkRequest {
 
   /**
    * Transport-neutral surface identifier written into lock and run-state records.
-   * Replaces the hardcoded `'discord'` literal (`:273`, `:300` in `run.ts`) so
-   * a future web run is not recorded as a Discord run.
+   * Allows a future web run to be recorded as `'web'` rather than `'discord'`.
    *
-   * The Discord adapter passes `'discord'`; a Phase B web adapter passes `'web'`.
+   * The Discord adapter passes `'discord'`; a web adapter passes `'web'`.
+   * surface is a string for transport-neutrality; runtime Surface is currently
+   * 'github'|'discord' — widen when a web surface is added.
    */
   readonly surface: string
 
@@ -430,7 +431,7 @@ export interface LaunchWorkRequest {
 
   /**
    * Transport-neutral requester identity.
-   * Discriminated on `kind` — `'discord-user'` today; `'web-operator'` in Phase B.
+   * Discriminated on `kind` — `'discord-user'` today; `'web-operator'` when a web surface is added.
    */
   readonly requester: RequesterIdentity
 

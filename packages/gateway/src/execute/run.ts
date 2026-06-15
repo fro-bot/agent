@@ -168,7 +168,7 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
   return Math.min(Math.max(60_000, Math.floor(remainingBudgetMs / 2)), remainingBudgetMs - 30_000, 13 * 60_000)
 }
 
-// (Unit 2 DiscordAdapterBridge removed in Unit 3 — thread creation now in adapter via threadFactory)
+// DiscordAdapterBridge was removed — thread creation now lives in the adapter via threadFactory
 
 // ---------------------------------------------------------------------------
 // executeWorkOnHeldSlot — the private slot-holding execution pipeline
@@ -274,9 +274,30 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Called after gates pass, before lock acquisition. The Discord adapter provides this to
     // create the response thread at the right pipeline stage. Non-Discord callers (in-memory
     // sinks, future web transports) omit it — the engine uses an empty thread ID in run-state.
+    //
+    // Bounded timeout: a hung threadFactory would pin the concurrency slot indefinitely.
+    // Uses Promise.race with a setTimeout so the timeout is compatible with fake timers in tests.
+    const THREAD_FACTORY_TIMEOUT_MS = 10_000
     let threadId = ''
     if (request.threadFactory !== undefined) {
-      const threadResult = await request.threadFactory()
+      let threadResult: Awaited<ReturnType<NonNullable<typeof request.threadFactory>>>
+      try {
+        threadResult = await Promise.race([
+          request.threadFactory(),
+          new Promise<never>((_, reject) => {
+            setTimeout(() => {
+              reject(new Error(`threadFactory timed out after ${THREAD_FACTORY_TIMEOUT_MS}ms`))
+            }, THREAD_FACTORY_TIMEOUT_MS)
+          }),
+        ])
+      } catch (threadError) {
+        logger.error(
+          {channelId, repo, err: threadError instanceof Error ? threadError.message : String(threadError)},
+          'run: threadFactory threw or timed out — aborting',
+        )
+        await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
+        return
+      }
       if (threadResult.ok === false) {
         logger.error({channelId, repo, err: threadResult.error}, 'run: threadFactory failed — aborting')
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
@@ -290,6 +311,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
     const coordLogger = toCoordLogger(logger)
+    // surface is a string for transport-neutrality; runtime Surface is currently
+    // 'github'|'discord' — widen when a web surface is added.
     const lockResult = await acquireLock(
       coordinationConfig,
       repo,
@@ -320,6 +343,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
 
     const now = new Date().toISOString()
+    // surface is a string for transport-neutrality; runtime Surface is currently
+    // 'github'|'discord' — widen when a web surface is added.
     const initialRunState = {
       run_id: runId,
       surface: request.surface as Surface,
@@ -482,7 +507,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           handle,
           directory: bindingWithEnsuredPath.workspacePath,
           promptText,
-          sink: replySink as unknown as import('../discord/streaming.js').DiscordStreamSink,
+          sink: replySink,
           signal: timeoutSignal,
           logger,
           coordinator,
@@ -704,7 +729,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
  * Transport-agnostic: accepts a `LaunchWorkRequest` with pre-constructed
  * `StatusSink` and `ReplySink` implementations. The Discord adapter
  * (`runMention`) calls this after mapping a Discord `Message` → `LaunchWorkRequest`.
- * A future web adapter (Phase B) will call this directly.
+ * A future web adapter will call this directly.
  *
  * Enforces the per-channel FIFO queue and global concurrency cap. A future
  * web caller goes through THIS and cannot bypass the queue/cap.
@@ -729,6 +754,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDeps): Promise<void> {
   const {concurrency, queue} = deps
   const channelId = request.channelId
+
+  // ── Empty-prompt front-door guard ────────────────────────────────────────────
+  // Fail fast before any queue/concurrency/lock/run-state work.
+  // The Discord adapter already strips the mention and checks for empty before
+  // calling launchWork, but this guard ensures any future caller (e.g. a web
+  // transport) cannot enter the engine with an empty prompt and hit the late
+  // EmptyPromptError path (which would churn thread/lock/run-state before failing).
+  if (request.promptText.trim().length === 0) {
+    await request.replySink.send('source', {content: 'Nothing to do — please include a task in your message.'})
+    return
+  }
+
   const task: RunTask = {request, deps}
 
   // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
@@ -778,7 +815,7 @@ async function ackEnqueueResult(request: LaunchWorkRequest, result: 'queued' | '
 }
 
 // ---------------------------------------------------------------------------
-// runMention — thin Discord adapter (Unit 3)
+// runMention — thin Discord adapter
 // ---------------------------------------------------------------------------
 
 /**
@@ -791,10 +828,10 @@ async function ackEnqueueResult(request: LaunchWorkRequest, result: 'queued' | '
  *
  * ## Adapter responsibilities
  *
- * 1. **Empty-prompt fail-fast (accepted Phase A behavior change):** strips the
- *    bot mention from `message.content` via `botUserId`. If the result is empty,
- *    replies on the SOURCE message (not a thread) and returns immediately — no
- *    thread created, no lock acquired, no run-state written.
+ * 1. **Empty-prompt fail-fast:** strips the bot mention from `message.content`
+ *    via `botUserId`. If the result is empty, replies on the SOURCE message
+ *    (not a thread) and returns immediately — no thread created, no lock
+ *    acquired, no run-state written.
  *
  * 2. **Pre-thread acks:** cap/queue acks go to the source message via
  *    `sendMessage(message, ...)` before a thread exists.
@@ -823,11 +860,11 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   const {logger, botUserId} = deps
   const channelId = message.channel.id
 
-  // ── Empty-prompt fail-fast (accepted Phase A behavior change) ─────────────
+  // ── Empty-prompt fail-fast ────────────────────────────────────────────────
   // Strip the bot mention from the message content. If the result is empty,
   // fail fast BEFORE thread/lock/run-state — reply on the source message.
-  // This deliberately changes the Unit 0 baseline behavior (which surfaced
-  // EmptyPromptError late in-thread after thread creation and lock acquisition).
+  // This avoids the late EmptyPromptError path (which surfaced in-thread after
+  // thread creation and lock acquisition) for the common bare-mention case.
   const mentionPattern = new RegExp(`<@!?${botUserId}>`, 'g')
   const strippedPrompt = message.content.replace(mentionPattern, '').trim()
   if (strippedPrompt.length === 0) {
@@ -948,7 +985,9 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     promptText: strippedPrompt,
     channelId,
     guildId: message.guild?.id,
-    surface: 'discord', // Phase B: 'web' — one documented cast in engine (request.surface as Surface)
+    // surface is a string for transport-neutrality; runtime Surface is currently 'github'|'discord' —
+    // widen when a web surface is added. The engine casts request.surface as Surface at lock/run-state.
+    surface: 'discord',
     binding,
     requester: {kind: 'discord-user', userId: message.author.id},
     statusSink,

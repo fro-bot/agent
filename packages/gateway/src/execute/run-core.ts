@@ -24,7 +24,6 @@
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
-import type {DiscordStreamSink} from '../discord/streaming.js'
 
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {formatToolPart} from './format-part.js'
@@ -60,6 +59,26 @@ export class RunCoreError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Minimal sink interface
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal streaming sink interface required by `runOpenCodeCore`.
+ *
+ * `runOpenCodeCore` only calls `sink.append(text)` — it never calls `flush()`,
+ * `buffered()`, or any other method. The caller (`run.ts`) is responsible for
+ * flushing after `runOpenCodeCore` resolves.
+ *
+ * Both `ReplySink` (from `execute/launch-types.ts`) and `DiscordStreamSink`
+ * (from `discord/streaming.ts`) satisfy this interface structurally, so no
+ * cast is needed at the call site in `run.ts`.
+ */
+export interface CoreStreamSink {
+  /** Append a text delta to the internal buffer. */
+  readonly append: (text: string) => void
+}
+
+// ---------------------------------------------------------------------------
 // Params
 // ---------------------------------------------------------------------------
 
@@ -82,8 +101,11 @@ export interface RunCoreParams {
    * Streaming sink that receives text deltas.
    * Caller is responsible for calling `sink.flush()` after `runOpenCodeCore`
    * resolves (`run.ts` does this after transitioning to COMPLETED).
+   *
+   * Typed as `CoreStreamSink` (only `append` required) so both `ReplySink` and
+   * `DiscordStreamSink` are structurally assignable without a cast.
    */
-  readonly sink: DiscordStreamSink
+  readonly sink: CoreStreamSink
   /** Abort signal — aborts event iteration when signalled. */
   readonly signal: AbortSignal
   /** Injected logger. Internal details only — never leak session internals to Discord. */
@@ -190,7 +212,7 @@ interface ToolCallInfo {
  */
 function appendToolSummary(
   part: import('./format-part.js').ExtractedToolPart,
-  sink: DiscordStreamSink,
+  sink: CoreStreamSink,
   logger: GatewayLogger,
   onActivity?: (summary: string) => void,
 ): void {

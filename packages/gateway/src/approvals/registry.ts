@@ -65,8 +65,8 @@ export interface DiscordApprovalActor {
 }
 
 /**
- * A future web operator who submitted an approval decision via the control surface (Phase B).
- * Shape is intentionally minimal — Phase B will extend this with session/auth fields.
+ * A future web operator who submitted an approval decision via the control surface.
+ * Shape is intentionally minimal — extend with session/auth fields when a web surface is added.
  */
 export interface WebOperatorActor {
   readonly kind: 'web-operator'

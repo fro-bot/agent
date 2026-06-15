@@ -742,13 +742,13 @@ describe('approval flow — cross-seam integration', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit 4: Non-Discord transport test
+// Non-Discord transport test
 // Proves the seam works for a second transport: a plain function-call
 // (simulating a web transport) renders+registers and settles via the same
 // registry. One gate, no parallel path.
 // ---------------------------------------------------------------------------
 
-describe('Unit 4: non-Discord transport — same registry, same fail-closed gate', () => {
+describe('non-Discord transport — same registry, same fail-closed gate', () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })

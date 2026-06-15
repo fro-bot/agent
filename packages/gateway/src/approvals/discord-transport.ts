@@ -7,8 +7,8 @@
  * - Attaches the settled-embed render function once the message is posted.
  * - Creates the per-request `postReply` closure that captures `sessionID`
  *   (the one documented Discord-specific cast in the approval path — the
- *   `result as Message` cast for `attachMessage`; Phase B will widen
- *   `ReplySink.send` to return a typed result when needed).
+ *   `result as Message` cast for `attachMessage`; widen `ReplySink.send` to
+ *   return a typed result when a web transport needs it).
  *
  * Returns a `PermissionCoordinatorDeps`-compatible `onPending` callback that
  * the engine wires into `createPermissionCoordinator`. A future web transport
@@ -185,8 +185,8 @@ export function createDiscordApprovalOnPending(
     // for attachMessage (Discord impl returns Result<Message, ...>).
     // This is the one documented Discord-specific cast in the approval transport —
     // the `result as Message` cast is resolved here (inside the transport where
-    // it's a clean Discord concern). Phase B will widen ReplySink.send to return
-    // a typed result when needed.
+    // it's a clean Discord concern). Widen ReplySink.send to return a typed
+    // result when a web transport needs the posted message reference.
     const settleEmbed = replySink.markVisibleOutputPending()
     // eslint-disable-next-line no-void
     void replySink
