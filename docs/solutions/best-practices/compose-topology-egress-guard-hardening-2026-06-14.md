@@ -92,7 +92,7 @@ Reject on **all** services, not just the sandboxed one — a banned key on a sib
 _SECOPT_CUSTOM_RE = re.compile(r'^(seccomp|apparmor)[:=](?!default$).+', re.IGNORECASE)
 ```
 
-This rejects `unconfined` and custom profile paths (`seccomp=/path.json`) while allowing the implicit/explicit default.
+This rejects the prefixed `seccomp:unconfined`/`apparmor:unconfined` forms and custom profile paths (`seccomp=/path.json`) while allowing the implicit/explicit default.
 
 ### 6. Security-weighted review on guard code is high-value
 
