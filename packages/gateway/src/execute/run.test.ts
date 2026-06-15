@@ -3911,3 +3911,601 @@ describe('formatTimeoutDuration', () => {
     expect(formatTimeoutDuration(125_000)).toBe('2 minutes 5 seconds')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Characterization tests — pin current Discord behavior as a zero-regression
+// gate for the Phase A refactor (Units 1–4).
+//
+// These tests assert CURRENT observable behavior via the existing Message-based
+// entry points. They must be GREEN on unmodified production code and must
+// remain green after the refactor.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Approval: pending wait → decision → run continues (approved)
+// ---------------------------------------------------------------------------
+
+describe('approval: pending wait → decision → run continues', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('a pending approval that resolves with "once" allows the run to complete successfully', async () => {
+    // #given — coordinator.onPermissionAsked resolves with 'once' (approved)
+    // This pins the current behavior: when an approval is granted, the run
+    // continues to completion (COMPLETED transition, succeeded reaction).
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    // Wire a real coordinator that resolves the permission immediately with 'once'
+    mockCreatePermissionCoordinator.mockImplementation(_coordinatorDeps => {
+      return {
+        onPermissionAsked: vi.fn().mockResolvedValue('once' as const),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    // runOpenCodeCore calls onPermissionAsked and awaits the result
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
+      const reply = await coordinator.onPermissionAsked({
+        requestID: 'req-approved-1',
+        sessionID: 'sess-approved',
+        permission: 'bash',
+        patterns: ['ls'],
+        title: 'Run command: ls',
+      })
+      // Approved — run continues
+      expect(reply).toBe('once')
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — run completed (not failed)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+    expect(transitionPhases).not.toContain('FAILED')
+  })
+
+  it('a pending approval that resolves with "reject" causes the run to fail-close (run-core sees reject)', async () => {
+    // #given — coordinator.onPermissionAsked resolves with 'reject' (denied)
+    // This pins the current behavior: when an approval is rejected, run-core
+    // receives 'reject' and the run fails.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    mockCreatePermissionCoordinator.mockImplementation(() => {
+      return {
+        onPermissionAsked: vi.fn().mockResolvedValue('reject' as const),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    // runOpenCodeCore calls onPermissionAsked, gets 'reject', and throws
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
+      const reply = await coordinator.onPermissionAsked({
+        requestID: 'req-rejected-1',
+        sessionID: 'sess-rejected',
+        permission: 'bash',
+        patterns: ['rm -rf /'],
+        title: 'Run command: rm -rf /',
+      })
+      expect(reply).toBe('reject')
+      // run-core would throw on reject — simulate that
+      const {RunCoreError} = runCoreModule
+      throw new RunCoreError('session-error', 'permission rejected')
+    })
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — run transitioned to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('COMPLETED')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Approval timeout: registry deadline → fail-closed reject (registry-level)
+// ---------------------------------------------------------------------------
+
+describe('approval timeout: registry deadline fires → fail-closed reject', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('registry deadline fires on open entry → postReply called with reject, entry removed', async () => {
+    // #given — a registry entry with a very short deadline
+    // This pins the current registry behavior: when the deadline fires on an
+    // open entry, it POSTs reject and removes the entry (fail-closed).
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    const onDeadlineSettled = vi.fn()
+
+    registry.register({
+      requestID: 'req-deadline-reg-1',
+      sessionID: 'ses-deadline',
+      channelID: 'chan-deadline',
+      directory: '/ws/deadline',
+      request: {
+        requestID: 'req-deadline-reg-1',
+        sessionID: 'ses-deadline',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+      deadlineMs: 10, // very short deadline
+      onDeadlineSettled,
+    })
+
+    expect(registry.has('req-deadline-reg-1')).toBe(true)
+
+    // #when — wait for deadline to fire
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // #then — entry removed (fail-closed)
+    expect(registry.has('req-deadline-reg-1')).toBe(false)
+    // #and — postReply called with 'reject'
+    expect(postReply).toHaveBeenCalledWith('req-deadline-reg-1', '/ws/deadline', 'reject')
+    // #and — onDeadlineSettled callback invoked
+    expect(onDeadlineSettled).toHaveBeenCalledOnce()
+  })
+
+  it('registry deadline fires while entry is claimed (button in-flight) → deadline is a no-op (button wins)', async () => {
+    // #given — entry is claimed (button click in-flight) when deadline fires
+    // This pins the current winner-vs-loser rule: claimed state beats the deadline.
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    // postReply hangs so the entry stays in 'claimed' state when deadline fires
+    let resolvePostReply!: (value: {ok: boolean}) => void
+    const postReply = vi.fn().mockReturnValue(
+      new Promise<{ok: boolean}>(resolve => {
+        resolvePostReply = resolve
+      }),
+    )
+    const onDeadlineSettled = vi.fn()
+
+    registry.register({
+      requestID: 'req-deadline-claimed-1',
+      sessionID: 'ses-claimed',
+      channelID: 'chan-claimed',
+      directory: '/ws/claimed',
+      request: {
+        requestID: 'req-deadline-claimed-1',
+        sessionID: 'ses-claimed',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+      deadlineMs: 20,
+      onDeadlineSettled,
+    })
+
+    // Claim the entry (button click) before deadline fires
+    const decisionPromise = registry.handleButtonDecision({
+      requestID: 'req-deadline-claimed-1',
+      channelID: 'chan-claimed',
+      decision: 'once',
+      decidedBy: 'user-1',
+    })
+
+    // #when — wait for deadline to fire (entry is claimed)
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // #then — deadline is a no-op (entry still exists, claimed by button)
+    // onDeadlineSettled NOT called (deadline lost to button)
+    expect(onDeadlineSettled).not.toHaveBeenCalled()
+    // Entry still exists (button owns it)
+    expect(registry.has('req-deadline-claimed-1')).toBe(true)
+
+    // Cleanup: resolve the button's postReply
+    resolvePostReply({ok: true})
+    await decisionPromise
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Approval dispose/shutdown: onDispose → disposeRun fail-closes pending entries
+// ---------------------------------------------------------------------------
+
+describe('approval dispose/shutdown: onDispose fail-closes pending registry entries', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('coordinator dispose calls onDispose which calls registry.disposeRun — pending entries fail-closed', async () => {
+    // #given — a coordinator wired to a real registry; a pending entry exists
+    // This pins the current behavior: coordinator.dispose → onDispose → registry.disposeRun
+    // → pending entries are fail-closed (postReply called with 'reject', entry removed).
+    //
+    // NOTE: coordinator.js is mocked at the module level in run.test.ts, so we use
+    // vi.importActual to get the real implementation for this integration test.
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const {createPermissionCoordinator: realCreatePermissionCoordinator} =
+      await vi.importActual<typeof import('../approvals/coordinator.js')>('../approvals/coordinator.js')
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    registry.register({
+      requestID: 'req-dispose-1',
+      sessionID: 'ses-dispose',
+      channelID: 'chan-dispose',
+      directory: '/ws/dispose',
+      request: {
+        requestID: 'req-dispose-1',
+        sessionID: 'ses-dispose',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command',
+      },
+      effects: {postReply},
+    })
+
+    expect(registry.has('req-dispose-1')).toBe(true)
+
+    const coordinator = realCreatePermissionCoordinator({
+      logger,
+      onDispose: sessionIDs => {
+        // eslint-disable-next-line no-void
+        void Promise.all(sessionIDs.map(async sid => registry.disposeRun(sid, 'run ended')))
+      },
+    })
+
+    // Register the request with the coordinator so it tracks the sessionID
+    // eslint-disable-next-line no-void
+    void coordinator.onPermissionAsked({
+      requestID: 'req-dispose-1',
+      sessionID: 'ses-dispose',
+      permission: 'bash',
+      patterns: [],
+      title: 'Run command',
+    })
+
+    // #when — coordinator disposed (run teardown)
+    coordinator.dispose('run ended')
+
+    // Allow async disposeRun to complete
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then — entry fail-closed (removed from registry)
+    expect(registry.has('req-dispose-1')).toBe(false)
+    // #and — postReply called with 'reject' (fail-closed)
+    expect(postReply).toHaveBeenCalledWith('req-dispose-1', '/ws/dispose', 'reject')
+  })
+
+  it('registry.disposeAll fail-closes all pending entries across all sessions (gateway shutdown)', async () => {
+    // #given — multiple pending entries across different sessions
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+
+    const postReplyA = vi.fn().mockResolvedValue({ok: true})
+    const postReplyB = vi.fn().mockResolvedValue({ok: true})
+
+    registry.register({
+      requestID: 'req-shutdown-A',
+      sessionID: 'ses-A',
+      channelID: 'chan-A',
+      directory: '/ws/a',
+      request: {requestID: 'req-shutdown-A', sessionID: 'ses-A', permission: 'bash', patterns: [], title: 'cmd A'},
+      effects: {postReply: postReplyA},
+    })
+    registry.register({
+      requestID: 'req-shutdown-B',
+      sessionID: 'ses-B',
+      channelID: 'chan-B',
+      directory: '/ws/b',
+      request: {requestID: 'req-shutdown-B', sessionID: 'ses-B', permission: 'bash', patterns: [], title: 'cmd B'},
+      effects: {postReply: postReplyB},
+    })
+
+    expect(registry.has('req-shutdown-A')).toBe(true)
+    expect(registry.has('req-shutdown-B')).toBe(true)
+
+    // #when — gateway shutdown: disposeAll
+    await registry.disposeAll('gateway shutdown')
+
+    // #then — all entries removed
+    expect(registry.has('req-shutdown-A')).toBe(false)
+    expect(registry.has('req-shutdown-B')).toBe(false)
+    // #and — both postReply calls made with 'reject'
+    expect(postReplyA).toHaveBeenCalledWith('req-shutdown-A', '/ws/a', 'reject')
+    expect(postReplyB).toHaveBeenCalledWith('req-shutdown-B', '/ws/b', 'reject')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Thread creation: message.startThread called for a valid run
+// ---------------------------------------------------------------------------
+
+describe('thread creation: message.startThread called for a valid run', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('startThread is called with the repo name as the thread name', async () => {
+    // #given — happy path run
+    // This pins the current behavior: startThread is called with name `fro-bot: ${repo}`
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const message = makeMessage()
+    const binding = makeBinding() // repo = 'widget'
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, binding, deps)
+
+    // #then — startThread called exactly once with the repo name
+    expect(message.startThread).toHaveBeenCalledOnce()
+    const call = (message.startThread as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {name: string}
+    expect(call.name).toBe(`fro-bot: ${REPO}`)
+  })
+
+  it('startThread is NOT called when workspace is not ready (pre-thread gate)', async () => {
+    // #given — workspace not ready
+    const {runMention} = await import('./run.js')
+    const readyz = makeReadyzFn('not-ready')
+    const message = makeMessage()
+    const deps = makeDeps({readyz})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — startThread never called (gate fires before thread creation)
+    expect(message.startThread).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// statusMode 'live-status': status message posted AND edited as run progresses
+// ---------------------------------------------------------------------------
+
+describe('statusMode live-status: status message posted and edited', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('live-status: createStatusController called with mode live-status and the created thread', async () => {
+    // #given — live-status mode
+    // This pins the current behavior: createStatusController receives the thread
+    // created by startThread, not the original message channel.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const ctrl = makeStatusControllerMock()
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    const deps = makeDeps({statusMode: 'live-status'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — createStatusController called with the thread and live-status mode
+    expect(mockCreateStatusController).toHaveBeenCalledOnce()
+    const ctrlCall = mockCreateStatusController.mock.calls[0]?.[0] as {
+      thread: unknown
+      mode: string
+    }
+    expect(ctrlCall.mode).toBe('live-status')
+    // The thread passed is the one returned by startThread (not the message channel)
+    expect(ctrlCall.thread).toBe(thread)
+    // #and — resolveToAnswer called (status controller owns the answer transition)
+    expect(ctrl.resolveToAnswer).toHaveBeenCalledOnce()
+  })
+
+  it('live-status: resolveToAnswer(handled) → status message is the answer (no sink flush)', async () => {
+    // #given — status controller handles the answer (edits status message in place)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'handled'}})
+    const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+    mockCreateDiscordStreamSink.mockReturnValue({
+      append: vi.fn(),
+      flush: flushMock,
+      buffered: vi.fn().mockReturnValue('The answer'),
+      markVisibleOutputSent: vi.fn(),
+      markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+      hasVisibleOutput: vi.fn().mockReturnValue(false),
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'live-status'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — sink.flush NOT called (status controller owns the answer)
+    expect(flushMock).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// statusMode 'typing-only': typing indicator pulses; NO status message posted
+// ---------------------------------------------------------------------------
+
+describe('statusMode typing-only: typing indicator only, no status message', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('typing-only: createStatusController called with mode typing-only', async () => {
+    // #given — typing-only mode
+    // This pins the current behavior: createStatusController is called with
+    // mode 'typing-only', which suppresses the status message.
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'typing-only'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — createStatusController called with typing-only mode
+    expect(mockCreateStatusController).toHaveBeenCalledOnce()
+    const ctrlCall = mockCreateStatusController.mock.calls[0]?.[0] as {mode: string}
+    expect(ctrlCall.mode).toBe('typing-only')
+  })
+
+  it('typing-only: resolveToAnswer always returns delegated → sink.flush called (no status message to edit)', async () => {
+    // #given — typing-only mode; controller always delegates (no status message)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    makeStatusControllerMock({resolveToAnswerResult: {transition: 'delegated'}})
+    const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10})
+    mockCreateDiscordStreamSink.mockReturnValue({
+      append: vi.fn(),
+      flush: flushMock,
+      buffered: vi.fn().mockReturnValue('answer text'),
+      markVisibleOutputSent: vi.fn(),
+      markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+      hasVisibleOutput: vi.fn().mockReturnValue(false),
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps({statusMode: 'typing-only'})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — sink.flush called (typing-only always delegates to sink)
+    expect(flushMock).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EMPTY-PROMPT baseline: bare @fro-bot mention → late EmptyPromptError in-thread
+//
+// IMPORTANT: Phase A Unit 3 deliberately changes this to fail-fast in the
+// adapter before thread/lock/run-state — this test documents the pre-change
+// baseline and will be updated in Unit 3.
+//
+// Current behavior (pinned here): buildDiscordPrompt throws EmptyPromptError
+// LATE in startRun — AFTER thread creation, lock acquisition, and run-state
+// setup. The error surfaces in-thread (sent to the thread, not the source
+// message) with the "nothing to do" copy.
+// ---------------------------------------------------------------------------
+
+describe('empty-prompt baseline: bare mention → late EmptyPromptError in-thread', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('bare @fro-bot mention: EmptyPromptError surfaces in-thread AFTER thread creation and lock acquisition', async () => {
+    // BASELINE: Phase A Unit 3 deliberately changes this to fail-fast in the
+    // adapter before thread/lock/run-state — this test documents the pre-change
+    // baseline and will be updated in Unit 3.
+    //
+    // Current behavior: buildDiscordPrompt throws EmptyPromptError late in
+    // startRun (after thread creation, lock acquisition, run-state setup).
+    // The error is caught by the exec-error handler and the "nothing to do"
+    // message is sent to the THREAD (not the source message).
+
+    // #given — buildDiscordPrompt throws EmptyPromptError (bare mention, no prompt text)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    // Override buildDiscordPrompt to throw EmptyPromptError (simulating bare mention)
+    const {EmptyPromptError} = promptModule
+    vi.mocked(promptModule.buildDiscordPrompt).mockImplementation(() => {
+      throw new EmptyPromptError()
+    })
+
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — thread WAS created (EmptyPromptError fires AFTER startThread)
+    expect(message.startThread).toHaveBeenCalledOnce()
+
+    // #and — lock WAS acquired (EmptyPromptError fires AFTER acquireLock)
+    expect(mockRuntime.acquireLock).toHaveBeenCalledOnce()
+
+    // #and — run-state WAS created (EmptyPromptError fires AFTER createRun)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — the "nothing to do" error message is sent to the THREAD (not the source message)
+    // This is the key behavior: the failure surfaces in-thread, not as a pre-thread reply.
+    const threadSends = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
+    const nothingToDoSend = threadSends.find(c => c.includes('Nothing to do') || c.includes('nothing to do'))
+    expect(nothingToDoSend).toBeDefined()
+
+    // #and — the source message did NOT receive the "nothing to do" reply
+    // (it would only receive a reply if the error fired before thread creation)
+    const messageSends = (message.reply as ReturnType<typeof vi.fn>).mock.calls.map(
+      c => (c[0] as {content?: string}).content ?? '',
+    )
+    const nothingToDoInMessage = messageSends.find(c => c.includes('Nothing to do') || c.includes('nothing to do'))
+    expect(nothingToDoInMessage).toBeUndefined()
+
+    // #and — run transitioned to FAILED (EmptyPromptError is a failure)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+
+    // #and — failed reaction set on the source message
+    const reactionStates = vi.mocked(reactionsModule.setRunReaction).mock.calls.map(c => c[1])
+    expect(reactionStates).toContain('failed')
+  })
+
+  it('empty-prompt: lock and concurrency slot are released even when EmptyPromptError fires late', async () => {
+    // BASELINE: documents that the current late-failure path still cleans up
+    // correctly (lock released, concurrency slot freed). Phase A Unit 3 will
+    // move the failure earlier, but cleanup must remain correct.
+
+    // #given — buildDiscordPrompt throws EmptyPromptError
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const {EmptyPromptError} = promptModule
+    vi.mocked(promptModule.buildDiscordPrompt).mockImplementation(() => {
+      throw new EmptyPromptError()
+    })
+
+    const releaseFn = vi.fn()
+    const message = makeMessage()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — lock released in inner finally
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    // #and — concurrency slot released in outer finally
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+  })
+})
