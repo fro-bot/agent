@@ -30,10 +30,12 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #   1c. NO service may declare extra_hosts with a host-gateway value — gives
 #      the container the Docker host's bridge IP, enabling egress relay around
 #      mitmproxy via any host-bound proxy/tunnel.
-#   1d. NO service may declare cap_add with NET_ADMIN, NET_RAW, or ALL —
-#      enables raw-socket/routing manipulation used to build VPN tunnels that
-#      bypass mitmproxy.  ALL grants every capability including NET_ADMIN and
-#      NET_RAW.  CAP_ prefix and case variants are normalized before checking.
+#   1d. NO service may declare cap_add with NET_ADMIN, NET_RAW, SYS_MODULE,
+#      SYS_ADMIN, SYS_PTRACE, or ALL — enables raw-socket/routing manipulation,
+#      kernel module loading, namespace escape, or host-process tracing (SYS_PTRACE
+#      enables ptrace(2) on host processes, dangerous with shared namespaces).
+#      ALL grants every capability including NET_ADMIN and NET_RAW.
+#      CAP_ prefix and case variants are normalized before checking.
 #   1e. NO service may map the /dev/net/tun device — the TUN/TAP interface
 #      used by VPN clients to construct egress tunnels around mitmproxy.
 #      Path normalization catches //, /./ and similar variants.
@@ -52,6 +54,20 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 #   1j. NO service may declare a confinement-disabling security_opt
 #      (seccomp:unconfined or apparmor:unconfined) — relaxes kernel confinement
 #      and unblocks operations that aid egress bypass.
+#   1k. NO service may declare ipc: host — shares the host IPC namespace
+#      (shared memory, semaphores, message queues), enabling lateral-movement
+#      within the host trust boundary.  ipc: service:<x>/container:<x>/
+#      shareable/private are not host-namespace escapes and are not rejected.
+#   1l. NO service may declare userns_mode: host — disables user-namespace
+#      remapping; when the daemon runs with --userns-remap, container-root is
+#      normally mapped to an unprivileged host UID, but userns_mode: host opts
+#      out, making container-root equivalent to host-root and amplifying any
+#      capability escape into a full host-root compromise.
+#   1m. NO service may declare uts: host — shares the host UTS namespace
+#      (hostname and NIS domain name) with the container, disclosing the host
+#      identity; a compromised container can read (and with sufficient privilege
+#      write) the host hostname, leaking infrastructure topology and enabling
+#      hostname-based authentication bypasses.
 #   2. workspace is attached to sandbox-net ONLY — it has zero direct egress.
 #   3. mitmproxy is attached to sandbox-net AND at least one non-internal
 #      network (its upstream leg to the internet).
@@ -322,7 +338,7 @@ for _svc in sorted(services.keys()):
 
 # ------------------------------------------------------------------
 # Invariant 1d: NO service may declare cap_add with NET_ADMIN, NET_RAW,
-# SYS_MODULE, SYS_ADMIN, or ALL.
+# SYS_MODULE, SYS_ADMIN, SYS_PTRACE, or ALL.
 #
 # NET_ADMIN and NET_RAW enable raw-socket and routing-table manipulation.
 # Combined with a VPN client image and /dev/net/tun, they can build a tunnel
@@ -334,6 +350,10 @@ for _svc in sorted(services.keys()):
 #
 # SYS_ADMIN enables the nsenter namespace-escape chain (ioctl NS_GET_PARENT +
 # setns into the host network namespace), escaping sandbox-net isolation.
+#
+# SYS_PTRACE enables ptrace(2) on host processes; combined with shared
+# namespaces (e.g. ipc: host or pid: host) it enables host-process inspection
+# and lateral-movement within the host trust boundary.
 #
 # ALL grants every Linux capability including all of the above — same
 # supersetting threat as privileged:true.
@@ -347,7 +367,7 @@ for _svc in sorted(services.keys()):
 # into a single-element list before iterating so scalar YAML values are
 # not silently missed by character-iteration.
 # ------------------------------------------------------------------
-_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "ALL"}
+_BANNED_CAPS = {"NET_ADMIN", "NET_RAW", "SYS_MODULE", "SYS_ADMIN", "SYS_PTRACE", "ALL"}
 for _svc in sorted(services.keys()):
     _svc_cfg = services.get(_svc) or {}
     _cap_add = _svc_cfg.get("cap_add") or []
@@ -360,10 +380,11 @@ for _svc in sorted(services.keys()):
         if _cap_norm in _BANNED_CAPS:
             failures.append(
                 f"FAIL: service '{_svc}' declares cap_add '{_cap}' — "
-                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and ALL enable raw-socket/routing "
-                "manipulation, kernel module loading, or namespace escape that can tunnel "
-                "workspace egress around mitmproxy and are not permitted. "
-                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, and SYS_ADMIN.)"
+                "NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, SYS_PTRACE, and ALL enable raw-socket/routing "
+                "manipulation, kernel module loading, namespace escape, or host-process tracing "
+                "that can tunnel workspace egress around mitmproxy or enable lateral-movement "
+                "within the host trust boundary and are not permitted. "
+                "(ALL grants every capability including NET_ADMIN, NET_RAW, SYS_MODULE, SYS_ADMIN, and SYS_PTRACE.)"
             )
             break
 
@@ -591,6 +612,90 @@ for _svc in sorted(services.keys()):
                 "Remove the seccomp/apparmor security_opt entry."
             )
             break
+
+# ------------------------------------------------------------------
+# Invariant 1k: NO service may declare ipc: host.
+#
+# ipc: host shares the host IPC namespace (shared memory, semaphores,
+# message queues) with the container.  Combined with SYS_PTRACE or other
+# capabilities, a process inside the container can inspect host processes
+# that share IPC — a lateral-movement path within the host trust boundary.
+#
+# ipc: service:<x> and ipc: container:<x> share another container's IPC
+# namespace (not the host's) and are not rejected here.  ipc: shareable
+# and ipc: private are also not host-namespace escapes and are allowed.
+#
+# Normalized shape (docker compose config JSON): scalar string "host" or
+# "service:<x>".  Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _ipc = _svc_cfg.get("ipc")
+    if _ipc is not None and str(_ipc).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares ipc: host — "
+            "ipc: host shares the host IPC namespace (shared memory, semaphores, "
+            "message queues); combined with SYS_PTRACE or other capabilities it "
+            "enables host-process inspection and lateral-movement within the host "
+            "trust boundary. Remove ipc: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1l: NO service may declare userns_mode: host.
+#
+# userns_mode: host disables user-namespace remapping for the container.
+# When the Docker daemon is configured with --userns-remap (user namespace
+# remapping), container-root is mapped to an unprivileged host UID.
+# Setting userns_mode: host opts the container out of that remapping,
+# making container-root equivalent to host-root.  Combined with any
+# capability escape or privileged operation, this amplifies the blast
+# radius: what would have been a remapped-UID escape becomes a full
+# host-root compromise.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _userns = _svc_cfg.get("userns_mode")
+    if _userns is not None and str(_userns).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares userns_mode: host — "
+            "userns_mode: host disables user-namespace remapping; when the Docker "
+            "daemon runs with --userns-remap, container-root is normally mapped to "
+            "an unprivileged host UID, but userns_mode: host opts out of that "
+            "remapping, making container-root equivalent to host-root and amplifying "
+            "any capability escape into a full host-root compromise. Remove userns_mode: host."
+        )
+
+# ------------------------------------------------------------------
+# Invariant 1m: NO service may declare uts: host.
+#
+# uts: host shares the host UTS namespace with the container.  The UTS
+# namespace controls the hostname and NIS domain name visible inside the
+# container; sharing it with the host exposes the host's identity
+# (hostname, domain) to any process running in the container.  This is
+# an information-disclosure risk: a compromised container can read — and
+# with sufficient privilege write — the host's hostname, leaking
+# infrastructure topology and potentially enabling hostname-based
+# authentication bypasses.  Lower severity than PID/IPC/userns escapes
+# but completes host-namespace-key coverage.
+#
+# Normalized shape (docker compose config JSON): scalar string "host".
+# Raw-YAML fallback shape: same scalar string.
+# ------------------------------------------------------------------
+for _svc in sorted(services.keys()):
+    _svc_cfg = services.get(_svc) or {}
+    _uts = _svc_cfg.get("uts")
+    if _uts is not None and str(_uts).strip().lower() == "host":
+        failures.append(
+            f"FAIL: service '{_svc}' declares uts: host — "
+            "uts: host shares the host UTS namespace (hostname and NIS domain name) "
+            "with the container, disclosing the host identity; a compromised container "
+            "can read (and with sufficient privilege write) the host hostname, leaking "
+            "infrastructure topology and enabling hostname-based authentication bypasses. "
+            "Remove uts: host."
+        )
 
 # ------------------------------------------------------------------
 # Invariant 6: workspace must mount the named volume 'workspace-repos'
