@@ -4443,114 +4443,111 @@ describe('statusMode typing-only: typing indicator only, no status message', () 
 })
 
 // ---------------------------------------------------------------------------
-// EMPTY-PROMPT baseline: bare @fro-bot mention → late EmptyPromptError in-thread
+// EMPTY-PROMPT fail-fast: bare @fro-bot mention → immediate reply on source message
 //
-// IMPORTANT: Phase A Unit 3 deliberately changes this to fail-fast in the
-// adapter before thread/lock/run-state — this test documents the pre-change
-// baseline and will be updated in Unit 3.
+// Phase A Unit 3 behavior (post-change): the adapter strips the bot mention and
+// detects an empty prompt BEFORE calling launchWork. It replies on the SOURCE
+// message (not a thread), creates no thread, acquires no lock, writes no run-state.
 //
-// Current behavior (pinned here): buildDiscordPrompt throws EmptyPromptError
-// LATE in startRun — AFTER thread creation, lock acquisition, and run-state
-// setup. The error surfaces in-thread (sent to the thread, not the source
-// message) with the "nothing to do" copy.
+// This deliberately changes the Unit 0 baseline (which surfaced EmptyPromptError
+// late in-thread after thread creation and lock acquisition). The change is an
+// accepted Phase A behavior delta — see plan KTD.
 // ---------------------------------------------------------------------------
 
-describe('empty-prompt baseline: bare mention → late EmptyPromptError in-thread', () => {
+describe('empty-prompt fail-fast: bare mention → immediate reply on source message (post-Unit-3 behavior)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
 
-  it('bare @fro-bot mention: EmptyPromptError surfaces in-thread AFTER thread creation and lock acquisition', async () => {
-    // BASELINE: Phase A Unit 3 deliberately changes this to fail-fast in the
-    // adapter before thread/lock/run-state — this test documents the pre-change
-    // baseline and will be updated in Unit 3.
-    //
-    // Current behavior: buildDiscordPrompt throws EmptyPromptError late in
-    // startRun (after thread creation, lock acquisition, run-state setup).
-    // The error is caught by the exec-error handler and the "nothing to do"
-    // message is sent to the THREAD (not the source message).
+  it('bare @fro-bot mention: fails fast BEFORE thread creation, lock, or run-state', async () => {
+    // Post-Unit-3 behavior: the adapter strips the bot mention and detects an
+    // empty prompt before calling launchWork. The "nothing to do" reply goes to
+    // the SOURCE message (not a thread). No thread is created, no lock acquired,
+    // no run-state written.
 
-    // #given — buildDiscordPrompt throws EmptyPromptError (bare mention, no prompt text)
+    // #given — message content is just the bot mention (empty prompt after strip)
     const {runMention} = await import('./run.js')
-    setupHappyPath()
-
-    // Override buildDiscordPrompt to throw EmptyPromptError (simulating bare mention)
-    const {EmptyPromptError} = promptModule
-    vi.mocked(promptModule.buildDiscordPrompt).mockImplementation(() => {
-      throw new EmptyPromptError()
-    })
+    // No setupHappyPath() — we must not reach the engine at all
 
     const thread = makeThread()
     const message = makeMessage(thread)
+    // Override content to be a bare mention (empty after strip)
+    ;(message as unknown as {content: string}).content = `<@${makeDeps().botUserId}>`
     const deps = makeDeps()
 
     // #when
     await runMention(message, makeBinding(), deps)
 
-    // #then — thread WAS created (EmptyPromptError fires AFTER startThread)
-    expect(message.startThread).toHaveBeenCalledOnce()
+    // #then — NO thread created (fail-fast fires before threadFactory)
+    expect(message.startThread).not.toHaveBeenCalled()
 
-    // #and — lock WAS acquired (EmptyPromptError fires AFTER acquireLock)
-    expect(mockRuntime.acquireLock).toHaveBeenCalledOnce()
+    // #and — NO lock acquired (fail-fast fires before launchWork)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
 
-    // #and — run-state WAS created (EmptyPromptError fires AFTER createRun)
-    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+    // #and — NO run-state created (fail-fast fires before launchWork)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
 
-    // #and — the "nothing to do" error message is sent to the THREAD (not the source message)
-    // This is the key behavior: the failure surfaces in-thread, not as a pre-thread reply.
-    const threadSends = thread.send.mock.calls.map(c => (c[0] as {content?: string}).content ?? '')
-    const nothingToDoSend = threadSends.find(c => c.includes('Nothing to do') || c.includes('nothing to do'))
-    expect(nothingToDoSend).toBeDefined()
+    // #and — the "nothing to do" reply is sent to the SOURCE message (not a thread)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+      content: string
+      allowedMentions: unknown
+    }
+    expect(call.content).toMatch(/nothing to do/i)
+    expect(call.allowedMentions).toEqual({parse: []})
 
-    // #and — the source message did NOT receive the "nothing to do" reply
-    // (it would only receive a reply if the error fired before thread creation)
-    const messageSends = (message.reply as ReturnType<typeof vi.fn>).mock.calls.map(
-      c => (c[0] as {content?: string}).content ?? '',
-    )
-    const nothingToDoInMessage = messageSends.find(c => c.includes('Nothing to do') || c.includes('nothing to do'))
-    expect(nothingToDoInMessage).toBeUndefined()
+    // #and — the thread did NOT receive the "nothing to do" message
+    expect(thread.send).not.toHaveBeenCalled()
 
-    // #and — run transitioned to FAILED (EmptyPromptError is a failure)
-    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
-    expect(transitionPhases).toContain('FAILED')
-
-    // #and — failed reaction set on the source message
-    const reactionStates = vi.mocked(reactionsModule.setRunReaction).mock.calls.map(c => c[1])
-    expect(reactionStates).toContain('failed')
+    // #and — no run-state transitions (no FAILED, no COMPLETED)
+    expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
   })
 
-  it('empty-prompt: lock and concurrency slot are released even when EmptyPromptError fires late', async () => {
-    // BASELINE: documents that the current late-failure path still cleans up
-    // correctly (lock released, concurrency slot freed). Phase A Unit 3 will
-    // move the failure earlier, but cleanup must remain correct.
+  it('empty-prompt fail-fast: concurrency slot is NOT acquired (no slot to release)', async () => {
+    // Post-Unit-3 behavior: fail-fast fires before launchWork, so the concurrency
+    // slot is never acquired and never needs to be released.
 
-    // #given — buildDiscordPrompt throws EmptyPromptError
+    // #given — message content is a bare mention
     const {runMention} = await import('./run.js')
-    setupHappyPath()
-
-    const {EmptyPromptError} = promptModule
-    vi.mocked(promptModule.buildDiscordPrompt).mockImplementation(() => {
-      throw new EmptyPromptError()
-    })
 
     const releaseFn = vi.fn()
+    const tryAcquireFn = vi.fn().mockReturnValue('ok')
     const message = makeMessage()
     const deps = makeDeps({
       concurrency: {
-        tryAcquire: vi.fn().mockReturnValue('ok'),
+        tryAcquire: tryAcquireFn,
         release: releaseFn,
-        activeCount: vi.fn().mockReturnValue(1),
+        activeCount: vi.fn().mockReturnValue(0),
         max: 3,
       },
     })
+    ;(message as unknown as {content: string}).content = `<@${deps.botUserId}>`
 
     // #when
     await runMention(message, makeBinding(), deps)
 
-    // #then — lock released in inner finally
-    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
-    // #and — concurrency slot released in outer finally
-    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    // #then — tryAcquire NOT called (fail-fast fires before launchWork)
+    expect(tryAcquireFn).not.toHaveBeenCalled()
+    // #and — release NOT called (slot was never acquired)
+    expect(releaseFn).not.toHaveBeenCalled()
+  })
+
+  it('empty-prompt fail-fast: whitespace-only prompt after mention strip also fails fast', async () => {
+    // #given — message content is mention + whitespace only
+    const {runMention} = await import('./run.js')
+
+    const message = makeMessage()
+    const deps = makeDeps()
+    ;(message as unknown as {content: string}).content = `<@${deps.botUserId}>   \t  `
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — fails fast: reply on source message, no thread
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toMatch(/nothing to do/i)
+    expect(message.startThread).not.toHaveBeenCalled()
   })
 })
 

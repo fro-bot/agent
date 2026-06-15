@@ -377,6 +377,30 @@ export interface LaunchWorkRequest {
   readonly promptText: string
 
   /**
+   * Optional thread factory called by the engine after `ensureClone` and `readyz`
+   * pass, before lock acquisition.
+   *
+   * The Discord adapter provides this to create the response thread at the right
+   * point in the pipeline (after gates pass, before lock). The factory creates the
+   * Discord thread, initializes the real `StatusSink`/`ReplySink` implementations
+   * (replacing any deferred proxies), and returns the thread ID for run-state.
+   *
+   * When absent (e.g. in-memory sink tests or future web transports that don't
+   * need a thread), the engine uses an empty string as the thread ID in run-state.
+   *
+   * This is the seam that keeps thread creation in the adapter while letting the
+   * engine trigger it at the correct pipeline stage. The engine never imports
+   * Discord types — it only calls this opaque factory.
+   *
+   * Returns `{ok: true, threadId}` on success or `{ok: false, error}` on failure.
+   * On failure the engine sends a coarse error via `replySink.send('source', ...)`
+   * and aborts the run (same behavior as the current `startThread` error path).
+   */
+  readonly threadFactory?: () => Promise<
+    {readonly ok: true; readonly threadId: string} | {readonly ok: false; readonly error: string}
+  >
+
+  /**
    * The channel ID scoping the per-channel FIFO queue and concurrency slot.
    *
    * Derived from `message.channel.id` (`:205`, `:807` in `run.ts`).
