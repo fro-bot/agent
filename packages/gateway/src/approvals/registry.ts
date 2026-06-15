@@ -1,10 +1,10 @@
 /**
  * Program-scoped approval registry bridge.
  *
- * Maps requestID → approval context across all in-flight runs so the Discord
- * button handler can: verify channel binding, claim exactly once
- * (single-winner), and POST the reply to OpenCode. All Discord/SDK side
- * effects are injected as closures — this module is pure and unit-testable.
+ * Maps requestID → approval context across all in-flight runs so any approval
+ * transport (Discord button, future web callback) can: verify scope binding,
+ * claim exactly once (single-winner), and POST the reply to OpenCode. All
+ * side effects are injected as closures — this module is pure and unit-testable.
  *
  * ### 3-state entry lifecycle
  *
@@ -51,11 +51,46 @@ import type {PermissionReply, PermissionReplyEvent, PermissionRequest, Settlemen
 // Public types
 // ---------------------------------------------------------------------------
 
-/** Render function injected after the Discord embed is posted successfully. */
+// ---------------------------------------------------------------------------
+// ApprovalActor — transport-neutral actor/operator identity
+// ---------------------------------------------------------------------------
+
+/**
+ * A Discord user who clicked an approval button.
+ */
+export interface DiscordApprovalActor {
+  readonly kind: 'discord-user'
+  /** Discord snowflake ID of the user who clicked the button. */
+  readonly userId: string
+}
+
+/**
+ * A future web operator who submitted an approval decision via the control surface (Phase B).
+ * Shape is intentionally minimal — Phase B will extend this with session/auth fields.
+ */
+export interface WebOperatorActor {
+  readonly kind: 'web-operator'
+  /** Stable operator identifier (e.g. GitHub login or internal operator ID). */
+  readonly operatorId: string
+}
+
+/**
+ * Transport-neutral actor identity for an approval decision.
+ *
+ * Discriminated on `kind` so callers can narrow without `as` casts:
+ * ```ts
+ * if (actor.kind === 'discord-user') {
+ *   // actor.userId is available here
+ * }
+ * ```
+ */
+export type ApprovalActor = DiscordApprovalActor | WebOperatorActor
+
+/** Render function injected after the approval embed/notification is posted successfully. */
 export type RenderFn = (
   request: PermissionRequest,
   decision: PermissionReply,
-  decidedBy: string | null,
+  actor: ApprovalActor | null,
   reason: SettlementReason,
 ) => Promise<void>
 
@@ -71,8 +106,17 @@ export interface ApprovalSideEffects {
 export interface RegisterParams {
   readonly requestID: string
   readonly sessionID: string
-  /** Thread/channel id where the embed will be posted — the binding. */
-  readonly channelID: string
+  /**
+   * Transport-neutral scope identifier for the approval entry.
+   *
+   * For Discord: the thread/channel ID where the embed is posted — used by the
+   * button handler to verify the interaction came from the correct channel.
+   * For a future web transport: an opaque scope token (e.g. session ID or
+   * request correlation ID) that the web callback verifies.
+   *
+   * Replaces the Discord-shaped `channelID` field.
+   */
+  readonly approvalScopeId: string
   /** Workspace dir for reply routing. */
   readonly directory: string
   readonly request: PermissionRequest
@@ -101,27 +145,32 @@ export type DecisionOutcome = 'ok' | 'not-found' | 'channel-mismatch' | 'already
 export type EntryState = 'open' | 'claimed' | 'confirmed'
 
 export interface ApprovalRegistry {
-  /** Register a new entry BEFORE sending the Discord embed. */
+  /** Register a new entry BEFORE sending the approval embed/notification. */
   register: (params: RegisterParams) => void
   /**
-   * Attach the settled-embed render function once the Discord message is
+   * Attach the settled-embed render function once the approval notification is
    * posted. Must be called after `register` and only when the send succeeds.
    */
   attachMessage: (requestID: string, renderFn: RenderFn) => void
   /**
-   * Mark that the Discord embed could not be posted. The entry stays
+   * Mark that the approval notification could not be posted. The entry stays
    * registered so the permission reply can still be POSTed on settlement;
-   * the embed edit step is skipped since there is nothing to edit.
+   * the render step is skipped since there is nothing to edit.
    */
   markMessagePostFailed: (requestID: string) => void
   has: (requestID: string) => boolean
   pending: () => readonly string[]
-  /** Button path: enforce channel binding, single-winner claim, POST reply. Does NOT edit the embed. */
-  handleButtonDecision: (args: {
+  /**
+   * Transport-neutral decision intake: enforce scope binding, single-winner
+   * claim, POST reply. Does NOT edit the embed/notification.
+   *
+   * Replaces the Discord-shaped `handleButtonDecision` method.
+   */
+  handleDecision: (args: {
     readonly requestID: string
-    readonly channelID: string
+    readonly approvalScopeId: string
     readonly decision: PermissionReply
-    readonly decidedBy: string
+    readonly actor: ApprovalActor
   }) => Promise<DecisionOutcome>
   /**
    * Authoritative settlement from `permission.replied`.
@@ -156,12 +205,12 @@ export interface ApprovalRegistry {
 interface RegistryEntry {
   readonly request: PermissionRequest
   readonly sessionID: string
-  readonly channelID: string
+  readonly approvalScopeId: string
   readonly directory: string
   readonly effects: ApprovalSideEffects
   state: EntryState
-  decidedBy: string | null
-  /** Set by attachMessage once the Discord embed is posted. */
+  actor: ApprovalActor | null
+  /** Set by attachMessage once the approval notification is posted. */
   renderFn: RenderFn | null
   /** Deadline timer handle — cleared on any terminal transition. */
   timer: ReturnType<typeof setTimeout> | null
@@ -206,7 +255,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   ): Promise<void> {
     if (entry.renderFn !== null) {
       try {
-        await entry.renderFn(entry.request, decision, entry.decidedBy, reason)
+        await entry.renderFn(entry.request, decision, entry.actor, reason)
       } catch (error) {
         logger.error({requestID, reason, err: error}, 'ApprovalRegistry: renderFn threw during settlement — continuing')
       }
@@ -215,13 +264,13 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
 
   /**
    * Shared fail-close helper: POST reject + render 'deadline' + delete.
-   * Used by both the deadline open-path and the handleButtonDecision reset
+   * Used by both the deadline open-path and the handleDecision reset
    * path when deadlineExpired is true.
    */
   async function failCloseNow(requestID: string, entry: RegistryEntry): Promise<void> {
     logger.warn({requestID}, 'ApprovalRegistry: fail-closing entry (deadline already expired)')
     entry.state = 'claimed'
-    entry.decidedBy = null
+    entry.actor = null
     try {
       const r = await entry.effects.postReply(requestID, entry.directory, 'reject')
       if (!r.ok) {
@@ -242,7 +291,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   // -------------------------------------------------------------------------
 
   function register(params: RegisterParams): void {
-    const {requestID, sessionID, channelID, directory, request, effects, deadlineMs, onDeadlineSettled} = params
+    const {requestID, sessionID, approvalScopeId, directory, request, effects, deadlineMs, onDeadlineSettled} = params
     if (entries.has(requestID)) {
       // FIX 3: clear the existing entry's timer before overwriting so the old
       // setTimeout cannot fire settleByDeadline on the replacement entry.
@@ -261,11 +310,11 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     const entry: RegistryEntry = {
       request,
       sessionID,
-      channelID,
+      approvalScopeId,
       directory,
       effects,
       state: 'open',
-      decidedBy: null,
+      actor: null,
       renderFn: null,
       timer: null,
       deadlineExpired: false,
@@ -377,38 +426,38 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
   }
 
   // -------------------------------------------------------------------------
-  // handleButtonDecision
+  // handleDecision (transport-neutral decision intake)
   // -------------------------------------------------------------------------
 
-  async function handleButtonDecision(args: {
+  async function handleDecision(args: {
     readonly requestID: string
-    readonly channelID: string
+    readonly approvalScopeId: string
     readonly decision: PermissionReply
-    readonly decidedBy: string
+    readonly actor: ApprovalActor
   }): Promise<DecisionOutcome> {
-    const {requestID, channelID, decision, decidedBy} = args
+    const {requestID, approvalScopeId, decision, actor} = args
 
     const entry = entries.get(requestID)
     if (entry === undefined) {
       return 'not-found'
     }
 
-    if (entry.channelID !== channelID) {
+    if (entry.approvalScopeId !== approvalScopeId) {
       logger.warn(
-        {requestID, expected: entry.channelID, received: channelID},
-        'ApprovalRegistry: channel mismatch — ignoring button click',
+        {requestID, expected: entry.approvalScopeId, received: approvalScopeId},
+        'ApprovalRegistry: scope mismatch — ignoring decision',
       )
       return 'channel-mismatch'
     }
 
-    // Single-winner gate: claimed or confirmed both block a second click.
+    // Single-winner gate: claimed or confirmed both block a second decision.
     if (entry.state === 'claimed' || entry.state === 'confirmed') {
       return 'already-claimed'
     }
 
     // Atomic claim — transitions open → claimed
     entry.state = 'claimed'
-    entry.decidedBy = decidedBy
+    entry.actor = actor
 
     let result: {readonly ok: boolean; readonly error?: string}
     try {
@@ -422,7 +471,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
         void failCloseNow(requestID, entry)
       } else {
         entry.state = 'open'
-        entry.decidedBy = null
+        entry.actor = null
       }
       return 'reply-failed'
     }
@@ -438,7 +487,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
         void failCloseNow(requestID, entry)
       } else {
         entry.state = 'open'
-        entry.decidedBy = null
+        entry.actor = null
       }
       return 'reply-failed'
     }
@@ -476,9 +525,9 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     clearTimer(entry)
 
     // Log if OpenCode's reply differs from our claimed decision (it wins).
-    if ((entry.state === 'claimed' || entry.state === 'confirmed') && entry.decidedBy !== null) {
+    if ((entry.state === 'claimed' || entry.state === 'confirmed') && entry.actor !== null) {
       // The reply is the echo of our POST. Render with OpenCode's reply.
-      logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — button winner echo')
+      logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — decision winner echo')
     } else {
       // Open entry: OpenCode-initiated (unsolicited reject or always-rule). No POST needed.
       logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — OpenCode-initiated')
@@ -638,7 +687,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     markMessagePostFailed,
     has,
     pending,
-    handleButtonDecision,
+    handleDecision,
     confirmReply,
     applySettlement,
     disposeRun,

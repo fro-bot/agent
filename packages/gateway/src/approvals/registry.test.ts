@@ -7,11 +7,11 @@
  * ### Core scenarios
  *
  * 1. register / has / pending — basic lifecycle
- * 2. handleButtonDecision — unknown id (not-found)
- * 3. handleButtonDecision — channel mismatch
- * 4. handleButtonDecision — happy path (open→claimed→confirmed)
- * 5. handleButtonDecision — claimed blocks second click while in-flight (single-winner)
- * 6. handleButtonDecision — reply-failed resets to open, retry works
+ * 2. handleDecision — unknown id (not-found)
+ * 3. handleDecision — scope mismatch
+ * 4. handleDecision — happy path (open→claimed→confirmed)
+ * 5. handleDecision — claimed blocks second decision while in-flight (single-winner)
+ * 6. handleDecision — reply-failed resets to open, retry works
  * 7. applySettlement — replied path (renderFn called; no second postReply)
  * 8. applySettlement — deadline/cascade path on open entry
  * 9. disposeRun — only settles entries for the matching sessionID
@@ -19,7 +19,7 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionRequest} from './coordinator.js'
-import type {ApprovalSideEffects, DecisionOutcome, RegisterParams, RenderFn} from './registry.js'
+import type {ApprovalActor, ApprovalSideEffects, DecisionOutcome, RegisterParams, RenderFn} from './registry.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -55,12 +55,16 @@ function makeRenderFn(): RenderFn {
   return vi.fn().mockResolvedValue(undefined)
 }
 
+function makeActor(overrides: Partial<ApprovalActor> = {}): ApprovalActor {
+  return {kind: 'discord-user', userId: 'user_A', ...overrides} as ApprovalActor
+}
+
 function makeParams(overrides: Partial<RegisterParams> = {}): RegisterParams {
   const request = overrides.request ?? makeRequest()
   return {
     requestID: request.requestID,
     sessionID: request.sessionID,
-    channelID: 'chan_1',
+    approvalScopeId: 'chan_1',
     directory: '/workspace/proj',
     request,
     effects: makeEffects(),
@@ -113,22 +117,22 @@ describe('register / has / pending', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 2: handleButtonDecision — unknown id
+// Scenario 2: handleDecision — unknown id
 // ---------------------------------------------------------------------------
 
-describe('handleButtonDecision — unknown id', () => {
+describe('handleDecision — unknown id', () => {
   it("returns 'not-found' and does NOT call postReply", async () => {
     // #given an empty registry
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
     registry.register(makeParams({effects}))
 
-    // #when clicking a button for an unknown requestID
-    const outcome = await registry.handleButtonDecision({
+    // #when a decision arrives for an unknown requestID
+    const outcome = await registry.handleDecision({
       requestID: 'per_UNKNOWN',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #then not-found; no side effects
@@ -138,22 +142,22 @@ describe('handleButtonDecision — unknown id', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 3: handleButtonDecision — channel mismatch
+// Scenario 3: handleDecision — scope mismatch
 // ---------------------------------------------------------------------------
 
-describe('handleButtonDecision — channel mismatch', () => {
+describe('handleDecision — scope mismatch', () => {
   it("returns 'channel-mismatch' and does NOT call postReply", async () => {
     // #given a registry entry bound to chan_1
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
-    registry.register(makeParams({channelID: 'chan_1', effects}))
+    registry.register(makeParams({approvalScopeId: 'chan_1', effects}))
 
-    // #when a button arrives from a different channel
-    const outcome = await registry.handleButtonDecision({
+    // #when a decision arrives from a different scope
+    const outcome = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_WRONG',
+      approvalScopeId: 'chan_WRONG',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #then channel-mismatch; no reply sent
@@ -163,22 +167,22 @@ describe('handleButtonDecision — channel mismatch', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 4: handleButtonDecision — happy path (open→claimed→confirmed)
+// Scenario 4: handleDecision — happy path (open→claimed→confirmed)
 // ---------------------------------------------------------------------------
 
-describe('handleButtonDecision — happy path', () => {
+describe('handleDecision — happy path', () => {
   it("returns 'ok', calls postReply once, state transitions to confirmed", async () => {
     // #given a registered entry
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
-    registry.register(makeParams({channelID: 'chan_1', directory: '/workspace/proj', effects}))
+    registry.register(makeParams({approvalScopeId: 'chan_1', directory: '/workspace/proj', effects}))
 
-    // #when the button is clicked with a valid channel
-    const outcome = await registry.handleButtonDecision({
+    // #when a decision arrives with a valid scope
+    const outcome = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: {kind: 'discord-user', userId: 'user_A'},
     })
 
     // #then ok; postReply called once with correct args; entry still exists (not yet settled)
@@ -188,17 +192,17 @@ describe('handleButtonDecision — happy path', () => {
   })
 
   it('confirmed entry does not call postReply on applySettlement(replied)', async () => {
-    // #given a confirmed entry (button clicked → postReply succeeded)
+    // #given a confirmed entry (decision submitted → postReply succeeded)
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
     const renderFn = makeRenderFn()
     registry.register(makeParams({effects}))
     registry.attachMessage('per_1', renderFn)
-    await registry.handleButtonDecision({
+    await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #when settled with reason 'replied'
@@ -213,28 +217,28 @@ describe('handleButtonDecision — happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 5: handleButtonDecision — claimed blocks second click (single-winner)
+// Scenario 5: handleDecision — claimed blocks second decision (single-winner)
 // ---------------------------------------------------------------------------
 
-describe('handleButtonDecision — already-claimed (single-winner)', () => {
-  it("returns 'already-claimed' on second click; postReply called only ONCE total", async () => {
-    // #given first click already settled
+describe('handleDecision — already-claimed (single-winner)', () => {
+  it("returns 'already-claimed' on second decision; postReply called only ONCE total", async () => {
+    // #given first decision already submitted
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
     registry.register(makeParams({effects}))
-    await registry.handleButtonDecision({
+    await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: {kind: 'discord-user', userId: 'user_A'},
     })
 
-    // #when a second click arrives
-    const outcome = await registry.handleButtonDecision({
+    // #when a second decision arrives
+    const outcome = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'always',
-      decidedBy: 'user_B',
+      actor: {kind: 'discord-user', userId: 'user_B'},
     })
 
     // #then already-claimed; no second postReply
@@ -242,7 +246,7 @@ describe('handleButtonDecision — already-claimed (single-winner)', () => {
     expect(effects.postReply).toHaveBeenCalledOnce()
   })
 
-  it("'claimed' state (postReply in-flight) blocks concurrent second click", async () => {
+  it("'claimed' state (postReply in-flight) blocks concurrent second decision", async () => {
     // #given postReply is slow (controllable via deferred promise)
     const registry = createApprovalRegistry({logger: makeLogger()})
     let resolveReply!: (v: {ok: boolean}) => void
@@ -252,23 +256,23 @@ describe('handleButtonDecision — already-claimed (single-winner)', () => {
     const effects = makeEffects({postReply: vi.fn().mockReturnValue(replyPromise)})
     registry.register(makeParams({effects}))
 
-    // Start first click (in-flight, not yet resolved)
-    const firstClickPromise = registry.handleButtonDecision({
+    // Start first decision (in-flight, not yet resolved)
+    const firstClickPromise = registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: {kind: 'discord-user', userId: 'user_A'},
     })
 
-    // Second click while first is in-flight
-    const secondOutcome = await registry.handleButtonDecision({
+    // Second decision while first is in-flight
+    const secondOutcome = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_B',
+      actor: {kind: 'discord-user', userId: 'user_B'},
     })
 
-    // #then second click is blocked immediately (claimed)
+    // #then second decision is blocked immediately (claimed)
     expect(secondOutcome).toBe<DecisionOutcome>('already-claimed')
 
     // Resolve the in-flight reply
@@ -280,34 +284,34 @@ describe('handleButtonDecision — already-claimed (single-winner)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 6: handleButtonDecision — reply-failed resets to open, retry works
+// Scenario 6: handleDecision — reply-failed resets to open, retry works
 // ---------------------------------------------------------------------------
 
-describe('handleButtonDecision — reply-failed', () => {
-  it("returns 'reply-failed' and resets to open so a subsequent click can retry", async () => {
+describe('handleDecision — reply-failed', () => {
+  it("returns 'reply-failed' and resets to open so a subsequent decision can retry", async () => {
     // #given postReply fails on first call, succeeds on retry
     const registry = createApprovalRegistry({logger: makeLogger()})
     const postReply = vi.fn().mockResolvedValueOnce({ok: false, error: 'timeout'}).mockResolvedValueOnce({ok: true})
     const effects = makeEffects({postReply})
     registry.register(makeParams({effects}))
 
-    // #when first click fails
-    const first = await registry.handleButtonDecision({
+    // #when first decision fails
+    const first = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #then reply-failed; state reset to open
     expect(first).toBe<DecisionOutcome>('reply-failed')
 
-    // #when retry click
-    const retry = await registry.handleButtonDecision({
+    // #when retry decision
+    const retry = await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #then retry succeeds; postReply called twice total
@@ -321,19 +325,20 @@ describe('handleButtonDecision — reply-failed', () => {
 // ---------------------------------------------------------------------------
 
 describe("applySettlement — reason 'replied'", () => {
-  it('calls renderFn with stashed decidedBy; does NOT call postReply again; unregisters', async () => {
-    // #given a confirmed entry (button was clicked)
+  it('calls renderFn with stashed actor; does NOT call postReply again; unregisters', async () => {
+    // #given a confirmed entry (decision submitted → postReply succeeded)
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
     const request = makeRequest()
     const renderFn = makeRenderFn()
     registry.register(makeParams({request, effects}))
     registry.attachMessage('per_1', renderFn)
-    await registry.handleButtonDecision({
+    const actor: ApprovalActor = {kind: 'discord-user', userId: 'user_A'}
+    await registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor,
     })
 
     // #when the coordinator fires settlement with reason 'replied'
@@ -341,7 +346,7 @@ describe("applySettlement — reason 'replied'", () => {
 
     // #then postReply NOT called again; renderFn called with correct args
     expect(effects.postReply).toHaveBeenCalledOnce()
-    expect(renderFn).toHaveBeenCalledExactlyOnceWith(request, 'once', 'user_A', 'replied')
+    expect(renderFn).toHaveBeenCalledExactlyOnceWith(request, 'once', actor, 'replied')
     expect(registry.has('per_1')).toBe(false)
   })
 
@@ -351,7 +356,7 @@ describe("applySettlement — reason 'replied'", () => {
     const effects = makeEffects()
     registry.register(makeParams({effects}))
     registry.markMessagePostFailed('per_1')
-    await registry.handleButtonDecision({requestID: 'per_1', channelID: 'chan_1', decision: 'once', decidedBy: 'u'})
+    await registry.handleDecision({requestID: 'per_1', approvalScopeId: 'chan_1', decision: 'once', actor: makeActor()})
 
     // #when settled
     await registry.applySettlement({requestID: 'per_1', decision: 'once', reason: 'replied'})
@@ -366,7 +371,7 @@ describe("applySettlement — reason 'replied'", () => {
 // ---------------------------------------------------------------------------
 
 describe("applySettlement — reason 'deadline' (unclaimed)", () => {
-  it('calls postReply(reject), renderFn(null, deadline), then unregisters', async () => {
+  it('calls postReply(reject), renderFn(null actor, deadline), then unregisters', async () => {
     // #given an open entry with a message attached
     const registry = createApprovalRegistry({logger: makeLogger()})
     const effects = makeEffects()
@@ -378,7 +383,7 @@ describe("applySettlement — reason 'deadline' (unclaimed)", () => {
     // #when deadline fires
     await registry.applySettlement({requestID: 'per_1', decision: 'reject', reason: 'deadline'})
 
-    // #then postReply called with reject; renderFn with decidedBy=null
+    // #then postReply called with reject; renderFn with actor=null
     expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'reject')
     expect(renderFn).toHaveBeenCalledExactlyOnceWith(request, 'reject', null, 'deadline')
     expect(registry.has('per_1')).toBe(false)
@@ -600,7 +605,7 @@ describe('markMessagePostFailed', () => {
 // ---------------------------------------------------------------------------
 
 describe('FIX 1 — cascadeReject skips claimed siblings', () => {
-  it('cascade from A reject does NOT send reject POST to B when B is claimed (button in-flight)', async () => {
+  it('cascade from A reject does NOT send reject POST to B when B is claimed (decision in-flight)', async () => {
     // #given two entries in the same session
     const registry = createApprovalRegistry({logger: makeLogger()})
 
@@ -617,7 +622,7 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
     )
     registry.attachMessage('per_A', renderFnA)
 
-    // Entry B: claimed (button approve in-flight — postReply held pending)
+    // Entry B: claimed (decision in-flight — postReply held pending)
     let resolveB!: (v: {ok: boolean}) => void
     const replyPromiseB = new Promise<{ok: boolean}>(res => {
       resolveB = res
@@ -634,12 +639,12 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
     )
     registry.attachMessage('per_B', renderFnB)
 
-    // Claim B (button click in-flight, not yet resolved)
-    const bClickPromise = registry.handleButtonDecision({
+    // Claim B (decision in-flight, not yet resolved)
+    const bClickPromise = registry.handleDecision({
       requestID: 'per_B',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_B',
+      actor: {kind: 'discord-user', userId: 'user_B'},
     })
 
     // #when A's confirmReply fires with reject (triggers cascade)
@@ -654,23 +659,23 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
     // #then B is still present (claimed, not cascaded)
     expect(registry.has('per_B')).toBe(true)
 
-    // #then effectsB.postReply was called ONCE (the button click), NOT a second time for cascade
+    // #then effectsB.postReply was called ONCE (the decision), NOT a second time for cascade
     // (it's still pending — the promise hasn't resolved yet)
     expect(effectsB.postReply).toHaveBeenCalledOnce()
 
-    // #when B's button postReply resolves successfully
+    // #when B's postReply resolves successfully
     resolveB({ok: true})
     const bOutcome = await bClickPromise
     expect(bOutcome).toBe<DecisionOutcome>('ok')
 
-    // #when B's confirmReply arrives (echo of the button approve)
+    // #when B's confirmReply arrives (echo of the decision)
     registry.confirmReply({requestID: 'per_B', sessionID: 'ses_1', reply: 'once'})
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // #then B is now settled (rendered approved once)
     expect(registry.has('per_B')).toBe(false)
     expect(renderFnB).toHaveBeenCalledOnce()
-    // renderFn called with 'once' (the button decision), not 'reject'
+    // renderFn called with 'once' (the decision), not 'reject'
     const [, decision] = (renderFnB as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, string, ...unknown[]]
     expect(decision).toBe('once')
   })
@@ -680,7 +685,7 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
 // FIX 2: deadlineExpired flag — fail-close on button postReply failure after deadline
 // ---------------------------------------------------------------------------
 
-describe('FIX 2 — deadlineExpired: fail-close when button postReply fails after deadline fired', () => {
+describe('FIX 2 — deadlineExpired: fail-close when decision postReply fails after deadline fired', () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })
@@ -702,12 +707,12 @@ describe('FIX 2 — deadlineExpired: fail-close when button postReply fails afte
     registry.register(makeParams({effects, deadlineMs: 5_000}))
     registry.attachMessage('per_1', renderFn)
 
-    // #when button is clicked (entry transitions to claimed)
-    const buttonClickPromise = registry.handleButtonDecision({
+    // #when decision is submitted (entry transitions to claimed)
+    const buttonClickPromise = registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #when deadline fires while button is in-flight (no-op, sets deadlineExpired)
@@ -740,7 +745,7 @@ describe('FIX 2 — deadlineExpired: fail-close when button postReply fails afte
     expect(registry.has('per_1')).toBe(false)
   })
 
-  it('throw path — entry is fail-closed when button postReply throws after deadline fired', async () => {
+  it('throw path — entry is fail-closed when decision postReply throws after deadline fired', async () => {
     // #given an entry with a deadline
     const registry = createApprovalRegistry({logger: makeLogger()})
 
@@ -754,12 +759,12 @@ describe('FIX 2 — deadlineExpired: fail-close when button postReply fails afte
     registry.register(makeParams({effects, deadlineMs: 5_000}))
     registry.attachMessage('per_1', renderFn)
 
-    // #when button is clicked
-    const buttonClickPromise = registry.handleButtonDecision({
+    // #when decision is submitted
+    const buttonClickPromise = registry.handleDecision({
       requestID: 'per_1',
-      channelID: 'chan_1',
+      approvalScopeId: 'chan_1',
       decision: 'once',
-      decidedBy: 'user_A',
+      actor: makeActor(),
     })
 
     // #when deadline fires while button is in-flight
@@ -901,7 +906,13 @@ describe('P2 — confirmReply sessionID mismatch guard', () => {
     const logger = makeLogger()
     const registry = createApprovalRegistry({logger})
     const renderFn = makeRenderFn()
-    registry.register(makeParams({sessionID: 'ses_1', request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'})}))
+    registry.register(
+      makeParams({
+        approvalScopeId: 'chan_1',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'}),
+      }),
+    )
     registry.attachMessage('per_1', renderFn)
 
     // #when confirmReply arrives with a different sessionID

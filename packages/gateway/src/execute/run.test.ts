@@ -182,7 +182,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     register: vi.fn(),
     has: vi.fn().mockReturnValue(false),
     pending: vi.fn().mockReturnValue([]),
-    handleButtonDecision: vi.fn().mockResolvedValue('ok'),
+    handleDecision: vi.fn().mockResolvedValue('ok'),
     applySettlement: vi.fn().mockResolvedValue(undefined),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
@@ -2142,7 +2142,7 @@ describe('runMention', () => {
       expect(approvalRegistry.register).toHaveBeenCalledWith(
         expect.objectContaining({
           requestID: 'req-abc-123',
-          channelID: thread.id,
+          approvalScopeId: thread.id,
           directory: canonicalPath,
         }),
       )
@@ -4086,7 +4086,7 @@ describe('approval timeout: registry deadline fires → fail-closed reject', () 
     registry.register({
       requestID: 'req-deadline-reg-1',
       sessionID: 'ses-deadline',
-      channelID: 'chan-deadline',
+      approvalScopeId: 'chan-deadline',
       directory: '/ws/deadline',
       request: {
         requestID: 'req-deadline-reg-1',
@@ -4132,7 +4132,7 @@ describe('approval timeout: registry deadline fires → fail-closed reject', () 
     registry.register({
       requestID: 'req-deadline-claimed-1',
       sessionID: 'ses-claimed',
-      channelID: 'chan-claimed',
+      approvalScopeId: 'chan-claimed',
       directory: '/ws/claimed',
       request: {
         requestID: 'req-deadline-claimed-1',
@@ -4146,12 +4146,12 @@ describe('approval timeout: registry deadline fires → fail-closed reject', () 
       onDeadlineSettled,
     })
 
-    // Claim the entry (button click) before deadline fires
-    const decisionPromise = registry.handleButtonDecision({
+    // Claim the entry (decision submitted) before deadline fires
+    const decisionPromise = registry.handleDecision({
       requestID: 'req-deadline-claimed-1',
-      channelID: 'chan-claimed',
+      approvalScopeId: 'chan-claimed',
       decision: 'once',
-      decidedBy: 'user-1',
+      actor: {kind: 'discord-user', userId: 'user-1'},
     })
 
     // #when — wait for deadline to fire (entry is claimed)
@@ -4196,7 +4196,7 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     registry.register({
       requestID: 'req-dispose-1',
       sessionID: 'ses-dispose',
-      channelID: 'chan-dispose',
+      approvalScopeId: 'chan-dispose',
       directory: '/ws/dispose',
       request: {
         requestID: 'req-dispose-1',
@@ -4252,7 +4252,7 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     registry.register({
       requestID: 'req-shutdown-A',
       sessionID: 'ses-A',
-      channelID: 'chan-A',
+      approvalScopeId: 'chan-A',
       directory: '/ws/a',
       request: {requestID: 'req-shutdown-A', sessionID: 'ses-A', permission: 'bash', patterns: [], title: 'cmd A'},
       effects: {postReply: postReplyA},
@@ -4260,7 +4260,7 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     registry.register({
       requestID: 'req-shutdown-B',
       sessionID: 'ses-B',
-      channelID: 'chan-B',
+      approvalScopeId: 'chan-B',
       directory: '/ws/b',
       request: {requestID: 'req-shutdown-B', sessionID: 'ses-B', permission: 'bash', patterns: [], title: 'cmd B'},
       effects: {postReply: postReplyB},

@@ -85,6 +85,13 @@ const ALLOWLISTED_FILES: readonly string[] = [
   // Contains `.send(` only in JSDoc block comments (not line comments) describing
   // the ReplySink interface contract. No runtime Discord calls here.
   'execute/launch-types.ts',
+
+  // Discord approval transport (Unit 4 — Phase A gateway control surface).
+  // Uses `replySink.send(...)` which is the transport-neutral ReplySink interface,
+  // NOT a raw Discord `.send()` call. The `allowedMentions:{parse:[]}` guard is
+  // enforced by the Discord adapter's ReplySink implementation in `runMention`.
+  // Also uses `editMessage(postedMessage, ...)` which IS the io.ts helper (not raw).
+  'approvals/discord-transport.ts',
 ]
 
 // ---------------------------------------------------------------------------

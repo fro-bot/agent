@@ -13,8 +13,8 @@ import type {ChannelQueue} from './queue.js'
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
-import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
-import {editMessage, sendMessage} from '../discord/io.js'
+import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
+import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
@@ -407,160 +407,64 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
       const approvalDeadlineMs = computeApprovalDeadlineMs(remainingBudgetMs)
 
+      // ── Discord approval transport — owns embed render, registry wiring, and
+      // the Message-reference cast (a clean Discord concern). The engine's
+      // onPending hook is transport-neutral; the Discord transport supplies the
+      // Discord implementation. A future web transport would supply its own.
+      //
+      // postReplyFactory: creates a per-request postReply closure that captures
+      // sessionID. Called once per onPending invocation by the transport.
+      // FIX 4: AbortSignal.timeout(10_000) avoids the dangling-timer leak from
+      // the old Promise.race approach. AbortSignal.timeout is self-cleaning.
+      const discordOnPending = createDiscordApprovalOnPending({
+        approvalRegistry,
+        replySink,
+        threadId,
+        directory: bindingWithEnsuredPath.workspacePath,
+        approvalDeadlineMs,
+        onDeadlineSettled: async () => {
+          // markVisibleOutputSent AFTER the send succeeds so flush() still
+          // adds _(no output)_ if the send fails (user needs the fallback).
+          const deadlineResult = await replySink.send('thread', {
+            content: 'Approval timed out — the task could not continue.',
+          })
+          const dr = deadlineResult as {success?: boolean} | undefined
+          if (dr?.success === true) {
+            replySink.markVisibleOutputSent()
+          }
+        },
+        postReplyFactory: sessionID => async (rID, directory, decision) => {
+          // Call the OpenCode SDK permission reply endpoint.
+          // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
+          try {
+            const res = await handle.client.postSessionIdPermissionsPermissionId({
+              path: {id: sessionID, permissionID: rID},
+              body: {response: decision},
+              query: {directory},
+              signal: AbortSignal.timeout(10_000),
+            })
+            const envelope = res as {error?: unknown} | undefined
+            if (envelope?.error != null) {
+              return {ok: false as const, error: String(envelope.error)}
+            }
+            return {ok: true as const}
+          } catch (error) {
+            return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
+          }
+        },
+        logger,
+      })
+
       const coordinator = createPermissionCoordinator({
         logger,
         onPending: req => {
-          // Per-request closures — each captures its own sessionID.
-          const {requestID, sessionID} = req
-
-          // postReply: call the OpenCode SDK permission reply endpoint.
-          // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
-          // A 10 s AbortSignal.timeout ensures we never hang indefinitely.
-          const postReplyForRequest = async (
-            rID: string,
-            directory: string,
-            decision: import('../approvals/coordinator.js').PermissionReply,
-          ) => {
-            // FIX 4: Use AbortSignal.timeout(10_000) passed directly to the SDK call.
-            // This avoids the dangling-timer leak from the old Promise.race approach
-            // (where the losing setTimeout would remain armed for 10 s after the SDK
-            // call resolved). AbortSignal.timeout is self-cleaning — no manual
-            // clearTimeout needed. The SDK's Config extends RequestInit which includes
-            // signal?: AbortSignal | null, so this is type-safe.
-            try {
-              const res = await handle.client.postSessionIdPermissionsPermissionId({
-                path: {id: sessionID, permissionID: rID},
-                body: {response: decision},
-                query: {directory},
-                signal: AbortSignal.timeout(10_000),
-              })
-              const envelope = res as {error?: unknown} | undefined
-              if (envelope?.error != null) {
-                return {ok: false as const, error: String(envelope.error)}
-              }
-              return {ok: true as const}
-            } catch (error) {
-              return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
-            }
-          }
-
-          // register-before-send: register the entry in the shared registry
-          // BEFORE attempting the Discord embed post. This ensures the button
-          // handler can look up the entry even if the send is still in-flight.
-          // Registry owns the deadline timer (single-owner rule).
-          //
-          // channelID: use threadId (set by threadFactory after thread creation).
-          // For non-Discord paths (in-memory sinks), threadId is '' — the registry
-          // still works; the channelID is only used for button-handler lookup.
-          //
-          // onDeadlineSettled: post a visible timed-out status via replySink.send
-          // and mark the sink so flush() does not add a misleading _(no output)_.
-          approvalRegistry.register({
-            requestID,
-            sessionID,
-            channelID: threadId,
-            directory: bindingWithEnsuredPath.workspacePath,
-            request: req,
-            effects: {postReply: postReplyForRequest},
-            deadlineMs: approvalDeadlineMs,
-            onDeadlineSettled: async () => {
-              // markVisibleOutputSent AFTER the send succeeds so flush() still
-              // adds _(no output)_ if the send fails (user needs the fallback).
-              // replySink.send returns unknown; cast to check success (Discord impl
-              // returns Result<Message, {message: string}> — one documented cast).
-              const deadlineResult = await replySink.send('thread', {
-                content: 'Approval timed out — the task could not continue.',
-              })
-              const dr = deadlineResult as {success?: boolean} | undefined
-              if (dr?.success === true) {
-                replySink.markVisibleOutputSent()
-              }
-            },
-          })
-
           // Awaiting-approval reaction — best-effort, fire-and-forget.
           // Replaces the working reaction with the awaiting-approval cue.
+          // The reaction is set here (in the engine) because it's transport-neutral
+          // state management; the Discord embed/button rendering is in the transport.
           statusSink.setReaction('awaiting-approval')
-
-          // Post a visible waiting-for-approval status BEFORE the embed so the
-          // user sees the run is blocked even if the embed send is slow.
-          // Fire-and-forget: status is best-effort; must not block onPending.
-          // .catch() prevents an unhandled rejection if the Discord send fails.
-          //
-          // Pending-visibility: mark the send as in-flight BEFORE the void send so
-          // timeout classification sees it as visible context even if the Discord
-          // round-trip has not completed yet. settle(true) on success promotes to
-          // permanently delivered; settle(false) on failure retracts the claim.
-          const settleWaitingStatus = replySink.markVisibleOutputPending()
-          // eslint-disable-next-line no-void
-          void replySink.send('thread', {content: 'Waiting for tool approval…'}).then(result => {
-            // replySink.send returns unknown; cast to check success (one documented cast).
-            const r = result as {success?: boolean; error?: {message: string}} | undefined
-            if (r?.success === true) {
-              settleWaitingStatus(true)
-            } else {
-              settleWaitingStatus(false)
-              logger.warn(
-                {requestID, err: r?.error?.message ?? 'unknown'},
-                'run: failed to post waiting-for-approval status',
-              )
-            }
-          })
-
-          // Fire-and-forget: send the embed then attach the render function.
-          // onPending must not throw (coordinator catches internally anyway).
-          //
-          // Pending-visibility: same pattern as the waiting-status send above —
-          // mark in-flight before the void send, settle on resolution.
-          //
-          // replySink.send returns unknown; cast to get the posted message reference
-          // for attachMessage (Discord impl returns Result<Message, ...>).
-          // This is the one documented cast in the engine — Phase B will widen
-          // ReplySink.send to return a typed result when needed.
-          const settleEmbed = replySink.markVisibleOutputPending()
-          // eslint-disable-next-line no-void
-          void replySink
-            .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]})
-            .then(result => {
-              const r = result as {success?: boolean; data?: Message; error?: {message: string}} | undefined
-              if (r?.success === true) {
-                // Embed send succeeded — settle pending claim as delivered so
-                // flush() does not add a misleading _(no output)_.
-                settleEmbed(true)
-                const postedMessage = r.data
-                if (postedMessage !== undefined) {
-                  // Attach the render function now that we have a message reference.
-                  approvalRegistry.attachMessage(
-                    requestID,
-                    async (
-                      permReq: import('../approvals/coordinator.js').PermissionRequest,
-                      decision: import('../approvals/coordinator.js').PermissionReply,
-                      decidedBy: string | null,
-                      reason: import('../approvals/coordinator.js').SettlementReason,
-                    ) => {
-                      const editResult = await editMessage(
-                        postedMessage,
-                        {
-                          embeds: [buildSettledEmbed(permReq, decision, {decidedBy: decidedBy ?? undefined, reason})],
-                          components: [],
-                        },
-                        logger,
-                      )
-                      if (editResult.success === false) {
-                        logger.warn(
-                          {requestID: permReq.requestID, err: editResult.error.message},
-                          'run: failed to edit approval message',
-                        )
-                      }
-                    },
-                  )
-                }
-              } else {
-                settleEmbed(false)
-                logger.warn({requestID, err: r?.error?.message ?? 'unknown'}, 'run: failed to post approval embed')
-                approvalRegistry.markMessagePostFailed(requestID)
-              }
-            })
+          // Delegate to the Discord transport for embed render + registry wiring.
+          discordOnPending(req)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.

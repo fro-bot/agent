@@ -14,13 +14,13 @@
  *
  * Fake effects:
  *   postReply    — records { requestID, directory, decision } per call
- *   renderFn     — records { request, decision, decidedBy, reason } per call
+ *   renderFn     — records { request, decision, actor, reason } per call
  *
  * All timer-sensitive tests use `vi.useFakeTimers()` to control deadline firing.
  */
 
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest} from './coordinator.js'
-import type {ApprovalSideEffects, RegisterParams} from './registry.js'
+import type {ApprovalActor, ApprovalSideEffects, RegisterParams, RenderFn} from './registry.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createPermissionCoordinator} from './coordinator.js'
@@ -43,7 +43,7 @@ interface PostReplyCall {
 interface RenderCall {
   request: PermissionRequest
   decision: string
-  decidedBy: string | null
+  actor: ApprovalActor | null
   reason: string
 }
 
@@ -58,7 +58,7 @@ function makeFakeEffects() {
 
   function makeEffectsFor(_requestID: string): {
     effects: ApprovalSideEffects
-    renderFn: (request: PermissionRequest, decision: string, decidedBy: string | null, reason: string) => Promise<void>
+    renderFn: RenderFn
   } {
     const effects: ApprovalSideEffects = {
       postReply: vi.fn(async (requestID: string, directory: string, decision: PermissionReply) => {
@@ -66,9 +66,9 @@ function makeFakeEffects() {
         return {ok: true}
       }),
     }
-    const renderFn = vi.fn(
-      async (request: PermissionRequest, decision: string, decidedBy: string | null, reason: string) => {
-        renderCalls.push({request, decision, decidedBy, reason})
+    const renderFn: RenderFn = vi.fn(
+      async (request: PermissionRequest, decision: PermissionReply, actor: ApprovalActor | null, reason: string) => {
+        renderCalls.push({request, decision, actor, reason})
       },
     )
     return {effects, renderFn}
@@ -107,7 +107,7 @@ function setup(deadlineMs?: number) {
     const params: RegisterParams = {
       requestID: request.requestID,
       sessionID: request.sessionID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request,
       effects,
@@ -163,11 +163,11 @@ describe('approval flow — cross-seam integration', () => {
     expect(postReplyCalls).toHaveLength(0)
 
     // Authorized button click (approve)
-    const clickResult = await registry.handleButtonDecision({
+    const clickResult = await registry.handleDecision({
       requestID: 'req-1',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-approved',
+      actor: {kind: 'discord-user', userId: 'user-approved'},
     })
     expect(clickResult).toBe('ok')
 
@@ -204,11 +204,11 @@ describe('approval flow — cross-seam integration', () => {
     const replyPromise = coordinator.onPermissionAsked(req)
 
     // Authorized deny click
-    const clickResult = await registry.handleButtonDecision({
+    const clickResult = await registry.handleDecision({
       requestID: 'req-2',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'reject',
-      decidedBy: 'user-deny',
+      actor: {kind: 'discord-user', userId: 'user-deny'},
     })
     expect(clickResult).toBe('ok')
     expect(postReplyCalls).toHaveLength(1)
@@ -244,11 +244,11 @@ describe('approval flow — cross-seam integration', () => {
     expect(registry.pending()).not.toContain('req-3')
 
     // Late button click
-    const lateResult = await registry.handleButtonDecision({
+    const lateResult = await registry.handleDecision({
       requestID: 'req-3',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-late',
+      actor: {kind: 'discord-user', userId: 'user-late'},
     })
 
     // #then — late click does nothing; no postReply emitted
@@ -280,11 +280,11 @@ describe('approval flow — cross-seam integration', () => {
     const postRepliesAfterDeadline = postReplyCalls.length
 
     // Late button click after deadline
-    const lateResult = await registry.handleButtonDecision({
+    const lateResult = await registry.handleDecision({
       requestID: 'req-4',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-late',
+      actor: {kind: 'discord-user', userId: 'user-late'},
     })
     expect(lateResult).toBe('not-found')
 
@@ -302,12 +302,12 @@ describe('approval flow — cross-seam integration', () => {
     const p5 = coordinator.onPermissionAsked(req)
     expect(registry.pending()).toContain('req-5')
 
-    // #when — button click from a different channel
-    const result = await registry.handleButtonDecision({
+    // #when — decision from a different scope
+    const result = await registry.handleDecision({
       requestID: 'req-5',
-      channelID: 'ch-WRONG',
+      approvalScopeId: 'ch-WRONG',
       decision: 'once',
-      decidedBy: 'attacker',
+      actor: {kind: 'discord-user', userId: 'attacker'},
     })
 
     // #then
@@ -407,7 +407,7 @@ describe('approval flow — cross-seam integration', () => {
     reg.register({
       requestID: 'req-8a',
       sessionID: SESSION_A,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: req8a,
       effects: e8a.effects,
@@ -417,7 +417,7 @@ describe('approval flow — cross-seam integration', () => {
     reg.register({
       requestID: 'req-8b',
       sessionID: SESSION_B,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: req8b,
       effects: e8b.effects,
@@ -478,7 +478,7 @@ describe('approval flow — cross-seam integration', () => {
     registry.register({
       requestID: req.requestID,
       sessionID: req.sessionID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: req,
       effects: heldEffects,
@@ -487,11 +487,11 @@ describe('approval flow — cross-seam integration', () => {
     registry.attachMessage(req.requestID, renderFn)
 
     // #when — button approve claims the entry (postReply is in-flight, not yet resolved)
-    const buttonPromise = registry.handleButtonDecision({
+    const buttonPromise = registry.handleDecision({
       requestID: req.requestID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-approved',
+      actor: {kind: 'discord-user', userId: 'user-approved'},
     })
 
     // Advance past the deadline while button POST is still in-flight
@@ -539,7 +539,7 @@ describe('approval flow — cross-seam integration', () => {
     registry.register({
       requestID: req.requestID,
       sessionID: req.sessionID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: req,
       effects,
@@ -574,7 +574,7 @@ describe('approval flow — cross-seam integration', () => {
     registry.register({
       requestID: req.requestID,
       sessionID: req.sessionID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: req,
       effects: {postReply: vi.fn().mockReturnValue(heldPost)},
@@ -582,11 +582,11 @@ describe('approval flow — cross-seam integration', () => {
     })
     registry.attachMessage(req.requestID, renderFn)
 
-    const buttonPromise = registry.handleButtonDecision({
+    const buttonPromise = registry.handleDecision({
       requestID: req.requestID,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-approved',
+      actor: {kind: 'discord-user', userId: 'user-approved'},
     })
 
     // Deadline fires while in-flight
@@ -624,7 +624,7 @@ describe('approval flow — cross-seam integration', () => {
     registry.register({
       requestID: 'req-ds-1',
       sessionID: SESSION_A,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: makeRequest('req-ds-1'),
       effects,
@@ -655,7 +655,7 @@ describe('approval flow — cross-seam integration', () => {
     registry.register({
       requestID: 'req-ds-2',
       sessionID: SESSION_A,
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       directory: DIRECTORY,
       request: makeRequest('req-ds-2'),
       effects,
@@ -665,11 +665,11 @@ describe('approval flow — cross-seam integration', () => {
     registry.attachMessage('req-ds-2', renderFn)
 
     // #when — button wins before deadline
-    await registry.handleButtonDecision({
+    await registry.handleDecision({
       requestID: 'req-ds-2',
-      channelID: 'ch-test',
+      approvalScopeId: 'ch-test',
       decision: 'once',
-      decidedBy: 'user-approved',
+      actor: {kind: 'discord-user', userId: 'user-approved'},
     })
     registry.confirmReply({requestID: 'req-ds-2', sessionID: SESSION_A, reply: 'once'})
     await vi.runAllTimersAsync()
@@ -699,7 +699,7 @@ describe('approval flow — cross-seam integration', () => {
         reg.register({
           requestID: request.requestID,
           sessionID: request.sessionID,
-          channelID: 'ch-test',
+          approvalScopeId: 'ch-test',
           directory: DIRECTORY,
           request,
           effects,
@@ -738,5 +738,186 @@ describe('approval flow — cross-seam integration', () => {
     coordinator.onPermissionReplied(makeReplyEvent('req-9', 'once'))
     await vi.runAllTimersAsync()
     await replyPromise
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit 4: Non-Discord transport test
+// Proves the seam works for a second transport: a plain function-call
+// (simulating a web transport) renders+registers and settles via the same
+// registry. One gate, no parallel path.
+// ---------------------------------------------------------------------------
+
+describe('Unit 4: non-Discord transport — same registry, same fail-closed gate', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('web-operator decision settles via the same registry as a Discord decision would', async () => {
+    // #given a registry + coordinator wired with a "web transport" onPending
+    // (plain function calls, no Discord embeds, no Discord.js)
+    const logger = makeLogger()
+    const {postReplyCalls, renderCalls, makeEffectsFor} = makeFakeEffects()
+    const registry = createApprovalRegistry({logger})
+
+    // Simulate a web transport's onPending: register + attach render (no embed)
+    function webOnPending(request: PermissionRequest) {
+      const {effects, renderFn} = makeEffectsFor(request.requestID)
+      // Web transport uses a correlation ID as the approvalScopeId
+      registry.register({
+        requestID: request.requestID,
+        sessionID: request.sessionID,
+        approvalScopeId: 'web-session-abc123',
+        directory: DIRECTORY,
+        request,
+        effects,
+      })
+      // Web transport attaches its own render function (e.g. update a DB record)
+      registry.attachMessage(request.requestID, renderFn)
+    }
+
+    const coordinator = createPermissionCoordinator({
+      logger,
+      onPending: webOnPending,
+      onReplied: event => {
+        registry.confirmReply(event)
+      },
+      onDispose: sessionIDs => {
+        // eslint-disable-next-line no-void
+        void Promise.all(sessionIDs.map(async sid => registry.disposeRun(sid, 'run ended')))
+      },
+    })
+
+    const req = makeRequest('req-web-1', SESSION_A)
+
+    // #when permission.asked arrives
+    const replyPromise = coordinator.onPermissionAsked(req)
+    expect(registry.pending()).toContain('req-web-1')
+
+    // #when a web operator submits a decision (plain function call, not a Discord button)
+    // The actor is a web-operator identity — NOT a discord-user
+    const outcome = await registry.handleDecision({
+      requestID: 'req-web-1',
+      approvalScopeId: 'web-session-abc123',
+      decision: 'once',
+      actor: {kind: 'web-operator', operatorId: 'operator-42'},
+    })
+
+    // #then the decision was accepted (same registry, same gate)
+    expect(outcome).toBe('ok')
+    expect(postReplyCalls).toHaveLength(1)
+    expect(postReplyCalls[0]).toMatchObject({requestID: 'req-web-1', directory: DIRECTORY, decision: 'once'})
+
+    // #when permission.replied arrives (authoritative settlement)
+    coordinator.onPermissionReplied(makeReplyEvent('req-web-1', 'once'))
+    await vi.runAllTimersAsync()
+    await replyPromise
+
+    // #then the entry is settled and the render function was called
+    expect(registry.has('req-web-1')).toBe(false)
+    expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0]).toMatchObject({decision: 'once', reason: 'replied'})
+    // The actor is the web-operator identity
+    expect(renderCalls[0]?.actor).toEqual({kind: 'web-operator', operatorId: 'operator-42'})
+  })
+
+  it('web-operator scope mismatch is rejected (same fail-closed gate)', async () => {
+    // #given a registry entry registered with a web scope
+    const logger = makeLogger()
+    const registry = createApprovalRegistry({logger})
+    const {effects} = makeFakeEffects().makeEffectsFor('req-web-2')
+    const req = makeRequest('req-web-2', SESSION_A)
+    registry.register({
+      requestID: 'req-web-2',
+      sessionID: SESSION_A,
+      approvalScopeId: 'web-session-correct',
+      directory: DIRECTORY,
+      request: req,
+      effects,
+    })
+
+    // #when a decision arrives with the wrong scope (simulating a CSRF-like attack)
+    const outcome = await registry.handleDecision({
+      requestID: 'req-web-2',
+      approvalScopeId: 'web-session-WRONG',
+      decision: 'once',
+      actor: {kind: 'web-operator', operatorId: 'attacker'},
+    })
+
+    // #then scope mismatch — same fail-closed gate as Discord channel mismatch
+    expect(outcome).toBe('channel-mismatch')
+    expect(registry.has('req-web-2')).toBe(true)
+  })
+
+  it('two concurrent requests from different transports both settle via the same registry', async () => {
+    // #given a shared registry with one Discord entry and one web entry
+    const logger = makeLogger()
+    const {postReplyCalls, renderCalls, makeEffectsFor} = makeFakeEffects()
+    const registry = createApprovalRegistry({logger})
+
+    const reqDiscord = makeRequest('req-discord', SESSION_A)
+    const reqWeb = makeRequest('req-web', SESSION_B)
+
+    const {effects: effectsDiscord, renderFn: renderFnDiscord} = makeEffectsFor('req-discord')
+    const {effects: effectsWeb, renderFn: renderFnWeb} = makeEffectsFor('req-web')
+
+    // Discord transport registers with a thread ID as scope
+    registry.register({
+      requestID: 'req-discord',
+      sessionID: SESSION_A,
+      approvalScopeId: 'discord-thread-123',
+      directory: DIRECTORY,
+      request: reqDiscord,
+      effects: effectsDiscord,
+    })
+    registry.attachMessage('req-discord', renderFnDiscord)
+
+    // Web transport registers with a correlation ID as scope
+    registry.register({
+      requestID: 'req-web',
+      sessionID: SESSION_B,
+      approvalScopeId: 'web-session-xyz',
+      directory: DIRECTORY,
+      request: reqWeb,
+      effects: effectsWeb,
+    })
+    registry.attachMessage('req-web', renderFnWeb)
+
+    expect(registry.pending()).toHaveLength(2)
+
+    // #when Discord button click settles the Discord entry
+    const discordOutcome = await registry.handleDecision({
+      requestID: 'req-discord',
+      approvalScopeId: 'discord-thread-123',
+      decision: 'once',
+      actor: {kind: 'discord-user', userId: 'discord-user-1'},
+    })
+    expect(discordOutcome).toBe('ok')
+
+    // #when web operator settles the web entry
+    const webOutcome = await registry.handleDecision({
+      requestID: 'req-web',
+      approvalScopeId: 'web-session-xyz',
+      decision: 'reject',
+      actor: {kind: 'web-operator', operatorId: 'operator-99'},
+    })
+    expect(webOutcome).toBe('ok')
+
+    // #then both entries are claimed; confirmReply settles them
+    registry.confirmReply({requestID: 'req-discord', sessionID: SESSION_A, reply: 'once'})
+    registry.confirmReply({requestID: 'req-web', sessionID: SESSION_B, reply: 'reject'})
+    await vi.runAllTimersAsync()
+
+    // #then both entries are settled via the SAME registry
+    expect(registry.has('req-discord')).toBe(false)
+    expect(registry.has('req-web')).toBe(false)
+    expect(postReplyCalls).toHaveLength(2)
+    expect(renderCalls).toHaveLength(2)
+
+    // No parallel registry was created — both settled via the same registry instance
+    expect(registry.pending()).toHaveLength(0)
   })
 })
