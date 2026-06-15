@@ -52,13 +52,13 @@ The consequence: the dashboard cannot launch work, the operator cannot approve a
 
 **Execution engine (`packages/gateway/src/execute/run.ts`, 834 lines):**
 - `runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps)` at line 805 — the thin Discord entry point; enqueues a `RunTask` and the real engine is `startRun(task: RunTask)` at line 184 (~600 lines).
-- `RunTask = { readonly message: Message; readonly binding: RepoBinding; readonly deps: RunMentionDeps }` (line 70) — the `message: Message` field is the primary Discord coupling to extract.
+- `RunTask = { readonly message: Message; readonly binding: RepoBinding; readonly deps: RunMentionDeps }` (line 97) — the `message: Message` field is the primary Discord coupling to extract.
 - `RunMentionDeps` (line 28) includes: `coordinationConfig`, `identity`, `concurrency`, `queue: ChannelQueue<RunTask>`, `attachUrl`/`attachToken`, `runTimeoutMs`, `botUserId`, `persona`, `logger`, `approvalRegistry: ApprovalRegistry`, `approvalMode`, `statusMode: 'live-status' | 'typing-only'`, `ensureClone`, `readyz`, `isShuttingDown`.
 - The Discord coupling is concentrated in: `RunTask.message: Message` (threaded through the engine for prompt-building and status replies) and the status/reply surface that writes back to that message.
 
 **Approval coordinator (`packages/gateway/src/approvals/coordinator.ts`):**
 - `createPermissionCoordinator(deps: PermissionCoordinatorDeps)` at line 206.
-- `PermissionCoordinatorDeps.onRequest` (line ~89): "Invoked when a new request is registered. The caller renders the Discord embed." — this is the transport-coupling seam to generalize.
+- `PermissionCoordinatorDeps.onPending` (`coordinator.ts:94`): "renders the Discord approval embed here AND registers the entry in the approval registry (including deadlineMs)." Plus `onReplied` (→ `registry.confirmReply`) and `onDispose` (→ `registry.disposeRun`). These deps callbacks are the transport-coupling seam to generalize. Public surface: `onPermissionAsked`/`onPermissionReplied` (`:72`/`:78`). (There is no `onRequest` callback.)
 - Comment at top: "Bridges OpenCode permission events to the Discord approval UI."
 - `parsePermissionRequest`/`parsePermissionReply` are pure parsers — already transport-agnostic, unchanged by Phase A.
 - `PermissionRequest`/`PermissionReplyEvent` interfaces exist and are transport-neutral.
@@ -80,8 +80,8 @@ The consequence: the dashboard cannot launch work, the operator cannot approve a
 
 - **`LaunchWorkRequest` carries sinks, not a `Message`.** The engine receives `StatusSink` and `ReplySink` interfaces rather than a raw Discord `Message`. The Discord adapter constructs concrete implementations of these interfaces from the `Message` and passes them in. This is the minimal seam: the engine's logic is unchanged, only its input contract changes.
 - **`runMention` stays as the Discord entry point, becomes a thin adapter.** It does not disappear — it maps `Message` → `LaunchWorkRequest` and calls `launchWork`. The `ChannelQueue<RunTask>` continues to work; `RunTask` carries a `LaunchWorkRequest` (or the sinks) rather than a raw `Message` where feasible, keeping the change minimal.
-- **Approval coordinator: `onRequest` becomes a transport-neutral render hook.** The `PermissionCoordinatorDeps.onRequest` callback is already the seam — it is "invoked when a new request is registered; the caller renders the Discord embed." Generalizing it means the callback receives a `PermissionRequest` and returns a `PermissionDecisionHandle` (or similar) that the coordinator uses to await the decision. The Discord implementation renders the embed and wires the button interaction; a future web implementation renders a web notification and wires an HTTP callback. The registry and fail-closed settlement are unchanged.
-- **One gate, no parallel path (R5).** The registry owns pending state and settlement. Any new transport plugs into the same registry via the `onRequest` hook — it cannot create a parallel registry or bypass the fail-closed timeout/restart semantics.
+- **Approval coordinator: the transport seam is the `onPending` + `onReplied` + `onDispose` deps callbacks, not a single render hook.** `PermissionCoordinatorDeps.onPending` (`coordinator.ts:94`) is the render-and-register hook — its doc states it "renders the Discord approval embed here **AND registers the entry in the approval registry** (including deadlineMs)." Render and registry-registration are coupled in this one callback, so the transport-neutral generalization must preserve that coupling (a transport renders its UI *and* registers the entry together), not split them. The decision-intake path is `onPermissionReplied`/`onReplied` → `registry.confirmReply`; teardown is `onDispose` → `registry.disposeRun` (fail-close). The public coordinator surface (`onPermissionAsked`/`onPermissionReplied`, `coordinator.ts:72`/`:78`) and the pure parsers (`parsePermissionRequest`/`parsePermissionReply`) are unchanged. Generalizing means a Discord transport supplies `onPending`/`onReplied`/`onDispose` implementations (embed + button wiring), and a future web transport supplies its own (notification + HTTP callback) — both reusing the same registry and fail-closed settlement.
+- **One gate, no parallel path (R5).** The registry owns pending state and settlement. Any new transport plugs into the same registry via the `onPending`/`onReplied`/`onDispose` callbacks — it cannot create a parallel registry or bypass the fail-closed timeout/restart semantics.
 - **Characterization-first / test-first execution.** Before refactoring Units 2 and 3, write characterization tests that pin the current Discord behavior (status message posted/edited, mention stripped, queue/concurrency, approval button flow). These tests must pass before and after the refactor. This is the zero-regression guarantee.
 - **Minimal diff, behavior-preserving.** The goal is a seam, not a rewrite. `startRun` internals are not restructured beyond what is needed to accept `LaunchWorkRequest` + sinks instead of `RunTask.message`. The Discord adapter in `runMention` is the only new code path.
 
@@ -92,14 +92,14 @@ The consequence: the dashboard cannot launch work, the operator cannot approve a
 - **Does Phase A need a new listener?** No — Phase A is purely a refactor that adds a seam. No new `serve()` call, no ingress-pin change.
 - **Should `RunTask` be eliminated?** No — `RunTask` continues to work; it carries `LaunchWorkRequest` (or the sinks) instead of a raw `Message`. Minimal change.
 - **Can `parsePermissionRequest`/`parsePermissionReply` stay as-is?** Yes — they are already pure and transport-agnostic. Phase A does not touch them.
-- **Is the `onRequest` hook the right seam for the approval coordinator?** Yes — it is already the documented transport-coupling point ("the caller renders the Discord embed"). Generalizing it is the minimal change.
+- **What is the right seam for the approval coordinator?** The `PermissionCoordinatorDeps` callbacks `onPending` (render + register), `onReplied` (→ `registry.confirmReply`), and `onDispose` (→ `registry.disposeRun`) — `coordinator.ts:94`+. These are the documented transport-coupling points. Note `onPending` couples rendering with registry-registration, so the generalization keeps render+register together per transport rather than splitting them. (There is no `onRequest` callback — verified against source.)
 - **Does Phase A change the Discord user experience?** No — R2 and R3 are explicit: same status message, typing indicator, queue behavior, reactions, and approval button flow.
 
 ### Deferred to Implementation
 
 - Exact names and shapes for `StatusSink`, `ReplySink`, and `LaunchWorkRequest` — to be determined during Unit 1 based on what `startRun` actually reads from `RunTask.message`.
 - Whether `RunTask` carries a `LaunchWorkRequest` directly or carries the sinks as separate fields — implementer decides based on the minimal-diff principle.
-- Exact form of the `PermissionDecisionHandle` returned by `onRequest` — to be determined during Unit 4 based on how the coordinator awaits the decision today.
+- Exact shape of the generalized `onPending`/`onReplied` transport implementations (and whether a small transport-descriptor type is worth introducing) — to be determined during Unit 4 based on how the coordinator awaits the decision today.
 - Whether a characterization test file is a separate Unit 0 or is folded into Units 2 and 3 as a pre-condition — execution decision for the implementer.
 
 ## High-Level Technical Design
@@ -114,7 +114,7 @@ The design introduces a thin interface layer between the Discord transport and t
 
 The Discord adapter (`runMention`) maps `Message` → `LaunchWorkRequest`, constructs the Discord `StatusSink`/`ReplySink` implementations, and calls `launchWork`. The `ChannelQueue<RunTask>` continues to enqueue work; `RunTask` carries the `LaunchWorkRequest` instead of the raw `Message`.
 
-The approval coordinator's `onRequest` hook is generalized: it receives a `PermissionRequest` and is responsible for rendering the approval UI (Discord embed, future web notification) and wiring the decision back to the coordinator. The registry and fail-closed settlement (timeout/restart → reject/dispose) are unchanged. The Discord button handler becomes one implementation of this hook.
+The approval coordinator's transport callbacks are generalized: `onPending` renders the approval UI **and** registers the entry in the registry (Discord embed today; a web notification in future), `onReplied` forwards the decision to `registry.confirmReply`, and `onDispose` fail-closes via `registry.disposeRun`. The registry and fail-closed settlement (timeout/restart → reject/dispose) are unchanged. The Discord embed+button handler becomes one implementation of these callbacks; a future web transport supplies its own.
 
 ```
 Discord Message
@@ -131,16 +131,16 @@ launchWork(request: LaunchWorkRequest, deps)   ← transport-agnostic engine
     ▼
 ChannelQueue<RunTask>  (RunTask carries LaunchWorkRequest)
 
-Approval path:
-coordinator.onRequest(permissionRequest)
+Approval path (transport callbacks: onPending render+register, onReplied → confirmReply):
+coordinator (onPermissionAsked / onPermissionReplied)
     │
-    ├── Discord impl: render embed → button interaction → registry.settle()
-    └── Future web impl: render notification → HTTP callback → registry.settle()
+    ├── Discord impl: onPending renders embed + registers → button → onReplied → registry.confirmReply
+    └── Future web impl: onPending renders notification + registers → HTTP callback → onReplied → registry.confirmReply
                                                                ▲
-                                                    registry (fail-closed, unchanged)
+                                                    registry (fail-closed: timeout/dispose, unchanged)
 ```
 
-A future web caller (Phase B) will call `launchWork` directly with its own `StatusSink`/`ReplySink` implementations (e.g., SSE stream) and plug into the same approval coordinator via a web `onRequest` implementation.
+A future web caller (Phase B) will call `launchWork` directly with its own `StatusSink`/`ReplySink` implementations (e.g., SSE stream) and plug into the same approval coordinator via web `onPending`/`onReplied`/`onDispose` implementations.
 
 ## Implementation Units
 
@@ -233,42 +233,46 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
 - [ ] **Unit 4: Generalize the approval coordinator seam**
 
-  **Goal:** The approval coordinator's `onRequest` hook becomes a transport-neutral render + decision-intake seam. The Discord button flow becomes one implementation. The registry and fail-closed settlement are unchanged. A decision from a non-Discord source settles via the same gate.
+  **Goal:** Generalize the approval coordinator's transport callbacks (`onPending`, `onReplied`, `onDispose`) so a non-Discord transport can render+register an approval, settle a decision, and fail-close teardown via the same registry. The Discord embed+button flow becomes one set of implementations. The registry and fail-closed settlement are unchanged. A decision from a non-Discord source settles via the same gate.
 
   **Requirements:** R4, R5
 
   **Dependencies:** Units 1, 2, 3 (the `LaunchWorkRequest` + sinks pattern is established; the coordinator is wired via `approvalRegistry` in `RunMentionDeps`)
 
   **Files:**
-  - Modify: `packages/gateway/src/approvals/coordinator.ts` (generalize `PermissionCoordinatorDeps.onRequest`)
+  - Modify: `packages/gateway/src/approvals/coordinator.ts` (generalize the `onPending`/`onReplied`/`onDispose` deps callbacks; the public `onPermissionAsked`/`onPermissionReplied` surface stays)
   - Modify (if needed): `packages/gateway/src/approvals/registry.ts` (verify fail-closed settlement is unchanged)
-  - Test: `packages/gateway/src/approvals/coordinator.test.ts` (new tests for non-Discord decision intake)
+  - Test: `packages/gateway/src/approvals/coordinator.test.ts` (new tests for non-Discord render+register and decision intake)
 
   **Approach:**
-  - Read `coordinator.ts` lines 1–250 to understand the current `onRequest` callback contract and how the coordinator awaits the decision.
-  - Generalize `PermissionCoordinatorDeps.onRequest` so it receives a `PermissionRequest` and returns a handle (or registers a decision callback) that the coordinator uses to await the decision. The Discord implementation renders the embed and wires the button interaction to call `registry.settle()`; a future web implementation would render a web notification and wire an HTTP callback to `registry.settle()`.
+  - Read `coordinator.ts` in full to confirm the current callback contract. Verified seam (do not look for `onRequest` — it does not exist):
+    - `PermissionCoordinatorDeps.onPending` (`coordinator.ts:94`) — renders the approval UI **and registers the entry in the approval registry** (including `deadlineMs`); render and registration are coupled in this one hook.
+    - `PermissionCoordinatorDeps.onReplied` — forwards the decision to `registry.confirmReply`.
+    - `PermissionCoordinatorDeps.onDispose` — calls `registry.disposeRun(sessionID, reason)` to fail-close on teardown.
+    - Public coordinator surface: `onPermissionAsked` (`:72`) / `onPermissionReplied` (`:78`).
+  - Generalize so the Discord transport supplies `onPending` (embed + register), `onReplied` (button→`confirmReply`), and `onDispose` implementations, and a future web transport supplies its own (notification + register, HTTP callback→`confirmReply`, teardown→`disposeRun`). Keep render+register coupled per transport — do not split them, since `onPending` owns both today.
   - `parsePermissionRequest`/`parsePermissionReply` are unchanged — they remain the pure parsing core.
-  - The registry's fail-closed settlement (timeout/restart → reject/dispose) is unchanged.
-  - Write a test that drives a decision from a non-Discord source (a plain function call simulating a web callback) and verifies it settles via the same registry.
+  - The registry's fail-closed settlement (timeout/restart → reject/dispose) and deadline ownership are unchanged.
+  - Write a test that drives render+register and a decision from a non-Discord source (plain function calls simulating a web transport) and verifies it settles via the same registry.
 
-  **Patterns to follow:** existing `coordinator.ts` `onRequest` callback shape; `registry.ts` `settle()` call pattern; `vi.hoisted()` + `vi.mock()` for test isolation.
+  **Patterns to follow:** the existing `onPending`/`onReplied`/`onDispose` deps callback shapes in `coordinator.ts`; `registry.confirmReply`/`disposeRun` call patterns in `registry.ts`; `vi.hoisted()` + `vi.mock()` for test isolation.
 
   **Test scenarios:**
-  - Happy path (Discord): a Discord button interaction calls the decision callback → `registry.settle()` is called → the coordinator resolves the permission request as approved.
-  - Happy path (non-Discord): a plain function call (simulating a future web callback) calls the decision callback → `registry.settle()` is called → the coordinator resolves the permission request as approved.
-  - Fail-closed (timeout): no decision arrives within `timeoutMs` → `registry.settle()` is called with reject → the coordinator resolves as rejected.
-  - Fail-closed (restart): the coordinator is disposed before a decision arrives → pending requests are rejected/disposed.
-  - One gate: two concurrent permission requests from different transports both settle via the same registry; neither bypasses the fail-closed semantics.
+  - Happy path (Discord): `onPending` renders+registers → a button interaction drives `onReplied` → `registry.confirmReply` → the coordinator resolves the request as approved.
+  - Happy path (non-Discord): a plain `onPending`/`onReplied` pair (simulating a web transport) renders+registers and settles → `registry.confirmReply` → resolved as approved.
+  - Fail-closed (timeout): no decision within the deadline → registry settles as reject → coordinator resolves as rejected.
+  - Fail-closed (dispose/restart): `onDispose` → `registry.disposeRun` fail-closes pending entries.
+  - One gate: two concurrent requests from different transports both settle via the same registry; neither bypasses fail-closed semantics or creates a parallel registry.
   - `parsePermissionRequest`/`parsePermissionReply` unchanged: existing parse tests still pass.
 
-  **Verification:** `pnpm check-types` clean; `pnpm test` passes; a non-Discord decision source settles via the same registry; fail-closed timeout/restart behavior is preserved and tested; `parsePermissionRequest`/`parsePermissionReply` tests unchanged.
+  **Verification:** `pnpm check-types` clean; `pnpm test` passes; a non-Discord transport renders+registers and settles via the same registry; fail-closed timeout/dispose behavior preserved and tested; `parsePermissionRequest`/`parsePermissionReply` tests unchanged; no reference to a nonexistent `onRequest`.
 
 ## System-Wide Impact
 
 - **Interaction graph:** `runMention` → `launchWork` → `StatusSink`/`ReplySink` (Discord implementations). The `ChannelQueue<RunTask>` is unchanged. The approval coordinator is wired via `approvalRegistry` in `RunMentionDeps` — unchanged from the caller's perspective.
 - **Error propagation:** unchanged — the engine's error handling (timeout, shutdown, run failure) is preserved; errors are surfaced via `StatusSink`/`ReplySink` to the transport, not thrown into the queue.
 - **State lifecycle:** no persistence changes. The registry's in-memory pending state and fail-closed settlement are unchanged.
-- **API surface parity:** `runMention` signature is unchanged (it is the Discord entry point); `launchWork` is a new export. The approval coordinator's `onRequest` callback contract changes shape (generalized), but the Discord implementation is updated in the same PR.
+- **API surface parity:** `runMention` signature is unchanged (it is the Discord entry point); `launchWork` is a new export. The approval coordinator's `onPending`/`onReplied`/`onDispose` deps-callback contracts change shape (generalized), but the Discord implementations are updated in the same PR.
 - **Sequencing:** Unit 1 (types) → Unit 2 (engine extraction) → Unit 3 (Discord adapter) → Unit 4 (approval seam). Units 2 and 3 both modify `run.ts` and are serial. Unit 4 modifies `coordinator.ts` and can run in parallel with Units 2–3 after Unit 1, but is logically cleaner after Unit 3 (the full `LaunchWorkRequest` pattern is established).
 - **Unchanged invariants:** Discord user experience (status message, typing indicator, queue behavior, reactions, approval button flow), ingress-pin constraint (`server.ts` has exactly one `serve()`), `parsePermissionRequest`/`parsePermissionReply` pure parsing, registry fail-closed settlement, `ChannelQueue<RunTask>` concurrency model.
 
@@ -279,8 +283,8 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 | `startRun` reads more from `RunTask.message` than expected, making the `StatusSink`/`ReplySink` interface surface larger than anticipated | Unit 1 inventories all `message` reads before defining the interfaces; the interface surface is driven by actual usage, not assumption |
 | Discord behavior regression (status message, mention strip, queue, reactions) | Characterization-first in Units 2 and 3: pin current behavior before refactoring; the characterization tests are the zero-regression gate |
 | `RunTask` type change breaks other callers of the queue | `RunTask` change is minimal (carry `LaunchWorkRequest` instead of raw `Message`); all callers are in `run.ts` and are updated in the same unit |
-| Approval coordinator `onRequest` generalization breaks the Discord button flow | Unit 4 updates the Discord `onRequest` implementation in the same PR; the Discord button tests must pass before and after |
-| A future web approval path creates a parallel registry (bypassing fail-closed) | R5 is explicit: one gate. The registry is the trust anchor. The `onRequest` hook is the only approved extension point. Code review enforces this. |
+| Approval coordinator callback generalization breaks the Discord button flow | Unit 4 updates the Discord `onPending`/`onReplied`/`onDispose` implementations in the same PR; the Discord button tests must pass before and after |
+| A future web approval path creates a parallel registry (bypassing fail-closed) | R5 is explicit: one gate. The registry is the trust anchor. The `onPending`/`onReplied`/`onDispose` callbacks are the only approved extension points. Code review enforces this. |
 | Phase B or C planned without access to the brainstorm (gitignored) | This plan carries forward all grounded context needed for Phase B and C planning (see Deferred Phases section below) |
 
 ## Deferred Phases (B & C) — grounding for future in-repo planning
@@ -325,7 +329,7 @@ This section exists because the origin brainstorm (`docs/brainstorms/2026-06-15-
 
 ## Documentation / Operational Notes
 
-- After Phase A merges: update `packages/gateway/AGENTS.md` to reflect that the transport-agnostic execution primitive now exists (`launchWork`) and that the approval coordinator's `onRequest` hook is the approved extension point for new transports. Remove or update the "deferred until a non-Discord caller exists" note.
+- After Phase A merges: update `packages/gateway/AGENTS.md` to reflect that the transport-agnostic execution primitive now exists (`launchWork`) and that the approval coordinator's `onPending`/`onReplied`/`onDispose` callbacks are the approved extension points for new transports. Remove or update the "deferred until a non-Discord caller exists" note.
 - The `launchWork` function and the `StatusSink`/`ReplySink` interfaces should be documented with JSDoc comments explaining the transport-neutral contract and the Discord adapter pattern, so future implementers (Phase B) know exactly what to implement.
 - No infra changes in Phase A. Phase B requires coordination with `marcusrbrown/infra` on the deploy topology before any new listener lands.
 - Verification commands (pnpm repo): `pnpm bootstrap`, `pnpm check-types`, `pnpm lint`, `pnpm test`. All must pass before merge.
@@ -335,8 +339,8 @@ This section exists because the origin brainstorm (`docs/brainstorms/2026-06-15-
 - Origin brainstorm (local-only/gitignored): `docs/brainstorms/2026-06-15-gateway-control-surface-spine-requirements.md`
 - Tracking issue: [fro-bot/agent#907](https://github.com/fro-bot/agent/issues/907)
 - North-star: `fro-bot/.github` `docs/brainstorms/2026-06-15-fro-bot-personal-agent-north-star-requirements.md`
-- Execution engine: `packages/gateway/src/execute/run.ts` (834 lines; `runMention` at line 805, `startRun` at line 184, `RunTask` at line 70, `RunMentionDeps` at line 28)
-- Approval coordinator: `packages/gateway/src/approvals/coordinator.ts` (`createPermissionCoordinator` at line 206, `PermissionCoordinatorDeps.onRequest` at line ~89)
+- Execution engine: `packages/gateway/src/execute/run.ts` (834 lines; `runMention` at line 805, `startRun` at line 184, `RunTask` at line 97, `RunMentionDeps` at line 28)
+- Approval coordinator: `packages/gateway/src/approvals/coordinator.ts` (`createPermissionCoordinator` at line 206; deps callbacks `onPending` at line 94, `onReplied`, `onDispose`; public `onPermissionAsked` at line 72 / `onPermissionReplied` at line 78)
 - Approval registry: `packages/gateway/src/approvals/registry.ts` (pending state + fail-closed settlement)
 - Ingress-pin constraint: `packages/gateway/src/http/ingress-pin.test.ts`
 - `packages/gateway/AGENTS.md` (execution is Discord-only; transport-agnostic primitive deferred)
