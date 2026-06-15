@@ -1,4 +1,4 @@
-import type {CoordinationConfig, Result} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result, Surface} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
@@ -7,6 +7,7 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
+import type {LaunchWorkRequest, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
@@ -92,11 +93,16 @@ export interface RunMentionDeps {
 
 /**
  * The task descriptor stored in the per-channel queue.
- * Exactly the three arguments `runMention` takes — the stable contract the queue stores.
+ *
+ * Carries a `LaunchWorkRequest` (transport-neutral engine input) instead of a
+ * raw Discord `Message`. The Discord adapter (`runMention`) constructs the
+ * `LaunchWorkRequest` from the `Message` before enqueuing.
+ *
+ * `deps` is still carried so the inner execution primitive can access
+ * coordination config, identity, concurrency, queue, and other deps.
  */
 export interface RunTask {
-  readonly message: Message
-  readonly binding: RepoBinding
+  readonly request: LaunchWorkRequest
   readonly deps: RunMentionDeps
 }
 
@@ -163,11 +169,36 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
 }
 
 // ---------------------------------------------------------------------------
-// startRun — the slot-holding execution pipeline
+// Unit 2 internal extension — Discord adapter bridge
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal extension carried on `RunTask` by the Discord adapter (`runMention`).
+ *
+ * Unit 2 bridge: thread creation still happens inside `executeWorkOnHeldSlot`
+ * because the Discord sinks depend on the thread. The adapter provides:
+ * - `_discordMessage`: the raw Discord `Message` used for thread creation.
+ * - `_initSinks(thread, rawThread)`: called after thread creation to wire the
+ *   real Discord sinks into the deferred proxy sinks on the `LaunchWorkRequest`.
+ *
+ * These fields are INTERNAL to Unit 2 and will be removed in Unit 3 when
+ * thread creation moves fully into the Discord adapter.
+ */
+interface DiscordAdapterBridge {
+  readonly _discordMessage: Message
+  readonly _initSinks: (thread: SinkThread, rawThread: Awaited<ReturnType<Message['startThread']>>) => void
+}
+
+// ---------------------------------------------------------------------------
+// executeWorkOnHeldSlot — the private slot-holding execution pipeline
 // ---------------------------------------------------------------------------
 
 /**
  * Execute the post-acquire pipeline for a task.
+ *
+ * PRIVATE — not exported. Callers must go through `launchWork` (the public
+ * front door) which enforces the per-channel FIFO queue and global concurrency
+ * cap. Exporting this function would allow callers to bypass the queue.
  *
  * ASSUMES the channel concurrency slot is already held by the caller.
  * Owns: clone → readyz → thread → lock → run-state → heartbeat → execute → cleanup.
@@ -177,12 +208,12 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  * - If a next task exists → starts it on the held slot (no release/re-acquire gap).
  * - If the queue is empty → calls `concurrency.release(channelId)` (only then is the slot freed).
  *
- * The handoff `startRun` is fire-and-forget from the completing run's perspective.
+ * The handoff `executeWorkOnHeldSlot` is fire-and-forget from the completing run's perspective.
  * Its own outer finally runs the same handoff/release logic, so the chain continues
  * and a thrown handoff still releases.
  */
-async function startRun(task: RunTask): Promise<void> {
-  const {message, binding, deps} = task
+async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
+  const {request, deps} = task
   const {
     concurrency,
     queue,
@@ -195,20 +226,27 @@ async function startRun(task: RunTask): Promise<void> {
     persona,
     logger,
   } = deps
-  const {approvalRegistry, approvalMode, statusMode, ensureClone, readyz} = deps
+  const {approvalRegistry, approvalMode, ensureClone, readyz} = deps
 
   // ── All mutable state that the outer finally needs is declared here so the
   // finally block can always reference channelId regardless of where execution
   // stopped. Async functions never throw synchronously, so the outer try/finally
   // always runs — but keeping these declarations before the try makes the
   // dependency explicit and avoids any ambiguity.
-  const channelId = message.channel.id
+  const channelId = request.channelId
+  const binding = request.binding
   const repo = `${binding.owner}/${binding.repo}`
 
   // ── Budget origin — single source of truth for hard abort and approval deadline ──
   // Captured once at run entry so both the AbortSignal.timeout and the approval
   // deadline clearance are computed from the same wall-clock reference.
   const runStartMs = Date.now()
+
+  // ── Unit 2 bridge: extract Discord-specific fields from the task ──────────
+  // These are provided by the Discord adapter (runMention) and will be removed
+  // in Unit 3 when thread creation moves fully into the adapter.
+  const bridge = task as RunTask & Partial<DiscordAdapterBridge>
+  const discordMessage = bridge._discordMessage
 
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
@@ -226,7 +264,9 @@ async function startRun(task: RunTask): Promise<void> {
         },
         'run: workspace clone unavailable — aborting',
       )
-      await sendMessage(message, {content: 'The workspace is not available right now. Please try again later.'}, logger)
+      await request.replySink.send('source', {
+        content: 'The workspace is not available right now. Please try again later.',
+      })
       return
     }
 
@@ -249,43 +289,63 @@ async function startRun(task: RunTask): Promise<void> {
 
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
-      await sendMessage(message, {content: 'The workspace is not reachable right now. Please try again later.'}, logger)
+      await request.replySink.send('source', {
+        content: 'The workspace is not reachable right now. Please try again later.',
+      })
       return
     }
 
     // ── Create response thread ─────────────────────────────────────────────────────────────────
+    // Unit 2: thread creation still uses the Discord message (via the bridge).
+    // Unit 3 will move thread creation into the Discord adapter.
+    if (discordMessage === undefined) {
+      // Non-Discord path (in-memory sinks, no thread needed): skip thread creation.
+      // The sinks are already fully initialized by the caller.
+      await executeWorkCore(task, bindingWithEnsuredPath, runStartMs)
+      return
+    }
 
     const runId = crypto.randomUUID()
-    let rawThread: Awaited<ReturnType<typeof message.startThread>>
+    let rawThread: Awaited<ReturnType<typeof discordMessage.startThread>>
     try {
-      rawThread = await message.startThread({name: `fro-bot: ${binding.repo}`})
+      rawThread = await discordMessage.startThread({name: `fro-bot: ${binding.repo}`})
     } catch (threadError) {
       logger.error({channelId, repo, err: String(threadError)}, 'run: startThread threw — aborting')
-      await sendMessage(message, {content: 'Could not start the task — please try again.'}, logger)
+      await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
       return
     }
     const threadId = rawThread.id
     const thread: SinkThread = rawThread
 
+    // ── Wire the real Discord sinks into the deferred proxy sinks ────────────
+    // The adapter's _initSinks callback initializes the real sinks now that we
+    // have the thread reference.
+    bridge._initSinks?.(thread, rawThread)
+
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
     const coordLogger = toCoordLogger(logger)
-    const lockResult = await acquireLock(coordinationConfig, repo, identity, 'discord', runId, coordLogger)
+    const lockResult = await acquireLock(
+      coordinationConfig,
+      repo,
+      identity,
+      request.surface as Surface,
+      runId,
+      coordLogger,
+    )
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
-      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
+      await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       return
     }
 
     if (lockResult.data.acquired === false) {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
       logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
-      await sendMessage(
-        thread,
-        {content: 'Another task is already in progress for this repo. Try again when it completes.'},
-        logger,
-      )
+      await request.replySink.send('thread', {
+        content: 'Another task is already in progress for this repo. Try again when it completes.',
+      })
       return
     }
 
@@ -297,7 +357,7 @@ async function startRun(task: RunTask): Promise<void> {
     const now = new Date().toISOString()
     const initialRunState = {
       run_id: runId,
-      surface: 'discord' as const,
+      surface: request.surface as Surface,
       thread_id: threadId,
       entity_ref: repo,
       phase: 'PENDING' as const,
@@ -310,7 +370,7 @@ async function startRun(task: RunTask): Promise<void> {
     const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
     if (createResult.success === false) {
       logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed')
-      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
+      await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
@@ -328,7 +388,7 @@ async function startRun(task: RunTask): Promise<void> {
     )
     if (ackResult.success === false) {
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
-      await sendMessage(thread, {content: 'Could not start the task — please try again.'}, logger)
+      await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
@@ -338,17 +398,8 @@ async function startRun(task: RunTask): Promise<void> {
     heartbeat.start()
 
     let heartbeatStopped = false
-    let sink: ReturnType<typeof createDiscordStreamSink> | null = null
 
-    // ── Status controller — per-run, created after thread is available ────────────────────────
-    // Adapts rawThread to StatusThread: discord.js ThreadChannel has .send() and .sendTyping()
-    // which structurally satisfy the StatusThread interface. Messages returned by .send() have
-    // .edit() and .delete() which satisfy StatusMessage.
-    const statusController = createStatusController({
-      thread: rawThread,
-      mode: statusMode,
-      logger,
-    })
+    const {statusSink, replySink} = request
 
     try {
       const execResult = await transitionRun(
@@ -366,15 +417,13 @@ async function startRun(task: RunTask): Promise<void> {
       runEtag = execResult.data.etag
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
-      // eslint-disable-next-line no-void
-      void setRunReaction(message, 'working', logger)
+      statusSink.setReaction('working')
 
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
       const handle = attachOpencode(attachUrl, attachToken)
-      sink = createDiscordStreamSink(thread, {logger})
       const promptText = buildDiscordPrompt({
-        messageText: message.content,
+        messageText: request.promptText,
         owner: bindingWithEnsuredPath.owner,
         repo: bindingWithEnsuredPath.repo,
         botUserId,
@@ -395,9 +444,9 @@ async function startRun(task: RunTask): Promise<void> {
 
       const coordinator = createPermissionCoordinator({
         logger,
-        onPending: request => {
+        onPending: req => {
           // Per-request closures — each captures its own sessionID.
-          const {requestID, sessionID} = request
+          const {requestID, sessionID} = req
 
           // postReply: call the OpenCode SDK permission reply endpoint.
           // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
@@ -442,7 +491,7 @@ async function startRun(task: RunTask): Promise<void> {
             sessionID,
             channelID: rawThread.id,
             directory: bindingWithEnsuredPath.workspacePath,
-            request,
+            request: req,
             effects: {postReply: postReplyForRequest},
             deadlineMs: approvalDeadlineMs,
             onDeadlineSettled: async () => {
@@ -454,15 +503,14 @@ async function startRun(task: RunTask): Promise<void> {
                 logger,
               )
               if (deadlineResult.success === true) {
-                sink?.markVisibleOutputSent()
+                replySink.markVisibleOutputSent()
               }
             },
           })
 
           // Awaiting-approval reaction — best-effort, fire-and-forget.
           // Replaces the working reaction with the awaiting-approval cue.
-          // eslint-disable-next-line no-void
-          void setRunReaction(message, 'awaiting-approval', logger)
+          statusSink.setReaction('awaiting-approval')
 
           // Post a visible waiting-for-approval status BEFORE the embed so the
           // user sees the run is blocked even if the embed send is slow.
@@ -473,13 +521,13 @@ async function startRun(task: RunTask): Promise<void> {
           // timeout classification sees it as visible context even if the Discord
           // round-trip has not completed yet. settle(true) on success promotes to
           // permanently delivered; settle(false) on failure retracts the claim.
-          const settleWaitingStatus = sink?.markVisibleOutputPending()
+          const settleWaitingStatus = replySink.markVisibleOutputPending()
           // eslint-disable-next-line no-void
           void sendMessage(rawThread, {content: 'Waiting for tool approval…'}, logger).then(result => {
             if (result.success === true) {
-              settleWaitingStatus?.(true)
+              settleWaitingStatus(true)
             } else {
-              settleWaitingStatus?.(false)
+              settleWaitingStatus(false)
               logger.warn({requestID, err: result.error.message}, 'run: failed to post waiting-for-approval status')
             }
           })
@@ -490,23 +538,23 @@ async function startRun(task: RunTask): Promise<void> {
           //
           // Pending-visibility: same pattern as the waiting-status send above —
           // mark in-flight before the void send, settle on resolution.
-          const settleEmbed = sink?.markVisibleOutputPending()
+          const settleEmbed = replySink.markVisibleOutputPending()
           // eslint-disable-next-line no-void
           void sendMessage<Message>(
             rawThread,
-            {embeds: [buildApprovalEmbed(request)], components: [buildApprovalButtons(requestID)]},
+            {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]},
             logger,
           ).then(result => {
             if (result.success === true) {
               // Embed send succeeded — settle pending claim as delivered so
               // flush() does not add a misleading _(no output)_.
-              settleEmbed?.(true)
+              settleEmbed(true)
               const postedMessage = result.data
               // Attach the render function now that we have a message reference.
               approvalRegistry.attachMessage(
                 requestID,
                 async (
-                  req: import('../approvals/coordinator.js').PermissionRequest,
+                  permReq: import('../approvals/coordinator.js').PermissionRequest,
                   decision: import('../approvals/coordinator.js').PermissionReply,
                   decidedBy: string | null,
                   reason: import('../approvals/coordinator.js').SettlementReason,
@@ -514,21 +562,21 @@ async function startRun(task: RunTask): Promise<void> {
                   const editResult = await editMessage(
                     postedMessage,
                     {
-                      embeds: [buildSettledEmbed(req, decision, {decidedBy: decidedBy ?? undefined, reason})],
+                      embeds: [buildSettledEmbed(permReq, decision, {decidedBy: decidedBy ?? undefined, reason})],
                       components: [],
                     },
                     logger,
                   )
                   if (editResult.success === false) {
                     logger.warn(
-                      {requestID: req.requestID, err: editResult.error.message},
+                      {requestID: permReq.requestID, err: editResult.error.message},
                       'run: failed to edit approval message',
                     )
                   }
                 },
               )
             } else {
-              settleEmbed?.(false)
+              settleEmbed(false)
               logger.warn({requestID, err: result.error.message}, 'run: failed to post approval embed')
               approvalRegistry.markMessagePostFailed(requestID)
             }
@@ -550,16 +598,16 @@ async function startRun(task: RunTask): Promise<void> {
           handle,
           directory: bindingWithEnsuredPath.workspacePath,
           promptText,
-          sink,
+          sink: replySink as unknown as import('../discord/streaming.js').DiscordStreamSink,
           signal: timeoutSignal,
           logger,
           coordinator,
           approvalMode,
           onActivity: (summary: string) => {
-            statusController.noteActivity(summary)
+            statusSink.noteActivity(summary)
           },
           onBusy: (busy: boolean) => {
-            statusController.setBusy(busy)
+            statusSink.setBusy(busy)
           },
         })
       } finally {
@@ -570,8 +618,7 @@ async function startRun(task: RunTask): Promise<void> {
 
       // ── Succeeded reaction — best-effort, fire-and-forget ────────────────────────────────────
       // Replaces the working/awaiting reaction with the succeeded cue.
-      // eslint-disable-next-line no-void
-      void setRunReaction(message, 'succeeded', logger)
+      statusSink.setReaction('succeeded')
 
       // ── session.idle received — transition to COMPLETED ──────────────────────────────────────
 
@@ -604,10 +651,10 @@ async function startRun(task: RunTask): Promise<void> {
       // resolveToAnswer returns:
       //   'handled'   → controller edited the status message into the answer; skip sink flush.
       //   'delegated' → controller deleted the status (or typing-only); flush via sink as normal.
-      const finalText = sink.buffered()
-      const answerResult = await statusController.resolveToAnswer(finalText)
+      const finalText = replySink.buffered()
+      const answerResult = await statusSink.resolveToAnswer(finalText)
       if (answerResult.transition === 'delegated') {
-        await sink.flush()
+        await replySink.flush()
       }
       // 'handled': answer is already in the status message — do not flush (would double-post).
     } catch (execError: unknown) {
@@ -631,8 +678,7 @@ async function startRun(task: RunTask): Promise<void> {
 
       // ── Failed reaction — best-effort, fire-and-forget ────────────────────────────────────────
       // Replaces the working/awaiting reaction with the failed cue.
-      // eslint-disable-next-line no-void
-      void setRunReaction(message, 'failed', logger)
+      statusSink.setReaction('failed')
 
       // Stop heartbeat (best-effort) if not already stopped
       if (heartbeatStopped === false) {
@@ -665,16 +711,13 @@ async function startRun(task: RunTask): Promise<void> {
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
       // Wrapped in its own try/catch so a flush failure does not mask the original error.
-      // Guard against double-post: sink is null when the error occurred before createDiscordStreamSink.
-      if (sink !== null) {
-        await sink.flush().catch((flushError: unknown) => {
-          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
-        })
-      }
+      await replySink.flush().catch((flushError: unknown) => {
+        logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
+      })
 
       // Coarse user message — no internal detail
       const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
-      const hasVisibleOutput = sink !== null && sink.hasVisibleOutput() === true
+      const hasVisibleOutput = replySink.hasVisibleOutput() === true
       const userMessage =
         isTimeout === true
           ? hasVisibleOutput === true
@@ -693,14 +736,17 @@ async function startRun(task: RunTask): Promise<void> {
       //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
       //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
       // Never both — single owner for the failure message.
-      const failureResult = await statusController.resolveToFailure(userMessage).catch((error: unknown) => {
+      const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
         logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
         return {transition: 'delegated' as const}
       })
       if (failureResult.transition === 'delegated') {
-        const failureSendResult = await sendMessage(thread, {content: userMessage}, logger)
-        if (failureSendResult.success === false) {
-          logger.warn({repo, runId, err: failureSendResult.error.message}, 'run: failed to send error reply to thread')
+        const failureSendResult = await replySink.send('thread', {content: userMessage})
+        if (failureSendResult !== undefined) {
+          const result = failureSendResult as {success?: boolean; error?: {message: string}}
+          if (result.success === false && result.error !== undefined) {
+            logger.warn({repo, runId, err: result.error.message}, 'run: failed to send error reply to thread')
+          }
         }
       }
     } finally {
@@ -713,7 +759,7 @@ async function startRun(task: RunTask): Promise<void> {
 
       // Dispose status controller — guaranteed cleanup of typing interval and debounce timer.
       // Must run in finally so timers never leak regardless of success or failure.
-      await statusController.dispose().catch((error: unknown) => {
+      await statusSink.dispose().catch((error: unknown) => {
         logger.warn({repo, runId, err: String(error)}, 'run: statusController.dispose failed')
       })
 
@@ -739,7 +785,7 @@ async function startRun(task: RunTask): Promise<void> {
     // This is consistent with the messageCreate guard in program.ts that refuses
     // new mentions once isShuttingDown() returns true.
     //
-    // The handed-off startRun is fire-and-forget from this run's perspective so
+    // The handed-off executeWorkOnHeldSlot is fire-and-forget from this run's perspective so
     // cleanup completes, but its own outer finally runs the same handoff/release
     // logic — so the chain continues and a thrown handoff still releases.
     if (deps.isShuttingDown?.() === true) {
@@ -753,7 +799,7 @@ async function startRun(task: RunTask): Promise<void> {
       } else {
         // Slot ownership transfers to the next run — do NOT call concurrency.release.
         // eslint-disable-next-line no-void
-        void startRun(nextTask).catch((error: unknown) => {
+        void executeWorkOnHeldSlot(nextTask).catch((error: unknown) => {
           logger.error(
             {channelId, err: error instanceof Error ? error.message : String(error)},
             'run: handoff startRun failed',
@@ -765,19 +811,438 @@ async function startRun(task: RunTask): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// runMention — the thin front door
+// executeWorkCore — non-Discord execution path (in-memory sinks, no thread)
 // ---------------------------------------------------------------------------
 
 /**
- * Front door for a mention-triggered run.
+ * Execute the core pipeline for a task that already has fully-initialized sinks
+ * (no Discord thread creation needed). Used by the non-Discord path in Unit 2.
+ *
+ * This is a simplified version of the Discord path that skips thread creation,
+ * lock acquisition, run-state lifecycle, and heartbeat — it runs the core
+ * execution pipeline directly.
+ *
+ * NOTE: This is a placeholder for the in-memory sink tests in Unit 2. The full
+ * non-Discord path (with lock, run-state, heartbeat) will be implemented in
+ * Unit 3 when the Discord adapter is fully separated.
+ */
+async function executeWorkCore(
+  task: RunTask,
+  bindingWithEnsuredPath: {readonly owner: string; readonly repo: string; readonly workspacePath: string},
+  runStartMs: number,
+): Promise<void> {
+  const {request, deps} = task
+  const {
+    coordinationConfig,
+    identity,
+    attachUrl,
+    attachToken,
+    runTimeoutMs,
+    botUserId,
+    persona,
+    logger,
+    approvalRegistry,
+    approvalMode,
+  } = deps
+
+  const channelId = request.channelId
+  const binding = request.binding
+  const repo = `${binding.owner}/${binding.repo}`
+  const coordLogger = toCoordLogger(logger)
+  const runId = crypto.randomUUID()
+
+  // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
+
+  const now = new Date().toISOString()
+  const initialRunState = {
+    run_id: runId,
+    surface: request.surface as Surface,
+    thread_id: '',
+    entity_ref: repo,
+    phase: 'PENDING' as const,
+    started_at: now,
+    last_heartbeat: now,
+    holder_id: identity,
+    details: {channelId, owner: binding.owner, repo: binding.repo},
+  }
+
+  const lockResult = await acquireLock(
+    coordinationConfig,
+    repo,
+    identity,
+    request.surface as Surface,
+    runId,
+    coordLogger,
+  )
+  if (lockResult.success === false) {
+    logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
+    await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
+    return
+  }
+  if (lockResult.data.acquired === false) {
+    logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
+    await request.replySink.send('thread', {
+      content: 'Another task is already in progress for this repo. Try again when it completes.',
+    })
+    return
+  }
+  let lockEtag = lockResult.data.etag
+
+  const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
+  if (createResult.success === false) {
+    logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed')
+    await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
+    await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+    return
+  }
+  let runEtag = createResult.data.etag
+
+  const ackResult = await transitionRun(coordinationConfig, identity, repo, runId, 'ACKNOWLEDGED', runEtag, coordLogger)
+  if (ackResult.success === false) {
+    logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
+    await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
+    await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+    return
+  }
+  runEtag = ackResult.data.etag
+
+  const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
+  heartbeat.start()
+  let heartbeatStopped = false
+
+  const {statusSink, replySink} = request
+
+  try {
+    const execResult = await transitionRun(coordinationConfig, identity, repo, runId, 'EXECUTING', runEtag, coordLogger)
+    if (execResult.success === false) {
+      throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
+    }
+    runEtag = execResult.data.etag
+
+    statusSink.setReaction('working')
+
+    const handle = attachOpencode(attachUrl, attachToken)
+    const promptText = buildDiscordPrompt({
+      messageText: request.promptText,
+      owner: bindingWithEnsuredPath.owner,
+      repo: bindingWithEnsuredPath.repo,
+      botUserId,
+      persona,
+    })
+
+    const elapsedMs = Date.now() - runStartMs
+    const remainingBudgetMs = Math.max(0, runTimeoutMs - elapsedMs)
+    const timeoutSignal = AbortSignal.timeout(remainingBudgetMs)
+    const approvalDeadlineMs = computeApprovalDeadlineMs(remainingBudgetMs)
+
+    const coordinator = createPermissionCoordinator({
+      logger,
+      onPending: req => {
+        const {requestID, sessionID} = req
+        const postReplyForRequest = async (
+          rID: string,
+          directory: string,
+          decision: import('../approvals/coordinator.js').PermissionReply,
+        ) => {
+          try {
+            const res = await handle.client.postSessionIdPermissionsPermissionId({
+              path: {id: sessionID, permissionID: rID},
+              body: {response: decision},
+              query: {directory},
+              signal: AbortSignal.timeout(10_000),
+            })
+            const envelope = res as {error?: unknown} | undefined
+            if (envelope?.error != null) {
+              return {ok: false as const, error: String(envelope.error)}
+            }
+            return {ok: true as const}
+          } catch (error) {
+            return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
+          }
+        }
+        approvalRegistry.register({
+          requestID,
+          sessionID,
+          channelID: channelId,
+          directory: bindingWithEnsuredPath.workspacePath,
+          request: req,
+          effects: {postReply: postReplyForRequest},
+          deadlineMs: approvalDeadlineMs,
+          onDeadlineSettled: async () => {
+            const deadlineResult = await replySink.send('thread', {
+              content: 'Approval timed out — the task could not continue.',
+            })
+            if (deadlineResult !== undefined) {
+              const r = deadlineResult as {success?: boolean}
+              if (r.success === true) {
+                replySink.markVisibleOutputSent()
+              }
+            }
+          },
+        })
+        statusSink.setReaction('awaiting-approval')
+        const settleWaitingStatus = replySink.markVisibleOutputPending()
+        // eslint-disable-next-line no-void
+        void replySink.send('thread', {content: 'Waiting for tool approval…'}).then(result => {
+          const r = result as {success?: boolean; error?: {message: string}} | undefined
+          if (r?.success === true) {
+            settleWaitingStatus(true)
+          } else {
+            settleWaitingStatus(false)
+            logger.warn(
+              {requestID, err: r?.error?.message ?? 'unknown'},
+              'run: failed to post waiting-for-approval status',
+            )
+          }
+        })
+        const settleEmbed = replySink.markVisibleOutputPending()
+        // eslint-disable-next-line no-void
+        void replySink.send('thread', {content: `[approval-embed:${requestID}]`}).then(result => {
+          const r = result as {success?: boolean; error?: {message: string}} | undefined
+          if (r?.success === true) {
+            settleEmbed(true)
+          } else {
+            settleEmbed(false)
+            logger.warn({requestID, err: r?.error?.message ?? 'unknown'}, 'run: failed to post approval embed')
+            approvalRegistry.markMessagePostFailed(requestID)
+          }
+        })
+      },
+      onReplied: event => {
+        approvalRegistry.confirmReply(event)
+      },
+      onDispose: sessionIDs => {
+        // eslint-disable-next-line no-void
+        void Promise.all(sessionIDs.map(async sid => approvalRegistry.disposeRun(sid, 'run ended')))
+      },
+    })
+
+    try {
+      await runOpenCodeCore({
+        handle,
+        directory: bindingWithEnsuredPath.workspacePath,
+        promptText,
+        sink: replySink as unknown as import('../discord/streaming.js').DiscordStreamSink,
+        signal: timeoutSignal,
+        logger,
+        coordinator,
+        approvalMode,
+        onActivity: (summary: string) => {
+          statusSink.noteActivity(summary)
+        },
+        onBusy: (busy: boolean) => {
+          statusSink.setBusy(busy)
+        },
+      })
+    } finally {
+      coordinator.dispose('run ended')
+    }
+
+    statusSink.setReaction('succeeded')
+
+    const stopResult = await heartbeat.stop()
+    heartbeatStopped = true
+    if (stopResult.success === true) {
+      runEtag = stopResult.data.runEtag
+      lockEtag = stopResult.data.lockEtag
+    } else {
+      logger.warn({repo, runId, err: stopResult.error.message}, 'run: heartbeat stop failed; using last known etags')
+    }
+
+    const completedResult = await transitionRun(
+      coordinationConfig,
+      identity,
+      repo,
+      runId,
+      'COMPLETED',
+      runEtag,
+      coordLogger,
+    )
+    if (completedResult.success === false) {
+      logger.error({repo, runId, err: completedResult.error.message}, 'run: transitionRun COMPLETED failed')
+    }
+
+    const finalText = replySink.buffered()
+    const answerResult = await statusSink.resolveToAnswer(finalText)
+    if (answerResult.transition === 'delegated') {
+      await replySink.flush()
+    }
+  } catch (execError: unknown) {
+    const isCoreError = execError instanceof RunCoreError
+    const isTimeout = isCoreError && execError.kind === 'timeout'
+    const isStreamEnded = isCoreError && execError.kind === 'stream-ended'
+    const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
+    const isEmptyPrompt = execError instanceof EmptyPromptError
+
+    logger.error(
+      {
+        repo,
+        runId,
+        kind: isCoreError ? execError.kind : 'unknown',
+        err: execError instanceof Error ? execError.message : String(execError),
+      },
+      'run: execution failed',
+    )
+
+    statusSink.setReaction('failed')
+
+    if (heartbeatStopped === false) {
+      const stopResult = await heartbeat.stop()
+      heartbeatStopped = true
+      if (stopResult.success === true) {
+        runEtag = stopResult.data.runEtag
+        lockEtag = stopResult.data.lockEtag
+      } else {
+        logger.warn({repo, runId, err: stopResult.error.message}, 'run: heartbeat stop failed; using last known etags')
+      }
+    }
+
+    const failedResult = await transitionRun(coordinationConfig, identity, repo, runId, 'FAILED', runEtag, coordLogger)
+    if (failedResult.success === false) {
+      logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
+    }
+
+    await replySink.flush().catch((flushError: unknown) => {
+      logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
+    })
+
+    const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
+    const hasVisibleOutput = replySink.hasVisibleOutput() === true
+    const userMessage =
+      isTimeout === true
+        ? hasVisibleOutput === true
+          ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+          : `The task reached the ${timeoutDuration} time limit. Please try again.`
+        : isReachability === true
+          ? 'The workspace is not reachable right now. Please try again later.'
+          : isEmptyPrompt === true
+            ? 'Nothing to do — please include a task in your message.'
+            : isStreamEnded === true
+              ? 'The task stream closed unexpectedly. Please try again.'
+              : 'The task failed. Please try again.'
+
+    const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
+      logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
+      return {transition: 'delegated' as const}
+    })
+    if (failureResult.transition === 'delegated') {
+      await replySink.send('thread', {content: userMessage}).catch((sendError: unknown) => {
+        logger.warn({repo, runId, err: String(sendError)}, 'run: failed to send error reply to thread')
+      })
+    }
+  } finally {
+    if (heartbeatStopped === false) {
+      await heartbeat.stop().catch(() => {
+        /* best-effort */
+      })
+    }
+
+    await statusSink.dispose().catch((error: unknown) => {
+      logger.warn({repo, runId, err: String(error)}, 'run: statusController.dispose failed')
+    })
+
+    const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+    if (releaseResult.success === false) {
+      logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// launchWork — the public, queue-and-cap-preserving front door
+// ---------------------------------------------------------------------------
+
+/**
+ * Public front door for launching a unit of work.
+ *
+ * Transport-agnostic: accepts a `LaunchWorkRequest` with pre-constructed
+ * `StatusSink` and `ReplySink` implementations. The Discord adapter
+ * (`runMention`) calls this after mapping a Discord `Message` → `LaunchWorkRequest`.
+ * A future web adapter (Phase B) will call this directly.
+ *
+ * Enforces the per-channel FIFO queue and global concurrency cap. A future
+ * web caller goes through THIS and cannot bypass the queue/cap.
  *
  * Decides whether to run immediately or enqueue, in this order:
  * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (pending work has
  *    priority; never take an immediate slot ahead of it).
  * 2. Else `concurrency.tryAcquire(channelId)`:
- *    - `'ok'`   → `startRun(task)` (slot held).
+ *    - `'ok'`   → `executeWorkOnHeldSlot(task)` (slot held).
  *    - `'busy'` → enqueue + queued ack (or "queue is full" if at capacity). Return without blocking.
  *    - `'cap'`  → terminal capacity reply, no enqueue (global cap stays terminal).
+ *
+ * Hard invariants:
+ * - `'cap'` is TERMINAL — no queue, no retry.
+ * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
+ *   raw errors) are logged but NEVER posted to the transport.
+ * - Bearer token (`attachToken`) is never logged.
+ *
+ * @param request - Transport-neutral engine input (prompt, sinks, binding, identity).
+ * @param deps - Runtime dependencies (concurrency, queue, coordination config, etc.).
+ */
+export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDeps): Promise<void> {
+  const {concurrency, queue} = deps
+  const channelId = request.channelId
+  const task: RunTask = {request, deps}
+
+  // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
+  // A new request must never leapfrog older queued work, even if a slot is free.
+  // Only the handoff path (executeWorkOnHeldSlot's outer finally) may start the next task.
+  if (queue.pendingCount(channelId) > 0) {
+    const enqueueResult = queue.enqueue(channelId, task)
+    await ackEnqueueResult(request, enqueueResult)
+    return
+  }
+
+  // ── Concurrency cap + per-channel in-flight guard ──────────────────────────
+  const slotResult = concurrency.tryAcquire(channelId)
+
+  if (slotResult === 'cap') {
+    await request.replySink.send('source', {content: 'fro-bot is at capacity right now — please try again shortly.'})
+    return
+  }
+
+  if (slotResult === 'busy') {
+    // Channel has an in-flight run — enqueue instead of rejecting.
+    const enqueueResult = queue.enqueue(channelId, task)
+    await ackEnqueueResult(request, enqueueResult)
+    return
+  }
+
+  // Slot acquired — executeWorkOnHeldSlot owns the release (via atomic handoff in its outer finally).
+  await executeWorkOnHeldSlot(task)
+}
+
+// ---------------------------------------------------------------------------
+// ackEnqueueResult — send the appropriate ephemeral ack for an enqueue result
+// ---------------------------------------------------------------------------
+
+/**
+ * Send the appropriate ephemeral ack for an enqueue result.
+ * Centralises the two reply strings so they live in exactly one place.
+ */
+async function ackEnqueueResult(request: LaunchWorkRequest, result: 'queued' | 'full'): Promise<void> {
+  if (result === 'queued') {
+    await request.replySink.send('source', {content: "Queued — I'll start this when the current task finishes."})
+  } else {
+    await request.replySink.send('source', {
+      content: 'The queue is full for this channel — please wait for pending tasks to complete.',
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// runMention — the Discord adapter (Unit 2: constructs sinks inline)
+// ---------------------------------------------------------------------------
+
+/**
+ * Discord adapter for mention-triggered runs.
+ *
+ * Maps a Discord `Message` → `LaunchWorkRequest` and calls `launchWork`.
+ *
+ * In Unit 2, the Discord sinks are "deferred" — they are initialized inside
+ * `executeWorkOnHeldSlot` after thread creation via the `_initSinks` callback.
+ * Unit 3 will make this a proper thin adapter where thread creation moves here.
  *
  * Hard invariants:
  * - `'cap'` is TERMINAL — no queue, no retry.
@@ -786,32 +1251,123 @@ async function startRun(task: RunTask): Promise<void> {
  * - Bearer token (`attachToken`) is never logged.
  * - Every Discord send uses `allowedMentions: {parse: []}`.
  */
-/**
- * Send the appropriate ephemeral ack for an enqueue result.
- * Centralises the two reply strings so they live in exactly one place.
- */
-async function ackEnqueueResult(message: Message, result: 'queued' | 'full', logger: GatewayLogger): Promise<void> {
-  if (result === 'queued') {
-    await sendMessage(message, {content: "Queued — I'll start this when the current task finishes."}, logger)
-  } else {
-    await sendMessage(
-      message,
-      {content: 'The queue is full for this channel — please wait for pending tasks to complete.'},
-      logger,
-    )
-  }
-}
-
 export async function runMention(message: Message, binding: RepoBinding, deps: RunMentionDeps): Promise<void> {
   const {concurrency, queue, logger} = deps
   const channelId = message.channel.id
-  const task: RunTask = {message, binding, deps}
+
+  // ── Build deferred Discord sinks ──────────────────────────────────────────
+  // The real sinks are initialized by _initSinks after thread creation inside
+  // executeWorkOnHeldSlot. Until then, pre-thread acks go directly to the message.
+
+  let realStatusSink: StatusSink | null = null
+  let realReplySink: ReplySink | null = null
+
+  const statusSink: StatusSink = {
+    noteActivity: (summary: string) => {
+      realStatusSink?.noteActivity(summary)
+    },
+    setBusy: (busy: boolean) => {
+      realStatusSink?.setBusy(busy)
+    },
+    resolveToAnswer: async (text: string) => {
+      if (realStatusSink !== null) return realStatusSink.resolveToAnswer(text)
+      return {transition: 'delegated' as const}
+    },
+    resolveToFailure: async (note: string) => {
+      if (realStatusSink !== null) return realStatusSink.resolveToFailure(note)
+      return {transition: 'delegated' as const}
+    },
+    dispose: async () => {
+      if (realStatusSink !== null) await realStatusSink.dispose()
+    },
+    setReaction: state => {
+      // eslint-disable-next-line no-void
+      void setRunReaction(message, state, logger)
+    },
+  }
+
+  const replySink: ReplySink = {
+    send: async (target, options) => {
+      if (target === 'source') return sendMessage(message, options, logger)
+      if (realReplySink !== null) return realReplySink.send(target, options)
+      return undefined
+    },
+    append: (text: string) => {
+      realReplySink?.append(text)
+    },
+    flush: async () => {
+      if (realReplySink !== null) return realReplySink.flush()
+      return undefined
+    },
+    buffered: () => realReplySink?.buffered() ?? '',
+    hasVisibleOutput: () => realReplySink?.hasVisibleOutput() ?? false,
+    markVisibleOutputSent: () => {
+      realReplySink?.markVisibleOutputSent()
+    },
+    markVisibleOutputPending: () => {
+      if (realReplySink !== null) return realReplySink.markVisibleOutputPending()
+      return (_delivered: boolean) => {
+        /* no-op settle handle — sink not yet initialized */
+      }
+    },
+  }
+
+  const request: LaunchWorkRequest = {
+    promptText: message.content,
+    channelId,
+    guildId: message.guild?.id,
+    surface: 'discord',
+    binding,
+    requester: {kind: 'discord-user', userId: message.author.id},
+    statusSink,
+    replySink,
+  }
+
+  // ── Build the RunTask with the Unit 2 Discord bridge ──────────────────────
+  const task: RunTask & DiscordAdapterBridge = {
+    request,
+    deps,
+    _discordMessage: message,
+    _initSinks: (_thread: SinkThread, rawThread: Awaited<ReturnType<Message['startThread']>>) => {
+      // Create the real Discord sinks now that we have the thread.
+      const statusController = createStatusController({
+        thread: rawThread,
+        mode: deps.statusMode,
+        logger,
+      })
+      realStatusSink = {
+        noteActivity: (summary: string) => statusController.noteActivity(summary),
+        setBusy: (busy: boolean) => statusController.setBusy(busy),
+        resolveToAnswer: async (text: string) => statusController.resolveToAnswer(text),
+        resolveToFailure: async (note: string) => statusController.resolveToFailure(note),
+        dispose: async () => statusController.dispose(),
+        setReaction: state => {
+          // eslint-disable-next-line no-void
+          void setRunReaction(message, state, logger)
+        },
+      }
+
+      const streamSink = createDiscordStreamSink(rawThread, {logger})
+      realReplySink = {
+        send: async (target, options) => {
+          if (target === 'source') return sendMessage(message, options, logger)
+          return sendMessage(rawThread, options, logger)
+        },
+        append: (text: string) => streamSink.append(text),
+        flush: async () => streamSink.flush(),
+        buffered: () => streamSink.buffered(),
+        hasVisibleOutput: () => streamSink.hasVisibleOutput(),
+        markVisibleOutputSent: () => streamSink.markVisibleOutputSent(),
+        markVisibleOutputPending: () => streamSink.markVisibleOutputPending(),
+      }
+    },
+  }
 
   // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
   // A new mention must never leapfrog older queued work, even if a slot is free.
-  // Only the handoff path (startRun's outer finally) may start the next task.
+  // Only the handoff path (executeWorkOnHeldSlot's outer finally) may start the next task.
   if (queue.pendingCount(channelId) > 0) {
-    await ackEnqueueResult(message, queue.enqueue(channelId, task), logger)
+    await ackEnqueueResult(request, queue.enqueue(channelId, task))
     return
   }
 
@@ -825,10 +1381,10 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
 
   if (slotResult === 'busy') {
     // Channel has an in-flight run — enqueue instead of rejecting.
-    await ackEnqueueResult(message, queue.enqueue(channelId, task), logger)
+    await ackEnqueueResult(request, queue.enqueue(channelId, task))
     return
   }
 
-  // Slot acquired — startRun owns the release (via atomic handoff in its outer finally).
-  await startRun(task)
+  // Slot acquired — executeWorkOnHeldSlot owns the release (via atomic handoff in its outer finally).
+  await executeWorkOnHeldSlot(task)
 }
