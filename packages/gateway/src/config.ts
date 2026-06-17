@@ -1,6 +1,7 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 
 import {closeSync, constants, fstatSync, openSync, readFileSync} from 'node:fs'
+import {isIP} from 'node:net'
 import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
@@ -82,6 +83,44 @@ export interface GatewayConfig {
     readonly webhookSecret: string
     readonly presenceChannelId: string
     readonly httpPort: number
+  }
+  /**
+   * Operator web surface configuration. Present only when all required operator
+   * config is set: `GATEWAY_OPERATOR_BIND_HOST`, `GATEWAY_OPERATOR_BIND_PORT`,
+   * and `GATEWAY_OPERATOR_PUBLIC_ORIGIN`.
+   *
+   * When absent, the operator HTTP server is not started (opt-in).
+   * Partial config (some but not all required vars) fails closed at startup.
+   *
+   * Security constraints enforced at config-load time:
+   *   - bindHost must be a literal IP address (no hostnames — `node:net` `isIP()` check).
+   *   - bindHost must NOT be an all-interfaces address: `0.0.0.0`, `::`, or `0:0:0:0:0:0:0:0`.
+   *   - bindHost must NOT be a loopback address: any `127.0.0.0/8` range, `::1`,
+   *     or the full-form `0:0:0:0:0:0:0:1`.
+   *   - bindHost must NOT be a sandbox-net address: `10.0.0.0/8` (Docker internal network;
+   *     the operator listener must be on gateway-net only).
+   *   - publicOrigin must be a valid https:// URL.
+   *
+   * The operator listener is bound to gateway-net only and is not reachable
+   * from sandbox-net. TLS is terminated by the infra reverse proxy.
+   */
+  readonly operatorWeb?: {
+    /**
+     * Bind host for the operator listener on gateway-net.
+     * Must be a literal IP address (not a hostname).
+     * Must NOT be an all-interfaces address (0.0.0.0, ::, 0:0:0:0:0:0:0:0),
+     * a loopback address (127.0.0.0/8, ::1, 0:0:0:0:0:0:0:1),
+     * or a sandbox-net address (10.0.0.0/8).
+     */
+    readonly bindHost: string
+    /** Bind port for the operator listener. */
+    readonly bindPort: number
+    /**
+     * Public HTTPS origin exposed by the infra reverse proxy.
+     * Used to validate X-Forwarded-Host/X-Forwarded-Proto headers.
+     * Example: 'https://operator.example.com'
+     */
+    readonly publicOrigin: string
   }
 }
 
@@ -473,6 +512,129 @@ export function loadGatewayConfig(): GatewayConfig {
     announce = {webhookSecret: gatewayWebhookSecret, presenceChannelId: gatewayPresenceChannelId, httpPort}
   }
 
+  // Operator web surface — opt-in: all three required vars must be set together, or none.
+  // Partial config (some but not all) fails closed with a clear error.
+  const operatorBindHost = readOptionalSecret('GATEWAY_OPERATOR_BIND_HOST')
+  const rawOperatorBindPort = readOptionalSecret('GATEWAY_OPERATOR_BIND_PORT')
+  const operatorPublicOrigin = readOptionalSecret('GATEWAY_OPERATOR_PUBLIC_ORIGIN')
+
+  const operatorVarsPresent = [operatorBindHost, rawOperatorBindPort, operatorPublicOrigin].filter(
+    v => v !== null,
+  ).length
+
+  if (operatorVarsPresent > 0 && operatorVarsPresent < 3) {
+    const missing: string[] = []
+    if (operatorBindHost === null) missing.push('GATEWAY_OPERATOR_BIND_HOST')
+    if (rawOperatorBindPort === null) missing.push('GATEWAY_OPERATOR_BIND_PORT')
+    if (operatorPublicOrigin === null) missing.push('GATEWAY_OPERATOR_PUBLIC_ORIGIN')
+    throw new Error(
+      `Partial operator web config: all three of GATEWAY_OPERATOR_BIND_HOST, GATEWAY_OPERATOR_BIND_PORT, and GATEWAY_OPERATOR_PUBLIC_ORIGIN must be set together to enable the operator listener, or none to disable it. Missing: ${missing.join(', ')}.`,
+    )
+  }
+
+  let operatorWeb: GatewayConfig['operatorWeb']
+
+  if (operatorVarsPresent === 3) {
+    // operatorVarsPresent === 3 means all three are non-null; narrow types with explicit guards.
+    if (operatorBindHost === null || rawOperatorBindPort === null || operatorPublicOrigin === null) {
+      throw new Error('Internal: operatorVarsPresent === 3 but a var is null — this is a bug')
+    }
+
+    // Validate bind host — must be a literal IP address (no hostnames).
+    // isIP() returns 4 for IPv4, 6 for IPv6, 0 for non-IP (hostname or invalid).
+    if (isIP(operatorBindHost) === 0) {
+      throw new Error(
+        `GATEWAY_OPERATOR_BIND_HOST must be a literal IP address, not a hostname: "${operatorBindHost}". Set it to the gateway container's gateway-net IP address (e.g. 172.20.0.2).`,
+      )
+    }
+
+    // Reject all-interfaces binds: 0.0.0.0, ::, and the full-form 0:0:0:0:0:0:0:0.
+    const ALL_INTERFACE_ADDRS = new Set(['0.0.0.0', '::', '0:0:0:0:0:0:0:0'])
+    if (ALL_INTERFACE_ADDRS.has(operatorBindHost)) {
+      throw new Error(
+        `GATEWAY_OPERATOR_BIND_HOST must not be "${operatorBindHost}" — the operator listener must be bound to a specific gateway-net address, not all interfaces. Set it to the gateway container's gateway-net IP address.`,
+      )
+    }
+
+    // Reject loopback: any 127.0.0.0/8 range, ::1, and full-form 0:0:0:0:0:0:0:1.
+    //
+    // Safe to use startsWith('127.') here: isIP() above has already proven this is a
+    // literal IP address, so no hostname can reach this check. The prefix uniquely
+    // identifies the 127.0.0.0/8 loopback range for dotted-decimal IPv4.
+    const LOOPBACK_ADDRS = new Set(['::1', '0:0:0:0:0:0:0:1'])
+    const isIPv4Loopback = operatorBindHost.startsWith('127.')
+    if (isIPv4Loopback || LOOPBACK_ADDRS.has(operatorBindHost)) {
+      throw new Error(
+        `GATEWAY_OPERATOR_BIND_HOST must not be "${operatorBindHost}" — the operator listener must be bound to a gateway-net address, not the loopback interface. Set it to the gateway container's gateway-net IP address.`,
+      )
+    }
+
+    // Reject sandbox-net: 10.0.0.0/8 (Docker internal network used by workspace).
+    // The operator listener must be on gateway-net only, not reachable from sandbox-net.
+    //
+    // Safe to use startsWith('10.') here: isIP() above has already proven this is a
+    // literal IPv4 address, so no hostname can reach this check. The prefix uniquely
+    // identifies the 10.0.0.0/8 range for dotted-decimal IPv4.
+    const isIPv4SandboxNet = operatorBindHost.startsWith('10.')
+    if (isIPv4SandboxNet) {
+      throw new Error(
+        `GATEWAY_OPERATOR_BIND_HOST must not be "${operatorBindHost}" — 10.0.0.0/8 is the sandbox-net (Docker internal network). The operator listener must be on gateway-net only (e.g. 172.20.x.x). Set it to the gateway container's gateway-net IP address.`,
+      )
+    }
+
+    // Reject all IPv6 literal addresses.
+    //
+    // gateway-net is an IPv4-only Docker bridge network; there is no IPv6 gateway-net
+    // topology. Binding the operator listener to any IPv6 address would either fail at
+    // runtime (no IPv6 interface on gateway-net) or silently bind to a different
+    // interface than intended. Reject all IPv6 literals now and revisit when an IPv6
+    // gateway-net topology exists.
+    //
+    // isIP() returns 6 for any valid IPv6 literal (including compressed forms like
+    // '::1', 'fe80::1', 'fc00::1', '2001:db8::1'). The all-interfaces ('::') and
+    // loopback ('::1', '0:0:0:0:0:0:0:1') cases are already caught above; this guard
+    // catches all remaining IPv6 literals (ULA, link-local, global unicast, etc.).
+    if (isIP(operatorBindHost) === 6) {
+      throw new Error(
+        `GATEWAY_OPERATOR_BIND_HOST must not be an IPv6 address: "${operatorBindHost}" — gateway-net is an IPv4-only Docker bridge network. IPv6 operator binds are not supported until an IPv6 gateway-net topology exists. Set it to the gateway container's IPv4 gateway-net address (e.g. 172.20.0.2).`,
+      )
+    }
+
+    // Validate bind port.
+    const operatorBindPort = Number.parseInt(rawOperatorBindPort, 10)
+    if (
+      Number.isFinite(operatorBindPort) === false ||
+      Number.isInteger(operatorBindPort) === false ||
+      operatorBindPort < 1 ||
+      operatorBindPort > 65535
+    ) {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_BIND_PORT value: "${rawOperatorBindPort}" (must be an integer in the range 1–65535)`,
+      )
+    }
+
+    // Validate public origin — must be a valid https:// URL.
+    let parsedPublicOrigin: URL
+    try {
+      parsedPublicOrigin = new URL(operatorPublicOrigin)
+    } catch {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" (must be a valid URL, e.g. https://operator.example.com)`,
+      )
+    }
+    if (parsedPublicOrigin.protocol !== 'https:') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" (must use https:// — the operator listener does not terminate TLS; TLS is handled by the infra reverse proxy)`,
+      )
+    }
+
+    operatorWeb = {
+      bindHost: operatorBindHost,
+      bindPort: operatorBindPort,
+      publicOrigin: operatorPublicOrigin,
+    }
+  }
+
   return {
     discordToken,
     discordApplicationId,
@@ -494,5 +656,6 @@ export function loadGatewayConfig(): GatewayConfig {
     maxConcurrentRuns,
     runTimeoutMs,
     ...(announce === undefined ? {} : {announce}),
+    ...(operatorWeb === undefined ? {} : {operatorWeb}),
   }
 }

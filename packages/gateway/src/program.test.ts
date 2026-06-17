@@ -225,6 +225,7 @@ async function runAndCaptureMentionDeps(
     setupReadinessFlag: vi.fn(),
     login: vi.fn().mockResolvedValue(undefined),
     startAnnounceServer: vi.fn(),
+    startOperatorServer: vi.fn(),
     runProviderSelfTest: vi.fn(async () => {}),
   }
 
@@ -268,6 +269,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: setupReadinessFlagSpy,
       login: loginSpy,
       startAnnounceServer: startAnnounceServerSpy,
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -301,6 +303,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: startAnnounceServerSpy,
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -338,6 +341,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: loginSpy,
       startAnnounceServer: startAnnounceServerSpy,
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -372,6 +376,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: loginSpy,
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: runProviderSelfTestSpy,
     }
 
@@ -400,6 +405,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: loginSpy,
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {
         throw new Error('IfNoneMatch not honored')
       }),
@@ -426,6 +432,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: startAnnounceServerSpy,
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -459,6 +466,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -485,6 +493,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: startAnnounceServerSpy,
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -506,6 +515,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -579,6 +589,7 @@ describe('makeGatewayProgram', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -641,6 +652,7 @@ describe('button interaction handler (approval flow)', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 
@@ -921,6 +933,119 @@ describe('button interaction handler (approval flow)', () => {
     )
   })
 
+  it('operator server starts when operatorWeb is configured', async () => {
+    // #given — config has operatorWeb present
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+    })
+    const fakeClient = makeFakeClient()
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — operator server was started once
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+
+    // #and — config was passed correctly
+    const [, serverConfig] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverConfig.bindHost).toBe('172.20.0.2')
+    expect(serverConfig.bindPort).toBe(4000)
+    expect(serverConfig.publicOrigin).toBe('https://operator.example.com')
+  })
+
+  it('operator server does NOT start when operatorWeb is absent', async () => {
+    // #given — config has no operatorWeb block
+    const fakeConfig = makeFakeConfig({announce: undefined, operatorWeb: undefined})
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — operator server was never started
+    expect(startOperatorServerSpy).not.toHaveBeenCalled()
+  })
+
+  it('composite close closes both announce and operator handles', async () => {
+    // #given — both announce and operatorWeb are configured
+    const fakeConfig = makeFakeConfig({
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
+      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+    })
+    const fakeClient = makeFakeClient()
+    const announceCloseSpy = vi.fn((cb?: (err?: Error) => void) => cb?.())
+    const operatorCloseSpy = vi.fn((cb?: (err?: Error) => void) => cb?.())
+    const fakeAnnounceHandle = {close: announceCloseSpy}
+    const fakeOperatorHandle = {close: operatorCloseSpy}
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn().mockReturnValue(fakeAnnounceHandle),
+      startOperatorServer: vi.fn().mockReturnValue(fakeOperatorHandle),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when — run the program (shutdown handlers are installed but not triggered here)
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — both server factories were called
+    expect(deps.startAnnounceServer).toHaveBeenCalledOnce()
+    expect(deps.startOperatorServer).toHaveBeenCalledOnce()
+  })
+
+  it('composite close: both server handles are created when both announce and operatorWeb are configured', async () => {
+    // #given — both announce and operatorWeb are configured
+    const fakeConfig = makeFakeConfig({
+      announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
+      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+    })
+    const fakeClient = makeFakeClient()
+    const fakeAnnounceHandle = makeFakeServerHandle()
+    const fakeOperatorHandle = makeFakeServerHandle()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn().mockReturnValue(fakeAnnounceHandle),
+      startOperatorServer: vi.fn().mockReturnValue(fakeOperatorHandle),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when — run the program
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — both factories were called (composite handle was built for shutdown)
+    expect(deps.startAnnounceServer).toHaveBeenCalledOnce()
+    expect(deps.startOperatorServer).toHaveBeenCalledOnce()
+  })
+
   it('shutdown → approvalRegistry.disposeAll called', async () => {
     // #given
     const {createApprovalRegistry} = await import('./approvals/registry.js')
@@ -938,6 +1063,7 @@ describe('button interaction handler (approval flow)', () => {
       setupReadinessFlag: vi.fn(),
       login: vi.fn().mockResolvedValue(undefined),
       startAnnounceServer: vi.fn().mockReturnValue(fakeServerHandle),
+      startOperatorServer: vi.fn(),
       runProviderSelfTest: vi.fn(async () => {}),
     }
 

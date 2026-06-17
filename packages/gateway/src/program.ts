@@ -7,6 +7,7 @@ import type {RunTask} from './execute/run.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
+import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
 import {
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -103,6 +104,14 @@ export interface GatewayProgramDeps {
    * Returns a CloseableServer handle that will be passed to installShutdownHandlers.
    */
   readonly startAnnounceServer: (deps: AnnounceServerDeps, config: AnnounceServerConfig) => CloseableServer
+  /**
+   * Factory for the operator web HTTP server.
+   * Receives the assembled deps + config so callers can inject fakes in tests.
+   * Returns a CloseableServer handle that will be passed to installShutdownHandlers.
+   * Only called when config.operatorWeb is present.
+   * Optional — when absent, the operator server is not started even if config.operatorWeb is set.
+   */
+  readonly startOperatorServer?: (deps: OperatorServerDeps, config: OperatorServerConfig) => CloseableServer
   /**
    * Provider semantics self-test — validates that the S3-compatible store honors
    * IfNoneMatch/IfMatch conditional write semantics required for safe coordination.
@@ -362,8 +371,62 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger.info({}, 'announce endpoint enabled — HTTP server started')
     }
 
-    // h. Install shutdown handlers — drain pending approvals fail-closed then await in-flight runs
-    installShutdownHandlers(client, logger, undefined, serverHandle, async () => {
+    // g2. Start operator web HTTP server (before shutdown handlers so the handle is available).
+    //     Operator web endpoint is opt-in: only started when all three required operator config
+    //     vars are set (GATEWAY_OPERATOR_BIND_HOST, GATEWAY_OPERATOR_BIND_PORT,
+    //     GATEWAY_OPERATOR_PUBLIC_ORIGIN). Partial config fails closed at loadGatewayConfig() time.
+    //     When absent, operatorServerHandle is undefined and shutdown skips it.
+    let operatorServerHandle: CloseableServer | undefined
+    if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
+      logger.info({}, 'operator web endpoint disabled — no operator web config set')
+    } else {
+      operatorServerHandle = deps.startOperatorServer(
+        {
+          logger,
+          isShuttingDown,
+        },
+        {
+          bindHost: config.operatorWeb.bindHost,
+          bindPort: config.operatorWeb.bindPort,
+          publicOrigin: config.operatorWeb.publicOrigin,
+        },
+      )
+      logger.info(
+        {bindHost: config.operatorWeb.bindHost, bindPort: config.operatorWeb.bindPort},
+        'operator web endpoint enabled — HTTP server started',
+      )
+    }
+
+    // h. Install shutdown handlers — drain pending approvals fail-closed then await in-flight runs.
+    //    Build a composite server handle that closes both the announce and operator servers
+    //    (if present) so installShutdownHandlers only needs to call close() once.
+    const compositeServerHandle: CloseableServer | undefined =
+      serverHandle === undefined && operatorServerHandle === undefined
+        ? undefined
+        : {
+            close(cb?: (err?: Error) => void): void {
+              const handles = [serverHandle, operatorServerHandle].filter((h): h is CloseableServer => h !== undefined)
+              if (handles.length === 0) {
+                cb?.()
+                return
+              }
+              let remaining = handles.length
+              let firstError: Error | undefined
+              for (const h of handles) {
+                h.close(err => {
+                  if (err !== undefined && err !== null && firstError === undefined) {
+                    firstError = err
+                  }
+                  remaining -= 1
+                  if (remaining === 0) {
+                    cb?.(firstError)
+                  }
+                })
+              }
+            },
+          }
+
+    installShutdownHandlers(client, logger, undefined, compositeServerHandle, async () => {
       // Dispose pending approvals before draining runs — ensures pending permissions
       // fail-closed so in-flight runs don't hang waiting for a button that will never come.
       //
