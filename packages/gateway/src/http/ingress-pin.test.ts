@@ -1,28 +1,36 @@
 /**
  * Gateway HTTP ingress surface pinning test.
  *
- * The gateway is reachable from the workspace over sandbox-net. Its only
- * inbound HTTP surface must be the HMAC/replay-gated POST /v1/announce
- * endpoint — a fixed-embed webhook that does not perform caller-directed
- * outbound requests. Any new route added to the gateway's HTTP ingress
- * could reopen the egress trust boundary (a workspace-reachable endpoint
- * that performs arbitrary outbound requests would let the workspace bypass
- * mitmproxy via the gateway). This test fails if the route inventory
- * changes, forcing a deliberate security review before the change ships.
+ * The gateway has two distinct HTTP surfaces with different trust boundaries:
+ *
+ *   1. ANNOUNCE surface (sandbox-net reachable):
+ *      - Bound to the announce HTTP port, reachable from the workspace via sandbox-net.
+ *      - HMAC/replay/timestamp/schema-gated POST /v1/announce webhook.
+ *      - Does NOT perform caller-directed outbound requests.
+ *      - Any new route here could reopen the egress trust boundary.
+ *
+ *   2. OPERATOR surface (gateway-net only):
+ *      - Bound to the operator bind host on gateway-net, NOT reachable from sandbox-net.
+ *      - TLS terminated by infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
+ *      - Human-authenticated browser surface (auth added in Unit 3+).
+ *      - No route from this surface appears in the announce surface, and vice versa.
+ *
+ * This test fails if either route inventory changes, forcing a deliberate security
+ * review before the change ships.
  *
  * If you are adding a new HTTP route and this test fails:
- *   1. Confirm the new endpoint does NOT perform caller-directed outbound
- *      requests on behalf of the workspace.
- *   2. Update EXPECTED_ROUTES below with the new route after review.
- *   3. Update deploy/README.md (Egress topology → Forward constraint) to
+ *   1. Confirm which surface the new endpoint belongs to (announce vs operator).
+ *   2. Confirm the new endpoint does NOT perform caller-directed outbound
+ *      requests on behalf of the workspace (for announce surface routes).
+ *   3. Update the appropriate EXPECTED_* constant below after review.
+ *   4. Update deploy/README.md (Egress topology → Forward constraint) to
  *      document the new endpoint and its trust properties.
  *
  * SERVER ENTRY-POINT PIN (tamper-evident):
- *   A second HTTP server added anywhere in packages/gateway/src/ would bypass
- *   the route-inventory check above (it only inspects buildAnnounceApp's routes).
- *   The static source-scan test below asserts there is exactly ONE serve() call
- *   across the entire gateway source tree. Adding a second server entry point
- *   fails this pin, requiring a deliberate security review.
+ *   The static source-scan test below asserts there are exactly TWO serve() calls
+ *   across the entire gateway source tree — one for the announce server and one for
+ *   the operator server. Adding a third server entry point fails this pin, requiring
+ *   a deliberate security review.
  *
  *   We use a static source scan (readFileSync + regex) rather than routing the
  *   existing pin through createAnnounceServer with serve() stubbed, because:
@@ -34,31 +42,49 @@
  */
 
 import type {Client} from 'discord.js'
+import type {OperatorServerConfig, OperatorServerDeps} from '../web/server.js'
 import type {AnnounceLogger} from './announce-handler.js'
 import {readdirSync, readFileSync, statSync} from 'node:fs'
 import {join} from 'node:path'
 import {describe, expect, it, vi} from 'vitest'
+import {buildOperatorApp} from '../web/server.js'
 import {buildAnnounceApp} from './server.js'
 
 // ---------------------------------------------------------------------------
-// Pinned ingress surface — update only after deliberate security review.
+// Pinned ingress surfaces — update only after deliberate security review.
 // ---------------------------------------------------------------------------
 
 /**
- * The complete set of HTTP routes the gateway exposes over sandbox-net.
+ * The complete set of HTTP routes the gateway exposes over sandbox-net (announce surface).
  * Each entry is { method, path } matching Hono's app.routes shape.
  *
  * Current surface: exactly one endpoint — the HMAC/replay/timestamp/schema-gated
  * announce webhook. It posts a fixed embed to a configured Discord channel and
  * does not perform caller-directed outbound requests.
+ *
+ * SECURITY: No operator route may appear here. The announce surface is workspace-reachable
+ * by design; adding operator routes here would collapse defense in depth to app-layer auth only.
  */
-const EXPECTED_ROUTES: readonly {method: string; path: string}[] = [{method: 'POST', path: '/v1/announce'}]
+const EXPECTED_ANNOUNCE_ROUTES: readonly {method: string; path: string}[] = [{method: 'POST', path: '/v1/announce'}]
+
+/**
+ * The complete set of HTTP routes the gateway exposes over gateway-net (operator surface).
+ * Each entry is { method, path } matching Hono's app.routes shape.
+ *
+ * Current surface: exactly one endpoint — the unauthenticated health check.
+ * Privileged routes (auth, launch, approvals, SSE) are added only after the auth boundary is in place
+ * after the auth boundary is in place.
+ *
+ * SECURITY: No announce route may appear here. The operator surface is gateway-net only
+ * and is not reachable from sandbox-net.
+ */
+const EXPECTED_OPERATOR_ROUTES: readonly {method: string; path: string}[] = [{method: 'GET', path: '/operator/health'}]
 
 // ---------------------------------------------------------------------------
-// Minimal stubs — we only need to build the app, not run requests.
+// Minimal stubs — we only need to build the apps, not run requests.
 // ---------------------------------------------------------------------------
 
-function makeStubDeps(): Parameters<typeof buildAnnounceApp>[0] {
+function makeAnnounceStubDeps(): Parameters<typeof buildAnnounceApp>[0] {
   const logger: AnnounceLogger = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -69,7 +95,7 @@ function makeStubDeps(): Parameters<typeof buildAnnounceApp>[0] {
   return {client, logger}
 }
 
-function makeStubConfig(): Parameters<typeof buildAnnounceApp>[1] {
+function makeAnnounceStubConfig(): Parameters<typeof buildAnnounceApp>[1] {
   return {
     webhookSecret: 'stub-secret',
     presenceChannelId: 'stub-channel',
@@ -77,51 +103,138 @@ function makeStubConfig(): Parameters<typeof buildAnnounceApp>[1] {
   }
 }
 
+function makeOperatorStubDeps(): OperatorServerDeps {
+  return {
+    logger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    isShuttingDown: () => false,
+  }
+}
+
+function makeOperatorStubConfig(): OperatorServerConfig {
+  return {
+    bindHost: '10.0.0.1',
+    bindPort: 0, // not used — we never call serve()
+    publicOrigin: 'https://operator.example.com',
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Pin test
+// Helper: extract unique logical routes from a Hono app, excluding middleware.
 // ---------------------------------------------------------------------------
 
-describe('gateway HTTP ingress surface', () => {
+function extractRoutes(app: {routes: readonly {method: string; path: string}[]}): {method: string; path: string}[] {
+  const seen = new Set<string>()
+  return app.routes
+    .map(r => ({method: r.method, path: r.path}))
+    .filter(r => {
+      // Exclude global middleware catch-alls (app.use('*', ...) registers as ALL /*)
+      if (r.method === 'ALL' && r.path === '/*') return false
+      const key = `${r.method}:${r.path}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Announce surface pin test
+// ---------------------------------------------------------------------------
+
+describe('gateway announce ingress surface (sandbox-net)', () => {
   it('is exactly {POST /v1/announce} — no undeclared routes', () => {
     // #given — build the Hono app without starting a server
-    const app = buildAnnounceApp(makeStubDeps(), makeStubConfig())
+    const app = buildAnnounceApp(makeAnnounceStubDeps(), makeAnnounceStubConfig())
 
     // #when — extract the registered user-defined routes as unique (method, path) pairs.
-    // Hono registers each middleware in a chain as a separate entry for the same route
-    // (e.g. bodyLimit + handler both appear as POST /v1/announce). Deduplicate by
-    // (method, path) so the pin reflects the logical route inventory, not the
-    // middleware-chain expansion. A new logical route still produces a new unique pair.
-    const seen = new Set<string>()
-    const actualRoutes = app.routes
-      .map(r => ({method: r.method, path: r.path}))
-      .filter(r => {
-        const key = `${r.method}:${r.path}`
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
+    const actualRoutes = extractRoutes(app)
 
     // #then — the inventory must match the pinned set exactly.
     // Adding a route without updating this pin fails the test, requiring a
     // security review of the new workspace-reachable endpoint.
-    expect(actualRoutes).toEqual(EXPECTED_ROUTES)
+    expect(actualRoutes).toEqual(EXPECTED_ANNOUNCE_ROUTES)
+  })
+
+  it('contains no operator routes — announce and operator surfaces are disjoint', () => {
+    // #given
+    const announceApp = buildAnnounceApp(makeAnnounceStubDeps(), makeAnnounceStubConfig())
+    const announceRoutes = extractRoutes(announceApp)
+    const operatorPaths = new Set(EXPECTED_OPERATOR_ROUTES.map(r => r.path))
+
+    // #when — check for overlap
+    const overlap = announceRoutes.filter(r => operatorPaths.has(r.path))
+
+    // #then — no operator route appears in the announce surface
+    expect(overlap).toEqual([])
   })
 })
 
 // ---------------------------------------------------------------------------
-// Server entry-point pin — tamper-evident single-server assertion.
+// Operator surface pin test
+// ---------------------------------------------------------------------------
+
+describe('gateway operator ingress surface (gateway-net)', () => {
+  it('is exactly {GET /operator/health} — no undeclared privileged routes', () => {
+    // #given — build the Hono app without starting a server
+    const app = buildOperatorApp(makeOperatorStubDeps(), makeOperatorStubConfig())
+
+    // #when — extract the registered user-defined routes as unique (method, path) pairs.
+    const actualRoutes = extractRoutes(app)
+
+    // #then — the inventory must match the pinned set exactly.
+    // Adding a privileged route without updating this pin fails the test, requiring
+    // a security review of the new operator endpoint.
+    expect(actualRoutes).toEqual(EXPECTED_OPERATOR_ROUTES)
+  })
+
+  it('contains no announce routes — operator and announce surfaces are disjoint', () => {
+    // #given
+    const operatorApp = buildOperatorApp(makeOperatorStubDeps(), makeOperatorStubConfig())
+    const operatorRoutes = extractRoutes(operatorApp)
+    const announcePaths = new Set(EXPECTED_ANNOUNCE_ROUTES.map(r => r.path))
+
+    // #when — check for overlap
+    const overlap = operatorRoutes.filter(r => announcePaths.has(r.path))
+
+    // #then — no announce route appears in the operator surface
+    expect(overlap).toEqual([])
+  })
+
+  it('every operator route has a path prefix of /operator/ — no route appears in both inventories', () => {
+    // #given
+    const operatorApp = buildOperatorApp(makeOperatorStubDeps(), makeOperatorStubConfig())
+    const operatorRoutes = extractRoutes(operatorApp)
+
+    // #when — check that all operator routes are namespaced
+    const nonOperatorPrefixed = operatorRoutes.filter(r => !r.path.startsWith('/operator/'))
+
+    // #then — all operator routes must be under /operator/
+    expect(nonOperatorPrefixed).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Server entry-point pin — tamper-evident two-server assertion.
 //
-// The route-inventory test above only inspects routes registered through
-// buildAnnounceApp(). A second HTTP server (serve() / http.createServer())
-// added ELSEWHERE in the gateway package would be completely invisible to it.
+// The route-inventory tests above only inspect routes registered through
+// buildAnnounceApp() and buildOperatorApp(). A third HTTP server (serve() /
+// http.createServer()) added ELSEWHERE in the gateway package would be
+// completely invisible to them.
 //
 // This test statically scans every .ts source file under packages/gateway/src/
-// and asserts there is exactly ONE serve( call. Adding a second server entry
-// point fails this pin, requiring a deliberate security review before the
-// change ships.
+// and asserts there are exactly TWO serve( calls:
+//   1. createAnnounceServer in http/server.ts
+//   2. createOperatorServer in web/server.ts
+//
+// Adding a third server entry point fails this pin, requiring a deliberate
+// security review before the change ships.
 //
 // We use a static source scan rather than a runtime stub approach because:
-//   - Stubs only catch routes wired through the factory chain; a second server
+//   - Stubs only catch routes wired through the factory chain; a third server
 //     in a different file would still be invisible.
 //   - A source scan is file-system-wide and catches any new serve() call
 //     regardless of where it lives in the package.
@@ -144,7 +257,7 @@ function collectTsFiles(dir: string): string[] {
 }
 
 describe('gateway server entry-point pin', () => {
-  it('has exactly one serve() call across packages/gateway/src/ — adding a second server requires security review', () => {
+  it('has exactly two serve() calls across packages/gateway/src/ — announce + operator servers', () => {
     // #given — locate the gateway src directory relative to this test file.
     // __dirname is packages/gateway/src/http; go up one level to src/.
     const gatewaySrcDir = join(__dirname, '..')
@@ -171,13 +284,18 @@ describe('gateway server entry-point pin', () => {
       })
     }
 
-    // #then — exactly one serve() call must exist (in createAnnounceServer in server.ts).
+    // #then — exactly two serve() calls must exist:
+    //   1. createAnnounceServer in http/server.ts
+    //   2. createOperatorServer in web/server.ts
     // If this assertion fails, a new HTTP server entry point was added to the gateway.
-    // Before updating this count:
+    // Before updating this count, perform a deliberate security review:
     //   1. Confirm the new server does NOT expose workspace-reachable endpoints that
     //      perform caller-directed outbound requests (egress trust boundary).
     //   2. Update deploy/README.md (Egress topology → Forward constraint).
-    expect(serveCallSites).toHaveLength(1)
-    expect(serveCallSites[0]?.file).toMatch(/server\.ts$/)
+    expect(serveCallSites).toHaveLength(2)
+
+    const files = serveCallSites.map(s => s.file)
+    expect(files.some(f => f.match(/http\/server\.ts$/))).toBe(true)
+    expect(files.some(f => f.match(/web\/server\.ts$/))).toBe(true)
   })
 })
