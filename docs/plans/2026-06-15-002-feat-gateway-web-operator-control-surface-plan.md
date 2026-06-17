@@ -328,7 +328,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   - Runtime and gateway typechecks pass.
   - No `as any`, `@ts-ignore`, or broad `unknown as` casts are introduced.
 
-- [ ] **Unit 2: Operator listener topology and security pin**
+- [x] **Unit 2: Operator listener topology and security pin**
 
   **Goal:** Add the operator web listener skeleton and deployment guardrails without exposing privileged behavior yet.
 
@@ -384,73 +384,252 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   - Gateway tests cover listener opt-in/out and ingress inventory.
   - Deploy validation tests cover the new topology with positive and negative controls.
 
-- [ ] **Unit 3: Operator authentication, sessions, CSRF, and audit seam**
+- [x] **Unit 3a: Config + operator route guardrail seam**
 
-  **Goal:** Add the browser auth boundary that all operator routes must pass through.
+  **Goal:** Establish the config plumbing and a mechanical route-wrapper that makes it structurally impossible for new privileged operator routes to skip rate-limiting, auth, origin, or CSRF checks.
 
-  **Requirements:** R1, R2, R3, R4, R5, R14, R16, R17
+  **Requirements:** R1, R3, R4, R13
 
   **Dependencies:** Unit 2
 
   **Files:**
-  - Create: `packages/gateway/src/web/auth/github.ts`
-  - Create: `packages/gateway/src/web/auth/session.ts`
-  - Create: `packages/gateway/src/web/auth/allowlist.ts`
-  - Create: `packages/gateway/src/web/auth/csrf.ts`
-  - Create: `packages/gateway/src/web/auth/repo-authz.ts`
-  - Create: `packages/gateway/src/web/audit.ts`
-  - Create: `packages/gateway/src/web/auth.test.ts`
-  - Create: `packages/gateway/src/web/audit.test.ts`
   - Modify: `packages/gateway/src/config.ts`
+  - Create: `packages/gateway/src/web/operator-route.ts`
+  - Create: `packages/gateway/src/web/operator-route.test.ts`
+  - Modify: `packages/gateway/src/web/server.ts`
+
+  **Approach:**
+  - Add config keys for `GATEWAY_OPERATOR_PUBLIC_ORIGIN`, GitHub App OAuth client id/secret, allowlist path, session secret, and CSRF signing key. Validate `GATEWAY_OPERATOR_PUBLIC_ORIGIN` as a canonical origin only: scheme + host + optional port, no path, query, hash, or userinfo component. Reject any value that does not parse as a valid `URL` with an empty pathname, no search, no hash, and no username/password.
+  - Add a `registerOperatorRoute` wrapper (or equivalent Hono middleware chain factory) that every privileged operator route must use. The wrapper enforces, in order: body-size limit, socket-keyed unauthenticated rate limit, session validation, Host/Origin/public-origin check, Fetch Metadata rejection, and CSRF verification for mutating methods. New routes that skip the wrapper fail a static test.
+  - Add a static test that enumerates all registered operator routes and asserts each one is wrapped; this is the mechanical guard that prevents future omissions.
+  - Use `readSecret` and hardened file/env helpers already in `packages/gateway/src/config.ts`.
+
+  **Patterns to follow:**
+  - Hardened config readers in `packages/gateway/src/config.ts`.
+  - Announce server lifecycle in `packages/gateway/src/http/server.ts`.
+
+  **Test scenarios:**
+  - Config: `GATEWAY_OPERATOR_PUBLIC_ORIGIN` with a path, query, hash, or userinfo component is rejected at startup.
+  - Config: a valid canonical origin (`https://ops.example.com`) is accepted.
+  - Static guard: a route registered without the wrapper causes the static test to fail.
+  - Static guard: all routes registered through the wrapper pass the static test.
+
+  **Verification:**
+  - Config validation and route-wrapper tests pass; no operator route can be added without the guardrail.
+
+- [ ] **Unit 3b: Audit seam and redaction guarantees**
+
+  **Goal:** Add a single typed audit seam for security-critical events so all subsequent units can emit structured, redacted audit records without duplicating sink logic.
+
+  **Requirements:** R4, R14, R16, R17
+
+  **Dependencies:** Unit 3a
+
+  **Files:**
+  - Create: `packages/gateway/src/web/audit.ts`
+  - Create: `packages/gateway/src/web/audit.test.ts`
+
+  **Approach:**
+  - Define a typed `AuditEvent` discriminated union covering: `auth.start`, `auth.callback.success`, `auth.callback.failure`, `auth.logout`, `auth.revocation`, `authz.denied`, `launch.accepted`, `launch.rejected`, `approval.decision`, `approval.rejected`, `binding.read`, `bearer.rejected`.
+  - Implement a single `emitAudit(event, logger)` function. Route success is reported only after the local audit sink accepts the event; downstream export may be asynchronous.
+  - Redaction: audit records must never include cookies, session secrets, GitHub tokens, raw request bodies, prompts, bearer values, or internal URLs. Add captured-log tests that assert these fields are absent from emitted records.
+  - Treat Gateway restart as clearing all in-flight audit state; durable export is a deployment concern.
+  - Audit retention: structured gateway logs are acceptable for v1 if deployment guarantees 30-day retention, access control, and redaction posture.
+
+  **Patterns to follow:**
+  - Logger redaction conventions in gateway tests.
+  - `docs/solutions/best-practices/signed-webhook-ingress-hardening-2026-05-29.md` redaction test patterns.
+
+  **Test scenarios:**
+  - Happy path: each event variant emits a structured record with the expected typed fields.
+  - Security: captured log output for every event variant contains no cookie, secret, token, prompt, or bearer value.
+  - Security: `bearer.rejected` event records the rejection without logging the credential value.
+
+  **Verification:**
+  - Audit seam is typed, redacted, and covered by captured-log tests.
+
+- [ ] **Unit 3c: GitHub OAuth state + PKCE identity verification**
+
+  **Goal:** Implement the GitHub App user OAuth web flow with PKCE S256 and state so the callback can verify human identity before any session is minted.
+
+  **Requirements:** R1, R4, R5, R14
+
+  **Dependencies:** Unit 3b
+
+  **Files:**
+  - Create: `packages/gateway/src/web/auth/github.ts`
+  - Create: `packages/gateway/src/web/auth/github.test.ts`
+  - Modify: `packages/gateway/src/web/server.ts`
+
+  **Approach:**
+  - Implement `GET /operator/auth/github/start`: generate a PKCE S256 code verifier (server-side only, never in a cookie), derive the code challenge, generate a cryptographic state value, store `{ codeVerifier, redirectTarget, issuedAt, consumed: false }` server-side with a short TTL and a cap on outstanding attempts per socket. Redirect to GitHub with `state`, `code_challenge`, and `code_challenge_method=S256`.
+  - Implement `GET /operator/auth/github/callback`: validate `state` (constant-time comparison, one-time consumption, TTL check), exchange `code` for a GitHub access token using the stored `codeVerifier` in the PKCE exchange. PKCE is not optional and is not a deploy-time detail.
+  - After token exchange, fetch the authenticated GitHub user and extract the stable numeric `id`. The numeric `id` is the authority for all subsequent identity checks; `login` is display metadata only.
+  - Bind and validate the OAuth return path as same-origin/path-allowlisted; reject absolute URLs and cross-origin redirects before OAuth state is minted.
+  - The OAuth callback route must be narrowly exempted from strict Fetch Metadata cross-site rejection (GitHub redirects cross-site); all other operator routes remain subject to full Fetch Metadata enforcement.
+  - Emit `auth.callback.success` or `auth.callback.failure` audit events via the Unit 3b seam.
+  - Repo authorization must verify human user access using the user OAuth token, not only app installation auth.
+
+  **Patterns to follow:**
+  - GitHub App user-to-server auth docs: PKCE S256/state flow.
+  - No-oracle auth failure behavior from signed webhook ingress.
+
+  **Test scenarios:**
+  - Happy path: valid state + PKCE exchange returns the numeric GitHub user id and display login.
+  - Error path: invalid state, replayed state, expired state, PKCE verifier mismatch, and oversized verifier records all fail closed and emit audit without leaking specifics.
+  - Error path: absolute URL or cross-origin redirect target in state is rejected before OAuth state is minted.
+  - Security: code verifier is never written to a cookie or included in any browser-visible response.
+  - Security: every auth failure branch returns the same coarse response shape.
+  - Security: OAuth callback is narrowly exempted from Fetch Metadata cross-site rejection; other routes are not.
+
+  **Verification:**
+  - OAuth flow is PKCE-enforced, state-validated, and identity-anchored to stable numeric GitHub id.
+
+- [ ] **Unit 3d: Session store, cookies, logout, and revocation hook**
+
+  **Goal:** Mint server-side opaque sessions after successful identity verification, enforce session lifetime and revocation, and provide the logout route.
+
+  **Requirements:** R2, R4, R14
+
+  **Dependencies:** Unit 3c
+
+  **Files:**
+  - Create: `packages/gateway/src/web/auth/session.ts`
+  - Create: `packages/gateway/src/web/auth/session.test.ts`
+  - Modify: `packages/gateway/src/web/server.ts`
+
+  **Approach:**
+  - v1 session store owns `create`, `get`, `touch`, `delete`, enforces 8-hour absolute and 30-minute idle expiry, scavenges expired entries, and caps stored sessions.
+  - Session IDs have at least 128 bits of CSPRNG entropy (preferably 256 bits); comparisons are constant-time.
+  - Store the session ID in a `__Host-` cookie: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` attribute.
+  - Always mint a fresh session ID after successful OAuth callback and clear any stale pre-auth cookie to prevent session fixation.
+  - Revocation is immediate for future requests; in-flight approval decisions already accepted by `handleDecision` continue to settlement and are not rolled back.
+  - Treat Gateway restart as global logout for v1: all sessions, CSRF tokens, idempotency records, and SSE subscriptions are gone. Browser clients must re-authenticate and snapshot-read after reconnect.
+  - Expose a revocation hook so SSE streams can be notified within one heartbeat/auth-check interval when a session is revoked.
+
+  **Patterns to follow:**
+  - `readSecret` and related file/env helpers in `packages/gateway/src/config.ts`.
+  - `userIsAuthorized` fail-closed posture in `packages/gateway/src/discord/mentions.ts`.
+
+  **Test scenarios:**
+  - Happy path: successful OAuth callback mints a fresh session and sets a `__Host-` cookie with correct attributes.
+  - Security: session cookie tests assert `__Host-` invariants: `Secure`, `HttpOnly`, `Path=/`, no `Domain` attribute.
+  - Security: stale pre-auth cookie is cleared before the new session cookie is set.
+  - Revocation: logout invalidates the session server-side and clears the cookie.
+  - Revocation: revoking a session triggers the revocation hook; concurrent sessions are independently revocable.
+  - Expiry: expired sessions are scavenged and return unauthorized on next request.
+  - Restart: after a simulated restart, previously valid session IDs are not found.
+
+  **Verification:**
+  - Session store is bounded, revocable, and covered by deterministic typed tests.
+
+- [ ] **Unit 3e: Origin / Fetch Metadata / CSRF middleware**
+
+  **Goal:** Implement the layered browser-origin protection stack that all mutating operator routes must pass through.
+
+  **Requirements:** R3, R4
+
+  **Dependencies:** Unit 3d
+
+  **Files:**
+  - Create: `packages/gateway/src/web/auth/csrf.ts`
+  - Create: `packages/gateway/src/web/auth/csrf.test.ts`
+  - Modify: `packages/gateway/src/web/operator-route.ts`
+
+  **Approach:**
+  - Do not rely on `hono/csrf` for JSON mutating routes. Implement custom signed double-submit CSRF tokens: tokens are bound to session id, operator id, issued-at, and a nonce/version; signed with the CSRF signing key from config; rotated on login, refresh, and a 15-minute interval; invalidated on logout, expiry, and revocation.
+  - Guard mutating routes in this order: (1) reject non-cookie credential schemes (`Authorization`, `Proxy-Authorization`, `X-API-Key`) and audit without logging credential values; (2) validate session; (3) validate `Host`/`Origin` against `GATEWAY_OPERATOR_PUBLIC_ORIGIN`; (4) reject unsafe Fetch Metadata combinations (`Sec-Fetch-Site: cross-site` on non-exempted routes, `Sec-Fetch-Mode: navigate` on non-navigation routes) when headers are present; (5) parse and verify CSRF token.
+  - The OAuth callback is narrowly exempted from Fetch Metadata cross-site rejection (established in Unit 3c); no other route is exempted.
+  - Add a `GET /operator/session/csrf` route that returns a fresh signed double-submit token for an authenticated session.
+
+  **Patterns to follow:**
+  - OWASP CSRF Prevention Cheat Sheet: signed double-submit + origin/Fetch Metadata defense in depth.
+  - No-oracle auth failure behavior from signed webhook ingress.
+
+  **Test scenarios:**
+  - Security: mutating routes reject missing CSRF token, invalid CSRF signature, expired CSRF token, and mismatched session binding.
+  - Security: mutating routes reject `Origin` header that does not match `GATEWAY_OPERATOR_PUBLIC_ORIGIN`.
+  - Security: `Sec-Fetch-Site: cross-site` on a non-exempted mutating route is rejected.
+  - Security: non-cookie credential schemes are rejected and audited without logging the credential value.
+  - Security: CSRF token refresh requires a valid session and rotates tokens on schedule.
+  - Happy path: a valid session + matching origin + valid CSRF token passes all checks.
+
+  **Verification:**
+  - CSRF and origin middleware are tested in isolation and wired into the route guardrail from Unit 3a.
+
+- [ ] **Unit 3f: Allowlist + repo authorization helper**
+
+  **Goal:** Implement the operator allowlist check and the single repo authorization helper used by all privileged routes.
+
+  **Requirements:** R1, R14, R19
+
+  **Dependencies:** Unit 3d
+
+  **Files:**
+  - Create: `packages/gateway/src/web/auth/allowlist.ts`
+  - Create: `packages/gateway/src/web/auth/repo-authz.ts`
+  - Create: `packages/gateway/src/web/auth/allowlist.test.ts`
+  - Create: `packages/gateway/src/web/auth/repo-authz.test.ts`
+
+  **Approach:**
+  - Load the operator allowlist from a hardened config/file path. v1 uses a file-backed allowlist; hot reload can be added later. Allowlist entries are stable numeric GitHub user IDs, not logins.
+  - Add one `checkRepoAuthz(operatorId, owner, repo, userOAuthToken, logger)` helper used by launch, run-state, approvals, and binding reads. v1 rule: allowlist membership plus verified GitHub read access to the target repo using the user OAuth token (not only app installation auth). Failures deny.
+  - Cache repo authorization by operator/repo: 5-minute positive TTL, 30-second negative TTL, TTL jitter, request coalescing for concurrent misses, fail-closed on lookup errors. GitHub rate-limit responses are cached through their retry window.
+  - Normalize and validate owner/repo names before any authz or queueing work.
+  - Emit `authz.denied` audit events via the Unit 3b seam on every denial.
+
+  **Patterns to follow:**
+  - `userIsAuthorized` fail-closed posture in `packages/gateway/src/discord/mentions.ts`.
+  - `docs/solutions/best-practices/centralize-s3-key-identity-construction-2026-06-09.md` for centralized helper patterns.
+
+  **Test scenarios:**
+  - Happy path: an allowlisted operator with GitHub read access to a repo is authorized.
+  - Error path: an allowlisted operator without GitHub read access is denied and audited.
+  - Error path: a non-allowlisted numeric user id is denied regardless of GitHub access.
+  - Caching: a positive authz result is cached; a negative result is cached with a shorter TTL.
+  - Caching: concurrent misses for the same operator/repo coalesce into one GitHub API call.
+  - Caching: a GitHub rate-limit response is cached through its retry window.
+  - Error path: GitHub API lookup failure fails closed and emits an audit event.
+  - Validation: malformed owner/repo names are rejected before authz work begins.
+
+  **Verification:**
+  - Allowlist and repo authz are deterministic, fail-closed, and covered by typed tests.
+
+- [ ] **Unit 3g: Minimal session routes**
+
+  **Goal:** Wire the three minimal session-management routes that the browser flow requires: current session info, CSRF token refresh, and logout.
+
+  **Requirements:** R2, R3, R4, R14
+
+  **Dependencies:** Units 3d and 3e
+
+  **Files:**
+  - Create: `packages/gateway/src/web/routes/session.ts`
+  - Create: `packages/gateway/src/web/routes/session.test.ts`
   - Modify: `packages/gateway/src/web/server.ts`
   - Modify: `deploy/README.md`
 
   **Approach:**
-  - Implement GitHub App user OAuth with state and PKCE.
-  - OAuth callback validation must require both state and PKCE verifier binding; PKCE is not optional and is not a deploy-time detail.
-  - Store OAuth verifier state server-side with redirect target, issued-at timestamp, one-time consumption flag, short TTL, and capped outstanding attempts per socket.
-  - Bind and validate the OAuth return path as same-origin/path-allowlisted state; reject absolute URLs and cross-origin redirects.
-  - Mint server-side opaque sessions after successful identity verification and allowlist authorization.
-  - Store the session ID in a secure `__Host-` cookie with HttpOnly, Secure, SameSite, `Path=/`, and no `Domain` attribute. Session IDs have at least 128 bits of CSPRNG entropy, preferably 256 bits, and comparisons are constant-time.
-  - Always mint a fresh session ID after successful OAuth callback and clear any stale pre-auth cookie to prevent session fixation.
-  - Enforce session lifetime, logout, revocation, origin checks, and CSRF defense on state-changing routes.
-  - Add a CSRF token bootstrap/refresh path for the signed double-submit token used by mutating JSON routes. Tokens are bound to session id, operator id, issued-at, and nonce/version; rotate on login, refresh, and a 15-minute interval; invalidate on logout, expiry, and revocation.
-  - Guard mutating routes in this order: reject non-cookie credential schemes, validate session, validate Host/Origin/public-origin, reject unsafe Fetch Metadata combinations when present, then parse and verify CSRF.
-  - Use stable GitHub numeric user IDs for authorization/audit and keep login only as display metadata.
-  - Add one repo authorization helper used by launch, run-state, approvals, and binding reads. v1 requires allowlist membership plus verified GitHub read access to the target repo; failures deny.
-  - Cache repo authorization by operator/repo with a 5-minute positive TTL, 30-second negative TTL, TTL jitter, request coalescing for concurrent misses, and fail-closed behavior on lookup errors. GitHub rate-limit responses are cached through their retry window.
-  - Add a single audit seam for auth, launch, approval, reject, binding-read, and authorization-denial events.
-  - Emit security-critical audit events through one typed seam. Route success is reported only after the local audit sink accepts the event; downstream export may be asynchronous.
-  - Reject standalone bearer/API callers in v1 with structured audit events.
-  - v1 session store owns create/get/touch/delete, enforces 8-hour absolute and 30-minute idle expiry, scavenges expired entries, and caps stored sessions.
-  - Treat Gateway restart as global logout for v1: all sessions, CSRF tokens, idempotency records, and SSE subscriptions are gone. Browser clients must re-authenticate and snapshot-read after reconnect.
+  - `GET /operator/session`: returns operator numeric id, display login, and session expiry for a valid session; returns `401` with a coarse body for invalid/expired sessions.
+  - `GET /operator/session/csrf`: returns a fresh signed double-submit token for an authenticated session (delegates to Unit 3e CSRF module).
+  - `POST /operator/session/logout`: invalidates the session server-side, clears the cookie, triggers the revocation hook from Unit 3d, and emits an `auth.logout` audit event.
+  - All three routes go through the `registerOperatorRoute` wrapper from Unit 3a. Logout additionally requires origin and CSRF checks.
+  - Update `deploy/README.md` to document the OAuth callback URL (`{GATEWAY_OPERATOR_PUBLIC_ORIGIN}/operator/auth/github/callback`), required secrets, and the distinction between OAuth client id/secret and GitHub App id/private key.
 
   **Patterns to follow:**
-  - `userIsAuthorized` fail-closed posture in `packages/gateway/src/discord/mentions.ts`.
-  - `readSecret` and related file/env helpers in `packages/gateway/src/config.ts`.
+  - Route wiring in `packages/gateway/src/web/server.ts`.
   - No-oracle auth failure behavior from signed webhook ingress.
-  - Logger redaction conventions in gateway tests.
 
   **Test scenarios:**
-  - Happy path: valid GitHub OAuth callback for an allowlisted numeric user creates a session cookie and audit record.
-  - Error path: invalid state, missing PKCE verifier, denied GitHub user, non-allowlisted user, expired session, revoked session, and invalid origin all fail closed.
-  - Error path: PKCE verifier mismatch, replayed state, expired verifier, and oversized verifier records fail closed and audit without leaking specifics.
-  - Security: every auth failure branch returns the same coarse response shape.
-  - Security: mutating routes reject missing/invalid CSRF or origin signals before changing state.
-  - Security: CSRF token bootstrap/refresh requires a valid session and rotates or expires tokens on schedule.
-  - Security: session cookie tests assert `__Host-` invariants: Secure, HttpOnly, `Path=/`, and no `Domain` attribute.
-  - Security: revoking a session closes associated SSE streams within one heartbeat/auth-check interval; concurrent sessions are independently revocable.
-  - Security: non-cookie credential schemes such as `Authorization`, `Proxy-Authorization`, and `X-API-Key` are rejected and audited without logging credential values.
-  - Abuse: OAuth start/callback and session endpoints apply bounded per-socket/per-session throttles with tests.
-  - Security: captured logs and audit records omit cookies, session secrets, GitHub tokens, request bodies, prompts, and bearer values.
-  - Revocation: logout invalidates the session server-side and clears the cookie.
-  - v1 boundary: `Authorization: Bearer` callers are denied and audited rather than accepted.
-  - Authz: an allowlisted operator without GitHub read access to a repo cannot launch, stream, approve, or read bindings for that repo.
-  - Validation: launch owner/repo names are normalized server-side, prompt and idempotency key lengths/formats are bounded, and canonical repo resolution happens before authz or queueing.
+  - Happy path: `GET /operator/session` returns operator id, login, and expiry for a valid session.
+  - Error path: `GET /operator/session` returns `401` for an expired or missing session.
+  - Happy path: `GET /operator/session/csrf` returns a fresh token for a valid session.
+  - Happy path: `POST /operator/session/logout` invalidates the session, clears the cookie, and emits an audit event.
+  - Security: `POST /operator/session/logout` requires a valid origin and CSRF token.
+  - Security: all three routes are covered by the static route-wrapper guard from Unit 3a.
 
   **Verification:**
-  - Operator routes cannot be reached without a valid session.
-  - Session and allowlist behavior is deterministic, typed, and redacted.
+  - Session routes are wired, tested, and covered by the route guardrail.
 
 - [ ] **Unit 4: SSE run observation and safe browser projections**
 

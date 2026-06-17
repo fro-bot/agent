@@ -5,18 +5,16 @@
  * returns the @hono/node-server handle so the caller (program.ts) can close
  * it during graceful shutdown.
  *
- * Security posture:
+ * Current posture (classification/guardrail only — no auth yet):
  *   - Listener binds to the configured gateway-net host/port only.
  *     Never 0.0.0.0, loopback, or sandbox-net for production config.
  *   - TLS is terminated by the infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
  *     The operator listener receives plain HTTP over gateway-net.
- *   - Forwarded-host/proto headers are validated against publicOrigin.
+ *   - Forwarded-host/proto headers are validated against publicOrigin (full host:port match).
  *     Requests with mismatched forwarded headers are rejected 400.
- *   - Unauthenticated socket-keyed rate limiting and body-size limits are
- *     enforced before any handler runs.
+ *   - Unauthenticated socket-keyed rate limiting and body-size limits are applied.
  *   - All responses pass through safe-response helpers (coarse, no-oracle).
- *   - No privileged routes are registered in this skeleton; auth routes are
- *     added only after the auth boundary is in place.
+ *   - No privileged routes registered yet; auth routes land when the auth boundary is in place.
  *
  * Mirror of packages/gateway/src/http/server.ts for the serve()/handle pattern.
  */
@@ -27,6 +25,7 @@ import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {assertAllPrivilegedRoutesWrapped, registerPublicRoute} from './operator-route.js'
 import {
   badRequestResponse,
   notFoundResponse,
@@ -153,19 +152,20 @@ function validateForwardedHeaders(
   const hasHost = forwardedHost !== undefined && forwardedHost !== ''
   const hasProto = forwardedProto !== undefined && forwardedProto !== ''
 
-  // No forwarded headers — direct connection, no proxy in path. Allow.
+  // No forwarded headers — direct connection on gateway-net (operator listener
+  // topology owns direct-socket reachability for Unit 3a). Allow here, but
+  // privileged routes must not rely on this alone when auth lands; they must
+  // enforce their own identity checks regardless of connection path.
   if (hasHost === false && hasProto === false) return true
 
   // Partial forwarded headers — suspicious. Reject.
   if (hasHost !== hasProto) return false
 
   // Both present — validate against public origin.
-  // X-Forwarded-Host may include port; strip it for comparison.
+  // X-Forwarded-Host must match publicOriginHost exactly, including port.
+  // A proxy forwarding from https://ops.example.com:8443 must send that full host.
   // hasHost/hasProto guards above ensure these are non-empty strings here.
-  const hostWithoutPort = (forwardedHost ?? '').split(':')[0]
-  const expectedHost = publicOriginHost.split(':')[0]
-
-  if (hostWithoutPort !== expectedHost) return false
+  if ((forwardedHost ?? '') !== publicOriginHost) return false
   if ((forwardedProto ?? '').toLowerCase() !== 'https') return false
 
   return true
@@ -271,11 +271,12 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
    * Returns 200 {ok:true} when the listener is running and not draining.
    * (Drain gate above returns 503 before this handler is reached.)
    *
+   * Registered as a public route via registerPublicRoute — explicitly unauthenticated.
    * Rate limit is applied here (not in middleware) to avoid Hono's middleware
    * context type mismatch with getConnInfo. This matches the announce server pattern.
    * Keyed on socket/proxy IP; per-client/post-auth identity keying is added with auth routes.
    */
-  app.get('/operator/health', c => {
+  registerPublicRoute(app, 'GET', '/operator/health', c => {
     // Rate limit keyed on actual TCP socket remote address (not X-Forwarded-For).
     // Socket/proxy IP is the coarse key for unauthenticated requests; per-client
     // identity keying is added when auth routes land.
@@ -286,6 +287,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       sourceKey = connInfo.remote.address ?? 'unknown'
     } catch {
       // No real socket (e.g. direct app.fetch() in tests) — use 'unknown' key.
+      // Warn in production: all rate-limit keys collapse to 'unknown', which
+      // defeats per-client isolation. Investigate if this appears in prod logs.
+      deps.logger.warn({}, 'getConnInfo unavailable — rate-limit key collapsed to unknown')
     }
     if (rateLimiter.allow(sourceKey) === false) {
       deps.logger.warn({}, 'operator request rate limited (unauthenticated)')
@@ -297,6 +301,12 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // ── Catch-all ──────────────────────────────────────────────────────────────
 
   app.notFound(c => notFoundResponse(c))
+
+  // ── Static guardrail ───────────────────────────────────────────────────────
+  // Verify every /operator/* route is explicitly classified as privileged or public.
+  // This throws at startup if any route was added without registerOperatorRoute or
+  // registerPublicRoute during app construction.
+  assertAllPrivilegedRoutesWrapped(app)
 
   return app
 }
