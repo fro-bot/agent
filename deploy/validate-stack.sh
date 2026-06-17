@@ -767,6 +767,159 @@ if not repos_mount_found:
         )
 
 # ------------------------------------------------------------------
+# Invariant 7: Operator web surface topology (when enabled).
+#
+# When GATEWAY_OPERATOR_BIND_HOST is set in the gateway service environment,
+# the operator listener is enabled. Validate:
+#   7a. GATEWAY_OPERATOR_BIND_HOST must not be '0.0.0.0', '::', or '0:0:0:0:0:0:0:0'
+#       (all-interfaces bind).
+#   7b. GATEWAY_OPERATOR_BIND_HOST must not be a loopback address: any 127.x.x.x,
+#       '::1', or '0:0:0:0:0:0:0:1'.
+#   7c. GATEWAY_OPERATOR_BIND_HOST must not be a sandbox-net address (10.0.0.0/8).
+#   7d. GATEWAY_OPERATOR_PUBLIC_ORIGIN must be present when bind host is set.
+#   7e. GATEWAY_OPERATOR_PUBLIC_ORIGIN must use https:// (TLS required).
+#   7f. GATEWAY_OPERATOR_BIND_PORT must be present when bind host is set.
+#   7g. GATEWAY_OPERATOR_BIND_PORT must be an integer in 1..65535 when present.
+#
+# The operator listener must be bound to a gateway-net address only.
+# TLS is terminated by the infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
+# ------------------------------------------------------------------
+import re as _re_op
+
+gateway_svc = services.get("gateway", {})
+gateway_env = gateway_svc.get("environment", {}) or {}
+
+# Normalize: docker compose config may produce a list of "KEY=VALUE" strings
+# or a dict {KEY: VALUE}. Handle both.
+if isinstance(gateway_env, list):
+    _env_dict = {}
+    for _entry in gateway_env:
+        if isinstance(_entry, str) and "=" in _entry:
+            _k, _v = _entry.split("=", 1)
+            _env_dict[_k.strip()] = _v.strip()
+    gateway_env = _env_dict
+
+operator_bind_host = gateway_env.get("GATEWAY_OPERATOR_BIND_HOST")
+operator_bind_port = gateway_env.get("GATEWAY_OPERATOR_BIND_PORT")
+operator_public_origin = gateway_env.get("GATEWAY_OPERATOR_PUBLIC_ORIGIN")
+
+# Only validate when the operator surface is enabled (bind host is set and non-empty).
+if operator_bind_host and str(operator_bind_host).strip():
+    _bind_host = str(operator_bind_host).strip()
+
+    # 7a-pre: reject non-literal IP addresses (hostnames).
+    # ipaddress.ip_address() raises ValueError for any non-literal (hostname, FQDN, etc.).
+    # This mirrors the isIP() check in config.ts and must run before subnet/string checks.
+    import ipaddress as _ipaddress
+    try:
+        _ipaddress.ip_address(_bind_host)
+    except ValueError:
+        failures.append(
+            f"FAIL: GATEWAY_OPERATOR_BIND_HOST is '{_bind_host}' — must be a literal IP address, "
+            "not a hostname. Set it to the gateway container's gateway-net IP address (e.g. 172.20.0.2)."
+        )
+
+    # 7a: reject all-interfaces binds
+    _ALL_IFACE = {"0.0.0.0", "::", "0:0:0:0:0:0:0:0"}
+    if _bind_host in _ALL_IFACE:
+        failures.append(
+            f"FAIL: GATEWAY_OPERATOR_BIND_HOST is '{_bind_host}' — the operator listener must be "
+            "bound to a specific gateway-net address, not all interfaces. "
+            "Set it to the gateway container's gateway-net IP address."
+        )
+
+    # 7b: reject loopback: any 127.x.x.x, ::1, 0:0:0:0:0:0:0:1
+    #
+    # Safe to use a ^127\. regex here: ipaddress.ip_address() above has already
+    # proven _bind_host is a literal IP address, so no hostname can reach this
+    # check. The prefix uniquely identifies the 127.0.0.0/8 loopback range for
+    # dotted-decimal IPv4.
+    _LOOPBACK_EXACT = {"::1", "0:0:0:0:0:0:0:1"}
+    _is_ipv4_loopback = bool(_re_op.match(r'^127\.', _bind_host))
+    if _bind_host in _LOOPBACK_EXACT or _is_ipv4_loopback:
+        failures.append(
+            f"FAIL: GATEWAY_OPERATOR_BIND_HOST is '{_bind_host}' — the operator listener must be "
+            "bound to a gateway-net address, not the loopback interface. "
+            "Set it to the gateway container's gateway-net IP address."
+        )
+
+    # 7c: reject sandbox-net (10.0.0.0/8)
+    #
+    # Safe to use a ^10\. regex here: ipaddress.ip_address() above has already
+    # proven _bind_host is a literal IP address, so no hostname can reach this
+    # check. The prefix uniquely identifies the 10.0.0.0/8 sandbox-net range for
+    # dotted-decimal IPv4.
+    _is_sandbox_net = bool(_re_op.match(r'^10\.', _bind_host))
+    if _is_sandbox_net:
+        failures.append(
+            f"FAIL: GATEWAY_OPERATOR_BIND_HOST is '{_bind_host}' — 10.0.0.0/8 is the sandbox-net "
+            "(Docker internal network). The operator listener must be on gateway-net only "
+            "(e.g. 172.20.x.x). Set it to the gateway container's gateway-net IP address."
+        )
+
+    # 7h: reject all IPv6 literal addresses.
+    #
+    # gateway-net is an IPv4-only Docker bridge network; there is no IPv6 gateway-net
+    # topology. Binding the operator listener to any IPv6 address would either fail at
+    # runtime (no IPv6 interface on gateway-net) or silently bind to a different
+    # interface than intended. Reject all IPv6 literals now and revisit when an IPv6
+    # gateway-net topology exists.
+    #
+    # ipaddress.ip_address() above has already proven _bind_host is a literal IP.
+    # The all-interfaces ('::') and loopback ('::1', '0:0:0:0:0:0:0:1') cases are
+    # already caught above; this guard catches all remaining IPv6 literals (ULA,
+    # link-local, global unicast, etc.).
+    try:
+        import ipaddress as _ipaddress_v6
+        _parsed_addr = _ipaddress_v6.ip_address(_bind_host)
+        if _parsed_addr.version == 6:
+            failures.append(
+                f"FAIL: GATEWAY_OPERATOR_BIND_HOST is '{_bind_host}' — IPv6 addresses are not "
+                "supported for the operator listener. gateway-net is an IPv4-only Docker bridge "
+                "network. IPv6 operator binds are rejected until an IPv6 gateway-net topology "
+                "exists. Set it to the gateway container's IPv4 gateway-net address (e.g. 172.20.0.2)."
+            )
+    except ValueError:
+        pass  # already caught by the 7a-pre hostname check above
+
+    # 7d: require public origin when bind host is set
+    if not operator_public_origin or not str(operator_public_origin).strip():
+        failures.append(
+            "FAIL: GATEWAY_OPERATOR_BIND_HOST is set but GATEWAY_OPERATOR_PUBLIC_ORIGIN is absent — "
+            "all three operator web vars (BIND_HOST, BIND_PORT, PUBLIC_ORIGIN) must be set together. "
+            "Set GATEWAY_OPERATOR_PUBLIC_ORIGIN to the https:// URL of the infra reverse proxy."
+        )
+    else:
+        # 7e: require https:// for public origin
+        _origin = str(operator_public_origin).strip()
+        if not _origin.startswith("https://"):
+            failures.append(
+                f"FAIL: GATEWAY_OPERATOR_PUBLIC_ORIGIN is '{_origin}' — must use https:// "
+                "(TLS is terminated by the infra reverse proxy; the operator listener receives "
+                "plain HTTP over gateway-net). Update the origin to use https://."
+            )
+
+    # 7f: require bind port when bind host is set
+    if not operator_bind_port or not str(operator_bind_port).strip():
+        failures.append(
+            "FAIL: GATEWAY_OPERATOR_BIND_HOST is set but GATEWAY_OPERATOR_BIND_PORT is absent — "
+            "all three operator web vars (BIND_HOST, BIND_PORT, PUBLIC_ORIGIN) must be set together. "
+            "Set GATEWAY_OPERATOR_BIND_PORT to the port the operator listener should bind to."
+        )
+    else:
+        # 7g: validate bind port value — must be an integer in 1..65535.
+        _raw_port = str(operator_bind_port).strip()
+        try:
+            _port_int = int(_raw_port)
+            if _port_int < 1 or _port_int > 65535:
+                raise ValueError("out of range")
+        except (ValueError, TypeError):
+            failures.append(
+                f"FAIL: GATEWAY_OPERATOR_BIND_PORT is '{_raw_port}' — must be an integer in the range 1–65535. "
+                "Set it to a valid port number (e.g. 4000)."
+            )
+
+# ------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------
 if failures:

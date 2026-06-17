@@ -65,13 +65,31 @@ export interface DiscordApprovalActor {
 }
 
 /**
- * A future web operator who submitted an approval decision via the control surface.
- * Shape is intentionally minimal — extend with session/auth fields when a web surface is added.
+ * A web operator who submitted an approval decision via the control surface.
+ *
+ * Carries stable GitHub numeric identity for authorization and audit, plus
+ * a display login for human-readable logs. The numeric ID is the authoritative
+ * identity — logins are mutable and must not be used for access decisions.
  */
 export interface WebOperatorActor {
   readonly kind: 'web-operator'
-  /** Stable operator identifier (e.g. GitHub login or internal operator ID). */
-  readonly operatorId: string
+  /**
+   * Stable GitHub numeric user ID (from the GitHub API `id` field).
+   * Used for authorization, audit, and idempotency key scoping.
+   * Prefer this over `login` for any access-control or audit decision.
+   */
+  readonly githubUserId: number
+  /**
+   * GitHub display login (e.g. `'octocat'`).
+   * Mutable — use only for human-readable logs and display metadata.
+   * Never use for authorization or audit identity.
+   */
+  readonly login: string
+  /**
+   * Opaque session correlation value for log correlation.
+   * Not used for authorization — use `githubUserId` instead.
+   */
+  readonly sessionCorrelationId: string
 }
 
 /**

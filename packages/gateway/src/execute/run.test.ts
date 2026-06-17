@@ -6,6 +6,8 @@ import type {LaunchWorkRequest, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
 import type {RunMentionDeps, RunTask} from './run.js'
 
+import {readFileSync} from 'node:fs'
+import {join} from 'node:path'
 import * as runtimeModule from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as coordinatorModule from '../approvals/coordinator.js'
@@ -2341,6 +2343,78 @@ describe('runMention', () => {
         }),
       )
     })
+
+    it('createApprovalOnPending factory: ApprovalTransportContext.directory equals canonical ensureClone path and approvalDeadlineMs is positive', async () => {
+      // Regression guard: the factory must receive the canonical path from ensureClone,
+      // not the stale binding.workspacePath. This is the Fix 4 assertion.
+      const {launchWork} = await import('./run.js')
+      setupHappyPath()
+
+      const CANONICAL_PATH = '/workspace/canonical/acme/widget'
+      const ensureClone = vi.fn().mockResolvedValue({success: true as const, data: CANONICAL_PATH})
+      const staleBinding = {...makeBinding(), workspacePath: '/old/stale/path'}
+
+      let capturedContext: import('./launch-types.js').ApprovalTransportContext | undefined
+      const createApprovalOnPending = vi
+        .fn()
+        .mockImplementation((ctx: import('./launch-types.js').ApprovalTransportContext) => {
+          capturedContext = ctx
+          return (_req: import('../approvals/coordinator.js').PermissionRequest) => {
+            /* no-op */
+          }
+        })
+
+      const noopSettle = (_delivered: boolean) => {
+        /* no-op */
+      }
+      const request: import('./launch-types.js').LaunchWorkRequest = {
+        promptText: 'do the thing',
+        channelId: CHANNEL_ID,
+        guildId: undefined,
+        surface: 'discord',
+        binding: staleBinding,
+        requester: {kind: 'discord-user', userId: 'user-111'},
+        statusSink: {
+          noteActivity: vi.fn(),
+          setBusy: vi.fn(),
+          resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+          resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+          dispose: vi.fn().mockResolvedValue(undefined),
+          setReaction: vi.fn(),
+        },
+        replySink: {
+          send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+          append: vi.fn(),
+          flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+          buffered: vi.fn().mockReturnValue(''),
+          hasVisibleOutput: vi.fn().mockReturnValue(false),
+          markVisibleOutputSent: vi.fn(),
+          markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+        },
+        createApprovalOnPending,
+      }
+
+      const deps = makeDeps({ensureClone, runTimeoutMs: 600_000})
+
+      // #when
+      await launchWork(request, deps)
+
+      // #then — factory was called
+      expect(createApprovalOnPending).toHaveBeenCalledOnce()
+      expect(capturedContext).toBeDefined()
+
+      // #and — directory is the canonical path from ensureClone, NOT the stale binding path
+      expect(capturedContext?.directory).toBe(CANONICAL_PATH)
+      expect(capturedContext?.directory).not.toBe('/old/stale/path')
+
+      // #and — approvalDeadlineMs is a positive number (not undefined, not zero)
+      expect(typeof capturedContext?.approvalDeadlineMs).toBe('number')
+      expect(capturedContext?.approvalDeadlineMs).toBeGreaterThan(0)
+      // Must be strictly less than runTimeoutMs (aligned with remaining budget)
+      expect(capturedContext?.approvalDeadlineMs).toBeLessThan(600_000)
+      // Must not exceed 13 minutes (Discord interaction-token guard)
+      expect(capturedContext?.approvalDeadlineMs).toBeLessThanOrEqual(13 * 60_000)
+    })
   })
 
   // ── Approval wait and timeout UX ────────────────────────────────────────
@@ -3919,6 +3993,92 @@ describe('reaction wiring — containment (failure isolation)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// TDZ regression: throwing createApprovalOnPending factory must not produce
+// "Cannot access 'coordinator' before initialization" — Fix 1 guard.
+// ---------------------------------------------------------------------------
+
+describe('TDZ regression: throwing createApprovalOnPending factory', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('factory that throws is handled cleanly: outer catch fires, concurrency slot released, no unhandled error', async () => {
+    // Regression guard: if `createApprovalOnPending` throws, the outer catch block must
+    // handle the error gracefully. The inner try/finally (which calls coordinator.dispose)
+    // is never entered because coordinator is only created AFTER the factory call succeeds.
+    // The outer finally must still release the concurrency slot.
+    //
+    // This test also guards against any future refactor that might accidentally introduce
+    // a TDZ error by referencing coordinator before it is initialized.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const FACTORY_ERROR = new Error('createApprovalOnPending factory threw')
+    const createApprovalOnPending = vi.fn().mockImplementation(() => {
+      throw FACTORY_ERROR
+    })
+
+    const releaseFn = vi.fn()
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+
+    const noopSettle = (_delivered: boolean) => {
+      /* no-op */
+    }
+    const request: import('./launch-types.js').LaunchWorkRequest = {
+      promptText: 'do the thing',
+      channelId: CHANNEL_ID,
+      guildId: undefined,
+      surface: 'discord',
+      binding: makeBinding(),
+      requester: {kind: 'discord-user', userId: 'user-111'},
+      statusSink: {
+        noteActivity: vi.fn(),
+        setBusy: vi.fn(),
+        resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        dispose: vi.fn().mockResolvedValue(undefined),
+        setReaction: vi.fn(),
+      },
+      replySink: {
+        send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+        buffered: vi.fn().mockReturnValue(''),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+      },
+      createApprovalOnPending,
+    }
+
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+      logger,
+    })
+
+    // #when — must not throw "Cannot access 'coordinator' before initialization"
+    // and must not throw at all (error is caught and handled internally)
+    await expect(launchWork(request, deps)).resolves.toBeUndefined()
+
+    // #then — concurrency slot released (outer finally ran despite factory throw)
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+
+    // #and — the factory error was NOT a TDZ error
+    // (If TDZ occurred, the error message would contain "Cannot access 'coordinator'")
+    const errorCalls = logger.error.mock.calls
+    for (const call of errorCalls) {
+      const errMsg = String((call[1] as {err?: string})?.err ?? call[0] ?? '')
+      expect(errMsg).not.toContain("Cannot access 'coordinator' before initialization")
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // formatTimeoutDuration — unit tests for the exported helper
 // ---------------------------------------------------------------------------
 
@@ -5078,4 +5238,249 @@ describe('threadFactory timeout path', () => {
     // #and — concurrency slot released (no leak)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
   }, 15_000)
+})
+
+// ---------------------------------------------------------------------------
+// Unit 1: Approval transport selection and web surface support
+// ---------------------------------------------------------------------------
+
+describe('Unit 1 — approval transport selection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('discord approval behavior is unchanged when no approval factory is provided (default path)', async () => {
+    // #given — a standard Discord mention with no createApprovalOnPending override
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    // #when — run completes normally
+    await runMention(message, makeBinding(), deps)
+
+    // #then — coordinator was created with an onPending callback (Discord transport wired)
+    expect(capturedOnPending).toBeDefined()
+    // #and — execution completed (Discord path unchanged)
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+
+  it('createApprovalOnPending factory is called with engine-owned context and its callback is used instead of Discord transport', async () => {
+    // #given — a LaunchWorkRequest with a createApprovalOnPending factory (simulating web transport)
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    // Capture the context the engine passes to the factory
+    let capturedContext: import('./launch-types.js').ApprovalTransportContext | undefined
+    const webApprovalOnPending = vi.fn()
+    const webFactory = vi.fn((ctx: import('./launch-types.js').ApprovalTransportContext) => {
+      capturedContext = ctx
+      return webApprovalOnPending
+    })
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    const noopSettle = (_delivered: boolean) => {
+      /* no-op */
+    }
+    const request: import('./launch-types.js').LaunchWorkRequest = {
+      promptText: 'do the thing',
+      channelId: CHANNEL_ID,
+      guildId: undefined,
+      surface: 'web',
+      binding: makeBinding(),
+      requester: {kind: 'web-operator', githubUserId: 12345, login: 'octocat', sessionCorrelationId: 'sess-abc'},
+      statusSink: {
+        noteActivity: vi.fn(),
+        setBusy: vi.fn(),
+        resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        dispose: vi.fn().mockResolvedValue(undefined),
+        setReaction: vi.fn(),
+      },
+      replySink: {
+        send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+        buffered: vi.fn().mockReturnValue(''),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+      },
+      createApprovalOnPending: webFactory,
+    }
+    const deps = makeDeps()
+
+    // #when — launch with web surface and createApprovalOnPending factory
+    await launchWork(request, deps)
+
+    // #then — factory was called exactly once (engine called it with context)
+    expect(webFactory).toHaveBeenCalledOnce()
+
+    // #then — context carries all engine-owned fields a web transport needs
+    expect(capturedContext).toBeDefined()
+    // canonical directory (from ensureClone, not stale binding.workspacePath)
+    expect(typeof capturedContext?.directory).toBe('string')
+    expect(capturedContext?.directory.length).toBeGreaterThan(0)
+    // approval deadline (aligned with run budget)
+    expect(
+      capturedContext?.approvalDeadlineMs === undefined || typeof capturedContext?.approvalDeadlineMs === 'number',
+    ).toBe(true)
+    // runId — stable UUID for this run
+    expect(typeof capturedContext?.runId).toBe('string')
+    expect(capturedContext?.runId.length).toBeGreaterThan(0)
+    // repo — owner/repo string
+    expect(typeof capturedContext?.repo).toBe('string')
+    expect(capturedContext?.repo).toContain('/')
+    // approvalRegistry — the program-scoped registry
+    expect(capturedContext?.approvalRegistry).toBeDefined()
+    expect(typeof capturedContext?.approvalRegistry?.register).toBe('function')
+    expect(typeof capturedContext?.approvalRegistry?.handleDecision).toBe('function')
+    // replySink — the run's reply sink
+    expect(capturedContext?.replySink).toBeDefined()
+    expect(typeof capturedContext?.replySink?.send).toBe('function')
+    // postReplyFactory — factory for per-request SDK reply closures
+    expect(typeof capturedContext?.postReplyFactory).toBe('function')
+
+    // #then — coordinator was created with an onPending callback
+    expect(capturedOnPending).toBeDefined()
+
+    // #when — simulate a permission request arriving
+    if (capturedOnPending !== undefined) {
+      capturedOnPending({
+        requestID: 'per_web_1',
+        sessionID: 'ses_web_1',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+    }
+
+    // #then — the web callback was called (not Discord transport)
+    expect(webApprovalOnPending).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({requestID: 'per_web_1', permission: 'bash'}),
+    )
+  })
+
+  it('web surface run compiles and executes without unsafe casts', async () => {
+    // #given — a LaunchWorkRequest with surface: 'web' (type-safe, no cast needed)
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const noopSettle = (_delivered: boolean) => {
+      /* no-op */
+    }
+    const request: import('./launch-types.js').LaunchWorkRequest = {
+      promptText: 'do the thing',
+      channelId: CHANNEL_ID,
+      guildId: undefined,
+      surface: 'web', // typed as Surface — no 'as Surface' cast needed
+      binding: makeBinding(),
+      requester: {kind: 'web-operator', githubUserId: 99999, login: 'webuser', sessionCorrelationId: 'sess-xyz'},
+      statusSink: {
+        noteActivity: vi.fn(),
+        setBusy: vi.fn(),
+        resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+        dispose: vi.fn().mockResolvedValue(undefined),
+        setReaction: vi.fn(),
+      },
+      replySink: {
+        send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+        buffered: vi.fn().mockReturnValue(''),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+      },
+    }
+    const deps = makeDeps()
+
+    // #when — launch with web surface
+    await launchWork(request, deps)
+
+    // #then — execution completed (web surface is now a valid Surface value)
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    // #and — acquireLock was called with 'web' surface (no cast, no error)
+    expect(mockRuntime.acquireLock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.any(String),
+      'web',
+      expect.any(String),
+      expect.anything(),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit 0: Characterization — Phase A seam invariants
+//
+// These static guards pin the public API contract that Phase B depends on:
+//   1. `executeWorkOnHeldSlot` is NOT exported — callers must use `launchWork`.
+//   2. `launchWork` IS exported — it is the single public front door.
+//   3. `runMention` IS exported — it is the Discord adapter entry point.
+//
+// If any of these fail, a caller has bypassed the queue/cap or the public
+// front door has been removed. Both require deliberate security review.
+// ---------------------------------------------------------------------------
+
+describe('Unit 0 — Phase A seam invariants (static guards)', () => {
+  it('executeWorkOnHeldSlot is NOT exported from run.ts — callers must use launchWork', async () => {
+    // #given — import the run module
+    const runModule = await import('./run.js')
+
+    // #then — the private execution primitive must not be exported
+    expect(Object.keys(runModule)).not.toContain('executeWorkOnHeldSlot')
+  })
+
+  it('launchWork IS exported from run.ts — it is the single public front door', async () => {
+    // #given — import the run module
+    const runModule = await import('./run.js')
+
+    // #then — the public front door must be exported
+    expect(typeof runModule.launchWork).toBe('function')
+  })
+
+  it('runMention IS exported from run.ts — it is the Discord adapter entry point', async () => {
+    // #given — import the run module
+    const runModule = await import('./run.js')
+
+    // #then — the Discord adapter must be exported
+    expect(typeof runModule.runMention).toBe('function')
+  })
+
+  it('run.ts source does not export executeWorkOnHeldSlot (static source scan)', () => {
+    // #given — read the source file directly (catches re-export patterns the module check misses)
+    const runSrcPath = join(__dirname, 'run.ts')
+    const content = readFileSync(runSrcPath, 'utf8')
+
+    // #then — no export keyword precedes executeWorkOnHeldSlot
+    // Matches: "export function executeWorkOnHeldSlot", "export async function executeWorkOnHeldSlot",
+    // "export { executeWorkOnHeldSlot", "export {executeWorkOnHeldSlot"
+    const exportPattern = /export\s+(?:async\s+)?function\s+executeWorkOnHeldSlot|export\s*\{[^}]*executeWorkOnHeldSlot/
+    expect(exportPattern.test(content)).toBe(false)
+  })
 })

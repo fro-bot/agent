@@ -457,25 +457,29 @@ volumes:
   workspace-repos:
 YAML
 
-NO_DOCKER_OUTPUT=""
-NO_DOCKER_EXIT=0
-NO_DOCKER_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_SHORTFORM_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_EXIT=$?
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  NO_DOCKER_OUTPUT=""
+  NO_DOCKER_EXIT=0
+  NO_DOCKER_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_SHORTFORM_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_EXIT=$?
 
-if [[ "${NO_DOCKER_EXIT}" -eq 0 ]]; then
-  pass "--topology-only exited zero via raw YAML fallback (no Docker in PATH)"
+  if [[ "${NO_DOCKER_EXIT}" -eq 0 ]]; then
+    pass "--topology-only exited zero via raw YAML fallback (no Docker in PATH)"
+  else
+    fail "--topology-only exited non-zero (${NO_DOCKER_EXIT}) via raw YAML fallback — output: ${NO_DOCKER_OUTPUT}"
+  fi
+
+  if echo "${NO_DOCKER_OUTPUT}" | grep -q "workspace-repos"; then
+    pass "raw YAML fallback output confirms workspace-repos mount"
+  else
+    fail "raw YAML fallback output does not confirm workspace-repos mount — output: ${NO_DOCKER_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  No-Docker-shortform-test output (stderr+stdout combined):"
+  echo "${NO_DOCKER_OUTPUT}" | sed 's/^/    /'
 else
-  fail "--topology-only exited non-zero (${NO_DOCKER_EXIT}) via raw YAML fallback — output: ${NO_DOCKER_OUTPUT}"
+  echo "  SKIP: TEST 9 (raw YAML fallback, no Docker): PyYAML not available — install python3-yaml/PyYAML to run this test."
 fi
-
-if echo "${NO_DOCKER_OUTPUT}" | grep -q "workspace-repos"; then
-  pass "raw YAML fallback output confirms workspace-repos mount"
-else
-  fail "raw YAML fallback output does not confirm workspace-repos mount — output: ${NO_DOCKER_OUTPUT}"
-fi
-
-echo ""
-echo "  No-Docker-shortform-test output (stderr+stdout combined):"
-echo "${NO_DOCKER_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 10 — Negative (no Docker): --topology-only must FAIL via raw YAML
@@ -509,25 +513,29 @@ volumes:
   mitmproxy-certs:
 YAML
 
-NO_DOCKER_NO_REPOS_OUTPUT=""
-NO_DOCKER_NO_REPOS_EXIT=0
-NO_DOCKER_NO_REPOS_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_NO_REPOS_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_NO_REPOS_EXIT=$?
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  NO_DOCKER_NO_REPOS_OUTPUT=""
+  NO_DOCKER_NO_REPOS_EXIT=0
+  NO_DOCKER_NO_REPOS_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_NO_REPOS_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_NO_REPOS_EXIT=$?
 
-if [[ "${NO_DOCKER_NO_REPOS_EXIT}" -ne 0 ]]; then
-  pass "--topology-only exited non-zero (${NO_DOCKER_NO_REPOS_EXIT}) for missing workspace-repos via raw YAML fallback"
+  if [[ "${NO_DOCKER_NO_REPOS_EXIT}" -ne 0 ]]; then
+    pass "--topology-only exited non-zero (${NO_DOCKER_NO_REPOS_EXIT}) for missing workspace-repos via raw YAML fallback"
+  else
+    fail "--topology-only exited ZERO for missing workspace-repos via raw YAML fallback — guard did NOT fire"
+  fi
+
+  if echo "${NO_DOCKER_NO_REPOS_OUTPUT}" | grep -q "/workspace/repos"; then
+    pass "raw YAML fallback failure message mentions '/workspace/repos'"
+  else
+    fail "raw YAML fallback failure message does not mention '/workspace/repos' — output: ${NO_DOCKER_NO_REPOS_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  No-Docker-no-repos-test output (stderr+stdout combined):"
+  echo "${NO_DOCKER_NO_REPOS_OUTPUT}" | sed 's/^/    /'
 else
-  fail "--topology-only exited ZERO for missing workspace-repos via raw YAML fallback — guard did NOT fire"
+  echo "  SKIP: TEST 10 (raw YAML fallback, no Docker): PyYAML not available — install python3-yaml/PyYAML to run this test."
 fi
-
-if echo "${NO_DOCKER_NO_REPOS_OUTPUT}" | grep -q "/workspace/repos"; then
-  pass "raw YAML fallback failure message mentions '/workspace/repos'"
-else
-  fail "raw YAML fallback failure message does not mention '/workspace/repos' — output: ${NO_DOCKER_NO_REPOS_OUTPUT}"
-fi
-
-echo ""
-echo "  No-Docker-no-repos-test output (stderr+stdout combined):"
-echo "${NO_DOCKER_NO_REPOS_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 11 — Negative (no Docker): --topology-only must FAIL via raw YAML
@@ -562,25 +570,29 @@ volumes:
   workspace-repos:
 YAML
 
-NO_DOCKER_INSECURE_OUTPUT=""
-NO_DOCKER_INSECURE_EXIT=0
-NO_DOCKER_INSECURE_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_INSECURE_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_INSECURE_EXIT=$?
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  NO_DOCKER_INSECURE_OUTPUT=""
+  NO_DOCKER_INSECURE_EXIT=0
+  NO_DOCKER_INSECURE_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${NO_DOCKER_INSECURE_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || NO_DOCKER_INSECURE_EXIT=$?
 
-if [[ "${NO_DOCKER_INSECURE_EXIT}" -ne 0 ]]; then
-  pass "--topology-only exited non-zero (${NO_DOCKER_INSECURE_EXIT}) for workspace-on-egress-net via raw YAML fallback"
+  if [[ "${NO_DOCKER_INSECURE_EXIT}" -ne 0 ]]; then
+    pass "--topology-only exited non-zero (${NO_DOCKER_INSECURE_EXIT}) for workspace-on-egress-net via raw YAML fallback"
+  else
+    fail "--topology-only exited ZERO for workspace-on-egress-net via raw YAML fallback — guard did NOT fire"
+  fi
+
+  if echo "${NO_DOCKER_INSECURE_OUTPUT}" | grep -qi "egress\|non-internal\|direct internet"; then
+    pass "raw YAML fallback failure message mentions egress/non-internal violation"
+  else
+    fail "raw YAML fallback failure message does not mention egress violation — output: ${NO_DOCKER_INSECURE_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  No-Docker-insecure-test output (stderr+stdout combined):"
+  echo "${NO_DOCKER_INSECURE_OUTPUT}" | sed 's/^/    /'
 else
-  fail "--topology-only exited ZERO for workspace-on-egress-net via raw YAML fallback — guard did NOT fire"
+  echo "  SKIP: TEST 11 (raw YAML fallback, no Docker): PyYAML not available — install python3-yaml/PyYAML to run this test."
 fi
-
-if echo "${NO_DOCKER_INSECURE_OUTPUT}" | grep -qi "egress\|non-internal\|direct internet"; then
-  pass "raw YAML fallback failure message mentions egress/non-internal violation"
-else
-  fail "raw YAML fallback failure message does not mention egress violation — output: ${NO_DOCKER_INSECURE_OUTPUT}"
-fi
-
-echo ""
-echo "  No-Docker-insecure-test output (stderr+stdout combined):"
-echo "${NO_DOCKER_INSECURE_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 12 — Negative: network_mode:host on workspace must be rejected.
@@ -950,25 +962,29 @@ fi
 echo ""
 echo "--- TEST 16: multi-file (no docker) — fail-closed with clear error message ---"
 
-MULTI_NODOCK_OUTPUT=""
-MULTI_NODOCK_EXIT=0
-MULTI_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${MULTI_BASE_COMPOSE}:${MULTI_OVERRIDE_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || MULTI_NODOCK_EXIT=$?
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  MULTI_NODOCK_OUTPUT=""
+  MULTI_NODOCK_EXIT=0
+  MULTI_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="${MULTI_BASE_COMPOSE}:${MULTI_OVERRIDE_COMPOSE}" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || MULTI_NODOCK_EXIT=$?
 
-if [[ "${MULTI_NODOCK_EXIT}" -ne 0 ]]; then
-  pass "multi-file (no docker): validate-stack.sh exited non-zero (${MULTI_NODOCK_EXIT}) — fail-closed as expected"
+  if [[ "${MULTI_NODOCK_EXIT}" -ne 0 ]]; then
+    pass "multi-file (no docker): validate-stack.sh exited non-zero (${MULTI_NODOCK_EXIT}) — fail-closed as expected"
+  else
+    fail "multi-file (no docker): validate-stack.sh exited ZERO — should have failed closed"
+  fi
+
+  if echo "${MULTI_NODOCK_OUTPUT}" | grep -qi "multiple files\|docker compose is unavailable"; then
+    pass "multi-file (no docker): error message mentions 'multiple files' / 'docker compose is unavailable'"
+  else
+    fail "multi-file (no docker): error message missing expected text — output: ${MULTI_NODOCK_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  multi-file-no-docker-test output (stderr+stdout combined):"
+  echo "${MULTI_NODOCK_OUTPUT}" | sed 's/^/    /'
 else
-  fail "multi-file (no docker): validate-stack.sh exited ZERO — should have failed closed"
+  echo "  SKIP: TEST 16 (multi-file, no docker): PyYAML not available — install python3-yaml/PyYAML to run this test."
 fi
-
-if echo "${MULTI_NODOCK_OUTPUT}" | grep -qi "multiple files\|docker compose is unavailable"; then
-  pass "multi-file (no docker): error message mentions 'multiple files' / 'docker compose is unavailable'"
-else
-  fail "multi-file (no docker): error message missing expected text — output: ${MULTI_NODOCK_OUTPUT}"
-fi
-
-echo ""
-echo "  multi-file-no-docker-test output (stderr+stdout combined):"
-echo "${MULTI_NODOCK_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 17 — Positive (single-file, no docker): single-file raw YAML fallback
@@ -980,19 +996,23 @@ echo "${MULTI_NODOCK_OUTPUT}" | sed 's/^/    /'
 echo ""
 echo "--- TEST 17: single-file (no docker) — raw YAML fallback still exits zero for real compose.yaml ---"
 
-SINGLE_NODOCK_OUTPUT=""
-SINGLE_NODOCK_EXIT=0
-SINGLE_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="deploy/compose.yaml" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || SINGLE_NODOCK_EXIT=$?
+if "${PYTHON3_BIN}" -c "import yaml" 2>/dev/null; then
+  SINGLE_NODOCK_OUTPUT=""
+  SINGLE_NODOCK_EXIT=0
+  SINGLE_NODOCK_OUTPUT="$(PATH="${NO_DOCKER_PATH}" COMPOSE_FILE="deploy/compose.yaml" PYTHON3_BIN="${PYTHON3_BIN}" "${BASH_BIN}" deploy/validate-stack.sh --topology-only 2>&1)" || SINGLE_NODOCK_EXIT=$?
 
-if [[ "${SINGLE_NODOCK_EXIT}" -eq 0 ]]; then
-  pass "single-file (no docker): validate-stack.sh exited zero for real compose.yaml via raw YAML fallback"
+  if [[ "${SINGLE_NODOCK_EXIT}" -eq 0 ]]; then
+    pass "single-file (no docker): validate-stack.sh exited zero for real compose.yaml via raw YAML fallback"
+  else
+    fail "single-file (no docker): validate-stack.sh exited non-zero (${SINGLE_NODOCK_EXIT}) — output: ${SINGLE_NODOCK_OUTPUT}"
+  fi
+
+  echo ""
+  echo "  single-file-no-docker-test output (stderr+stdout combined):"
+  echo "${SINGLE_NODOCK_OUTPUT}" | sed 's/^/    /'
 else
-  fail "single-file (no docker): validate-stack.sh exited non-zero (${SINGLE_NODOCK_EXIT}) — output: ${SINGLE_NODOCK_OUTPUT}"
+  echo "  SKIP: TEST 17 (single-file, no docker): PyYAML not available — install python3-yaml/PyYAML to run this test."
 fi
-
-echo ""
-echo "  single-file-no-docker-test output (stderr+stdout combined):"
-echo "${SINGLE_NODOCK_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # TEST 20 — Negative: sidecar attached to [sandbox-net, shadow-egress]
@@ -3942,6 +3962,699 @@ fi
 echo ""
 echo "  uts-host-test output (stderr+stdout combined):"
 echo "${UTS_HOST_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# OPERATOR WEB SURFACE TOPOLOGY TESTS
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TEST OP-1 — Negative: GATEWAY_OPERATOR_BIND_HOST=0.0.0.0 must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-1: operator topology guard rejects GATEWAY_OPERATOR_BIND_HOST=0.0.0.0 ---"
+
+OP1_COMPOSE="${TMPDIR_TEST}/compose-op1.yaml"
+cat > "${OP1_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "0.0.0.0"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP1_OUTPUT=""
+OP1_EXIT=0
+OP1_OUTPUT="$(COMPOSE_FILE="${OP1_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP1_EXIT=$?
+
+if [[ "${OP1_EXIT}" -ne 0 ]]; then
+  pass "OP-1: validate-stack.sh exited non-zero (${OP1_EXIT}) for BIND_HOST=0.0.0.0"
+else
+  fail "OP-1: validate-stack.sh exited ZERO for BIND_HOST=0.0.0.0 — guard did NOT fire"
+fi
+
+if echo "${OP1_OUTPUT}" | grep -qi "0\.0\.0\.0\|all interfaces\|all-interfaces"; then
+  pass "OP-1: failure message mentions 0.0.0.0 / all-interfaces"
+else
+  fail "OP-1: failure message does not mention 0.0.0.0 — output: ${OP1_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-1 output (stderr+stdout combined):"
+echo "${OP1_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-2 — Negative: GATEWAY_OPERATOR_BIND_HOST=127.0.0.1 must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-2: operator topology guard rejects GATEWAY_OPERATOR_BIND_HOST=127.0.0.1 ---"
+
+OP2_COMPOSE="${TMPDIR_TEST}/compose-op2.yaml"
+cat > "${OP2_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "127.0.0.1"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP2_OUTPUT=""
+OP2_EXIT=0
+OP2_OUTPUT="$(COMPOSE_FILE="${OP2_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP2_EXIT=$?
+
+if [[ "${OP2_EXIT}" -ne 0 ]]; then
+  pass "OP-2: validate-stack.sh exited non-zero (${OP2_EXIT}) for BIND_HOST=127.0.0.1"
+else
+  fail "OP-2: validate-stack.sh exited ZERO for BIND_HOST=127.0.0.1 — guard did NOT fire"
+fi
+
+if echo "${OP2_OUTPUT}" | grep -qi "127\.0\.0\.1\|loopback"; then
+  pass "OP-2: failure message mentions 127.0.0.1 / loopback"
+else
+  fail "OP-2: failure message does not mention 127.0.0.1 — output: ${OP2_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-2 output (stderr+stdout combined):"
+echo "${OP2_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-3 — Negative: GATEWAY_OPERATOR_PUBLIC_ORIGIN with http:// must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-3: operator topology guard rejects http:// public origin ---"
+
+OP3_COMPOSE="${TMPDIR_TEST}/compose-op3.yaml"
+cat > "${OP3_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "http://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP3_OUTPUT=""
+OP3_EXIT=0
+OP3_OUTPUT="$(COMPOSE_FILE="${OP3_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP3_EXIT=$?
+
+if [[ "${OP3_EXIT}" -ne 0 ]]; then
+  pass "OP-3: validate-stack.sh exited non-zero (${OP3_EXIT}) for http:// public origin"
+else
+  fail "OP-3: validate-stack.sh exited ZERO for http:// public origin — guard did NOT fire"
+fi
+
+if echo "${OP3_OUTPUT}" | grep -qi "https://\|TLS\|tls"; then
+  pass "OP-3: failure message mentions https:// / TLS requirement"
+else
+  fail "OP-3: failure message does not mention https:// — output: ${OP3_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-3 output (stderr+stdout combined):"
+echo "${OP3_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-4 — Negative: GATEWAY_OPERATOR_BIND_HOST set without PUBLIC_ORIGIN.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-4: operator topology guard rejects missing PUBLIC_ORIGIN when BIND_HOST is set ---"
+
+OP4_COMPOSE="${TMPDIR_TEST}/compose-op4.yaml"
+cat > "${OP4_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP4_OUTPUT=""
+OP4_EXIT=0
+OP4_OUTPUT="$(COMPOSE_FILE="${OP4_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP4_EXIT=$?
+
+if [[ "${OP4_EXIT}" -ne 0 ]]; then
+  pass "OP-4: validate-stack.sh exited non-zero (${OP4_EXIT}) for missing PUBLIC_ORIGIN"
+else
+  fail "OP-4: validate-stack.sh exited ZERO for missing PUBLIC_ORIGIN — guard did NOT fire"
+fi
+
+if echo "${OP4_OUTPUT}" | grep -qi "PUBLIC_ORIGIN\|public.origin"; then
+  pass "OP-4: failure message mentions PUBLIC_ORIGIN"
+else
+  fail "OP-4: failure message does not mention PUBLIC_ORIGIN — output: ${OP4_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-4 output (stderr+stdout combined):"
+echo "${OP4_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-5 — Positive: valid operator config on gateway-net must pass.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-5: operator topology guard accepts valid gateway-net operator config ---"
+
+OP5_COMPOSE="${TMPDIR_TEST}/compose-op5.yaml"
+cat > "${OP5_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP5_OUTPUT=""
+OP5_EXIT=0
+OP5_OUTPUT="$(COMPOSE_FILE="${OP5_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP5_EXIT=$?
+
+if [[ "${OP5_EXIT}" -eq 0 ]]; then
+  pass "OP-5: validate-stack.sh exited zero for valid operator config"
+else
+  fail "OP-5: validate-stack.sh exited non-zero (${OP5_EXIT}) for valid operator config — output: ${OP5_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-5 output (stderr+stdout combined):"
+echo "${OP5_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-6 — Positive: operator listener disabled (no env vars) must pass.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-6: operator topology guard accepts compose with no operator config (listener disabled) ---"
+
+OP6_OUTPUT=""
+OP6_EXIT=0
+OP6_OUTPUT="$(COMPOSE_FILE=deploy/compose.yaml bash deploy/validate-stack.sh --topology-only 2>&1)" || OP6_EXIT=$?
+
+if [[ "${OP6_EXIT}" -eq 0 ]]; then
+  pass "OP-6: validate-stack.sh exited zero for real compose.yaml (operator listener disabled)"
+else
+  fail "OP-6: validate-stack.sh exited non-zero (${OP6_EXIT}) for real compose.yaml — output: ${OP6_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-6 output (stderr+stdout combined):"
+echo "${OP6_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-7 — Negative: sandbox-net address (10.0.0.2) must be rejected.
+#
+# 10.0.0.0/8 is the Docker internal sandbox-net. The operator listener must
+# be on gateway-net only (e.g. 172.20.x.x). Binding to a sandbox-net address
+# would make the operator surface reachable from the workspace container,
+# collapsing the network-layer isolation to app-layer auth only.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-7: operator topology guard rejects sandbox-net address (10.0.0.2) ---"
+
+OP7_COMPOSE="${TMPDIR_TEST}/compose-op7.yaml"
+cat > "${OP7_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "10.0.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP7_OUTPUT=""
+OP7_EXIT=0
+OP7_OUTPUT="$(COMPOSE_FILE="${OP7_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP7_EXIT=$?
+
+if [[ "${OP7_EXIT}" -ne 0 ]]; then
+  pass "OP-7: validate-stack.sh exited non-zero (${OP7_EXIT}) for sandbox-net operator bind host"
+else
+  fail "OP-7: validate-stack.sh exited ZERO for sandbox-net operator bind host — guard did NOT fire"
+fi
+
+if echo "${OP7_OUTPUT}" | grep -qi "sandbox-net\|10\.0\.0\.0"; then
+  pass "OP-7: failure message mentions sandbox-net or 10.0.0.0/8"
+else
+  fail "OP-7: failure message does not mention sandbox-net — output: ${OP7_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-7 output (stderr+stdout combined):"
+echo "${OP7_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-8 — Negative: hostname bind host (e.g. "localhost") must be rejected.
+#
+# The operator listener must be bound to a literal IP address, not a hostname.
+# Hostnames are not permitted because they require DNS resolution, which
+# introduces a TOCTOU window and may resolve to unexpected addresses.
+# This mirrors the isIP() check in config.ts.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-8: operator topology guard rejects hostname bind host (localhost) ---"
+
+OP8_COMPOSE="${TMPDIR_TEST}/compose-op8.yaml"
+cat > "${OP8_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "localhost"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP8_OUTPUT=""
+OP8_EXIT=0
+OP8_OUTPUT="$(COMPOSE_FILE="${OP8_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP8_EXIT=$?
+
+if [[ "${OP8_EXIT}" -ne 0 ]]; then
+  pass "OP-8: validate-stack.sh exited non-zero (${OP8_EXIT}) for hostname bind host 'localhost'"
+else
+  fail "OP-8: validate-stack.sh exited ZERO for hostname bind host 'localhost' — guard did NOT fire"
+fi
+
+if echo "${OP8_OUTPUT}" | grep -qi "literal IP\|hostname\|localhost"; then
+  pass "OP-8: failure message mentions literal IP / hostname requirement"
+else
+  fail "OP-8: failure message does not mention literal IP / hostname — output: ${OP8_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-8 output (stderr+stdout combined):"
+echo "${OP8_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-9 — Negative: invalid operator bind port (non-integer) must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-9: operator topology guard rejects non-integer bind port ---"
+
+OP9_COMPOSE="${TMPDIR_TEST}/compose-op9.yaml"
+cat > "${OP9_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "not-a-port"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP9_OUTPUT=""
+OP9_EXIT=0
+OP9_OUTPUT="$(COMPOSE_FILE="${OP9_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP9_EXIT=$?
+
+if [[ "${OP9_EXIT}" -ne 0 ]]; then
+  pass "OP-9: validate-stack.sh exited non-zero (${OP9_EXIT}) for non-integer bind port 'not-a-port'"
+else
+  fail "OP-9: validate-stack.sh exited ZERO for non-integer bind port — guard did NOT fire"
+fi
+
+if echo "${OP9_OUTPUT}" | grep -qi "BIND_PORT\|1.65535\|integer\|range"; then
+  pass "OP-9: failure message mentions BIND_PORT / integer / range requirement"
+else
+  fail "OP-9: failure message does not mention port validation — output: ${OP9_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-9 output (stderr+stdout combined):"
+echo "${OP9_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-10 — Negative: out-of-range operator bind port (70000) must be rejected.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-10: operator topology guard rejects out-of-range bind port (70000) ---"
+
+OP10_COMPOSE="${TMPDIR_TEST}/compose-op10.yaml"
+cat > "${OP10_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "172.20.0.2"
+      GATEWAY_OPERATOR_BIND_PORT: "70000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP10_OUTPUT=""
+OP10_EXIT=0
+OP10_OUTPUT="$(COMPOSE_FILE="${OP10_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP10_EXIT=$?
+
+if [[ "${OP10_EXIT}" -ne 0 ]]; then
+  pass "OP-10: validate-stack.sh exited non-zero (${OP10_EXIT}) for out-of-range bind port 70000"
+else
+  fail "OP-10: validate-stack.sh exited ZERO for out-of-range bind port 70000 — guard did NOT fire"
+fi
+
+if echo "${OP10_OUTPUT}" | grep -qi "BIND_PORT\|1.65535\|integer\|range"; then
+  pass "OP-10: failure message mentions BIND_PORT / integer / range requirement"
+else
+  fail "OP-10: failure message does not mention port validation — output: ${OP10_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-10 output (stderr+stdout combined):"
+echo "${OP10_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-11 — Negative: IPv6 link-local address (fe80::1) must be rejected.
+#
+# gateway-net is an IPv4-only Docker bridge network. All IPv6 literal addresses
+# are rejected until an IPv6 gateway-net topology exists.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-11: operator topology guard rejects IPv6 link-local bind host (fe80::1) ---"
+
+OP11_COMPOSE="${TMPDIR_TEST}/compose-op11.yaml"
+cat > "${OP11_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "fe80::1"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP11_OUTPUT=""
+OP11_EXIT=0
+OP11_OUTPUT="$(COMPOSE_FILE="${OP11_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP11_EXIT=$?
+
+if [[ "${OP11_EXIT}" -ne 0 ]]; then
+  pass "OP-11: validate-stack.sh exited non-zero (${OP11_EXIT}) for IPv6 link-local bind host fe80::1"
+else
+  fail "OP-11: validate-stack.sh exited ZERO for IPv6 link-local bind host — IPv6 guard did NOT fire"
+fi
+
+if echo "${OP11_OUTPUT}" | grep -qi "IPv6\|not supported"; then
+  pass "OP-11: failure message mentions IPv6 / not supported"
+else
+  fail "OP-11: failure message does not mention IPv6 rejection — output: ${OP11_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-11 output (stderr+stdout combined):"
+echo "${OP11_OUTPUT}" | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# TEST OP-12 — Negative: IPv6 ULA address (fc00::1) must be rejected.
+#
+# ULA (Unique Local Address) is a private IPv6 range analogous to RFC-1918.
+# It is still IPv6 and must be rejected for the same reason as link-local.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST OP-12: operator topology guard rejects IPv6 ULA bind host (fc00::1) ---"
+
+OP12_COMPOSE="${TMPDIR_TEST}/compose-op12.yaml"
+cat > "${OP12_COMPOSE}" <<'YAML'
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    networks:
+      - sandbox-net
+      - egress-net
+  gateway:
+    image: ubuntu:22.04
+    networks:
+      - gateway-net
+      - sandbox-net
+    environment:
+      GATEWAY_OPERATOR_BIND_HOST: "fc00::1"
+      GATEWAY_OPERATOR_BIND_PORT: "4000"
+      GATEWAY_OPERATOR_PUBLIC_ORIGIN: "https://operator.example.com"
+  workspace:
+    image: ubuntu:22.04
+    networks:
+      - sandbox-net
+    volumes:
+      - workspace-repos:/workspace/repos
+
+networks:
+  sandbox-net:
+    internal: true
+  egress-net: {}
+  gateway-net: {}
+
+volumes:
+  workspace-repos:
+YAML
+
+OP12_OUTPUT=""
+OP12_EXIT=0
+OP12_OUTPUT="$(COMPOSE_FILE="${OP12_COMPOSE}" bash deploy/validate-stack.sh --topology-only 2>&1)" || OP12_EXIT=$?
+
+if [[ "${OP12_EXIT}" -ne 0 ]]; then
+  pass "OP-12: validate-stack.sh exited non-zero (${OP12_EXIT}) for IPv6 ULA bind host fc00::1"
+else
+  fail "OP-12: validate-stack.sh exited ZERO for IPv6 ULA bind host — IPv6 guard did NOT fire"
+fi
+
+if echo "${OP12_OUTPUT}" | grep -qi "IPv6\|not supported"; then
+  pass "OP-12: failure message mentions IPv6 / not supported"
+else
+  fail "OP-12: failure message does not mention IPv6 rejection — output: ${OP12_OUTPUT}"
+fi
+
+echo ""
+echo "  OP-12 output (stderr+stdout combined):"
+echo "${OP12_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
 # Summary

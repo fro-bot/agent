@@ -17,7 +17,7 @@
 # packages/runtime/src/shared/constants.ts.
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:24.16.0-alpine@sha256:fb71d01345f11b708a3553c66e7c74074f2d506400ea81973343d915cb64eef0 AS build
+FROM node:24.16.0-alpine@sha256:21f403ab171f2dc89bad4dd69d7721bfd15f084ccb46cdd225f31f2bc59b5c9a AS build
 
 WORKDIR /workspace
 
@@ -34,7 +34,7 @@ RUN pnpm install --frozen-lockfile --filter @fro-bot/workspace-agent...
 RUN pnpm --filter @fro-bot/workspace-agent build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.16.0-alpine@sha256:fb71d01345f11b708a3553c66e7c74074f2d506400ea81973343d915cb64eef0 AS runtime
+FROM node:24.16.0-alpine@sha256:21f403ab171f2dc89bad4dd69d7721bfd15f084ccb46cdd225f31f2bc59b5c9a AS runtime
 
 WORKDIR /app
 

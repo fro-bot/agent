@@ -42,6 +42,14 @@ services:
       # (the endpoint stays disabled). Uncomment both lines AND both bind-mounts below.
       # GATEWAY_WEBHOOK_SECRET_FILE: /run/secrets/gateway_webhook_secret
       # GATEWAY_PRESENCE_CHANNEL_ID_FILE: /run/secrets/gateway_presence_channel_id
+      # Optional — operator web surface (opt-in). ALL THREE must be set together to
+      # enable the operator HTTP listener on gateway-net, or NONE (listener stays disabled).
+      # The listener binds to GATEWAY_OPERATOR_BIND_HOST on gateway-net — never 0.0.0.0
+      # or 127.0.0.1. TLS is terminated by the infra reverse proxy at PUBLIC_ORIGIN.
+      # Uncomment all three lines when deploying the operator web surface.
+      # GATEWAY_OPERATOR_BIND_HOST: 172.20.0.2   # gateway container's gateway-net IP
+      # GATEWAY_OPERATOR_BIND_PORT: 4000
+      # GATEWAY_OPERATOR_PUBLIC_ORIGIN: https://operator.example.com
       # Optional — canonical Fro Bot persona for the @-mention loop. When set, the
       # persona text is prepended to the Discord agent prompt (voice + behavior).
       # Absent → the loop falls back to built-in Discord guidance (fail-soft).

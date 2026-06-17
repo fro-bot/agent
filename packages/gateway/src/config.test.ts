@@ -70,6 +70,9 @@ beforeEach(() => {
     'GATEWAY_STATUS_MODE_FILE',
     'GATEWAY_PERSONA',
     'GATEWAY_PERSONA_FILE',
+    'GATEWAY_OPERATOR_BIND_HOST',
+    'GATEWAY_OPERATOR_BIND_PORT',
+    'GATEWAY_OPERATOR_PUBLIC_ORIGIN',
   ]) {
     delete process.env[key]
   }
@@ -1671,5 +1674,302 @@ describe('loadGatewayConfig — GATEWAY_STATUS_MODE', () => {
 
     // #then
     expect(config.statusMode).toBe('live-status')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_* — operator web surface config
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — operator web surface', () => {
+  it('happy path: all three operator vars absent → operatorWeb is undefined (listener disabled)', () => {
+    // #given — no operator vars set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — operator listener is disabled
+    expect(config.operatorWeb).toBeUndefined()
+  })
+
+  it('happy path: all three operator vars set → operatorWeb is populated', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb).toEqual({
+      bindHost: '172.20.0.2',
+      bindPort: 4000,
+      publicOrigin: 'https://operator.example.com',
+    })
+  })
+
+  it('error path: only GATEWAY_OPERATOR_BIND_HOST set → fails closed (partial config)', () => {
+    // #given — partial config
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+
+    // #when / #then — must throw with a clear message
+    expect(() => loadGatewayConfig()).toThrow(/partial operator web config/i)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_BIND_PORT/)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_PUBLIC_ORIGIN/)
+  })
+
+  it('error path: only GATEWAY_OPERATOR_BIND_PORT set → fails closed (partial config)', () => {
+    // #given — partial config
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/partial operator web config/i)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_BIND_HOST/)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_PUBLIC_ORIGIN/)
+  })
+
+  it('error path: only GATEWAY_OPERATOR_PUBLIC_ORIGIN set → fails closed (partial config)', () => {
+    // #given — partial config
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/partial operator web config/i)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_BIND_HOST/)
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_BIND_PORT/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=0.0.0.0 → throws (all-interfaces bind rejected)', () => {
+    // #given — all-interfaces bind is not allowed for the operator listener
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '0.0.0.0'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "0\.0\.0\.0"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=127.0.0.1 → throws (loopback bind rejected)', () => {
+    // #given — loopback bind is not allowed for the operator listener
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '127.0.0.1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "127\.0\.0\.1"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_PUBLIC_ORIGIN with http:// → throws (TLS required)', () => {
+    // #given — http:// origin is not allowed; TLS must be terminated by the reverse proxy
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'http://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must use https:\/\//)
+  })
+
+  it('error path: GATEWAY_OPERATOR_PUBLIC_ORIGIN is not a valid URL → throws', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'not-a-url'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_BIND_PORT=0 → throws (invalid port)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '0'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_BIND_PORT/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_BIND_PORT=70000 → throws (port out of range)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '70000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_BIND_PORT/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_BIND_PORT=not-a-number → throws (non-integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = 'not-a-port'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_BIND_PORT/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=::1 → throws (IPv6 loopback rejected)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '::1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "::1"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=0:0:0:0:0:0:0:1 → throws (full-form IPv6 loopback rejected)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '0:0:0:0:0:0:0:1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "0:0:0:0:0:0:0:1"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=127.0.0.2 → throws (127.0.0.0/8 loopback range rejected)', () => {
+    // #given — any 127.x.x.x address is loopback, not just 127.0.0.1
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '127.0.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "127\.0\.0\.2"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=10.0.0.2 → throws (sandbox-net rejected)', () => {
+    // #given — 10.0.0.0/8 is the Docker internal sandbox-net; operator must be on gateway-net
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '10.0.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/10\.0\.0\.0\/8 is the sandbox-net/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=10.255.255.1 → throws (sandbox-net range rejected)', () => {
+    // #given — any 10.x.x.x address is sandbox-net
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '10.255.255.1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/sandbox-net/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=:: → throws (IPv6 all-interfaces rejected)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '::'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be "::"/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=localhost → throws (hostname not allowed)', () => {
+    // #given — only literal IP addresses are accepted; hostnames are rejected
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = 'localhost'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must be a literal IP address/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=gateway.internal → throws (hostname not allowed)', () => {
+    // #given — DNS names are not accepted; only literal IPs
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = 'gateway.internal'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must be a literal IP address/)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_BIND_HOST=172.20.0.5 → accepted (gateway-net address)', () => {
+    // #given — gateway-net addresses (172.20.x.x) must remain valid
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.5'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — gateway-net address is accepted
+    expect(config.operatorWeb?.bindHost).toBe('172.20.0.5')
+  })
+
+  // ---------------------------------------------------------------------------
+  // IPv6 bind host — all IPv6 literals rejected (gateway-net is IPv4-only)
+  // ---------------------------------------------------------------------------
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=fe80::1 → throws (IPv6 link-local rejected)', () => {
+    // #given — link-local IPv6 address; gateway-net is IPv4-only
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = 'fe80::1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then — all IPv6 literals are rejected until IPv6 gateway-net topology exists
+    expect(() => loadGatewayConfig()).toThrow(/must not be an IPv6 address/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=fc00::1 → throws (IPv6 ULA rejected)', () => {
+    // #given — ULA (Unique Local Address) IPv6; gateway-net is IPv4-only
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = 'fc00::1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be an IPv6 address/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=2001:db8::1 → throws (IPv6 global unicast rejected)', () => {
+    // #given — documentation-range IPv6 global unicast; gateway-net is IPv4-only
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '2001:db8::1'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be an IPv6 address/)
+  })
+
+  it('security: GATEWAY_OPERATOR_BIND_HOST=0:0:0:0:0:0:0:2 → throws (full-form IPv6 non-loopback rejected)', () => {
+    // #given — full-form IPv6 address that is not loopback or all-interfaces;
+    // the all-interfaces (0:0:0:0:0:0:0:0) and loopback (0:0:0:0:0:0:0:1) forms
+    // are caught by earlier guards; this verifies the IPv6 catch-all fires for others.
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '0:0:0:0:0:0:0:2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/must not be an IPv6 address/)
   })
 })
