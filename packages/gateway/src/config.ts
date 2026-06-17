@@ -613,7 +613,11 @@ export function loadGatewayConfig(): GatewayConfig {
       )
     }
 
-    // Validate public origin — must be a valid https:// URL.
+    // Validate public origin — must be a canonical https:// origin:
+    //   scheme + host + optional port, no path beyond /, no query, no hash, no userinfo.
+    // A canonical origin is used for OAuth callbacks, cookies, CORS, and CSRF checks.
+    // Any extra component (path, query, hash, credentials) indicates a misconfiguration
+    // that would silently break those checks at runtime.
     let parsedPublicOrigin: URL
     try {
       parsedPublicOrigin = new URL(operatorPublicOrigin)
@@ -627,11 +631,55 @@ export function loadGatewayConfig(): GatewayConfig {
         `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" (must use https:// — the operator listener does not terminate TLS; TLS is handled by the infra reverse proxy)`,
       )
     }
+    // Reject non-canonical origin components. A canonical origin has:
+    //   - pathname of exactly '/' (URL always normalizes to '/' when no path is given)
+    //   - no search (query string)
+    //   - no hash
+    //   - no username or password (userinfo)
+    // pathname === '/' is the root — the only acceptable value. Any deeper path
+    // (e.g. '/some/path') means the value is a URL, not an origin.
+    if (parsedPublicOrigin.pathname !== '/') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" — must be a canonical origin (scheme + host + optional port only). ` +
+          `Remove the path component. A canonical origin has no path beyond /, no query, no hash, and no username/password. ` +
+          `Example: https://operator.example.com`,
+      )
+    }
+    if (parsedPublicOrigin.search !== '') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" — must be a canonical origin (scheme + host + optional port only). ` +
+          `Remove the query string. A canonical origin has no path beyond /, no query, no hash, and no username/password. ` +
+          `Example: https://operator.example.com`,
+      )
+    }
+    if (parsedPublicOrigin.hash !== '') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" — must be a canonical origin (scheme + host + optional port only). ` +
+          `Remove the hash fragment. A canonical origin has no path beyond /, no query, no hash, and no username/password. ` +
+          `Example: https://operator.example.com`,
+      )
+    }
+    if (parsedPublicOrigin.username !== '') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" — must be a canonical origin (scheme + host + optional port only). ` +
+          `Remove the username. A canonical origin has no path beyond /, no query, no hash, and no username/password. ` +
+          `Example: https://operator.example.com`,
+      )
+    }
+    if (parsedPublicOrigin.password !== '') {
+      throw new Error(
+        `Invalid GATEWAY_OPERATOR_PUBLIC_ORIGIN value: "${operatorPublicOrigin}" — must be a canonical origin (scheme + host + optional port only). ` +
+          `Remove the password. A canonical origin has no path beyond /, no query, no hash, and no username/password. ` +
+          `Example: https://operator.example.com`,
+      )
+    }
 
+    // Normalize to parsedPublicOrigin.origin: strips trailing slash and default ports.
+    // Stored value is always scheme+host+optional-non-default-port (no trailing slash).
     operatorWeb = {
       bindHost: operatorBindHost,
       bindPort: operatorBindPort,
-      publicOrigin: operatorPublicOrigin,
+      publicOrigin: parsedPublicOrigin.origin,
     }
   }
 

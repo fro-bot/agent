@@ -1973,3 +1973,89 @@ describe('loadGatewayConfig — operator web surface', () => {
     expect(() => loadGatewayConfig()).toThrow(/must not be an IPv6 address/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_PUBLIC_ORIGIN — canonical origin validation
+// ---------------------------------------------------------------------------
+
+function setOperatorEnv(origin: string): void {
+  setRequiredEnv()
+  process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+  process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+  process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
+}
+
+describe('loadGatewayConfig — GATEWAY_OPERATOR_PUBLIC_ORIGIN canonical origin validation', () => {
+  it('happy path: bare https origin with no path → accepted', () => {
+    // #given
+    setOperatorEnv('https://ops.example.com')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.publicOrigin).toBe('https://ops.example.com')
+  })
+
+  it('happy path: https origin with explicit port → accepted', () => {
+    // #given
+    setOperatorEnv('https://ops.example.com:8443')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.publicOrigin).toBe('https://ops.example.com:8443')
+  })
+
+  it('error path: origin with a path beyond / → rejected', () => {
+    // #given — paths beyond the root are not allowed in a canonical origin
+    setOperatorEnv('https://ops.example.com/some/path')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/canonical origin/)
+  })
+
+  it('error path: origin with a query string → rejected', () => {
+    // #given
+    setOperatorEnv('https://ops.example.com?foo=bar')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/canonical origin/)
+  })
+
+  it('error path: origin with a hash fragment → rejected', () => {
+    // #given
+    setOperatorEnv('https://ops.example.com#section')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/canonical origin/)
+  })
+
+  it('error path: origin with a username → rejected', () => {
+    // #given
+    setOperatorEnv('https://user@ops.example.com')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/canonical origin/)
+  })
+
+  it('error path: origin with a password → rejected', () => {
+    // #given
+    setOperatorEnv('https://user:pass@ops.example.com')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/canonical origin/)
+  })
+
+  it('edge: origin with trailing slash only (/) → accepted and normalized (trailing slash stripped)', () => {
+    // #given — https://ops.example.com/ is a valid canonical origin (pathname='/'); accepted
+    setOperatorEnv('https://ops.example.com/')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — stored as parsedPublicOrigin.origin which strips the trailing slash
+    expect(config.operatorWeb?.publicOrigin).toBe('https://ops.example.com')
+  })
+})
