@@ -381,15 +381,16 @@ describe('operator server — trusted origin enforcement', () => {
     expect(res.status).toBe(400)
   })
 
-  it('accepts X-Forwarded-Host with port suffix (host:port form)', async () => {
-    // #given — publicOrigin has no port; forwarded host includes port
-    // Inject a stub rate limiter so getConnInfo (which needs a real socket) is not reached
+  it('rejects X-Forwarded-Host with port suffix when publicOrigin has no port (full-host mismatch)', async () => {
+    // #given — publicOrigin has no explicit port (default 443 for https);
+    // publicOriginHost is 'operator.example.com' (no port suffix).
+    // Forwarded host includes ':443' — does not match exactly.
     const app = buildOperatorApp(
       makeStubDeps({rateLimiter: {allow: () => true}}),
       makeStubConfig({publicOrigin: 'https://operator.example.com'}),
     )
 
-    // #when — host with port suffix should match after stripping port
+    // #when — host with port suffix does NOT match the stored publicOriginHost
     const req = new Request('http://127.0.0.1/operator/health', {
       headers: {
         'x-forwarded-host': 'operator.example.com:443',
@@ -398,8 +399,8 @@ describe('operator server — trusted origin enforcement', () => {
     })
     const res = await app.fetch(req)
 
-    // #then — port suffix is stripped for comparison; accepted
-    expect(res.status).toBe(200)
+    // #then — full-host comparison: 'operator.example.com:443' !== 'operator.example.com'; rejected
+    expect(res.status).toBe(400)
   })
 
   it('rejects comma-separated X-Forwarded-Host (multi-value header)', async () => {
@@ -416,6 +417,46 @@ describe('operator server — trusted origin enforcement', () => {
     const res = await app.fetch(req)
 
     // #then — comma-separated host does not match the expected host; reject
+    expect(res.status).toBe(400)
+  })
+
+  it('accepts X-Forwarded-Host matching publicOrigin with non-default port (exact host:port match)', async () => {
+    // #given — publicOrigin includes a non-default port; forwarded host must match exactly
+    const app = buildOperatorApp(
+      makeStubDeps({rateLimiter: {allow: () => true}}),
+      makeStubConfig({publicOrigin: 'https://operator.example.com:8443'}),
+    )
+
+    // #when — forwarded host matches the stored publicOriginHost exactly
+    const req = new Request('http://127.0.0.1/operator/health', {
+      headers: {
+        'x-forwarded-host': 'operator.example.com:8443',
+        'x-forwarded-proto': 'https',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — exact match; accepted
+    expect(res.status).toBe(200)
+  })
+
+  it('rejects X-Forwarded-Host with mismatched port (port in forwarded but not in publicOrigin)', async () => {
+    // #given — publicOrigin has no explicit port; forwarded host includes a non-standard port
+    const app = buildOperatorApp(
+      makeStubDeps({rateLimiter: {allow: () => true}}),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — forwarded host has port 8443 but publicOriginHost is 'operator.example.com'
+    const req = new Request('http://127.0.0.1/operator/health', {
+      headers: {
+        'x-forwarded-host': 'operator.example.com:8443',
+        'x-forwarded-proto': 'https',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — 'operator.example.com:8443' !== 'operator.example.com'; rejected
     expect(res.status).toBe(400)
   })
 
@@ -564,5 +605,24 @@ describe('operator server — warning log on rejection paths', () => {
 
     // #then — warn was called once
     expect(logger.warn).toHaveBeenCalledOnce()
+  })
+
+  it('logs a warning when getConnInfo is unavailable (no-socket fallback path)', async () => {
+    // #given — use app.fetch() directly (no real socket) so getConnInfo throws;
+    // inject a rate limiter that always allows so the fallback path is reached.
+    const logger = makeLogger()
+    const app = buildOperatorApp(makeStubDeps({logger, rateLimiter: {allow: () => true}}), makeStubConfig())
+
+    // #when — direct app.fetch() has no underlying socket; getConnInfo will throw
+    const req = new Request('http://127.0.0.1/operator/health')
+    const res = await app.fetch(req)
+
+    // #then — request still succeeds (fallback key is used)
+    expect(res.status).toBe(200)
+
+    // #and — a warning was emitted for the collapsed rate-limit key
+    const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [Record<string, unknown>, string][]
+    const fallbackWarning = warnCalls.find(([, msg]) => msg.includes('getConnInfo unavailable'))
+    expect(fallbackWarning).toBeDefined()
   })
 })
