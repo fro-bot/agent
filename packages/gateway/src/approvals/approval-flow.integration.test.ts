@@ -803,7 +803,7 @@ describe('non-Discord transport — same registry, same fail-closed gate', () =>
       requestID: 'req-web-1',
       approvalScopeId: 'web-session-abc123',
       decision: 'once',
-      actor: {kind: 'web-operator', operatorId: 'operator-42'},
+      actor: {kind: 'web-operator', githubUserId: 42, login: 'operator-42', sessionCorrelationId: 'sess-web-1'},
     })
 
     // #then the decision was accepted (same registry, same gate)
@@ -820,8 +820,13 @@ describe('non-Discord transport — same registry, same fail-closed gate', () =>
     expect(registry.has('req-web-1')).toBe(false)
     expect(renderCalls).toHaveLength(1)
     expect(renderCalls[0]).toMatchObject({decision: 'once', reason: 'replied'})
-    // The actor is the web-operator identity
-    expect(renderCalls[0]?.actor).toEqual({kind: 'web-operator', operatorId: 'operator-42'})
+    // The actor is the web-operator identity with stable GitHub numeric ID
+    expect(renderCalls[0]?.actor).toEqual({
+      kind: 'web-operator',
+      githubUserId: 42,
+      login: 'operator-42',
+      sessionCorrelationId: 'sess-web-1',
+    })
   })
 
   it('web-operator scope mismatch is rejected (same fail-closed gate)', async () => {
@@ -844,7 +849,7 @@ describe('non-Discord transport — same registry, same fail-closed gate', () =>
       requestID: 'req-web-2',
       approvalScopeId: 'web-session-WRONG',
       decision: 'once',
-      actor: {kind: 'web-operator', operatorId: 'attacker'},
+      actor: {kind: 'web-operator', githubUserId: 0, login: 'attacker', sessionCorrelationId: 'sess-attacker'},
     })
 
     // #then scope mismatch — same fail-closed gate as Discord channel mismatch
@@ -902,7 +907,7 @@ describe('non-Discord transport — same registry, same fail-closed gate', () =>
       requestID: 'req-web',
       approvalScopeId: 'web-session-xyz',
       decision: 'reject',
-      actor: {kind: 'web-operator', operatorId: 'operator-99'},
+      actor: {kind: 'web-operator', githubUserId: 99, login: 'operator-99', sessionCorrelationId: 'sess-web-99'},
     })
     expect(webOutcome).toBe('ok')
 

@@ -1,5 +1,6 @@
-import type {CoordinationConfig, Result, Surface} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
+import type {PermissionRequest} from '../approvals/coordinator.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
@@ -7,7 +8,7 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
-import type {LaunchWorkRequest, ReplySink, StatusSink} from './launch-types.js'
+import type {LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
@@ -315,16 +316,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
     const coordLogger = toCoordLogger(logger)
-    // surface is a string for transport-neutrality; runtime Surface is currently
-    // 'github'|'discord' — widen when a web surface is added.
-    const lockResult = await acquireLock(
-      coordinationConfig,
-      repo,
-      identity,
-      request.surface as Surface,
-      runId,
-      coordLogger,
-    )
+    const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger)
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
@@ -347,11 +339,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
 
     const now = new Date().toISOString()
-    // surface is a string for transport-neutrality; runtime Surface is currently
-    // 'github'|'discord' — widen when a web surface is added.
     const initialRunState = {
       run_id: runId,
-      surface: request.surface as Surface,
+      surface: request.surface,
       thread_id: threadId, // empty string for non-Discord/in-memory paths
       entity_ref: repo,
       phase: 'PENDING' as const,
@@ -436,53 +426,75 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
       const approvalDeadlineMs = computeApprovalDeadlineMs(remainingBudgetMs)
 
-      // ── Discord approval transport — owns embed render, registry wiring, and
-      // the Message-reference cast (a clean Discord concern). The engine's
-      // onPending hook is transport-neutral; the Discord transport supplies the
-      // Discord implementation. A future web transport would supply its own.
+      // ── Approval transport selection ──────────────────────────────────────────
       //
-      // postReplyFactory: creates a per-request postReply closure that captures
-      // sessionID. Called once per onPending invocation by the transport.
-      // FIX 4: AbortSignal.timeout(10_000) avoids the dangling-timer leak from
-      // the old Promise.race approach. AbortSignal.timeout is self-cleaning.
-      const discordOnPending = createDiscordApprovalOnPending({
-        approvalRegistry,
-        replySink,
-        threadId,
-        directory: bindingWithEnsuredPath.workspacePath,
-        approvalDeadlineMs,
-        onDeadlineSettled: async () => {
-          // markVisibleOutputSent AFTER the send succeeds so flush() still
-          // adds _(no output)_ if the send fails (user needs the fallback).
-          const deadlineResult = await replySink.send('thread', {
-            content: 'Approval timed out — the task could not continue.',
+      // The engine's onPending hook is the transport-neutral extension point.
+      // When the request carries a `createApprovalOnPending` factory (e.g. a web
+      // transport), the engine calls it with all engine-owned context and uses
+      // the returned callback. When absent (the default for Discord), the engine
+      // constructs the Discord approval transport.
+      //
+      // The factory shape ensures the web transport receives canonical directory,
+      // deadline, runId/repo, registry, and postReply factory — without the
+      // transport duplicating engine internals or using stale binding paths.
+      //
+      // AbortSignal.timeout(10_000) avoids the dangling-timer leak from the old
+      // Promise.race approach. AbortSignal.timeout is self-cleaning.
+      const postReplyFactory: PostReplyFactory = sessionID => async (rID, dir, decision) => {
+        // Call the OpenCode SDK permission reply endpoint.
+        // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
+        try {
+          const res = await handle.client.postSessionIdPermissionsPermissionId({
+            path: {id: sessionID, permissionID: rID},
+            body: {response: decision},
+            query: {directory: dir},
+            signal: AbortSignal.timeout(10_000),
           })
-          const dr = deadlineResult as {success?: boolean} | undefined
-          if (dr?.success === true) {
-            replySink.markVisibleOutputSent()
+          const envelope = res as {error?: unknown} | undefined
+          if (envelope?.error != null) {
+            return {ok: false as const, error: String(envelope.error)}
           }
-        },
-        postReplyFactory: sessionID => async (rID, directory, decision) => {
-          // Call the OpenCode SDK permission reply endpoint.
-          // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
-          try {
-            const res = await handle.client.postSessionIdPermissionsPermissionId({
-              path: {id: sessionID, permissionID: rID},
-              body: {response: decision},
-              query: {directory},
-              signal: AbortSignal.timeout(10_000),
+          return {ok: true as const}
+        } catch (error) {
+          return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
+        }
+      }
+
+      // ── Approval transport selection — resolved before coordinator creation ──────
+      // `resolvedApprovalOnPending` is resolved first. If the factory throws, the outer
+      // catch handles it; the inner try/finally (which calls coordinator.dispose) is never
+      // entered, so there is no risk of accessing an uninitialized coordinator.
+      const resolvedApprovalOnPending: (req: PermissionRequest) => void =
+        request.createApprovalOnPending === undefined
+          ? createDiscordApprovalOnPending({
+              approvalRegistry,
+              replySink,
+              threadId,
+              directory: bindingWithEnsuredPath.workspacePath,
+              approvalDeadlineMs,
+              onDeadlineSettled: async () => {
+                // markVisibleOutputSent AFTER the send succeeds so flush() still
+                // adds _(no output)_ if the send fails (user needs the fallback).
+                const deadlineResult = await replySink.send('thread', {
+                  content: 'Approval timed out — the task could not continue.',
+                })
+                const dr = deadlineResult as {success?: boolean} | undefined
+                if (dr?.success === true) {
+                  replySink.markVisibleOutputSent()
+                }
+              },
+              postReplyFactory,
+              logger,
             })
-            const envelope = res as {error?: unknown} | undefined
-            if (envelope?.error != null) {
-              return {ok: false as const, error: String(envelope.error)}
-            }
-            return {ok: true as const}
-          } catch (error) {
-            return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
-          }
-        },
-        logger,
-      })
+          : request.createApprovalOnPending({
+              approvalRegistry,
+              directory: bindingWithEnsuredPath.workspacePath,
+              approvalDeadlineMs,
+              runId,
+              repo,
+              replySink,
+              postReplyFactory,
+            })
 
       const coordinator = createPermissionCoordinator({
         logger,
@@ -492,8 +504,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // The reaction is set here (in the engine) because it's transport-neutral
           // state management; the Discord embed/button rendering is in the transport.
           statusSink.setReaction('awaiting-approval')
-          // Delegate to the Discord transport for embed render + registry wiring.
-          discordOnPending(req)
+          // Delegate to the resolved approval transport for notification + registry wiring.
+          resolvedApprovalOnPending(req)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
@@ -993,8 +1005,6 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     promptText: strippedPrompt,
     channelId,
     guildId: message.guild?.id,
-    // surface is a string for transport-neutrality; runtime Surface is currently 'github'|'discord' —
-    // widen when a web surface is added. The engine casts request.surface as Surface at lock/run-state.
     surface: 'discord',
     binding,
     requester: {kind: 'discord-user', userId: message.author.id},
