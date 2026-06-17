@@ -417,7 +417,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Config validation and route-wrapper tests pass; no operator route can be added without the guardrail.
 
-- [ ] **Unit 3b: Audit seam and redaction guarantees**
+- [x] **Unit 3b: Audit seam and redaction guarantees**
 
   **Goal:** Add a single typed audit seam for security-critical events so all subsequent units can emit structured, redacted audit records without duplicating sink logic.
 
