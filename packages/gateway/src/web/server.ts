@@ -152,10 +152,9 @@ function validateForwardedHeaders(
   const hasHost = forwardedHost !== undefined && forwardedHost !== ''
   const hasProto = forwardedProto !== undefined && forwardedProto !== ''
 
-  // No forwarded headers — direct connection on gateway-net (operator listener
-  // topology owns direct-socket reachability for Unit 3a). Allow here, but
-  // privileged routes must not rely on this alone when auth lands; they must
-  // enforce their own identity checks regardless of connection path.
+  // No forwarded headers — direct connection on gateway-net. Network topology
+  // owns socket reachability; allow here, but authenticated routes must enforce
+  // identity independently of connection path.
   if (hasHost === false && hasProto === false) return true
 
   // Partial forwarded headers — suspicious. Reject.
@@ -256,9 +255,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // X-Forwarded-For, which is caller-spoofable). Use getConnInfo(c).remote.address
   // with a fallback to 'unknown' for test environments without a real socket.
   //
-  // For authenticated routes (added in Unit 3+): key on the authenticated
-  // identity (user ID / session ID) in addition to the socket key, so that
-  // a single authenticated user cannot exhaust the unauthenticated burst budget.
+  // For authenticated routes: key on the authenticated identity (user ID /
+  // session ID) so that a single authenticated user cannot exhaust the
+  // unauthenticated burst budget.
   //
   // Failure to call rateLimiter.allow() in a new route is a security defect.
   // The ingress-pin test (http/ingress-pin.test.ts) will catch any new route
