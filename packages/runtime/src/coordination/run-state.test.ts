@@ -5,7 +5,7 @@ import type {CoordinationConfig, RunState} from './types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {createRun, findStaleRuns, transitionRun} from './run-state.js'
+import {createRun, findStaleRuns, parseRunState, transitionRun} from './run-state.js'
 
 function createLogger(): Logger {
   return {
@@ -61,6 +61,96 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
     staleThresholdMs: 60_000,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Unit 1: Surface widening — web surface validation
+// ---------------------------------------------------------------------------
+
+describe('parseRunState — surface validation', () => {
+  it("accepts surface: 'github'", () => {
+    // #given a run-state with github surface
+    const state = {
+      run_id: 'run-1',
+      surface: 'github',
+      thread_id: 'thread-1',
+      entity_ref: 'owner/repo#123',
+      phase: 'PENDING',
+      started_at: '2026-04-24T18:00:00.000Z',
+      last_heartbeat: '2026-04-24T18:00:00.000Z',
+      holder_id: 'gateway-1',
+      details: {},
+    }
+
+    // #when parsed
+    const result = parseRunState(JSON.stringify(state))
+
+    // #then valid
+    expect(result.success).toBe(true)
+  })
+
+  it("accepts surface: 'discord'", () => {
+    // #given a run-state with discord surface
+    const state = {
+      run_id: 'run-1',
+      surface: 'discord',
+      thread_id: 'thread-1',
+      entity_ref: 'owner/repo#123',
+      phase: 'PENDING',
+      started_at: '2026-04-24T18:00:00.000Z',
+      last_heartbeat: '2026-04-24T18:00:00.000Z',
+      holder_id: 'gateway-1',
+      details: {},
+    }
+
+    // #when parsed
+    const result = parseRunState(JSON.stringify(state))
+
+    // #then valid
+    expect(result.success).toBe(true)
+  })
+
+  it("accepts surface: 'web' (Unit 1 widening)", () => {
+    // #given a run-state with web surface
+    const state = {
+      run_id: 'run-1',
+      surface: 'web',
+      thread_id: '',
+      entity_ref: 'owner/repo#123',
+      phase: 'PENDING',
+      started_at: '2026-04-24T18:00:00.000Z',
+      last_heartbeat: '2026-04-24T18:00:00.000Z',
+      holder_id: 'gateway-1',
+      details: {},
+    }
+
+    // #when parsed
+    const result = parseRunState(JSON.stringify(state))
+
+    // #then valid — web is a recognized surface
+    expect(result.success).toBe(true)
+  })
+
+  it("rejects an unknown surface: 'ftp'", () => {
+    // #given a run-state with an unknown surface
+    const state = {
+      run_id: 'run-1',
+      surface: 'ftp',
+      thread_id: 'thread-1',
+      entity_ref: 'owner/repo#123',
+      phase: 'PENDING',
+      started_at: '2026-04-24T18:00:00.000Z',
+      last_heartbeat: '2026-04-24T18:00:00.000Z',
+      holder_id: 'gateway-1',
+      details: {},
+    }
+
+    // #when parsed
+    const result = parseRunState(JSON.stringify(state))
+
+    // #then invalid — unknown surface is rejected
+    expect(result.success).toBe(false)
+  })
+})
 
 describe('run-state coordination', () => {
   beforeEach(() => {

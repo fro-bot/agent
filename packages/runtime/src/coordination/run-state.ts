@@ -47,7 +47,7 @@ function hasValidRunStateShape(value: unknown): value is RunState {
   const candidate = value as Partial<RunState>
   return (
     typeof candidate.run_id === 'string' &&
-    (candidate.surface === 'github' || candidate.surface === 'discord') &&
+    (candidate.surface === 'github' || candidate.surface === 'discord' || candidate.surface === 'web') &&
     typeof candidate.thread_id === 'string' &&
     typeof candidate.entity_ref === 'string' &&
     (candidate.phase === 'PENDING' ||
