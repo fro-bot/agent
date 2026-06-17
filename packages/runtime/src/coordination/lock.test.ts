@@ -75,6 +75,44 @@ describe('lock coordination', () => {
     vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
   })
 
+  it("accepts a fresh existing lock with surface: 'web'", async () => {
+    // #given
+    const existingLock = createLockRecord({surface: 'web', acquired_at: '2026-04-24T18:14:30.000Z'})
+    const storeAdapter = createStoreAdapter({
+      conditionalPut: vi
+        .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+        .mockResolvedValueOnce(err(new Error('precondition failed'))),
+      getObject: vi.fn(async () => ok({data: JSON.stringify(existingLock), etag: 'etag-existing'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+
+    // #then
+    expect(result).toEqual(ok({acquired: false, etag: null, holder: existingLock}))
+  })
+
+  it('rejects an existing lock with an unknown surface', async () => {
+    // #given
+    const invalidLock = {...createLockRecord(), surface: 'ftp'}
+    const storeAdapter = createStoreAdapter({
+      conditionalPut: vi
+        .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+        .mockResolvedValueOnce(err(new Error('precondition failed'))),
+      getObject: vi.fn(async () => ok({data: JSON.stringify(invalidLock), etag: 'etag-existing'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'gateway-2', 'github', 'run-2', logger)
+
+    // #then
+    expect(result).toEqual(err(new Error('Invalid lock record payload')))
+  })
+
   it('acquires a lock when no existing lock record is present', async () => {
     // #given
     const storeAdapter = createStoreAdapter()

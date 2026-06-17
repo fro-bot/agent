@@ -35,6 +35,10 @@
  *    are all transport-agnostic — you get them for free.
  */
 
+import type {Surface} from '@fro-bot/runtime'
+
+import type {PermissionReply, PermissionRequest} from '../approvals/coordinator.js'
+import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {MessageContentOptions} from '../discord/io.js'
 import type {TransitionResult} from '../discord/status-message.js'
@@ -53,13 +57,31 @@ export interface DiscordRequesterIdentity {
 }
 
 /**
- * A future web operator who triggered the run via the control surface.
- * Shape is intentionally minimal — extend with session/auth fields when a web surface is added.
+ * A web operator who triggered the run via the control surface.
+ *
+ * Carries stable GitHub numeric identity for authorization and audit, plus
+ * a display login for human-readable logs. The numeric ID is the authoritative
+ * identity — logins are mutable and must not be used for access decisions.
  */
 export interface WebOperatorIdentity {
   readonly kind: 'web-operator'
-  /** Stable operator identifier (e.g. GitHub login or internal operator ID). */
-  readonly operatorId: string
+  /**
+   * Stable GitHub numeric user ID (from the GitHub API `id` field).
+   * Used for authorization, audit, and idempotency key scoping.
+   * Prefer this over `login` for any access-control or audit decision.
+   */
+  readonly githubUserId: number
+  /**
+   * GitHub display login (e.g. `'octocat'`).
+   * Mutable — use only for human-readable logs and display metadata.
+   * Never use for authorization or audit identity.
+   */
+  readonly login: string
+  /**
+   * Opaque session correlation value for log correlation.
+   * Not used for authorization — use `githubUserId` instead.
+   */
+  readonly sessionCorrelationId: string
 }
 
 /**
@@ -415,13 +437,13 @@ export interface LaunchWorkRequest {
 
   /**
    * Transport-neutral surface identifier written into lock and run-state records.
-   * Allows a future web run to be recorded as `'web'` rather than `'discord'`.
+   * Allows a web run to be recorded as `'web'` rather than `'discord'`.
    *
    * The Discord adapter passes `'discord'`; a web adapter passes `'web'`.
-   * surface is a string for transport-neutrality; runtime Surface is currently
-   * 'github'|'discord' — widen when a web surface is added.
+   * Now typed as `Surface` (which includes `'github' | 'discord' | 'web'`)
+   * so callers get compile-time validation and the engine needs no cast.
    */
-  readonly surface: string
+  readonly surface: Surface
 
   /**
    * The repo binding (owner, repo, channelId, workspacePath, …).
@@ -452,4 +474,140 @@ export interface LaunchWorkRequest {
    * `sendMessage`. See `ReplySink` for the full contract.
    */
   readonly replySink: ReplySink
+
+  /**
+   * Optional factory for the transport-specific approval notification callback.
+   *
+   * When present, the engine calls this factory once — after `ensureClone`,
+   * `readyz`, thread creation, lock acquisition, and run-state setup — passing
+   * all engine-owned context the transport needs to register entries in the
+   * approval registry, set deadlines, and wire reply routing. The factory
+   * returns the `onPending` callback that the coordinator calls for each
+   * permission request.
+   *
+   * When absent (the default), the engine uses the Discord approval transport
+   * (`createDiscordApprovalOnPending`). Discord behavior is unchanged.
+   *
+   * A web transport provides this factory to push approval notifications to SSE
+   * subscribers and register entries in the approval registry with a web scope
+   * ID — without duplicating engine internals or using stale binding paths.
+   *
+   * The factory must not throw. The returned callback must not throw — the
+   * coordinator wraps it defensively.
+   *
+   * @example
+   * ```ts
+   * // Web transport:
+   * const request: LaunchWorkRequest = {
+   *   // ...
+   *   createApprovalOnPending: (ctx) => (req) => {
+   *     ctx.approvalRegistry.register({
+   *       requestID: req.requestID,
+   *       sessionID: req.sessionID,
+   *       approvalScopeId: ctx.runId,   // web scope: runId or session correlation ID
+   *       directory: ctx.directory,
+   *       request: req,
+   *       effects: { postReply: ctx.postReplyFactory(req.sessionID) },
+   *       deadlineMs: ctx.approvalDeadlineMs,
+   *     })
+   *     hub.notify({ runId: ctx.runId, repo: ctx.repo, request: req })
+   *   },
+   * }
+   * ```
+   */
+  readonly createApprovalOnPending?: (context: ApprovalTransportContext) => (request: PermissionRequest) => void
+}
+
+// ---------------------------------------------------------------------------
+// PostReplyFactory — transport-neutral factory for per-request SDK reply closures
+// ---------------------------------------------------------------------------
+
+/**
+ * Factory for the per-request `postReply` function.
+ *
+ * The transport calls this once per `onPending` invocation to create a closure
+ * that captures the per-request `sessionID`. The factory receives the
+ * `sessionID` and returns a function that POSTs the decision to OpenCode.
+ *
+ * Defined here (in `launch-types.ts`) so `ApprovalTransportContext` can
+ * reference it without creating a circular import with `discord-transport.ts`.
+ * `discord-transport.ts` re-exports this type for backwards compatibility.
+ */
+export type PostReplyFactory = (
+  sessionID: string,
+) => (
+  requestID: string,
+  directory: string,
+  decision: PermissionReply,
+) => Promise<{readonly ok: boolean; readonly error?: string}>
+
+// ---------------------------------------------------------------------------
+// ApprovalTransportContext — engine-owned context passed to the approval factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Engine-owned context passed to `LaunchWorkRequest.createApprovalOnPending`.
+ *
+ * Contains everything a transport needs to register approval entries in the
+ * shared registry, set deadlines, and wire reply routing — without duplicating
+ * engine internals or using stale binding paths.
+ *
+ * All fields are set by the engine at the point it has canonical directory,
+ * deadline, runId/repo, registry, and postReply factory available (after
+ * `ensureClone`, `readyz`, thread creation, lock acquisition, and run-state
+ * setup).
+ *
+ * ## Field ownership
+ *
+ * - `approvalRegistry` — program-scoped registry; the trust anchor for
+ *   fail-closed settlement. The transport calls `register()` here.
+ * - `directory` — canonical workspace path from `ensureClone` (not the
+ *   potentially stale `binding.workspacePath`). Use this for reply routing.
+ * - `approvalDeadlineMs` — per-approval deadline aligned with the run budget.
+ *   Pass to `registry.register({ deadlineMs })`.
+ * - `runId` — stable UUID for this run. Use as `approvalScopeId` for web
+ *   transports (or derive a scope token from it).
+ * - `repo` — `owner/repo` string for audit, logging, and correlation.
+ * - `replySink` — the run's reply sink. Available if the transport wants to
+ *   post a waiting-status message (Discord does; a web transport may use its
+ *   own channel instead).
+ * - `postReplyFactory` — factory for the per-request `postReply` closure.
+ *   Call `postReplyFactory(sessionID)` once per `onPending` invocation to
+ *   create the closure that POSTs the decision to OpenCode.
+ */
+export interface ApprovalTransportContext {
+  /** Program-scoped approval registry. The transport calls `register()` here. */
+  readonly approvalRegistry: ApprovalRegistry
+  /**
+   * Canonical workspace directory from `ensureClone`.
+   * Use for `registry.register({ directory })` and reply routing.
+   */
+  readonly directory: string
+  /**
+   * Per-approval deadline in milliseconds, aligned with the run budget.
+   * Pass to `registry.register({ deadlineMs })`.
+   * `undefined` when no deadline is configured.
+   */
+  readonly approvalDeadlineMs: number | undefined
+  /**
+   * Stable UUID for this run.
+   * Use as `approvalScopeId` for web transports (or derive a scope token).
+   */
+  readonly runId: string
+  /**
+   * `owner/repo` string for audit, logging, and correlation.
+   */
+  readonly repo: string
+  /**
+   * The run's reply sink. Available if the transport wants to post a
+   * waiting-status message. Discord uses this; a web transport may use
+   * its own notification channel instead.
+   */
+  readonly replySink: ReplySink
+  /**
+   * Factory for the per-request `postReply` closure.
+   * Call `postReplyFactory(sessionID)` once per `onPending` invocation.
+   * The returned function POSTs the decision to OpenCode's reply endpoint.
+   */
+  readonly postReplyFactory: PostReplyFactory
 }

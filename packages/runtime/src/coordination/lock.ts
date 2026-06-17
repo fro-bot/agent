@@ -58,7 +58,7 @@ function hasValidLockRecordShape(value: unknown): value is LockRecord {
   return (
     typeof candidate.repo === 'string' &&
     typeof candidate.holder_id === 'string' &&
-    (candidate.surface === 'github' || candidate.surface === 'discord') &&
+    (candidate.surface === 'github' || candidate.surface === 'discord' || candidate.surface === 'web') &&
     typeof candidate.acquired_at === 'string' &&
     typeof candidate.ttl_seconds === 'number' &&
     Number.isFinite(candidate.ttl_seconds) &&

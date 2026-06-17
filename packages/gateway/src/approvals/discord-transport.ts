@@ -33,7 +33,7 @@
 import type {Message} from 'discord.js'
 
 import type {GatewayLogger} from '../discord/client.js'
-import type {ReplySink} from '../execute/launch-types.js'
+import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
 import type {ApprovalActor, ApprovalRegistry} from './registry.js'
 
@@ -45,22 +45,12 @@ import {editMessage} from '../discord/io.js'
 // ---------------------------------------------------------------------------
 
 /**
- * Factory for the per-request `postReply` function.
+ * Re-export `PostReplyFactory` from `launch-types.ts` for backwards compatibility.
  *
- * The transport calls this once per `onPending` invocation to create a closure
- * that captures the per-request `sessionID`. The factory receives the
- * `sessionID` and returns a function that POSTs the decision to OpenCode.
- *
- * This is the seam that keeps the SDK call inside the transport (a clean
- * Discord/OpenCode concern) while letting the engine remain transport-neutral.
+ * The canonical definition lives in `launch-types.ts` so `ApprovalTransportContext`
+ * can reference it without creating a circular import with this module.
  */
-export type PostReplyFactory = (
-  sessionID: string,
-) => (
-  requestID: string,
-  directory: string,
-  decision: PermissionReply,
-) => Promise<{readonly ok: boolean; readonly error?: string}>
+export type {PostReplyFactory}
 
 export interface DiscordApprovalTransportDeps {
   /** Program-scoped approval registry shared with the button handler. */
@@ -160,24 +150,32 @@ export function createDiscordApprovalOnPending(
     // round-trip has not completed yet. settle(true) on success promotes to
     // permanently delivered; settle(false) on failure retracts the claim.
     const settleWaitingStatus = replySink.markVisibleOutputPending()
-    // ReplySink.send must not reject — the Discord impl is fail-soft (sendMessage never rejects).
-    // A non-fail-soft transport (e.g. a future web transport) must add a .catch() here that
-    // calls settleWaitingStatus(false) and releases the pending claim, or the rejection will
-    // surface as an unhandled rejection inside onPending.
     // eslint-disable-next-line no-void
-    void replySink.send('thread', {content: 'Waiting for tool approval\u2026'}).then(result => {
-      // replySink.send returns unknown; cast to check success (one documented cast).
-      const r = result as {success?: boolean; error?: {message: string}} | undefined
-      if (r?.success === true) {
-        settleWaitingStatus(true)
-      } else {
+    void replySink
+      .send('thread', {content: 'Waiting for tool approval…'})
+      .then(result => {
+        // replySink.send returns unknown; cast to check success (one documented cast).
+        const r = result as {success?: boolean; error?: {message: string}} | undefined
+        if (r?.success === true) {
+          settleWaitingStatus(true)
+        } else {
+          settleWaitingStatus(false)
+          logger.warn(
+            {requestID, err: r?.error?.message ?? 'unknown'},
+            'discord-transport: failed to post waiting-for-approval status',
+          )
+        }
+      })
+      .catch((error: unknown) => {
+        // Settle the pending visibility claim false so flush() does not treat
+        // this as delivered visible output. Log a warning but do not rethrow —
+        // onPending must not throw (coordinator wraps it defensively).
         settleWaitingStatus(false)
         logger.warn(
-          {requestID, err: r?.error?.message ?? 'unknown'},
-          'discord-transport: failed to post waiting-for-approval status',
+          {requestID, err: error instanceof Error ? error.message : String(error)},
+          'discord-transport: waiting-for-approval send rejected unexpectedly',
         )
-      }
-    })
+      })
 
     // Fire-and-forget: send the embed then attach the render function.
     // onPending must not throw (coordinator catches internally anyway).
@@ -192,8 +190,6 @@ export function createDiscordApprovalOnPending(
     // it's a clean Discord concern). Widen ReplySink.send to return a typed
     // result when a web transport needs the posted message reference.
     const settleEmbed = replySink.markVisibleOutputPending()
-    // Same contract as above: ReplySink.send must not reject. A non-fail-soft transport
-    // must add a .catch() that calls settleEmbed(false) and releases the pending claim.
     // eslint-disable-next-line no-void
     void replySink
       .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]})
@@ -218,8 +214,8 @@ export function createDiscordApprovalOnPending(
               ) => {
                 // Derive a display string from the typed actor for the settled embed.
                 // Discord-specific: extract the userId for the decidedBy display.
-                const decidedBy =
-                  actor === null ? null : actor.kind === 'discord-user' ? actor.userId : actor.operatorId
+                // For web operators, use the display login (mutable but human-readable for embeds).
+                const decidedBy = actor === null ? null : actor.kind === 'discord-user' ? actor.userId : actor.login
                 const editResult = await editMessage(
                   postedMessage,
                   {
@@ -245,6 +241,17 @@ export function createDiscordApprovalOnPending(
           )
           approvalRegistry.markMessagePostFailed(requestID)
         }
+      })
+      .catch((error: unknown) => {
+        // Settle the pending visibility claim false and mark the registry entry
+        // as post-failed so the button handler knows the embed was never posted.
+        // Log a warning but do not rethrow — onPending must not throw.
+        settleEmbed(false)
+        logger.warn(
+          {requestID, err: error instanceof Error ? error.message : String(error)},
+          'discord-transport: approval embed send rejected unexpectedly',
+        )
+        approvalRegistry.markMessagePostFailed(requestID)
       })
   }
 }

@@ -2,7 +2,7 @@ import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/types.
 
 export type RunPhase = 'PENDING' | 'ACKNOWLEDGED' | 'EXECUTING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
 
-export type Surface = 'github' | 'discord'
+export type Surface = 'github' | 'discord' | 'web'
 
 export interface RunState {
   readonly run_id: string
