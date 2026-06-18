@@ -27,11 +27,12 @@
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {OperatorAllowlist} from './allowlist.js'
 import type {SessionDeps, SessionStore} from './session.js'
 import {createHash, randomBytes} from 'node:crypto'
 import {emitAudit} from '../audit.js'
-import {registerPublicRoute} from '../operator-route.js'
-import {badRequestResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
+import {registerPublicCrossSiteRoute, registerPublicRoute} from '../operator-route.js'
+import {badRequestResponse, forbiddenResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
 import {buildSessionCookieValue, parseSessionCookie} from './session.js'
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,13 @@ export interface GitHubOAuthDeps {
    * Required when sessionStore is present; ignored otherwise.
    */
   readonly sessionDeps?: SessionDeps
+  /**
+   * Operator allowlist for post-authentication authorization.
+   * When present (alongside sessionStore), the callback checks the allowlist
+   * BEFORE minting a session — non-allowlisted users are denied 403 and never
+   * get a session cookie. When absent, no allowlist check is performed.
+   */
+  readonly allowlist?: OperatorAllowlist
 }
 
 /** Configuration for the GitHub OAuth PKCE + state routes. */
@@ -189,6 +197,7 @@ export function buildGitHubOAuthDeps(
   rateLimiter: RateLimiter,
   sessionStore?: SessionStore,
   sessionDeps?: SessionDeps,
+  allowlist?: OperatorAllowlist,
 ): GitHubOAuthDeps {
   return {
     logger,
@@ -202,6 +211,7 @@ export function buildGitHubOAuthDeps(
     rateLimiter,
     ...(sessionStore === undefined ? {} : {sessionStore}),
     ...(sessionDeps === undefined ? {} : {sessionDeps}),
+    ...(allowlist === undefined ? {} : {allowlist}),
   }
 }
 
@@ -444,11 +454,12 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
   // ── GET /operator/auth/github/callback ─────────────────────────────────────
   //
-  // GitHub redirects the browser cross-site after authorization, so future
-  // Fetch Metadata middleware must allow this callback route to receive
-  // Sec-Fetch-Site: cross-site.
+  // GitHub redirects the browser cross-site after authorization, so this route
+  // is registered as a public cross-site route to allow Sec-Fetch-Site: cross-site.
+  // The Fetch Metadata browser guard exempts this route from cross-site rejection.
+  // All other security checks (state validation, PKCE, source key binding) remain.
 
-  registerPublicRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
+  registerPublicCrossSiteRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
     // Determine source key for rate limiting and source key binding validation.
     const sourceKey = deps.getSourceKey(c)
 
@@ -614,6 +625,14 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
     // Mint a server-side session when a session store is wired.
     if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
+      // Check allowlist BEFORE minting a session — non-allowlisted users must not
+      // receive a session cookie. This is the authoritative allowlist gate for OAuth.
+      if (deps.allowlist !== undefined && deps.allowlist.isAuthorized(githubUserId) === false) {
+        deps.logger.warn({githubUserId}, 'oauth callback: operator not in allowlist — session not minted')
+        emitAudit({kind: 'auth.callback.failure', correlationId, reason: 'not_allowlisted' as const}, deps.auditLogger)
+        return forbiddenResponse(c)
+      }
+
       const nowMs = deps.sessionDeps.clock()
 
       // Clear any stale pre-auth session cookie before setting the new one

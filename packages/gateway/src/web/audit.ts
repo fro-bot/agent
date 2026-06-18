@@ -16,6 +16,7 @@ export type AuthCallbackFailureReason =
   | 'token_exchange_failed'
   | 'user_fetch_failed'
   | 'source_key_mismatch'
+  | 'not_allowlisted'
   | 'unknown'
 
 /** Safe reasons for authorization denial. */
@@ -29,6 +30,24 @@ export type ApprovalRejectedReason = 'already_claimed' | 'not_found' | 'deadline
 
 /** Safe reasons for bearer token rejection. */
 export type BearerRejectedReason = 'missing_token' | 'invalid_signature' | 'expired' | 'unknown'
+
+/** Safe reasons for browser-origin guard rejection. */
+export type BrowserGuardRejectedReason =
+  | 'non_cookie_credential'
+  | 'no_session'
+  | 'invalid_session'
+  | 'not_allowlisted'
+  | 'origin_null'
+  | 'origin_mismatch'
+  | 'origin_missing'
+  | 'fetch_site_cross_site'
+  | 'fetch_site_same_site'
+  | 'fetch_mode_navigate'
+  | 'fetch_mode_no_cors'
+  | 'fetch_dest_object_embed'
+  | 'csrf_missing'
+  | 'csrf_invalid'
+  | 'unknown'
 
 /** OAuth flow initiated. */
 export interface AuthStartEvent {
@@ -126,6 +145,20 @@ export interface BearerRejectedEvent {
   readonly reason: BearerRejectedReason
 }
 
+/** Browser-origin guard rejected a request. */
+export interface BrowserGuardRejectedEvent {
+  readonly kind: 'browser.guard.rejected'
+  readonly correlationId: string
+  /** Safe enum — never header values, origins, or credential values. */
+  readonly reason: BrowserGuardRejectedReason
+  /**
+   * GitHub numeric user ID — present only when reason is 'not_allowlisted'
+   * (i.e. the session was valid but the user is not in the allowlist).
+   * Absent for all other rejection reasons where identity is not yet established.
+   */
+  readonly githubUserId?: number
+}
+
 /** All security-critical audit events. */
 export type AuditEvent =
   | AuthStartEvent
@@ -140,6 +173,7 @@ export type AuditEvent =
   | ApprovalRejectedEvent
   | BindingReadEvent
   | BearerRejectedEvent
+  | BrowserGuardRejectedEvent
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -207,6 +241,7 @@ const LOG_LEVEL: Record<AuditEvent['kind'], 'info' | 'warn'> = {
   'approval.rejected': 'warn',
   'binding.read': 'info',
   'bearer.rejected': 'warn',
+  'browser.guard.rejected': 'warn',
 }
 
 /** Compile-time exhaustiveness guard — unreachable at runtime. */
@@ -243,6 +278,7 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'authz.denied':
     case 'launch.rejected':
     case 'bearer.rejected':
+    case 'browser.guard.rejected':
       // No additional caller-controlled string fields on these variants.
       break
     default:

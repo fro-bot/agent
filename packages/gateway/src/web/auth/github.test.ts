@@ -2111,3 +2111,173 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     expect(revocationHook).toHaveBeenCalledExactlyOnceWith(staleSessionId)
   })
 })
+
+// ---------------------------------------------------------------------------
+// OAuth callback — allowlist check before session creation (Fix 2)
+// ---------------------------------------------------------------------------
+
+function buildTestAppWithSessionAndAllowlist(
+  deps: GitHubOAuthDeps,
+  config: GitHubOAuthConfig,
+  sessionStore: SessionStore,
+  sessionDeps: SessionDeps,
+  allowlist: import('./allowlist.js').OperatorAllowlist,
+): Hono {
+  const app = new Hono()
+  registerPublicRoute(app, 'GET', '/operator/health', c => c.json({ok: true}))
+  buildGitHubOAuthRoutes(app, {...deps, sessionStore, sessionDeps, allowlist}, config)
+  assertAllPrivilegedRoutesWrapped(app)
+  return app
+}
+
+describe('GET /operator/auth/github/callback — allowlist check before session creation', () => {
+  it('returns 403 and does not mint a session when user is not in allowlist', async () => {
+    // #given — allowlist only contains user 99, callback returns user 42
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const allowlist: import('./allowlist.js').OperatorAllowlist = {
+      isAuthorized: (id: number) => id === 99, // only user 99 is allowed
+      size: 1,
+    }
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}), // user 42 is NOT in allowlist
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSessionAndAllowlist(deps, config, sessionStore, sessionDeps, allowlist)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — 403 Forbidden (not allowlisted)
+    expect(res.status).toBe(403)
+
+    // #and — no session was created
+    expect(sessionStore.size()).toBe(0)
+  })
+
+  it('does not set a session cookie when user is not in allowlist', async () => {
+    // #given — allowlist only contains user 99, callback returns user 42
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const allowlist: import('./allowlist.js').OperatorAllowlist = {
+      isAuthorized: (id: number) => id === 99,
+      size: 1,
+    }
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSessionAndAllowlist(deps, config, sessionStore, sessionDeps, allowlist)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — no session cookie in response
+    const setCookieHeaders = res.headers.getSetCookie()
+    const sessionCookie = setCookieHeaders.find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`))
+    expect(sessionCookie).toBeUndefined()
+  })
+
+  it('emits auth.callback.failure with reason not_allowlisted when user is not in allowlist', async () => {
+    // #given — allowlist only contains user 99, callback returns user 42
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const allowlist: import('./allowlist.js').OperatorAllowlist = {
+      isAuthorized: (id: number) => id === 99,
+      size: 1,
+    }
+
+    const auditLogger = makeAuditLogger()
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+      auditLogger,
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSessionAndAllowlist(deps, config, sessionStore, sessionDeps, allowlist)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    await app.fetch(req)
+
+    // #then — audit event emitted with reason not_allowlisted
+    const failureRecord = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
+    expect(failureRecord).toBeDefined()
+    expect(failureRecord?.reason).toBe('not_allowlisted')
+  })
+
+  it('allows session creation when user IS in allowlist', async () => {
+    // #given — allowlist contains user 42, callback returns user 42
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const allowlist: import('./allowlist.js').OperatorAllowlist = {
+      isAuthorized: (id: number) => id === 42, // user 42 is allowed
+      size: 1,
+    }
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSessionAndAllowlist(deps, config, sessionStore, sessionDeps, allowlist)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — 200 OK, session created
+    expect(res.status).toBe(200)
+    expect(sessionStore.size()).toBe(1)
+  })
+})

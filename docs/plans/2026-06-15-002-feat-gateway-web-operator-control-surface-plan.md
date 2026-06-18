@@ -523,56 +523,53 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Session store is bounded, revocable, and covered by deterministic typed tests.
 
-- [ ] **Unit 3e: Origin / Fetch Metadata / CSRF middleware**
+- [x] **Unit 3e: Allowlist authorization + Origin / Fetch Metadata / CSRF middleware** *(corrected scope — 2026-06-18)*
 
-  **Goal:** Implement the layered browser-origin protection stack that all mutating operator routes must pass through.
+  **Goal:** Implement the complete authorization boundary: operator allowlist check AND the layered browser-origin protection stack. This is the corrected gate per fro-bot/.github#3512 issuecomment 4738952239.
 
-  **Requirements:** R3, R4
+  **Requirements:** R1, R3, R4, R14
 
   **Dependencies:** Unit 3d
 
   **Files:**
-  - Create: `packages/gateway/src/web/auth/csrf.ts`
-  - Create: `packages/gateway/src/web/auth/csrf.test.ts`
-  - Modify: `packages/gateway/src/web/operator-route.ts`
+  - Created: `packages/gateway/src/web/auth/allowlist.ts`
+  - Created: `packages/gateway/src/web/auth/allowlist.test.ts`
+  - Created: `packages/gateway/src/web/auth/csrf.ts`
+  - Created: `packages/gateway/src/web/auth/csrf.test.ts`
+  - Created: `packages/gateway/src/web/auth/csrf-route.ts`
+  - Modified: `packages/gateway/src/web/operator-route.ts` (added `registerPublicCrossSiteRoute`, `isPublicCrossSiteRoute`)
+  - Modified: `packages/gateway/src/web/auth/github.ts` (callback uses `registerPublicCrossSiteRoute`)
+  - Modified: `packages/gateway/src/web/server.ts` (wired CSRF endpoint, added `allowlist`/`csrfSecret`/`auditLogger` deps)
+  - Modified: `packages/gateway/src/web/audit.ts` (added `BrowserGuardRejectedEvent`)
+  - Modified: `packages/gateway/src/web/audit.test.ts` (tests for new audit events)
+  - Modified: `packages/gateway/src/web/server.test.ts` (integration tests for CSRF endpoint and browser guard)
+  - Modified: `packages/gateway/src/web/operator-route.test.ts` (cross-site route classification tests)
 
   **Approach:**
-  - Do not rely on `hono/csrf` for JSON mutating routes. Implement custom signed double-submit CSRF tokens: tokens are bound to session id, operator id, issued-at, and a nonce/version; signed with the CSRF signing key from config; rotated on login, refresh, and a 15-minute interval; invalidated on logout, expiry, and revocation.
-  - Guard mutating routes in this order: (1) reject non-cookie credential schemes (`Authorization`, `Proxy-Authorization`, `X-API-Key`) and audit without logging credential values; (2) validate session; (3) validate `Host`/`Origin` against `GATEWAY_OPERATOR_PUBLIC_ORIGIN`; (4) reject unsafe Fetch Metadata combinations (`Sec-Fetch-Site: cross-site` on non-exempted routes, `Sec-Fetch-Mode: navigate` on non-navigation routes) when headers are present; (5) parse and verify CSRF token.
-  - The OAuth callback is narrowly exempted from Fetch Metadata cross-site rejection (established in Unit 3c); no other route is exempted.
-  - Add a `GET /operator/session/csrf` route that returns a fresh signed double-submit token for an authenticated session.
-
-  **Patterns to follow:**
-  - OWASP CSRF Prevention Cheat Sheet: signed double-submit + origin/Fetch Metadata defense in depth.
-  - No-oracle auth failure behavior from signed webhook ingress.
-
-  **Test scenarios:**
-  - Security: mutating routes reject missing CSRF token, invalid CSRF signature, expired CSRF token, and mismatched session binding.
-  - Security: mutating routes reject `Origin` header that does not match `GATEWAY_OPERATOR_PUBLIC_ORIGIN`.
-  - Security: `Sec-Fetch-Site: cross-site` on a non-exempted mutating route is rejected.
-  - Security: non-cookie credential schemes are rejected and audited without logging the credential value.
-  - Security: CSRF token refresh requires a valid session and rotates tokens on schedule.
-  - Happy path: a valid session + matching origin + valid CSRF token passes all checks.
+  - Allowlist: file-backed (text, one numeric GitHub user ID per line, comments with #). Fail-closed: missing/empty/malformed startup config rejects; browser guard denies non-allowlisted session-bound identities and audits the numeric GitHub user ID.
+  - CSRF tokens: HMAC-SHA256, bound to session ID + operator ID + 15-minute interval. 30-second grace window for previous interval. Timing-safe comparison. CSRF signing key must be strict base64url with at least 256 bits of decoded entropy. Token format: `base64url(payload).base64url(hmac)`.
+  - Browser guard (`applyBrowserGuard`): (a) reject non-cookie credential schemes; (b) validate session cookie; (c) enforce allowlist; (d) validate Origin exactly against `publicOrigin`; reject `Origin: null`; (e) validate Fetch Metadata; (f) verify CSRF token for mutating routes.
+  - OAuth callback registered via `registerPublicCrossSiteRoute` — exempt from cross-site Fetch Metadata rejection only. All other security checks remain.
+  - `GET /operator/session/csrf`: privileged route, requires session + allowlist + origin/fetch-metadata pass. Returns token in response body only.
+  - New audit event: `browser.guard.rejected` — safe enums only, no header values.
+  - `Vary: Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest` on guard responses and CSRF endpoint responses.
 
   **Verification:**
-  - CSRF and origin middleware are tested in isolation and wired into the route guardrail from Unit 3a.
+  - 52/52 test files pass. Type check clean. Lint clean. Build succeeds.
 
-- [ ] **Unit 3f: Allowlist + repo authorization helper**
+- [ ] **Unit 3f: Repo authorization helper**
 
-  **Goal:** Implement the operator allowlist check and the single repo authorization helper used by all privileged routes.
+  **Goal:** Implement the single repo authorization helper used by all privileged routes.
 
   **Requirements:** R1, R14, R19
 
-  **Dependencies:** Unit 3d
+  **Dependencies:** Unit 3e
 
   **Files:**
-  - Create: `packages/gateway/src/web/auth/allowlist.ts`
   - Create: `packages/gateway/src/web/auth/repo-authz.ts`
-  - Create: `packages/gateway/src/web/auth/allowlist.test.ts`
   - Create: `packages/gateway/src/web/auth/repo-authz.test.ts`
 
   **Approach:**
-  - Load the operator allowlist from a hardened config/file path. v1 uses a file-backed allowlist; hot reload can be added later. Allowlist entries are stable numeric GitHub user IDs, not logins.
   - Add one `checkRepoAuthz(operatorId, owner, repo, userOAuthToken, logger)` helper used by launch, run-state, approvals, and binding reads. v1 rule: allowlist membership plus verified GitHub read access to the target repo using the user OAuth token (not only app installation auth). Failures deny.
   - Cache repo authorization by operator/repo: 5-minute positive TTL, 30-second negative TTL, TTL jitter, request coalescing for concurrent misses, fail-closed on lookup errors. GitHub rate-limit responses are cached through their retry window.
   - Normalize and validate owner/repo names before any authz or queueing work.
@@ -593,7 +590,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   - Validation: malformed owner/repo names are rejected before authz work begins.
 
   **Verification:**
-  - Allowlist and repo authz are deterministic, fail-closed, and covered by typed tests.
+  - Repo authz is deterministic, fail-closed, and covered by typed tests.
 
 - [ ] **Unit 3g: Minimal session routes**
 

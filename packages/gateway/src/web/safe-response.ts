@@ -44,6 +44,17 @@ export function badRequestResponse<E extends Env, P extends string, I extends In
 }
 
 /**
+ * Return a coarse 403 Forbidden.
+ * Use when an authenticated user is denied access (e.g. not in allowlist).
+ * Never include the specific reason in the response body.
+ */
+export function forbiddenResponse<E extends Env, P extends string, I extends Input>(
+  c: OperatorResponseContext<E, P, I>,
+): Response {
+  return c.json({error: 'forbidden'}, 403)
+}
+
+/**
  * Return a coarse 404 Not Found.
  * Use for unknown routes and resources that do not exist or are not visible
  * to the current operator. Never distinguish between "not found" and "not authorized".

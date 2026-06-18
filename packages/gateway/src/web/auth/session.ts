@@ -18,9 +18,10 @@
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {BrowserGuardDeps} from './csrf.js'
 import {randomBytes} from 'node:crypto'
 import {emitAudit} from '../audit.js'
-import {registerPublicRoute} from '../operator-route.js'
+import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {okResponse, rateLimitedResponse} from '../safe-response.js'
 
 // ---------------------------------------------------------------------------
@@ -310,12 +311,31 @@ export function parseSessionCookie(cookieHeader: string | undefined): string | u
 /**
  * Register the POST /operator/auth/logout route on the given Hono app.
  *
- * Registered as a public route (no session required to call logout — idempotent).
+ * Logout is a privileged route protected by session + allowlist + origin + CSRF.
+ * The browser guard (applied automatically by the privileged-route guard seam
+ * installed in server.ts) runs before this handler. The handler reads the
+ * authenticated context (sessionId, githubUserId) from Hono context variables
+ * set by the guard wrapper.
+ *
  * Invalidates the session server-side and clears the session cookie.
- * Returns 200 regardless of whether a valid session was found (no oracle).
+ * Returns 200 after successful authenticated logout.
+ *
+ * @throws {Error} Programming error if browserGuardDeps is not provided.
+ *   Logout must always be protected — a public mutating logout path is a
+ *   CSRF footgun and is not supported.
  */
-export function buildLogoutRoutes(app: Hono, store: SessionStore, deps: SessionDeps): void {
-  registerPublicRoute(app, 'POST', '/operator/auth/logout', async (c: Context): Promise<Response> => {
+export function buildLogoutRoutes(
+  app: Hono,
+  store: SessionStore,
+  deps: SessionDeps,
+  _browserGuardDeps: BrowserGuardDeps,
+): void {
+  // Protected logout — requires session + allowlist + origin + CSRF.
+  // Registered as a privileged route so the static guardrail enforces it.
+  // The browser guard is applied automatically by the privileged-route guard seam
+  // (setOperatorRouteGuard in server.ts). The handler reads the authenticated context
+  // (sessionId, githubUserId) from Hono context variables set by the guard wrapper.
+  registerOperatorRoute(app, 'POST', '/operator/auth/logout', async (c: Context): Promise<Response> => {
     // Rate limit check — shared with the operator app, keyed on socket address.
     if (deps.rateLimiter !== undefined) {
       const sourceKey = deps.getSourceKey === undefined ? 'unknown' : deps.getSourceKey(c)
@@ -325,29 +345,29 @@ export function buildLogoutRoutes(app: Hono, store: SessionStore, deps: SessionD
       }
     }
 
-    const cookieHeader = c.req.header('cookie')
-    const sessionId = parseSessionCookie(cookieHeader)
-
-    if (sessionId !== undefined) {
-      const nowMs = deps.clock()
-      const entry = store.get(sessionId, nowMs)
-
-      if (entry !== undefined) {
-        // Emit audit event before deleting the session.
-        // correlationId must NOT be the session ID — session IDs are never logged.
-        emitAudit(
-          {
-            kind: 'auth.logout',
-            correlationId: 'logout',
-            githubUserId: entry.githubUserId,
-          },
-          deps.auditLogger,
-        )
-        deps.logger.info({githubUserId: entry.githubUserId}, 'session logout')
-      }
-
-      store.delete(sessionId)
+    // Read the authenticated context stored by the guard wrapper.
+    // The browser guard (session + allowlist + origin + CSRF) has already run.
+    const authCtx = getOperatorAuthContext(c)
+    if (authCtx === undefined) {
+      // Guard not installed — this is a programming error. buildLogoutRoutes requires
+      // browserGuardDeps and the guard must be installed before registering privileged routes.
+      return c.json({error: 'unauthorized'}, 401)
     }
+
+    const {sessionId, githubUserId} = authCtx
+
+    // Emit audit event before deleting the session.
+    emitAudit(
+      {
+        kind: 'auth.logout',
+        correlationId: 'logout',
+        githubUserId,
+      },
+      deps.auditLogger,
+    )
+    deps.logger.info({githubUserId}, 'session logout')
+
+    store.delete(sessionId)
 
     // Always clear the cookie — idempotent logout
     const clearCookie = buildSessionCookieValue('', {clear: true})
