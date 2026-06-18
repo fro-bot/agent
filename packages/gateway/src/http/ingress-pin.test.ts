@@ -42,11 +42,13 @@
  */
 
 import type {Client} from 'discord.js'
+import type {GitHubOAuthConfig, GitHubOAuthDeps} from '../web/auth/github.js'
 import type {OperatorServerConfig, OperatorServerDeps} from '../web/server.js'
 import type {AnnounceLogger} from './announce-handler.js'
 import {readdirSync, readFileSync, statSync} from 'node:fs'
 import {join} from 'node:path'
 import {describe, expect, it, vi} from 'vitest'
+import {createInMemoryStateStore} from '../web/auth/github.js'
 import {buildOperatorApp} from '../web/server.js'
 import {buildAnnounceApp} from './server.js'
 
@@ -68,17 +70,32 @@ import {buildAnnounceApp} from './server.js'
 const EXPECTED_ANNOUNCE_ROUTES: readonly {method: string; path: string}[] = [{method: 'POST', path: '/v1/announce'}]
 
 /**
- * The complete set of HTTP routes the gateway exposes over gateway-net (operator surface).
+ * The complete set of HTTP routes the gateway exposes over gateway-net (operator surface)
+ * when GitHub OAuth is NOT configured (no deps.githubOAuth / config.githubOAuth).
  * Each entry is { method, path } matching Hono's app.routes shape.
  *
  * Current surface: exactly one endpoint — the unauthenticated health check.
- * Privileged routes (auth, launch, approvals, SSE) are added only after the auth boundary is in place
- * after the auth boundary is in place.
+ * GitHub OAuth routes (/operator/auth/github/start, /operator/auth/github/callback)
+ * are registered only when both deps.githubOAuth and config.githubOAuth are provided;
+ * see EXPECTED_OPERATOR_ROUTES_WITH_OAUTH below.
  *
  * SECURITY: No announce route may appear here. The operator surface is gateway-net only
  * and is not reachable from sandbox-net.
  */
 const EXPECTED_OPERATOR_ROUTES: readonly {method: string; path: string}[] = [{method: 'GET', path: '/operator/health'}]
+
+/**
+ * The complete set of HTTP routes the gateway exposes over gateway-net (operator surface)
+ * when GitHub OAuth IS configured (both deps.githubOAuth and config.githubOAuth provided).
+ *
+ * SECURITY: All three routes are public (unauthenticated pre-auth surface). No announce
+ * route may appear here.
+ */
+const EXPECTED_OPERATOR_ROUTES_WITH_OAUTH: readonly {method: string; path: string}[] = [
+  {method: 'GET', path: '/operator/health'},
+  {method: 'GET', path: '/operator/auth/github/start'},
+  {method: 'GET', path: '/operator/auth/github/callback'},
+]
 
 // ---------------------------------------------------------------------------
 // Minimal stubs — we only need to build the apps, not run requests.
@@ -120,6 +137,34 @@ function makeOperatorStubConfig(): OperatorServerConfig {
     bindHost: '10.0.0.1',
     bindPort: 0, // not used — we never call serve()
     publicOrigin: 'https://operator.example.com',
+  }
+}
+
+function makeOAuthStubDeps(): GitHubOAuthDeps {
+  return {
+    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
+    fetch: vi.fn(async () => new Response('{}', {status: 200, headers: {'content-type': 'application/json'}})),
+    clock: () => 0,
+    generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
+    generateState: () => 'stub-state-value-32-bytes-long-ok',
+    stateStore: createInMemoryStateStore(),
+    getSourceKey: () => 'stub-source-key',
+    // rateLimiter is overwritten by buildOperatorApp with the shared instance;
+    // provide a pass-through stub so the type is satisfied.
+    rateLimiter: {allow: () => true},
+  }
+}
+
+function makeOAuthStubConfig(): GitHubOAuthConfig {
+  return {
+    clientId: 'stub-client-id',
+    clientSecret: 'stub-client-secret',
+    publicOrigin: 'https://operator.example.com',
+    callbackPath: '/operator/auth/github/callback',
+    allowedReturnPaths: ['/operator/dashboard'],
+    maxOutstandingAttemptsPerKey: 5,
+    stateTtlMs: 10 * 60 * 1000,
   }
 }
 
@@ -207,6 +252,59 @@ describe('gateway operator ingress surface (gateway-net)', () => {
   it('every operator route has a path prefix of /operator/ — no route appears in both inventories', () => {
     // #given
     const operatorApp = buildOperatorApp(makeOperatorStubDeps(), makeOperatorStubConfig())
+    const operatorRoutes = extractRoutes(operatorApp)
+
+    // #when — check that all operator routes are namespaced
+    const nonOperatorPrefixed = operatorRoutes.filter(r => !r.path.startsWith('/operator/'))
+
+    // #then — all operator routes must be under /operator/
+    expect(nonOperatorPrefixed).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Operator surface pin test — OAuth-enabled
+// ---------------------------------------------------------------------------
+
+describe('gateway operator ingress surface (gateway-net) — OAuth-enabled', () => {
+  it('is exactly {GET /operator/health, GET /operator/auth/github/start, GET /operator/auth/github/callback} when OAuth deps and config are provided', () => {
+    // #given — build the Hono app with OAuth deps and config
+    const app = buildOperatorApp(
+      {...makeOperatorStubDeps(), githubOAuth: makeOAuthStubDeps()},
+      {...makeOperatorStubConfig(), githubOAuth: makeOAuthStubConfig()},
+    )
+
+    // #when — extract the registered user-defined routes as unique (method, path) pairs.
+    const actualRoutes = extractRoutes(app)
+
+    // #then — the inventory must match the pinned OAuth-enabled set exactly.
+    // Adding a route without updating this pin fails the test, requiring a
+    // security review of the new operator endpoint.
+    expect(actualRoutes).toEqual(EXPECTED_OPERATOR_ROUTES_WITH_OAUTH)
+  })
+
+  it('contains no announce routes when OAuth is enabled — surfaces remain disjoint', () => {
+    // #given
+    const operatorApp = buildOperatorApp(
+      {...makeOperatorStubDeps(), githubOAuth: makeOAuthStubDeps()},
+      {...makeOperatorStubConfig(), githubOAuth: makeOAuthStubConfig()},
+    )
+    const operatorRoutes = extractRoutes(operatorApp)
+    const announcePaths = new Set(EXPECTED_ANNOUNCE_ROUTES.map(r => r.path))
+
+    // #when — check for overlap
+    const overlap = operatorRoutes.filter(r => announcePaths.has(r.path))
+
+    // #then — no announce route appears in the operator surface
+    expect(overlap).toEqual([])
+  })
+
+  it('every OAuth-enabled operator route has a path prefix of /operator/', () => {
+    // #given
+    const operatorApp = buildOperatorApp(
+      {...makeOperatorStubDeps(), githubOAuth: makeOAuthStubDeps()},
+      {...makeOperatorStubConfig(), githubOAuth: makeOAuthStubConfig()},
+    )
     const operatorRoutes = extractRoutes(operatorApp)
 
     // #when — check that all operator routes are namespaced

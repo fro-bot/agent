@@ -73,6 +73,12 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_BIND_HOST',
     'GATEWAY_OPERATOR_BIND_PORT',
     'GATEWAY_OPERATOR_PUBLIC_ORIGIN',
+    'GATEWAY_OPERATOR_GITHUB_CLIENT_ID',
+    'GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET',
+    'GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS',
+    'GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS',
+    'GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS',
+    'GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE',
   ]) {
     delete process.env[key]
   }
@@ -420,6 +426,18 @@ function setRequiredEnv(): void {
   process.env.GATEWAY_WEBHOOK_SECRET = 'test-webhook-secret'
   process.env.GATEWAY_PRESENCE_CHANNEL_ID = 'test-presence-channel-id'
   process.env.WORKSPACE_OPENCODE_TOKEN = 'test-opencode-token'
+}
+
+/**
+ * Set the minimum operator web env vars for a valid config.
+ * Call after setRequiredEnv() when testing operator web happy paths.
+ */
+function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string} = {}): void {
+  process.env.GATEWAY_OPERATOR_BIND_HOST = overrides.bindHost ?? '172.20.0.2'
+  process.env.GATEWAY_OPERATOR_BIND_PORT = overrides.bindPort ?? '4000'
+  process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = overrides.publicOrigin ?? 'https://operator.example.com'
+  process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
+  process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
 }
 
 describe('loadGatewayConfig', () => {
@@ -1696,18 +1714,21 @@ describe('loadGatewayConfig — operator web surface', () => {
   it('happy path: all three operator vars set → operatorWeb is populated', () => {
     // #given
     setRequiredEnv()
-    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
-    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
-    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    setOperatorWebEnv()
 
     // #when
     const config = loadGatewayConfig()
 
     // #then
-    expect(config.operatorWeb).toEqual({
+    expect(config.operatorWeb).toMatchObject({
       bindHost: '172.20.0.2',
       bindPort: 4000,
       publicOrigin: 'https://operator.example.com',
+      oauthClientId: 'test-oauth-client-id',
+      oauthClientSecret: 'test-oauth-client-secret',
+      oauthAllowedReturnPaths: ['/operator'],
+      oauthStateTtlMs: 600_000,
+      oauthMaxOutstandingAttemptsPerKey: 5,
     })
   })
 
@@ -1912,9 +1933,7 @@ describe('loadGatewayConfig — operator web surface', () => {
   it('happy path: GATEWAY_OPERATOR_BIND_HOST=172.20.0.5 → accepted (gateway-net address)', () => {
     // #given — gateway-net addresses (172.20.x.x) must remain valid
     setRequiredEnv()
-    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.5'
-    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
-    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    setOperatorWebEnv({bindHost: '172.20.0.5'})
 
     // #when
     const config = loadGatewayConfig()
@@ -1983,6 +2002,8 @@ function setOperatorEnv(origin: string): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
   process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
+  process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
+  process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
 }
 
 describe('loadGatewayConfig — GATEWAY_OPERATOR_PUBLIC_ORIGIN canonical origin validation', () => {
@@ -2057,5 +2078,196 @@ describe('loadGatewayConfig — GATEWAY_OPERATOR_PUBLIC_ORIGIN canonical origin 
 
     // #then — stored as parsedPublicOrigin.origin which strips the trailing slash
     expect(config.operatorWeb?.publicOrigin).toBe('https://ops.example.com')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_GITHUB_CLIENT_ID / CLIENT_SECRET — OAuth credential validation
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — operator web OAuth credentials', () => {
+  it('error path: GATEWAY_OPERATOR_GITHUB_CLIENT_ID missing → throws', () => {
+    // #given — all three operator vars set but no OAuth client id
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-secret'
+    // GATEWAY_OPERATOR_GITHUB_CLIENT_ID intentionally absent
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_GITHUB_CLIENT_ID/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET missing → throws', () => {
+    // #given — all three operator vars set but no OAuth client secret
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-client-id'
+    // GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET intentionally absent
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET/)
+  })
+
+  it('happy path: OAuth credentials present → oauthClientId and oauthClientSecret populated', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthClientId).toBe('test-oauth-client-id')
+    expect(config.operatorWeb?.oauthClientSecret).toBe('test-oauth-client-secret')
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS overrides default', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS = '/operator/dashboard,/operator/runs'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthAllowedReturnPaths).toEqual(['/operator/dashboard', '/operator/runs'])
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS defaults to ["/operator"]', () => {
+    // #given — no override
+    setRequiredEnv()
+    setOperatorWebEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthAllowedReturnPaths).toEqual(['/operator'])
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS overrides default', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS = '300000'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthStateTtlMs).toBe(300_000)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS defaults to 600000', () => {
+    // #given — no override
+    setRequiredEnv()
+    setOperatorWebEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthStateTtlMs).toBe(600_000)
+  })
+
+  it('error path: GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS=0 → throws', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS/)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS overrides default', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS = '10'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthMaxOutstandingAttemptsPerKey).toBe(10)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS defaults to 5', () => {
+    // #given — no override
+    setRequiredEnv()
+    setOperatorWebEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.oauthMaxOutstandingAttemptsPerKey).toBe(5)
+  })
+
+  it('error path: GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS=abc → throws (non-integer)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS = 'abc'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS=-1 → throws (negative not allowed)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS = '-1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS=0 → throws', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS=banana → throws (non-integer)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS = 'banana'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS/)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE → reads client id from file', () => {
+    // #given — client id provided via _FILE (the compose bind-mount pattern)
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_BIND_HOST = '172.20.0.2'
+    process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
+    process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
+    delete process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID
+    const clientIdFile = join(tmpDir, 'github-client-id.txt')
+    writeFileSync(clientIdFile, 'file-client-id\n', {mode: 0o600})
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE = clientIdFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — _FILE value is read and trimmed
+    expect(config.operatorWeb?.oauthClientId).toBe('file-client-id')
+
+    delete process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE
   })
 })
