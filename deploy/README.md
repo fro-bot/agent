@@ -258,6 +258,63 @@ The gateway auto-discovers the installation ID at runtime — you do not need to
 - **Under-privileged** (e.g. `contents: none`): the gateway returns an error at `/add-project` time with a message naming the missing permissions and a link to the installation settings page.
 - **Over-privileged** (e.g. `contents: write` when only `read` is required): the gateway logs a `WARN` entry listing the over-privileged scopes but does not block the request. Operators should review and reduce permissions to the minimum needed.
 
+## Operator OAuth (Web Surface)
+
+The gateway exposes a browser-facing operator API at `GATEWAY_OPERATOR_PUBLIC_ORIGIN`. Human operators authenticate via GitHub OAuth before accessing any privileged endpoint. This is separate from the GitHub App used for repository access — they serve different purposes and use different credentials.
+
+| Credential                      | Purpose                                 |
+| ------------------------------- | --------------------------------------- |
+| GitHub OAuth client ID + secret | Human operator login (browser session)  |
+| GitHub App ID + private key     | Installation auth for repository access |
+
+### OAuth callback URL
+
+When creating the GitHub OAuth App, set the callback URL to:
+
+```
+{GATEWAY_OPERATOR_PUBLIC_ORIGIN}/operator/auth/github/callback
+```
+
+For example, if `GATEWAY_OPERATOR_PUBLIC_ORIGIN=https://operator.example.com`, the callback URL is `https://operator.example.com/operator/auth/github/callback`.
+
+### Required secrets
+
+```bash
+# GitHub OAuth App credentials (required for operator web login)
+echo -n 'YOUR_OAUTH_CLIENT_ID'     > deploy/secrets/github-oauth-client-id
+echo -n 'YOUR_OAUTH_CLIENT_SECRET' > deploy/secrets/github-oauth-client-secret
+
+# CSRF signing key — 256-bit CSPRNG entropy, base64url-encoded, no padding
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' > deploy/secrets/gateway-csrf-secret
+
+# Operator allowlist — one GitHub numeric user ID per line
+echo -n 'YOUR_GITHUB_USER_ID' > deploy/secrets/gateway-operator-allowlist
+
+chmod 0600 deploy/secrets/github-oauth-client-id \
+           deploy/secrets/github-oauth-client-secret \
+           deploy/secrets/gateway-csrf-secret \
+           deploy/secrets/gateway-operator-allowlist
+```
+
+> **OAuth App vs GitHub App:** The OAuth App is for human login only — it authenticates the browser session. The GitHub App (App ID + private key) is for installation auth — it lets the gateway call the GitHub API on behalf of installed repositories. Both are required for a full deployment; they are independent credentials.
+
+> **Allowlist:** Only GitHub user IDs listed in `gateway-operator-allowlist` can log in. Add one numeric user ID per line. Find your numeric ID at `https://api.github.com/users/<your-login>` (the `id` field).
+
+### Operator API surface
+
+All privileged operator endpoints are under `/operator/` and require a valid session cookie. The browser guard enforces session validity, allowlist membership, and origin/Fetch Metadata checks on every request.
+
+| Method | Path                             | Auth           | Purpose                                                 |
+| ------ | -------------------------------- | -------------- | ------------------------------------------------------- |
+| `GET`  | `/operator/health`               | None           | Health check                                            |
+| `GET`  | `/operator/auth/github/start`    | None           | Start OAuth login                                       |
+| `GET`  | `/operator/auth/github/callback` | None           | OAuth callback (GitHub redirects here)                  |
+| `POST` | `/operator/auth/logout`          | Session + CSRF | Invalidate session and clear cookie                     |
+| `GET`  | `/operator/session/csrf`         | Session        | Get a signed CSRF token for mutating requests           |
+| `GET`  | `/operator/session`              | Session        | Get current session info (operatorId, login, expiresAt) |
+
+Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
+
 ## Workspace Port Model
 
 The workspace container exposes two internal ports, both accessible only within the Docker Compose sandbox network:
