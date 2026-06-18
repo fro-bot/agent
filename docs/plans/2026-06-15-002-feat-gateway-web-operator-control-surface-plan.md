@@ -557,7 +557,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - 52/52 test files pass. Type check clean. Lint clean. Build succeeds.
 
-- [ ] **Unit 3f: Repo authorization helper**
+- [x] **Unit 3f: Repo authorization helper**
 
   **Goal:** Implement the single repo authorization helper used by all privileged routes.
 
