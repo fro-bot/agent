@@ -20,7 +20,14 @@ export type AuthCallbackFailureReason =
   | 'unknown'
 
 /** Safe reasons for authorization denial. */
-export type AuthzDeniedReason = 'not_allowlisted' | 'suspended' | 'unknown'
+export type AuthzDeniedReason =
+  | 'not_allowlisted'
+  | 'suspended'
+  | 'invalid_repo_name'
+  | 'github_denied'
+  | 'rate_limited'
+  | 'lookup_error'
+  | 'unknown'
 
 /** Safe reasons for launch rejection. */
 export type LaunchRejectedReason = 'binding_not_found' | 'concurrency_cap' | 'authz_denied' | 'unknown'
