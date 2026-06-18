@@ -448,7 +448,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Audit seam is typed, redacted, and covered by captured-log tests.
 
-- [ ] **Unit 3c: GitHub OAuth state + PKCE identity verification**
+- [x] **Unit 3c: GitHub OAuth state + PKCE identity verification**
 
   **Goal:** Implement the GitHub App user OAuth web flow with PKCE S256 and state so the callback can verify human identity before any session is minted.
 

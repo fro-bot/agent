@@ -5,7 +5,7 @@
  * returns the @hono/node-server handle so the caller (program.ts) can close
  * it during graceful shutdown.
  *
- * Current posture (classification/guardrail only — no auth yet):
+ * Current posture:
  *   - Listener binds to the configured gateway-net host/port only.
  *     Never 0.0.0.0, loopback, or sandbox-net for production config.
  *   - TLS is terminated by the infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
@@ -14,17 +14,21 @@
  *     Requests with mismatched forwarded headers are rejected 400.
  *   - Unauthenticated socket-keyed rate limiting and body-size limits are applied.
  *   - All responses pass through safe-response helpers (coarse, no-oracle).
- *   - No privileged routes registered yet; auth routes land when the auth boundary is in place.
+ *   - GitHub OAuth start and callback routes are registered as public (unauthenticated).
+ *     The callback route must remain compatible with future Fetch Metadata middleware
+ *     because GitHub redirects cross-site after authorization.
  *
  * Mirror of packages/gateway/src/http/server.ts for the serve()/handle pattern.
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {buildGitHubOAuthRoutes} from './auth/github.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute} from './operator-route.js'
 import {
   badRequestResponse,
@@ -80,6 +84,12 @@ export interface OperatorServerDeps {
   readonly rateLimiter?: import('../http/rate-limit.js').RateLimiter
   /** Injectable clock for testability. */
   readonly clock?: () => number
+  /**
+   * Optional GitHub OAuth dependencies for the auth routes.
+   * When present, the GitHub OAuth start and callback routes are registered.
+   * When absent, the auth routes are not registered (opt-in).
+   */
+  readonly githubOAuth?: GitHubOAuthDeps
 }
 
 export interface OperatorServerConfig {
@@ -97,6 +107,13 @@ export interface OperatorServerConfig {
    * Example: 'https://operator.example.com'
    */
   readonly publicOrigin: string
+  /**
+   * Optional GitHub OAuth configuration for the auth routes.
+   * When present (alongside deps.githubOAuth), the GitHub OAuth start and
+   * callback routes are registered. When absent, the auth routes are not
+   * registered (opt-in).
+   */
+  readonly githubOAuth?: GitHubOAuthConfig
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +313,27 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     }
     return okResponse(c)
   })
+
+  // ── GitHub OAuth routes ────────────────────────────────────────────────────
+  //
+  // Registered only when both deps.githubOAuth and config.githubOAuth are present.
+  // Both must be provided together — partial config is a programming error.
+  //
+  // Routes registered:
+  //   GET /operator/auth/github/start    — public, unauthenticated
+  //   GET /operator/auth/github/callback — public OAuth redirect callback
+  if (deps.githubOAuth !== undefined && config.githubOAuth !== undefined) {
+    // Thread the shared rate limiter into the OAuth deps so both OAuth routes
+    // participate in the same per-socket budget as the health route.
+    const oauthDepsWithRateLimiter = {...deps.githubOAuth, rateLimiter}
+    buildGitHubOAuthRoutes(app, oauthDepsWithRateLimiter, config.githubOAuth)
+  } else if (deps.githubOAuth !== undefined || config.githubOAuth !== undefined) {
+    // Partial config: one is set but not the other. This is a programming error.
+    throw new Error(
+      'buildOperatorApp: deps.githubOAuth and config.githubOAuth must both be present or both absent. ' +
+        'Partial GitHub OAuth config is a programming error.',
+    )
+  }
 
   // ── Catch-all ──────────────────────────────────────────────────────────────
 
