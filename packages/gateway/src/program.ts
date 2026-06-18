@@ -32,6 +32,7 @@ import {createRateLimiter} from './http/rate-limit.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
+import {createInMemorySessionStore} from './web/auth/session.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
@@ -399,8 +400,27 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // participate in the same per-socket budget as the health route.
       const operatorRateLimiter = createRateLimiter({limit: 20, windowMs: 60_000})
 
+      // Build the shared in-memory session store for the operator surface.
+      // Gateway restart is global logout — acceptable for v1.
+      const sessionStore = createInMemorySessionStore()
+      const sessionDeps = {
+        logger,
+        auditLogger: logger,
+        clock: () => Date.now(),
+      }
+
       // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
-      const githubOAuthDeps = buildGitHubOAuthDeps(logger, logger, getSourceKey, operatorRateLimiter)
+      // Pass the session store so successful callbacks mint a fresh session.
+      // Pass the allowlist so non-allowlisted users are denied before session creation.
+      const githubOAuthDeps = buildGitHubOAuthDeps(
+        logger,
+        logger,
+        getSourceKey,
+        operatorRateLimiter,
+        sessionStore,
+        sessionDeps,
+        config.operatorWeb.allowlist,
+      )
 
       operatorServerHandle = deps.startOperatorServer(
         {
@@ -408,6 +428,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           isShuttingDown,
           rateLimiter: operatorRateLimiter,
           githubOAuth: githubOAuthDeps,
+          sessionStore,
+          sessionDeps,
+          allowlist: config.operatorWeb.allowlist,
+          csrfSecret: config.operatorWeb.csrfSecret,
+          auditLogger: logger,
         },
         {
           bindHost: config.operatorWeb.bindHost,

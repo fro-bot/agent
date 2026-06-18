@@ -22,14 +22,20 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {AuditLogger} from './audit.js'
+import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {SessionDeps, SessionStore} from './auth/session.js'
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {buildCsrfRoute} from './auth/csrf-route.js'
+import {applyBrowserGuard} from './auth/csrf.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
-import {assertAllPrivilegedRoutesWrapped, registerPublicRoute} from './operator-route.js'
+import {buildLogoutRoutes} from './auth/session.js'
+import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
 import {
   badRequestResponse,
   notFoundResponse,
@@ -90,6 +96,33 @@ export interface OperatorServerDeps {
    * When absent, the auth routes are not registered (opt-in).
    */
   readonly githubOAuth?: GitHubOAuthDeps
+  /**
+   * Optional session store for the logout route.
+   * When present (alongside sessionDeps), POST /operator/auth/logout is registered.
+   */
+  readonly sessionStore?: SessionStore
+  /**
+   * Session deps (logger, auditLogger, clock) for the logout route.
+   * Required when sessionStore is present; ignored otherwise.
+   */
+  readonly sessionDeps?: SessionDeps
+  /**
+   * Optional operator allowlist for the browser guard.
+   * When present (alongside csrfSecret and auditLogger), the browser guard is applied
+   * to authenticated operator routes and the CSRF endpoint is registered.
+   */
+  readonly allowlist?: OperatorAllowlist
+  /**
+   * CSRF token signing key (HMAC-SHA256), base64url-encoded with no padding/newlines.
+   * Required when allowlist is present; ignored otherwise.
+   * Must decode to at least 32 bytes (256 bits) of CSPRNG entropy.
+   */
+  readonly csrfSecret?: string
+  /**
+   * Audit logger for security events.
+   * Required when allowlist is present; ignored otherwise.
+   */
+  readonly auditLogger?: AuditLogger
 }
 
 export interface OperatorServerConfig {
@@ -333,6 +366,104 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       'buildOperatorApp: deps.githubOAuth and config.githubOAuth must both be present or both absent. ' +
         'Partial GitHub OAuth config is a programming error.',
     )
+  }
+
+  // ── Browser guard deps (shared by logout and CSRF endpoint) ───────────────
+  //
+  // Built when allowlist, csrfSecret, auditLogger, and sessionStore are all present.
+  // Used to protect both the logout route and the CSRF endpoint.
+  //
+  // Partial deps (some but not all of allowlist/csrfSecret/auditLogger/sessionStore)
+  // is a programming error — fail closed with a clear error instead of silently
+  // disabling the guard. The guard is all-or-nothing.
+  const browserGuardPieces = [deps.allowlist, deps.csrfSecret, deps.auditLogger, deps.sessionStore]
+  const browserGuardPresentCount = browserGuardPieces.filter(v => v !== undefined).length
+  if (browserGuardPresentCount > 0 && browserGuardPresentCount < 4) {
+    const missing: string[] = []
+    if (deps.allowlist === undefined) missing.push('allowlist')
+    if (deps.csrfSecret === undefined) missing.push('csrfSecret')
+    if (deps.auditLogger === undefined) missing.push('auditLogger')
+    if (deps.sessionStore === undefined) missing.push('sessionStore')
+    throw new Error(
+      `buildOperatorApp: partial browser guard deps — all four of allowlist, csrfSecret, auditLogger, and sessionStore must be provided together to enable the browser guard, or none to disable it. Missing: ${missing.join(', ')}. This is a programming error — partial browser guard wiring silently disables security enforcement.`,
+    )
+  }
+  const browserGuardDeps =
+    deps.allowlist !== undefined &&
+    deps.csrfSecret !== undefined &&
+    deps.auditLogger !== undefined &&
+    deps.sessionStore !== undefined
+      ? {
+          logger: deps.logger,
+          auditLogger: deps.auditLogger,
+          sessionStore: deps.sessionStore,
+          allowlist: deps.allowlist,
+          csrfSecret: deps.csrfSecret,
+          publicOrigin: config.publicOrigin,
+          clock: deps.sessionDeps?.clock ?? (() => Date.now()),
+        }
+      : undefined
+
+  // ── Privileged-route guard installation ────────────────────────────────────
+  //
+  // When browserGuardDeps is present, install a generic guard on the app before
+  // registering any privileged routes. Every subsequent `registerOperatorRoute`
+  // call will automatically wrap its handler: the guard runs first (browser guard /
+  // allowlist / CSRF enforcement), and the handler only executes if the guard allows.
+  //
+  // The guard calls applyBrowserGuard with:
+  //   - isPublicCrossSiteRoute=false (privileged routes are never cross-site)
+  //   - requireCsrf=true for mutating methods (POST/PUT/PATCH/DELETE), false for safe methods
+  //
+  // This ensures future privileged routes cannot forget browser guard enforcement.
+  // Routes registered before this point (health, OAuth) are public and unaffected.
+  if (browserGuardDeps !== undefined) {
+    const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+    setOperatorRouteGuard(app, async (c, method, _path) => {
+      const requireCsrf = SAFE_METHODS.has(method.toUpperCase()) === false
+      return applyBrowserGuard(c, browserGuardDeps, false, requireCsrf)
+    })
+  }
+
+  // ── Logout route ───────────────────────────────────────────────────────────
+  //
+  // Registered only when sessionStore, sessionDeps, AND browserGuardDeps are all present.
+  // Logout is always a privileged route protected by session + allowlist + origin + CSRF.
+  // Providing sessionStore/sessionDeps without browserGuardDeps is a programming error —
+  // a public mutating logout path is a CSRF footgun and is not supported.
+  // Thread the shared rate limiter and socket-derived source key into the logout route
+  // so it participates in the same per-socket budget as the health and OAuth routes.
+  if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
+    if (browserGuardDeps === undefined) {
+      throw new Error(
+        'buildOperatorApp: sessionStore and sessionDeps are present but browserGuardDeps is absent. ' +
+          'Logout must always be protected by the browser guard (session + allowlist + origin + CSRF). ' +
+          'Provide allowlist, csrfSecret, and auditLogger alongside sessionStore, or omit sessionStore entirely. ' +
+          'This is a programming error — a public mutating logout path is a CSRF footgun.',
+      )
+    }
+    const sessionDepsWithRateLimiter = {
+      ...deps.sessionDeps,
+      rateLimiter,
+      getSourceKey: (c: Parameters<typeof getConnInfo>[0]) => {
+        try {
+          const connInfo = getConnInfo(c)
+          return connInfo.remote.address ?? 'unknown'
+        } catch {
+          return 'unknown'
+        }
+      },
+    }
+    buildLogoutRoutes(app, deps.sessionStore, sessionDepsWithRateLimiter, browserGuardDeps)
+  }
+
+  // ── CSRF endpoint ──────────────────────────────────────────────────────────
+  //
+  // Registered only when allowlist, csrfSecret, auditLogger, and sessionStore are present.
+  // Route: GET /operator/session/csrf — privileged (requires session + allowlist).
+  // Returns a fresh signed CSRF token for the authenticated session.
+  if (browserGuardDeps !== undefined) {
+    buildCsrfRoute(app, browserGuardDeps)
   }
 
   // ── Catch-all ──────────────────────────────────────────────────────────────
