@@ -592,41 +592,45 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Repo authz is deterministic, fail-closed, and covered by typed tests.
 
-- [ ] **Unit 3g: Minimal session routes**
+- [ ] **Unit 3g: Operator session-info route**
 
-  **Goal:** Wire the three minimal session-management routes that the browser flow requires: current session info, CSRF token refresh, and logout.
+  **Goal:** Add the one remaining session-management route the browser flow needs — current session info — and document the operator OAuth deployment surface.
 
-  **Requirements:** R2, R3, R4, R14
+  **Requirements:** R2, R4, R14
 
   **Dependencies:** Units 3d and 3e
 
+  > **Reconciliation (2026-06-18, against `main` `85dd30ee`):** the CSRF and logout routes this unit originally enumerated already shipped and are wired:
+  > - `GET /operator/session/csrf` → `buildCsrfRoute` in `packages/gateway/src/web/auth/csrf-route.ts`, wired in `server.ts` (`buildCsrfRoute(app, browserGuardDeps)`).
+  > - logout → `buildLogoutRoutes` in `packages/gateway/src/web/auth/session.ts` at `POST /operator/auth/logout` (the shipped path; this unit's earlier `/operator/session/logout` text was never built), wired in `server.ts`, emits `auth.logout`, protected by session + allowlist + origin + CSRF.
+  >
+  > The shipped logout/CSRF routes are NOT moved or renamed — shipped reality is canonical and re-pathing tested, wired routes is churn with regression risk and no functional gain. Unit 3g's real delta is the new `GET /operator/session` route plus the deploy doc.
+
   **Files:**
-  - Create: `packages/gateway/src/web/routes/session.ts`
-  - Create: `packages/gateway/src/web/routes/session.test.ts`
+  - Create: `packages/gateway/src/web/auth/session-info-route.ts`
+  - Create: `packages/gateway/src/web/auth/session-info-route.test.ts`
   - Modify: `packages/gateway/src/web/server.ts`
   - Modify: `deploy/README.md`
 
   **Approach:**
-  - `GET /operator/session`: returns operator numeric id, display login, and session expiry for a valid session; returns `401` with a coarse body for invalid/expired sessions.
-  - `GET /operator/session/csrf`: returns a fresh signed double-submit token for an authenticated session (delegates to Unit 3e CSRF module).
-  - `POST /operator/session/logout`: invalidates the session server-side, clears the cookie, triggers the revocation hook from Unit 3d, and emits an `auth.logout` audit event.
-  - All three routes go through the `registerOperatorRoute` wrapper from Unit 3a. Logout additionally requires origin and CSRF checks.
+  - `GET /operator/session`: returns the operator numeric id (`githubUserId`), display login, and session absolute expiry for a valid session; returns `401` with a coarse body for invalid/expired/missing sessions. Safe method — no CSRF token required (the guard uses `requireCsrf=false` for GET).
+  - Registered via `registerOperatorRoute` so the privileged-route guard seam (`setOperatorRouteGuard` in `server.ts`) applies session + allowlist + origin checks automatically; the handler reads the authenticated context (`githubUserId`, `sessionId`) via `getOperatorAuthContext(c)` — no double session lookup, matching `buildCsrfRoute`/`buildLogoutRoutes`.
+  - Source the display login + expiry from the session store entry: `store.get(sessionId, now)` returns a `Readonly<SessionEntry>` carrying `githubUserId`, `login` (always present), `issuedAt`, and `lastAccessedAt`. Report effective expiry as `min(issuedAt + SESSION_ABSOLUTE_TTL_MS, lastAccessedAt + SESSION_IDLE_TTL_MS)` (whichever bounds the session sooner). If `store.get` returns `undefined` (raced revocation/expiry between guard and handler), return the coarse `401`. No GitHub lookup is needed. Set `Cache-Control: no-store, private` and `Vary: Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest` like the CSRF route.
+  - Wire in `server.ts` alongside the CSRF endpoint, gated on the same `browserGuardDeps` presence (and `sessionStore`) so it is only registered when the auth boundary is in place.
   - Update `deploy/README.md` to document the OAuth callback URL (`{GATEWAY_OPERATOR_PUBLIC_ORIGIN}/operator/auth/github/callback`), required secrets, and the distinction between OAuth client id/secret and GitHub App id/private key.
 
   **Patterns to follow:**
-  - Route wiring in `packages/gateway/src/web/server.ts`.
-  - No-oracle auth failure behavior from signed webhook ingress.
+  - `buildCsrfRoute` in `packages/gateway/src/web/auth/csrf-route.ts` (privileged GET, reads auth context, no-store headers) — the closest sibling.
+  - Coarse auth-failure behavior from signed webhook ingress.
 
   **Test scenarios:**
   - Happy path: `GET /operator/session` returns operator id, login, and expiry for a valid session.
   - Error path: `GET /operator/session` returns `401` for an expired or missing session.
-  - Happy path: `GET /operator/session/csrf` returns a fresh token for a valid session.
-  - Happy path: `POST /operator/session/logout` invalidates the session, clears the cookie, and emits an audit event.
-  - Security: `POST /operator/session/logout` requires a valid origin and CSRF token.
-  - Security: all three routes are covered by the static route-wrapper guard from Unit 3a.
+  - Headers: response sets `Cache-Control: no-store, private` and the `Vary` header.
+  - Security: the route is covered by the static route-wrapper guard (`assertAllPrivilegedRoutesWrapped`) and only registered when the browser guard is installed.
 
   **Verification:**
-  - Session routes are wired, tested, and covered by the route guardrail.
+  - The session-info route is wired, tested, coarse on failure, and covered by the route guardrail; the deploy doc reflects the operator OAuth surface.
 
 - [ ] **Unit 4: SSE run observation and safe browser projections**
 
