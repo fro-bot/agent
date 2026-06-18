@@ -45,10 +45,13 @@ import type {Client} from 'discord.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from '../web/auth/github.js'
 import type {OperatorServerConfig, OperatorServerDeps} from '../web/server.js'
 import type {AnnounceLogger} from './announce-handler.js'
+
 import {readdirSync, readFileSync, statSync} from 'node:fs'
 import {join} from 'node:path'
 import {describe, expect, it, vi} from 'vitest'
+import {loadAllowlistFromText} from '../web/auth/allowlist.js'
 import {createInMemoryStateStore} from '../web/auth/github.js'
+import {createInMemorySessionStore} from '../web/auth/session.js'
 import {buildOperatorApp} from '../web/server.js'
 import {buildAnnounceApp} from './server.js'
 
@@ -95,6 +98,25 @@ const EXPECTED_OPERATOR_ROUTES_WITH_OAUTH: readonly {method: string; path: strin
   {method: 'GET', path: '/operator/health'},
   {method: 'GET', path: '/operator/auth/github/start'},
   {method: 'GET', path: '/operator/auth/github/callback'},
+]
+
+/**
+ * The complete set of HTTP routes the gateway exposes over gateway-net (operator surface)
+ * when the full browser guard is configured (OAuth + allowlist + csrfSecret + sessionStore).
+ *
+ * This is the production-ready surface: OAuth routes (public), logout (privileged, CSRF-gated),
+ * CSRF token endpoint (privileged, safe GET), and session info endpoint (privileged, safe GET).
+ *
+ * SECURITY: All privileged routes are wrapped by the browser guard (session + allowlist +
+ * origin + Fetch Metadata). Adding a route here requires a deliberate security review.
+ */
+const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; path: string}[] = [
+  {method: 'GET', path: '/operator/health'},
+  {method: 'GET', path: '/operator/auth/github/start'},
+  {method: 'GET', path: '/operator/auth/github/callback'},
+  {method: 'POST', path: '/operator/auth/logout'},
+  {method: 'GET', path: '/operator/session/csrf'},
+  {method: 'GET', path: '/operator/session'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -165,6 +187,23 @@ function makeOAuthStubConfig(): GitHubOAuthConfig {
     allowedReturnPaths: ['/operator/dashboard'],
     maxOutstandingAttemptsPerKey: 5,
     stateTtlMs: 10 * 60 * 1000,
+  }
+}
+
+function makeBrowserGuardStubDeps(): OperatorServerDeps {
+  const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+  return {
+    ...makeOperatorStubDeps(),
+    githubOAuth: makeOAuthStubDeps(),
+    sessionStore: createInMemorySessionStore(),
+    sessionDeps: {
+      logger,
+      auditLogger: {info: vi.fn(), warn: vi.fn()},
+      clock: () => 0,
+    },
+    allowlist: loadAllowlistFromText('12345', logger),
+    csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
   }
 }
 
@@ -312,6 +351,44 @@ describe('gateway operator ingress surface (gateway-net) — OAuth-enabled', () 
 
     // #then — all operator routes must be under /operator/
     expect(nonOperatorPrefixed).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Operator surface pin test — full browser guard (OAuth + allowlist + session)
+// ---------------------------------------------------------------------------
+
+describe('gateway operator ingress surface (gateway-net) — full browser guard', () => {
+  it('is exactly the expected set when OAuth, allowlist, csrfSecret, and sessionStore are all provided', () => {
+    // #given — build the Hono app with full browser guard deps
+    const app = buildOperatorApp(makeBrowserGuardStubDeps(), {
+      ...makeOperatorStubConfig(),
+      githubOAuth: makeOAuthStubConfig(),
+    })
+
+    // #when — extract the registered user-defined routes as unique (method, path) pairs.
+    const actualRoutes = extractRoutes(app)
+
+    // #then — the inventory must match the pinned full-browser-guard set exactly.
+    // Adding a privileged route without updating this pin fails the test, requiring
+    // a security review of the new operator endpoint.
+    expect(actualRoutes).toEqual(EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD)
+  })
+
+  it('contains no announce routes when full browser guard is enabled — surfaces remain disjoint', () => {
+    // #given
+    const operatorApp = buildOperatorApp(makeBrowserGuardStubDeps(), {
+      ...makeOperatorStubConfig(),
+      githubOAuth: makeOAuthStubConfig(),
+    })
+    const operatorRoutes = extractRoutes(operatorApp)
+    const announcePaths = new Set(EXPECTED_ANNOUNCE_ROUTES.map(r => r.path))
+
+    // #when — check for overlap
+    const overlap = operatorRoutes.filter(r => announcePaths.has(r.path))
+
+    // #then — no announce route appears in the operator surface
+    expect(overlap).toEqual([])
   })
 })
 

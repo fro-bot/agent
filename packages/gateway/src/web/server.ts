@@ -26,6 +26,7 @@ import type {AuditLogger} from './audit.js'
 import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
+
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
@@ -34,6 +35,7 @@ import {createRateLimiter} from '../http/rate-limit.js'
 import {buildCsrfRoute} from './auth/csrf-route.js'
 import {applyBrowserGuard} from './auth/csrf.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
+import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
 import {
@@ -464,6 +466,15 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Returns a fresh signed CSRF token for the authenticated session.
   if (browserGuardDeps !== undefined) {
     buildCsrfRoute(app, browserGuardDeps)
+  }
+
+  // ── Session info endpoint ───────────────────────────────────────────────────
+  //
+  // Registered only when the browser guard is present (same condition as CSRF endpoint).
+  // Route: GET /operator/session — privileged (requires session + allowlist).
+  // Returns current session info (operatorId, login, expiresAt) for the authenticated session.
+  if (browserGuardDeps !== undefined) {
+    buildSessionInfoRoute(app, browserGuardDeps)
   }
 
   // ── Catch-all ──────────────────────────────────────────────────────────────
