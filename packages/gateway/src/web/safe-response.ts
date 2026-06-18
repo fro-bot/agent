@@ -80,10 +80,15 @@ export function rateLimitedResponse<E extends Env, P extends string, I extends I
 
 /**
  * Return a coarse 503 Service Unavailable.
- * Use during graceful shutdown drain.
+ * Use during graceful shutdown drain or when server capacity is exhausted.
+ * When retryAfterSeconds is provided, sets a Retry-After header.
  */
 export function unavailableResponse<E extends Env, P extends string, I extends Input>(
   c: OperatorResponseContext<E, P, I>,
+  retryAfterSeconds?: number,
 ): Response {
+  if (retryAfterSeconds !== undefined) {
+    c.header('Retry-After', String(retryAfterSeconds))
+  }
   return c.json({error: 'unavailable'}, 503)
 }

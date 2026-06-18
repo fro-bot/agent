@@ -485,7 +485,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - OAuth flow is PKCE-enforced, state-validated, and identity-anchored to stable numeric GitHub id.
 
-- [ ] **Unit 3d: Session store, cookies, logout, and revocation hook**
+- [x] **Unit 3d: Session store, cookies, logout, and revocation hook**
 
   **Goal:** Mint server-side opaque sessions after successful identity verification, enforce session lifetime and revocation, and provide the logout route.
 
