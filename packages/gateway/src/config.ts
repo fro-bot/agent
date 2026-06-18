@@ -121,6 +121,35 @@ export interface GatewayConfig {
      * Example: 'https://operator.example.com'
      */
     readonly publicOrigin: string
+    /**
+     * GitHub OAuth App client ID.
+     * Read from GATEWAY_OPERATOR_GITHUB_CLIENT_ID (or GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE).
+     */
+    readonly oauthClientId: string
+    /**
+     * GitHub OAuth App client secret. Never logged or browser-visible.
+     * Read from GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET (or _FILE variant).
+     */
+    readonly oauthClientSecret: string
+    /**
+     * Allowlisted same-origin return paths for post-auth redirect.
+     * Comma-separated list read from GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS.
+     * Defaults to ['/operator'] when unset.
+     * Only paths in this list are accepted as return_to targets.
+     */
+    readonly oauthAllowedReturnPaths: readonly string[]
+    /**
+     * TTL for OAuth state entries in milliseconds.
+     * Read from GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS.
+     * Defaults to 600_000 (10 minutes).
+     */
+    readonly oauthStateTtlMs: number
+    /**
+     * Maximum outstanding (unconsumed) OAuth attempts per source key.
+     * Read from GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS.
+     * Defaults to 5.
+     */
+    readonly oauthMaxOutstandingAttemptsPerKey: number
   }
 }
 
@@ -674,12 +703,57 @@ export function loadGatewayConfig(): GatewayConfig {
       )
     }
 
+    // Read GitHub OAuth client credentials — required when operator web is enabled.
+    // GATEWAY_OPERATOR_GITHUB_CLIENT_ID: GitHub OAuth App client ID.
+    // Also accepts GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE pointing to a file.
+    const oauthClientId = readSecret('GATEWAY_OPERATOR_GITHUB_CLIENT_ID')
+    const oauthClientSecret = readSecret('GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET')
+
+    // Read optional OAuth tuning parameters with safe defaults.
+    const rawAllowedReturnPaths = readOptionalSecret('GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS')
+    const oauthAllowedReturnPaths: readonly string[] =
+      rawAllowedReturnPaths === null
+        ? ['/operator']
+        : rawAllowedReturnPaths
+            .split(',')
+            .map(p => p.trim())
+            .filter(p => p.length > 0)
+
+    const rawStateTtlMs = readOptionalSecret('GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS')
+    let oauthStateTtlMs = 600_000 // 10 minutes default
+    if (rawStateTtlMs !== null) {
+      const parsed = Number.parseInt(rawStateTtlMs, 10)
+      if (Number.isFinite(parsed) === false || Number.isInteger(parsed) === false || parsed < 1) {
+        throw new Error(
+          `Invalid GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS value: "${rawStateTtlMs}" (must be a positive integer in milliseconds)`,
+        )
+      }
+      oauthStateTtlMs = parsed
+    }
+
+    const rawMaxOutstanding = readOptionalSecret('GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS')
+    let oauthMaxOutstandingAttemptsPerKey = 5 // default
+    if (rawMaxOutstanding !== null) {
+      const parsed = Number.parseInt(rawMaxOutstanding, 10)
+      if (Number.isFinite(parsed) === false || Number.isInteger(parsed) === false || parsed < 1) {
+        throw new Error(
+          `Invalid GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS value: "${rawMaxOutstanding}" (must be a positive integer)`,
+        )
+      }
+      oauthMaxOutstandingAttemptsPerKey = parsed
+    }
+
     // Normalize to parsedPublicOrigin.origin: strips trailing slash and default ports.
     // Stored value is always scheme+host+optional-non-default-port (no trailing slash).
     operatorWeb = {
       bindHost: operatorBindHost,
       bindPort: operatorBindPort,
       publicOrigin: parsedPublicOrigin.origin,
+      oauthClientId,
+      oauthClientSecret,
+      oauthAllowedReturnPaths,
+      oauthStateTtlMs,
+      oauthMaxOutstandingAttemptsPerKey,
     }
   }
 
