@@ -19,8 +19,14 @@ import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {setOperatorRouteGuard} from '../operator-route.js'
 import {loadAllowlistFromText} from './allowlist.js'
+import {applyBrowserGuard} from './csrf.js'
 import {buildSessionInfoRoute} from './session-info-route.js'
-import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
+import {
+  createInMemorySessionStore,
+  SESSION_ABSOLUTE_TTL_MS,
+  SESSION_COOKIE_NAME,
+  SESSION_IDLE_TTL_MS,
+} from './session.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -316,5 +322,82 @@ describe('buildSessionInfoRoute — response headers', () => {
     // #then
     expect(res.status).toBe(200)
     expect(res.headers.get('Vary')).toBe('Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Integration — real session store + real browser guard (touch→recompute path)
+// ---------------------------------------------------------------------------
+
+describe('buildSessionInfoRoute — integration: real guard touch updates expiresAt', () => {
+  it('expiresAt reflects the idle window refreshed by the guard touch, not the pre-request lastAccessedAt', async () => {
+    // #given — real in-memory session store and a controlled clock
+    //
+    // Timeline:
+    //   issuedAt  = nowMs - 1_000  (session is 1 second old)
+    //   nowMs     = the moment the request arrives (guard runs touch at this time)
+    //
+    // We choose issuedAt such that the absolute expiry (issuedAt + 8h) is far in
+    // the future, so the idle bound (nowMs + 30min) is always the sooner one.
+    // This lets us assert expiresAt === nowMs + SESSION_IDLE_TTL_MS precisely.
+    const nowMs = 5_000_000
+    const issuedAt = nowMs - 1_000 // absolute expires at nowMs - 1000 + 8h (far future)
+
+    const sessionStore = createInMemorySessionStore()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, issuedAt)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    // Advance the store's internal lastAccessedAt to issuedAt (create sets it to issuedAt).
+    // The guard will call touch(sessionId, nowMs) which sets lastAccessedAt = nowMs.
+    // The handler then reads lastAccessedAt = nowMs → idleExpiry = nowMs + SESSION_IDLE_TTL_MS.
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const browserGuardDeps: BrowserGuardDeps = {
+      logger,
+      auditLogger: {info: vi.fn(), warn: vi.fn()},
+      sessionStore,
+      allowlist: loadAllowlistFromText('42\n', logger),
+      csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
+      publicOrigin: 'https://operator.example.com',
+      // Fixed clock: guard and handler both see nowMs — touch sets lastAccessedAt = nowMs
+      clock: () => nowMs,
+    }
+
+    // Build a real Hono app with the REAL browser guard installed exactly as server.ts does
+    const app = new Hono()
+    const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+    setOperatorRouteGuard(app, async (c, method, _path) => {
+      const requireCsrf = SAFE_METHODS.has(method.toUpperCase()) === false
+      return applyBrowserGuard(c, browserGuardDeps, false, requireCsrf)
+    })
+    buildSessionInfoRoute(app, browserGuardDeps)
+
+    // #when — GET /operator/session with a valid session cookie and matching Origin
+    // (GET is a safe method: no CSRF token required; Origin must match publicOrigin)
+    const req = new Request('https://operator.example.com/operator/session', {
+      method: 'GET',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — 200 and expiresAt === nowMs + SESSION_IDLE_TTL_MS
+    // This proves the guard's touch(sessionId, nowMs) updated lastAccessedAt to nowMs
+    // and the handler recomputed idleExpiry from the refreshed value — the production contract.
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {operatorId: number; login: string; expiresAt: number}
+    expect(body.operatorId).toBe(42)
+    expect(body.login).toBe('octocat')
+
+    // Verify idle bound is sooner than absolute bound (precondition for the assertion)
+    const absoluteExpiry = issuedAt + SESSION_ABSOLUTE_TTL_MS
+    const expectedIdleExpiry = nowMs + SESSION_IDLE_TTL_MS
+    expect(expectedIdleExpiry).toBeLessThan(absoluteExpiry)
+
+    // The key assertion: expiresAt reflects the guard-refreshed lastAccessedAt (= nowMs),
+    // not the original issuedAt-based lastAccessedAt that was set at session creation.
+    expect(body.expiresAt).toBe(expectedIdleExpiry)
   })
 })
