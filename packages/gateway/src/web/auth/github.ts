@@ -27,10 +27,13 @@
 import type {Context, Hono} from 'hono'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
+import type {OperatorAllowlist} from './allowlist.js'
+import type {SessionDeps, SessionStore} from './session.js'
 import {createHash, randomBytes} from 'node:crypto'
 import {emitAudit} from '../audit.js'
-import {registerPublicRoute} from '../operator-route.js'
-import {badRequestResponse, rateLimitedResponse} from '../safe-response.js'
+import {registerPublicCrossSiteRoute, registerPublicRoute} from '../operator-route.js'
+import {badRequestResponse, forbiddenResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
+import {buildSessionCookieValue, parseSessionCookie} from './session.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -119,6 +122,24 @@ export interface GitHubOAuthDeps {
    * OAuth routes participate in the same per-socket budget.
    */
   readonly rateLimiter: RateLimiter
+  /**
+   * Server-side session store. When present, a successful OAuth callback mints
+   * a fresh session and sets the __Host- session cookie. When absent, the
+   * callback returns a coarse JSON identity response (pre-session-layer posture).
+   */
+  readonly sessionStore?: SessionStore
+  /**
+   * Session deps (logger, auditLogger, clock) for session operations.
+   * Required when sessionStore is present; ignored otherwise.
+   */
+  readonly sessionDeps?: SessionDeps
+  /**
+   * Operator allowlist for post-authentication authorization.
+   * When present (alongside sessionStore), the callback checks the allowlist
+   * BEFORE minting a session — non-allowlisted users are denied 403 and never
+   * get a session cookie. When absent, no allowlist check is performed.
+   */
+  readonly allowlist?: OperatorAllowlist
 }
 
 /** Configuration for the GitHub OAuth PKCE + state routes. */
@@ -174,6 +195,9 @@ export function buildGitHubOAuthDeps(
   auditLogger: AuditLogger,
   getSourceKey: (c: Context) => string,
   rateLimiter: RateLimiter,
+  sessionStore?: SessionStore,
+  sessionDeps?: SessionDeps,
+  allowlist?: OperatorAllowlist,
 ): GitHubOAuthDeps {
   return {
     logger,
@@ -185,6 +209,9 @@ export function buildGitHubOAuthDeps(
     stateStore: createInMemoryStateStore(),
     getSourceKey,
     rateLimiter,
+    ...(sessionStore === undefined ? {} : {sessionStore}),
+    ...(sessionDeps === undefined ? {} : {sessionDeps}),
+    ...(allowlist === undefined ? {} : {allowlist}),
   }
 }
 
@@ -427,11 +454,12 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
 
   // ── GET /operator/auth/github/callback ─────────────────────────────────────
   //
-  // GitHub redirects the browser cross-site after authorization, so future
-  // Fetch Metadata middleware must allow this callback route to receive
-  // Sec-Fetch-Site: cross-site.
+  // GitHub redirects the browser cross-site after authorization, so this route
+  // is registered as a public cross-site route to allow Sec-Fetch-Site: cross-site.
+  // The Fetch Metadata browser guard exempts this route from cross-site rejection.
+  // All other security checks (state validation, PKCE, source key binding) remain.
 
-  registerPublicRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
+  registerPublicCrossSiteRoute(app, 'GET', config.callbackPath, async (c: Context): Promise<Response> => {
     // Determine source key for rate limiting and source key binding validation.
     const sourceKey = deps.getSourceKey(c)
 
@@ -593,14 +621,52 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       return badRequestResponse(c)
     }
 
-    // Emit success audit event.
-    emitAudit({kind: 'auth.callback.success', correlationId, githubUserId, login}, deps.auditLogger)
-
     deps.logger.info({githubUserId}, 'oauth callback: identity verified')
 
-    // Identity is verified. Session minting is handled by the session layer
-    // (not yet wired). Return a coarse success response until the session layer
-    // is in place; the session layer will replace this with a cookie + redirect.
+    // Mint a server-side session when a session store is wired.
+    if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
+      // Check allowlist BEFORE minting a session — non-allowlisted users must not
+      // receive a session cookie. This is the authoritative allowlist gate for OAuth.
+      if (deps.allowlist !== undefined && deps.allowlist.isAuthorized(githubUserId) === false) {
+        deps.logger.warn({githubUserId}, 'oauth callback: operator not in allowlist — session not minted')
+        emitAudit({kind: 'auth.callback.failure', correlationId, reason: 'not_allowlisted' as const}, deps.auditLogger)
+        return forbiddenResponse(c)
+      }
+
+      const nowMs = deps.sessionDeps.clock()
+
+      // Clear any stale pre-auth session cookie before setting the new one
+      // to prevent session fixation.
+      const existingCookieHeader = c.req.header('cookie')
+      const existingSessionId = parseSessionCookie(existingCookieHeader)
+      if (existingSessionId !== undefined) {
+        deps.sessionStore.delete(existingSessionId)
+      }
+
+      const newSessionId = deps.sessionStore.create({githubUserId, login}, nowMs)
+      if (newSessionId === undefined) {
+        // Session cap reached — return 503 with Retry-After so clients know to retry.
+        // This is a capacity issue, not a bad request; 400 would be semantically wrong.
+        deps.sessionDeps.logger.warn({githubUserId}, 'oauth callback: session cap reached')
+        return unavailableResponse(c, 60)
+      }
+
+      // Emit success audit event only after session is successfully minted.
+      emitAudit({kind: 'auth.callback.success', correlationId, githubUserId, login}, deps.auditLogger)
+
+      // Clear stale cookie first, then set the new session cookie.
+      // Hono's c.header() appends when called multiple times for Set-Cookie.
+      if (existingSessionId !== undefined) {
+        c.header('Set-Cookie', buildSessionCookieValue('', {clear: true}), {append: true})
+      }
+      c.header('Set-Cookie', buildSessionCookieValue(newSessionId), {append: true})
+
+      deps.sessionDeps.logger.info({githubUserId}, 'oauth callback: session minted')
+      return c.json({githubUserId, login}, 200)
+    }
+
+    // No session store wired — identity verified, emit success audit before returning.
+    emitAudit({kind: 'auth.callback.success', correlationId, githubUserId, login}, deps.auditLogger)
     return c.json({githubUserId, login}, 200)
   })
 }

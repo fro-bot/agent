@@ -931,6 +931,61 @@ describe('emitAudit — redaction edge cases', () => {
 })
 
 // ---------------------------------------------------------------------------
+// browser.guard.rejected
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — browser.guard.rejected', () => {
+  it('emits a structured warn record with expected fields', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'browser.guard.rejected',
+      correlationId: 'corr-014',
+      reason: 'origin_mismatch',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.warn)).toBe('audit: browser.guard.rejected')
+    expect(firstCallCtx(logger.warn)).toMatchObject({
+      kind: 'browser.guard.rejected',
+      correlationId: 'corr-014',
+      reason: 'origin_mismatch',
+    })
+  })
+
+  it('redacts sensitive values planted in correlationId; reason enum is preserved', () => {
+    // #given
+    for (const planted of [
+      PLANTED_COOKIE,
+      PLANTED_TOKEN,
+      PLANTED_BEARER,
+      PLANTED_SECRET,
+      PLANTED_PROMPT,
+      PLANTED_INTERNAL_URL,
+    ]) {
+      const logger = makeLogger()
+      const event: AuditEvent = {
+        kind: 'browser.guard.rejected',
+        correlationId: planted,
+        reason: 'fetch_site_cross_site',
+      }
+
+      // #when
+      emitAudit(event, logger)
+
+      // #then
+      assertNoSensitiveValues(logger)
+      expect(serializeAllCalls(logger)).toContain('fetch_site_cross_site')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Sink resilience — throwing logger must not propagate
 // ---------------------------------------------------------------------------
 

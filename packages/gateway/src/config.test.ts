@@ -1,5 +1,6 @@
 import type {GatewayConfig} from './config.js'
 
+import {Buffer} from 'node:buffer'
 import {mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
@@ -79,6 +80,10 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS',
     'GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS',
     'GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE',
+    'GATEWAY_OPERATOR_CSRF_SECRET',
+    'GATEWAY_OPERATOR_CSRF_SECRET_FILE',
+    'GATEWAY_OPERATOR_ALLOWLIST',
+    'GATEWAY_OPERATOR_ALLOWLIST_FILE',
   ]) {
     delete process.env[key]
   }
@@ -431,6 +436,7 @@ function setRequiredEnv(): void {
 /**
  * Set the minimum operator web env vars for a valid config.
  * Call after setRequiredEnv() when testing operator web happy paths.
+ * Includes CSRF secret and allowlist (required for Unit 3e production wiring).
  */
 function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string} = {}): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = overrides.bindHost ?? '172.20.0.2'
@@ -438,6 +444,9 @@ function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; pub
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = overrides.publicOrigin ?? 'https://operator.example.com'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
+  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+  process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
 
 describe('loadGatewayConfig', () => {
@@ -2004,6 +2013,9 @@ function setOperatorEnv(origin: string): void {
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
+  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+  process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
 
 describe('loadGatewayConfig — GATEWAY_OPERATOR_PUBLIC_ORIGIN canonical origin validation', () => {
@@ -2257,6 +2269,8 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     process.env.GATEWAY_OPERATOR_BIND_PORT = '4000'
     process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = 'https://operator.example.com'
     process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
     delete process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID
     const clientIdFile = join(tmpDir, 'github-client-id.txt')
     writeFileSync(clientIdFile, 'file-client-id\n', {mode: 0o600})
@@ -2269,5 +2283,198 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
     expect(config.operatorWeb?.oauthClientId).toBe('file-client-id')
 
     delete process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_CSRF_SECRET and GATEWAY_OPERATOR_ALLOWLIST — Unit 3e gaps
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — CSRF secret and operator allowlist (Unit 3e production wiring)', () => {
+  it('error path: operator web enabled but GATEWAY_OPERATOR_CSRF_SECRET missing → throws', () => {
+    // #given — all operator web vars set but no CSRF secret
+    setRequiredEnv()
+    setOperatorWebEnv()
+    // Explicitly remove the CSRF secret that setOperatorWebEnv() sets
+    delete process.env.GATEWAY_OPERATOR_CSRF_SECRET
+    delete process.env.GATEWAY_OPERATOR_CSRF_SECRET_FILE
+
+    // #when / #then — must fail closed, not silently disable the gate
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_CSRF_SECRET/)
+  })
+
+  it('error path: operator web enabled but GATEWAY_OPERATOR_ALLOWLIST missing → throws', () => {
+    // #given — all operator web vars + CSRF secret set but no allowlist
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    // Explicitly remove the allowlist that setOperatorWebEnv() sets
+    delete process.env.GATEWAY_OPERATOR_ALLOWLIST
+    delete process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE
+
+    // #when / #then — must fail closed
+    expect(() => loadGatewayConfig()).toThrow(/GATEWAY_OPERATOR_ALLOWLIST/)
+  })
+
+  it('error path: GATEWAY_OPERATOR_ALLOWLIST file is empty → throws (fail closed)', () => {
+    // #given — allowlist file exists but is empty
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    const allowlistFile = join(tmpDir, 'allowlist-empty.txt')
+    writeFileSync(allowlistFile, '', {mode: 0o600})
+    process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE = allowlistFile
+
+    // #when / #then — empty allowlist must fail closed
+    expect(() => loadGatewayConfig()).toThrow(/allowlist/i)
+  })
+
+  it('error path: GATEWAY_OPERATOR_ALLOWLIST file has malformed entries → throws (fail closed)', () => {
+    // #given — allowlist file with non-numeric entries
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    const allowlistFile = join(tmpDir, 'allowlist-bad.txt')
+    writeFileSync(allowlistFile, 'not-a-number\n', {mode: 0o600})
+    process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE = allowlistFile
+
+    // #when / #then — malformed allowlist must fail closed
+    expect(() => loadGatewayConfig()).toThrow(/allowlist/i)
+  })
+
+  it('happy path: CSRF secret and allowlist both present → config includes csrfSecret and allowlist', () => {
+    // #given — all operator web vars + CSRF secret + valid allowlist
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    const allowlistFile = join(tmpDir, 'allowlist-valid.txt')
+    writeFileSync(allowlistFile, '# comment\n42\n99\n', {mode: 0o600})
+    process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE = allowlistFile
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — csrfSecret and allowlist are present in operatorWeb
+    expect(config.operatorWeb?.csrfSecret).toBe('dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE')
+    expect(config.operatorWeb?.allowlist).toBeDefined()
+    expect(config.operatorWeb?.allowlist?.isAuthorized(42)).toBe(true)
+    expect(config.operatorWeb?.allowlist?.isAuthorized(99)).toBe(true)
+    expect(config.operatorWeb?.allowlist?.isAuthorized(1)).toBe(false)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_ALLOWLIST env var (inline text) → parsed as allowlist', () => {
+    // #given — allowlist provided inline via env var (not file)
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.allowlist?.isAuthorized(42)).toBe(true)
+    expect(config.operatorWeb?.allowlist?.isAuthorized(99)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_OPERATOR_CSRF_SECRET — strict base64url validation (Fix 1)
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — CSRF secret strict base64url validation', () => {
+  it('happy path: valid base64url CSRF secret (32 bytes) → parses and stores csrfSecret', () => {
+    // #given — 32 bytes of CSPRNG entropy, base64url-encoded (no padding)
+    setRequiredEnv()
+    setOperatorWebEnv()
+    // 32 bytes → 43 base64url chars (no padding)
+    const validSecret = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — csrfSecret is stored as-is
+    expect(config.operatorWeb?.csrfSecret).toBe(validSecret)
+  })
+
+  it('happy path: valid base64url CSRF secret (64 bytes) → accepted (more than minimum)', () => {
+    // #given — 64 bytes → 86 base64url chars
+    setRequiredEnv()
+    setOperatorWebEnv()
+    // Generate a valid 64-byte base64url string (no padding)
+    const secret64 = Buffer.alloc(64, 0xab).toString('base64url')
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = secret64
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.csrfSecret).toBe(secret64)
+  })
+
+  it('error path: CSRF secret with base64 padding (=) → throws (not strict base64url)', () => {
+    // #given — base64 with padding is not strict base64url
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE='
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/strict base64url/)
+  })
+
+  it('error path: CSRF secret with + character → throws (not base64url)', () => {
+    // #given — base64 standard uses + which is not base64url
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nIS+='
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/strict base64url/)
+  })
+
+  it('error path: CSRF secret with / character → throws (not base64url)', () => {
+    // #given — base64 standard uses / which is not base64url
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nIS/='
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/strict base64url/)
+  })
+
+  it('error path: CSRF secret decodes to fewer than 32 bytes → throws (too short)', () => {
+    // #given — 16 bytes → 22 base64url chars (below 32-byte minimum)
+    setRequiredEnv()
+    setOperatorWebEnv()
+    const shortSecret = Buffer.alloc(16, 0xaa).toString('base64url')
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = shortSecret
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/at least 32 bytes/)
+  })
+
+  it('error path: CSRF secret decodes to exactly 31 bytes → throws (one byte short)', () => {
+    // #given — 31 bytes is one byte below the 32-byte minimum
+    setRequiredEnv()
+    setOperatorWebEnv()
+    const shortSecret = Buffer.alloc(31, 0xbb).toString('base64url')
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = shortSecret
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/at least 32 bytes/)
+  })
+
+  it('happy path: CSRF secret decodes to exactly 32 bytes → accepted (minimum boundary)', () => {
+    // #given — exactly 32 bytes is the minimum
+    setRequiredEnv()
+    setOperatorWebEnv()
+    const minSecret = Buffer.alloc(32, 0xcc).toString('base64url')
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = minSecret
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorWeb?.csrfSecret).toBe(minSecret)
   })
 })

@@ -1,10 +1,13 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
+import type {OperatorAllowlist} from './web/auth/allowlist.js'
 
+import {Buffer} from 'node:buffer'
 import {closeSync, constants, fstatSync, openSync, readFileSync} from 'node:fs'
 import {isIP} from 'node:net'
 import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
+import {parseAllowlistText} from './web/auth/allowlist.js'
 
 const DEFAULT_S3_PREFIX = 'fro-bot-state'
 const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
@@ -150,6 +153,20 @@ export interface GatewayConfig {
      * Defaults to 5.
      */
     readonly oauthMaxOutstandingAttemptsPerKey: number
+    /**
+     * CSRF token signing key (HMAC-SHA256), base64url-encoded with no padding/newlines.
+     * Read from GATEWAY_OPERATOR_CSRF_SECRET (or _FILE variant).
+     * Required when operator web is enabled — startup fails if absent.
+     * Must decode to at least 32 bytes (256 bits) of CSPRNG entropy.
+     */
+    readonly csrfSecret: string
+    /**
+     * Operator allowlist — set of authorized numeric GitHub user IDs.
+     * Loaded from GATEWAY_OPERATOR_ALLOWLIST_FILE or GATEWAY_OPERATOR_ALLOWLIST env var.
+     * Required when operator web is enabled — startup fails if absent, empty, or malformed.
+     * Fail-closed: missing/unreadable/empty/malformed allowlist denies everyone.
+     */
+    readonly allowlist: OperatorAllowlist
   }
 }
 
@@ -743,6 +760,59 @@ export function loadGatewayConfig(): GatewayConfig {
       oauthMaxOutstandingAttemptsPerKey = parsed
     }
 
+    // Read and validate CSRF signing secret — required when operator web is enabled.
+    // Must be a strict base64url string (no padding, no newlines, no non-base64url chars),
+    // decode to at least 32 bytes (256 bits of HMAC-SHA256 key entropy), and be round-trip
+    // stable (re-encoding the decoded bytes must reproduce the original string).
+    //
+    // GATEWAY_OPERATOR_CSRF_SECRET is an HMAC-SHA256 key with at least 256 bits of CSPRNG
+    // entropy, encoded as base64url with no padding and no newlines.
+    const rawCsrfSecret = readSecret('GATEWAY_OPERATOR_CSRF_SECRET')
+    // Strict base64url: only A-Z, a-z, 0-9, -, _ (no padding, no whitespace, no +, /)
+    // Use \w (word chars: [A-Za-z0-9_]) plus - for the full base64url alphabet.
+    if (/^[\w-]+$/.test(rawCsrfSecret) === false) {
+      throw new Error(
+        String.raw`Invalid GATEWAY_OPERATOR_CSRF_SECRET: must be strict base64url encoding (characters A-Z, a-z, 0-9, -, _ only; no padding, no whitespace, no + or /). Generate with: node -e "require('crypto').randomBytes(32).toString('base64url')" | tr -d '\n'`,
+      )
+    }
+    // Decode and check minimum length (32 bytes = 256 bits)
+    const csrfKeyBytes = Buffer.from(rawCsrfSecret, 'base64url')
+    if (csrfKeyBytes.length < 32) {
+      throw new Error(
+        String.raw`Invalid GATEWAY_OPERATOR_CSRF_SECRET: decoded to ${csrfKeyBytes.length} bytes but at least 32 bytes (256 bits) are required. Generate a new secret with: node -e "require('crypto').randomBytes(32).toString('base64url')" | tr -d '\n'`,
+      )
+    }
+    // Round-trip stability: re-encoding must reproduce the original string
+    const csrfSecretRoundTrip = csrfKeyBytes.toString('base64url')
+    if (csrfSecretRoundTrip !== rawCsrfSecret) {
+      throw new Error(
+        'Invalid GATEWAY_OPERATOR_CSRF_SECRET: value is not round-trip stable (re-encoding the decoded bytes does not reproduce the original string). Ensure the value is canonical base64url with no padding.',
+      )
+    }
+    const csrfSecret = rawCsrfSecret
+
+    // Read operator allowlist — required when operator web is enabled.
+    // Supports both file-backed (GATEWAY_OPERATOR_ALLOWLIST_FILE) and inline
+    // (GATEWAY_OPERATOR_ALLOWLIST) variants. Fail-closed: missing/empty/malformed → throw.
+    const rawAllowlistText = readOptionalMultilineSecret('GATEWAY_OPERATOR_ALLOWLIST')
+    if (rawAllowlistText === null) {
+      throw new Error(
+        'Missing required operator allowlist: set GATEWAY_OPERATOR_ALLOWLIST env var (newline-separated numeric GitHub user IDs) or GATEWAY_OPERATOR_ALLOWLIST_FILE pointing to a file. The operator web surface requires an explicit allowlist — it cannot start without one.',
+      )
+    }
+    const allowlistParseResult = parseAllowlistText(rawAllowlistText)
+    if (allowlistParseResult.ok === false) {
+      throw new Error(
+        `Invalid operator allowlist: ${allowlistParseResult.reason}. Fix GATEWAY_OPERATOR_ALLOWLIST or GATEWAY_OPERATOR_ALLOWLIST_FILE. The operator web surface requires a valid, non-empty allowlist — it cannot start with a malformed or empty one.`,
+      )
+    }
+    // Construct OperatorAllowlist directly from the parse result — no double parse, no dead logger.
+    const {ids: allowlistIds} = allowlistParseResult
+    const allowlist: OperatorAllowlist = {
+      isAuthorized: (githubUserId: number) => allowlistIds.has(githubUserId),
+      size: allowlistIds.size,
+    }
+
     // Normalize to parsedPublicOrigin.origin: strips trailing slash and default ports.
     // Stored value is always scheme+host+optional-non-default-port (no trailing slash).
     operatorWeb = {
@@ -754,6 +824,8 @@ export function loadGatewayConfig(): GatewayConfig {
       oauthAllowedReturnPaths,
       oauthStateTtlMs,
       oauthMaxOutstandingAttemptsPerKey,
+      csrfSecret,
+      allowlist,
     }
   }
 

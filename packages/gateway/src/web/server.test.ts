@@ -19,13 +19,18 @@ import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
 
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {SessionDeps} from './auth/session.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
 import {Buffer} from 'node:buffer'
 import {createServer} from 'node:http'
 
 import {describe, expect, it, vi} from 'vitest'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {loadAllowlistFromText} from './auth/allowlist.js'
+import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
+import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './auth/session.js'
+import {isPrivilegedRoute, isPublicCrossSiteRoute, isPublicRoute} from './operator-route.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
 
 // ---------------------------------------------------------------------------
@@ -738,5 +743,878 @@ describe('operator server — warning log on rejection paths', () => {
     const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [Record<string, unknown>, string][]
     const fallbackWarning = warnCalls.find(([, msg]) => msg.includes('getConnInfo unavailable'))
     expect(fallbackWarning).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — logout route registration
+// ---------------------------------------------------------------------------
+
+function makeStubSessionDeps(overrides?: Partial<SessionDeps>): SessionDeps {
+  return {
+    logger: makeLogger(),
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
+    clock: () => Date.now(),
+    ...overrides,
+  }
+}
+
+describe('buildOperatorApp — logout route registration', () => {
+  it('registers POST /operator/auth/logout when sessionStore, sessionDeps, and browser guard deps are provided', () => {
+    // #given — all required deps for logout (sessionStore + sessionDeps + browser guard deps)
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps, allowlist, csrfSecret, auditLogger, logger}),
+      makeStubConfig(),
+    )
+
+    // #when — extract unique logical routes
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: {method: string; path: string}) => ({method: route.method, path: route.path}))
+      .filter((route: {method: string; path: string}) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — logout route is registered
+    expect(routes).toContainEqual({method: 'POST', path: '/operator/auth/logout'})
+  })
+
+  it('does NOT register POST /operator/auth/logout when sessionStore is absent', () => {
+    // #given — no session store
+    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
+
+    // #when
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: {method: string; path: string}) => ({method: route.method, path: route.path}))
+      .filter((route: {method: string; path: string}) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — logout route is NOT registered
+    expect(routes).not.toContainEqual({method: 'POST', path: '/operator/auth/logout'})
+  })
+
+  it('throws a programming error when sessionStore/sessionDeps are present but browser guard deps are absent', () => {
+    // #given — sessionStore + sessionDeps without allowlist/csrfSecret/auditLogger
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+
+    // #when / #then — must throw: public mutating logout is a CSRF footgun
+    expect(() => buildOperatorApp(makeStubDeps({sessionStore, sessionDeps}), makeStubConfig())).toThrow(
+      'programming error',
+    )
+  })
+
+  it('logout route is classified as privileged (requires session + CSRF)', () => {
+    // #given — all required deps for logout
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps, allowlist, csrfSecret, auditLogger, logger}),
+      makeStubConfig(),
+    )
+
+    // #when / #then — logout is privileged (not public)
+    expect(isPrivilegedRoute(app, 'POST', '/operator/auth/logout')).toBe(true)
+    expect(isPublicRoute(app, 'POST', '/operator/auth/logout')).toBe(false)
+  })
+
+  it('logout route returns 200 and clears the session cookie when session + CSRF are valid', async () => {
+    // #given — all required deps for logout
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps,
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        'x-csrf-token': csrfToken,
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — success
+    expect(res.status).toBe(200)
+
+    // #and — session is invalidated
+    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+
+    // #and — clear-cookie header is set
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie).toContain(SESSION_COOKIE_NAME)
+    expect(setCookie.toLowerCase()).toContain('max-age=0')
+  })
+
+  it('logout route returns 429 when rate limiter rejects (after guard passes)', async () => {
+    // #given — valid session + CSRF, but rate limiter always blocks
+    // Rate limit check runs inside the handler after the guard passes.
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps,
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => false},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — valid session + CSRF but rate limiter blocks
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        'x-csrf-token': csrfToken,
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rate limited
+    expect(res.status).toBe(429)
+  })
+
+  it('logout route clears cookie and invalidates session when rate limiter allows', async () => {
+    // #given — rate limiter allows; valid session + CSRF
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps,
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        'x-csrf-token': csrfToken,
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — allowed; session cleared
+    expect(res.status).toBe(200)
+    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie.toLowerCase()).toContain('max-age=0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CSRF endpoint — GET /operator/session/csrf
+// ---------------------------------------------------------------------------
+
+const TEST_CSRF_SECRET = Buffer.from('test-csrf-secret-32-bytes-long!!', 'utf8').toString('base64url')
+
+function makeStubBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>) {
+  const logger = makeLogger()
+  const auditLogger = {info: vi.fn(), warn: vi.fn()}
+  const allowlist = loadAllowlistFromText('42\n', logger)
+  return {
+    logger,
+    auditLogger,
+    sessionStore,
+    allowlist,
+    csrfSecret: TEST_CSRF_SECRET,
+  }
+}
+
+describe('buildOperatorApp — CSRF endpoint registration', () => {
+  it('registers GET /operator/session/csrf when allowlist, csrfSecret, auditLogger, and sessionStore are provided', () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps: makeStubSessionDeps(), allowlist, csrfSecret, auditLogger, logger}),
+      makeStubConfig(),
+    )
+
+    // #when — extract unique logical routes
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — CSRF endpoint is registered
+    expect(routes).toContainEqual({method: 'GET', path: '/operator/session/csrf'})
+  })
+
+  it('does NOT register GET /operator/session/csrf when allowlist is absent', () => {
+    // #given — no allowlist
+    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
+
+    // #when
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — CSRF endpoint is NOT registered
+    expect(routes).not.toContainEqual({method: 'GET', path: '/operator/session/csrf'})
+  })
+})
+
+describe('GET /operator/session/csrf — happy path', () => {
+  it('returns 200 with csrfToken when session is valid and operator is allowlisted', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+    const body = (await res.json()) as {csrfToken?: unknown}
+
+    // #then
+    expect(res.status).toBe(200)
+    expect(typeof body.csrfToken).toBe('string')
+    expect((body.csrfToken as string).length).toBeGreaterThan(0)
+  })
+
+  it('returns 401 when no session cookie is present', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — no session cookie
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {origin: 'https://operator.example.com'},
+    })
+    const res = await app.fetch(req)
+
+    // #then
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 403 when operator is not in allowlist', async () => {
+    // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then
+    expect(res.status).toBe(403)
+  })
+
+  it('returns 400 when Origin does not match publicOrigin', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — wrong origin
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://evil.attacker.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 when non-cookie credential scheme is present', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — Authorization header present (non-cookie credential)
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        authorization: 'Bearer some-token',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected without logging the credential value
+    expect(res.status).toBe(400)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Auto-guard: registerOperatorRoute applies browser guard automatically (Unit 3e gap #2)
+// ---------------------------------------------------------------------------
+
+describe('registerOperatorRoute — auto-guard applies browser guard to privileged routes', () => {
+  it('a privileged route registered via registerOperatorRoute rejects unauthenticated requests with 401', async () => {
+    // #given — build app with browser guard deps and a privileged route
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — GET a privileged route (CSRF endpoint) without a session cookie
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {origin: 'https://operator.example.com'},
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected 401 (no session)
+    expect(res.status).toBe(401)
+  })
+
+  it('a privileged route registered via registerOperatorRoute rejects non-allowlisted operators with 403', async () => {
+    // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — GET privileged route with non-allowlisted session
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected 403 (not allowlisted)
+    expect(res.status).toBe(403)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Logout protection: POST /operator/auth/logout requires session + CSRF (Unit 3e gap #3)
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #3)', () => {
+  it('rejects logout without session cookie with 401 when browser guard is enabled', async () => {
+    // #given — app with browser guard deps
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — POST logout without session cookie
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {origin: 'https://operator.example.com'},
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected 401 (no session)
+    expect(res.status).toBe(401)
+  })
+
+  it('rejects logout without CSRF token with 400 when browser guard is enabled', async () => {
+    // #given — valid session but no CSRF token
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — POST logout with session but no CSRF token
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        // No x-csrf-token
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected 400 (missing CSRF token)
+    expect(res.status).toBe(400)
+  })
+
+  it('allows logout with valid session and CSRF token when browser guard is enabled', async () => {
+    // #given — valid session and valid CSRF token
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const {generateCsrfToken: genToken} = await import('./auth/csrf.js')
+    const csrfToken = genToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
+
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now + 1000}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — POST logout with valid session and CSRF token
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        'x-csrf-token': csrfToken,
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — success
+    expect(res.status).toBe(200)
+    // #and — session is invalidated
+    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+  })
+})
+
+describe('buildOperatorApp — OAuth callback is cross-site public', () => {
+  it('oAuth callback is registered as public cross-site when OAuth is configured', () => {
+    // #given
+    const app = buildOperatorApp(
+      makeStubDeps({githubOAuth: makeStubGitHubOAuthDeps()}),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when / #then — callback is cross-site public
+    expect(isPublicCrossSiteRoute(app, 'GET', '/operator/auth/github/callback')).toBe(true)
+    expect(isPublicRoute(app, 'GET', '/operator/auth/github/callback')).toBe(true)
+  })
+
+  it('oAuth start is NOT cross-site public (only callback is)', () => {
+    // #given
+    const app = buildOperatorApp(
+      makeStubDeps({githubOAuth: makeStubGitHubOAuthDeps()}),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when / #then — start is public but NOT cross-site
+    expect(isPublicCrossSiteRoute(app, 'GET', '/operator/auth/github/start')).toBe(false)
+    expect(isPublicRoute(app, 'GET', '/operator/auth/github/start')).toBe(true)
+  })
+})
+
+describe('server integration — forwarded-header rejection before CSRF', () => {
+  it('rejects with 400 on bad forwarded headers before reaching CSRF check', async () => {
+    // #given — server with browser guard enabled
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — bad forwarded headers (should reject before CSRF check)
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+        'x-forwarded-host': 'evil.attacker.com',
+        'x-forwarded-proto': 'https',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected at forwarded-header check (400), not at CSRF check
+    expect(res.status).toBe(400)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — partial browser guard deps throws (Fix 4)
+// ---------------------------------------------------------------------------
+
+describe('buildOperatorApp — partial browser guard deps throws at construction time (Fix 4)', () => {
+  it('throws when allowlist is provided but csrfSecret is absent', () => {
+    // #given — allowlist present but csrfSecret and auditLogger absent
+    const sessionStore = createInMemorySessionStore()
+    const {allowlist} = makeStubBrowserGuardDeps(sessionStore)
+
+    // #when / #then — partial deps must throw at construction time
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps({allowlist, sessionStore}), // csrfSecret and auditLogger absent
+        makeStubConfig(),
+      ),
+    ).toThrow(/partial browser guard deps/)
+  })
+
+  it('throws when csrfSecret is provided but allowlist is absent', () => {
+    // #given — csrfSecret present but allowlist and auditLogger absent
+    const sessionStore = createInMemorySessionStore()
+    const {csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+
+    // #when / #then
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps({csrfSecret, sessionStore}), // allowlist and auditLogger absent
+        makeStubConfig(),
+      ),
+    ).toThrow(/partial browser guard deps/)
+  })
+
+  it('throws when auditLogger is provided but allowlist and csrfSecret are absent', () => {
+    // #given — auditLogger present but allowlist and csrfSecret absent
+    const sessionStore = createInMemorySessionStore()
+    const {auditLogger} = makeStubBrowserGuardDeps(sessionStore)
+
+    // #when / #then
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps({auditLogger, sessionStore}), // allowlist and csrfSecret absent
+        makeStubConfig(),
+      ),
+    ).toThrow(/partial browser guard deps/)
+  })
+
+  it('does NOT throw when all four browser guard deps are absent (guard disabled)', () => {
+    // #given — no browser guard deps at all
+    // #when / #then — all absent is valid (guard disabled)
+    expect(() => buildOperatorApp(makeStubDeps(), makeStubConfig())).not.toThrow()
+  })
+
+  it('does NOT throw when all four browser guard deps are present (guard enabled)', () => {
+    // #given — all four browser guard deps present
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+
+    // #when / #then — all present is valid (guard enabled)
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps({allowlist, csrfSecret, auditLogger, sessionStore, sessionDeps: makeStubSessionDeps(), logger}),
+        makeStubConfig(),
+      ),
+    ).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)', () => {
+  it('returns Cache-Control: no-store, private on successful CSRF token response', async () => {
+    // #given — valid session and allowlisted operator
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — success with Cache-Control: no-store, private
+    expect(res.status).toBe(200)
+    const cacheControl = res.headers.get('cache-control') ?? ''
+    expect(cacheControl).toContain('no-store')
+    expect(cacheControl).toContain('private')
+  })
+
+  it('returns Vary header on successful CSRF token response', async () => {
+    // #given — valid session and allowlisted operator
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://operator.example.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — Vary header present
+    expect(res.status).toBe(200)
+    const vary = res.headers.get('vary') ?? ''
+    expect(vary).toContain('Origin')
+  })
+
+  it('returns Vary header on rejection response (origin mismatch)', async () => {
+    // #given — valid session but wrong Origin
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when — wrong Origin
+    const req = new Request('http://127.0.0.1/operator/session/csrf', {
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: 'https://evil.attacker.com',
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — rejected with Vary header
+    expect(res.status).toBe(400)
+    const vary = res.headers.get('vary') ?? ''
+    expect(vary).toContain('Origin')
   })
 })
