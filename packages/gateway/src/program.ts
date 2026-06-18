@@ -411,6 +411,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
       // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
       // Pass the session store so successful callbacks mint a fresh session.
+      // Pass the allowlist so non-allowlisted users are denied before session creation.
       const githubOAuthDeps = buildGitHubOAuthDeps(
         logger,
         logger,
@@ -418,6 +419,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         operatorRateLimiter,
         sessionStore,
         sessionDeps,
+        config.operatorWeb.allowlist,
       )
 
       operatorServerHandle = deps.startOperatorServer(
@@ -428,6 +430,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           githubOAuth: githubOAuthDeps,
           sessionStore,
           sessionDeps,
+          allowlist: config.operatorWeb.allowlist,
+          csrfSecret: config.operatorWeb.csrfSecret,
+          auditLogger: logger,
         },
         {
           bindHost: config.operatorWeb.bindHost,

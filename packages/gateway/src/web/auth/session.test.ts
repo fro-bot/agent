@@ -16,10 +16,14 @@
  */
 
 import type {AuditLogger} from '../audit.js'
+import type {BrowserGuardDeps} from './csrf.js'
 import type {SessionDeps, SessionStore} from './session.js'
+import {Buffer} from 'node:buffer'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
-import {assertAllPrivilegedRoutesWrapped, registerPublicRoute} from '../operator-route.js'
+import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from '../operator-route.js'
+import {loadAllowlistFromText} from './allowlist.js'
+import {applyBrowserGuard, generateCsrfToken} from './csrf.js'
 import {
   buildLogoutRoutes,
   buildSessionCookieValue,
@@ -630,28 +634,66 @@ describe('parseSessionCookie', () => {
 // Logout route
 // ---------------------------------------------------------------------------
 
-function buildTestLogoutApp(store: SessionStore, deps: SessionDeps): Hono {
+const TEST_CSRF_SECRET = Buffer.from('test-csrf-secret-32-bytes-long!!', 'utf8').toString('base64url')
+const PUBLIC_ORIGIN = 'https://operator.example.com'
+
+/**
+ * Build a test app with the full browser guard installed and the logout route registered.
+ * Logout is always a privileged route — this helper mirrors the production wiring in server.ts.
+ */
+function buildTestLogoutApp(
+  store: SessionStore,
+  deps: SessionDeps,
+  guardDepsOverrides?: Partial<BrowserGuardDeps>,
+): Hono {
+  const logger = makeLogger()
+  const auditLogger = makeAuditLogger()
+  const allowlist = loadAllowlistFromText('42\n', logger)
+  const browserGuardDeps: BrowserGuardDeps = {
+    logger,
+    auditLogger,
+    sessionStore: store,
+    allowlist,
+    csrfSecret: TEST_CSRF_SECRET,
+    publicOrigin: PUBLIC_ORIGIN,
+    clock: deps.clock,
+    ...guardDepsOverrides,
+  }
+
   const app = new Hono()
   registerPublicRoute(app, 'GET', '/operator/health', c => c.json({ok: true}))
-  buildLogoutRoutes(app, store, deps)
+
+  // Install the browser guard before registering privileged routes — mirrors server.ts.
+  const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+  setOperatorRouteGuard(app, async (c, method, _path) => {
+    const requireCsrf = SAFE_METHODS.has(method.toUpperCase()) === false
+    return applyBrowserGuard(c, browserGuardDeps, false, requireCsrf)
+  })
+
+  buildLogoutRoutes(app, store, deps, browserGuardDeps)
   assertAllPrivilegedRoutesWrapped(app)
   return app
 }
 
-describe('POST /operator/auth/logout — happy path', () => {
-  it('returns 200 and clears the session cookie when a valid session exists', async () => {
+describe('POST /operator/auth/logout — happy path (privileged route)', () => {
+  it('returns 200 and clears the session cookie when session + CSRF are valid', async () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
     const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
       method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
     })
     const res = await app.fetch(req)
 
@@ -669,12 +711,17 @@ describe('POST /operator/auth/logout — happy path', () => {
     const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
       method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
     })
     const res = await app.fetch(req)
 
@@ -692,16 +739,22 @@ describe('POST /operator/auth/logout — happy path', () => {
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
-    const app = buildTestLogoutApp(store, deps)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
+    // Pass the same auditLogger to the guard deps so we capture guard audit events too
+    const app = buildTestLogoutApp(store, deps, {auditLogger, clock: () => now + 1_000})
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
       method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
     })
     await app.fetch(req)
 
-    // #then — audit event emitted
+    // #then — auth.logout audit event emitted (from the handler, not the guard)
     const logoutEvent = auditLogger.records.find(r => r.kind === 'auth.logout')
     expect(logoutEvent).toBeDefined()
     expect(logoutEvent?.githubUserId).toBe(42)
@@ -715,12 +768,17 @@ describe('POST /operator/auth/logout — happy path', () => {
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
-    const app = buildTestLogoutApp(store, deps)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
+    const app = buildTestLogoutApp(store, deps, {auditLogger, clock: () => now + 1_000})
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
       method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
     })
     await app.fetch(req)
 
@@ -739,72 +797,118 @@ describe('POST /operator/auth/logout — happy path', () => {
   })
 })
 
-describe('POST /operator/auth/logout — no session cookie', () => {
-  it('returns 200 even when no session cookie is present (idempotent logout)', async () => {
-    // #given
+describe('POST /operator/auth/logout — guard enforcement (privileged route)', () => {
+  it('returns 401 when no session cookie is present (guard rejects unauthenticated requests)', async () => {
+    // #given — logout is a privileged route; no session = 401
     const store = createInMemorySessionStore()
     const deps = makeStubDeps()
     const app = buildTestLogoutApp(store, deps)
 
     // #when — no cookie header
-    const req = new Request('https://operator.example.com/operator/auth/logout', {method: 'POST'})
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+      method: 'POST',
+      headers: {origin: PUBLIC_ORIGIN},
+    })
     const res = await app.fetch(req)
 
-    // #then — idempotent; still 200
-    expect(res.status).toBe(200)
+    // #then — guard rejects with 401 (no session)
+    expect(res.status).toBe(401)
   })
 
-  it('still clears the cookie even when no session cookie is present', async () => {
-    // #given
+  it('returns 400 when session is valid but CSRF token is missing', async () => {
+    // #given — valid session but no CSRF token
     const store = createInMemorySessionStore()
-    const deps = makeStubDeps()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const deps = makeStubDeps({clock: () => now + 1_000})
+    const app = buildTestLogoutApp(store, deps)
+
+    // #when — no x-csrf-token header
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        // No x-csrf-token
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — guard rejects with 400 (missing CSRF token)
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 when Origin header is absent on mutating request', async () => {
+    // #given — valid session and CSRF token but no Origin header
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const deps = makeStubDeps({clock: () => now + 1_000})
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
+    const app = buildTestLogoutApp(store, deps)
+
+    // #when — no Origin header (absent origin on mutating request is rejected)
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        'x-csrf-token': csrfToken,
+        // No origin header
+      },
+    })
+    const res = await app.fetch(req)
+
+    // #then — guard rejects with 400 (absent origin on mutating request)
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 403 when operator is not in allowlist', async () => {
+    // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 99, login: 'notallowed'}, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const deps = makeStubDeps({clock: () => now + 1_000})
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 99, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {method: 'POST'})
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
+    })
     const res = await app.fetch(req)
 
-    // #then — clear-cookie header is still set
-    const setCookie = res.headers.get('set-cookie') ?? ''
-    expect(setCookie).toContain(SESSION_COOKIE_NAME)
-    expect(setCookie.toLowerCase()).toContain('max-age=0')
+    // #then — guard rejects with 403 (not allowlisted)
+    expect(res.status).toBe(403)
   })
 })
 
 describe('POST /operator/auth/logout — unknown session ID', () => {
-  it('returns 200 for an unknown session ID (no oracle)', async () => {
-    // #given
+  it('returns 401 for an unknown session ID (guard rejects invalid session)', async () => {
+    // #given — unknown session ID; guard rejects before handler runs
     const store = createInMemorySessionStore()
     const deps = makeStubDeps()
     const app = buildTestLogoutApp(store, deps)
 
     // #when — send a session cookie with an unknown ID
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
       method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=unknown-session-id-xyz`},
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=unknown-session-id-xyz`,
+        origin: PUBLIC_ORIGIN,
+      },
     })
     const res = await app.fetch(req)
 
-    // #then — no oracle; still 200
-    expect(res.status).toBe(200)
-  })
-
-  it('does NOT emit an audit event for an unknown session ID (no oracle)', async () => {
-    // #given
-    const store = createInMemorySessionStore()
-    const auditLogger = makeAuditLogger()
-    const deps = makeStubDeps({auditLogger})
-    const app = buildTestLogoutApp(store, deps)
-
-    // #when — send a session cookie with an unknown ID
-    const req = new Request('https://operator.example.com/operator/auth/logout', {
-      method: 'POST',
-      headers: {cookie: `${SESSION_COOKIE_NAME}=unknown-session-id-xyz`},
-    })
-    await app.fetch(req)
-
-    // #then — no audit event emitted (unknown session = no oracle)
-    expect(auditLogger.records).toHaveLength(0)
+    // #then — guard rejects with 401 (invalid session)
+    expect(res.status).toBe(401)
   })
 })
 
@@ -948,14 +1052,25 @@ describe('parseSessionCookie — empty value', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /operator/auth/logout — response body', () => {
-  it('response body is {ok: true}', async () => {
-    // #given
+  it('response body is {ok: true} when session + CSRF are valid', async () => {
+    // #given — valid session and CSRF token
     const store = createInMemorySessionStore()
-    const deps = makeStubDeps()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const deps = makeStubDeps({clock: () => now + 1_000})
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
 
     // #when
-    const req = new Request('https://operator.example.com/operator/auth/logout', {method: 'POST'})
+    const req = new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+      method: 'POST',
+      headers: {
+        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        origin: PUBLIC_ORIGIN,
+        'x-csrf-token': csrfToken,
+      },
+    })
     const res = await app.fetch(req)
 
     // #then — body is {ok: true}

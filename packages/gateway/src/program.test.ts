@@ -172,6 +172,8 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
 function makeOperatorWebConfig(
   overrides: Partial<NonNullable<GatewayConfig['operatorWeb']>> = {},
 ): NonNullable<GatewayConfig['operatorWeb']> {
+  // Build a minimal deny-all allowlist for tests that don't need real allowlist behavior.
+  const denyAllAllowlist = {isAuthorized: () => false, size: 0}
   return {
     bindHost: '172.20.0.2',
     bindPort: 4000,
@@ -181,6 +183,8 @@ function makeOperatorWebConfig(
     oauthAllowedReturnPaths: ['/operator'],
     oauthStateTtlMs: 600_000,
     oauthMaxOutstandingAttemptsPerKey: 5,
+    csrfSecret: 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE',
+    allowlist: denyAllAllowlist,
     ...overrides,
   }
 }
@@ -1137,6 +1141,47 @@ describe('button interaction handler (approval flow)', () => {
 
     // #then — operator server was never started
     expect(startOperatorServerSpy).not.toHaveBeenCalled()
+  })
+
+  it('operator server receives allowlist and csrfSecret from config when operatorWeb is configured', async () => {
+    // #given — config has operatorWeb with csrfSecret and allowlist
+    const testAllowlist = {isAuthorized: (id: number) => id === 42, size: 1}
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig({
+        csrfSecret: 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE',
+        allowlist: testAllowlist,
+      }),
+    })
+    const fakeClient = makeFakeClient()
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — operator server was started
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+
+    // #and — deps include allowlist and csrfSecret
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.allowlist).toBeDefined()
+    expect(serverDeps.allowlist?.isAuthorized(42)).toBe(true)
+    expect(serverDeps.allowlist?.isAuthorized(99)).toBe(false)
+    expect(serverDeps.csrfSecret).toBe('dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE')
+    expect(serverDeps.auditLogger).toBeDefined()
   })
 
   it('shutdown → approvalRegistry.disposeAll called', async () => {
