@@ -23,12 +23,14 @@
 
 import type {ServerType} from '@hono/node-server'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {SessionDeps, SessionStore} from './auth/session.js'
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
+import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute} from './operator-route.js'
 import {
   badRequestResponse,
@@ -90,6 +92,16 @@ export interface OperatorServerDeps {
    * When absent, the auth routes are not registered (opt-in).
    */
   readonly githubOAuth?: GitHubOAuthDeps
+  /**
+   * Optional session store for the logout route.
+   * When present (alongside sessionDeps), POST /operator/auth/logout is registered.
+   */
+  readonly sessionStore?: SessionStore
+  /**
+   * Session deps (logger, auditLogger, clock) for the logout route.
+   * Required when sessionStore is present; ignored otherwise.
+   */
+  readonly sessionDeps?: SessionDeps
 }
 
 export interface OperatorServerConfig {
@@ -333,6 +345,28 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       'buildOperatorApp: deps.githubOAuth and config.githubOAuth must both be present or both absent. ' +
         'Partial GitHub OAuth config is a programming error.',
     )
+  }
+
+  // ── Logout route ───────────────────────────────────────────────────────────
+  //
+  // Registered only when both sessionStore and sessionDeps are present.
+  // Route: POST /operator/auth/logout — public (no session required to call logout).
+  // Thread the shared rate limiter and socket-derived source key into the logout route
+  // so it participates in the same per-socket budget as the health and OAuth routes.
+  if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
+    const sessionDepsWithRateLimiter = {
+      ...deps.sessionDeps,
+      rateLimiter,
+      getSourceKey: (c: Parameters<typeof getConnInfo>[0]) => {
+        try {
+          const connInfo = getConnInfo(c)
+          return connInfo.remote.address ?? 'unknown'
+        } catch {
+          return 'unknown'
+        }
+      },
+    }
+    buildLogoutRoutes(app, deps.sessionStore, sessionDepsWithRateLimiter)
   }
 
   // ── Catch-all ──────────────────────────────────────────────────────────────

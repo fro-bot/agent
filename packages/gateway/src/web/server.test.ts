@@ -19,6 +19,7 @@ import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
 
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {SessionDeps} from './auth/session.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
 import {Buffer} from 'node:buffer'
 import {createServer} from 'node:http'
@@ -26,6 +27,8 @@ import {createServer} from 'node:http'
 import {describe, expect, it, vi} from 'vitest'
 import {createRateLimiter} from '../http/rate-limit.js'
 import {createInMemoryStateStore} from './auth/github.js'
+import {createInMemorySessionStore} from './auth/session.js'
+import {isPublicRoute} from './operator-route.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
 
 // ---------------------------------------------------------------------------
@@ -738,5 +741,154 @@ describe('operator server — warning log on rejection paths', () => {
     const warnCalls = (logger.warn as ReturnType<typeof vi.fn>).mock.calls as [Record<string, unknown>, string][]
     const fallbackWarning = warnCalls.find(([, msg]) => msg.includes('getConnInfo unavailable'))
     expect(fallbackWarning).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — logout route registration
+// ---------------------------------------------------------------------------
+
+function makeStubSessionDeps(overrides?: Partial<SessionDeps>): SessionDeps {
+  return {
+    logger: makeLogger(),
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
+    clock: () => Date.now(),
+    ...overrides,
+  }
+}
+
+describe('buildOperatorApp — logout route registration', () => {
+  it('registers POST /operator/auth/logout when sessionStore and sessionDeps are provided', () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+    const app = buildOperatorApp(makeStubDeps({sessionStore, sessionDeps}), makeStubConfig())
+
+    // #when — extract unique logical routes
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: {method: string; path: string}) => ({method: route.method, path: route.path}))
+      .filter((route: {method: string; path: string}) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — logout route is registered
+    expect(routes).toContainEqual({method: 'POST', path: '/operator/auth/logout'})
+  })
+
+  it('does NOT register POST /operator/auth/logout when sessionStore is absent', () => {
+    // #given — no session store
+    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
+
+    // #when
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: {method: string; path: string}) => ({method: route.method, path: route.path}))
+      .filter((route: {method: string; path: string}) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — logout route is NOT registered
+    expect(routes).not.toContainEqual({method: 'POST', path: '/operator/auth/logout'})
+  })
+
+  it('logout route is classified as public (no session required to call logout)', () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+    const app = buildOperatorApp(makeStubDeps({sessionStore, sessionDeps}), makeStubConfig())
+
+    // #when / #then — logout is public (idempotent, no oracle)
+    expect(isPublicRoute(app, 'POST', '/operator/auth/logout')).toBe(true)
+  })
+
+  it('logout route returns 200 and clears the session cookie', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps, rateLimiter: {allow: () => true}}),
+      makeStubConfig(),
+    )
+
+    // #when
+    const {SESSION_COOKIE_NAME} = await import('./auth/session.js')
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+    })
+    const res = await app.fetch(req)
+
+    // #then — success
+    expect(res.status).toBe(200)
+
+    // #and — session is invalidated
+    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+
+    // #and — clear-cookie header is set
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie).toContain(SESSION_COOKIE_NAME)
+    expect(setCookie.toLowerCase()).toContain('max-age=0')
+  })
+
+  it('logout route returns 429 when rate limiter rejects', async () => {
+    // #given — rate limiter always blocks
+    const sessionStore = createInMemorySessionStore()
+    const sessionDeps = makeStubSessionDeps()
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps, rateLimiter: {allow: () => false}}),
+      makeStubConfig(),
+    )
+
+    // #when
+    const {SESSION_COOKIE_NAME} = await import('./auth/session.js')
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {cookie: `${SESSION_COOKIE_NAME}=some-session-id`},
+    })
+    const res = await app.fetch(req)
+
+    // #then — rate limited
+    expect(res.status).toBe(429)
+  })
+
+  it('logout route clears cookie and invalidates session when rate limiter allows', async () => {
+    // #given — rate limiter allows
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const app = buildOperatorApp(
+      makeStubDeps({sessionStore, sessionDeps, rateLimiter: {allow: () => true}}),
+      makeStubConfig(),
+    )
+
+    // #when
+    const {SESSION_COOKIE_NAME} = await import('./auth/session.js')
+    const req = new Request('http://127.0.0.1/operator/auth/logout', {
+      method: 'POST',
+      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`},
+    })
+    const res = await app.fetch(req)
+
+    // #then — allowed; session cleared
+    expect(res.status).toBe(200)
+    expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie.toLowerCase()).toContain('max-age=0')
   })
 })
