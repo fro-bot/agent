@@ -1,5 +1,6 @@
 import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
+import type {Context} from 'hono'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
@@ -14,6 +15,7 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_STALE_THRESHOLD_MS,
 } from '@fro-bot/runtime'
+import {getConnInfo} from '@hono/node-server/conninfo'
 import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
@@ -26,8 +28,10 @@ import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createAppClient} from './github/app-client.js'
+import {createRateLimiter} from './http/rate-limit.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
+import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
@@ -372,23 +376,52 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     }
 
     // g2. Start operator web HTTP server (before shutdown handlers so the handle is available).
-    //     Operator web endpoint is opt-in: only started when all three required operator config
-    //     vars are set (GATEWAY_OPERATOR_BIND_HOST, GATEWAY_OPERATOR_BIND_PORT,
-    //     GATEWAY_OPERATOR_PUBLIC_ORIGIN). Partial config fails closed at loadGatewayConfig() time.
+    //     Operator web endpoint is opt-in: only started when all required operator config
+    //     vars are set. Partial config fails closed at loadGatewayConfig() time.
     //     When absent, operatorServerHandle is undefined and shutdown skips it.
     let operatorServerHandle: CloseableServer | undefined
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
+      // Build the source key extractor for OAuth outstanding-attempt counting.
+      // Must use the TCP socket address (not caller-spoofable headers).
+      // getConnInfo may throw in environments without a real socket; fall back to 'unknown'.
+      const getSourceKey = (c: Context): string => {
+        try {
+          return getConnInfo(c).remote.address ?? 'unknown'
+        } catch {
+          return 'unknown'
+        }
+      }
+
+      // Build the shared rate limiter for the operator surface.
+      // Passed to both buildGitHubOAuthDeps and OperatorServerDeps so OAuth routes
+      // participate in the same per-socket budget as the health route.
+      const operatorRateLimiter = createRateLimiter({limit: 20, windowMs: 60_000})
+
+      // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
+      const githubOAuthDeps = buildGitHubOAuthDeps(logger, logger, getSourceKey, operatorRateLimiter)
+
       operatorServerHandle = deps.startOperatorServer(
         {
           logger,
           isShuttingDown,
+          rateLimiter: operatorRateLimiter,
+          githubOAuth: githubOAuthDeps,
         },
         {
           bindHost: config.operatorWeb.bindHost,
           bindPort: config.operatorWeb.bindPort,
           publicOrigin: config.operatorWeb.publicOrigin,
+          githubOAuth: {
+            clientId: config.operatorWeb.oauthClientId,
+            clientSecret: config.operatorWeb.oauthClientSecret,
+            publicOrigin: config.operatorWeb.publicOrigin,
+            callbackPath: '/operator/auth/github/callback',
+            allowedReturnPaths: config.operatorWeb.oauthAllowedReturnPaths,
+            stateTtlMs: config.operatorWeb.oauthStateTtlMs,
+            maxOutstandingAttemptsPerKey: config.operatorWeb.oauthMaxOutstandingAttemptsPerKey,
+          },
         },
       )
       logger.info(

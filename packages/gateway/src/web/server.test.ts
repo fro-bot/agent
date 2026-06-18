@@ -18,12 +18,14 @@
 import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
 
+import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
 import {Buffer} from 'node:buffer'
 import {createServer} from 'node:http'
 
 import {describe, expect, it, vi} from 'vitest'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {createInMemoryStateStore} from './auth/github.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,118 @@ describe('buildOperatorApp — route inventory', () => {
 
     // #then — only the health route is registered (no privileged routes yet)
     expect(routes).toEqual([{method: 'GET', path: '/operator/health'}])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Helpers — GitHub OAuth stubs (used only in the OAuth route tests below)
+// ---------------------------------------------------------------------------
+
+function makeStubGitHubOAuthDeps(overrides?: Partial<GitHubOAuthDeps>): GitHubOAuthDeps {
+  return {
+    logger: makeLogger(),
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
+    fetch: vi.fn(async () => new Response('{}', {status: 200, headers: {'content-type': 'application/json'}})),
+    clock: () => Date.now(),
+    generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
+    generateState: () => 'stub-state-value-32-bytes-long-ok',
+    stateStore: createInMemoryStateStore(),
+    getSourceKey: () => 'stub-source-key',
+    // rateLimiter is overwritten by buildOperatorApp with the shared instance;
+    // provide a pass-through stub so the type is satisfied.
+    rateLimiter: {allow: () => true},
+    ...overrides,
+  }
+}
+
+function makeStubGitHubOAuthConfig(overrides?: Partial<GitHubOAuthConfig>): GitHubOAuthConfig {
+  return {
+    clientId: 'stub-client-id',
+    clientSecret: 'stub-client-secret',
+    publicOrigin: 'https://operator.example.com',
+    callbackPath: '/operator/auth/github/callback',
+    allowedReturnPaths: ['/operator/dashboard'],
+    maxOutstandingAttemptsPerKey: 5,
+    stateTtlMs: 10 * 60 * 1000,
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — OAuth route registration
+// ---------------------------------------------------------------------------
+
+describe('buildOperatorApp — OAuth route registration', () => {
+  it('registers /operator/auth/github/start and /operator/auth/github/callback when both deps.githubOAuth and config.githubOAuth are provided', () => {
+    // #given — both OAuth deps and config are present
+    const app = buildOperatorApp(
+      makeStubDeps({githubOAuth: makeStubGitHubOAuthDeps()}),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — extract unique logical routes (excluding global middleware)
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — health + both OAuth routes are registered
+    expect(routes).toContainEqual({method: 'GET', path: '/operator/health'})
+    expect(routes).toContainEqual({method: 'GET', path: '/operator/auth/github/start'})
+    expect(routes).toContainEqual({method: 'GET', path: '/operator/auth/github/callback'})
+    expect(routes).toHaveLength(3)
+  })
+
+  it('registers only /operator/health when neither deps.githubOAuth nor config.githubOAuth are provided', () => {
+    // #given — no OAuth deps or config
+    const app = buildOperatorApp(makeStubDeps(), makeStubConfig())
+
+    // #when
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then — only health route
+    expect(routes).toEqual([{method: 'GET', path: '/operator/health'}])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — partial OAuth config is a programming error
+// ---------------------------------------------------------------------------
+
+describe('buildOperatorApp — partial OAuth config programming error', () => {
+  it('throws when deps.githubOAuth is set but config.githubOAuth is absent', () => {
+    // #given — only deps side is provided
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps({githubOAuth: makeStubGitHubOAuthDeps()}),
+        makeStubConfig(), // no githubOAuth in config
+      ),
+    ).toThrow('programming error')
+  })
+
+  it('throws when config.githubOAuth is set but deps.githubOAuth is absent', () => {
+    // #given — only config side is provided
+    expect(() =>
+      buildOperatorApp(
+        makeStubDeps(), // no githubOAuth in deps
+        makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+      ),
+    ).toThrow('programming error')
   })
 })
 

@@ -15,6 +15,7 @@ export type AuthCallbackFailureReason =
   | 'provider_error'
   | 'token_exchange_failed'
   | 'user_fetch_failed'
+  | 'source_key_mismatch'
   | 'unknown'
 
 /** Safe reasons for authorization denial. */

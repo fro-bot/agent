@@ -168,6 +168,23 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
   }
 }
 
+/** Full operatorWeb config block for tests — includes all required OAuth fields. */
+function makeOperatorWebConfig(
+  overrides: Partial<NonNullable<GatewayConfig['operatorWeb']>> = {},
+): NonNullable<GatewayConfig['operatorWeb']> {
+  return {
+    bindHost: '172.20.0.2',
+    bindPort: 4000,
+    publicOrigin: 'https://operator.example.com',
+    oauthClientId: 'test-oauth-client-id',
+    oauthClientSecret: 'test-oauth-client-secret',
+    oauthAllowedReturnPaths: ['/operator'],
+    oauthStateTtlMs: 600_000,
+    oauthMaxOutstandingAttemptsPerKey: 5,
+    ...overrides,
+  }
+}
+
 /** Minimal fake Discord client for program tests. */
 function makeFakeClient() {
   return {
@@ -937,7 +954,7 @@ describe('button interaction handler (approval flow)', () => {
     // #given — config has operatorWeb present
     const fakeConfig = makeFakeConfig({
       announce: undefined,
-      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+      operatorWeb: makeOperatorWebConfig(),
     })
     const fakeClient = makeFakeClient()
     const fakeOperatorHandle = makeFakeServerHandle()
@@ -994,7 +1011,7 @@ describe('button interaction handler (approval flow)', () => {
     // #given — both announce and operatorWeb are configured
     const fakeConfig = makeFakeConfig({
       announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
-      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+      operatorWeb: makeOperatorWebConfig(),
     })
     const fakeClient = makeFakeClient()
     const announceCloseSpy = vi.fn((cb?: (err?: Error) => void) => cb?.())
@@ -1023,7 +1040,7 @@ describe('button interaction handler (approval flow)', () => {
     // #given — both announce and operatorWeb are configured
     const fakeConfig = makeFakeConfig({
       announce: {webhookSecret: 'test-webhook-secret', presenceChannelId: 'test-presence-channel-id', httpPort: 3000},
-      operatorWeb: {bindHost: '172.20.0.2', bindPort: 4000, publicOrigin: 'https://operator.example.com'},
+      operatorWeb: makeOperatorWebConfig(),
     })
     const fakeClient = makeFakeClient()
     const fakeAnnounceHandle = makeFakeServerHandle()
@@ -1044,6 +1061,82 @@ describe('button interaction handler (approval flow)', () => {
     // #then — both factories were called (composite handle was built for shutdown)
     expect(deps.startAnnounceServer).toHaveBeenCalledOnce()
     expect(deps.startOperatorServer).toHaveBeenCalledOnce()
+  })
+
+  it('operator server receives githubOAuth deps and config when operatorWeb is configured', async () => {
+    // #given — config has operatorWeb with OAuth fields
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig({
+        oauthClientId: 'my-client-id',
+        oauthClientSecret: 'my-client-secret',
+        oauthAllowedReturnPaths: ['/operator/dashboard'],
+        oauthStateTtlMs: 300_000,
+        oauthMaxOutstandingAttemptsPerKey: 3,
+      }),
+    })
+    const fakeClient = makeFakeClient()
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — operator server was started once
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+
+    // #and — deps include githubOAuth
+    const [serverDeps, serverConfig] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.githubOAuth).toBeDefined()
+    expect(typeof serverDeps.githubOAuth?.fetch).toBe('function')
+    expect(typeof serverDeps.githubOAuth?.generateVerifier).toBe('function')
+    expect(typeof serverDeps.githubOAuth?.generateState).toBe('function')
+    expect(typeof serverDeps.githubOAuth?.getSourceKey).toBe('function')
+    expect(serverDeps.githubOAuth?.stateStore).toBeDefined()
+
+    // #and — config carries OAuth fields from GatewayConfig
+    expect(serverConfig.githubOAuth).toBeDefined()
+    expect(serverConfig.githubOAuth?.clientId).toBe('my-client-id')
+    expect(serverConfig.githubOAuth?.clientSecret).toBe('my-client-secret')
+    expect(serverConfig.githubOAuth?.allowedReturnPaths).toEqual(['/operator/dashboard'])
+    expect(serverConfig.githubOAuth?.stateTtlMs).toBe(300_000)
+    expect(serverConfig.githubOAuth?.maxOutstandingAttemptsPerKey).toBe(3)
+    expect(serverConfig.githubOAuth?.callbackPath).toBe('/operator/auth/github/callback')
+    expect(serverConfig.githubOAuth?.publicOrigin).toBe('https://operator.example.com')
+  })
+
+  it('operator server receives no githubOAuth when operatorWeb is absent', async () => {
+    // #given — no operatorWeb
+    const fakeConfig = makeFakeConfig({announce: undefined, operatorWeb: undefined})
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — operator server was never started
+    expect(startOperatorServerSpy).not.toHaveBeenCalled()
   })
 
   it('shutdown → approvalRegistry.disposeAll called', async () => {
