@@ -1823,7 +1823,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
 
-    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, now)
+    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, '', now)
     if (staleSessionId === undefined) throw new Error('expected stale session to be created')
 
     stateStore.set('valid-state-value', {
@@ -1967,6 +1967,8 @@ describe('GET /operator/auth/github/callback — session minting', () => {
       onRevoke: () => undefined,
       scavenge: () => undefined,
       size: () => 10_000,
+      getOperatorToken: () => undefined,
+      dropOperatorToken: () => undefined,
     }
 
     const deps = makeStubDeps({
@@ -2006,6 +2008,8 @@ describe('GET /operator/auth/github/callback — session minting', () => {
       onRevoke: () => undefined,
       scavenge: () => undefined,
       size: () => 10_000,
+      getOperatorToken: () => undefined,
+      dropOperatorToken: () => undefined,
     }
 
     const deps = makeStubDeps({
@@ -2045,6 +2049,8 @@ describe('GET /operator/auth/github/callback — session minting', () => {
       onRevoke: () => undefined,
       scavenge: () => undefined,
       size: () => 10_000,
+      getOperatorToken: () => undefined,
+      dropOperatorToken: () => undefined,
     }
 
     const auditLogger = makeAuditLogger()
@@ -2078,7 +2084,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
 
-    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, now)
+    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, '', now)
     if (staleSessionId === undefined) throw new Error('expected stale session to be created')
 
     // Register a revocation hook on the stale session
@@ -2109,6 +2115,217 @@ describe('GET /operator/auth/github/callback — session minting', () => {
 
     // #then — revocation hook was called (stale session was deleted)
     expect(revocationHook).toHaveBeenCalledExactlyOnceWith(staleSessionId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OAuth callback — OAuth token retention in session (Unit 3h)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/auth/github/callback — OAuth token retention', () => {
+  it('getOperatorToken returns the access token after a successful OAuth callback', async () => {
+    // #given
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const accessToken = 'ghs_RETAINED_TOKEN'
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+    expect(res.status).toBe(200)
+
+    // #then — extract session ID from cookie and verify token is retained
+    const setCookieHeaders = res.headers.getSetCookie()
+    const sessionCookieHeader = setCookieHeaders.find(
+      h => h.startsWith(`${SESSION_COOKIE_NAME}=`) && !h.toLowerCase().includes('max-age=0'),
+    )
+    if (sessionCookieHeader === undefined) throw new Error('expected session cookie to be set')
+    const cookieValue = sessionCookieHeader.split(';')[0]
+    if (cookieValue === undefined) throw new Error('expected cookie value')
+    const sessionId = cookieValue.slice(SESSION_COOKIE_NAME.length + 1)
+
+    // #and — getOperatorToken returns the access token
+    expect(sessionStore.getOperatorToken(sessionId, now + 2000)).toBe(accessToken)
+  })
+
+  it('access token is NOT present in the session cookie value', async () => {
+    // #given — security: token must never appear in the cookie
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const accessToken = 'ghs_NEVER_IN_COOKIE'
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — token is NOT in any Set-Cookie header
+    const setCookieHeaders = res.headers.getSetCookie()
+    for (const header of setCookieHeaders) {
+      expect(header).not.toContain(accessToken)
+    }
+  })
+
+  it('access token is NOT present in the response body', async () => {
+    // #given — security: token must never appear in any operator-facing response
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const accessToken = 'ghs_NEVER_IN_BODY'
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+    const body = await res.text()
+
+    // #then — token is NOT in the response body
+    expect(body).not.toContain(accessToken)
+  })
+
+  it('access token is NOT present in any log message during the callback (no-oracle)', async () => {
+    // #given — capture all logger calls
+    const logMessages: string[] = []
+    const capturingLogger = {
+      debug: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
+        logMessages.push(msg)
+      }),
+      info: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
+        logMessages.push(msg)
+      }),
+      warn: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
+        logMessages.push(msg)
+      }),
+      error: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
+        logMessages.push(msg)
+      }),
+    }
+
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const accessToken = 'ghs_NEVERLOG_TOKEN'
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
+      logger: capturingLogger,
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000, logger: capturingLogger})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    await app.fetch(req)
+
+    // #then — token never appears in any log message
+    for (const msg of logMessages) {
+      expect(msg).not.toContain(accessToken)
+    }
+  })
+
+  it('getOperatorToken returns undefined after logout (token dropped with session)', async () => {
+    // #given — complete a successful OAuth callback
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const accessToken = 'ghs_LOGOUT_TOKEN'
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+    expect(res.status).toBe(200)
+
+    // Extract session ID
+    const setCookieHeaders = res.headers.getSetCookie()
+    const sessionCookieHeader = setCookieHeaders.find(
+      h => h.startsWith(`${SESSION_COOKIE_NAME}=`) && !h.toLowerCase().includes('max-age=0'),
+    )
+    if (sessionCookieHeader === undefined) throw new Error('expected session cookie to be set')
+    const cookieValue = sessionCookieHeader.split(';')[0]
+    if (cookieValue === undefined) throw new Error('expected cookie value')
+    const sessionId = cookieValue.slice(SESSION_COOKIE_NAME.length + 1)
+
+    // Verify token is retained
+    expect(sessionStore.getOperatorToken(sessionId, now + 2000)).toBe(accessToken)
+
+    // #when — logout (revoke the session)
+    sessionStore.delete(sessionId)
+
+    // #then — token is gone
+    expect(sessionStore.getOperatorToken(sessionId, now + 3000)).toBeUndefined()
   })
 })
 

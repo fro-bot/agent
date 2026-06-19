@@ -81,7 +81,7 @@ describe('createInMemorySessionStore — create', () => {
     const now = 1_000_000
 
     // #when
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
 
     // #then — session ID is a non-empty string
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
@@ -95,7 +95,7 @@ describe('createInMemorySessionStore — create', () => {
     const now = 1_000_000
 
     // #when
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
 
     // #then — 32 hex chars = 128 bits; base64url 22 chars = ~132 bits
     // Accept either hex (64 chars for 256 bits) or base64url (43+ chars for 256 bits)
@@ -111,7 +111,7 @@ describe('createInMemorySessionStore — create', () => {
     // #when
     const ids = new Set<string>()
     for (let i = 0; i < 20; i++) {
-      const id = store.create({githubUserId: 42, login: 'octocat'}, now)
+      const id = store.create({githubUserId: 42, login: 'octocat'}, '', now)
       if (id === undefined) throw new Error('expected session ID to be defined')
       ids.add(id)
     }
@@ -126,7 +126,7 @@ describe('createInMemorySessionStore — create', () => {
     const now = 1_000_000
 
     // #when
-    const sessionId = store.create({githubUserId: 99, login: 'testuser'}, now)
+    const sessionId = store.create({githubUserId: 99, login: 'testuser'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const entry = store.get(sessionId, now)
 
@@ -149,7 +149,7 @@ describe('createInMemorySessionStore — get with expiry', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when — access 1 second later
@@ -163,7 +163,7 @@ describe('createInMemorySessionStore — get with expiry', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when — access 1ms past absolute TTL
@@ -177,7 +177,7 @@ describe('createInMemorySessionStore — get with expiry', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when — access 1ms past idle TTL without any touch
@@ -203,7 +203,7 @@ describe('createInMemorySessionStore — get with expiry', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     store.delete(sessionId)
 
@@ -224,7 +224,7 @@ describe('createInMemorySessionStore — touch', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when — touch at 25 minutes (within idle TTL)
@@ -241,7 +241,7 @@ describe('createInMemorySessionStore — touch', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when — touch just before absolute TTL expires
@@ -272,7 +272,7 @@ describe('createInMemorySessionStore — delete', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when
@@ -294,8 +294,8 @@ describe('createInMemorySessionStore — delete', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, now)
-    const sessionB = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, '', now)
+    const sessionB = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionA === undefined || sessionB === undefined) throw new Error('expected session IDs to be defined')
 
     // #when — revoke only session A
@@ -316,7 +316,7 @@ describe('createInMemorySessionStore — revocation hook', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     const hookCalled = vi.fn()
@@ -333,7 +333,7 @@ describe('createInMemorySessionStore — revocation hook', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     const hookCalled = vi.fn()
@@ -350,8 +350,8 @@ describe('createInMemorySessionStore — revocation hook', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, now)
-    const sessionB = store.create({githubUserId: 43, login: 'other'}, now)
+    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, '', now)
+    const sessionB = store.create({githubUserId: 43, login: 'other'}, '', now)
     if (sessionA === undefined || sessionB === undefined) throw new Error('expected session IDs to be defined')
 
     const hookA = vi.fn()
@@ -371,8 +371,8 @@ describe('createInMemorySessionStore — revocation hook', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, now)
-    const sessionB = store.create({githubUserId: 43, login: 'other'}, now)
+    const sessionA = store.create({githubUserId: 42, login: 'octocat'}, '', now)
+    const sessionB = store.create({githubUserId: 43, login: 'other'}, '', now)
     if (sessionA === undefined || sessionB === undefined) throw new Error('expected session IDs to be defined')
 
     const hookA = vi.fn()
@@ -395,8 +395,8 @@ describe('createInMemorySessionStore — scavenge', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    store.create({githubUserId: 42, login: 'octocat'}, now)
-    store.create({githubUserId: 43, login: 'other'}, now)
+    store.create({githubUserId: 42, login: 'octocat'}, '', now)
+    store.create({githubUserId: 43, login: 'other'}, '', now)
 
     // #when — scavenge past absolute TTL
     store.scavenge(now + SESSION_ABSOLUTE_TTL_MS + 1)
@@ -409,7 +409,7 @@ describe('createInMemorySessionStore — scavenge', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    store.create({githubUserId: 42, login: 'octocat'}, now)
+    store.create({githubUserId: 42, login: 'octocat'}, '', now)
 
     // #when — scavenge 1 second after creation (well within TTL)
     store.scavenge(now + 1_000)
@@ -422,7 +422,7 @@ describe('createInMemorySessionStore — scavenge', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     store.delete(sessionId)
 
@@ -445,11 +445,11 @@ describe('createInMemorySessionStore — cap', () => {
     const now = 1_000_000
 
     for (let i = 0; i < SESSION_MAX_ENTRIES; i++) {
-      store.create({githubUserId: i, login: `user${i}`}, now)
+      store.create({githubUserId: i, login: `user${i}`}, '', now)
     }
 
     // #when — one more create
-    const result = store.create({githubUserId: 99999, login: 'overflow'}, now)
+    const result = store.create({githubUserId: 99999, login: 'overflow'}, '', now)
 
     // #then — cap enforced; returns undefined
     expect(result).toBeUndefined()
@@ -461,12 +461,12 @@ describe('createInMemorySessionStore — cap', () => {
     const now = 1_000_000
 
     for (let i = 0; i < SESSION_MAX_ENTRIES; i++) {
-      store.create({githubUserId: i, login: `user${i}`}, now)
+      store.create({githubUserId: i, login: `user${i}`}, '', now)
     }
 
     // #when — scavenge past absolute TTL, then create
     store.scavenge(now + SESSION_ABSOLUTE_TTL_MS + 1)
-    const result = store.create({githubUserId: 99999, login: 'new'}, now + SESSION_ABSOLUTE_TTL_MS + 2)
+    const result = store.create({githubUserId: 99999, login: 'new'}, '', now + SESSION_ABSOLUTE_TTL_MS + 2)
 
     // #then — create succeeds
     expect(result).toBeDefined()
@@ -482,7 +482,7 @@ describe('createInMemorySessionStore — simulated restart', () => {
     // #given — create a session in store A
     const storeA = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = storeA.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = storeA.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     expect(storeA.get(sessionId, now + 1_000)).toBeDefined()
 
@@ -680,7 +680,7 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -708,7 +708,7 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -735,7 +735,7 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
@@ -764,7 +764,7 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
     // #given — session IDs are never logged (security invariant)
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
@@ -819,7 +819,7 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
     // #given — valid session but no CSRF token
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const app = buildTestLogoutApp(store, deps)
@@ -843,7 +843,7 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
     // #given — valid session and CSRF token but no Origin header
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -868,7 +868,7 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = store.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 99, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -924,7 +924,7 @@ describe('createInMemorySessionStore — create scavenges before cap check', () 
 
     const ids: string[] = []
     for (let i = 0; i < SESSION_MAX_ENTRIES; i++) {
-      const id = store.create({githubUserId: i, login: `user${i}`}, now)
+      const id = store.create({githubUserId: i, login: `user${i}`}, '', now)
       if (id === undefined) throw new Error('expected session ID to be defined')
       ids.push(id)
     }
@@ -935,7 +935,7 @@ describe('createInMemorySessionStore — create scavenges before cap check', () 
     store.delete(firstId)
 
     // #when — create a new session without calling scavenge() manually
-    const newId = store.create({githubUserId: 99999, login: 'reauth-user'}, now + 1_000)
+    const newId = store.create({githubUserId: 99999, login: 'reauth-user'}, '', now + 1_000)
 
     // #then — create succeeds because revoked entry was scavenged opportunistically
     expect(newId).toBeDefined()
@@ -947,11 +947,11 @@ describe('createInMemorySessionStore — create scavenges before cap check', () 
     const now = 1_000_000
 
     for (let i = 0; i < SESSION_MAX_ENTRIES; i++) {
-      store.create({githubUserId: i, login: `user${i}`}, now)
+      store.create({githubUserId: i, login: `user${i}`}, '', now)
     }
 
     // #when — create at a time past absolute TTL (entries are expired)
-    const newId = store.create({githubUserId: 99999, login: 'new-user'}, now + SESSION_ABSOLUTE_TTL_MS + 1)
+    const newId = store.create({githubUserId: 99999, login: 'new-user'}, '', now + SESSION_ABSOLUTE_TTL_MS + 1)
 
     // #then — create succeeds because expired entries were scavenged opportunistically
     expect(newId).toBeDefined()
@@ -963,11 +963,11 @@ describe('createInMemorySessionStore — create scavenges before cap check', () 
     const now = 1_000_000
 
     for (let i = 0; i < SESSION_MAX_ENTRIES; i++) {
-      store.create({githubUserId: i, login: `user${i}`}, now)
+      store.create({githubUserId: i, login: `user${i}`}, '', now)
     }
 
     // #when — create at same time (all entries still live)
-    const result = store.create({githubUserId: 99999, login: 'overflow'}, now)
+    const result = store.create({githubUserId: 99999, login: 'overflow'}, '', now)
 
     // #then — cap enforced; returns undefined
     expect(result).toBeUndefined()
@@ -983,7 +983,7 @@ describe('createInMemorySessionStore — get returns Readonly', () => {
     // #given
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #when
@@ -1008,7 +1008,7 @@ describe('generateSessionId — entropy', () => {
     const now = 1_000_000
 
     // #when
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #then — 32 bytes base64url = 43 chars (no padding)
@@ -1021,7 +1021,7 @@ describe('generateSessionId — entropy', () => {
     const now = 1_000_000
 
     // #when
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
 
     // #then — only base64url charset (no +, /, or =)
@@ -1048,6 +1048,229 @@ describe('parseSessionCookie — empty value', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Session store — OAuth token retention (Unit 3h)
+// ---------------------------------------------------------------------------
+
+describe('createInMemorySessionStore — getOperatorToken (token retention)', () => {
+  it('getOperatorToken returns the token stored at create time', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_SECRETTOKEN'
+
+    // #when
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #then — token is retrievable via the narrow accessor
+    expect(store.getOperatorToken(sessionId, now)).toBe(token)
+  })
+
+  it('getOperatorToken returns undefined for an unknown session ID', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+
+    // #when / #then
+    expect(store.getOperatorToken('nonexistent-id', now)).toBeUndefined()
+  })
+
+  it('getOperatorToken returns undefined after the session is revoked (logout)', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — revoke the session (logout path)
+    store.delete(sessionId)
+
+    // #then — token is gone
+    expect(store.getOperatorToken(sessionId, now + 1_000)).toBeUndefined()
+  })
+
+  it('getOperatorToken returns undefined after absolute TTL expiry', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — access past absolute TTL
+    const result = store.getOperatorToken(sessionId, now + SESSION_ABSOLUTE_TTL_MS + 1)
+
+    // #then — token is gone (TTL-evicted)
+    expect(result).toBeUndefined()
+  })
+
+  it('getOperatorToken returns undefined after idle TTL expiry', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — access past idle TTL without any touch
+    const result = store.getOperatorToken(sessionId, now + SESSION_IDLE_TTL_MS + 1)
+
+    // #then — token is gone (idle-evicted)
+    expect(result).toBeUndefined()
+  })
+
+  it('token is NOT present in the SessionEntry returned by get()', () => {
+    // #given — security: token must not leak into the public SessionEntry shape
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_SECRETTOKEN'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when
+    const entry = store.get(sessionId, now)
+
+    // #then — entry does not contain the token in any field
+    expect(entry).toBeDefined()
+    const entryJson = JSON.stringify(entry)
+    expect(entryJson).not.toContain(token)
+    // Explicit field check: SessionIdentity fields only
+    expect(Object.keys(entry ?? {})).not.toContain('oauthToken')
+  })
+
+  it('token is NOT present in SessionIdentity (githubUserId, login only)', () => {
+    // #given — security: SessionIdentity must not gain the token field
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_SECRETTOKEN'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when
+    const entry = store.get(sessionId, now)
+
+    // #then — only expected fields present
+    if (entry === undefined) throw new Error('expected entry to be defined')
+    expect(entry.githubUserId).toBe(42)
+    expect(entry.login).toBe('octocat')
+    // Token must not appear as any property
+    for (const value of Object.values(entry)) {
+      expect(value).not.toBe(token)
+    }
+  })
+})
+
+describe('createInMemorySessionStore — dropOperatorToken (re-auth coupling)', () => {
+  it('dropOperatorToken removes the token; getOperatorToken returns undefined after', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — drop the token (e.g. on detected GitHub token expiry)
+    store.dropOperatorToken(sessionId)
+
+    // #then — token is gone; session itself is still valid
+    expect(store.getOperatorToken(sessionId, now + 1_000)).toBeUndefined()
+    expect(store.get(sessionId, now + 1_000)).toBeDefined()
+  })
+
+  it('dropOperatorToken on unknown session ID is a no-op (does not throw)', () => {
+    // #given
+    const store = createInMemorySessionStore()
+
+    // #when / #then — no throw
+    expect(() => store.dropOperatorToken('nonexistent-id')).not.toThrow()
+  })
+
+  it('dropOperatorToken on revoked session is a no-op (does not throw)', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    store.delete(sessionId)
+
+    // #when / #then — no throw
+    expect(() => store.dropOperatorToken(sessionId)).not.toThrow()
+  })
+
+  it('session remains valid after dropOperatorToken (only token is cleared, not the session)', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when
+    store.dropOperatorToken(sessionId)
+
+    // #then — session is still valid
+    const entry = store.get(sessionId, now + 1_000)
+    expect(entry).toBeDefined()
+    expect(entry?.githubUserId).toBe(42)
+  })
+})
+
+describe('createInMemorySessionStore — token no-oracle (token never in public entry)', () => {
+  it('token does not appear in the entry returned by get() at any point in the lifecycle', () => {
+    // #given — the session store has no logger; the no-oracle invariant is enforced by
+    // ensuring the token never appears in the public SessionEntry returned by get().
+    // Route-level no-oracle (logger calls) is tested in github.test.ts.
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_SUPERSECRETTOKEN_NEVERLOG'
+
+    // #when — exercise the full token lifecycle
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const retrieved = store.getOperatorToken(sessionId, now)
+    store.dropOperatorToken(sessionId)
+    const afterDrop = store.getOperatorToken(sessionId, now)
+
+    // #then — token is returned correctly by the accessor (not leaked elsewhere)
+    expect(retrieved).toBe(token)
+    expect(afterDrop).toBeUndefined()
+
+    // #and — the entry returned by get() does not contain the token in any field
+    const entry = store.get(sessionId, now)
+    const entryStr = JSON.stringify(entry)
+    expect(entryStr).not.toContain(token)
+  })
+})
+
+describe('createInMemorySessionStore — create signature backward compat', () => {
+  it('create still returns a session ID with the new three-argument signature', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+
+    // #when — new signature: (identity, oauthToken, nowMs)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, 'ghs_TOKEN', now)
+
+    // #then
+    expect(sessionId).toBeDefined()
+    expect(typeof sessionId).toBe('string')
+  })
+
+  it('create with token stores identity correctly (get() returns correct fields)', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+
+    // #when
+    const sessionId = store.create({githubUserId: 99, login: 'testuser'}, 'ghs_TOKEN', now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const entry = store.get(sessionId, now)
+
+    // #then — identity fields are correct
+    expect(entry?.githubUserId).toBe(99)
+    expect(entry?.login).toBe('testuser')
+    expect(entry?.issuedAt).toBe(now)
+    expect(entry?.revoked).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Logout response body
 // ---------------------------------------------------------------------------
 
@@ -1056,7 +1279,7 @@ describe('POST /operator/auth/logout — response body', () => {
     // #given — valid session and CSRF token
     const store = createInMemorySessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session ID to be defined')
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})

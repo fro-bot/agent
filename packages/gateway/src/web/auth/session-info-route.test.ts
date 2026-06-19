@@ -41,7 +41,7 @@ function makeLogger() {
   }
 }
 
-function makeStubSessionStore(entry?: Readonly<SessionEntry>): SessionStore {
+function makeStubSessionStore(entry?: Readonly<Omit<SessionEntry, 'oauthToken'>>): SessionStore {
   return {
     create: vi.fn(() => 'stub-session-id'),
     get: vi.fn((_sessionId: string, _nowMs: number) => entry),
@@ -50,6 +50,8 @@ function makeStubSessionStore(entry?: Readonly<SessionEntry>): SessionStore {
     onRevoke: vi.fn(),
     scavenge: vi.fn(),
     size: vi.fn(() => 0),
+    getOperatorToken: vi.fn(() => undefined),
+    dropOperatorToken: vi.fn(),
   }
 }
 
@@ -344,7 +346,7 @@ describe('buildSessionInfoRoute — integration: real guard touch updates expire
     const issuedAt = nowMs - 1_000 // absolute expires at nowMs - 1000 + 8h (far future)
 
     const sessionStore = createInMemorySessionStore()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, issuedAt)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', issuedAt)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     // Advance the store's internal lastAccessedAt to issuedAt (create sets it to issuedAt).
