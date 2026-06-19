@@ -16,6 +16,8 @@ Add the Gateway-side API surface that Phase A made possible: GitHub-authenticate
 
 > **Operator-surface types are now owned by `packages/gateway/src/operator-contract/` (the frozen contract at `OPERATOR_CONTRACT_VERSION = '1.0.0'`).** Consuming units in this plan (launch, run-state, approvals) MUST import operator-surface types from that module, not re-declare them. The dashboard's `operator-client.ts` is a non-canonical downstream fixture; the contract barrel is the import authority.
 
+> **S2 authority decision (ratified 2026-06-19, [#951](https://github.com/fro-bot/agent/issues/951); ADR: `docs/decisions/2026-06-19-s2-operator-auth-authority.md`).** This Gateway operator-auth surface is the **single S2 operator-auth authority**. The dashboard delegates interactive operator auth to it and maintains no parallel operator identity. The dashboard's read-only Arctic + signed-cookie session is **retired** (no transitional dual-session period), and the gateway's numeric-GitHub-user-ID allowlist is the **single allowlist source of truth**. Dashboard-side consuming work is tracked at `fro-bot/dashboard#53`.
+
 ## Problem Frame
 
 The Gateway currently has two proven control paths: Discord commands/mentions for launching work and Discord buttons for OpenCode approvals. Phase A extracted `launchWork`, transport-neutral sinks, and the generalized approval registry so another transport can use the same queue, concurrency cap, shutdown handoff, and fail-closed approval gate.
@@ -58,7 +60,7 @@ The missing piece is the authenticated browser-facing API. The existing HTTP ann
 
 ### Deferred to Separate Tasks
 
-- Dashboard UI integration in `fro-bot/dashboard` consumes the Gateway surface after the Gateway API exists.
+- Dashboard UI integration in `fro-bot/dashboard` consumes the Gateway surface after the Gateway API exists. Per the S2 authority decision (`docs/decisions/2026-06-19-s2-operator-auth-authority.md`), the dashboard rides the gateway operator session for all auth (read and interactive), retires its Arctic + signed-cookie session, and keeps no independent allowlist. Tracked at `fro-bot/dashboard#53`.
 - Operator-complete UX ships in the dashboard repo after this API is available; this plan proves the flow through API/smoke coverage, not production UI screens.
 - Machine/API caller support gets a separate token, replay, rate-limit, and audit design.
 - Hot-reloadable or remote operator allowlist management can follow the file-backed v1 allowlist.
