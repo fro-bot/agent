@@ -12,7 +12,7 @@
 import type {DecisionOutcome} from '../approvals/registry.js'
 import type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 
-import {accessSync, constants, readFileSync} from 'node:fs'
+import {readFileSync} from 'node:fs'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {describe, expect, it} from 'vitest'
@@ -176,16 +176,17 @@ describe('R7 structural boundary: no decidedBy:string in approval-decision sourc
 
       // Existence guard: fail loudly if a scanned file has been renamed or deleted
       // so a rename cannot silently drop coverage.
+      // Read directly and surface a missing/renamed target from the read error
+      // itself — a single read avoids a check-then-read race.
+      let content: string
       try {
-        accessSync(absPath, constants.R_OK)
+        content = readFileSync(absPath, 'utf8')
       } catch {
         throw new Error(
           `R7 scan target no longer exists or is unreadable: ${relPath}\n` +
             `Update SCAN_TARGETS in approval.test.ts to reflect the rename.`,
         )
       }
-
-      const content = readFileSync(absPath, 'utf8')
       const lines = content.split('\n')
 
       for (const [i, line] of lines.entries()) {
