@@ -27,6 +27,7 @@ import {handleMention, userIsAuthorized} from './discord/mentions.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
+import {createRunIndex} from './execute/run-index.js'
 import {createAppClient} from './github/app-client.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
@@ -175,6 +176,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       adapter: s3Adapter,
       storeConfig: config.objectStore,
       identity: config.identity,
+    })
+    // Server-owned run index: authoritative runId → {repo, surface} resolution.
+    // Populated at run creation; used by privileged routes (future SSE/launch) to
+    // authorize a run by id without trusting client-supplied owner/repo.
+    const runIndex = createRunIndex({
+      bindingsStore,
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      logger,
     })
     const appClient = createAppClient({
       appId: config.githubAppId,
@@ -334,6 +344,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           // shutdown matches that contract and is consistent with the messageCreate
           // guard above that refuses new mentions once isShuttingDown() returns true.
           isShuttingDown,
+          // Server-owned run index: populated at run creation for privileged route authz.
+          runIndex,
         },
         logger,
       }
