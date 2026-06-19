@@ -35,6 +35,8 @@ Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot
 - `OPERATOR_CONTRACT_VERSION` is **build-time pinned** and never negotiated over the wire. Any endpoint reading a version header must reject unrecognized versions fail-closed.
 - The dashboard's `operator-client.ts` is a **non-canonical downstream fixture**; it does not define the contract.
 
+This Gateway operator-auth surface (`packages/gateway/src/web/auth/`) is the **single S2 operator-auth authority** (ratified [#951](https://github.com/fro-bot/agent/issues/951); ADR: `docs/decisions/2026-06-19-s2-operator-auth-authority.md`). The dashboard delegates interactive operator auth to it and maintains no parallel operator identity — it rides the gateway session (same-origin via `GATEWAY_OPERATOR_PUBLIC_ORIGIN`) and the gateway's numeric-GitHub-user-ID allowlist is the **single allowlist source of truth**. Do not add a second operator OAuth/session/allowlist anywhere downstream.
+
 ## Effect / Result<> boundary
 
 This package is the **only** place in the monorepo that uses `effect`. The Action and the runtime package stay on hand-rolled `Result<T, E>` from `@bfra.me/es`.
