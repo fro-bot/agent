@@ -2,6 +2,30 @@
 
 The Discord-first gateway daemon. Wraps `@fro-bot/runtime` with Effect 3.x as the composition layer.
 
+## Redaction gate
+
+Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot/.github@data`. A repo redacted in that file is never included in operator output and never triggers a per-repo GitHub query — the denylist check happens before any binding lookup, run-state read, or status projection.
+
+**Source:** `fro-bot/.github` repository, `data` branch, `metadata/repos.yaml`. Read via the gateway App client's Contents API (injectable `MetadataReader`; tests inject a fake).
+
+**Deny keys** (`databaseId` / `nodeId`) are captured at ingest time (`add-project`) via `GET /repos/{owner}/{repo}` and stored on the `RepoBinding` (gateway-local; the shared `RunState` is not changed). At surface time the gate resolves run → binding → deny keys — no GitHub call is made to resolve repo identity. This is the denylist-before-query invariant.
+
+**Fail-closed posture:**
+- Cold start (never successfully loaded) → deny all. No last-known-good to fall back to.
+- Refresh failure after a prior good load → serve last-known-good for a bounded grace window while emitting hard alarms (`logger.error`). After the grace window expires without a successful refresh → deny all.
+- Missing deny key (binding has no `databaseId` or `nodeId`, or binding not found) → denied. Never resolved via a surface-time query.
+- A redacted entry in `repos.yaml` with only an `R_`-format `node_id` and no numeric `database_id` → the whole denylist load fails closed (schema error). Every redacted entry must contribute a usable numeric `database_id`.
+
+**Backfill:** Active bindings created before deny-key capture was added are backfilled offline/admin via `src/bindings/backfill-deny-keys.ts` before the first operator consumer ships. Records still missing deny keys after backfill are omitted (fail closed) — never resolved via a surface-time query.
+
+**Stale-redaction window:** A repo redacted in `repos.yaml` after ingest may surface until the next denylist refresh (bounded by TTL + grace window). Long-lived operator streams re-check on each request. This is a documented accepted risk.
+
+**No-oracle:** Redacted repo owner/name are never stored, logged, or returned anywhere in the gate. Only deny keys (`databaseId` / `nodeId`) are retained from redacted entries. Error messages on denial paths are repo-identity-free.
+
+**Composes alongside `checkRepoAuthz`:** authz proves the operator may see a repo; redaction proves the repo is not hidden by policy. Both must pass. The two gates are independent and cannot silently diverge.
+
+**Cross-reference:** `src/operator-contract/redaction.ts` (`REDACTION_OBLIGATION`) is the agent-side authority. See also: `fro-bot/dashboard` `docs/solutions/security-issues/cross-source-redaction-denylist-before-query-2026-06-15.md` — the dashboard's reference implementation of the same invariant.
+
 ## Operator API contract
 
 `packages/gateway/src/operator-contract/` is the **single authority** for operator-surface types (lifecycle, identity, approval-decision, responses) and the contract version. Import from its barrel (`index.ts`); do not re-declare these types elsewhere.
