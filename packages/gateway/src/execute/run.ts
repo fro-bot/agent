@@ -10,6 +10,7 @@ import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
+import type {RunIndex} from './run-index.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
@@ -74,6 +75,15 @@ export interface RunMentionDeps {
    * proceeds as normal.
    */
   readonly isShuttingDown?: () => boolean
+  /**
+   * Server-owned run index for `runId → {repo, surface}` resolution.
+   *
+   * Populated at run creation so privileged routes (future SSE/launch) can
+   * authorize a run by id without trusting client-supplied owner/repo.
+   * Optional — when absent, registration is skipped (e.g. in tests that do
+   * not exercise the index).
+   */
+  readonly runIndex?: RunIndex
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -357,6 +367,19 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
+    }
+
+    // Register the run in the server-owned index so privileged routes can resolve
+    // runId → {repo, surface} without trusting client-supplied owner/repo.
+    // Best-effort: index is optional and register() is synchronous — never blocks execution.
+    // Wrapped in try/catch so a buggy register() implementation never aborts the run.
+    try {
+      deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
+    } catch (registerError: unknown) {
+      logger.warn(
+        {repo, runId, err: registerError instanceof Error ? registerError.message : String(registerError)},
+        'run: runIndex.register threw — continuing (best-effort)',
+      )
     }
 
     let runEtag = createResult.data.etag

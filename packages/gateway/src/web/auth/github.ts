@@ -643,7 +643,11 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
         deps.sessionStore.delete(existingSessionId)
       }
 
-      const newSessionId = deps.sessionStore.create({githubUserId, login}, nowMs)
+      // Pass the access token to the session store for server-side retention.
+      // The token is stored in-memory only — never in the cookie, never logged,
+      // never in any operator-facing response. The cookie value remains the opaque
+      // session ID; the token is accessible only via sessionStore.getOperatorToken().
+      const newSessionId = deps.sessionStore.create({githubUserId, login}, accessToken, nowMs)
       if (newSessionId === undefined) {
         // Session cap reached — return 503 with Retry-After so clients know to retry.
         // This is a capacity issue, not a bad request; 400 would be semantically wrong.

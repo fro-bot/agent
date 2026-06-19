@@ -5484,3 +5484,89 @@ describe('Unit 0 — Phase A seam invariants (static guards)', () => {
     expect(exportPattern.test(content)).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// FIX 5: runIndex.register() wiring test
+// ---------------------------------------------------------------------------
+
+describe('runIndex.register() wiring (FIX 5)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('createRun → runIndex.register() called with correct repo (entity_ref), surface, and startedAt', async () => {
+    // #given — a mock runIndex with a spy on register()
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const registerFn = vi.fn()
+    const runIndex = {
+      register: registerFn,
+      lookup: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const deps = makeDeps({runIndex})
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — register was called once
+    expect(registerFn).toHaveBeenCalledOnce()
+
+    // #and — called with the correct runId (any string), repo, surface, and startedAt
+    const [calledRunId, calledEntry] = registerFn.mock.calls[0] as [
+      string,
+      {repo: string; surface: string; startedAt: string},
+    ]
+    expect(typeof calledRunId).toBe('string')
+    expect(calledRunId.length).toBeGreaterThan(0)
+    // repo must be the entity_ref: owner/repo
+    expect(calledEntry.repo).toBe(`${OWNER}/${REPO}`)
+    // surface must be 'discord' (the default surface in makeMinimalRequest)
+    expect(calledEntry.surface).toBe('discord')
+    // startedAt must be a non-empty ISO string
+    expect(typeof calledEntry.startedAt).toBe('string')
+    expect(calledEntry.startedAt.length).toBeGreaterThan(0)
+  })
+
+  it('register() failure does not break run execution (best-effort)', async () => {
+    // #given — runIndex.register() throws
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const registerFn = vi.fn(() => {
+      throw new Error('index register failed')
+    })
+    const runIndex = {
+      register: registerFn,
+      lookup: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const deps = makeDeps({runIndex})
+    const message = makeMessage()
+
+    // #when — should not throw; execution continues despite register() throwing
+    await runMention(message, makeBinding(), deps)
+
+    // #then — register was called
+    expect(registerFn).toHaveBeenCalledOnce()
+    // #and — execution completed normally (runOpenCodeCore was called)
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+
+  it('runIndex is optional — omitting it does not break run execution', async () => {
+    // #given — no runIndex in deps
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+
+    const deps = makeDeps({runIndex: undefined})
+    const message = makeMessage()
+
+    // #when — should not throw
+    await runMention(message, makeBinding(), deps)
+
+    // #then — execution completed normally
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+})

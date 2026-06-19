@@ -836,7 +836,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // #given — all required deps for logout
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -883,7 +883,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // Rate limit check runs inside the handler after the guard passes.
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -921,7 +921,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // #given — rate limiter allows; valid session + CSRF
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -1030,7 +1030,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1094,7 +1094,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1128,7 +1128,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1162,7 +1162,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1230,7 +1230,7 @@ describe('registerOperatorRoute — auto-guard applies browser guard to privileg
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1298,7 +1298,7 @@ describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #
     // #given — valid session but no CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1334,7 +1334,7 @@ describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #
     // #given — valid session and valid CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1403,7 +1403,7 @@ describe('server integration — forwarded-header rejection before CSRF', () => 
     // #given — server with browser guard enabled
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1513,7 +1513,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session and allowlisted operator
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1550,7 +1550,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session and allowlisted operator
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1586,7 +1586,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session but wrong Origin
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
