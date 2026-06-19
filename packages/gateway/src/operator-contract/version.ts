@@ -12,4 +12,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.0.0'
+export const OPERATOR_CONTRACT_VERSION = '1.1.0'
