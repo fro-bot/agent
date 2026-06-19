@@ -1,49 +1,29 @@
 /**
- * Denylist cache + isRepoDenied predicate for the gateway redaction gate.
+ * Denylist cache for the gateway redaction gate.
  *
- * ## Design: sync predicate + async lazy refresh
+ * Wraps `readRepoDenylist` with a TTL-based in-memory cache, inflight-refresh
+ * deduplication, and a bounded grace window for last-known-good serving.
  *
- * `isRepoDenied` is called on the hot path (every operator surface-time check)
- * and must be a pure synchronous in-memory lookup — no I/O, no await.
+ * ## Fail-closed posture
  *
- * Refresh is async and lazy: `getDenylistState()` is the async entry point that
- * callers invoke before a batch of checks (or at startup) to guarantee freshness.
- * It triggers a refresh when the TTL has elapsed, waits for the in-flight refresh
- * to complete (deduplicating concurrent callers), then returns. After it resolves,
- * `isRepoDenied` reads the updated in-memory state synchronously.
+ * - Cold start (never successfully loaded) → deny all.
+ * - Refresh failure within grace window → serve last-known-good; emit hard alarm.
+ * - Grace window expired without successful refresh → evict last-known-good → deny all.
+ * - Missing deny key (null/null or undefined/undefined) → denied.
  *
- * ## Cache / grace semantics (P0-DoS fix)
+ * ## Grace-window enforcement
  *
- * State: `lastGoodDenylist`, `lastGoodAt`, `lastAttemptAt`.
+ * Grace expiry is checked on EVERY read (isRepoDenied / getDenylistState), not only
+ * inside doRefresh. This prevents last-known-good from being served past
+ * `lastGoodAt + graceMs` even with sparse callers and a failed refresh cadence.
  *
- * - **Cold start** (lastGoodDenylist === null, never loaded): unavailable →
- *   `isRepoDenied` returns **true for everything** (deny all). No last-known-good.
- * - **Successful load/refresh**: update `lastGoodDenylist` + `lastGoodAt`; serve
- *   from it.
- * - **Refresh failure with a prior good load**: keep serving `lastGoodDenylist`
- *   for a bounded grace window (`graceMs`) measured from `lastGoodAt`; emit a
- *   **hard alarm** (`logger.error`) on each failed refresh during grace. After
- *   `lastGoodAt + graceMs` elapses without a successful refresh → deny all.
- * - **NEVER** serve an unfiltered/allow-all path. "Unavailable" always means
- *   deny-all, never allow-all.
+ * ## Inflight deduplication
  *
- * ## isRepoDenied semantics
- *
- * Returns `true` (denied) if:
- * - `repoKey.databaseId ∈ redactedDatabaseIds`, OR
- * - `repoKey.nodeId ∈ redactedNodeIds`, OR
- * - both `databaseId` and `nodeId` are null/undefined (fail closed on missing key), OR
- * - no denylist has been successfully loaded (cold start / post-grace deny-all).
- *
- * Returns `false` (allowed) only when a denylist is loaded and neither key matches.
- *
- * Security invariants:
- * - No I/O on the hot path (`isRepoDenied`).
- * - Unavailability always means deny-all, never allow-all.
- * - Hard alarms on every failed refresh during the grace window.
- * - Cold start denies all — there is no last-known-good to fall back to.
+ * Only one refresh is in flight at a time. Concurrent getDenylistState() calls
+ * during a refresh all await the same promise.
  */
 
+import type {RunStatusRepoKey} from '../operator-contract/index.js'
 import type {MetadataReader, RepoDenylist} from './metadata-reader.js'
 
 import {readRepoDenylist} from './metadata-reader.js'
@@ -55,20 +35,12 @@ import {readRepoDenylist} from './metadata-reader.js'
 /**
  * The repo identity keys used for denylist matching.
  *
- * Both fields are optional at the call site (a binding may not have been
- * backfilled yet). A record with neither a usable databaseId nor nodeId is
- * denied (fail closed).
+ * FIX 10: Re-exported as a type alias of RunStatusRepoKey from the operator contract barrel
+ * so the two types cannot drift. Surface-gate and denylist both use the same canonical type.
+ * Import from the contract barrel (operator-contract/index.js) as the single authority.
  */
-export interface RepoKey {
-  readonly databaseId: number | null
-  readonly nodeId: string | null
-}
+export type RepoKey = RunStatusRepoKey
 
-/**
- * Logger interface for the denylist cache.
- *
- * Matches the GatewayLogger shape used elsewhere in the gateway.
- */
 export interface DenylistLogger {
   readonly debug: (context: Record<string, unknown>, message: string) => void
   readonly info: (context: Record<string, unknown>, message: string) => void
@@ -76,124 +48,114 @@ export interface DenylistLogger {
   readonly error: (context: Record<string, unknown>, message: string) => void
 }
 
-/**
- * Dependencies for `createDenylistCache`.
- */
-export interface DenylistCacheDeps {
-  /** Injectable metadata reader (tests inject a fake; production injects the App-client reader). */
+export interface DenylistCacheOptions {
   readonly reader: MetadataReader
-  /** TTL in milliseconds before a refresh is attempted. Default: 5 minutes. */
   readonly ttlMs: number
-  /**
-   * Grace window in milliseconds from `lastGoodAt` during which the last-known-good
-   * denylist is served on refresh failure. After this window, deny-all kicks in.
-   * Default: a small multiple of ttlMs (e.g. 3×).
-   */
   readonly graceMs: number
-  /** Injectable clock — returns the current time in milliseconds. Default: Date.now. */
   readonly now: () => number
-  /** Logger for hard alarms on refresh failure. */
   readonly logger: DenylistLogger
 }
 
-/**
- * The denylist cache handle returned by `createDenylistCache`.
- */
 export interface DenylistCache {
   /**
-   * Async entry point: ensures the denylist is loaded (or refreshed if the TTL
-   * has elapsed). Deduplicates concurrent callers — only one in-flight refresh
-   * runs at a time.
-   *
-   * Call this before a batch of `isRepoDenied` checks to guarantee freshness.
-   * After it resolves, `isRepoDenied` is a pure synchronous lookup.
+   * Trigger a refresh if the TTL has expired, then return the current state.
+   * Awaiting this is the standard way to ensure the cache is warm.
    */
   readonly getDenylistState: () => Promise<void>
-
   /**
-   * Pure synchronous predicate. Returns `true` (denied) if the repo is in the
-   * denylist, if the key is missing (null/null), or if no denylist has been
-   * successfully loaded (cold start / post-grace deny-all).
+   * Synchronous predicate: returns true if the repo is denied.
    *
-   * No I/O. Reads the in-memory state set by the last `getDenylistState()` call.
+   * Fail-closed: returns true when:
+   * - No successful load has ever completed (cold start).
+   * - The last-known-good has expired past the grace window.
+   * - The repoKey has no usable deny key (databaseId == null AND nodeId == null/undefined/'').
+   * - The databaseId or nodeId matches a redacted entry.
    */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
 }
 
 // ---------------------------------------------------------------------------
-// Factory
+// Implementation
 // ---------------------------------------------------------------------------
 
 /**
- * Create a denylist cache with TTL + bounded-grace-on-failure semantics.
+ * Create a denylist cache backed by the given MetadataReader.
  *
- * @param deps - Injectable dependencies (reader, ttlMs, graceMs, now, logger).
- * @returns A `DenylistCache` handle with `getDenylistState()` + `isRepoDenied()`.
+ * @param options - Cache configuration.
+ * @returns A DenylistCache instance.
  */
-export function createDenylistCache(deps: DenylistCacheDeps): DenylistCache {
-  const {reader, ttlMs, graceMs, now, logger} = deps
+export function createDenylistCache(options: DenylistCacheOptions): DenylistCache {
+  const {reader, ttlMs, graceMs, now, logger} = options
 
-  // ---------------------------------------------------------------------------
-  // Mutable cache state (closure — no classes)
-  // ---------------------------------------------------------------------------
-
-  /** The last successfully-loaded denylist. null = never loaded. */
+  // State
   let lastGoodDenylist: RepoDenylist | null = null
-
-  /** Timestamp (ms) of the last successful load. null = never loaded. */
   let lastGoodAt: number | null = null
-
-  /** Timestamp (ms) of the last refresh attempt (success or failure). */
   let lastAttemptAt: number | null = null
-
-  /**
-   * In-flight refresh promise. Deduplicates concurrent `getDenylistState()` calls:
-   * if a refresh is already running, new callers await the same promise.
-   */
   let inflightRefresh: Promise<void> | null = null
 
   // ---------------------------------------------------------------------------
-  // Internal: perform a single refresh attempt
+  // Grace-window eviction (checked on every read)
   // ---------------------------------------------------------------------------
 
+  /**
+   * Evict last-known-good if the grace window has expired without a successful refresh.
+   * Called on every read path so the boundary is enforced by elapsed time, not refresh cadence.
+   */
+  function evictIfGraceExpired(): void {
+    if (lastGoodDenylist === null || lastGoodAt === null) {
+      // Nothing to evict — already in deny-all state.
+      return
+    }
+
+    const nowMs = now()
+    if (nowMs > lastGoodAt + graceMs) {
+      // Grace window expired — evict last-known-good → deny all.
+      logger.error(
+        {lastGoodAt, graceMs, nowMs},
+        'denylist: grace window expired without successful refresh — evicting last-known-good, denying all',
+      )
+      lastGoodDenylist = null
+      lastGoodAt = null
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Refresh logic
+  // ---------------------------------------------------------------------------
+
+  function needsRefresh(): boolean {
+    if (lastAttemptAt === null) {
+      // Never attempted — needs refresh.
+      return true
+    }
+    return now() > lastAttemptAt + ttlMs
+  }
+
   async function doRefresh(): Promise<void> {
-    const attemptAt = now()
-    lastAttemptAt = attemptAt
+    lastAttemptAt = now()
 
     const result = await readRepoDenylist(reader)
 
     if (result.success === true) {
-      // Successful load — update last-known-good
       lastGoodDenylist = result.data
-      lastGoodAt = attemptAt
-      logger.debug({}, 'denylist-cache: refresh succeeded')
-      return
-    }
-
-    // Refresh failed — determine whether we are in the grace window
-    const currentTime = now()
-    const inGrace = lastGoodAt !== null && currentTime < lastGoodAt + graceMs
-
-    if (inGrace) {
-      // Hard alarm: serving stale last-known-good during grace window.
-      // lastGoodAt is non-null here (inGrace guarantees it).
-      const graceRemainingMs = lastGoodAt === null ? 0 : lastGoodAt + graceMs - currentTime
-      logger.error(
-        {errorName: result.error.name, graceRemainingMs},
-        'denylist-cache: refresh failed — serving last-known-good within grace window (HARD ALARM)',
-      )
+      lastGoodAt = now()
+      logger.info({}, 'denylist: refresh succeeded')
     } else {
-      // Grace window expired (or never had a good load) — deny-all will apply
-      logger.error(
-        {
-          errorName: result.error.name,
-          hadPriorGoodLoad: lastGoodDenylist !== null,
-        },
-        'denylist-cache: refresh failed — grace window expired or cold start, deny-all in effect (HARD ALARM)',
-      )
+      // Refresh failed — check grace window.
+      const nowMs = now()
+      const withinGrace = lastGoodDenylist !== null && lastGoodAt !== null && nowMs <= lastGoodAt + graceMs
 
-      // Evict the stale last-known-good so deny-all kicks in
-      if (lastGoodDenylist !== null) {
+      if (withinGrace) {
+        logger.error(
+          {error: result.error.message, lastGoodAt: lastGoodAt ?? undefined},
+          'denylist: refresh failed — serving last-known-good within grace window',
+        )
+      } else {
+        // Past grace or no prior good load — deny all.
+        logger.error(
+          {error: result.error.message},
+          'denylist: refresh failed — no valid last-known-good (cold start or grace expired), denying all',
+        )
         lastGoodDenylist = null
         lastGoodAt = null
       }
@@ -201,29 +163,23 @@ export function createDenylistCache(deps: DenylistCacheDeps): DenylistCache {
   }
 
   // ---------------------------------------------------------------------------
-  // getDenylistState — async entry point
+  // getDenylistState
   // ---------------------------------------------------------------------------
 
   async function getDenylistState(): Promise<void> {
-    const currentTime = now()
+    // Check grace expiry on every call (independent of refresh scheduling).
+    evictIfGraceExpired()
 
-    // Determine whether a refresh is needed
-    const needsRefresh =
-      lastAttemptAt === null || // never attempted
-      currentTime >= (lastAttemptAt ?? 0) + ttlMs // TTL elapsed since last attempt
-
-    if (needsRefresh === false) {
-      // Within TTL — no refresh needed
+    if (needsRefresh() === false) {
       return
     }
 
-    // Deduplicate concurrent callers: if a refresh is already in flight, await it
+    // Inflight deduplication: only one refresh at a time.
     if (inflightRefresh !== null) {
       await inflightRefresh
       return
     }
 
-    // Start a new refresh
     inflightRefresh = doRefresh().finally(() => {
       inflightRefresh = null
     })
@@ -232,36 +188,41 @@ export function createDenylistCache(deps: DenylistCacheDeps): DenylistCache {
   }
 
   // ---------------------------------------------------------------------------
-  // isRepoDenied — pure synchronous predicate
+  // isRepoDenied
   // ---------------------------------------------------------------------------
 
   function isRepoDenied(repoKey: RepoKey): boolean {
-    // Fail closed on missing key — no usable deny key means deny
-    if (repoKey.databaseId === null && repoKey.nodeId === null) {
+    // Check grace expiry on every read (FIX 2: independent of refresh cadence).
+    evictIfGraceExpired()
+
+    // Missing key → denied (fail closed).
+    // FIX 6: treat databaseId == null (null or undefined) AND nodeId == null/undefined/'' as missing.
+    const hasDatabaseId = repoKey.databaseId != null
+    const hasNodeId = repoKey.nodeId != null && repoKey.nodeId !== ''
+
+    if (hasDatabaseId === false && hasNodeId === false) {
       return true
     }
 
-    // No denylist loaded (cold start or post-grace eviction) — deny all
+    // No successful load → deny all (cold start or grace expired).
     if (lastGoodDenylist === null) {
       return true
     }
 
-    // Pure in-memory set lookup — no I/O.
-    // TypeScript narrows databaseId/nodeId to non-null inside these branches.
-    if (repoKey.databaseId !== null && lastGoodDenylist.redactedDatabaseIds.has(repoKey.databaseId)) {
+    const {redactedDatabaseIds, redactedNodeIds} = lastGoodDenylist
+
+    // Check databaseId match.
+    if (hasDatabaseId && redactedDatabaseIds.has(repoKey.databaseId)) {
       return true
     }
 
-    if (repoKey.nodeId !== null && lastGoodDenylist.redactedNodeIds.has(repoKey.nodeId)) {
+    // Check nodeId match.
+    if (hasNodeId && redactedNodeIds.has(repoKey.nodeId)) {
       return true
     }
 
     return false
   }
-
-  // ---------------------------------------------------------------------------
-  // Return the cache handle
-  // ---------------------------------------------------------------------------
 
   return {getDenylistState, isRepoDenied}
 }

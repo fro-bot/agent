@@ -1,6 +1,12 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {AppNotInstalledError, AuthError, InsufficientPermissionsError, createAppClient} from './app-client.js' // eslint-disable-line perfectionist/sort-named-imports
+import {
+  AppNotInstalledError,
+  AuthError,
+  createAppClient,
+  InsufficientPermissionsError,
+  RepoNotFoundError,
+} from './app-client.js'
 
 const {mockAuth, mockCreateAppAuth, mockRequest, MockOctokit} = vi.hoisted(() => {
   const mockAuth = vi.fn()
@@ -475,8 +481,10 @@ describe('createAppClient.getRepoIdentity', () => {
     expect(secondCall?.[0]).toMatch(/GET \/repos\/\{owner\}\/\{repo\}/)
   })
 
-  it('error: repo not found (404) → Result.err(AppNotInstalledError)', async () => {
+  it('error: repo not found (404) after successful auth → Result.err(RepoNotFoundError) (FIX 9)', async () => {
     // #given — installation discovery succeeds but repo GET returns 404
+    // FIX 9: A 404 from GET /repos/{owner}/{repo} AFTER a successful authForRepo means the
+    // repo was deleted or renamed — NOT that the App is not installed. Map to RepoNotFoundError.
     const notFoundError = Object.assign(new Error('Not Found'), {status: 404})
     mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockRejectedValueOnce(notFoundError)
     const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
@@ -484,10 +492,27 @@ describe('createAppClient.getRepoIdentity', () => {
     // #when
     const result = await client.getRepoIdentity('owner', 'repo')
 
-    // #then
+    // #then — RepoNotFoundError (not AppNotInstalledError — the App IS installed)
     expect(result.success).toBe(false)
     if (result.success === true) return
-    expect(result.error).toBeInstanceOf(AppNotInstalledError)
+    expect(result.error).toBeInstanceOf(RepoNotFoundError)
+    // Must NOT be AppNotInstalledError — that would be misleading (App is installed, repo is gone)
+    expect(result.error).not.toBeInstanceOf(AppNotInstalledError)
+  })
+
+  it('error: repo not found message (no status) → Result.err(RepoNotFoundError) (FIX 9)', async () => {
+    // #given — repo GET returns a "not found" message without a status field
+    const notFoundError = new Error('Not found')
+    mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockRejectedValueOnce(notFoundError)
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then — RepoNotFoundError
+    expect(result.success).toBe(false)
+    if (result.success === true) return
+    expect(result.error).toBeInstanceOf(RepoNotFoundError)
   })
 
   it('error: auth failure → Result.err(AuthError)', async () => {

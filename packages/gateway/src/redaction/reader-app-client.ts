@@ -16,6 +16,7 @@ import type {MetadataReader} from './metadata-reader.js'
 
 import {Buffer} from 'node:buffer'
 
+import {isOctokitNotFound} from '../github/errors.js'
 import {makeNotFoundError} from './metadata-reader.js'
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,16 @@ const METADATA_REPO = '.github'
 
 /** The git ref (branch) where the metadata lives. */
 const METADATA_REF = 'data'
+
+/**
+ * Timeout for GitHub Contents API requests (FIX 3).
+ *
+ * A hanging Octokit call combined with inflight-refresh deduplication would
+ * stall the cache indefinitely (stale → deny-all until restart). This timeout
+ * bounds the hang to 10s; on timeout the transport-error sentinel is returned
+ * and the cache handles it via the grace window.
+ */
+export const METADATA_REQUEST_TIMEOUT_MS = 10_000
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -56,7 +67,10 @@ export function createAppClientMetadataReader(appClient: AppClient): MetadataRea
 
     const {octokit} = authResult.data
 
-    // Fetch the file via the Contents API
+    // Fetch the file via the Contents API with a timeout (FIX 3).
+    // A hanging request combined with inflight-refresh deduplication would stall the cache
+    // indefinitely. AbortSignal.timeout() bounds the hang; on timeout the error propagates
+    // as a transport error and the cache handles it via the grace window.
     let response: {data: unknown}
     try {
       response = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
@@ -64,13 +78,14 @@ export function createAppClientMetadataReader(appClient: AppClient): MetadataRea
         repo: METADATA_REPO,
         path,
         ref: ref === METADATA_REF ? METADATA_REF : ref,
+        request: {signal: AbortSignal.timeout(METADATA_REQUEST_TIMEOUT_MS)},
       })
     } catch (fetchError) {
       // Map 404 to the not-found sentinel so readRepoDenylist maps it to MetadataUnavailableError
       if (isOctokitNotFound(fetchError)) {
         throw makeNotFoundError(`${path} not found on ref=${ref} in ${METADATA_OWNER}/${METADATA_REPO}`)
       }
-      // Re-throw other errors as-is (transport errors)
+      // Re-throw other errors as-is (transport errors, including timeout AbortError)
       throw fetchError
     }
 
@@ -95,24 +110,6 @@ export function createAppClientMetadataReader(appClient: AppClient): MetadataRea
     // GitHub's Contents API returns base64 with newlines — strip them before decoding
     return Buffer.from(content.replaceAll('\n', ''), 'base64').toString('utf8')
   }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Check whether an Octokit request error is a 404 / not-found.
- *
- * @octokit/request-error sets `status` on the error object.
- */
-function isOctokitNotFound(error: unknown): boolean {
-  if (error instanceof Error) {
-    const status = (error as {status?: number}).status
-    if (status === 404) return true
-    if (/not.?found|404/i.test(error.message)) return true
-  }
-  return false
 }
 
 // ---------------------------------------------------------------------------

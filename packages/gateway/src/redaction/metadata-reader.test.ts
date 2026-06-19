@@ -426,6 +426,72 @@ describe('readRepoDenylist — fail-closed error taxonomy', () => {
 })
 
 // ---------------------------------------------------------------------------
+// readRepoDenylist — FIX 8: malformed/null entry in repos array → fail closed
+// ---------------------------------------------------------------------------
+
+describe('readRepoDenylist — malformed entry fail-closed (FIX 8)', () => {
+  it('fails closed (MetadataSchemaError) when the repos array contains a null entry', async () => {
+    // #given — repos array with a null entry (corruption)
+    // A null entry could be a corrupted redacted entry — silently skipping it would miss
+    // the redaction. Fail the whole load closed instead.
+    const yaml = 'version: 1\nrepos:\n  - null\n'
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — whole load fails closed
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('fails closed (MetadataSchemaError) when the repos array contains a non-object entry (string)', async () => {
+    // #given — repos array with a string entry (corruption)
+    const yaml = 'version: 1\nrepos:\n  - "not-an-object"\n'
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — whole load fails closed
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('fails closed (MetadataSchemaError) when the repos array contains a non-object entry (number)', async () => {
+    // #given — repos array with a number entry (corruption)
+    const yaml = 'version: 1\nrepos:\n  - 42\n'
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — whole load fails closed
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+
+  it('fails closed even when a valid entry precedes the malformed one', async () => {
+    // #given — first entry is valid, second is null (corruption)
+    // The valid entry must NOT be returned — the whole load fails closed.
+    const yaml = [
+      'version: 1',
+      'repos:',
+      '  - owner: "[REDACTED]"',
+      '    name: "[REDACTED]"',
+      '    private: true',
+      '    node_id: "MDEwOlJlcG9zaXRvcnkxODY5MTU0"',
+      '    database_id: 1869154',
+      '  - null',
+    ].join('\n')
+
+    // #when
+    const result = await readRepoDenylist(fakeReader(yaml))
+
+    // #then — whole load fails closed (not a partial result)
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error : null).toBeInstanceOf(MetadataSchemaError)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // readRepoDenylist — no-oracle: error messages must not contain redacted owner/name
 // ---------------------------------------------------------------------------
 

@@ -33,10 +33,10 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus, RunStatusRepoKey} from '../operator-contract/run-status.js'
+import type {OperatorRunStatus, RunStatusRepoKey} from '../operator-contract/index.js'
 import type {RepoKey} from './denylist.js'
 
-import {toOperatorRunStatus} from '../operator-contract/run-status.js'
+import {toOperatorRunStatus} from '../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
 // Public types

@@ -33,6 +33,8 @@ import {Buffer} from 'node:buffer'
 import {err, ok} from '@fro-bot/runtime'
 import {parse} from 'yaml'
 
+import {safeErrorMessage} from '../github/errors.js'
+
 // ---------------------------------------------------------------------------
 // Reader interface (injectable — tests inject a fake, production injects real)
 // ---------------------------------------------------------------------------
@@ -247,8 +249,15 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
 
   for (const rawEntry of doc.repos) {
     if (rawEntry === null || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
-      // Skip malformed entries silently
-      continue
+      // FIX 8: Fail closed on malformed/null entries — a null or non-object entry in the
+      // repos array is a corruption signal. Silently skipping it could miss a redaction
+      // (e.g. a redacted entry that was corrupted to null would be silently omitted from
+      // the denylist, allowing the repo to surface). Fail the whole load closed instead.
+      return err(
+        new MetadataSchemaError(
+          `${METADATA_PATH}: repos array contains a malformed entry (null or non-object) — failing closed`,
+        ),
+      )
     }
 
     const entry = rawEntry as RawRepoEntry
@@ -320,24 +329,6 @@ export async function readRepoDenylist(reader: MetadataReader): Promise<Result<R
 function isNotFoundError(error: unknown): boolean {
   if (error === null || typeof error !== 'object') return false
   return (error as Record<string, unknown>).code === NOT_FOUND_CODE
-}
-
-/**
- * Extract a safe error message that cannot contain sensitive material.
- *
- * Strips PEM blocks and JWT-shaped strings before returning the message.
- * This is a defence-in-depth measure — callers should never pass raw auth
- * material into error constructors, but this catches accidental leakage.
- */
-function safeErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return 'unknown error'
-  }
-  // Strip PEM blocks
-  let msg = error.message.replaceAll(/-----BEGIN[^-]+-----[\s\S]*?-----END[^-]+-----/g, '[REDACTED]')
-  // Strip JWT-shaped strings (three base64url segments)
-  msg = msg.replaceAll(/[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}/g, '[REDACTED]')
-  return msg
 }
 
 /**

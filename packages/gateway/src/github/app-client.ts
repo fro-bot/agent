@@ -14,9 +14,39 @@ import {err, ok} from '@fro-bot/runtime'
 import {createAppAuth} from '@octokit/auth-app'
 import {Octokit} from '@octokit/core'
 
+import {isOctokitNotFound, safeErrorMessage} from './errors.js'
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Timeout for GitHub API requests in getRepoIdentity (FIX 3).
+ *
+ * A hanging Octokit call during add-project ingest would stall the flow.
+ * On timeout the error propagates as an AuthError (non-fatal for backfill;
+ * the binding stays keyless and fails closed at the gate).
+ */
+export const REPO_IDENTITY_REQUEST_TIMEOUT_MS = 10_000
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
+
+/**
+ * The repository was not found via GET /repos/{owner}/{repo} after a successful
+ * authForRepo. This means the repo was deleted or renamed — NOT that the App is
+ * not installed (that would have failed at the authForRepo stage).
+ *
+ * FIX 9: Remap 404 from getRepoIdentity to this error rather than AppNotInstalledError,
+ * which is misleading (the App IS installed — the repo is gone).
+ */
+export class RepoNotFoundError extends Error {
+  constructor(owner: string, repo: string) {
+    super(`Repository ${owner}/${repo} not found (deleted or renamed)`)
+    this.name = 'RepoNotFoundError'
+  }
+}
 
 export class AppNotInstalledError extends Error {
   readonly installUrl: string
@@ -110,11 +140,16 @@ export interface AppClient {
    *
    * Returns the stable numeric `databaseId` (immutable across rename/transfer)
    * and the `nodeId` string for use as deny keys in the redaction gate.
+   *
+   * Error mapping (FIX 9):
+   * - AppNotInstalledError: authForRepo failed (App not installed on this repo).
+   * - RepoNotFoundError: authForRepo succeeded but GET /repos returned 404 (repo deleted/renamed).
+   * - AuthError: other auth or API failure.
    */
   readonly getRepoIdentity: (
     owner: string,
     repo: string,
-  ) => Promise<Result<RepoIdentity, AppNotInstalledError | AuthError>>
+  ) => Promise<Result<RepoIdentity, RepoNotFoundError | AppNotInstalledError | AuthError>>
 
   /**
    * Evict the cached installation ID for the given (owner, repo) pair.
@@ -185,7 +220,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
             permissions: response.data.permissions ?? {},
           }
         } catch (discoveryError) {
-          if (isNotFoundError(discoveryError)) {
+          if (isOctokitNotFound(discoveryError)) {
             return err(new AppNotInstalledError(owner, repo, installUrl))
           }
           return err(new AuthError(safeErrorMessage(discoveryError)))
@@ -238,7 +273,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
   async function getRepoIdentity(
     owner: string,
     repo: string,
-  ): Promise<Result<RepoIdentity, AppNotInstalledError | AuthError>> {
+  ): Promise<Result<RepoIdentity, RepoNotFoundError | AppNotInstalledError | AuthError>> {
     // Authenticate via the existing flow — reuses the cached installation ID when available.
     const authResult = await authForRepo(owner, repo)
     if (authResult.success === false) {
@@ -256,14 +291,23 @@ export function createAppClient(options: AppClientOptions): AppClient {
     // Issue GET /repos/{owner}/{repo} to capture the immutable numeric id and node_id.
     // This is the only correct endpoint for repo identity — GET /repos/{owner}/{repo}/installation
     // returns only installation id + permissions, NOT repo identity.
+    //
+    // FIX 3: Add a timeout so a hanging request cannot stall the add-project flow indefinitely.
+    // FIX 9: A 404 here means the repo was deleted/renamed AFTER a successful authForRepo
+    //        (which proves the App IS installed). Map to RepoNotFoundError, not AppNotInstalledError.
     try {
-      const response = await octokit.request('GET /repos/{owner}/{repo}', {owner, repo})
+      const response = await octokit.request('GET /repos/{owner}/{repo}', {
+        owner,
+        repo,
+        request: {signal: AbortSignal.timeout(REPO_IDENTITY_REQUEST_TIMEOUT_MS)},
+      })
 
       const {id, node_id: nodeId} = response.data
       return ok({databaseId: id, nodeId})
     } catch (error) {
-      if (isNotFoundError(error)) {
-        return err(new AppNotInstalledError(owner, repo, installUrl))
+      if (isOctokitNotFound(error)) {
+        // FIX 9: 404 after successful auth = repo gone (deleted/renamed), not App not installed.
+        return err(new RepoNotFoundError(owner, repo))
       }
       return err(new AuthError(safeErrorMessage(error)))
     }
@@ -318,31 +362,4 @@ function verifyPermissions(
   return null
 }
 
-function isNotFoundError(error: unknown): boolean {
-  if (error instanceof Error) {
-    // @octokit/request-error sets status on the error object
-    const status = (error as {status?: number}).status
-    if (status === 404) return true
-    if (/not.?found|404/i.test(error.message)) return true
-  }
-  return false
-}
-
-/**
- * Extract a safe error message that cannot contain sensitive material.
- *
- * We strip anything that looks like a PEM block or a JWT (three base64url
- * segments separated by dots) before returning the message. This is a
- * defence-in-depth measure — callers should never pass raw auth material
- * into error constructors, but this catches accidental leakage.
- */
-function safeErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return 'Unknown error'
-  }
-  // Strip PEM blocks
-  let msg = error.message.replaceAll(/-----BEGIN[^-]+-----[\s\S]*?-----END[^-]+-----/g, '[REDACTED]')
-  // Strip JWT-shaped strings (three base64url segments)
-  msg = msg.replaceAll(/[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}/g, '[REDACTED]')
-  return msg
-}
+// isOctokitNotFound and safeErrorMessage are imported from ./errors.js (FIX 10)

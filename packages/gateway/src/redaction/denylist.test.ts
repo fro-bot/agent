@@ -473,6 +473,133 @@ describe('grace window — bounded last-known-good on refresh failure', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FIX 2 — Grace-window overstay: sparse-caller grace expiry
+// ---------------------------------------------------------------------------
+
+describe('grace window — sparse-caller grace expiry (FIX 2)', () => {
+  it('denies all on the very next read after lastGoodAt+graceMs, even with no getDenylistState() call in between', async () => {
+    // #given — first load succeeds; all subsequent loads fail
+    let nowMs = 0
+    const now = vi.fn().mockImplementation(() => nowMs)
+    const logger = makeLogger()
+    let readerCallCount = 0
+    const onceOkThenFail: MetadataReader = async () => {
+      readerCallCount++
+      if (readerCallCount === 1) return DENYLIST_YAML
+      throw new Error('refresh failure')
+    }
+    const cache = createDenylistCache({
+      reader: onceOkThenFail,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now,
+      logger,
+    })
+
+    // #when — initial load at t=0 (succeeds)
+    await cache.getDenylistState()
+    // Verify: allowed repo is allowed within grace
+    expect(cache.isRepoDenied({databaseId: ALLOWED_DB_ID, nodeId: ALLOWED_NODE_ID})).toBe(false)
+
+    // #when — advance past TTL but within grace; trigger a failed refresh
+    nowMs = TTL_MS + 1
+    await cache.getDenylistState() // refresh fails → within grace → last-known-good served
+    expect(cache.isRepoDenied({databaseId: ALLOWED_DB_ID, nodeId: ALLOWED_NODE_ID})).toBe(false)
+
+    // #when — advance past lastGoodAt+graceMs WITHOUT calling getDenylistState()
+    // (sparse caller — no refresh triggered, but grace has elapsed)
+    nowMs = GRACE_MS + 1
+
+    // #then — the very next isRepoDenied call must deny all (grace expired on read)
+    // This is the FIX 2 invariant: grace expiry is enforced by elapsed time on every read,
+    // not by refresh cadence. Without this fix, last-known-good would be served past grace
+    // because doRefresh (which evicts) is only called when needsRefresh() fires.
+    expect(cache.isRepoDenied({databaseId: ALLOWED_DB_ID, nodeId: ALLOWED_NODE_ID})).toBe(true)
+    expect(cache.isRepoDenied({databaseId: REDACTED_DB_ID, nodeId: null})).toBe(true)
+  })
+
+  it('emits a logger.error alarm when grace expires on a read (not just on refresh)', async () => {
+    // #given — first load succeeds; subsequent loads fail
+    let nowMs = 0
+    const now = vi.fn().mockImplementation(() => nowMs)
+    const logger = makeLogger()
+    let readerCallCount = 0
+    const onceOkThenFail: MetadataReader = async () => {
+      readerCallCount++
+      if (readerCallCount === 1) return DENYLIST_YAML
+      throw new Error('refresh failure')
+    }
+    const cache = createDenylistCache({
+      reader: onceOkThenFail,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now,
+      logger,
+    })
+
+    // #when — initial load, then failed refresh within grace
+    await cache.getDenylistState()
+    nowMs = TTL_MS + 1
+    await cache.getDenylistState()
+
+    // Reset error call count to isolate the grace-expiry-on-read alarm
+    vi.clearAllMocks()
+
+    // #when — advance past grace; trigger via isRepoDenied (no getDenylistState call)
+    nowMs = GRACE_MS + 1
+    cache.isRepoDenied({databaseId: ALLOWED_DB_ID, nodeId: ALLOWED_NODE_ID})
+
+    // #then — logger.error was called (grace-expiry alarm on read path)
+    expect(logger.error).toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX 6 — Missing-key null check: undefined and empty-string treated as absent
+// ---------------------------------------------------------------------------
+
+describe('isRepoDenied — missing key null check (FIX 6)', () => {
+  it('denies a repoKey with {databaseId: undefined, nodeId: undefined} (undefined treated as null)', async () => {
+    // #given — cache loaded with a valid denylist
+    const now = vi.fn().mockReturnValue(0)
+    const cache = createDenylistCache({
+      reader: fakeOkReader(DENYLIST_YAML),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+
+    // #when — check with undefined values (coerced to null by the interface)
+    // TypeScript interface uses null, but runtime values may be undefined (legacy bindings)
+    const result = cache.isRepoDenied({databaseId: undefined as unknown as null, nodeId: undefined as unknown as null})
+
+    // #then — denied (fail closed on missing key)
+    expect(result).toBe(true)
+  })
+
+  it('denies a repoKey with {databaseId: null, nodeId: ""} (empty string treated as absent)', async () => {
+    // #given — cache loaded with a valid denylist
+    const now = vi.fn().mockReturnValue(0)
+    const cache = createDenylistCache({
+      reader: fakeOkReader(DENYLIST_YAML),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+
+    // #when — check with null databaseId and empty-string nodeId
+    const result = cache.isRepoDenied({databaseId: null, nodeId: ''})
+
+    // #then — denied (empty string nodeId is treated as absent → fail closed)
+    expect(result).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Concurrent refresh — only one in-flight refresh at a time
 // ---------------------------------------------------------------------------
 
