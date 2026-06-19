@@ -83,6 +83,24 @@ describe('assertRedactionApplied', () => {
     expect(() => assertRedactionApplied({repoRef: 'owner/repo'})).toThrow(Error)
   })
 
+  it('(no-oracle) thrown message does NOT echo the repoRef value (stub must not leak repo identity)', () => {
+    // #given — a context with a sensitive repo reference
+    const sensitiveRepoRef = 'secret-org/secret-repo'
+
+    // #when — the stub throws
+    let thrownMessage = ''
+    try {
+      assertRedactionApplied({repoRef: sensitiveRepoRef})
+    } catch (error) {
+      thrownMessage = error instanceof Error ? error.message : String(error)
+    }
+
+    // #then — the message must not contain any part of the repo identity
+    expect(thrownMessage.length).toBeGreaterThan(0)
+    expect(thrownMessage).not.toContain('secret-org')
+    expect(thrownMessage).not.toContain('secret-repo')
+  })
+
   it('is importable from the contract barrel (index.ts)', async () => {
     // #given — the public barrel for the operator-contract module
     // #when — assertRedactionApplied is imported from the barrel
@@ -91,6 +109,11 @@ describe('assertRedactionApplied', () => {
     // #then — it is present and is a function
     expect(typeof barrel.assertRedactionApplied).toBe('function')
   })
+
+  // Deferred behavioral tests — surfaced as durable reminders for the real gate implementation
+  it.todo('omits a denylisted repo run when the real redaction gate is implemented')
+  it.todo('handles node_id format skew when deriving deny keys')
+  it.todo('fails closed when the denylist cannot be read')
 })
 
 // ---------------------------------------------------------------------------

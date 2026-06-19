@@ -111,6 +111,32 @@ describe('parseOperatorSessionInfo — missing fields', () => {
   })
 })
 
+describe('parseOperatorSessionInfo — numeric guard hardening (NaN / Infinity / float)', () => {
+  it('returns err when operatorId is NaN (not a valid integer id)', () => {
+    // #given — NaN passes typeof === 'number' but is not a valid GitHub user id
+    const input = {operatorId: Number.NaN, login: 'octocat', expiresAt: 1_700_000_000_000}
+
+    // #when / #then
+    expect(parseOperatorSessionInfo(input).success).toBe(false)
+  })
+
+  it('returns err when operatorId is a float (GitHub user ids are integers)', () => {
+    // #given — 42.5 passes typeof === 'number' but is not an integer id
+    const input = {operatorId: 42.5, login: 'octocat', expiresAt: 1_700_000_000_000}
+
+    // #when / #then
+    expect(parseOperatorSessionInfo(input).success).toBe(false)
+  })
+
+  it('returns err when expiresAt is Infinity (not a finite ms timestamp)', () => {
+    // #given — Infinity passes typeof === 'number' but is not a valid timestamp
+    const input = {operatorId: 42, login: 'octocat', expiresAt: Infinity}
+
+    // #when / #then
+    expect(parseOperatorSessionInfo(input).success).toBe(false)
+  })
+})
+
 describe('parseOperatorSessionInfo — wrong-typed fields', () => {
   it('returns err when operatorId is a string instead of number', () => {
     // #given
@@ -357,6 +383,41 @@ describe('parseOperatorOk — error paths', () => {
 
   it('returns err when ok is a string', () => {
     expect(parseOperatorOk({ok: 'true'}).success).toBe(false)
+  })
+
+  it('no-oracle: error message does not echo sensitive input values', () => {
+    // #given — a crafted malicious input: ok is a wrong type embedding a sensitive value
+    const input = {ok: 'ghs_DEADBEEF_SECRET_TOKEN', extra: 'ghp_ANOTHER_SECRET'}
+
+    // #when
+    const result = parseOperatorOk(input)
+
+    // #then — must be an error (ok is not true)
+    expect(result.success).toBe(false)
+    const message = result.success === false ? result.error.message : ''
+    // The error message must NOT echo any part of the crafted input
+    expect(message).not.toContain('ghs_DEADBEEF_SECRET_TOKEN')
+    expect(message).not.toContain('ghp_ANOTHER_SECRET')
+    expect(message).not.toContain('ghs_')
+    expect(message).not.toContain('ghp_')
+    expect(message.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Barrel re-export smoke test
+// ---------------------------------------------------------------------------
+
+describe('barrel re-exports', () => {
+  it('parse functions are importable from the contract barrel (index.ts)', async () => {
+    // #given — the public barrel for the operator-contract module
+    const barrel = await import('./index.js')
+
+    // #when / #then — all four parse functions are present and callable
+    expect(typeof barrel.parseOperatorSessionInfo).toBe('function')
+    expect(typeof barrel.parseOperatorCsrfToken).toBe('function')
+    expect(typeof barrel.parseOperatorOk).toBe('function')
+    expect(typeof barrel.parseOperatorError).toBe('function')
   })
 })
 

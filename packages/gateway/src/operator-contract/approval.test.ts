@@ -12,7 +12,7 @@
 import type {DecisionOutcome} from '../approvals/registry.js'
 import type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 
-import {readFileSync} from 'node:fs'
+import {accessSync, constants, readFileSync} from 'node:fs'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {describe, expect, it} from 'vitest'
@@ -161,10 +161,11 @@ describe('R7 structural boundary: no decidedBy:string in approval-decision sourc
    * Pattern that would indicate a free-form string actor bypassing the
    * ApprovalActor discriminated union (the R7 anti-pattern).
    *
-   * Matches `decidedBy` followed by optional whitespace, a colon, optional
-   * whitespace, and `string` — i.e. a parameter or property typed as `string`.
+   * Matches `decidedBy` (with optional `?` for optional params) followed by
+   * optional whitespace, a colon, optional whitespace, and `string` — i.e. a
+   * parameter or property typed as `string` (required or optional).
    */
-  const DECIDED_BY_PATTERN = /decidedBy\s*:\s*string/
+  const DECIDED_BY_PATTERN = /decidedBy\??\s*:\s*string/
 
   it('no approval-decision source file contains a decidedBy: string parameter', () => {
     // #given — the approval-decision source files
@@ -172,6 +173,18 @@ describe('R7 structural boundary: no decidedBy:string in approval-decision sourc
 
     for (const relPath of SCAN_TARGETS) {
       const absPath = path.join(gatewaySrcRoot, relPath)
+
+      // Existence guard: fail loudly if a scanned file has been renamed or deleted
+      // so a rename cannot silently drop coverage.
+      try {
+        accessSync(absPath, constants.R_OK)
+      } catch {
+        throw new Error(
+          `R7 scan target no longer exists or is unreadable: ${relPath}\n` +
+            `Update SCAN_TARGETS in approval.test.ts to reflect the rename.`,
+        )
+      }
+
       const content = readFileSync(absPath, 'utf8')
       const lines = content.split('\n')
 
@@ -200,8 +213,8 @@ describe('R7 structural boundary: no decidedBy:string in approval-decision sourc
     expect(violations).toHaveLength(0)
   })
 
-  it('self-test: scanner WOULD flag a decidedBy: string parameter', () => {
-    // #given — a fixture string containing the anti-pattern
+  it('self-test: scanner WOULD flag a decidedBy: string parameter (required)', () => {
+    // #given — a fixture string containing the anti-pattern (required param)
     const fixtureContent = [
       '// some-handler.ts',
       'async function handleApproval(requestID: string, decidedBy: string, decision: string) {',
@@ -221,6 +234,27 @@ describe('R7 structural boundary: no decidedBy:string in approval-decision sourc
     // #then — the scanner must flag the anti-pattern
     expect(violations.length).toBeGreaterThan(0)
     expect(violations[0]?.text).toContain('decidedBy: string')
+  })
+
+  it('self-test: scanner WOULD flag a decidedBy?: string optional parameter', () => {
+    // #given — a fixture string containing the anti-pattern (optional param variant)
+    const fixtureContent = [
+      '// some-handler.ts',
+      'interface ApprovalOpts { requestID: string; decidedBy?: string }',
+    ].join('\n')
+
+    // #when — scan the fixture
+    const violations: {line: number; text: string}[] = []
+    for (const [i, line] of fixtureContent.split('\n').entries()) {
+      if (line.trimStart().startsWith('//')) continue
+      if (DECIDED_BY_PATTERN.test(line)) {
+        violations.push({line: i + 1, text: line.trim()})
+      }
+    }
+
+    // #then — the scanner must flag the optional variant too
+    expect(violations.length).toBeGreaterThan(0)
+    expect(violations[0]?.text).toContain('decidedBy?: string')
   })
 
   it('self-test: scanner does NOT flag a line comment or JSDoc comment containing decidedBy: string', () => {

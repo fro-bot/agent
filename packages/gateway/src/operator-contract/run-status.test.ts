@@ -26,7 +26,7 @@ const makeRunState = (overrides: Partial<RunState> = {}): RunState => ({
 const BASE_OPTS = {
   nowMs: BASE_NOW_MS,
   staleThresholdMs: 60_000,
-  isRepoDenylisted: false,
+  isRepoDenylisted: () => false,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,8 +119,8 @@ describe('toOperatorRunStatus — redaction (r5/r6)', () => {
     // #given a run whose repo is on the denylist
     const runState = makeRunState({entity_ref: 'secret-org/secret-repo#1'})
 
-    // #when projected with isRepoDenylisted:true
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: true})
+    // #when projected with a predicate that always returns true
+    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => true})
 
     // #then the record is omitted entirely — null, not a populated status
     expect(result).toBeNull()
@@ -130,8 +130,8 @@ describe('toOperatorRunStatus — redaction (r5/r6)', () => {
     // #given a run whose repo is NOT on the denylist
     const runState = makeRunState({entity_ref: 'public-org/public-repo#5'})
 
-    // #when projected with isRepoDenylisted:false
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: false})
+    // #when projected with a predicate that always returns false
+    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => false})
 
     // #then the record is populated — not accidentally omitted
     assert(result !== null, 'expected a populated status for a non-denylisted repo')
@@ -142,11 +142,48 @@ describe('toOperatorRunStatus — redaction (r5/r6)', () => {
     // #given an actively-running denylisted run
     const runState = makeRunState({phase: 'EXECUTING', entity_ref: 'hidden/repo#99'})
 
-    // #when projected with isRepoDenylisted:true
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: true})
+    // #when projected with a predicate that always returns true
+    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => true})
 
     // #then null — the active status must not leak the repo's activity
     expect(result).toBeNull()
+  })
+
+  it('(r6) membership-based predicate gates on entity_ref — denylisted org omitted, public org surfaced', () => {
+    // #given a predicate backed by org-prefix membership (simulates metadata/repos.yaml)
+    const isRepoDenylisted = (ref: string) => ref.startsWith('secret-org/')
+
+    // #given a run in the denylisted org
+    const secretRun = makeRunState({entity_ref: 'secret-org/secret-repo#1'})
+    // #given a run in a public org
+    const publicRun = makeRunState({entity_ref: 'public-org/ok-repo#2'})
+
+    // #when projected with the membership predicate
+    const secretResult = toOperatorRunStatus(secretRun, {...BASE_OPTS, isRepoDenylisted})
+    const publicResult = toOperatorRunStatus(publicRun, {...BASE_OPTS, isRepoDenylisted})
+
+    // #then the denylisted run is omitted
+    expect(secretResult).toBeNull()
+    // #then the public run is surfaced with its entity_ref
+    assert(publicResult !== null, 'expected a populated status for a non-denylisted repo')
+    expect(publicResult.entityRef).toBe('public-org/ok-repo#2')
+  })
+
+  it('(r6) predicate receives the run entity_ref as its argument', () => {
+    // #given a spy predicate that records the argument it was called with
+    const capturedArgs: string[] = []
+    const isRepoDenylisted = (ref: string) => {
+      capturedArgs.push(ref)
+      return false
+    }
+    const runState = makeRunState({entity_ref: 'acme/widget#7'})
+
+    // #when projected
+    toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted})
+
+    // #then the predicate was called with the run's entity_ref
+    expect(capturedArgs).toHaveLength(1)
+    expect(capturedArgs[0]).toBe('acme/widget#7')
   })
 })
 
@@ -207,6 +244,29 @@ describe('toOperatorRunStatus — stale derivation', () => {
     // #then stale defaults to true (fail-safe — unknown freshness = stale)
     assert(result !== null, 'expected a populated status')
     expect(result.stale).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fail-closed fallback: unknown phase → 'failed'
+// ---------------------------------------------------------------------------
+
+describe('toOperatorRunStatus — unknown phase fallback (fail-closed)', () => {
+  it("returns status 'failed' for an unrecognized phase value (defense-in-depth)", () => {
+    // #given — a RunState carrying an out-of-domain phase (data corruption or a
+    // newer-build phase this version does not know). The cast injects the runtime
+    // value the type system forbids, exercising the ?? 'failed' fallback.
+    const runState: RunState = {
+      ...makeRunState(),
+      phase: 'UNKNOWN_FUTURE_PHASE' as unknown as RunState['phase'],
+    }
+
+    // #when projected with a non-denylisted repo
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then status falls back to 'failed' (not undefined / not a missing key)
+    expect(result).not.toBeNull()
+    expect(result?.status).toBe('failed')
   })
 })
 

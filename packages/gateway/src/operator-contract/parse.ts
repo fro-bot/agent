@@ -32,8 +32,10 @@ function hasValidOperatorSessionInfoShape(value: unknown): value is OperatorSess
   const candidate = value as Record<string, unknown>
   return (
     typeof candidate.operatorId === 'number' &&
+    Number.isInteger(candidate.operatorId) &&
     typeof candidate.login === 'string' &&
-    typeof candidate.expiresAt === 'number'
+    typeof candidate.expiresAt === 'number' &&
+    Number.isFinite(candidate.expiresAt)
   )
 }
 

@@ -1,7 +1,7 @@
 /**
  * Redaction and authorization obligation clauses for the operator API contract.
  *
- * This module embeds the #950 redaction obligation and the authorization obligation
+ * This module embeds the metadata/repos.yaml redaction obligation and the authorization obligation
  * as normative contract clauses bound to OPERATOR_CONTRACT_VERSION.
  *
  * It does NOT implement the redaction gate itself. The gate ships with the first
@@ -14,7 +14,7 @@
  */
 
 // ---------------------------------------------------------------------------
-// REDACTION_OBLIGATION — normative clause for the #950 redaction invariant
+// REDACTION_OBLIGATION — normative clause for the repo redaction invariant
 // ---------------------------------------------------------------------------
 
 /**
@@ -88,16 +88,16 @@ export interface RedactionContext {
  * denylist-before-query gate (bound alongside checkRepoAuthz). Until then,
  * calling this function always throws.
  *
- * The real gate implementation is deferred to the #950 follow-up task.
+ * The real gate implementation is deferred to the redaction gate follow-up.
  *
- * @param context - The repo reference being accessed.
+ * @param _context - The repo reference being accessed (unused by the stub; the real gate will use it).
  * @throws {Error} Always — until the real gate replaces this stub body.
  */
-export function assertRedactionApplied(context: RedactionContext): void {
+export function assertRedactionApplied(_context: RedactionContext): void {
   throw new Error(
-    `REDACTION_GATE_NOT_IMPLEMENTED: redaction check not yet implemented for repo '${context.repoRef}'. ` +
-      `The first repo-data endpoint must replace this stub with the real denylist-before-query gate ` +
-      `(bound alongside checkRepoAuthz). See REDACTION_OBLIGATION for the four operational rules.`,
+    'REDACTION_GATE_NOT_IMPLEMENTED: redaction check not yet implemented. ' +
+      'The first repo-data endpoint must replace this stub with the real denylist-before-query gate ' +
+      '(bound alongside checkRepoAuthz). See REDACTION_OBLIGATION for the four operational rules.',
   )
 }
 
