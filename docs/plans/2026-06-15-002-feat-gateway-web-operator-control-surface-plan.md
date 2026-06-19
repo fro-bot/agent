@@ -13,6 +13,8 @@ deepened: 2026-06-15
 
 Add the Gateway-side API surface that Phase A made possible: GitHub-authenticated allowlisted operators can launch work, observe run state, and approve or reject tool requests through the same execution and approval spine Discord already uses. The surface is browser-only in v1, uses server-side opaque sessions, preserves the gateway ingress/egress boundary, and leaves scoped read-only binding data as an optional Phase B.1 follow-up.
 
+> **Operator-surface types are now owned by `packages/gateway/src/operator-contract/` (the frozen contract at `OPERATOR_CONTRACT_VERSION = '1.0.0'`).** Consuming units in this plan (launch, run-state, approvals) MUST import operator-surface types from that module, not re-declare them. The dashboard's `operator-client.ts` is a non-canonical downstream fixture; the contract barrel is the import authority.
+
 ## Problem Frame
 
 The Gateway currently has two proven control paths: Discord commands/mentions for launching work and Discord buttons for OpenCode approvals. Phase A extracted `launchWork`, transport-neutral sinks, and the generalized approval registry so another transport can use the same queue, concurrency cap, shutdown handoff, and fail-closed approval gate.
