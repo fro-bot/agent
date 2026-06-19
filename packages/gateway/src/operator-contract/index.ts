@@ -14,4 +14,5 @@
  * redaction modules land.
  */
 
+export type {OperatorIdentity} from './identity.js'
 export {OPERATOR_CONTRACT_VERSION} from './version.js'

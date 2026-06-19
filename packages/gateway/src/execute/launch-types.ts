@@ -42,6 +42,7 @@ import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {MessageContentOptions} from '../discord/io.js'
 import type {TransitionResult} from '../discord/status-message.js'
+import type {OperatorIdentity} from '../operator-contract/identity.js'
 
 // ---------------------------------------------------------------------------
 // RequesterIdentity — discriminated union for transport-neutral caller identity
@@ -59,30 +60,11 @@ export interface DiscordRequesterIdentity {
 /**
  * A web operator who triggered the run via the control surface.
  *
- * Carries stable GitHub numeric identity for authorization and audit, plus
- * a display login for human-readable logs. The numeric ID is the authoritative
- * identity — logins are mutable and must not be used for access decisions.
+ * Type alias for the canonical {@link OperatorIdentity} defined in the
+ * operator-contract module. The structural shape is declared exactly once
+ * there; this alias keeps the existing export path valid for all consumers.
  */
-export interface WebOperatorIdentity {
-  readonly kind: 'web-operator'
-  /**
-   * Stable GitHub numeric user ID (from the GitHub API `id` field).
-   * Used for authorization, audit, and idempotency key scoping.
-   * Prefer this over `login` for any access-control or audit decision.
-   */
-  readonly githubUserId: number
-  /**
-   * GitHub display login (e.g. `'octocat'`).
-   * Mutable — use only for human-readable logs and display metadata.
-   * Never use for authorization or audit identity.
-   */
-  readonly login: string
-  /**
-   * Opaque session correlation value for log correlation.
-   * Not used for authorization — use `githubUserId` instead.
-   */
-  readonly sessionCorrelationId: string
-}
+export type WebOperatorIdentity = OperatorIdentity
 
 /**
  * Transport-neutral requester identity.
