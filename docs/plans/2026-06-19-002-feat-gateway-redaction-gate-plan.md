@@ -1,8 +1,9 @@
 ---
 title: "feat: Gateway metadata/repos.yaml redaction gate (denylist-before-query)"
 type: feat
-status: active
+status: completed
 date: 2026-06-19
+completed: 2026-06-19
 origin: https://github.com/fro-bot/agent/issues/950 (Fro Bot triage comment as requirements)
 ---
 
@@ -103,7 +104,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
 ## Implementation Units
 
-- [ ] **Unit 1: Repo deny-key persistence on bindings (gateway-local)**
+- [x] **Unit 1: Repo deny-key persistence on bindings (gateway-local)**
 
   **Goal:** Add `databaseId` + `nodeId` to the gateway's `RepoBinding` so a repo's deny keys are available at surface time without a query. The shared `RunState` is NOT changed (Fork 2).
 
@@ -129,7 +130,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
   **Verification:** bindings can carry repo deny keys gateway-locally; the shared `RunState` is untouched; legacy bindings remain valid and resolve to "no deny key."
 
-- [ ] **Unit 2: Capture deny keys at ingest + active-binding backfill**
+- [x] **Unit 2: Capture deny keys at ingest + active-binding backfill**
 
   **Goal:** Capture the repo's `database_id` + `node_id` when `add-project` validates the repo, persist on the binding; and backfill the deny keys for existing ACTIVE bindings so the gate is functional for the current corpus (Fork 3).
 
@@ -160,7 +161,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
   **Verification:** new bindings carry deny keys captured at ingest via the correct repo query; active legacy bindings are backfilled offline before the first consumer; no surface-time identity query exists.
 
-- [ ] **Unit 3: Denylist reader (mirror dashboard, fail-closed)**
+- [x] **Unit 3: Denylist reader (mirror dashboard, fail-closed)**
 
   **Goal:** Read and parse `metadata/repos.yaml@data` into a denylist of `redactedDatabaseIds` + `redactedNodeIds`, with the dashboard's fail-closed taxonomy.
 
@@ -188,7 +189,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
   **Verification:** the reader produces a correct denylist from valid input and fails closed (err, no throw) on every error path, never leaking redacted owner/name.
 
-- [ ] **Unit 4: Denylist cache + `isRepoDenied` predicate**
+- [x] **Unit 4: Denylist cache + `isRepoDenied` predicate**
 
   **Goal:** Cache the parsed denylist with a short TTL (fail-closed on refresh failure) and expose the `isRepoDenied(repoKey)` predicate the gate uses.
 
@@ -218,7 +219,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
   **Verification:** the predicate is a pure in-memory lookup; denies on match or missing key; cold-start fails closed; refresh failure serves bounded last-known-good with alarms, then fails closed past the grace window.
 
-- [ ] **Unit 5: Wire the gate into the contract + every working-set builder**
+- [x] **Unit 5: Wire the gate into the contract + every working-set builder**
 
   **Goal:** Replace `assertRedactionApplied`'s stub, change `isRepoDenylisted` to the repo-key shape, resolve deny keys from the binding, and apply the denylist filter as the FIRST step in every operator working-set builder — composing alongside `checkRepoAuthz`.
 
@@ -250,7 +251,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
 
   **Verification:** the contract consumes the real denylist via binding-resolved repo keys, omits denied/keyless repos before any query, composes alongside authz, and the stub no longer ships.
 
-- [ ] **Unit 6: Cross-source leak tests + obligation docs**
+- [x] **Unit 6: Cross-source leak tests + obligation docs**
 
   **Goal:** Prove the cross-source leak path is closed (no output AND no query for a denylisted repo) and document the invariant + backfill need.
 
