@@ -70,6 +70,46 @@ describe('hasValidRepoBindingShape', () => {
     const rest = Object.fromEntries(Object.entries(binding).filter(([k]) => k !== 'createdByDiscordId'))
     expect(hasValidRepoBindingShape(rest)).toBe(false)
   })
+
+  it('accepts a binding with optional databaseId and nodeId present', () => {
+    // #given
+    const value = makeBinding({databaseId: 987654321, nodeId: 'MDEwOlJlcG9zaXRvcnkx'})
+
+    // #when / #then
+    expect(hasValidRepoBindingShape(value)).toBe(true)
+  })
+
+  it('accepts a binding with only databaseId present (nodeId absent)', () => {
+    // #given
+    const value = makeBinding({databaseId: 1})
+
+    // #when / #then
+    expect(hasValidRepoBindingShape(value)).toBe(true)
+  })
+
+  it('accepts a binding with only nodeId present (databaseId absent)', () => {
+    // #given
+    const value = makeBinding({nodeId: 'R_kgDOBcdefg'})
+
+    // #when / #then
+    expect(hasValidRepoBindingShape(value)).toBe(true)
+  })
+
+  it('rejects a binding where databaseId is a string instead of a number', () => {
+    // #given — databaseId must be a number when present
+    const value = {...makeBinding(), databaseId: '123456789'}
+
+    // #when / #then
+    expect(hasValidRepoBindingShape(value)).toBe(false)
+  })
+
+  it('rejects a binding where nodeId is a number instead of a string', () => {
+    // #given — nodeId must be a string when present
+    const value = {...makeBinding(), nodeId: 42}
+
+    // #when / #then
+    expect(hasValidRepoBindingShape(value)).toBe(false)
+  })
 })
 
 describe('hasValidChannelIndexShape', () => {
@@ -501,6 +541,88 @@ describe('createBindingsStore', () => {
         expect(result.success).toBe(false)
       })
     }
+  })
+
+  // ─── Unit 1: deny-key fields (databaseId / nodeId) ──────────────────────────
+
+  // Happy path — binding with deny keys round-trips through the store
+  it('createBinding + getBindingByRepo round-trips a binding that carries databaseId and nodeId', async () => {
+    // #given
+    const bindingWithKeys = makeBinding({databaseId: 123456789, nodeId: 'R_kgDOBcdefg'})
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-primary'}))
+      .mockResolvedValueOnce(ok({etag: 'etag-index'}))
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(bindingWithKeys), etag: 'etag-primary'}))
+    const adapter = makeAdapter({conditionalPut, getObject})
+    const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+    // #when — write then read
+    const writeResult = await store.createBinding(bindingWithKeys)
+    const readResult = await store.getBindingByRepo('foo', 'bar')
+
+    // #then — write succeeds and read returns the binding with deny keys intact
+    expect(writeResult).toEqual(ok({primaryEtag: 'etag-primary', indexEtag: 'etag-index'}))
+    expect(readResult).toEqual(ok(bindingWithKeys))
+    expect(readResult.success === true ? readResult.data?.databaseId : undefined).toBe(123456789)
+    expect(readResult.success === true ? readResult.data?.nodeId : undefined).toBe('R_kgDOBcdefg')
+    // Verify the serialized payload written to S3 includes the deny keys
+    expect(conditionalPut).toHaveBeenNthCalledWith(
+      1,
+      'fro-bot-state/gateway/foo/bar/bindings/repo.json',
+      JSON.stringify(bindingWithKeys),
+      {ifNoneMatch: '*'},
+    )
+  })
+
+  // Legacy compat — binding WITHOUT deny keys parses fine (fields undefined)
+  it('getBindingByRepo returns a valid binding when stored payload has no databaseId or nodeId (legacy)', async () => {
+    // #given — a legacy binding stored without the new fields
+    const legacyBinding = makeBinding() // no databaseId / nodeId
+    const adapter = makeAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(legacyBinding), etag: 'etag-primary'})),
+    })
+    const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+    // #when
+    const result = await store.getBindingByRepo('foo', 'bar')
+
+    // #then — binding is valid; deny-key fields are absent (undefined)
+    expect(result).toEqual(ok(legacyBinding))
+    expect(result.success === true ? result.data?.databaseId : 'FAIL').toBeUndefined()
+    expect(result.success === true ? result.data?.nodeId : 'FAIL').toBeUndefined()
+  })
+
+  // Legacy compat — listBindings returns legacy bindings (no deny keys) alongside keyed ones
+  it('listBindings returns both legacy bindings and bindings with deny keys', async () => {
+    // #given
+    const legacyBinding = makeBinding({owner: 'acme', repo: 'legacy', channelId: '111'})
+    const keyedBinding = makeBinding({owner: 'acme', repo: 'keyed', channelId: '222', databaseId: 42, nodeId: 'MDEw'})
+    const keys = [
+      'fro-bot-state/gateway/acme/legacy/bindings/repo.json',
+      'fro-bot-state/gateway/acme/keyed/bindings/repo.json',
+    ]
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(legacyBinding), etag: 'etag-a'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(keyedBinding), etag: 'etag-b'}))
+    const adapter = makeAdapter({
+      list: vi.fn(async () => ok(keys)),
+      getObject,
+    })
+    const store = createBindingsStore({adapter, storeConfig: STORE_CONFIG, identity: IDENTITY})
+
+    // #when
+    const result = await store.listBindings()
+
+    // #then — both bindings returned; legacy has no deny keys, keyed has them
+    expect(result).toEqual(ok([legacyBinding, keyedBinding]))
+    if (result.success !== true) throw new Error('expected success')
+    expect(result.data[0]?.databaseId).toBeUndefined()
+    expect(result.data[1]?.databaseId).toBe(42)
+    expect(result.data[1]?.nodeId).toBe('MDEw')
   })
 
   // Error path — primary succeeds, index fails, rollback also fails → PartialWriteError
