@@ -23,9 +23,13 @@ const makeRunState = (overrides: Partial<RunState> = {}): RunState => ({
   ...overrides,
 })
 
+// Non-denied repoKey for the happy path
+const ALLOWED_REPO_KEY = {databaseId: 42, nodeId: 'MDEwOlJlcG9zaXRvcnk0Mg=='}
+
 const BASE_OPTS = {
   nowMs: BASE_NOW_MS,
   staleThresholdMs: 60_000,
+  repoKey: ALLOWED_REPO_KEY,
   isRepoDenylisted: () => false,
 }
 
@@ -115,23 +119,33 @@ describe('toOperatorRunStatus — operator-safe fields', () => {
 // ---------------------------------------------------------------------------
 
 describe('toOperatorRunStatus — redaction (r5/r6)', () => {
-  it('(r6) returns null for a denylisted repo — record is omitted, not populated', () => {
-    // #given a run whose repo is on the denylist
+  it('(r6) returns null for a denied repoKey — record is omitted, not populated', () => {
+    // #given a run whose repo is on the denylist (predicate returns true for the supplied key)
     const runState = makeRunState({entity_ref: 'secret-org/secret-repo#1'})
+    const deniedKey = {databaseId: 999, nodeId: 'MDEwOlJlcG9zaXRvcnk5OTk='}
 
     // #when projected with a predicate that always returns true
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => true})
+    const result = toOperatorRunStatus(runState, {
+      ...BASE_OPTS,
+      repoKey: deniedKey,
+      isRepoDenylisted: () => true,
+    })
 
     // #then the record is omitted entirely — null, not a populated status
     expect(result).toBeNull()
   })
 
-  it('(positive control) returns a populated status for a non-denylisted repo', () => {
+  it('(positive control) returns a populated status for a non-denied repoKey', () => {
     // #given a run whose repo is NOT on the denylist
     const runState = makeRunState({entity_ref: 'public-org/public-repo#5'})
+    const allowedKey = {databaseId: 5, nodeId: 'MDEwOlJlcG9zaXRvcnk1'}
 
     // #when projected with a predicate that always returns false
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => false})
+    const result = toOperatorRunStatus(runState, {
+      ...BASE_OPTS,
+      repoKey: allowedKey,
+      isRepoDenylisted: () => false,
+    })
 
     // #then the record is populated — not accidentally omitted
     assert(result !== null, 'expected a populated status for a non-denylisted repo')
@@ -141,49 +155,93 @@ describe('toOperatorRunStatus — redaction (r5/r6)', () => {
   it('(r6) denylisted result is null even when phase is EXECUTING (no partial leak)', () => {
     // #given an actively-running denylisted run
     const runState = makeRunState({phase: 'EXECUTING', entity_ref: 'hidden/repo#99'})
+    const deniedKey = {databaseId: 99, nodeId: 'MDEwOlJlcG9zaXRvcnk5OQ=='}
 
     // #when projected with a predicate that always returns true
-    const result = toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted: () => true})
+    const result = toOperatorRunStatus(runState, {
+      ...BASE_OPTS,
+      repoKey: deniedKey,
+      isRepoDenylisted: () => true,
+    })
 
     // #then null — the active status must not leak the repo's activity
     expect(result).toBeNull()
   })
 
-  it('(r6) membership-based predicate gates on entity_ref — denylisted org omitted, public org surfaced', () => {
-    // #given a predicate backed by org-prefix membership (simulates metadata/repos.yaml)
-    const isRepoDenylisted = (ref: string) => ref.startsWith('secret-org/')
+  it('(r6) null/null repoKey is denied (fail closed — no usable deny key)', () => {
+    // #given a run whose binding has no deny keys (legacy / unbackfilled)
+    const runState = makeRunState({entity_ref: 'legacy/repo#1'})
+    const missingKey = {databaseId: null, nodeId: null}
 
-    // #given a run in the denylisted org
+    // #when projected with a predicate that denies null/null keys (fail-closed)
+    const result = toOperatorRunStatus(runState, {
+      ...BASE_OPTS,
+      repoKey: missingKey,
+      isRepoDenylisted: key => key.databaseId === null && key.nodeId === null,
+    })
+
+    // #then the record is omitted — fail closed on missing deny key
+    expect(result).toBeNull()
+  })
+
+  it('(r6) predicate receives the repoKey object (not the entity_ref string)', () => {
+    // #given a spy predicate that records the argument it was called with
+    const capturedKeys: {databaseId: number | null; nodeId: string | null}[] = []
+    const isRepoDenylisted = (key: {readonly databaseId: number | null; readonly nodeId: string | null}) => {
+      capturedKeys.push({databaseId: key.databaseId, nodeId: key.nodeId})
+      return false
+    }
+    const runState = makeRunState({entity_ref: 'acme/widget#7'})
+    const repoKey = {databaseId: 7, nodeId: 'MDEwOlJlcG9zaXRvcnk3'}
+
+    // #when projected
+    toOperatorRunStatus(runState, {...BASE_OPTS, repoKey, isRepoDenylisted})
+
+    // #then the predicate was called with the repoKey object
+    expect(capturedKeys).toHaveLength(1)
+    expect(capturedKeys[0]).toEqual({databaseId: 7, nodeId: 'MDEwOlJlcG9zaXRvcnk3'})
+  })
+
+  it('(r4) a repo that passes authz but is denylisted is still omitted (redaction independent)', () => {
+    // #given a run that would pass authz (simulated by the caller having already checked)
+    // but whose repo is on the denylist
+    const runState = makeRunState({entity_ref: 'visible-but-redacted/repo#10'})
+    const repoKey = {databaseId: 10, nodeId: 'MDEwOlJlcG9zaXRvcnkxMA=='}
+
+    // #when projected with a predicate that denies this specific databaseId
+    const result = toOperatorRunStatus(runState, {
+      ...BASE_OPTS,
+      repoKey,
+      isRepoDenylisted: key => key.databaseId === 10,
+    })
+
+    // #then the record is omitted — redaction wins regardless of authz
+    expect(result).toBeNull()
+  })
+
+  it('(r6) membership-based predicate gates on repoKey — denylisted id omitted, public id surfaced', () => {
+    // #given a predicate backed by databaseId membership (simulates metadata/repos.yaml)
+    const deniedIds = new Set([100, 200, 300])
+    const isRepoDenylisted = (key: {readonly databaseId: number | null; readonly nodeId: string | null}) =>
+      key.databaseId !== null && deniedIds.has(key.databaseId)
+
+    // #given a run with a denied databaseId
     const secretRun = makeRunState({entity_ref: 'secret-org/secret-repo#1'})
-    // #given a run in a public org
+    const secretKey = {databaseId: 100, nodeId: 'MDEwOlJlcG9zaXRvcnkxMDA='}
+
+    // #given a run with an allowed databaseId
     const publicRun = makeRunState({entity_ref: 'public-org/ok-repo#2'})
+    const publicKey = {databaseId: 999, nodeId: 'MDEwOlJlcG9zaXRvcnk5OTk='}
 
     // #when projected with the membership predicate
-    const secretResult = toOperatorRunStatus(secretRun, {...BASE_OPTS, isRepoDenylisted})
-    const publicResult = toOperatorRunStatus(publicRun, {...BASE_OPTS, isRepoDenylisted})
+    const secretResult = toOperatorRunStatus(secretRun, {...BASE_OPTS, repoKey: secretKey, isRepoDenylisted})
+    const publicResult = toOperatorRunStatus(publicRun, {...BASE_OPTS, repoKey: publicKey, isRepoDenylisted})
 
     // #then the denylisted run is omitted
     expect(secretResult).toBeNull()
     // #then the public run is surfaced with its entity_ref
     assert(publicResult !== null, 'expected a populated status for a non-denylisted repo')
     expect(publicResult.entityRef).toBe('public-org/ok-repo#2')
-  })
-
-  it('(r6) predicate receives the run entity_ref as its argument', () => {
-    // #given a spy predicate that records the argument it was called with
-    const capturedArgs: string[] = []
-    const isRepoDenylisted = (ref: string) => {
-      capturedArgs.push(ref)
-      return false
-    }
-    const runState = makeRunState({entity_ref: 'acme/widget#7'})
-
-    // #when projected
-    toOperatorRunStatus(runState, {...BASE_OPTS, isRepoDenylisted})
-
-    // #then the predicate was called with the run's entity_ref
-    expect(capturedArgs).toHaveLength(1)
-    expect(capturedArgs[0]).toBe('acme/widget#7')
   })
 })
 
