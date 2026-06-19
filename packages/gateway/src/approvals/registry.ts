@@ -45,6 +45,7 @@
  */
 
 import type {GatewayLogger} from '../discord/client.js'
+import type {OperatorIdentity} from '../operator-contract/identity.js'
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
 
 // ---------------------------------------------------------------------------
@@ -67,30 +68,12 @@ export interface DiscordApprovalActor {
 /**
  * A web operator who submitted an approval decision via the control surface.
  *
- * Carries stable GitHub numeric identity for authorization and audit, plus
- * a display login for human-readable logs. The numeric ID is the authoritative
- * identity — logins are mutable and must not be used for access decisions.
+ * Type alias for the canonical {@link OperatorIdentity} defined in the
+ * operator-contract module. The structural shape is declared exactly once
+ * there; this alias keeps the existing export path valid for all consumers
+ * (discord-transport.ts, approval-flow.integration.test.ts, registry.test.ts).
  */
-export interface WebOperatorActor {
-  readonly kind: 'web-operator'
-  /**
-   * Stable GitHub numeric user ID (from the GitHub API `id` field).
-   * Used for authorization, audit, and idempotency key scoping.
-   * Prefer this over `login` for any access-control or audit decision.
-   */
-  readonly githubUserId: number
-  /**
-   * GitHub display login (e.g. `'octocat'`).
-   * Mutable — use only for human-readable logs and display metadata.
-   * Never use for authorization or audit identity.
-   */
-  readonly login: string
-  /**
-   * Opaque session correlation value for log correlation.
-   * Not used for authorization — use `githubUserId` instead.
-   */
-  readonly sessionCorrelationId: string
-}
+export type WebOperatorActor = OperatorIdentity
 
 /**
  * Transport-neutral actor identity for an approval decision.

@@ -28,13 +28,23 @@
  */
 
 import type {GatewayLogger} from '../discord/client.js'
+import type {PermissionReply} from '../operator-contract/approval.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/** Reply verbs accepted by the OpenCode permission reply endpoint. */
-export type PermissionReply = 'once' | 'always' | 'reject'
+/**
+ * Re-export seam — `PermissionReply` is now solely defined in the operator
+ * contract module. This re-export keeps the `coordinator.js` path valid for
+ * all 9 existing import sites (launch-types.ts, registry.ts, discord-transport.ts,
+ * discord/approvals.ts, and 5 test files including the `import * as coordinatorModule`
+ * namespace import in run.test.ts) without a 9-file change.
+ *
+ * Consider migrating import sites to the contract directly in a future pass:
+ *   `import type { PermissionReply } from '../operator-contract/approval.js'`
+ */
+export type {PermissionReply} from '../operator-contract/approval.js'
 
 /** Parsed `permission.asked` payload — the request awaiting a decision. */
 export interface PermissionRequest {

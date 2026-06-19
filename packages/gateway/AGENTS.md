@@ -2,6 +2,15 @@
 
 The Discord-first gateway daemon. Wraps `@fro-bot/runtime` with Effect 3.x as the composition layer.
 
+## Operator API contract
+
+`packages/gateway/src/operator-contract/` is the **single authority** for operator-surface types (lifecycle, identity, approval-decision, responses) and the contract version. Import from its barrel (`index.ts`); do not re-declare these types elsewhere.
+
+- `registry.handleDecision` is the **sole approval gate** — all transports (Discord, web) settle through it; no transport may implement a parallel settlement path.
+- `OperatorIdentity` is always constructed **server-side** from the authenticated session. It is never deserialized from a request payload.
+- `OPERATOR_CONTRACT_VERSION` is **build-time pinned** and never negotiated over the wire. Any endpoint reading a version header must reject unrecognized versions fail-closed.
+- The dashboard's `operator-client.ts` is a **non-canonical downstream fixture**; it does not define the contract.
+
 ## Effect / Result<> boundary
 
 This package is the **only** place in the monorepo that uses `effect`. The Action and the runtime package stay on hand-rolled `Result<T, E>` from `@bfra.me/es`.
