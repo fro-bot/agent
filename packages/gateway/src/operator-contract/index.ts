@@ -14,6 +14,8 @@
  * redaction modules land.
  */
 
+export type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
+export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'
 export type {OperatorRunStatus, OperatorWebStatus, RunPhase, Surface} from './run-status.js'
 export {toOperatorRunStatus} from './run-status.js'
