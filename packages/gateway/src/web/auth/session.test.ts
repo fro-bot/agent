@@ -1238,6 +1238,145 @@ describe('createInMemorySessionStore — token no-oracle (token never in public 
   })
 })
 
+// ---------------------------------------------------------------------------
+// Session store — token cleared on teardown (FIX 2)
+// ---------------------------------------------------------------------------
+
+describe('createInMemorySessionStore — token cleared on teardown (FIX 2)', () => {
+  it('delete() clears the oauthToken before/as the entry is revoked', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_REVOKE_TOKEN'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — revoke the session (logout path)
+    store.delete(sessionId)
+
+    // #then — getOperatorToken returns undefined (token is gone)
+    expect(store.getOperatorToken(sessionId, now + 1_000)).toBeUndefined()
+  })
+
+  it('scavenge() clears the oauthToken before removing expired entries', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_SCAVENGE_TOKEN'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — scavenge past absolute TTL
+    store.scavenge(now + SESSION_ABSOLUTE_TTL_MS + 1)
+
+    // #then — getOperatorToken returns undefined (token is gone after scavenge)
+    // The session is gone from the store, so getOperatorToken returns undefined.
+    expect(store.getOperatorToken(sessionId, now + SESSION_ABSOLUTE_TTL_MS + 2)).toBeUndefined()
+  })
+
+  it('scavenge() clears the oauthToken for revoked entries', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_REVOKED_SCAVENGE_TOKEN'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // Revoke the session (sets revoked=true, clears token via delete())
+    store.delete(sessionId)
+
+    // #when — scavenge removes the revoked entry
+    store.scavenge(now + 1_000)
+
+    // #then — token is gone (was cleared by delete() before scavenge removed the entry)
+    expect(store.getOperatorToken(sessionId, now + 2_000)).toBeUndefined()
+    // Store size is 0 (entry was removed by scavenge)
+    expect(store.size()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Session store — no-oracle over accessor paths (FIX 4)
+// ---------------------------------------------------------------------------
+
+describe('createInMemorySessionStore — no-oracle over accessor paths (FIX 4)', () => {
+  it('getOperatorToken() never logs the token string', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_NOLOG_GETTOKEN_SECRET'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // createInMemorySessionStore has no logger — the no-oracle invariant for
+    // accessor paths is enforced by the store not accepting a logger at all.
+    // The token is only accessible via getOperatorToken(); it never appears in
+    // any public entry, log, or response. This test verifies the accessor returns
+    // the correct value without leaking it into the public entry.
+    const retrieved = store.getOperatorToken(sessionId, now)
+    expect(retrieved).toBe(token)
+
+    // The public entry must not contain the token
+    const entry = store.get(sessionId, now)
+    const entryStr = JSON.stringify(entry)
+    expect(entryStr).not.toContain(token)
+  })
+
+  it('dropOperatorToken() never logs the token string', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_NOLOG_DROP_SECRET'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — drop the token
+    store.dropOperatorToken(sessionId)
+
+    // #then — token is gone; session is still valid
+    expect(store.getOperatorToken(sessionId, now + 1_000)).toBeUndefined()
+    expect(store.get(sessionId, now + 1_000)).toBeDefined()
+
+    // The public entry must not contain the token
+    const entry = store.get(sessionId, now)
+    const entryStr = JSON.stringify(entry)
+    expect(entryStr).not.toContain(token)
+  })
+
+  it('delete() path: token never appears in public entry after revocation', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_NOLOG_DELETE_SECRET'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — revoke the session
+    store.delete(sessionId)
+
+    // #then — getOperatorToken returns undefined (token cleared)
+    expect(store.getOperatorToken(sessionId, now + 1_000)).toBeUndefined()
+    // get() returns undefined for revoked session
+    expect(store.get(sessionId, now + 1_000)).toBeUndefined()
+  })
+
+  it('scavenge() path: token never appears in public entry after scavenge', () => {
+    // #given
+    const store = createInMemorySessionStore()
+    const now = 1_000_000
+    const token = 'ghs_NOLOG_SCAVENGE_SECRET'
+    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, token, now)
+    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+
+    // #when — scavenge past absolute TTL
+    store.scavenge(now + SESSION_ABSOLUTE_TTL_MS + 1)
+
+    // #then — token is gone (entry removed by scavenge)
+    expect(store.getOperatorToken(sessionId, now + SESSION_ABSOLUTE_TTL_MS + 2)).toBeUndefined()
+    expect(store.get(sessionId, now + SESSION_ABSOLUTE_TTL_MS + 2)).toBeUndefined()
+  })
+})
+
 describe('createInMemorySessionStore — create signature backward compat', () => {
   it('create still returns a session ID with the new three-argument signature', () => {
     // #given

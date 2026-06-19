@@ -372,7 +372,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Register the run in the server-owned index so privileged routes can resolve
     // runId → {repo, surface} without trusting client-supplied owner/repo.
     // Best-effort: index is optional and register() is synchronous — never blocks execution.
-    deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
+    // Wrapped in try/catch so a buggy register() implementation never aborts the run.
+    try {
+      deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
+    } catch (registerError: unknown) {
+      logger.warn(
+        {repo, runId, err: registerError instanceof Error ? registerError.message : String(registerError)},
+        'run: runIndex.register threw — continuing (best-effort)',
+      )
+    }
 
     let runEtag = createResult.data.etag
 

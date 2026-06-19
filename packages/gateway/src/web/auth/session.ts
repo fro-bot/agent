@@ -144,6 +144,12 @@ export interface SessionStore {
    *   - The session is revoked or TTL-expired.
    *   - The token was explicitly dropped via dropOperatorToken().
    *
+   * Re-auth contract (deferred to 4b): a 4b route calls get() to confirm the
+   * session is valid, then getOperatorToken(). A valid session with undefined
+   * token means re-auth is needed (distinct from no-session). The typed re-auth
+   * result shape is designed with the 4b consumer. Return type stays
+   * `string | undefined` for v1.
+   *
    * Security: the token is NEVER logged, never included in any response, and
    * never returned via get(). This is the only sanctioned accessor.
    */
@@ -288,6 +294,9 @@ export function createInMemorySessionStore(): SessionStore {
     delete(sessionId: string): void {
       const entry = entries.get(sessionId)
       if (entry === undefined) return
+      // Clear the token from heap before marking revoked so it doesn't linger
+      // in memory after revocation. Hooks run after the token is cleared.
+      entry.oauthToken = undefined
       entry.revoked = true
 
       const sessionHooks = hooks.get(sessionId)
@@ -315,6 +324,9 @@ export function createInMemorySessionStore(): SessionStore {
     scavenge(nowMs: number): void {
       for (const [key, entry] of entries) {
         if (entry.revoked === true || isExpired(entry, nowMs)) {
+          // Clear the token from heap before removing the entry so it doesn't
+          // linger in memory after TTL eviction or scavenge.
+          entry.oauthToken = undefined
           entries.delete(key)
           hooks.delete(key)
         }

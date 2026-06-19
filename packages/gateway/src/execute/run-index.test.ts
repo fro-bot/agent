@@ -3,10 +3,10 @@
  *
  * Two-tier design:
  *   1. Bounded in-memory accelerator (cap + TTL).
- *   2. Canonical fallback via durable run-state scan (listBindings + findStaleRuns path).
+ *   2. Canonical fallback via durable run-state scan (listBindings + findRunsForRepo path).
  *
  * P0 correctness: eviction from the accelerator NEVER causes `undefined` for a run
- * whose run-state still exists in durable storage.
+ * whose run-state still exists in durable storage AND whose channel binding still exists.
  */
 
 import type {CoordinationConfig, RunState, Surface} from '@fro-bot/runtime'
@@ -81,7 +81,7 @@ interface MockDeps {
   coordinationConfig: CoordinationConfig
   identity: string
   logger: GatewayLogger
-  /** Override the findStaleRuns mock return value per-repo. */
+  /** Override the findRunsForRepo mock return value per-repo. */
   runsByRepo: Map<string, RunState[]>
 }
 
@@ -465,6 +465,412 @@ describe('createRunIndex', () => {
 
       // #then — found in the second repo despite first failing
       expect(result).toEqual({repo: 'acme/widget', surface: 'discord'})
+    })
+  })
+
+  // ── FIX 1: Fallback timeout ───────────────────────────────────────────────
+
+  describe('fallback timeout (FIX 1)', () => {
+    it('returns undefined within the timeout when fallback I/O never resolves', async () => {
+      // #given — findRunsForRepo returns a promise that never resolves (simulates hung S3)
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(
+        async () =>
+          new Promise<RunState[]>(() => {
+            /* never resolves */
+          }),
+      )
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+        // Very short timeout so the test completes quickly
+        fallbackTimeoutMs: 50,
+      })
+
+      // #when — lookup with a hung fallback
+      const start = Date.now()
+      const result = await index.lookup('run-hung')
+      const elapsed = Date.now() - start
+
+      // #then — returns undefined (not a hang); completes within a reasonable window
+      expect(result).toBeUndefined()
+      // Should complete well within 1s (timeout is 50ms)
+      expect(elapsed).toBeLessThan(1_000)
+    })
+
+    it('returns undefined within the timeout when listBindings never resolves', async () => {
+      // #given — listBindings itself never resolves
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn(
+          async () =>
+            new Promise<never>(() => {
+              /* never resolves */
+            }),
+        ),
+      }
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        fallbackTimeoutMs: 50,
+      })
+
+      // #when
+      const start = Date.now()
+      const result = await index.lookup('run-hung-bindings')
+      const elapsed = Date.now() - start
+
+      // #then — returns undefined (not a hang)
+      expect(result).toBeUndefined()
+      expect(elapsed).toBeLessThan(1_000)
+    })
+  })
+
+  // ── FIX 3: Negative cache + concurrent-scan dedup ────────────────────────
+
+  describe('negative cache (FIX 3)', () => {
+    it('repeated unknown-runId lookups within the negative-TTL do only one scan', async () => {
+      // #given — run does not exist anywhere
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(async () => [])
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — look up the same unknown runId twice
+      const first = await index.lookup('run-unknown-neg')
+      const second = await index.lookup('run-unknown-neg')
+
+      // #then — both return undefined (no oracle)
+      expect(first).toBeUndefined()
+      expect(second).toBeUndefined()
+      // Only one scan was performed (second hit the negative cache)
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+
+    it('negative cache expires after TTL and allows a re-scan', async () => {
+      // #given — run does not exist anywhere; very short negative TTL
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(async () => [])
+      // Use a custom now() so we can advance the clock
+      let testNow = Date.now()
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now: () => testNow,
+        findRunsForRepo,
+        // Inject a very short negative TTL via the internal constant — we can't
+        // override it directly, but we can advance the clock past the real 60s TTL.
+        // Instead, use a real clock advance of 61s to expire the negative cache.
+      })
+
+      // #when — first lookup populates negative cache
+      await index.lookup('run-neg-expire')
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+
+      // Advance clock past the 60s negative cache TTL
+      testNow += 61_000
+
+      // #when — second lookup after TTL expiry should re-scan
+      await index.lookup('run-neg-expire')
+
+      // #then — two scans total (negative cache expired)
+      expect(findRunsForRepo).toHaveBeenCalledTimes(2)
+    })
+
+    it('negative cache is bounded — evicts oldest entry when cap is reached', async () => {
+      // #given — fill the negative cache beyond its cap (200 entries)
+      // We use a small cap via the internal constant; we can't override it directly,
+      // but we can verify the Map doesn't grow unbounded by checking behavior.
+      // This test verifies the eviction logic by registering a run after negative-caching it.
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(async () => [])
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+      })
+
+      // Populate negative cache with 201 distinct unknown runIds
+      // (one more than the cap of 200)
+      for (let i = 0; i < 201; i++) {
+        await index.lookup(`run-neg-cap-${i}`)
+      }
+
+      // #then — the index still functions correctly (no crash, no unbounded growth)
+      // The first entry (run-neg-cap-0) was evicted; a lookup for it would re-scan.
+      // We can't directly inspect the Map size, but we verify no error was thrown.
+      const result = await index.lookup('run-neg-cap-0')
+      expect(result).toBeUndefined()
+      // run-neg-cap-0 was evicted from negative cache, so it re-scanned
+      // Total calls: 201 (initial) + 1 (re-scan after eviction) = 202
+      expect(findRunsForRepo.mock.calls.length).toBeGreaterThanOrEqual(202)
+    })
+
+    it('negative cache does not change the no-oracle contract — still returns undefined', async () => {
+      // #given — a run exists in one repo; we look up a different (unknown) runId
+      const runsByRepo = new Map([['acme/widget', [makeRunState('run-real', 'acme/widget')]]])
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — look up an unknown runId twice (second hits negative cache)
+      const first = await index.lookup('run-unknown-oracle')
+      const second = await index.lookup('run-unknown-oracle')
+
+      // #then — both return undefined (no oracle: unknown and unauthorized are the same)
+      expect(first).toBeUndefined()
+      expect(second).toBeUndefined()
+    })
+  })
+
+  describe('concurrent-scan dedup (FIX 3)', () => {
+    it('concurrent lookups for the same missing runId dedup to one scan', async () => {
+      // #given — findRunsForRepo is slow (resolves after a tick)
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      let resolveAll: (() => void) | undefined
+      const barrier = new Promise<void>(resolve => {
+        resolveAll = resolve
+      })
+      const findRunsForRepo = vi.fn(async () => {
+        await barrier
+        return []
+      })
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+        fallbackTimeoutMs: 5_000,
+      })
+
+      // #when — fire two concurrent lookups for the same runId
+      const p1 = index.lookup('run-concurrent')
+      const p2 = index.lookup('run-concurrent')
+
+      // Unblock the scan
+      resolveAll?.()
+      const [r1, r2] = await Promise.all([p1, p2])
+
+      // #then — both return undefined; only one scan was performed
+      expect(r1).toBeUndefined()
+      expect(r2).toBeUndefined()
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  // ── FIX 6: Exact S3 key regression test ──────────────────────────────────
+
+  describe('exact S3 key shape (FIX 6)', () => {
+    it('fallback queries the expected key prefix shape containing identity and repo', async () => {
+      // #given — use the real production path (no findRunsForRepo injection)
+      // so we can inspect the actual key passed to the store mock.
+      const coordinationConfig = makeCoordinationConfig()
+      const listMock = coordinationConfig.storeAdapter.list as ReturnType<typeof vi.fn>
+      listMock.mockResolvedValue({success: true, data: []})
+
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const identity = 'discord-gateway'
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig,
+        identity,
+        logger: makeLogger(),
+        now,
+      })
+
+      // #when — trigger the fallback (run not in accelerator)
+      await index.lookup('run-key-shape-test')
+
+      // #then — list was called with a prefix that contains the identity and repo
+      expect(listMock).toHaveBeenCalled()
+      const calledPrefix = listMock.mock.calls[0]?.[0] as string
+      expect(typeof calledPrefix).toBe('string')
+      // The prefix must contain the identity segment (not a wrong identity like /coordination/)
+      expect(calledPrefix).toContain(identity)
+      // The prefix must contain the repo slug
+      expect(calledPrefix).toContain('acme')
+      expect(calledPrefix).toContain('widget')
+      // Must NOT use a wrong identity
+      expect(calledPrefix).not.toContain('/coordination/')
+    })
+  })
+
+  // ── FIX 7: startedAt stored on accelerator entry ─────────────────────────
+
+  describe('startedAt stored on accelerator entry (FIX 7)', () => {
+    it('register stores startedAt on the accelerator entry (not discarded)', async () => {
+      // #given
+      const deps = makeDeps()
+      const startedAt = '2026-06-19T12:00:00.000Z'
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+      })
+
+      // #when — register with a known startedAt
+      index.register('run-startedat', {repo: 'acme/widget', surface: 'discord', startedAt})
+
+      // #then — lookup returns the correct location (startedAt is stored internally)
+      // RunLocation does not expose startedAt (by design — it's {repo, surface} only)
+      const result = await index.lookup('run-startedat')
+      expect(result).toEqual({repo: 'acme/widget', surface: 'discord'})
+    })
+
+    it('fallback re-registers with startedAt from run-state (not discarded)', async () => {
+      // #given — run exists in durable state with a known started_at
+      const startedAt = '2026-06-19T10:00:00.000Z'
+      const runState = {...makeRunState('run-fallback-startedat', 'acme/widget', 'discord'), started_at: startedAt}
+      const runsByRepo = new Map([['acme/widget', [runState]]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — fallback resolves the run
+      const result = await index.lookup('run-fallback-startedat')
+
+      // #then — location is correct; startedAt was stored (not discarded) during re-cache
+      expect(result).toEqual({repo: 'acme/widget', surface: 'discord'})
+      // Second lookup hits the accelerator (re-cached with startedAt)
+      const second = await index.lookup('run-fallback-startedat')
+      expect(second).toEqual({repo: 'acme/widget', surface: 'discord'})
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  // ── FIX 8: Observability — debug log on lookup miss ──────────────────────
+
+  describe('observability: debug log on lookup miss (FIX 8)', () => {
+    it('logs debug with runId (not repo) when fallback scan finds nothing', async () => {
+      // #given — run does not exist anywhere
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+      const findRunsForRepo = vi.fn(async () => [])
+      const logger = makeLogger()
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when
+      await index.lookup('run-miss-debug')
+
+      // #then — debug was called with the runId
+      const debugCalls = (logger.debug as ReturnType<typeof vi.fn>).mock.calls
+      const missCall = debugCalls.find(
+        (call: unknown[]) => typeof call[1] === 'string' && call[1].includes('not found'),
+      )
+      expect(missCall).toBeDefined()
+      // The context object must contain the runId
+      const ctx = missCall?.[0] as Record<string, unknown>
+      expect(ctx.runId).toBe('run-miss-debug')
+      // Must NOT contain repo identity (no oracle)
+      expect(Object.keys(ctx)).not.toContain('repo')
     })
   })
 })

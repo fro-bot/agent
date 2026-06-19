@@ -7,14 +7,32 @@
  *      scan pattern (listBindings → per-repo run-state read) so a live run is
  *      never lost to eviction.
  *
+ * Accelerator sizing: DEFAULT_CAP=500 entries / DEFAULT_TTL_MS=30 min.
+ * Sized for a single-operator deployment where concurrent active runs are
+ * well below 500 and 30 min covers the typical run lifetime.
+ *
  * P0 correctness guarantee: eviction from the accelerator NEVER causes `undefined`
- * for a run whose run-state still exists in durable storage. The accelerator is an
- * optimization; the canonical fallback is the correctness guarantee.
+ * for a run whose run-state still exists in durable storage AND whose channel
+ * binding still exists. The accelerator is an optimization; the canonical fallback
+ * is the correctness guarantee.
+ *
+ * Binding-removal staleness is ACCEPTABLE by design: the canonical fallback
+ * resolves a run only while its channel binding still exists. Once a channel is
+ * unbound, its runs are intentionally NOT operator-observable — the binding is
+ * the authorization anchor. No binding means no repo-access path, so an unbound
+ * run has no authz path anyway. The P0 invariant is therefore: evicted-but-live
+ * AND still-bound always resolves.
  *
  * Resolution contract: `lookup(runId)` returns `{repo, surface}` for any run with
- * durable run-state, or `undefined` only when no run-state exists anywhere. A caller
- * that receives `undefined` maps it to a generic not-found/not-authorized response —
+ * durable run-state and a live binding, or `undefined` otherwise. A caller that
+ * receives `undefined` maps it to a generic not-found/not-authorized response —
  * this index is NOT a run-existence oracle.
+ *
+ * Fallback note: the per-repo scan mirrors the recovery.ts scan pattern
+ * (listBindings → per-repo run-state read). Both use the shared
+ * getRunPrefix/parseRunState from @fro-bot/runtime, which bounds drift risk.
+ * If the run-state key/scan format changes in @fro-bot/runtime, both paths
+ * are updated together.
  */
 
 import type {CoordinationConfig, RunState, Surface} from '@fro-bot/runtime'
@@ -56,7 +74,13 @@ export interface RunIndex {
    * 1. Accelerator hit → return immediately.
    * 2. Miss → canonical fallback: scan all bound repos via durable run-state.
    *    Cache the result back into the accelerator.
-   * 3. Return `undefined` only when no run-state exists anywhere.
+   * 3. Return `undefined` only when no run-state exists anywhere (or the
+   *    fallback scan times out — treated as not-found, not an error).
+   *
+   * getOperatorToken re-auth contract (deferred to 4b): a 4b route calls
+   * get() to confirm the session is valid, then getOperatorToken(). A valid
+   * session with undefined token means re-auth is needed (distinct from
+   * no-session). The typed re-auth result shape is designed with the 4b consumer.
    */
   lookup: (runId: string) => Promise<RunLocation | undefined>
 }
@@ -65,11 +89,31 @@ export interface RunIndex {
 // Deps
 // ---------------------------------------------------------------------------
 
-/** Default accelerator cap (entries). */
+/** Default accelerator cap (entries). Sized for single-operator deployment. */
 const DEFAULT_CAP = 500
 
-/** Default accelerator TTL (30 minutes). */
+/** Default accelerator TTL (30 minutes). Covers typical run lifetime. */
 const DEFAULT_TTL_MS = 30 * 60 * 1000
+
+/**
+ * Timeout for the canonical fallback scan (listBindings + per-repo reads).
+ * A slow/hanging S3 would stall lookup() and block the SSE subscribe route.
+ * On timeout → treat as "not resolved via fallback" and return undefined
+ * (fail-safe: a route getting undefined denies; better than hanging).
+ */
+const RUN_INDEX_FALLBACK_TIMEOUT_MS = 8_000
+
+/**
+ * Negative cache TTL: a runId that resolved to "not found" via fallback is
+ * remembered for this duration so repeated misses don't re-scan within the window.
+ */
+const NEGATIVE_CACHE_TTL_MS = 60_000
+
+/**
+ * Negative cache cap: bounded to prevent unbounded growth from unknown runId floods.
+ * Oldest entry is evicted when the cap is reached (same pattern as the accelerator).
+ */
+const NEGATIVE_CACHE_CAP = 200
 
 export interface RunIndexDeps {
   readonly bindingsStore: BindingsStore
@@ -93,6 +137,11 @@ export interface RunIndexDeps {
    * continues to the next repo.
    */
   readonly findRunsForRepo?: (repo: string) => Promise<readonly RunState[]>
+  /**
+   * Fallback scan timeout in milliseconds. Defaults to RUN_INDEX_FALLBACK_TIMEOUT_MS (8s).
+   * Injectable for tests.
+   */
+  readonly fallbackTimeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +151,15 @@ export interface RunIndexDeps {
 interface AcceleratorEntry {
   readonly repo: string
   readonly surface: Surface
+  readonly startedAt: string
+  readonly expiresAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Internal negative cache entry
+// ---------------------------------------------------------------------------
+
+interface NegativeCacheEntry {
   readonly expiresAt: number
 }
 
@@ -171,9 +229,19 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
   const cap = deps.cap ?? DEFAULT_CAP
   const ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS
   const now = deps.now ?? (() => Date.now())
+  const fallbackTimeoutMs = deps.fallbackTimeoutMs ?? RUN_INDEX_FALLBACK_TIMEOUT_MS
 
   // Insertion-ordered map: oldest entry is first (Map preserves insertion order).
   const accelerator = new Map<string, AcceleratorEntry>()
+
+  // Negative cache: runIds confirmed "not found" via fallback, bounded by cap + TTL.
+  // Prevents repeated full scans for unknown runIds (S3 amplification mitigation).
+  // Security: still returns undefined — no oracle leak; just avoids redundant scans.
+  const negativeCache = new Map<string, NegativeCacheEntry>()
+
+  // Inflight fallback dedup: if a scan for a given runId is already in flight,
+  // concurrent lookups for the same runId await the same promise (mirrors denylist.ts pattern).
+  const inflightFallbacks = new Map<string, Promise<RunLocation | undefined>>()
 
   // ---------------------------------------------------------------------------
   // register
@@ -194,15 +262,46 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
     accelerator.set(runId, {
       repo: entry.repo,
       surface: entry.surface,
+      startedAt: entry.startedAt,
       expiresAt: now() + ttlMs,
     })
+
+    // A newly registered runId is known-good — remove from negative cache if present.
+    negativeCache.delete(runId)
   }
 
   // ---------------------------------------------------------------------------
-  // Canonical fallback
+  // Negative cache helpers
   // ---------------------------------------------------------------------------
 
-  async function fallbackLookup(runId: string): Promise<RunLocation | undefined> {
+  function isNegativelyCached(runId: string): boolean {
+    const entry = negativeCache.get(runId)
+    if (entry === undefined) return false
+    if (now() >= entry.expiresAt) {
+      // Expired — evict and treat as not cached.
+      negativeCache.delete(runId)
+      return false
+    }
+    return true
+  }
+
+  function addToNegativeCache(runId: string): void {
+    // Evict oldest when at cap.
+    if (negativeCache.size >= NEGATIVE_CACHE_CAP) {
+      const oldestKey = negativeCache.keys().next().value
+      if (oldestKey !== undefined) {
+        negativeCache.delete(oldestKey)
+      }
+    }
+    negativeCache.delete(runId)
+    negativeCache.set(runId, {expiresAt: now() + NEGATIVE_CACHE_TTL_MS})
+  }
+
+  // ---------------------------------------------------------------------------
+  // Canonical fallback (with timeout + negative cache + inflight dedup)
+  // ---------------------------------------------------------------------------
+
+  async function doFallbackScan(runId: string): Promise<RunLocation | undefined> {
     // Enumerate all bound repos.
     const bindingsResult = await bindingsStore.listBindings()
     if (bindingsResult.success === false) {
@@ -242,7 +341,39 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
       }
     }
 
+    // Not found in any bound repo — add to negative cache to avoid re-scanning.
+    addToNegativeCache(runId)
+    logger.debug({runId}, 'run-index: fallback scan complete — runId not found in any bound repo')
     return undefined
+  }
+
+  async function fallbackLookup(runId: string): Promise<RunLocation | undefined> {
+    // Negative cache hit: skip the scan entirely.
+    if (isNegativelyCached(runId)) {
+      return undefined
+    }
+
+    // Inflight dedup: if a scan for this runId is already in flight, await it.
+    const existing = inflightFallbacks.get(runId)
+    if (existing !== undefined) {
+      return existing
+    }
+
+    // Start a new scan, bounded by the fallback timeout.
+    // On timeout → return undefined (fail-safe: deny is better than hanging).
+    const scanPromise = Promise.race([
+      doFallbackScan(runId),
+      new Promise<undefined>(resolve => {
+        setTimeout(() => {
+          resolve(undefined)
+        }, fallbackTimeoutMs)
+      }),
+    ]).finally(() => {
+      inflightFallbacks.delete(runId)
+    })
+
+    inflightFallbacks.set(runId, scanPromise)
+    return scanPromise
   }
 
   // ---------------------------------------------------------------------------
@@ -250,19 +381,19 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
   // ---------------------------------------------------------------------------
 
   async function lookup(runId: string): Promise<RunLocation | undefined> {
-    // #given — check the accelerator first
+    // Check the accelerator first.
     const cached = accelerator.get(runId)
     if (cached !== undefined) {
-      // #when — check TTL
+      // Check TTL.
       if (now() < cached.expiresAt) {
-        // #then — accelerator hit
+        // Accelerator hit — return immediately.
         return {repo: cached.repo, surface: cached.surface}
       }
       // Expired — evict and fall through to canonical fallback.
       accelerator.delete(runId)
     }
 
-    // #when — accelerator miss or expired → canonical fallback
+    // Accelerator miss or expired → canonical fallback.
     return fallbackLookup(runId)
   }
 
