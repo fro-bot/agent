@@ -17,6 +17,8 @@
 export type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'
+export {parseOperatorCsrfToken, parseOperatorError, parseOperatorOk, parseOperatorSessionInfo} from './parse.js'
+export type {OperatorCsrfToken, OperatorError, OperatorOk, OperatorSessionInfo} from './responses.js'
 export type {OperatorRunStatus, OperatorWebStatus, RunPhase, Surface} from './run-status.js'
 export {toOperatorRunStatus} from './run-status.js'
 export {OPERATOR_CONTRACT_VERSION} from './version.js'

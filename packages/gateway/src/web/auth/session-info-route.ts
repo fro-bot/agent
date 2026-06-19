@@ -22,6 +22,7 @@
  */
 
 import type {Hono} from 'hono'
+import type {OperatorSessionInfo} from '../../operator-contract/responses.js'
 import type {BrowserGuardDeps} from './csrf.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
@@ -78,13 +79,12 @@ export function buildSessionInfoRoute(app: Hono, deps: BrowserGuardDeps): void {
     // serve a cached response to a different origin or fetch context.
     c.header('Vary', 'Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest')
 
-    return c.json(
-      {
-        operatorId: entry.githubUserId,
-        login: entry.login,
-        expiresAt,
-      },
-      200,
-    )
+    const responseBody: OperatorSessionInfo = {
+      operatorId: entry.githubUserId,
+      login: entry.login,
+      expiresAt,
+    }
+
+    return c.json(responseBody, 200)
   })
 }
