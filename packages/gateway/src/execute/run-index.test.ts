@@ -432,6 +432,29 @@ describe('createRunIndex', () => {
       expect(result).toBeUndefined()
     })
 
+    it('fails safe to undefined when listBindings rejects (unexpected throw)', async () => {
+      // #given — listBindings rejects with an unexpected error (not a Result failure)
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockRejectedValue(new Error('unexpected network crash')),
+      }
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+      })
+
+      // #when — lookup must not propagate the rejection
+      const result = await index.lookup('run-any-rejection')
+
+      // #then — graceful degradation; caller sees undefined, not a thrown error
+      expect(result).toBeUndefined()
+    })
+
     it('continues scanning other repos when one repo scan fails', async () => {
       // #given — first repo scan throws, second has the run
       const runsByRepo = new Map<string, RunState[]>([
@@ -540,6 +563,68 @@ describe('createRunIndex', () => {
       // #then — returns undefined (not a hang)
       expect(result).toBeUndefined()
       expect(elapsed).toBeLessThan(1_000)
+    })
+  })
+
+  // ── FIX A/B: Timeout does NOT populate negative cache ────────────────────
+
+  describe('timed-out fallback scan is not added to negative cache', () => {
+    it('a subsequent lookup after a timeout triggers a new scan (not served from negative cache)', async () => {
+      // #given — listBindings resolves immediately; findRunsForRepo hangs on the
+      // first call then resolves on the second, so we can observe the re-scan.
+      const bindingsStore: BindingsStore = {
+        createBinding: vi.fn(),
+        getBindingByRepo: vi.fn(),
+        getBindingByChannelId: vi.fn(),
+        listBindings: vi.fn().mockResolvedValue({
+          success: true,
+          data: [makeBinding('acme', 'widget')],
+        }),
+      }
+
+      let callCount = 0
+      // First call hangs (simulates a slow S3 that causes the timeout to fire).
+      // Second call resolves immediately with the run (simulates recovery).
+      const findRunsForRepo = vi.fn(async (repo: string): Promise<RunState[]> => {
+        callCount++
+        if (callCount === 1) {
+          // Never resolves — the timeout races it and wins.
+          return new Promise<RunState[]>(() => {
+            /* intentionally never resolves */
+          })
+        }
+        // Second call: return the run so we can confirm a new scan was triggered.
+        return [makeRunState('run-timeout-rescan', repo, 'discord')]
+      })
+
+      const index = createRunIndex({
+        bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: makeLogger(),
+        now,
+        findRunsForRepo,
+        // Very short timeout so the first scan times out quickly.
+        fallbackTimeoutMs: 30,
+      })
+
+      // #when — first lookup times out → returns undefined
+      const first = await index.lookup('run-timeout-rescan')
+
+      // #then — timed-out result is undefined (fail-safe)
+      expect(first).toBeUndefined()
+      // The first scan was started (callCount incremented)
+      expect(callCount).toBeGreaterThanOrEqual(1)
+
+      // #when — second lookup for the same runId; if timeout had populated the
+      // negative cache, this would return undefined without calling findRunsForRepo again.
+      // It must NOT be served from the negative cache — a new scan must fire.
+      const second = await index.lookup('run-timeout-rescan')
+
+      // #then — second lookup triggered a new scan and found the run
+      expect(second).toEqual({repo: 'acme/widget', surface: 'discord'})
+      // findRunsForRepo was called at least twice (once for the hung scan, once for the re-scan)
+      expect(findRunsForRepo).toHaveBeenCalledTimes(2)
     })
   })
 

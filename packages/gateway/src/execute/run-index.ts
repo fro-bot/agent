@@ -303,7 +303,20 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
 
   async function doFallbackScan(runId: string): Promise<RunLocation | undefined> {
     // Enumerate all bound repos.
-    const bindingsResult = await bindingsStore.listBindings()
+    // listBindings is contractually Result-returning (never throws), but we wrap
+    // defensively so any unexpected rejection fails safe to undefined rather than
+    // propagating to the caller (belt-and-suspenders: every other fallback path
+    // already returns undefined on error).
+    let bindingsResult: Awaited<ReturnType<typeof bindingsStore.listBindings>>
+    try {
+      bindingsResult = await bindingsStore.listBindings()
+    } catch (error: unknown) {
+      logger.warn(
+        {err: error instanceof Error ? error.message : String(error)},
+        'run-index: listBindings threw unexpectedly — cannot resolve via fallback',
+      )
+      return undefined
+    }
     if (bindingsResult.success === false) {
       logger.warn({err: bindingsResult.error.message}, 'run-index: listBindings failed — cannot resolve via fallback')
       return undefined
