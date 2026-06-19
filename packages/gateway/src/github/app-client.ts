@@ -77,6 +77,14 @@ export interface AppClientAuthResult {
   readonly token: string
 }
 
+/** The repo's immutable GitHub identity, captured at ingest for deny-key matching. */
+export interface RepoIdentity {
+  /** GitHub numeric repository id (database_id). Stable across rename/transfer. */
+  readonly databaseId: number
+  /** GitHub node_id string for the repository. */
+  readonly nodeId: string
+}
+
 export interface AppClient {
   /**
    * Return an authenticated Octokit instance for the given repository.
@@ -92,6 +100,21 @@ export interface AppClient {
     owner: string,
     repo: string,
   ) => Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>>
+
+  /**
+   * Fetch the repo's immutable numeric id and node_id via GET /repos/{owner}/{repo}.
+   *
+   * Uses the authenticated octokit from authForRepo — no extra auth round-trip.
+   * Call this during the add-project ingest flow where a legitimate repo query
+   * already happens. Do NOT call at run-creation or surface time.
+   *
+   * Returns the stable numeric `databaseId` (immutable across rename/transfer)
+   * and the `nodeId` string for use as deny keys in the redaction gate.
+   */
+  readonly getRepoIdentity: (
+    owner: string,
+    repo: string,
+  ) => Promise<Result<RepoIdentity, AppNotInstalledError | AuthError>>
 
   /**
    * Evict the cached installation ID for the given (owner, repo) pair.
@@ -212,11 +235,45 @@ export function createAppClient(options: AppClientOptions): AppClient {
     }
   }
 
+  async function getRepoIdentity(
+    owner: string,
+    repo: string,
+  ): Promise<Result<RepoIdentity, AppNotInstalledError | AuthError>> {
+    // Authenticate via the existing flow — reuses the cached installation ID when available.
+    const authResult = await authForRepo(owner, repo)
+    if (authResult.success === false) {
+      // Propagate auth errors (AppNotInstalledError, InsufficientPermissionsError, AuthError).
+      // InsufficientPermissionsError is not in our return type but extends Error — wrap it.
+      const error = authResult.error
+      if (error instanceof AppNotInstalledError) {
+        return err(error)
+      }
+      return err(new AuthError(safeErrorMessage(error)))
+    }
+
+    const {octokit} = authResult.data
+
+    // Issue GET /repos/{owner}/{repo} to capture the immutable numeric id and node_id.
+    // This is the only correct endpoint for repo identity — GET /repos/{owner}/{repo}/installation
+    // returns only installation id + permissions, NOT repo identity.
+    try {
+      const response = await octokit.request('GET /repos/{owner}/{repo}', {owner, repo})
+
+      const {id, node_id: nodeId} = response.data
+      return ok({databaseId: id, nodeId})
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return err(new AppNotInstalledError(owner, repo, installUrl))
+      }
+      return err(new AuthError(safeErrorMessage(error)))
+    }
+  }
+
   function invalidateCache(owner: string, repo: string): void {
     installationCache.delete(cacheKey(owner, repo))
   }
 
-  return {authForRepo, invalidateCache}
+  return {authForRepo, getRepoIdentity, invalidateCache}
 }
 
 // ---------------------------------------------------------------------------

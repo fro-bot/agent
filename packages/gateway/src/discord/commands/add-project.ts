@@ -404,6 +404,26 @@ async function runAddProjectPhases(
   }
 
   const {token} = authResult.data
+
+  // Capture the repo's immutable numeric id and node_id for the redaction deny-key gate.
+  // Folds into the existing auth flow — getRepoIdentity reuses the cached installation id,
+  // so this is not a new auth round-trip.
+  // Failure is non-fatal: the binding is written without deny keys (fails closed at the gate later).
+  let databaseId: number | undefined
+  let nodeId: string | undefined
+  const identityResult = await appClient.getRepoIdentity(owner, repo)
+  if (identityResult.success === false) {
+    logger.warn('add-project: repo identity capture failed; binding will lack deny keys', {
+      correlationId,
+      phase,
+      owner,
+      repo,
+    })
+  } else {
+    databaseId = identityResult.data.databaseId
+    nodeId = identityResult.data.nodeId
+  }
+
   logger.info('add-project phase', {correlationId, phase, outcome: 'success', durationMs: Date.now() - startTime})
 
   // ---------------------------------------------------------------------------
@@ -648,6 +668,9 @@ async function runAddProjectPhases(
     workspacePath,
     createdAt: new Date().toISOString(),
     createdByDiscordId: interaction.user.id,
+    // Deny keys for the redaction gate — captured at ingest, absent on failure (fails closed later).
+    ...(databaseId === undefined ? {} : {databaseId}),
+    ...(nodeId === undefined ? {} : {nodeId}),
   }
 
   const bindingResult = await bindingsStore.createBinding(binding)

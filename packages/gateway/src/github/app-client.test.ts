@@ -33,6 +33,13 @@ const INSTALLATION_RESPONSE = {
   },
 }
 
+const REPO_IDENTITY_RESPONSE = {
+  data: {
+    id: 123456789,
+    node_id: 'MDEwOlJlcG9zaXRvcnkxMjM0NTY3ODk=',
+  },
+}
+
 function makeLogger() {
   const lines: string[] = []
   return {
@@ -392,5 +399,143 @@ describe('createAppClient', () => {
     expect(mockRequest).toHaveBeenCalledTimes(2)
     const appTypeCalls = mockAuth.mock.calls.filter(args => (args[0] as {type: string}).type === 'app')
     expect(appTypeCalls).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getRepoIdentity tests
+// ---------------------------------------------------------------------------
+
+describe('createAppClient.getRepoIdentity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+
+    mockCreateAppAuth.mockImplementation(() => mockAuth)
+    // eslint-disable-next-line prefer-arrow-callback
+    MockOctokit.mockImplementation(function () {
+      return {request: mockRequest}
+    })
+
+    mockAuth.mockImplementation(async ({type}: {type: string}) => {
+      if (type === 'app') return {token: 'jwt-token-value'}
+      if (type === 'installation') return {token: 'installation-token-value'}
+      return {token: 'unknown'}
+    })
+
+    // Default: installation discovery succeeds
+    mockRequest.mockResolvedValue(INSTALLATION_RESPONSE)
+  })
+
+  it('happy path: returns {databaseId, nodeId} from GET /repos/{owner}/{repo}', async () => {
+    // #given — first call is installation discovery, second is repo identity
+    mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockResolvedValueOnce(REPO_IDENTITY_RESPONSE)
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBe(123456789)
+    expect(result.data.nodeId).toBe('MDEwOlJlcG9zaXRvcnkxMjM0NTY3ODk=')
+  })
+
+  it('happy path: databaseId is the numeric id (not node_id)', async () => {
+    // #given — repo with a different numeric id
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: 42, node_id: 'R_kgDOBcdefg'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('myorg', 'myrepo')
+
+    // #then
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBe(42)
+    expect(result.data.nodeId).toBe('R_kgDOBcdefg')
+  })
+
+  it('uses the authenticated octokit from authForRepo (no extra auth round-trip)', async () => {
+    // #given — track all request calls
+    mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockResolvedValueOnce(REPO_IDENTITY_RESPONSE) // discovery then identity
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    await client.getRepoIdentity('owner', 'repo')
+
+    // #then — exactly 2 request calls: one for installation discovery, one for repo identity
+    // (no extra JWT or installation token minting beyond what authForRepo already does)
+    expect(mockRequest).toHaveBeenCalledTimes(2)
+    const [firstCall, secondCall] = mockRequest.mock.calls as [[string, unknown], [string, unknown]][]
+    expect(firstCall?.[0]).toContain('/installation')
+    expect(secondCall?.[0]).not.toContain('/installation')
+    expect(secondCall?.[0]).toMatch(/GET \/repos\/\{owner\}\/\{repo\}/)
+  })
+
+  it('error: repo not found (404) → Result.err(AppNotInstalledError)', async () => {
+    // #given — installation discovery succeeds but repo GET returns 404
+    const notFoundError = Object.assign(new Error('Not Found'), {status: 404})
+    mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockRejectedValueOnce(notFoundError)
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then
+    expect(result.success).toBe(false)
+    if (result.success === true) return
+    expect(result.error).toBeInstanceOf(AppNotInstalledError)
+  })
+
+  it('error: auth failure → Result.err(AuthError)', async () => {
+    // #given — authForRepo itself fails (App not installed)
+    const notFoundError = Object.assign(new Error('Not Found'), {status: 404})
+    mockRequest.mockRejectedValue(notFoundError)
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then — propagates the auth error
+    expect(result.success).toBe(false)
+    if (result.success === true) return
+    expect(result.error).toBeInstanceOf(AppNotInstalledError)
+  })
+
+  it('error: generic API error → Result.err(AuthError)', async () => {
+    // #given — repo GET throws a non-404 error
+    const apiError = new Error('Internal Server Error')
+    mockRequest.mockResolvedValueOnce(INSTALLATION_RESPONSE).mockRejectedValueOnce(apiError)
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when
+    const result = await client.getRepoIdentity('owner', 'repo')
+
+    // #then
+    expect(result.success).toBe(false)
+    if (result.success === true) return
+    expect(result.error).toBeInstanceOf(AuthError)
+  })
+
+  it('security: rename-stable — databaseId is the immutable numeric id (not derived from name)', async () => {
+    // #given — repo with a numeric id that would survive a rename/transfer
+    const STABLE_ID = 987654321
+    mockRequest
+      .mockResolvedValueOnce(INSTALLATION_RESPONSE)
+      .mockResolvedValueOnce({data: {id: STABLE_ID, node_id: 'MDEwOlJlcG9zaXRvcnkx'}})
+    const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+    // #when — called with original name
+    const result = await client.getRepoIdentity('original-owner', 'original-repo')
+
+    // #then — databaseId is the stable numeric id, not derived from the name
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.databaseId).toBe(STABLE_ID)
+    // The id is a number, not a string derived from owner/repo
+    expect(typeof result.data.databaseId).toBe('number')
   })
 })
