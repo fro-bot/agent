@@ -87,6 +87,14 @@ export interface DenylistCache {
 export function createDenylistCache(options: DenylistCacheOptions): DenylistCache {
   const {reader, ttlMs, graceMs, now, logger} = options
 
+  // The grace window must exceed the refresh interval, otherwise a single
+  // transient refresh failure jumps straight to deny-all with no retry attempt
+  // inside the window. Enforcing this at construction makes the misconfiguration
+  // unrepresentable rather than a silent availability foot-gun.
+  if (ttlMs >= graceMs) {
+    throw new Error(`Denylist cache requires ttlMs (${ttlMs}) < graceMs (${graceMs})`)
+  }
+
   // State
   let lastGoodDenylist: RepoDenylist | null = null
   let lastGoodAt: number | null = null

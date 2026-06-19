@@ -98,6 +98,29 @@ const GRACE_MS = 3000
 // isRepoDenied — match semantics (after a successful load)
 // ---------------------------------------------------------------------------
 
+describe('createDenylistCache — construction guard', () => {
+  it('throws when ttlMs >= graceMs (would skip retries within the grace window)', () => {
+    // #given/when/then — equal and greater both rejected so a misconfiguration
+    // cannot silently jump straight to deny-all on a single transient failure.
+    const deps = {reader: fakeOkReader(DENYLIST_YAML), now: () => 0, logger: makeLogger()}
+    expect(() => createDenylistCache({...deps, ttlMs: 3000, graceMs: 3000})).toThrow(/ttlMs/)
+    expect(() => createDenylistCache({...deps, ttlMs: 5000, graceMs: 3000})).toThrow(/ttlMs/)
+  })
+
+  it('accepts ttlMs < graceMs', () => {
+    // #given/when/then — the valid configuration constructs without throwing
+    expect(() =>
+      createDenylistCache({
+        reader: fakeOkReader(DENYLIST_YAML),
+        ttlMs: TTL_MS,
+        graceMs: GRACE_MS,
+        now: () => 0,
+        logger: makeLogger(),
+      }),
+    ).not.toThrow()
+  })
+})
+
 describe('isRepoDenied — match semantics', () => {
   it('denies a repoKey whose databaseId is in the denylist', async () => {
     // #given — cache loaded with a denylist containing REDACTED_DB_ID
