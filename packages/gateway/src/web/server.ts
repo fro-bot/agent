@@ -350,6 +350,10 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // session ID) so that a single authenticated user cannot exhaust the
   // unauthenticated burst budget.
   //
+  // Exception: authenticated long-lived streaming routes (e.g. the run-stream route)
+  // use the per-operator stream-slot cap (gate 7, keyed on numeric githubUserId) for
+  // backpressure instead of the socket-keyed rateLimiter — stronger keying for that case.
+  //
   // Failure to call rateLimiter.allow() in a new route is a security defect.
   // The ingress-pin test (http/ingress-pin.test.ts) will catch any new route
   // added without updating the pinned inventory — use that as the review gate.

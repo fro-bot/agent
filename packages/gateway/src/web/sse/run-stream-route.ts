@@ -322,13 +322,16 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
       }
 
       // ── Gate 4: Split owner/repo ───────────────────────────────────────────
-      const slashIdx = location.repo.indexOf('/')
+      // Strip any trailing `#...` suffix (e.g. `#runNumber`) before splitting so
+      // future entity_ref formats with a fragment do not bleed into the repo name.
+      const repoPath = location.repo.split('#')[0] ?? location.repo
+      const slashIdx = repoPath.indexOf('/')
       if (slashIdx === -1) {
         deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'run-stream: denied')
         return notFoundResponse(c)
       }
-      owner = location.repo.slice(0, slashIdx)
-      repo = location.repo.slice(slashIdx + 1)
+      owner = repoPath.slice(0, slashIdx)
+      repo = repoPath.slice(slashIdx + 1)
       if (owner.length === 0 || repo.length === 0) {
         deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'run-stream: denied')
         return notFoundResponse(c)

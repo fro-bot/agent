@@ -374,6 +374,62 @@ describe('GET /operator/runs/:runId/stream — server-owned repo resolution', ()
 })
 
 // ---------------------------------------------------------------------------
+// NBC-4: #-suffix strip — fragment in location.repo must not bleed into repo name
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — #-suffix strip in resolved repo', () => {
+  it('strips a trailing #runNumber from location.repo before resolving owner/repo', async () => {
+    // #given — runIndex returns a repo string with a #-suffix fragment
+    const runIndex = makeRunIndex('owner/repo#42')
+    const bindingsLookup = makeBindingsLookup(42, 'node-id-1')
+    const deps = makeDeps({runIndex, bindingsLookup})
+    const app = buildTestApp(deps)
+
+    // #when
+    await fetchStream(app, 'run-abc')
+
+    // #then — downstream calls use 'repo', not 'repo#42'
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledWith('owner', 'repo')
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalledWith('owner', 'repo#42')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Security: 429 over-cap path — no SSE frame written, no stream entered
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — 429 over-cap: no SSE frame emitted', () => {
+  it('returns 429 with no ready frame and no data frame when the per-operator cap is exceeded', async () => {
+    // #given — cap of 1; first stream holds the slot open
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+    const deps = makeDeps({manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    // First request acquires the slot; do not await the body so the stream stays open
+    const res1Promise = fetchStream(app, 'run-abc')
+    await new Promise<void>(resolve => setTimeout(resolve, 10))
+
+    // #when — second request from the same operator (same githubUserId=99)
+    const res2 = await fetchStream(app, 'run-def')
+
+    // #then — 429 response; subscribe was never called for the second request
+    expect(res2.status).toBe(429)
+    const body2 = await res2.json()
+    expect(body2).toEqual({error: 'rate limited'})
+    // subscribe called exactly once (only for the first, slot-holding request)
+    expect(manager.subscribe).toHaveBeenCalledTimes(1)
+    // response is not text/event-stream — no SSE stream was entered
+    const contentType = res2.headers.get('content-type') ?? ''
+    expect(contentType).not.toContain('text/event-stream')
+
+    const res1 = await res1Promise
+    await res1.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Security: denylisted repo → not-found, checkRepoAuthz NOT reached
 // ---------------------------------------------------------------------------
 
