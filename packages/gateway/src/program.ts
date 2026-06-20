@@ -225,9 +225,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     // Run-observation manager: projects run states and fans them to SSE subscribers.
     // It is fed by the run lifecycle hook and holds a latest-status cache per active run.
     // No HTTP route consumes it yet, so nothing subscribes.
+    const DENYLIST_TTL_MS = 5 * 60_000 // 5-minute TTL — also used as the background refresh cadence
     const denylistCache = createDenylistCache({
       reader: createAppClientMetadataReader(appClient),
-      ttlMs: 5 * 60_000, // 5-minute TTL
+      ttlMs: DENYLIST_TTL_MS,
       graceMs: 30 * 60_000, // 30-minute grace window
       now: () => Date.now(),
       logger,
@@ -248,6 +249,31 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       clearTimeout: id => clearTimeout(id),
       now: () => Date.now(),
     })
+
+    // Prime the denylist cache once at startup so isRepoDenied reads primed state
+    // rather than deny-all. A prime failure is logged but must not crash startup —
+    // the cache stays fail-closed (deny-all) until a later refresh succeeds.
+    yield* Effect.tryPromise({
+      try: async () => {
+        try {
+          await denylistCache.getDenylistState()
+        } catch (primeError: unknown) {
+          logger.warn(
+            {err: String(primeError)},
+            'denylist: startup prime failed — cache stays deny-all until next refresh',
+          )
+        }
+      },
+      catch: error => (error instanceof Error ? error : new Error(String(error))),
+    })
+
+    // Background refresh: keep the denylist warm on the same cadence as the TTL.
+    // Errors are logged by the cache internally; the interval catch is a final safety net.
+    const denylistRefreshInterval = setInterval(() => {
+      denylistCache.getDenylistState().catch((error: unknown) => {
+        logger.warn({err: String(error)}, 'denylist: background refresh failed')
+      })
+    }, DENYLIST_TTL_MS)
 
     // e. Register slash commands
     yield* Effect.tryPromise({
@@ -530,6 +556,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           }
 
     installShutdownHandlers(client, logger, undefined, compositeServerHandle, async () => {
+      // Stop the denylist background refresh — no new refreshes after shutdown starts.
+      clearInterval(denylistRefreshInterval)
+
+      // Shut down the run-observation manager — closes all SSE subscriptions and clears timers.
+      runObservationManager.shutdown()
+
       // Dispose pending approvals before draining runs — ensures pending permissions
       // fail-closed so in-flight runs don't hang waiting for a button that will never come.
       //

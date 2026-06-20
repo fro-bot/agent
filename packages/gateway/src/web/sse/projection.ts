@@ -70,7 +70,11 @@ export async function projectRunObservation(
   }
 
   const scopeId = scopeIdFor(runState)
-  const overlaidStatus = deps.hasPendingForScope(scopeId) === true ? 'waiting_for_approval' : base.status
+  // Only overlay waiting_for_approval when the run is actively running — a stale approval
+  // entry must not override a terminal status (succeeded/failed/cancelled) that has already
+  // been reached. The overlay is meaningless once the run has left the running state.
+  const overlaidStatus =
+    base.status === 'running' && deps.hasPendingForScope(scopeId) === true ? 'waiting_for_approval' : base.status
 
   // Copy only the contract fields; never spread runState or read its details.
   const result: OperatorRunStatus = {

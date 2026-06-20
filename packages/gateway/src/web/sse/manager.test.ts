@@ -1129,6 +1129,129 @@ describe('run isolation', () => {
   })
 })
 
+// ===========================================================================
+// 11. Error path: throwing projectFn is caught, logged, no cache/frame
+// ===========================================================================
+
+describe('error path — throwing projectRunObservation', () => {
+  it('a rejecting projectFn is caught, logged, and produces no cache entry and no frame', async () => {
+    // #given a manager whose projectRunObservation always rejects
+    const projectFn: ProjectFn = async () => {
+      throw new Error('projection exploded')
+    }
+    const warnSpy = vi.fn()
+    const {manager} = makeManager(projectFn, {
+      logger: {info: vi.fn(), warn: warnSpy, error: vi.fn(), debug: vi.fn()},
+    })
+
+    // #given a subscriber before the observe
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+    const initialFrameCount = frames.length
+
+    // #when observing with a throwing projectFn
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #then no new status frame was produced
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(0)
+
+    // #then no close was triggered (the subscriber is still open)
+    expect(closes).toHaveLength(0)
+
+    // #then the warn logger was called (error was logged)
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-001'}),
+      expect.stringContaining('projectRunObservation threw'),
+    )
+
+    // #then no cache entry was created (subscribing again gets reset)
+    const {frames: frames2} = collectFrames(manager, 'run-001')
+    await drain()
+    expect(frames2.some(f => f.type === 'reset')).toBe(true)
+    expect(frames2.some(f => f.type === 'status')).toBe(false)
+
+    // #then total frame count did not increase beyond the initial reset
+    expect(frames.length).toBe(initialFrameCount)
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 12. Post-shutdown behavior: subscribe and observe after shutdown
+// ===========================================================================
+
+describe('post-shutdown behavior', () => {
+  it('subscribe after shutdown immediately calls onClose("shutdown") and returns a no-op unsubscribe', async () => {
+    // #given a manager that has been shut down
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+    manager.shutdown()
+
+    // #when subscribing after shutdown
+    const closes: string[] = []
+    const frames: ObservationFrame[] = []
+    const unsubscribe = manager.subscribe('run-001', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    })
+    await drain()
+
+    // #then onClose is called immediately with 'shutdown'
+    expect(closes).toContain('shutdown')
+
+    // #then no frames were delivered
+    expect(frames).toHaveLength(0)
+
+    // #then the returned unsubscribe is a no-op (does not throw)
+    expect(() => unsubscribe()).not.toThrow()
+  })
+
+  it('observe after shutdown returns early — no cache entry, no frame delivered', async () => {
+    // #given a manager with a subscriber, then shut down
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus({status: 'running'})
+    const {manager} = makeManager(projectFn)
+
+    // Subscribe before shutdown to verify no frames arrive after
+    const frames: ObservationFrame[] = []
+    manager.subscribe('run-001', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: vi.fn(),
+    })
+    await drain()
+
+    manager.shutdown()
+    const frameCountAtShutdown = frames.length
+
+    // #when observing after shutdown
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #then no new frames were delivered (observe returned early)
+    expect(frames.length).toBe(frameCountAtShutdown)
+
+    // #then no cache entry was created (a new subscribe gets reset)
+    const frames2: ObservationFrame[] = []
+    manager.subscribe('run-001', {
+      onEvent: frame => {
+        frames2.push(frame)
+      },
+      onClose: vi.fn(),
+    })
+    await drain()
+    // After shutdown, subscribe immediately calls onClose — no frames expected
+    expect(frames2.filter(f => f.type === 'status')).toHaveLength(0)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Cleanup: ensure no real timers leak between tests
 // ---------------------------------------------------------------------------

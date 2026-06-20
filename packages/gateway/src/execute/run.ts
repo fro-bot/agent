@@ -394,15 +394,24 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       )
     }
 
-    // Push the initial PENDING state to the observation pipeline.
+    // Notify the observation pipeline of a run-state transition.
     // Fire-and-forget: neither a sync throw nor an async rejection must abort the run.
-    try {
-      deps.runObserver
-        ?.observe(initialRunState)
-        .catch((error: unknown) => logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed'))
-    } catch (observeError: unknown) {
-      logger.warn({repo, runId, err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
+    // Optional-chaining the .catch() ensures undefined-observer is a clean no-op (no TypeError).
+    function notifyObserver(state: import('@fro-bot/runtime').RunState): void {
+      try {
+        deps.runObserver?.observe(state)?.catch((error: unknown) => {
+          logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed')
+        })
+      } catch (observeError: unknown) {
+        logger.warn(
+          {repo, runId, err: String(observeError)},
+          'run: runObserver.observe threw — continuing (best-effort)',
+        )
+      }
     }
+
+    // Push the initial PENDING state to the observation pipeline.
+    notifyObserver(initialRunState)
 
     let runEtag = createResult.data.etag
 
@@ -424,13 +433,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     runEtag = ackResult.data.etag
 
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
-    try {
-      deps.runObserver
-        ?.observe(ackResult.data.state)
-        .catch((error: unknown) => logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed'))
-    } catch (observeError: unknown) {
-      logger.warn({repo, runId, err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
-    }
+    notifyObserver(ackResult.data.state)
 
     const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
     heartbeat.start()
@@ -455,16 +458,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       runEtag = execResult.data.etag
 
       // Push the EXECUTING state to the observation pipeline (best-effort, fire-and-forget).
-      try {
-        deps.runObserver
-          ?.observe(execResult.data.state)
-          .catch((error: unknown) => logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed'))
-      } catch (observeError: unknown) {
-        logger.warn(
-          {repo, runId, err: String(observeError)},
-          'run: runObserver.observe threw — continuing (best-effort)',
-        )
-      }
+      notifyObserver(execResult.data.state)
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
       statusSink.setReaction('working')
@@ -637,18 +631,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Non-fatal: continue to flush sink and release resources
       } else {
         // Push the COMPLETED state to the observation pipeline (best-effort, fire-and-forget).
-        try {
-          deps.runObserver
-            ?.observe(completedResult.data.state)
-            .catch((error: unknown) =>
-              logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed'),
-            )
-        } catch (observeError: unknown) {
-          logger.warn(
-            {repo, runId, err: String(observeError)},
-            'run: runObserver.observe threw — continuing (best-effort)',
-          )
-        }
+        notifyObserver(completedResult.data.state)
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
@@ -714,18 +697,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
       } else {
         // Push the FAILED state to the observation pipeline (best-effort, fire-and-forget).
-        try {
-          deps.runObserver
-            ?.observe(failedResult.data.state)
-            .catch((error: unknown) =>
-              logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed'),
-            )
-        } catch (observeError: unknown) {
-          logger.warn(
-            {repo, runId, err: String(observeError)},
-            'run: runObserver.observe threw — continuing (best-effort)',
-          )
-        }
+        notifyObserver(failedResult.data.state)
       }
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.

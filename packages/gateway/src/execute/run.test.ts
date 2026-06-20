@@ -2786,13 +2786,10 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — observe called for PENDING (createRun), ACKNOWLEDGED, EXECUTING, COMPLETED
+      // #then — observe called for PENDING (createRun), ACKNOWLEDGED, EXECUTING, COMPLETED in exact order
       expect(observeFn).toHaveBeenCalledTimes(4)
       const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
-      expect(phases).toContain('PENDING')
-      expect(phases).toContain('ACKNOWLEDGED')
-      expect(phases).toContain('EXECUTING')
-      expect(phases).toContain('COMPLETED')
+      expect(phases).toEqual(['PENDING', 'ACKNOWLEDGED', 'EXECUTING', 'COMPLETED'])
     })
 
     it('failure path: observe called with FAILED state on error', async () => {
@@ -2834,9 +2831,9 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — observe called with FAILED state
+      // #then — observe called with PENDING, ACKNOWLEDGED, EXECUTING, FAILED in exact order
       const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
-      expect(phases).toContain('FAILED')
+      expect(phases).toEqual(['PENDING', 'ACKNOWLEDGED', 'EXECUTING', 'FAILED'])
     })
 
     it('best-effort sync: observe that throws synchronously does not abort the run', async () => {

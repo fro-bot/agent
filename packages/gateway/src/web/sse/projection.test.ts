@@ -206,6 +206,53 @@ describe('projectRunObservation — waiting_for_approval overlay', () => {
     // #then blocked is never produced
     expect(result?.status).not.toBe('blocked')
   })
+
+  it('does NOT override a terminal succeeded status even when hasPendingForScope is true', async () => {
+    // #given a run that has already completed (base status = succeeded) but a stale
+    // approval entry still reports pending for the scope
+    const runState = makeRunState({phase: 'COMPLETED', surface: 'github', run_id: 'run-terminal-1'})
+    const baseStatus = makeBaseStatus({phase: 'COMPLETED', status: 'succeeded'})
+    // hasPendingForScope returns true — simulates a stale approval entry
+    const deps = makeDeps(baseStatus, () => true)
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then the terminal status is preserved — overlay does NOT apply
+    expect(result).not.toBeNull()
+    expect(result?.status).toBe('succeeded')
+    expect(result?.status).not.toBe('waiting_for_approval')
+  })
+
+  it('does NOT override a terminal failed status even when hasPendingForScope is true', async () => {
+    // #given a run that has failed (base status = failed) but a stale approval entry lingers
+    const runState = makeRunState({phase: 'FAILED', surface: 'github', run_id: 'run-terminal-2'})
+    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed'})
+    const deps = makeDeps(baseStatus, () => true)
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then the terminal status is preserved
+    expect(result).not.toBeNull()
+    expect(result?.status).toBe('failed')
+    expect(result?.status).not.toBe('waiting_for_approval')
+  })
+
+  it('does NOT override a queued status (waiting_for_approval only applies to running)', async () => {
+    // #given a run in PENDING phase (queued) with a pending approval scope
+    const runState = makeRunState({phase: 'PENDING', surface: 'github', run_id: 'run-queued-1'})
+    const baseStatus = makeBaseStatus({phase: 'PENDING', status: 'queued'})
+    const deps = makeDeps(baseStatus, () => true)
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then queued status is preserved — overlay only applies to running
+    expect(result).not.toBeNull()
+    expect(result?.status).toBe('queued')
+    expect(result?.status).not.toBe('waiting_for_approval')
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -224,7 +224,11 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // State
   // ---------------------------------------------------------------------------
 
-  /** Latest projected status per run (one frame per active run). */
+  // Latest projected status per run (one frame per active run).
+  // A run that never reaches a terminal status (e.g. because a transition fails after
+  // PENDING is observed) leaves its entry here until process restart. A future
+  // staleness/reconcile path will evict these entries; for now the leak is bounded
+  // by the number of active runs and is cleared on process restart.
   const latestStatusCache = new Map<string, OperatorRunStatus>()
 
   /** Active subscribers per run. Map<runId, Map<subId, SubscriberState>>. */
@@ -266,12 +270,17 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
     }
 
-    // Notify the caller
-    try {
-      sub.callbacks.onClose(reason)
-    } catch (error) {
-      logger.warn({subId: sub.id, runId: sub.runId, err: String(error)}, 'manager: onClose threw — ignoring')
-    }
+    // Schedule onClose via queueMicrotask so a slow or synchronous onClose callback
+    // cannot block observe() from returning. The terminal-status path calls dropSubscriber
+    // synchronously inside observe(); without this deferral, a slow onClose would hold
+    // the observe() promise open until onClose completes.
+    queueMicrotask(() => {
+      try {
+        sub.callbacks.onClose(reason)
+      } catch (error) {
+        logger.warn({subId: sub.id, runId: sub.runId, err: String(error)}, 'manager: onClose threw — ignoring')
+      }
+    })
   }
 
   // ---------------------------------------------------------------------------
@@ -328,7 +337,10 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       try {
         await sub.callbacks.onEvent(frame)
       } catch (error) {
-        // Writer failure: contain the error, drop the subscriber
+        // Writer failure: contain the error, drop the subscriber.
+        // Reset writerRunning before returning so the invariant holds even though
+        // dropSubscriber does not clear it (it only clears timers and the queue).
+        sub.writerRunning = false
         logger.warn(
           {subId: sub.id, runId: sub.runId, err: String(error)},
           'manager: onEvent threw — dropping subscriber',
