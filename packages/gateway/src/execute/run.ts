@@ -333,7 +333,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       threadId = threadResult.threadId
     }
 
-    const runId = crypto.randomUUID()
+    const runId = request.runId ?? crypto.randomUUID()
 
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
@@ -466,13 +466,20 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
       const handle = attachOpencode(attachUrl, attachToken)
-      const promptText = buildDiscordPrompt({
-        messageText: request.promptText,
-        owner: bindingWithEnsuredPath.owner,
-        repo: bindingWithEnsuredPath.repo,
-        botUserId,
-        persona,
-      })
+      const promptText =
+        request.promptBuilder === undefined
+          ? buildDiscordPrompt({
+              messageText: request.promptText,
+              owner: bindingWithEnsuredPath.owner,
+              repo: bindingWithEnsuredPath.repo,
+              botUserId,
+              persona,
+            })
+          : request.promptBuilder({
+              messageText: request.promptText,
+              owner: bindingWithEnsuredPath.owner,
+              repo: bindingWithEnsuredPath.repo,
+            })
 
       // ── Remaining budget — single origin for hard abort AND approval deadline ──
       //

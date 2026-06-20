@@ -381,6 +381,42 @@ export interface LaunchWorkRequest {
   readonly promptText: string
 
   /**
+   * Optional caller-supplied run ID.
+   *
+   * When present, the engine uses this value instead of generating its own
+   * `crypto.randomUUID()`. This allows the launch route to own the runId
+   * before work starts — registering a PENDING run-index entry and returning
+   * 202 {runId} immediately (fire-and-return).
+   *
+   * When absent (the default for Discord), the engine generates its own UUID
+   * as before — Discord behavior is unchanged.
+   *
+   * The caller is responsible for generating a valid UUID (e.g. `crypto.randomUUID()`).
+   */
+  readonly runId?: string
+
+  /**
+   * Optional injectable prompt builder.
+   *
+   * When present, the engine calls this function instead of `buildDiscordPrompt`
+   * to construct the prompt text passed to OpenCode. This allows a web launch
+   * to omit Discord-thread/persona framing (DISCORD_MECHANICAL_GUIDANCE) that
+   * is inappropriate for a web-launched run.
+   *
+   * When absent (the default for Discord), `buildDiscordPrompt` is used exactly
+   * as today — Discord behavior is unchanged.
+   *
+   * The builder receives the raw prompt text, owner, and repo. It must return
+   * a non-empty string. The engine does not validate the returned string beyond
+   * the existing empty-prompt check at the front door.
+   */
+  readonly promptBuilder?: (args: {
+    readonly messageText: string
+    readonly owner: string
+    readonly repo: string
+  }) => string
+
+  /**
    * Optional thread factory called by the engine after `ensureClone` and `readyz`
    * pass, before lock acquisition.
    *

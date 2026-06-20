@@ -120,6 +120,7 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'GET', path: '/operator/session'},
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'GET', path: '/operator/repos'},
+  {method: 'POST', path: '/operator/runs'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -223,9 +224,46 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     },
     runIndex: {
       lookup: vi.fn(async () => undefined),
+      register: vi.fn(),
     },
     // Provide listBindings so the repos route is registered in the pinned inventory.
     listBindings: vi.fn(async () => ({success: true as const, data: []})),
+    // Provide getBindingByRepo and launchWorkDeps so the launch route is registered.
+    getBindingByRepo: vi.fn(async () => ({success: true as const, data: null})),
+    launchWorkDeps: {
+      coordinationConfig: {} as import('../execute/run.js').RunMentionDeps['coordinationConfig'],
+      identity: 'stub-identity',
+      concurrency: {tryAcquire: vi.fn(() => 'ok' as const), release: vi.fn(), activeCount: vi.fn(() => 0), max: 3},
+      queue: {
+        enqueue: vi.fn(() => 'queued' as const),
+        takeNext: vi.fn(() => undefined),
+        pendingCount: vi.fn(() => 0),
+        clear: vi.fn(() => 0),
+      },
+      attachUrl: 'http://localhost:3000',
+      attachToken: 'stub-token',
+      runTimeoutMs: 600_000,
+      botUserId: 'bot-123',
+      persona: null,
+      logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
+      approvalRegistry: {
+        register: vi.fn(),
+        attachMessage: vi.fn(),
+        markMessagePostFailed: vi.fn(),
+        has: vi.fn(() => false),
+        pending: vi.fn(() => []),
+        hasPendingForScope: vi.fn(() => false),
+        handleDecision: vi.fn(async () => 'ok' as const),
+        confirmReply: vi.fn(),
+        applySettlement: vi.fn(async () => undefined),
+        disposeRun: vi.fn(async () => undefined),
+        disposeAll: vi.fn(async () => undefined),
+      },
+      approvalMode: 'approval-required' as const,
+      statusMode: 'live-status' as const,
+      ensureClone: vi.fn(async () => ({success: true as const, data: '/workspace'})),
+      readyz: vi.fn(async () => ({success: true as const, data: {ready: true as const, opencode: 'ready' as const}})),
+    },
   }
 }
 

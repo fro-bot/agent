@@ -24,6 +24,7 @@
 import type {ServerType} from '@hono/node-server'
 import type {RepoBinding} from '../bindings/types.js'
 import type {RunIndex} from '../execute/run-index.js'
+import type {RunMentionDeps} from '../execute/run.js'
 import type {DenylistCache} from '../redaction/denylist.js'
 import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
@@ -31,6 +32,7 @@ import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {IdempotencyGuard} from './operator/idempotency.js'
 import type {RunObservationManager} from './sse/manager.js'
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
@@ -44,6 +46,8 @@ import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
+import {createIdempotencyGuard} from './operator/idempotency.js'
+import {buildLaunchRoute} from './operator/launch-route.js'
 import {buildReposRoute} from './operator/repos-route.js'
 import {
   badRequestResponse,
@@ -155,10 +159,11 @@ export interface OperatorServerDeps {
   /**
    * Server-owned run index for runId → {repo, surface} resolution.
    * Required by the run-stream route to resolve a runId to its repo without
-   * trusting any client-supplied value. Optional — omit in tests that don't
-   * exercise the run-stream route.
+   * trusting any client-supplied value. The launch route uses register() to
+   * record PENDING entries before firing launchWork. Optional — omit in tests
+   * that don't exercise the run-stream or launch routes.
    */
-  readonly runIndex?: Pick<RunIndex, 'lookup'>
+  readonly runIndex?: Pick<RunIndex, 'lookup' | 'register'>
   /**
    * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
    * When absent, a fresh in-memory cache is created per buildOperatorApp call.
@@ -174,6 +179,27 @@ export interface OperatorServerDeps {
   readonly listBindings?: () => Promise<
     {readonly success: true; readonly data: RepoBinding[]} | {readonly success: false; readonly error: Error}
   >
+  /**
+   * Binding lookup for the launch route's server-owned repo resolution.
+   * When present (alongside launchWorkDeps and the browser guard), POST /operator/runs
+   * is registered. When absent, the launch route is not registered (opt-in).
+   */
+  readonly getBindingByRepo?: (
+    owner: string,
+    repo: string,
+  ) => Promise<
+    {readonly success: true; readonly data: RepoBinding | null} | {readonly success: false; readonly error: Error}
+  >
+  /**
+   * Engine dependencies for the launch route's launchWork call.
+   * Required when getBindingByRepo is present; ignored otherwise.
+   */
+  readonly launchWorkDeps?: RunMentionDeps
+  /**
+   * Per-operator idempotency guard for the launch route.
+   * When absent and the launch route is registered, a fresh in-memory guard is created.
+   */
+  readonly idempotencyGuard?: IdempotencyGuard
 }
 
 export interface OperatorServerConfig {
@@ -615,6 +641,56 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         logger: deps.logger,
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Launch route ───────────────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND getBindingByRepo
+  // and launchWorkDeps are provided.
+  // Route: POST /operator/runs — privileged (requires session + allowlist + CSRF).
+  // Returns 202 {runId} immediately (fire-and-return); operator observes via SSE.
+  //
+  // Gate ordering:
+  //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
+  //   2. Operator rate limit (3/min, 10/hr, operator-keyed)
+  //   3. Session token resolution
+  //   4. Body parse: {repo, prompt, idempotencyKey?}
+  //   5. Server-owned binding resolution via getBindingByRepo
+  //   6. Denylist check (before authz, no oracle)
+  //   7. checkRepoAuthz (allowlist + GitHub repo access)
+  //   8. Empty-prompt fail-fast
+  //   9. Per-operator idempotency guard
+  //  10. Generate runId + register PENDING in run index
+  //  11. Fire launchWork WITHOUT await → return 202 {runId}
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.getBindingByRepo !== undefined &&
+    deps.launchWorkDeps !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildLaunchRoute(app, {
+      sessionStore: deps.sessionStore,
+      bindingsLookup: {getBindingByRepo: deps.getBindingByRepo},
+      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard(),
+      runIndex: deps.runIndex ?? {register: () => undefined, lookup: async () => undefined},
+      launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
       now: clock,
     })
