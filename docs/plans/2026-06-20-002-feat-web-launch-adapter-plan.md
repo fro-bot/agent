@@ -105,7 +105,7 @@ A web operator has no Discord channel to imply the repo, so the surface must (a)
 
 ## Implementation Units
 
-- [ ] **Unit 5a: Scoped operator repo-list route (`GET /operator/repos`)**
+- [x] **Unit 5a: Scoped operator repo-list route (`GET /operator/repos`)**
 
   **Goal:** An authenticated operator can list the repos they may launch work in, scoped so they cannot enumerate unrelated repositories.
 
@@ -143,7 +143,7 @@ A web operator has no Discord channel to imply the repo, so the surface must (a)
 
   **Verification:** An operator sees only denylist-cleared repos they can actually access; the route leaks no internal binding fields; the contract version bumped additively.
 
-- [ ] **Unit 5b: Web sinks + launch route (`POST /operator/runs`)**
+- [x] **Unit 5b: Web sinks + launch route (`POST /operator/runs`)**
 
   **Goal:** An authenticated operator launches work in a chosen repo through `launchWork`, recorded as `surface: 'web'` and attributed to their GitHub identity; the route returns `202 {runId}` immediately (fire-and-return) for the operator to observe via SSE.
 

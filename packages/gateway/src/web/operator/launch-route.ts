@@ -44,6 +44,7 @@ import type {IdempotencyGuard} from './idempotency.js'
 import {randomUUID} from 'node:crypto'
 import {launchWork} from '../../execute/run.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
+import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
@@ -265,11 +266,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     }
 
     // ── Gate 6: Denylist check — BEFORE authz (no oracle, no GitHub call) ────
-    const repoKey: RepoKey = {
-      databaseId: typeof binding.databaseId === 'number' ? binding.databaseId : null,
-      nodeId: typeof binding.nodeId === 'string' ? binding.nodeId : null,
-    }
-    if (deps.isRepoDenied(repoKey) === true) {
+    if (deps.isRepoDenied(bindingToRepoKey(binding)) === true) {
       deps.logger.warn({githubUserId, gate: 'denylisted'}, 'launch: denied — repo denylisted')
       return notFoundResponse(c)
     }

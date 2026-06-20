@@ -28,7 +28,7 @@ import type {RepoKey} from '../../redaction/denylist.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
 import {toRepoSummary} from '../../operator-contract/repo-summary.js'
-import {filterDeniedRecords} from '../../redaction/surface-gate.js'
+import {bindingToRepoKey, filterDeniedRecords} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 
@@ -141,14 +141,7 @@ export function buildReposRoute(app: Hono, deps: ReposRouteDeps): void {
     // ── Gate 4: Denylist filter — BEFORE any authz call ──────────────────────
     // Denylisted repos must never reach checkRepoAuthz (no oracle, no GitHub call).
     // Extract deny keys from each binding; null/null means no usable key (fail closed).
-    const allowed = filterDeniedRecords(
-      bindings,
-      (binding: RepoBinding): RepoKey => ({
-        databaseId: typeof binding.databaseId === 'number' ? binding.databaseId : null,
-        nodeId: typeof binding.nodeId === 'string' ? binding.nodeId : null,
-      }),
-      deps.isRepoDenied,
-    )
+    const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
 
     // Apply the hard cap BEFORE authz fan-out to bound the number of GitHub calls.
     // Bindings beyond the cap are silently truncated (first MAX_REPOS_PER_LISTING).
