@@ -3,11 +3,12 @@
  *
  * Gate ordering:
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
- *   2. Resolve OAuth token via session store
- *   3. listBindings() — all bound repos
- *   4. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   5. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   6. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+ *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
+ *   3. Resolve OAuth token via session store
+ *   4. listBindings() — all bound repos
+ *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
+ *   6. checkRepoAuthz() per surviving binding — keep only authorized repos
+ *   7. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
@@ -26,6 +27,63 @@ import {describe, expect, it, vi} from 'vitest'
 import {createRepoAuthzCache} from '../auth/repo-authz.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
 import {buildReposRoute, MAX_REPOS_PER_LISTING} from './repos-route.js'
+
+// ---------------------------------------------------------------------------
+// Rate limit tests (FIX-3)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/repos — operator-keyed rate limit', () => {
+  it('returns 429 when the per-minute rate limit is exceeded', async () => {
+    // #given — rate limiter that always denies
+    const deps = makeBaseDeps({
+      perMinRateLimiter: {allow: () => false},
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then
+    expect(res.status).toBe(429)
+  })
+
+  it('rate limit is operator-keyed (keyed on githubUserId, not socket)', async () => {
+    // #given — rate limiter that records keys
+    const seenKeys: string[] = []
+    const perMinRateLimiter = {
+      allow: (key: string) => {
+        seenKeys.push(key)
+        return true
+      },
+    }
+    const deps = makeBaseDeps({perMinRateLimiter})
+    const app = buildTestApp(deps, {githubUserId: 9999, sessionId: 'sess-xyz'})
+
+    // #when
+    await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — key is the operator's githubUserId as a string
+    expect(seenKeys.length).toBeGreaterThan(0)
+    expect(seenKeys[0]).toBe('9999')
+  })
+
+  it('rate limit is checked AFTER auth context and BEFORE binding enumeration', async () => {
+    // #given — rate limiter denies; listBindings should NOT be called
+    const listBindings = vi.fn(async () => ({success: true as const, data: [] as RepoBinding[]}))
+    const deps = makeBaseDeps({
+      perMinRateLimiter: {allow: () => false},
+      listBindings,
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — 429 and listBindings was never called
+    expect(res.status).toBe(429)
+    expect(listBindings).not.toHaveBeenCalled()
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -103,8 +103,8 @@ describe('createIdempotencyGuard', () => {
   })
 
   describe('bounded store — eviction', () => {
-    it('evicts the oldest entry when the cap is reached', () => {
-      // #given — cap of 2 entries
+    it('evicts the oldest entry when the cap is reached (all live)', () => {
+      // #given — cap of 2 entries, all live
       const guard = createIdempotencyGuard({maxEntries: 2})
       guard.record(1, 'key-a', 'run-a')
       guard.record(1, 'key-b', 'run-b')
@@ -116,6 +116,40 @@ describe('createIdempotencyGuard', () => {
       expect(guard.check(1, 'key-a')).toBeUndefined()
       expect(guard.check(1, 'key-b')).toBe('run-b')
       expect(guard.check(1, 'key-c')).toBe('run-c')
+    })
+
+    it('evicts an expired entry before a live one when at capacity', () => {
+      // #given — cap of 2 entries; key-a is expired, key-b is live
+      let nowMs = 0
+      const guard = createIdempotencyGuard({maxEntries: 2, now: () => nowMs, ttlMs: 1000})
+      guard.record(1, 'key-a', 'run-a') // inserted at t=0, expires at t=1000
+      guard.record(1, 'key-b', 'run-b') // inserted at t=0, expires at t=1000
+
+      // Advance past key-a's TTL but keep key-b live by re-recording it
+      nowMs = 1001
+      guard.record(1, 'key-b', 'run-b-renewed') // update in place; expires at t=2001
+
+      // #when — insert key-c at capacity (key-a is expired, key-b is live)
+      guard.record(1, 'key-c', 'run-c')
+
+      // #then — expired key-a is evicted; live key-b survives; key-c is inserted
+      expect(guard.check(1, 'key-a')).toBeUndefined()
+      expect(guard.check(1, 'key-b')).toBe('run-b-renewed')
+      expect(guard.check(1, 'key-c')).toBe('run-c')
+    })
+
+    it('updating an existing key does not evict a different live key', () => {
+      // #given — cap of 2 entries, both live
+      const guard = createIdempotencyGuard({maxEntries: 2})
+      guard.record(1, 'key-a', 'run-a')
+      guard.record(1, 'key-b', 'run-b')
+
+      // #when — update key-a in place (not a new key)
+      guard.record(1, 'key-a', 'run-a-v2')
+
+      // #then — key-b is NOT evicted; key-a is updated
+      expect(guard.check(1, 'key-a')).toBe('run-a-v2')
+      expect(guard.check(1, 'key-b')).toBe('run-b')
     })
   })
 

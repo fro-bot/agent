@@ -7,6 +7,11 @@
  *
  * The web surface has no Discord thread, no typing indicator, and no reaction
  * emoji. All methods are no-ops or return the minimal required values.
+ *
+ * v1 limitation: web launches deliver run STATUS via the SSE stream only.
+ * Agent output text is accumulated in the ReplySink buffer but is not streamed
+ * to the operator — the web replySink is a no-op for delivery. A follow-up will
+ * wire agent output text to the SSE stream so operators can observe it in real time.
  */
 
 import type {MessageContentOptions} from '../../discord/io.js'

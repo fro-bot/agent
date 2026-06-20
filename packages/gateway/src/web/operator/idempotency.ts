@@ -10,8 +10,10 @@
  * Retention window: entries expire after IDEMPOTENCY_TTL_MS. A duplicate within
  * the window echoes the prior runId without starting a new launch.
  *
- * Bounded: the store is capped at MAX_ENTRIES. When the cap is reached, the oldest
- * entry is evicted before inserting the new one (same pattern as run-index.ts).
+ * Bounded: the store is capped at MAX_ENTRIES. When the cap is reached, expired
+ * entries are evicted first; only if still at capacity is the oldest live entry
+ * evicted (same pattern as run-index.ts). Updating an existing key never triggers
+ * capacity eviction of a different live key.
  */
 
 // ---------------------------------------------------------------------------
@@ -21,7 +23,7 @@
 /** Retention window for idempotency entries: 10 minutes. */
 export const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000
 
-/** Maximum number of idempotency entries before oldest is evicted. */
+/** Maximum number of idempotency entries before eviction. */
 export const IDEMPOTENCY_MAX_ENTRIES = 10_000
 
 // ---------------------------------------------------------------------------
@@ -47,6 +49,9 @@ export interface IdempotencyGuard {
    *
    * Call AFTER generating the runId and BEFORE firing launchWork so the
    * idempotency entry is visible to concurrent duplicate requests.
+   *
+   * If the key already exists (update-in-place), the entry is updated without
+   * triggering capacity eviction of a different live key.
    */
   readonly record: (githubUserId: number, clientKey: string, runId: string) => void
 }
@@ -58,7 +63,7 @@ export interface IdempotencyGuard {
 export interface IdempotencyGuardDeps {
   /** Injectable clock for TTL checks. Defaults to Date.now. */
   readonly now?: () => number
-  /** Maximum entries before oldest is evicted. Defaults to IDEMPOTENCY_MAX_ENTRIES. */
+  /** Maximum entries before eviction. Defaults to IDEMPOTENCY_MAX_ENTRIES. */
   readonly maxEntries?: number
   /** Entry TTL in milliseconds. Defaults to IDEMPOTENCY_TTL_MS. */
   readonly ttlMs?: number
@@ -97,7 +102,27 @@ export function createIdempotencyGuard(deps?: IdempotencyGuardDeps): Idempotency
   function record(githubUserId: number, clientKey: string, runId: string): void {
     const key = makeKey(githubUserId, clientKey)
 
-    // Evict oldest when at cap (before inserting so we never exceed cap).
+    // If the key already exists, update in place without triggering capacity eviction.
+    // Delete first so the insertion order reflects the latest registration.
+    if (store.has(key)) {
+      store.delete(key)
+      store.set(key, {runId, expiresAt: now() + ttlMs})
+      return
+    }
+
+    // New key — evict expired entries first before checking capacity.
+    if (store.size >= maxEntries) {
+      const nowMs = now()
+      for (const [k, entry] of store) {
+        if (nowMs >= entry.expiresAt) {
+          store.delete(k)
+          // Stop after evicting one expired entry — enough to make room.
+          break
+        }
+      }
+    }
+
+    // If still at capacity after expired eviction, evict the oldest live entry.
     if (store.size >= maxEntries) {
       const oldestKey = store.keys().next().value
       if (oldestKey !== undefined) {
@@ -105,9 +130,6 @@ export function createIdempotencyGuard(deps?: IdempotencyGuardDeps): Idempotency
       }
     }
 
-    // Re-inserting an existing key moves it to the end (newest). Delete first
-    // so the insertion order reflects the latest registration.
-    store.delete(key)
     store.set(key, {runId, expiresAt: now() + ttlMs})
   }
 

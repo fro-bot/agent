@@ -1,38 +1,30 @@
 /**
  * Transport-neutral types for the `launchWork` execution engine.
  *
- * ## Design contract
- *
- * `LaunchWorkRequest` carries everything the engine needs to execute a unit of
+ * Design contract: `LaunchWorkRequest` carries everything the engine needs to execute a unit of
  * work without knowing the transport. The Discord adapter (`runMention`) maps a
  * Discord `Message` → `LaunchWorkRequest`, constructs concrete `StatusSink` and
  * `ReplySink` implementations over the existing Discord live-status/typing flow,
  * and calls `launchWork`. A future web adapter will do the same with SSE or
  * WebSocket implementations.
  *
- * ## Sink contract
+ * Sink contract:
+ *   - `StatusSink` — the engine calls these methods to manage the working-state UX
+ *     (typing indicator, status message, source-message reactions). The Discord
+ *     adapter implements this by adapting `createStatusController` from
+ *     `discord/status-message.ts` and `setRunReaction` from `discord/reactions.ts`.
+ *     Do NOT reimplement `statusMode` logic — wrap the existing controller.
+ *   - `ReplySink` — the engine calls these methods to deliver output and ephemeral
+ *     acks. The Discord adapter implements this over `createDiscordStreamSink` (for
+ *     streaming output) and `sendMessage`/`io.ts` (for acks). The `send` method
+ *     accepts `MessageContentOptions` from `discord/io.ts` so the Discord
+ *     implementation needs no cast at the call site.
  *
- * - `StatusSink` — the engine calls these methods to manage the working-state UX
- *   (typing indicator, status message, source-message reactions). The Discord
- *   adapter implements this by adapting `createStatusController` from
- *   `discord/status-message.ts` and `setRunReaction` from `discord/reactions.ts`.
- *   Do NOT reimplement `statusMode` logic — wrap the existing controller.
- *
- * - `ReplySink` — the engine calls these methods to deliver output and ephemeral
- *   acks. The Discord adapter implements this over `createDiscordStreamSink` (for
- *   streaming output) and `sendMessage`/`io.ts` (for acks). The `send` method
- *   accepts `MessageContentOptions` from `discord/io.ts` so the Discord
- *   implementation needs no cast at the call site.
- *
- * ## Adding a new transport
- *
- * To add a new transport:
- * 1. Implement `StatusSink` (typing/progress/reaction equivalents for your transport).
- * 2. Implement `ReplySink` (streaming output + ack delivery for your transport).
- * 3. Construct a `LaunchWorkRequest` with a `RequesterIdentity` discriminated on
- *    `kind: 'web-operator'` (or a new variant) and call `launchWork`.
- * 4. The engine, queue, concurrency cap, lock, run-state, and approval registry
- *    are all transport-agnostic — you get them for free.
+ * Adding a new transport: implement `StatusSink` and `ReplySink` for the new
+ * surface, construct a `LaunchWorkRequest` with a `RequesterIdentity` discriminated
+ * on `kind: 'web-operator'` (or a new variant), and call `launchWork`. The engine,
+ * queue, concurrency cap, lock, run-state, and approval registry are all
+ * transport-agnostic.
  */
 
 import type {Surface} from '@fro-bot/runtime'

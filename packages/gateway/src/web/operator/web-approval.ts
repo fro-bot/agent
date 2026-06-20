@@ -16,6 +16,7 @@
 
 import type {PermissionRequest} from '../../approvals/coordinator.js'
 import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/launch-types.js'
+import type {OperatorLogger} from '../server.js'
 
 // ---------------------------------------------------------------------------
 // Web auto-deny createApprovalOnPending
@@ -32,8 +33,14 @@ import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/la
  * The deny is fire-and-forget: the callback does not await the reply POST
  * (the coordinator wraps it defensively). This ensures no lock hold and no
  * deadlock regardless of the reply POST outcome.
+ *
+ * A logger may be provided to surface failed deny POSTs at warn level.
+ * When absent, failed deny POSTs are silently swallowed (the coordinator's
+ * deadline will eventually settle the entry fail-closed).
  */
-export function createWebAutoDenyApproval(): NonNullable<LaunchWorkRequest['createApprovalOnPending']> {
+export function createWebAutoDenyApproval(
+  logger?: OperatorLogger,
+): NonNullable<LaunchWorkRequest['createApprovalOnPending']> {
   return (ctx: ApprovalTransportContext): ((request: PermissionRequest) => void) => {
     return (req: PermissionRequest): void => {
       // Auto-deny: immediately reject the permission request.
@@ -41,9 +48,13 @@ export function createWebAutoDenyApproval(): NonNullable<LaunchWorkRequest['crea
       // 'reject' is the deny reply value (OpenCode PermissionReply enum).
       const postReply = ctx.postReplyFactory(req.sessionID)
       // eslint-disable-next-line no-void
-      void postReply(req.requestID, ctx.directory, 'reject').catch(() => {
-        // Best-effort: a failed deny POST is acceptable — the coordinator's
-        // deadline will eventually settle the entry fail-closed.
+      void postReply(req.requestID, ctx.directory, 'reject').catch((error: unknown) => {
+        if (logger !== undefined) {
+          logger.warn(
+            {runId: ctx.runId, repo: ctx.repo, err: error instanceof Error ? error.message : String(error)},
+            'web-approval: auto-deny postReply failed (best-effort; coordinator deadline will settle fail-closed)',
+          )
+        }
       })
     }
   }

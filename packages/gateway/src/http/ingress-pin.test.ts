@@ -12,7 +12,7 @@
  *   2. OPERATOR surface (gateway-net only):
  *      - Bound to the operator bind host on gateway-net, NOT reachable from sandbox-net.
  *      - TLS terminated by infra reverse proxy at GATEWAY_OPERATOR_PUBLIC_ORIGIN.
- *      - Human-authenticated browser surface (auth added in Unit 3+).
+ *      - Human-authenticated browser surface (session + allowlist + CSRF guard).
  *      - No route from this surface appears in the announce surface, and vice versa.
  *
  * This test fails if either route inventory changes, forcing a deliberate security

@@ -690,6 +690,104 @@ describe('POST /operator/runs — bad request bodies', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FIX-1: idempotency commit-after-fire — entry recorded before fire, not before
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — idempotency commit-after-fire', () => {
+  it('idempotency entry is recorded AFTER runId generation (commit-after-fire ordering)', async () => {
+    // #given — track when idempotency.record is called relative to runIndex.register
+    const callOrder: string[] = []
+    const idempotencyGuard = createIdempotencyGuard()
+    const originalRecord = idempotencyGuard.record.bind(idempotencyGuard)
+    const recordSpy = vi.fn((...args: Parameters<typeof originalRecord>) => {
+      callOrder.push('idempotency.record')
+      return originalRecord(...args)
+    })
+    const runIndex = {
+      register: vi.fn((..._args: unknown[]) => {
+        callOrder.push('runIndex.register')
+      }),
+    }
+    const deps = makeDeps({
+      idempotencyGuard: {...idempotencyGuard, record: recordSpy},
+      runIndex,
+    })
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'order-key'})
+
+    // #then — 202 returned; runIndex.register called before idempotency.record
+    expect(response.status).toBe(202)
+    expect(callOrder).toEqual(['runIndex.register', 'idempotency.record'])
+  })
+
+  it('same operator + same key twice → second echoes the runId (idempotency entry survives fire)', async () => {
+    // #given — verify the idempotency entry is committed and survives the fire
+    const idempotencyGuard = createIdempotencyGuard()
+    const runIndex = {register: vi.fn()}
+    const deps = makeDeps({idempotencyGuard, runIndex})
+    const app = buildApp(deps)
+
+    // #when — first launch
+    const response1 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'fire-key'})
+    const body1 = (await response1.json()) as {runId: string}
+
+    // #when — second launch with same key
+    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'fire-key'})
+    const body2 = (await response2.json()) as {runId: string}
+
+    // #then — both 202; same runId echoed; runIndex.register called only once
+    expect(response1.status).toBe(202)
+    expect(response2.status).toBe(202)
+    expect(body1.runId).toBe(body2.runId)
+    expect(runIndex.register).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-4: array and null body rejection
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — array and null body rejection', () => {
+  it('returns 400 for an array body (typeof [] === "object" but not a plain object)', async () => {
+    // #given
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when — send an array as the body
+    const response = await app.fetch(
+      new Request('http://localhost/operator/runs', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify([{repo: 'acme/widget', prompt: 'do something'}]),
+      }),
+    )
+
+    // #then — rejected as bad request
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 400 for a null body', async () => {
+    // #given
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when — send null as the body
+    const response = await app.fetch(
+      new Request('http://localhost/operator/runs', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: 'null',
+      }),
+    )
+
+    // #then — rejected as bad request
+    expect(response.status).toBe(400)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Discord-path regression: absent seams → Discord behavior unchanged
 // ---------------------------------------------------------------------------
 

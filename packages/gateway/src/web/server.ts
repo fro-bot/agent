@@ -665,6 +665,11 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   9. Per-operator idempotency guard
   //  10. Generate runId + register PENDING in run index
   //  11. Fire launchWork WITHOUT await → return 202 {runId}
+  // The launch route requires deps.runIndex to register PENDING entries before
+  // firing launchWork. Without it, run registrations would be silently dropped,
+  // breaking the SSE observation path. Gate on runIndex being present so a
+  // misconfiguration fails loudly at startup (route not registered) rather than
+  // silently at runtime (runs not observable).
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -672,7 +677,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.getBindingByRepo !== undefined &&
     deps.launchWorkDeps !== undefined &&
     deps.allowlist !== undefined &&
-    deps.auditLogger !== undefined
+    deps.auditLogger !== undefined &&
+    deps.runIndex !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildLaunchRoute(app, {
@@ -689,7 +695,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard(),
-      runIndex: deps.runIndex ?? {register: () => undefined, lookup: async () => undefined},
+      runIndex: deps.runIndex,
       launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
       now: clock,

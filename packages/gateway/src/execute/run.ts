@@ -333,7 +333,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       threadId = threadResult.threadId
     }
 
-    const runId = request.runId ?? crypto.randomUUID()
+    const runId = request.runId !== undefined && request.runId !== '' ? request.runId : crypto.randomUUID()
 
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 

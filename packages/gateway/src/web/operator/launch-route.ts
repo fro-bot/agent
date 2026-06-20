@@ -19,7 +19,8 @@
  *   8. Empty-prompt fail-fast
  *   9. Per-operator idempotency guard (${githubUserId}:${clientKey})
  *  10. Generate runId + register PENDING in run index
- *  11. Fire launchWork WITHOUT await (.catch logs) → return 202 {runId}
+ *  11. Record idempotency entry (runId)
+ *  12. Fire launchWork WITHOUT await (.catch logs) → return 202 {runId}
  *
  * Security invariants:
  *   - Server-owned repo resolution: client body names a repo; server resolves
@@ -62,9 +63,6 @@ const LAUNCH_RATE_WINDOW_MIN_MS = 60_000
 /** Per-operator launch rate limit: 10 requests per hour. */
 const LAUNCH_RATE_LIMIT_PER_HR = 10
 const LAUNCH_RATE_WINDOW_HR_MS = 60 * 60_000
-
-/** Maximum body size for the launch route (prompt + repo + key). */
-export const LAUNCH_MAX_BODY_BYTES = 64 * 1024
 
 // ---------------------------------------------------------------------------
 // Types
@@ -213,8 +211,10 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return c.json({error: 'bad request'}, 400)
     }
 
-    if (body === null || typeof body !== 'object') {
-      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — body is not an object')
+    // Reject non-plain-object bodies: null, arrays, and primitives all fail.
+    // typeof [] === 'object', so Array.isArray check is required.
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — body is not a plain object')
       return c.json({error: 'bad request'}, 400)
     }
 
@@ -315,15 +315,22 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       )
     }
 
-    // Record idempotency entry AFTER generating the runId.
+    // ── Gate 11: Record idempotency entry AFTER generating the runId ──────────
+    // Committed here (after runId is generated). A failed background run's key
+    // persists until TTL; failure-aware cleanup needs run-state lifecycle tracking.
     if (idempotencyKey !== undefined) {
       deps.idempotencyGuard.record(githubUserId, idempotencyKey, runId)
     }
 
-    // ── Gate 11: Fire launchWork WITHOUT await (fire-and-return) ─────────────
+    // ── Gate 12: Fire launchWork WITHOUT await (fire-and-return) ─────────────
     // Build the LaunchWorkRequest with web-specific sinks, auto-deny approval,
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.
+    //
+    // v1 web launches deliver run STATUS via the SSE stream only; agent output
+    // text is not streamed to the operator yet (a follow-up). The web replySink
+    // accumulates text in memory but does not deliver it — the operator observes
+    // run phase/status via GET /operator/runs/:runId/stream.
     const operatorIdentity = {
       kind: 'web-operator' as const,
       githubUserId,
@@ -341,17 +348,20 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       requester: operatorIdentity,
       statusSink: createWebStatusSink(),
       replySink: createWebReplySink(),
-      createApprovalOnPending: createWebAutoDenyApproval(),
+      createApprovalOnPending: createWebAutoDenyApproval(deps.logger),
       promptBuilder: buildWebPrompt,
     }
 
     // Fire-and-return: do NOT await launchWork. The engine awaits the whole run
     // on the immediate-slot path. Awaiting here would hang the HTTP connection.
+    // launchWork is async — all failures arrive via the returned Promise.
+    const launchWorkPromise = launchWork(request, deps.launchWorkDeps)
+
     // eslint-disable-next-line no-void
-    void launchWork(request, deps.launchWorkDeps).catch((error: unknown) => {
+    void launchWorkPromise.catch((error: unknown) => {
       deps.logger.error(
-        {githubUserId, runId, err: error instanceof Error ? error.message : String(error)},
-        'launch: launchWork threw unexpectedly',
+        {githubUserId, runId, owner, repo, err: error instanceof Error ? error.message : String(error)},
+        'launch: background run failed',
       )
     })
 
