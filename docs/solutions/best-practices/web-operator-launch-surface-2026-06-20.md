@@ -39,6 +39,8 @@ Several patterns below were load-bearing safety properties, not conveniences: wi
 
 `launchWork` awaits the **entire run** on the immediate-slot path. An HTTP route that awaited it would hold the connection open for the whole run budget (minutes). Instead the route owns the `runId`, registers it, fires `launchWork` **without** `await`, logs the returned promise's rejection, and returns `202 {runId}` immediately. The operator then observes the run over the SSE stream.
 
+The snippet below is the fire-and-return tail only. In the real route the run id is generated and the run registered **after** the pre-launch gates, so the full order is: resolve binding (server-owned) → denylist → authz → generate runId + register → fire. Don't register before the repo is resolved and authorized.
+
 ```ts
 const request = {
   promptText: promptField, runId, channelId: `web:${owner}/${repo}`,
