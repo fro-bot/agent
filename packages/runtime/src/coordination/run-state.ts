@@ -6,8 +6,8 @@ import {err, ok} from '../shared/types.js'
 import {resolveConditionalPut, resolveGetObject} from './adapter-guards.js'
 
 const VALID_TRANSITIONS: Record<RunPhase, readonly RunPhase[]> = {
-  PENDING: ['ACKNOWLEDGED'],
-  ACKNOWLEDGED: ['EXECUTING'],
+  PENDING: ['ACKNOWLEDGED', 'FAILED', 'CANCELLED'],
+  ACKNOWLEDGED: ['EXECUTING', 'FAILED', 'CANCELLED'],
   EXECUTING: ['COMPLETED', 'FAILED', 'CANCELLED'],
   COMPLETED: [],
   FAILED: [],

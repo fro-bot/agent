@@ -373,6 +373,131 @@ describe('run-state coordination', () => {
     )
   })
 
+  // ---------------------------------------------------------------------------
+  // Transition table — early-FAILED/CANCELLED edges (R4)
+  // ---------------------------------------------------------------------------
+
+  it('allows PENDING to transition directly to FAILED', async () => {
+    const failed = createRunState({phase: 'FAILED'})
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'PENDING'})), etag: 'etag-1'})),
+      conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'FAILED', 'etag-1', logger)
+
+    expect(result).toEqual(ok({etag: 'etag-2', state: failed}))
+  })
+
+  it('allows PENDING to transition directly to CANCELLED', async () => {
+    const cancelled = createRunState({phase: 'CANCELLED'})
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'PENDING'})), etag: 'etag-1'})),
+      conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'CANCELLED', 'etag-1', logger)
+
+    expect(result).toEqual(ok({etag: 'etag-2', state: cancelled}))
+  })
+
+  it('allows ACKNOWLEDGED to transition directly to FAILED', async () => {
+    const failed = createRunState({phase: 'FAILED'})
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'ACKNOWLEDGED'})), etag: 'etag-1'})),
+      conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'FAILED', 'etag-1', logger)
+
+    expect(result).toEqual(ok({etag: 'etag-2', state: failed}))
+  })
+
+  it('allows ACKNOWLEDGED to transition directly to CANCELLED', async () => {
+    const cancelled = createRunState({phase: 'CANCELLED'})
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'ACKNOWLEDGED'})), etag: 'etag-1'})),
+      conditionalPut: vi.fn(async () => ok({etag: 'etag-2'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'CANCELLED', 'etag-1', logger)
+
+    expect(result).toEqual(ok({etag: 'etag-2', state: cancelled}))
+  })
+
+  it('rejects PENDING to EXECUTING (skipping ACKNOWLEDGED)', async () => {
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'PENDING'})), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'EXECUTING', 'etag-1', logger)
+
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('Invalid run-state transition')
+  })
+
+  it('rejects ACKNOWLEDGED to COMPLETED (skipping EXECUTING)', async () => {
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'ACKNOWLEDGED'})), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'COMPLETED', 'etag-1', logger)
+
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('Invalid run-state transition')
+  })
+
+  it('rejects any transition out of a terminal COMPLETED phase', async () => {
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'COMPLETED'})), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'FAILED', 'etag-1', logger)
+
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('Invalid run-state transition')
+  })
+
+  it('rejects any transition out of a terminal FAILED phase', async () => {
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'FAILED'})), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'CANCELLED', 'etag-1', logger)
+
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('Invalid run-state transition')
+  })
+
+  it('rejects any transition out of a terminal CANCELLED phase', async () => {
+    const storeAdapter = createStoreAdapter({
+      getObject: vi.fn(async () => ok({data: JSON.stringify(createRunState({phase: 'CANCELLED'})), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'EXECUTING', 'etag-1', logger)
+
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toContain('Invalid run-state transition')
+  })
+
   it('skips structurally invalid run-state payloads and continues scanning', async () => {
     // #given
     const staleRun = createRunState({phase: 'EXECUTING', last_heartbeat: '2026-04-24T18:13:00.000Z'})
