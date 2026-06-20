@@ -35,7 +35,6 @@
 import type {RunState} from '@fro-bot/runtime'
 import type {OperatorRunStatus, RunStatusRepoKey} from '../operator-contract/index.js'
 import type {RepoKey} from './denylist.js'
-
 import {toOperatorRunStatus} from '../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
@@ -53,6 +52,25 @@ export interface BindingsLookup {
     owner: string,
     repo: string,
   ) => Promise<{success: true; data: {databaseId?: number; nodeId?: string} | null} | {success: false; error: Error}>
+}
+
+// ---------------------------------------------------------------------------
+// bindingToRepoKey — single owner of the binding → deny-key extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the denylist key from an already-resolved binding.
+ *
+ * The single place that maps a binding's optional `databaseId`/`nodeId` to a
+ * `RepoKey`, so the extraction shape lives in exactly one place. A binding with
+ * a missing/wrong-typed key yields `null` for that field (fail-closed at the
+ * denylist check).
+ */
+export function bindingToRepoKey(binding: {readonly databaseId?: number; readonly nodeId?: string}): RepoKey {
+  return {
+    databaseId: typeof binding.databaseId === 'number' ? binding.databaseId : null,
+    nodeId: typeof binding.nodeId === 'string' ? binding.nodeId : null,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +110,7 @@ export async function resolveBindingDenyKeys(
     return NULL_KEY
   }
 
-  const binding = result.data
-  const databaseId = typeof binding.databaseId === 'number' ? binding.databaseId : null
-  const nodeId = typeof binding.nodeId === 'string' ? binding.nodeId : null
-
-  return {databaseId, nodeId}
+  return bindingToRepoKey(result.data)
 }
 
 // ---------------------------------------------------------------------------
