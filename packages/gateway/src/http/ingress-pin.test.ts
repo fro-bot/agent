@@ -105,7 +105,8 @@ const EXPECTED_OPERATOR_ROUTES_WITH_OAUTH: readonly {method: string; path: strin
  * when the full browser guard is configured (OAuth + allowlist + csrfSecret + sessionStore).
  *
  * This is the production-ready surface: OAuth routes (public), logout (privileged, CSRF-gated),
- * CSRF token endpoint (privileged, safe GET), and session info endpoint (privileged, safe GET).
+ * CSRF token endpoint (privileged, safe GET), session info endpoint (privileged, safe GET),
+ * and the authenticated SSE run-stream endpoint (privileged, safe GET).
  *
  * SECURITY: All privileged routes are wrapped by the browser guard (session + allowlist +
  * origin + Fetch Metadata). Adding a route here requires a deliberate security review.
@@ -117,6 +118,7 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'POST', path: '/operator/auth/logout'},
   {method: 'GET', path: '/operator/session/csrf'},
   {method: 'GET', path: '/operator/session'},
+  {method: 'GET', path: '/operator/runs/:runId/stream'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -204,6 +206,23 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     allowlist: loadAllowlistFromText('12345', logger),
     csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
     auditLogger: {info: vi.fn(), warn: vi.fn()},
+    // Provide the run-stream route deps so the route is registered in the pinned inventory.
+    denylistCache: {
+      getDenylistState: vi.fn(async () => undefined),
+      isRepoDenied: vi.fn(() => false),
+    },
+    bindingsLookup: {
+      getBindingByRepo: vi.fn(async () => ({success: true as const, data: null})),
+    },
+    runObservationManager: {
+      observe: vi.fn(async () => undefined),
+      subscribe: vi.fn(() => () => undefined),
+      abortSubscription: vi.fn(),
+      shutdown: vi.fn(),
+    },
+    runIndex: {
+      lookup: vi.fn(async () => undefined),
+    },
   }
 }
 

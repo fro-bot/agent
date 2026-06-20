@@ -1,9 +1,9 @@
 /**
- * manager.test.ts — Tests for the run-observation pub/sub manager (Unit 3).
+ * manager.test.ts — Tests for the run-observation pub/sub manager.
  *
- * Test-first (RED→GREEN). The load-bearing risks are:
- *   1. Non-blocking backpressure: observe() must never await a subscriber write.
- *   2. Observer-only invariant: the manager must never call any mutating run API.
+ * The load-bearing risks are:
+ *   - Non-blocking backpressure: observe() must never await a subscriber write.
+ *   - Observer-only invariant: the manager must never call any mutating run API.
  *
  * BDD comments: #given / #when / #then.
  *

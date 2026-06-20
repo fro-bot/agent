@@ -504,6 +504,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           allowlist: config.operatorWeb.allowlist,
           csrfSecret: config.operatorWeb.csrfSecret,
           auditLogger: logger,
+          // Wire the existing program-scoped instances so the run-stream route
+          // can reach them without creating second copies.
+          denylistCache,
+          bindingsLookup: bindingsStore,
+          runObservationManager,
+          runIndex,
         },
         {
           bindHost: config.operatorWeb.bindHost,

@@ -1,12 +1,12 @@
 /**
- * projection.test.ts — Tests for the run-status projection (Unit 1).
+ * projection.test.ts — Tests for the run-status projection.
  *
  * Covers:
- * 1. Happy path: each RunPhase maps to the expected base OperatorWebStatus.
- * 2. Overlay: waiting_for_approval overrides 'running' when hasPendingForScope → true.
- * 3. Edge: denied/keyless repo (projectRunStatus → null) yields null.
- * 4. Safety: the closed DTO contains ONLY the contract fields — no details passthrough.
- * 5. Scope: scopeIdFor returns thread_id for discord, run_id for non-discord.
+ * - Happy path: each RunPhase maps to the expected base OperatorWebStatus.
+ * - Overlay: waiting_for_approval overrides 'running' when hasPendingForScope → true.
+ * - Edge: denied/keyless repo (projectRunStatus → null) yields null.
+ * - Safety: the closed DTO contains ONLY the contract fields — no details passthrough.
+ * - Scope: scopeIdFor returns thread_id for discord, run_id for non-discord.
  *
  * Test seam: projectRunStatus is injected via the deps object so tests can drive
  * it without needing a real binding store or denylist. This avoids the async I/O
@@ -104,14 +104,14 @@ describe('scopeIdFor', () => {
     expect(scopeId).toBe('run-github-99')
   })
 
-  it('returns run_id for a web run (forward-compat with Unit 6)', () => {
+  it('returns run_id for a web run (forward-compat for non-discord surfaces)', () => {
     // #given a web run
     const runState = makeRunState({surface: 'web', run_id: 'run-web-77'})
 
     // #when computing the scope id
     const scopeId = scopeIdFor(runState)
 
-    // #then run_id is returned (web runs use runId scope, registered by Unit 6)
+    // #then run_id is returned (web runs use runId scope)
     expect(scopeId).toBe('run-web-77')
   })
 })

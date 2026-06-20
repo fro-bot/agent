@@ -1618,3 +1618,55 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     expect(vary).toContain('Origin')
   })
 })
+
+// ---------------------------------------------------------------------------
+// OperatorServerDeps — optional streaming deps wiring
+// ---------------------------------------------------------------------------
+
+describe('buildOperatorApp — optional streaming deps accepted without error', () => {
+  it('accepts denylistCache, bindingsLookup, and runObservationManager without registering new routes', () => {
+    // #given — stub implementations of the three optional streaming deps
+    const stubDenylistCache: import('./server.js').OperatorServerDeps['denylistCache'] = {
+      getDenylistState: async () => undefined,
+      isRepoDenied: () => false,
+    }
+    const stubBindingsLookup: import('./server.js').OperatorServerDeps['bindingsLookup'] = {
+      getBindingByRepo: async () => ({success: true, data: null}),
+    }
+    const stubRunObservationManager: import('./server.js').OperatorServerDeps['runObservationManager'] = {
+      observe: async () => undefined,
+      subscribe: () => () => undefined,
+      abortSubscription: () => undefined,
+      shutdown: () => undefined,
+    }
+
+    // #when — build the app with all three optional deps present
+    const app = buildOperatorApp(
+      makeStubDeps({
+        denylistCache: stubDenylistCache,
+        bindingsLookup: stubBindingsLookup,
+        runObservationManager: stubRunObservationManager,
+      }),
+      makeStubConfig(),
+    )
+
+    // #then — no error thrown; route inventory is unchanged (no new route registered yet)
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    expect(routes).toEqual([{method: 'GET', path: '/operator/health'}])
+  })
+
+  it('accepts buildOperatorApp without the optional streaming deps (backward-compatible)', () => {
+    // #given — no streaming deps (omitted entirely)
+    // #when / #then — no error; existing call sites that omit the new deps still compile and run
+    expect(() => buildOperatorApp(makeStubDeps(), makeStubConfig())).not.toThrow()
+  })
+})

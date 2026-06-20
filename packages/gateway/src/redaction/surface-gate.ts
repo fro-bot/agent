@@ -56,6 +56,50 @@ export interface BindingsLookup {
 }
 
 // ---------------------------------------------------------------------------
+// resolveBindingDenyKeys — shared fail-closed binding → deny-key resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve deny-keys for a repo by calling getBindingByRepo directly.
+ *
+ * Fail-closed: returns {databaseId: null, nodeId: null} on store error,
+ * missing binding, or missing keys. Try/catch is internal — callers never
+ * see a thrown error from this function.
+ *
+ * Used by both resolveRunRepoKey (entity_ref path) and the run-stream route
+ * (owner/repo already resolved from RunIndex) so the fail-closed logic lives
+ * in exactly one place.
+ */
+export async function resolveBindingDenyKeys(
+  owner: string,
+  repo: string,
+  bindingsLookup: BindingsLookup,
+): Promise<RunStatusRepoKey> {
+  const NULL_KEY: RunStatusRepoKey = {databaseId: null, nodeId: null}
+
+  let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>>
+  try {
+    result = await bindingsLookup.getBindingByRepo(owner, repo)
+  } catch {
+    return NULL_KEY
+  }
+
+  if (result.success === false) {
+    return NULL_KEY
+  }
+
+  if (result.data === null) {
+    return NULL_KEY
+  }
+
+  const binding = result.data
+  const databaseId = typeof binding.databaseId === 'number' ? binding.databaseId : null
+  const nodeId = typeof binding.nodeId === 'string' ? binding.nodeId : null
+
+  return {databaseId, nodeId}
+}
+
+// ---------------------------------------------------------------------------
 // resolveRunRepoKey — resolve a run's entity_ref to its binding deny keys
 // ---------------------------------------------------------------------------
 
@@ -108,23 +152,7 @@ export async function resolveRunRepoKey(runState: RunState, bindingsLookup: Bind
   }
 
   const {owner, repo} = parsed
-  const result = await bindingsLookup.getBindingByRepo(owner, repo)
-
-  if (result.success === false) {
-    // Store error — fail closed
-    return NULL_KEY
-  }
-
-  if (result.data === null) {
-    // Binding not found — fail closed
-    return NULL_KEY
-  }
-
-  const binding = result.data
-  const databaseId = typeof binding.databaseId === 'number' ? binding.databaseId : null
-  const nodeId = typeof binding.nodeId === 'string' ? binding.nodeId : null
-
-  return {databaseId, nodeId}
+  return resolveBindingDenyKeys(owner, repo, bindingsLookup)
 }
 
 // ---------------------------------------------------------------------------
