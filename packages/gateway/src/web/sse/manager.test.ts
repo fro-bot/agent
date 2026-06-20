@@ -668,6 +668,46 @@ describe('denied-repo omission', () => {
 
     manager.shutdown()
   })
+
+  it('cold-start deny-all: null projection at manager boundary yields no cache entry and no emitted frame', async () => {
+    // Pins the fail-closed posture at the manager boundary: when the denylist cache is
+    // unprimed (cold start), projectRunObservation returns null (deny-all). The manager
+    // must produce no observable output — no cache write, no frame to any subscriber.
+
+    // #given a manager whose projection always returns null (unprimed denylist → deny-all)
+    const projectFn: ProjectFn = async () => null
+    const {manager} = makeManager(projectFn)
+
+    // #when observing before any subscriber exists (cold path — no subscribers yet)
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #then subscribing after the denied observe yields reset (no cache entry was written)
+    const {frames: framesAfter, closes: closesAfter} = collectFrames(manager, 'run-001')
+    await drain()
+
+    expect(framesAfter.filter(f => f.type === 'status')).toHaveLength(0)
+    expect(framesAfter.filter(f => f.type === 'reset')).toHaveLength(1)
+    expect(closesAfter).toHaveLength(0)
+
+    // #when a subscriber is present during a cold-start denied observe
+    const {frames: framesDuring, closes: closesDuring} = collectFrames(manager, 'run-002')
+    await drain()
+    // Initial subscribe with no cache → reset (expected)
+    const resetsBefore = framesDuring.filter(f => f.type === 'reset').length
+
+    await manager.observe(makeRunState({run_id: 'run-002', phase: 'EXECUTING'}))
+    await drain()
+
+    // #then no status frame was emitted to the subscriber
+    expect(framesDuring.filter(f => f.type === 'status')).toHaveLength(0)
+    // #then no additional reset was triggered by the denied observe
+    expect(framesDuring.filter(f => f.type === 'reset')).toHaveLength(resetsBefore)
+    // #then no close was triggered
+    expect(closesDuring).toHaveLength(0)
+
+    manager.shutdown()
+  })
 })
 
 // ===========================================================================

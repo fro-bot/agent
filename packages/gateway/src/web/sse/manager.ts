@@ -201,21 +201,22 @@ function estimateFrameBytes(frame: ObservationFrame): number {
 }
 
 // ---------------------------------------------------------------------------
-// ID generation
-// ---------------------------------------------------------------------------
-
-let subIdCounter = 0
-function nextSubId(): string {
-  subIdCounter++
-  return `sub-${subIdCounter}`
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 export function createRunObservationManager(deps: RunObservationManagerDeps): RunObservationManager {
   const {logger} = deps
+
+  // ---------------------------------------------------------------------------
+  // ID generation — per-factory counter so two managers never share sub IDs
+  // ---------------------------------------------------------------------------
+
+  let subIdCounter = 0
+  function nextSubId(): string {
+    subIdCounter++
+    return `sub-${subIdCounter}`
+  }
+
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
   const maxStreamDurationMs = deps.maxStreamDurationMs ?? DEFAULT_MAX_STREAM_DURATION_MS
   const subscriberQueueCapBytes = deps.subscriberQueueCapBytes ?? DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES
@@ -484,7 +485,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Fan out to all current subscribers (non-blocking — never awaits writes)
     fanOut(runId, frame)
 
-    // On terminal status: clear the cache entry AFTER fan-out and close subscribers
+    // On terminal status: clear the cache entry AFTER fan-out and close subscribers.
+    // Order matters: fanOut() above calls enqueueFrame() → drainQueue() fire-and-forget.
+    // drainQueue() captures `frame` in a local variable and calls onEvent(frame) before
+    // its first `await` suspends — so the terminal frame is already in-flight when
+    // closeRunSubscribers() runs synchronously below and clears each subscriber's queue.
+    // The queue clear does NOT drop the in-flight frame because drainQueue() holds a
+    // direct reference to it; reordering fanOut and closeRunSubscribers would silently
+    // discard the terminal frame for any subscriber whose writer task hadn't started yet.
     if (isTerminal(projected.status) === true) {
       latestStatusCache.delete(runId)
       closeRunSubscribers(runId, 'terminal')
