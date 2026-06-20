@@ -195,5 +195,4 @@ void replySink.send('thread', {content: 'Waiting for tool approval…'}).then(/*
 - [`discord-slash-command-orchestration-patterns-2026-05-27.md`](./discord-slash-command-orchestration-patterns-2026-05-27.md)
   — Discord is now one transport over shared primitives, not the canonical pipeline.
 
-> Consolidation note: when the web transport lands, the related docs above may warrant a refresh so
-> their Discord-specific snippets read as "one transport" rather than the only one.
+> Consolidation status (2026-06-20): the web transports have landed, so the seam now carries more than Discord. The read transport is [authenticated-sse-run-observation-2026-06-20.md](authenticated-sse-run-observation-2026-06-20.md) (PR #961/#962); the write transport is [web-operator-launch-surface-2026-06-20.md](web-operator-launch-surface-2026-06-20.md) (PR #968). The remaining Discord-specific docs above (the mention-loop and slash-command docs) still read as the canonical pipeline rather than one transport; a future refresh can soften that framing, but the seam itself is proven by two non-Discord transports.
