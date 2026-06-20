@@ -27,8 +27,10 @@ import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
 import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
+import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
 import type {RunObservationManager} from './sse/manager.js'
+import type {RunIndex} from './sse/run-stream-route.js'
 
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
@@ -38,6 +40,7 @@ import {createRateLimiter} from '../http/rate-limit.js'
 import {buildCsrfRoute} from './auth/csrf-route.js'
 import {applyBrowserGuard} from './auth/csrf.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
+import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
@@ -49,6 +52,7 @@ import {
   rateLimitedResponse,
   unavailableResponse,
 } from './safe-response.js'
+import {buildRunStreamRoute} from './sse/run-stream-route.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -147,6 +151,20 @@ export interface OperatorServerDeps {
    * Optional — omit in tests that don't exercise streaming.
    */
   readonly runObservationManager?: RunObservationManager
+  /**
+   * Server-owned run index for runId → {repo, surface} resolution.
+   * Required by the run-stream route to resolve a runId to its repo without
+   * trusting any client-supplied value. Optional — omit in tests that don't
+   * exercise the run-stream route.
+   */
+  readonly runIndex?: RunIndex
+  /**
+   * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
+   * When absent, a fresh in-memory cache is created per buildOperatorApp call.
+   * Pass a shared instance in production so positive/negative results are reused
+   * across requests and the GitHub API is not called redundantly.
+   */
+  readonly repoAuthzCache?: RepoAuthzCache
 }
 
 export interface OperatorServerConfig {
@@ -497,6 +515,55 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Returns current session info (operatorId, login, expiresAt) for the authenticated session.
   if (browserGuardDeps !== undefined) {
     buildSessionInfoRoute(app, browserGuardDeps)
+  }
+
+  // ── Run-stream SSE endpoint ─────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND the run-observation
+  // deps (denylistCache, bindingsLookup, runObservationManager) are provided.
+  // Route: GET /operator/runs/:runId/stream — privileged (requires session + allowlist).
+  //
+  // Gate ordering (all must pass before any byte is written):
+  //   1. Guard (browser/session/allowlist/CSRF) — installed above
+  //   2. Session token resolution
+  //   3. RunIndex.lookup (server-owned repo resolution)
+  //   4. Denylist check (pre-subscribe redaction, fail-closed)
+  //   5. checkRepoAuthz (allowlist + GitHub repo access)
+  //   6. Per-operator stream slot acquisition
+  //   7. SSE stream open → first snapshot/reset frame
+  //
+  // Every failure at steps 2–5 returns the identical generic not-found shape.
+  // There is NO authorized non-stream response — a distinguishable success would
+  // be a run-resolved/authorized oracle.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.bindingsLookup !== undefined &&
+    deps.runObservationManager !== undefined &&
+    deps.runIndex !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildRunStreamRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      manager: deps.runObservationManager,
+      logger: deps.logger,
+      now: clock,
+    })
   }
 
   // ── Catch-all ──────────────────────────────────────────────────────────────
