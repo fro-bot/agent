@@ -26,8 +26,11 @@ tags:
 ## Context
 
 The gateway's Discord mention loop runs at most one agent execution per channel at a
-time (a per-channel concurrency slot, layered over a per-repo S3 lock). The original
-behavior rejected a second `@`-mention while a channel was busy. Making busy channels
+time (a per-channel concurrency slot, layered over a per-repo S3 lock). The queue is keyed
+by `channelId`, which for Discord is the real channel snowflake but for the operator web
+launch transport is a synthetic per-repo key (`web:<owner>/<repo>`) — the same FIFO + cap +
+shutdown discipline applies to both by reuse, not extension. The original behavior rejected
+a second `@`-mention while a channel was busy. Making busy channels
 *queue* instead of reject introduces three correctness hazards that are easy to get
 subtly wrong:
 
