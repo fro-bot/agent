@@ -2742,6 +2742,156 @@ describe('runMention', () => {
     })
   })
 
+  // ── Run observer hook ───────────────────────────────────────────────────
+
+  describe('run observer hook', () => {
+    it('happy path: observe called with correct RunState at each transition (PENDING→ACKNOWLEDGED→EXECUTING→COMPLETED)', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+
+      const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
+      const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
+      const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'ack-etag', state: ackState}})
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'exec-etag', state: execState}})
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'done-etag', state: completedState}})
+      mockRuntime.createHeartbeatController.mockReturnValue({
+        start: vi.fn(),
+        stop: vi.fn().mockResolvedValue({
+          success: true,
+          data: {runEtag: 'r-etag', lockEtag: 'l-etag', runState: completedState},
+        }),
+        isRunning: false,
+      })
+      mockRunOpenCodeCore.mockResolvedValue(undefined)
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+      const observeFn = vi.fn().mockResolvedValue(undefined)
+      const runObserver = {observe: observeFn}
+      const deps = makeDeps({runObserver})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — observe called for PENDING (createRun), ACKNOWLEDGED, EXECUTING, COMPLETED
+      expect(observeFn).toHaveBeenCalledTimes(4)
+      const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+      expect(phases).toContain('PENDING')
+      expect(phases).toContain('ACKNOWLEDGED')
+      expect(phases).toContain('EXECUTING')
+      expect(phases).toContain('COMPLETED')
+    })
+
+    it('failure path: observe called with FAILED state on error', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const failedState = {run_id: 'r1', phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState
+      const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
+      const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
+
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'ack-etag', state: ackState}})
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'exec-etag', state: execState}})
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'fail-etag', state: failedState}})
+      mockRuntime.createHeartbeatController.mockReturnValue({
+        start: vi.fn(),
+        stop: vi.fn().mockResolvedValue({
+          success: true,
+          data: {runEtag: 'r-etag', lockEtag: 'l-etag', runState: failedState},
+        }),
+        isRunning: false,
+      })
+      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+      const observeFn = vi.fn().mockResolvedValue(undefined)
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — observe called with FAILED state
+      const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+      expect(phases).toContain('FAILED')
+    })
+
+    it('best-effort sync: observe that throws synchronously does not abort the run', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const observeFn = vi.fn().mockImplementation(() => {
+        throw new Error('observe threw synchronously')
+      })
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when — must not throw
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — run completed normally (COMPLETED transition happened)
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('COMPLETED')
+    })
+
+    it('best-effort async: observe that rejects does not abort the run and does not surface as unhandled rejection', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const observeFn = vi.fn().mockRejectedValue(new Error('observe rejected'))
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when — must not throw; rejection must be contained
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — run completed normally
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('COMPLETED')
+    })
+
+    it('inert: omitting runObserver (undefined) is safe — run completes normally', async () => {
+      // #given — no runObserver in deps
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const deps = makeDeps() // runObserver absent
+      const message = makeMessage()
+
+      // #when — must not throw
+      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — run completed normally
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('COMPLETED')
+    })
+  })
+
   // ── Status controller wiring ─────────────────────────────────────────────
 
   describe('status controller wiring', () => {
