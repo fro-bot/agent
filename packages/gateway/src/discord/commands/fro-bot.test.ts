@@ -73,6 +73,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     },
     appClient: {
       authForRepo: vi.fn(),
+      getRepoIdentity: vi.fn(),
       invalidateCache: vi.fn(),
     },
     workspaceClient: {

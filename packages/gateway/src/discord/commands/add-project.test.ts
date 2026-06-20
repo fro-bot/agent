@@ -146,10 +146,16 @@ function makeBindingsStore(overrides?: {
   } as unknown as BindingsStore
 }
 
-function makeAppClient(overrides?: {authForRepo?: ReturnType<typeof vi.fn>}): AppClient {
+function makeAppClient(overrides?: {
+  authForRepo?: ReturnType<typeof vi.fn>
+  getRepoIdentity?: ReturnType<typeof vi.fn>
+}): AppClient {
   return {
     authForRepo:
       overrides?.authForRepo ?? vi.fn().mockResolvedValue(ok({octokit: {}, installationId: 1, token: 'ghs_testtoken'})),
+    getRepoIdentity:
+      overrides?.getRepoIdentity ??
+      vi.fn().mockResolvedValue(ok({databaseId: 123456789, nodeId: 'MDEwOlJlcG9zaXRvcnkx'})),
     invalidateCache: vi.fn(),
   } as unknown as AppClient
 }
@@ -1542,6 +1548,115 @@ describe('executeAddProject', () => {
       expect(replyContent).toMatch(/internal error|please try again/i)
       // #and — the original error is preserved in the re-fail
       expect(((result as {_tag: 'Left'; left: unknown}).left as Error).message).toBe('S3 socket hang up')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Identity capture at ingest (Unit 2)
+  // -------------------------------------------------------------------------
+
+  describe('WRITING_BINDING: repo identity captured at ingest', () => {
+    it('happy path: binding is written with databaseId and nodeId from getRepoIdentity', async () => {
+      // #given — getRepoIdentity returns a valid identity
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction} = makeInteraction({guild, userId})
+
+      const getRepoIdentity = vi.fn().mockResolvedValue(ok({databaseId: 123456789, nodeId: 'MDEwOlJlcG9zaXRvcnkx'}))
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const appClient = {...makeAppClient(), getRepoIdentity} as unknown as AppClient
+      const deps = makeDeps({
+        appClient,
+        bindingsStore: makeBindingsStore({createBinding}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — binding was written with deny keys
+      const calls = createBinding.mock.calls as [{databaseId?: number; nodeId?: string}][]
+      expect(calls[0]?.[0]?.databaseId).toBe(123456789)
+      expect(calls[0]?.[0]?.nodeId).toBe('MDEwOlJlcG9zaXRvcnkx')
+    })
+
+    it('identity capture failure is non-fatal: binding is written without deny keys, warning logged', async () => {
+      // #given — getRepoIdentity fails (e.g. transient API error)
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({guild, userId})
+
+      const getRepoIdentity = vi.fn().mockResolvedValue(err(new Error('API error')))
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const logger = makeLogger()
+      const appClient = {...makeAppClient(), getRepoIdentity} as unknown as AppClient
+      const deps = makeDeps({
+        appClient,
+        bindingsStore: makeBindingsStore({createBinding}),
+        logger,
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — command still reaches READY (identity failure is non-fatal)
+      expect(lastEditReplyContent(editReply)).toContain('Ready')
+      // #and — binding was written (without deny keys)
+      expect(createBinding).toHaveBeenCalled()
+      const calls = createBinding.mock.calls as [{databaseId?: number; nodeId?: string}][]
+      expect(calls[0]?.[0]?.databaseId).toBeUndefined()
+      expect(calls[0]?.[0]?.nodeId).toBeUndefined()
+      // #and — warning was logged about the identity capture failure
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('identity'),
+        expect.objectContaining({correlationId: 'interaction-id'}),
+      )
+    })
+
+    it('security: getRepoIdentity is called with the same owner/repo as the binding (canonicalized)', async () => {
+      // #given — URL with mixed case; identity call must use canonicalized lowercase
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction} = makeInteraction({
+        url: 'https://github.com/TestOwner/TestRepo',
+        guild,
+        userId,
+      })
+
+      const getRepoIdentity = vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'}))
+      const appClient = {...makeAppClient(), getRepoIdentity} as unknown as AppClient
+      const deps = makeDeps({appClient})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — getRepoIdentity called with lowercase owner/repo
+      expect(getRepoIdentity).toHaveBeenCalledWith('testowner', 'testrepo')
+    })
+
+    it('security: databaseId and nodeId are NOT present in the Discord reply (internal only)', async () => {
+      // #given
+      const userId = uniqueUserId()
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      const {interaction, editReply} = makeInteraction({guild, userId})
+
+      const getRepoIdentity = vi.fn().mockResolvedValue(ok({databaseId: 123456789, nodeId: 'MDEwOlJlcG9zaXRvcnkx'}))
+      const appClient = {...makeAppClient(), getRepoIdentity} as unknown as AppClient
+      const deps = makeDeps({appClient})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — deny keys never appear in any Discord reply
+      for (const content of allEditReplies(editReply)) {
+        expect(content).not.toContain('123456789')
+        expect(content).not.toContain('MDEwOlJlcG9zaXRvcnkx')
+        expect(content).not.toContain('databaseId')
+        expect(content).not.toContain('nodeId')
+      }
     })
   })
 })

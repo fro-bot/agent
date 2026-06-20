@@ -945,3 +945,153 @@ describe('P2 — confirmReply sessionID mismatch guard', () => {
     expect(renderFn).toHaveBeenCalledOnce()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Unit 2: hasPendingForScope
+// ---------------------------------------------------------------------------
+
+describe('hasPendingForScope', () => {
+  // Happy: open entry for scope → true
+  it('returns true when an open entry exists for the scope', () => {
+    // #given a registry with one open entry for scope_A
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams({approvalScopeId: 'scope_A'}))
+
+    // #when queried for scope_A
+    const result = registry.hasPendingForScope('scope_A')
+
+    // #then true (open entry matches)
+    expect(result).toBe(true)
+  })
+
+  // Happy: claimed entry for scope → true
+  it('returns true when a claimed entry exists for the scope', async () => {
+    // #given a registry with an entry that is in-flight (claimed)
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    let resolveReply!: (v: {ok: boolean}) => void
+    const replyPromise = new Promise<{ok: boolean}>(res => {
+      resolveReply = res
+    })
+    const effects = makeEffects({postReply: vi.fn().mockReturnValue(replyPromise)})
+    registry.register(makeParams({approvalScopeId: 'scope_A', effects}))
+
+    // Transition to claimed (postReply in-flight, not yet resolved)
+    const clickPromise = registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: 'scope_A',
+      decision: 'once',
+      actor: makeActor(),
+    })
+
+    // #when queried while entry is claimed
+    const result = registry.hasPendingForScope('scope_A')
+
+    // #then true (claimed entry matches)
+    expect(result).toBe(true)
+
+    // Cleanup: resolve the in-flight reply so no dangling promise
+    resolveReply({ok: true})
+    await clickPromise
+  })
+
+  // Edge: only a confirmed (settled/deleted) entry existed → false
+  it('returns false after the matching entry is settled via applySettlement', async () => {
+    // #given a registry with one open entry for scope_A
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams({approvalScopeId: 'scope_A'}))
+
+    // #when the entry is settled (applySettlement deletes it)
+    await registry.applySettlement({requestID: 'per_1', decision: 'reject', reason: 'deadline'})
+
+    // #then false (entry is gone — confirmed state is transient and entry is deleted)
+    const result = registry.hasPendingForScope('scope_A')
+    expect(result).toBe(false)
+  })
+
+  // Edge: no entries for scope → false
+  it('returns false for a scope with no entries', () => {
+    // #given an empty registry
+    const registry = createApprovalRegistry({logger: makeLogger()})
+
+    // #when queried for a scope that was never registered
+    const result = registry.hasPendingForScope('scope_NONE')
+
+    // #then false
+    expect(result).toBe(false)
+  })
+
+  // Edge: false after entry is disposed
+  it('returns false after the matching entry is disposed via disposeRun', async () => {
+    // #given a registry with one open entry for scope_A
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        approvalScopeId: 'scope_A',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'}),
+      }),
+    )
+
+    // #when the run is disposed
+    await registry.disposeRun('ses_1', 'run ended')
+
+    // #then false (entry is gone)
+    const result = registry.hasPendingForScope('scope_A')
+    expect(result).toBe(false)
+  })
+
+  // Isolation: different scope does not satisfy the query
+  it('returns false when only an entry for a DIFFERENT scope exists', () => {
+    // #given a registry with an open entry for scope_B
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams({approvalScopeId: 'scope_B'}))
+
+    // #when queried for scope_A
+    const result = registry.hasPendingForScope('scope_A')
+
+    // #then false (no cross-scope match)
+    expect(result).toBe(false)
+  })
+
+  // Isolation: multiple scopes — only the matching scope returns true
+  it('returns true only for the scope that has an open entry, false for others', () => {
+    // #given two entries in different scopes
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        sessionID: 'ses_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'}),
+      }),
+    )
+    registry.register(
+      makeParams({
+        requestID: 'per_2',
+        sessionID: 'ses_2',
+        approvalScopeId: 'scope_B',
+        request: makeRequest({requestID: 'per_2', sessionID: 'ses_2'}),
+      }),
+    )
+
+    // #when queried for each scope
+    const resultA = registry.hasPendingForScope('scope_A')
+    const resultB = registry.hasPendingForScope('scope_B')
+    const resultC = registry.hasPendingForScope('scope_C')
+
+    // #then only the matching scope returns true
+    expect(resultA).toBe(true)
+    expect(resultB).toBe(true)
+    expect(resultC).toBe(false)
+  })
+
+  // Type safety: return value is always a boolean (never throws)
+  it('never throws and always returns a boolean', () => {
+    // #given an empty registry
+    const registry = createApprovalRegistry({logger: makeLogger()})
+
+    // #when called with various inputs #then it returns a boolean and never throws
+    expect(typeof registry.hasPendingForScope('')).toBe('boolean')
+    expect(typeof registry.hasPendingForScope('any-scope')).toBe('boolean')
+  })
+})

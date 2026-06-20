@@ -10,6 +10,7 @@ import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
+import type {RunIndex} from './run-index.js'
 
 import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
 
@@ -74,6 +75,27 @@ export interface RunMentionDeps {
    * proceeds as normal.
    */
   readonly isShuttingDown?: () => boolean
+  /**
+   * Server-owned run index for `runId → {repo, surface}` resolution.
+   *
+   * Populated at run creation so privileged routes (future SSE/launch) can
+   * authorize a run by id without trusting client-supplied owner/repo.
+   * Optional — when absent, registration is skipped (e.g. in tests that do
+   * not exercise the index).
+   */
+  readonly runIndex?: RunIndex
+  /**
+   * Run-state observer for the SSE observation pipeline.
+   *
+   * Called best-effort after each successful run-state transition so the
+   * observation manager can project and fan out the new state to subscribers.
+   * Optional — when absent, observation is skipped (e.g. in tests that do
+   * not exercise the SSE pipeline).
+   *
+   * Narrow interface: only `observe` is exposed here so run.ts cannot call
+   * subscribe, shutdown, or abortSubscription on the manager.
+   */
+  readonly runObserver?: {readonly observe: (runState: import('@fro-bot/runtime').RunState) => Promise<void>}
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -359,6 +381,38 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       return
     }
 
+    // Register the run in the server-owned index so privileged routes can resolve
+    // runId → {repo, surface} without trusting client-supplied owner/repo.
+    // Best-effort: index is optional and register() is synchronous — never blocks execution.
+    // Wrapped in try/catch so a buggy register() implementation never aborts the run.
+    try {
+      deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
+    } catch (registerError: unknown) {
+      logger.warn(
+        {repo, runId, err: registerError instanceof Error ? registerError.message : String(registerError)},
+        'run: runIndex.register threw — continuing (best-effort)',
+      )
+    }
+
+    // Notify the observation pipeline of a run-state transition.
+    // Fire-and-forget: neither a sync throw nor an async rejection must abort the run.
+    // Optional-chaining the .catch() ensures undefined-observer is a clean no-op (no TypeError).
+    function notifyObserver(state: import('@fro-bot/runtime').RunState): void {
+      try {
+        deps.runObserver?.observe(state)?.catch((error: unknown) => {
+          logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed')
+        })
+      } catch (observeError: unknown) {
+        logger.warn(
+          {repo, runId, err: String(observeError)},
+          'run: runObserver.observe threw — continuing (best-effort)',
+        )
+      }
+    }
+
+    // Push the initial PENDING state to the observation pipeline.
+    notifyObserver(initialRunState)
+
     let runEtag = createResult.data.etag
 
     const ackResult = await transitionRun(
@@ -377,6 +431,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       return
     }
     runEtag = ackResult.data.etag
+
+    // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
+    notifyObserver(ackResult.data.state)
 
     const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
     heartbeat.start()
@@ -399,6 +456,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
       }
       runEtag = execResult.data.etag
+
+      // Push the EXECUTING state to the observation pipeline (best-effort, fire-and-forget).
+      notifyObserver(execResult.data.state)
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
       statusSink.setReaction('working')
@@ -569,6 +629,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (completedResult.success === false) {
         logger.error({repo, runId, err: completedResult.error.message}, 'run: transitionRun COMPLETED failed')
         // Non-fatal: continue to flush sink and release resources
+      } else {
+        // Push the COMPLETED state to the observation pipeline (best-effort, fire-and-forget).
+        notifyObserver(completedResult.data.state)
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
@@ -632,6 +695,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       )
       if (failedResult.success === false) {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
+      } else {
+        // Push the FAILED state to the observation pipeline (best-effort, fire-and-forget).
+        notifyObserver(failedResult.data.state)
       }
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.

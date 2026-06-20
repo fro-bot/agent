@@ -74,6 +74,18 @@ vi.mock('./workspace-api/ensure-clone.js', async importOriginal => {
   }
 })
 
+// Stub createDenylistCache so program tests can assert startup priming without real GitHub App calls.
+vi.mock('./redaction/denylist.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./redaction/denylist.js')>()
+  return {
+    ...actual,
+    createDenylistCache: vi.fn().mockReturnValue({
+      getDenylistState: vi.fn().mockResolvedValue(undefined),
+      isRepoDenied: vi.fn().mockReturnValue(false),
+    }),
+  }
+})
+
 const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
@@ -639,6 +651,7 @@ describe('button interaction handler (approval flow)', () => {
       register: vi.fn(),
       has: vi.fn().mockReturnValue(false),
       pending: vi.fn().mockReturnValue([]),
+      hasPendingForScope: vi.fn().mockReturnValue(false),
       handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
       attachMessage: vi.fn(),
@@ -1182,6 +1195,71 @@ describe('button interaction handler (approval flow)', () => {
     expect(serverDeps.allowlist?.isAuthorized(99)).toBe(false)
     expect(serverDeps.csrfSecret).toBe('dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE')
     expect(serverDeps.auditLogger).toBeDefined()
+  })
+
+  it('denylist: getDenylistState is called once at startup to prime the cache', async () => {
+    // #given — the denylist cache mock is already set up via vi.mock above
+    const {createDenylistCache} = await import('./redaction/denylist.js')
+    const createDenylistCacheMock = vi.mocked(createDenylistCache)
+
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — createDenylistCache was called (the cache was created)
+    expect(createDenylistCacheMock).toHaveBeenCalledOnce()
+
+    // #and — getDenylistState was called at startup to prime the cache
+    const fakeCacheInstance = createDenylistCacheMock.mock.results[0]?.value as {
+      getDenylistState: ReturnType<typeof vi.fn>
+    }
+    expect(fakeCacheInstance).toBeDefined()
+    expect(fakeCacheInstance.getDenylistState).toHaveBeenCalledOnce()
+  })
+
+  it('denylist: startup prime failure is logged and does not crash boot', async () => {
+    // #given — getDenylistState rejects on the first call (prime failure)
+    const {createDenylistCache} = await import('./redaction/denylist.js')
+    const createDenylistCacheMock = vi.mocked(createDenylistCache)
+    createDenylistCacheMock.mockReturnValueOnce({
+      getDenylistState: vi.fn().mockRejectedValue(new Error('prime failed — network error')),
+      isRepoDenied: vi.fn().mockReturnValue(true), // stays deny-all
+    })
+
+    const fakeConfig = makeFakeConfig({announce: undefined})
+    const fakeClient = makeFakeClient()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    try {
+      // #when — boot must NOT throw even though prime failed
+      await expect(Effect.runPromise(makeGatewayProgram(deps, fakeConfig))).resolves.toBeUndefined()
+
+      // #then — a warn was logged about the prime failure
+      const warnMessages = warnSpy.mock.calls.map(args => String(args[0]))
+      expect(warnMessages.some(m => m.includes('startup prime failed'))).toBe(true)
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('shutdown → approvalRegistry.disposeAll called', async () => {

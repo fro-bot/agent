@@ -15,10 +15,13 @@
  * Security (R5/R6 cross-obligation, metadata/repos.yaml redaction obligation): entity_ref is 'owner/repo#123'.
  * Exposing it for a repo redacted in metadata/repos.yaml reintroduces the repo-redaction cross-obligation leak.
  * The pre-query redaction gate does NOT retroactively scrub an already-stored run's status,
- * so toOperatorRunStatus requires a caller-supplied isRepoDenylisted predicate and returns null
+ * so toOperatorRunStatus requires a caller-supplied repoKey + isRepoDenylisted predicate and returns null
  * (omit the record entirely) for a denylisted repo. A populated status is never returned
  * for a denylisted repo — not even a partial one. The predicate form makes the "forgot to check"
  * state unrepresentable: the projection cannot be called without supplying a denylist mechanism.
+ *
+ * The caller (gateway bridge) resolves the run → its binding → deny keys and passes them in.
+ * The contract function stays pure and synchronous — no binding lookups, no I/O.
  *
  * Note: 'blocked' and 'waiting_for_approval' are NOT produced by this pure projection.
  * They are derived by the snapshot endpoint from queue/registry state and layered on top
@@ -78,38 +81,54 @@ const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
 }
 
 /**
+ * The repo identity keys used for denylist matching.
+ *
+ * Supplied by the gateway bridge, which resolves the run → its binding → deny keys.
+ * A record with neither a usable databaseId nor nodeId is denied (fail closed).
+ */
+export interface RunStatusRepoKey {
+  readonly databaseId: number | null
+  readonly nodeId: string | null
+}
+
+/**
  * Pure, redaction-aware projection from RunState to OperatorRunStatus.
  *
- * Returns null when opts.isRepoDenylisted(runState.entity_ref) returns true — the record
+ * Returns null when opts.isRepoDenylisted(opts.repoKey) returns true — the record
  * is omitted entirely. This is the critical repo-redaction cross-obligation: entity_ref
  * would otherwise expose a denylisted repo's identity and activity that the pre-query gate
  * cannot scrub.
  *
  * The predicate form makes the "forgot to check" state unrepresentable: callers MUST supply
  * a denylist mechanism (e.g. backed by metadata/repos.yaml). Passing a blanket `() => false`
- * is an explicit opt-out, not a silent default. The predicate receives the raw entity_ref
- * string (e.g. 'owner/repo#123'); the caller is responsible for parsing owner/repo if needed.
+ * is an explicit opt-out, not a silent default.
+ *
+ * The caller (gateway bridge) resolves the run → its binding → deny keys and passes them in
+ * as `repoKey`. The contract function stays pure and synchronous — no binding lookups, no I/O.
  *
  * @param runState - The canonical run state from the coordination layer.
  * @param opts - Projection options.
  * @param opts.nowMs - Current time in milliseconds (explicit; no hidden clock coupling).
  * @param opts.staleThresholdMs - Age threshold in ms beyond which a run is considered
  *   stale. REQUIRED explicit param — no hidden coupling to any runtime default constant.
- * @param opts.isRepoDenylisted - Predicate that receives the run's entity_ref and returns
- *   true if that repo is on the metadata/repos.yaml denylist. When true, returns null
- *   (record omitted) to prevent identity/activity leak. The caller supplies the denylist
- *   mechanism; the projection cannot be called without one.
+ * @param opts.repoKey - The repo's deny keys resolved from the binding by the gateway bridge.
+ *   A null/null key means no usable deny key (fails closed — denied).
+ * @param opts.isRepoDenylisted - Predicate that receives the repoKey and returns true if
+ *   that repo is on the metadata/repos.yaml denylist. When true, returns null (record omitted)
+ *   to prevent identity/activity leak. The caller supplies the denylist mechanism; the
+ *   projection cannot be called without one.
  */
 export const toOperatorRunStatus = (
   runState: RunState,
   opts: {
     readonly nowMs: number
     readonly staleThresholdMs: number
-    readonly isRepoDenylisted: (entityRef: string) => boolean
+    readonly repoKey: RunStatusRepoKey
+    readonly isRepoDenylisted: (repoKey: RunStatusRepoKey) => boolean
   },
 ): OperatorRunStatus | null => {
   // #given the redaction predicate — check first, before touching any field
-  if (opts.isRepoDenylisted(runState.entity_ref) === true) {
+  if (opts.isRepoDenylisted(opts.repoKey) === true) {
     // Omit the record entirely. A populated status must never be returned for a
     // denylisted repo — even a partial one would leak the repo's identity/activity.
     return null

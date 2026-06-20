@@ -836,7 +836,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // #given — all required deps for logout
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -883,7 +883,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // Rate limit check runs inside the handler after the guard passes.
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -921,7 +921,7 @@ describe('buildOperatorApp — logout route registration', () => {
     // #given — rate limiter allows; valid session + CSRF
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
@@ -1030,7 +1030,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1094,7 +1094,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1128,7 +1128,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1162,7 +1162,7 @@ describe('GET /operator/session/csrf — happy path', () => {
     // #given
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1230,7 +1230,7 @@ describe('registerOperatorRoute — auto-guard applies browser guard to privileg
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1298,7 +1298,7 @@ describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #
     // #given — valid session but no CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1334,7 +1334,7 @@ describe('POST /operator/auth/logout — browser guard protection (Unit 3e gap #
     // #given — valid session and valid CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1403,7 +1403,7 @@ describe('server integration — forwarded-header rejection before CSRF', () => 
     // #given — server with browser guard enabled
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1513,7 +1513,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session and allowlisted operator
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1550,7 +1550,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session and allowlisted operator
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1586,7 +1586,7 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     // #given — valid session but wrong Origin
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1616,5 +1616,57 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
     expect(res.status).toBe(400)
     const vary = res.headers.get('vary') ?? ''
     expect(vary).toContain('Origin')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OperatorServerDeps — optional streaming deps wiring
+// ---------------------------------------------------------------------------
+
+describe('buildOperatorApp — optional streaming deps accepted without error', () => {
+  it('accepts denylistCache, bindingsLookup, and runObservationManager without registering new routes', () => {
+    // #given — stub implementations of the three optional streaming deps
+    const stubDenylistCache: import('./server.js').OperatorServerDeps['denylistCache'] = {
+      getDenylistState: async () => undefined,
+      isRepoDenied: () => false,
+    }
+    const stubBindingsLookup: import('./server.js').OperatorServerDeps['bindingsLookup'] = {
+      getBindingByRepo: async () => ({success: true, data: null}),
+    }
+    const stubRunObservationManager: import('./server.js').OperatorServerDeps['runObservationManager'] = {
+      observe: async () => undefined,
+      subscribe: () => () => undefined,
+      abortSubscription: () => undefined,
+      shutdown: () => undefined,
+    }
+
+    // #when — build the app with all three optional deps present
+    const app = buildOperatorApp(
+      makeStubDeps({
+        denylistCache: stubDenylistCache,
+        bindingsLookup: stubBindingsLookup,
+        runObservationManager: stubRunObservationManager,
+      }),
+      makeStubConfig(),
+    )
+
+    // #then — no error thrown; route inventory is unchanged (no new route registered yet)
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    expect(routes).toEqual([{method: 'GET', path: '/operator/health'}])
+  })
+
+  it('accepts buildOperatorApp without the optional streaming deps (backward-compatible)', () => {
+    // #given — no streaming deps (omitted entirely)
+    // #when / #then — no error; existing call sites that omit the new deps still compile and run
+    expect(() => buildOperatorApp(makeStubDeps(), makeStubConfig())).not.toThrow()
   })
 })
