@@ -119,7 +119,7 @@ All bounds are named constants in `manager.ts`, injectable for tests. *(Replay c
   **Patterns to follow:** `surface-gate.ts` `projectRunStatus` call shape; the contract's `OperatorWebStatus` value set.
 
   **Test scenarios:**
-  - Happy path: each `RunPhase` maps to the expected base status (`PENDING`/`ACKNOWLEDGED`→`queued`, `EXECUTING`→`running`, `COMPLETED`→`succeeded`, `FAILED`→`failed`, `CANCELLED`→`cancelled`).
+  - Happy path: each `RunPhase` maps to the expected base status per the contract's `PHASE_TO_WEB_STATUS` (`PENDING`→`queued`, `ACKNOWLEDGED`/`EXECUTING`→`running`, `COMPLETED`→`succeeded`, `FAILED`→`failed`, `CANCELLED`→`cancelled`).
   - Overlay: a run whose scope has a pending approval projects `waiting_for_approval` (overrides `running`).
   - Edge: a denylisted/keyless repo (`projectRunStatus` returns `null`) yields `null` (no record).
   - Safety: a `RunState` whose `details` carries raw output / a workspace path / tool args projects an output that contains **none** of those keys/values — assert the serialized DTO has exactly the contract fields (structural allowlist proof).

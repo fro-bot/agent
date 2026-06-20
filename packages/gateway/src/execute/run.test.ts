@@ -184,6 +184,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     register: vi.fn(),
     has: vi.fn().mockReturnValue(false),
     pending: vi.fn().mockReturnValue([]),
+    hasPendingForScope: vi.fn().mockReturnValue(false),
     handleDecision: vi.fn().mockResolvedValue('ok'),
     applySettlement: vi.fn().mockResolvedValue(undefined),
     attachMessage: vi.fn(),
