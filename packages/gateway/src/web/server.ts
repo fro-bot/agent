@@ -22,6 +22,7 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {RunIndex} from '../execute/run-index.js'
 import type {DenylistCache} from '../redaction/denylist.js'
 import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
@@ -30,8 +31,6 @@ import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
 import type {RunObservationManager} from './sse/manager.js'
-import type {RunIndex} from './sse/run-stream-route.js'
-
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
@@ -157,7 +156,7 @@ export interface OperatorServerDeps {
    * trusting any client-supplied value. Optional — omit in tests that don't
    * exercise the run-stream route.
    */
-  readonly runIndex?: RunIndex
+  readonly runIndex?: Pick<RunIndex, 'lookup'>
   /**
    * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
    * When absent, a fresh in-memory cache is created per buildOperatorApp call.

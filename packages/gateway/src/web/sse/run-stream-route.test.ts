@@ -1965,6 +1965,120 @@ describe('GET /operator/runs/:runId/stream — lease: unexpected throw closes st
 })
 
 // ---------------------------------------------------------------------------
+// Route-owned max-duration timer: defense-in-depth hard cap
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal fake setTimeout/clearTimeout pair that lets tests fire the one-shot
+ * timer manually without real wall-clock delays.
+ */
+function makeFakeOneShotTimer(): {
+  readonly setTimeout: (fn: () => void, _ms: number) => ReturnType<typeof globalThis.setTimeout>
+  readonly clearTimeout: (handle: ReturnType<typeof globalThis.setTimeout> | undefined) => void
+  readonly fire: () => Promise<void>
+  readonly cleared: () => boolean
+  readonly scheduled: () => boolean
+} {
+  let callback: (() => void) | undefined
+  let isCleared = false
+
+  return {
+    setTimeout: (fn: () => void, _ms: number): ReturnType<typeof globalThis.setTimeout> => {
+      callback = fn
+      return 1 as unknown as ReturnType<typeof globalThis.setTimeout>
+    },
+    clearTimeout: (_handle: ReturnType<typeof globalThis.setTimeout> | undefined): void => {
+      isCleared = true
+      callback = undefined
+    },
+    fire: async (): Promise<void> => {
+      if (callback !== undefined) {
+        callback()
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+      }
+    },
+    cleared: () => isCleared,
+    scheduled: () => callback !== undefined,
+  }
+}
+
+describe('GET /operator/runs/:runId/stream — route-owned max-duration timer', () => {
+  it('firing the max-duration timer triggers cleanup: unsubscribe called once, slot released, stream resolves', async () => {
+    // #given — stream opens with a fake one-shot timer; manager holds the stream open
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const fakeOneShot = makeFakeOneShotTimer()
+    const deps = makeDeps({
+      manager,
+      maxStreamsPerOperator: 1,
+      setInterval: fakeTimer.setInterval,
+      clearInterval: fakeTimer.clearInterval,
+      setTimeout: fakeOneShot.setTimeout,
+      clearTimeout: fakeOneShot.clearTimeout,
+    })
+    const app = buildTestApp(deps)
+
+    // #when — stream opens
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+    expect(fakeOneShot.scheduled()).toBe(true)
+
+    // Fire the max-duration timer
+    await fakeOneShot.fire()
+
+    // #then — cleanup ran: unsubscribe called once
+    expect(unsubscribeCalls).toBe(1)
+
+    // Slot must be released: a new stream from the same operator should succeed
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res.body?.cancel()
+  })
+
+  it('max-duration timer is cleared on a normal teardown path (no leak)', async () => {
+    // #given — stream opens with a fake one-shot timer; manager closes the stream normally
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const fakeOneShot = makeFakeOneShotTimer()
+    const deps = makeDeps({
+      manager,
+      setInterval: fakeTimer.setInterval,
+      clearInterval: fakeTimer.clearInterval,
+      setTimeout: fakeOneShot.setTimeout,
+      clearTimeout: fakeOneShot.clearTimeout,
+    })
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+    expect(fakeOneShot.scheduled()).toBe(true)
+
+    // #when — stream ends via manager onClose (normal teardown)
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // #then — clearTimeout was called (timer cleared in cleanup, no leak)
+    expect(fakeOneShot.cleared()).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // FIX-D: contract version ready frame emitted as first SSE frame on success
 // ---------------------------------------------------------------------------
 

@@ -20,35 +20,31 @@
 import type {Socket} from 'node:net'
 import type {HttpBindings} from '@hono/node-server'
 import type {Context, Hono} from 'hono'
+import type {RunIndex as FullRunIndex} from '../../execute/run-index.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {ObservationFrame, RunObservationManager} from './manager.js'
-
 import {streamSSE, type SSEStreamingApi} from 'hono/streaming'
 import {OPERATOR_CONTRACT_VERSION} from '../../operator-contract/index.js'
 import {resolveBindingDenyKeys} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {DEFAULT_MAX_STREAM_DURATION_MS} from './manager.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/** Minimal run-index interface required by this route. */
-export interface RunIndex {
-  readonly lookup: (runId: string) => Promise<{readonly repo: string; readonly surface: string} | undefined>
-}
 
 /** Dependencies for the run-stream route. */
 export interface RunStreamRouteDeps {
   /** Session store for token retrieval. */
   readonly sessionStore: SessionStore
   /** Server-owned run index for runId → repo resolution. */
-  readonly runIndex: RunIndex
+  readonly runIndex: Pick<FullRunIndex, 'lookup'>
   /** Denylist cache for pre-subscribe redaction check. */
   readonly denylistCache: DenylistCache
   /** Bindings lookup for deny-key resolution. */
@@ -81,6 +77,22 @@ export interface RunStreamRouteDeps {
    * Injected in tests to verify the timer is cleared on teardown.
    */
   readonly clearInterval?: (id: ReturnType<typeof globalThis.setInterval> | undefined) => void
+  /**
+   * Route-owned hard max-duration for a single SSE connection (defense-in-depth).
+   * Defaults to DEFAULT_MAX_STREAM_DURATION_MS (same 30-minute value as the manager).
+   * Injected in tests to drive the timer without real wall-clock delays.
+   */
+  readonly maxStreamDurationMs?: number
+  /**
+   * Injectable setTimeout — defaults to globalThis.setTimeout.
+   * Injected in tests to drive the max-duration timer manually.
+   */
+  readonly setTimeout?: (fn: () => void, ms: number) => ReturnType<typeof globalThis.setTimeout>
+  /**
+   * Injectable clearTimeout — defaults to globalThis.clearTimeout.
+   * Injected in tests to verify the timer is cleared on teardown.
+   */
+  readonly clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout> | undefined) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +392,10 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
 
     const setIntervalFn = deps.setInterval ?? globalThis.setInterval.bind(globalThis)
     const clearIntervalFn = deps.clearInterval ?? globalThis.clearInterval.bind(globalThis)
+    const setTimeoutFn = deps.setTimeout ?? globalThis.setTimeout.bind(globalThis)
+    const clearTimeoutFn = deps.clearTimeout ?? globalThis.clearTimeout.bind(globalThis)
     const leaseIntervalMs = deps.leaseIntervalMs ?? DEFAULT_LEASE_INTERVAL_MS
+    const routeMaxDurationMs = deps.maxStreamDurationMs ?? DEFAULT_MAX_STREAM_DURATION_MS
 
     let cleaned = false
     // Declared before subscribe so a synchronous onClose('shutdown') during subscribe
@@ -388,12 +403,16 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
     let unsubscribe: (() => void) | undefined
     // Declared before subscribe so a synchronous onClose can clear it.
     let leaseTimer: ReturnType<typeof globalThis.setInterval> | undefined
+    // Declared before subscribe so a synchronous onClose can clear it safely
+    // (clearTimeout(undefined) is a no-op).
+    let maxDurationTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 
     const cleanup = (closeReason: string): void => {
       if (cleaned === true) return
       cleaned = true
-      // Clear the lease timer before unsubscribing so no tick fires during teardown.
+      // Clear both timers before unsubscribing so no tick or fire occurs during teardown.
       clearIntervalFn(leaseTimer)
+      clearTimeoutFn(maxDurationTimer)
       // unsubscribe may be undefined if onClose fired synchronously during subscribe.
       unsubscribe?.()
       // Release the slot synchronously so a rapid reconnect storm cannot
@@ -454,6 +473,13 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
             cleanup('client-abort')
             resolve()
           })
+
+          // Route-owned hard max-duration timer (defense-in-depth).
+          // Closes the connection if the manager's own max-duration timer fails to fire.
+          maxDurationTimer = setTimeoutFn(() => {
+            cleanup('route-max-duration')
+            resolve()
+          }, routeMaxDurationMs)
 
           // Start the continuous-authz lease timer.
           // Re-verifies session, token, redaction, and repo authz on each tick.
