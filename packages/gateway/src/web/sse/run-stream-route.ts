@@ -17,6 +17,8 @@
  * a run-resolved/authorized oracle.
  */
 
+import type {Socket} from 'node:net'
+import type {HttpBindings} from '@hono/node-server'
 import type {Context, Hono} from 'hono'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
@@ -70,6 +72,54 @@ export interface RunStreamRouteDeps {
 
 /** Default maximum concurrent SSE streams per operator. */
 const DEFAULT_MAX_STREAMS_PER_OPERATOR = 5
+
+/**
+ * Per-connection socket timeout for SSE streams.
+ * Must exceed the manager's 15s heartbeat interval so an idle-but-heartbeating
+ * stream is not killed by the socket timeout. The global server timeout (10s)
+ * bounds idle pre-auth sockets and is intentionally left unchanged.
+ */
+const SOCKET_TIMEOUT_MS = 60_000
+
+// ---------------------------------------------------------------------------
+// Socket timeout helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the Node socket from the Hono context's HttpBindings env, if present.
+ * Returns undefined when running outside @hono/node-server (e.g. test harness
+ * with plain app.fetch()) or when the socket has not yet been assigned.
+ */
+function getConnectionSocket(c: Context): Socket | undefined {
+  const env = c.env as HttpBindings | undefined
+  const socket = env?.incoming?.socket
+  // IncomingMessage.socket is typed as Socket | null in Node's types
+  return socket ?? undefined
+}
+
+/**
+ * Raise the per-connection socket timeout above the heartbeat interval.
+ * Returns the prior timeout value so it can be restored on every exit path.
+ * Safe to call when socket is undefined — returns 0 (no-op restore).
+ */
+function raiseSocketTimeout(socket: Socket | undefined): number {
+  if (socket === undefined) return 0
+  // socket.timeout is number | undefined in Node's types; treat undefined as 0
+  const prior = socket.timeout ?? 0
+  socket.setTimeout(SOCKET_TIMEOUT_MS)
+  return prior
+}
+
+/**
+ * Restore the socket timeout to the value captured before the stream opened.
+ * Must run on every exit path (normal close, error, abort) to avoid leaking
+ * the raised timeout to a reused keep-alive socket.
+ * Safe to call when socket is undefined — no-op.
+ */
+function restoreSocketTimeout(socket: Socket | undefined, priorTimeout: number): void {
+  if (socket === undefined) return
+  socket.setTimeout(priorTimeout)
+}
 
 // ---------------------------------------------------------------------------
 // Deny-key resolution (mirrors resolveRunRepoKey logic from surface-gate.ts,
@@ -217,12 +267,21 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
     // ── Gate 8: Open SSE stream ──────────────────────────────────────────────
     // All gates passed. Transition directly into the SSE stream.
     // There is NO intermediate authorized response — the stream IS the success.
+
+    // Capture the connection socket before entering streamSSE so we can raise
+    // and restore its timeout. Undefined when not running under @hono/node-server.
+    const socket = getConnectionSocket(c)
+    const priorSocketTimeout = raiseSocketTimeout(socket)
+
     let cleaned = false
 
     const cleanup = (unsubscribe: () => void): void => {
       if (cleaned === true) return
       cleaned = true
       unsubscribe()
+      // Restore the socket timeout to its pre-stream value so it never leaks
+      // to a reused keep-alive socket.
+      restoreSocketTimeout(socket, priorSocketTimeout)
       // Release the slot synchronously so a rapid reconnect storm cannot
       // transiently exceed the cap.
       const count = activeStreams.get(githubUserId) ?? 0
@@ -236,30 +295,40 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
     return streamSSE(c, async stream => {
       // Promise that resolves when the stream should end (manager closes or client aborts).
       // The streamSSE callback must stay alive (not return) while the stream is open.
-      await new Promise<void>(resolve => {
-        const unsubscribe = deps.manager.subscribe(runId, {
-          onEvent: async (frame: ObservationFrame) => {
-            if (cleaned === true) return
-            try {
-              await writeFrame(stream, frame)
-            } catch {
-              // Write failure — stream is likely closed; cleanup will handle it
+      try {
+        await new Promise<void>(resolve => {
+          const unsubscribe = deps.manager.subscribe(runId, {
+            onEvent: async (frame: ObservationFrame) => {
+              if (cleaned === true) return
+              try {
+                await writeFrame(stream, frame)
+              } catch {
+                // Write failure — stream is likely closed; cleanup will handle it
+                cleanup(unsubscribe)
+                resolve()
+              }
+            },
+            onClose: (_reason: string) => {
               cleanup(unsubscribe)
               resolve()
-            }
-          },
-          onClose: (_reason: string) => {
+            },
+          })
+
+          // Register abort handler so client disconnect releases the slot
+          stream.onAbort(() => {
             cleanup(unsubscribe)
             resolve()
-          },
+          })
         })
-
-        // Register abort handler so client disconnect releases the slot
-        stream.onAbort(() => {
-          cleanup(unsubscribe)
-          resolve()
-        })
-      })
+      } finally {
+        // Safety net: restore the socket timeout if cleanup() was never called
+        // (e.g. an unexpected throw before any teardown path fired).
+        // cleanup() sets cleaned=true before restoring, so this is a no-op when
+        // cleanup already ran — avoids a double-restore on a reused keep-alive socket.
+        if (cleaned === false) {
+          restoreSocketTimeout(socket, priorSocketTimeout)
+        }
+      }
     })
   })
 }

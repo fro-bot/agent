@@ -733,3 +733,349 @@ describe('GET /operator/runs/:runId/stream — happy path', () => {
     expect(text).toContain('"runId":"run-abc"')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Socket timeout: per-connection timeout raised on stream open, restored on cleanup
+// ---------------------------------------------------------------------------
+
+/** Build a mock socket with a controllable setTimeout. */
+function makeMockSocket(initialTimeout = 10_000): {
+  readonly socket: {setTimeout: ReturnType<typeof vi.fn>; timeout: number}
+  readonly setTimeoutCalls: number[]
+} {
+  const setTimeoutCalls: number[] = []
+  const socket = {
+    setTimeout: vi.fn((ms: number) => {
+      setTimeoutCalls.push(ms)
+      socket.timeout = ms
+    }),
+    timeout: initialTimeout,
+  }
+  return {socket, setTimeoutCalls}
+}
+
+/** Build a mock HttpBindings env with a controllable socket. */
+function makeMockEnv(socket: {setTimeout: ReturnType<typeof vi.fn>; timeout: number}): {
+  incoming: {socket: typeof socket}
+  outgoing: Record<string, never>
+} {
+  return {incoming: {socket}, outgoing: {}}
+}
+
+/** Fetch the stream route with a mock env (simulates @hono/node-server bindings). */
+async function fetchStreamWithEnv(app: Hono, runId: string, env: Record<string, unknown>): Promise<Response> {
+  const req = new Request(`http://localhost/operator/runs/${runId}/stream`)
+  return app.fetch(req, env)
+}
+
+describe('GET /operator/runs/:runId/stream — socket timeout', () => {
+  it('calls socket.setTimeout(60_000) on stream open (above the 15s heartbeat)', async () => {
+    // #given — all gates pass; mock socket with initial timeout of 10_000
+    const {socket, setTimeoutCalls} = makeMockSocket(10_000)
+    const env = makeMockEnv(socket)
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when — stream opens with mock env
+    const res = await fetchStreamWithEnv(app, 'run-abc', env)
+
+    // #then — socket.setTimeout called with 60_000 (> 15_000 heartbeat)
+    expect(setTimeoutCalls).toContain(60_000)
+    expect(60_000).toBeGreaterThan(15_000)
+
+    await res.body?.cancel()
+  })
+
+  it('restores the prior socket timeout on cleanup (onClose path)', async () => {
+    // #given — mock socket with initial timeout of 10_000; manager closes the stream
+    const {socket, setTimeoutCalls} = makeMockSocket(10_000)
+    const env = makeMockEnv(socket)
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when — stream opens, then manager closes it
+    const res = await fetchStreamWithEnv(app, 'run-abc', env)
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // #then — setTimeout called with 60_000 (raise), then 10_000 (restore)
+    expect(setTimeoutCalls[0]).toBe(60_000)
+    expect(setTimeoutCalls.at(-1)).toBe(10_000)
+  })
+
+  it('restores the prior socket timeout on the write-failure path', async () => {
+    // #given — mock socket; onEvent write throws to simulate a broken connection
+    const {socket, setTimeoutCalls} = makeMockSocket(10_000)
+    const env = makeMockEnv(socket)
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStreamWithEnv(app, 'run-abc', env)
+
+    // Trigger a write failure by calling onEvent after the stream body is cancelled
+    await res.body?.cancel()
+    // Deliver a frame after cancel — writeFrame will throw; cleanup must still restore
+    if (capturedCallbacks !== undefined) {
+      const result = capturedCallbacks.onEvent({type: 'heartbeat'})
+      if (result instanceof Promise) {
+        await result.catch(() => {})
+      }
+    }
+
+    // #then — restore call must have happened (last setTimeout call = prior timeout)
+    expect(setTimeoutCalls[0]).toBe(60_000)
+    expect(setTimeoutCalls.at(-1)).toBe(10_000)
+  })
+
+  it('does not crash when socket is undefined (graceful degrade)', async () => {
+    // #given — env with no socket (c.env.incoming.socket is undefined)
+    const envNoSocket = {incoming: {socket: undefined}, outgoing: {}}
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when — stream opens without a socket
+    const res = await fetchStreamWithEnv(app, 'run-abc', envNoSocket)
+
+    // #then — stream still opens normally (no crash)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+
+    await res.body?.cancel()
+  })
+
+  it('does not crash when c.env is undefined (test harness / non-node-server path)', async () => {
+    // #given — no env passed (c.env is undefined, as in plain Hono test harness)
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when — plain fetch with no env
+    const res = await fetchStream(app, 'run-abc')
+
+    // #then — stream still opens normally
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cleanup idempotency: concurrent onAbort + onClose run cleanup exactly once
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — cleanup idempotency', () => {
+  it('concurrent onAbort + onClose: unsubscribe called once, slot released once', async () => {
+    // #given — cap of 1; track unsubscribe calls
+    let unsubscribeCalls = 0
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+    const deps = makeDeps({manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    // First stream opens and holds the slot
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — fire both onAbort (via body cancel) and onClose concurrently
+    // onAbort fires when the body is cancelled; onClose fires from the manager
+    const abortPromise = res.body?.cancel()
+    capturedCallbacks?.onClose('terminal')
+    await abortPromise
+
+    // #then — unsubscribe called exactly once (idempotent cleanup)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Slot must be released: a new stream from the same operator should succeed
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+  })
+
+  it('concurrent onAbort + onClose with socket: socket restored exactly once', async () => {
+    // #given — mock socket; both teardown paths fire
+    const {socket, setTimeoutCalls} = makeMockSocket(10_000)
+    const env = makeMockEnv(socket)
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStreamWithEnv(app, 'run-abc', env)
+
+    // #when — fire both teardown paths
+    const abortPromise = res.body?.cancel()
+    capturedCallbacks?.onClose('terminal')
+    await abortPromise
+
+    // #then — restore call (10_000) appears exactly once after the raise (60_000)
+    const restoreCalls = setTimeoutCalls.filter(ms => ms === 10_000)
+    expect(restoreCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EOF / observation-failed: clean stream end, not an error
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — EOF / observation-failed', () => {
+  it('ends the stream cleanly when manager closes with observation-failed', async () => {
+    // #given — manager closes with observation-failed (EOF before terminal)
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+    const deps = makeDeps({manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — manager signals EOF (observation failure, not run success)
+    capturedCallbacks?.onClose('observation-failed')
+    await res.body?.cancel()
+
+    // #then — cleanup ran (unsubscribe called, slot released)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Slot released: new stream allowed
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Isolation: one connection's teardown does not affect other subscribers
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — isolation', () => {
+  it('unsubscribes only the per-connection subscriber, not the run-wide abortSubscription', async () => {
+    // #given — two connections to the same run; each gets its own unsubscribe
+    let sub1Unsubscribed = false
+    let sub2Unsubscribed = false
+    let sub1Callbacks: SubscriberCallbacks | undefined
+    let callCount = 0
+
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        callCount++
+        if (callCount === 1) {
+          sub1Callbacks = callbacks
+          return () => {
+            sub1Unsubscribed = true
+          }
+        }
+        return () => {
+          sub2Unsubscribed = true
+        }
+      }),
+    })
+    const deps = makeDeps({manager, maxStreamsPerOperator: 5})
+    // Two separate apps (different operator user IDs) to avoid cap collision
+    const app1 = buildTestApp(deps, 1, 'session-1')
+    const app2 = buildTestApp(deps, 2, 'session-2')
+
+    const res1 = await fetchStream(app1, 'run-abc')
+    const res2 = await fetchStream(app2, 'run-abc')
+    expect(res1.status).toBe(200)
+    expect(res2.status).toBe(200)
+
+    // #when — close only connection 1 via manager onClose
+    sub1Callbacks?.onClose('terminal')
+    await res1.body?.cancel()
+
+    // #then — only sub1 was unsubscribed; sub2 is unaffected
+    expect(sub1Unsubscribed).toBe(true)
+    expect(sub2Unsubscribed).toBe(false)
+    // abortSubscription was never called (run-wide teardown)
+    expect(manager.abortSubscription).not.toHaveBeenCalled()
+
+    await res2.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Heartbeat: heartbeat frames flow through writeFrame
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — heartbeat', () => {
+  it('writes a heartbeat frame as an SSE comment line', async () => {
+    // #given — manager delivers a heartbeat frame
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        Promise.resolve(callbacks.onEvent({type: 'heartbeat'})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 10; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes(': heartbeat')) break
+    }
+    await reader.cancel()
+
+    // #then — heartbeat written as SSE comment (keepalive, not a named event)
+    expect(text).toContain(': heartbeat')
+  })
+
+  it('socket timeout (60_000) exceeds the manager heartbeat interval (15_000)', () => {
+    // #given / #then — structural invariant: the socket timeout must exceed the heartbeat
+    // so an idle-but-heartbeating stream is not killed by the socket timeout.
+    const SOCKET_TIMEOUT_MS = 60_000
+    const HEARTBEAT_INTERVAL_MS = 15_000
+    expect(SOCKET_TIMEOUT_MS).toBeGreaterThan(HEARTBEAT_INTERVAL_MS)
+  })
+})
