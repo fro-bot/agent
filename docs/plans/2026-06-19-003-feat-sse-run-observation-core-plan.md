@@ -1,9 +1,10 @@
 ---
 title: "feat: Inert SSE run-observation core (Unit 4a)"
 type: feat
-status: active
+status: completed
 date: 2026-06-19
 deepened: 2026-06-19
+completed: 2026-06-19
 origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan.md
 ---
 
@@ -95,7 +96,7 @@ All bounds are named constants in `manager.ts`, injectable for tests. *(Replay c
 
 ## Implementation Units
 
-- [ ] **Unit 1: Run-status projection (consumes the contract bridge)**
+- [x] **Unit 1: Run-status projection (consumes the contract bridge)**
 
   **Goal:** Map a safe `RunState` to an `OperatorRunStatus` (closed DTO) with the `waiting_for_approval` overlay, via the redaction bridge.
 
@@ -127,7 +128,7 @@ All bounds are named constants in `manager.ts`, injectable for tests. *(Replay c
 
   **Verification:** Every phase + the overlay produce a valid `OperatorWebStatus`; denied repos omit (`null`); the output is a closed DTO with no `details` passthrough.
 
-- [ ] **Unit 2: Registry scope-pending accessor**
+- [x] **Unit 2: Registry scope-pending accessor**
 
   **Goal:** Add `hasPendingForScope(approvalScopeId)` so the projection's `waiting_for_approval` overlay derives from the run's scope, not requestID guessing.
 
@@ -156,7 +157,7 @@ All bounds are named constants in `manager.ts`, injectable for tests. *(Replay c
 
   **Verification:** `hasPendingForScope` is true iff an open/claimed entry exists for exactly that scope.
 
-- [ ] **Unit 3: Lean backpressure-safe pub/sub manager (snapshot-on-subscribe)**
+- [x] **Unit 3: Lean backpressure-safe pub/sub manager (snapshot-on-subscribe)**
 
   **Goal:** The observer-only manager that fans run-status frames to subscribers without ever stalling on a slow consumer, serves the latest snapshot on subscribe, and heartbeats — with no replay buffer, no staleness detector, and no per-operator cap (all deferred to 4b).
 
@@ -194,7 +195,7 @@ All bounds are named constants in `manager.ts`, injectable for tests. *(Replay c
 
   **Verification:** The manager is non-blocking-backpressure-safe, snapshot-on-subscribe, redacted (denied omitted before cache), observer-only, and fully tested — no replay/staleness/cap, no route exposed.
 
-- [ ] **Unit 4: Run-lifecycle observer hook (push source)**
+- [x] **Unit 4: Run-lifecycle observer hook (push source)**
 
   **Goal:** Wire the manager's `observe` into the gateway run lifecycle so transitions push safe `RunState` snapshots; instantiate the manager in the composition root.
 
