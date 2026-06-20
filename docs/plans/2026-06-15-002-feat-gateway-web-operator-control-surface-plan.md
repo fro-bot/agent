@@ -637,7 +637,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - The session-info route is wired, tested, coarse on failure, and covered by the route guardrail; the deploy doc reflects the operator OAuth surface.
 
-- [ ] **Unit 3h: Operator session OAuth token retention** *(prerequisite for repo authorization; added 2026-06-19 from Unit 4 design review)*
+- [x] **Unit 3h: Operator session OAuth token retention** *(shipped via #958, v0.72.0)*
 
   **Goal:** Retain the operator's GitHub OAuth token server-side, bound to the session, so privileged routes can call `checkRepoAuthz` (which requires the user OAuth token).
 
@@ -674,7 +674,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - The operator OAuth token is retained server-side, accessible only through the narrow accessor, dropped on session end or on first detected expiry/revocation, scoped to repo-read, and never exposed to clients or logs.
 
-- [ ] **Unit 3i: Server-owned run index for `runId → repo` resolution** *(prerequisite for SSE observation and web launch; added 2026-06-19 from Unit 4 design review)*
+- [x] **Unit 3i: Server-owned run index for `runId → repo` resolution** *(shipped via #958, v0.72.0)*
 
   **Goal:** Provide an authoritative, server-side way to resolve a `runId` to its repo (`entity_ref`) so privileged routes can authorize a run by id without trusting client-supplied owner/repo.
 
@@ -708,7 +708,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - `runId → repo` resolves correctly for any run with durable run-state (accelerator hit or canonical fallback), the accelerator is bounded, eviction never false-negatives a live run, and unknown runs never leak existence to unauthorized callers.
 
-- [ ] **Unit 4: SSE run observation and safe browser projections** *(reshaped 2026-06-19 from design review — consumes the operator contract; split into 4a inert core + 4b authz/wiring)*
+- [x] **Unit 4: SSE run observation and safe browser projections** *(shipped: 4a inert core via #961 v0.72.0, 4b authz/route via #962 v0.72.0)*
 
   **Goal:** Let authenticated operators observe active and recent runs through a bounded, redacted, status-only stream that consumes the operator contract.
 
@@ -720,7 +720,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
 
   **Split:**
 
-  - [ ] **Unit 4a: Inert SSE core (no public route)**
+  - [x] **Unit 4a: Inert SSE core (no public route)** *(shipped via #961, v0.72.0)*
 
     **Files:**
     - Create: `packages/gateway/src/web/sse/manager.ts`
