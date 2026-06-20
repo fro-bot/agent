@@ -549,7 +549,7 @@ describe('GET /operator/runs/:runId/stream — per-operator stream cap', () => {
 
     // #then — 429 (honest backpressure for an already-authorized operator)
     expect(res2.status).toBe(429)
-    expect(body2).toEqual({error: 'too many streams'})
+    expect(body2).toEqual({error: 'rate limited'})
     // subscribe was only called once (for the first request)
     expect(manager.subscribe).toHaveBeenCalledTimes(1)
 
@@ -1696,7 +1696,7 @@ describe('GET /operator/runs/:runId/stream — cap: multi-session same operator'
 
     // #then — 429: cap is keyed on githubUserId, not sessionId
     expect(res2.status).toBe(429)
-    expect(body2).toEqual({error: 'too many streams'})
+    expect(body2).toEqual({error: 'rate limited'})
 
     await res1.body?.cancel()
   })
@@ -1727,9 +1727,290 @@ describe('GET /operator/runs/:runId/stream — cap: multi-session same operator'
 
     // #then — 429
     expect(res3.status).toBe(429)
-    expect(body3).toEqual({error: 'too many streams'})
+    expect(body3).toEqual({error: 'rate limited'})
 
     await res1.body?.cancel()
     await res2.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-2: synchronous onClose during subscribe — no TDZ, slot released, timer cleared
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — synchronous onClose during subscribe', () => {
+  it('synchronous onClose("shutdown") during subscribe does not throw and releases the slot', async () => {
+    // #given — manager fires onClose synchronously during subscribe (simulates shutdown)
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        // Fire onClose synchronously before subscribe returns
+        callbacks.onClose('shutdown')
+        return () => undefined
+      }),
+    })
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    // #when — request that triggers synchronous onClose during subscribe
+    // This must not throw a TDZ ReferenceError (unsubscribe was undefined at onClose time)
+    let res: Response | undefined
+    await expect(
+      (async () => {
+        res = await fetchStream(app, 'run-abc')
+      })(),
+    ).resolves.not.toThrow()
+
+    // #then — slot was released (new stream from same operator succeeds)
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res?.body?.cancel()
+  })
+
+  it('synchronous onClose during subscribe clears the lease timer', async () => {
+    // #given — manager fires onClose synchronously during subscribe
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        callbacks.onClose('shutdown')
+        return () => undefined
+      }),
+    })
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+
+    // #then — clearInterval was called (timer cleared even though it was set after subscribe)
+    expect(fakeTimer.cleared()).toBe(true)
+
+    await res?.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-2: socket.setTimeout throw does not skip slot release
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — socket.setTimeout throw resilience', () => {
+  it('slot is released even when restoreSocketTimeout throws (ERR_SOCKET_DESTROYED)', async () => {
+    // #given — a mock socket whose setTimeout throws on the restore call
+    let setTimeoutCallCount = 0
+    const socket = {
+      setTimeout: vi.fn((ms: number) => {
+        setTimeoutCallCount++
+        // First call (raise) succeeds; second call (restore) throws
+        if (setTimeoutCallCount >= 2) {
+          throw new Error('ERR_SOCKET_DESTROYED')
+        }
+        socket.timeout = ms
+      }),
+      timeout: 10_000,
+    }
+    const env = makeMockEnv(socket)
+
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStreamWithEnv(app, 'run-abc', env)
+    expect(res.status).toBe(200)
+
+    // #when — close the stream (triggers restoreSocketTimeout which throws)
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // #then — slot was released despite the socket throw (new stream succeeds)
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-3: gate throws → 404 (no-oracle preserved)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — gate throws → 404', () => {
+  it('returns 404 when getOperatorToken throws (no 500, no stream)', async () => {
+    // #given — session store throws on getOperatorToken
+    const sessionStore = makeSessionStore({
+      getOperatorToken: vi.fn(() => {
+        throw new Error('store unavailable')
+      }),
+    })
+    const manager = makeManager()
+    const deps = makeDeps({sessionStore, manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    const body = await res.json()
+
+    // #then — 404 (not 500), no stream opened
+    expect(res.status).toBe(404)
+    expect(body).toEqual({error: 'not-found'})
+    expect(manager.subscribe).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 when runIndex.lookup throws (no 500, no stream)', async () => {
+    // #given — runIndex throws
+    const runIndex: RunStreamRouteDeps['runIndex'] = {
+      lookup: vi.fn(async () => {
+        throw new Error('index unavailable')
+      }),
+    }
+    const manager = makeManager()
+    const deps = makeDeps({runIndex, manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    const body = await res.json()
+
+    // #then — 404 (not 500), no stream opened
+    expect(res.status).toBe(404)
+    expect(body).toEqual({error: 'not-found'})
+    expect(manager.subscribe).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 when getDenylistState throws (no 500, no stream)', async () => {
+    // #given — denylist cache throws on getDenylistState
+    const denylistCache: DenylistCache = {
+      getDenylistState: vi.fn(async () => {
+        throw new Error('denylist unavailable')
+      }),
+      isRepoDenied: vi.fn(() => false),
+    }
+    const manager = makeManager()
+    const deps = makeDeps({denylistCache, manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    const body = await res.json()
+
+    // #then — 404 (not 500), no stream opened
+    expect(res.status).toBe(404)
+    expect(body).toEqual({error: 'not-found'})
+    expect(manager.subscribe).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-5: lease check throws → stream closed (fail-closed)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: unexpected throw closes stream', () => {
+  it('closes the stream when checkRepoAuthz throws inside a lease tick', async () => {
+    // #given — gate passes (cache hit); lease tick's checkRepoAuthz throws unexpectedly
+    // The cache returns authorized on the first call (gate), then undefined (cache miss)
+    // on subsequent calls so the lease tick goes to fetch — which throws.
+    let cacheCallCount = 0
+    const repoAuthzDeps: RepoAuthzDeps = {
+      ...makeRepoAuthzDeps(true),
+      cache: {
+        get: vi.fn(() => {
+          cacheCallCount++
+          if (cacheCallCount === 1) {
+            // Gate call: authorized (cache hit)
+            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
+          }
+          // Lease tick: cache miss → goes to fetch
+          return undefined
+        }),
+        set: vi.fn(),
+        getInFlight: vi.fn(() => undefined),
+        setInFlight: vi.fn(),
+        deleteInFlight: vi.fn(),
+        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
+      },
+      fetch: vi.fn(async () => {
+        throw new Error('network error')
+      }),
+    }
+
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — fire a lease tick where checkRepoAuthz throws
+    await fakeTimer.tick()
+
+    // #then — stream was closed (fail-closed on unexpected lease error)
+    expect(unsubscribeCalls).toBe(1)
+
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// FIX-D: contract version ready frame emitted as first SSE frame on success
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — contract version ready frame', () => {
+  it('emits a ready frame with contractVersion as the first SSE event on success', async () => {
+    // #given — all gates pass; manager holds the stream open
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — first SSE event is 'ready' with contractVersion
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 10; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes('event: ready')) break
+    }
+    await reader.cancel()
+
+    expect(text).toContain('event: ready')
+    expect(text).toContain('"contractVersion"')
+  })
+
+  it('does NOT emit a ready frame on denial paths (no-oracle preserved)', async () => {
+    // #given — runIndex returns undefined (run not found)
+    const runIndex = makeRunIndex(undefined)
+    const deps = makeDeps({runIndex})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    const body = await res.json()
+
+    // #then — 404 JSON response, no SSE stream, no ready frame
+    expect(res.status).toBe(404)
+    expect(body).toEqual({error: 'not-found'})
+    expect(res.headers.get('content-type')).not.toContain('text/event-stream')
   })
 })

@@ -56,11 +56,17 @@ export interface StatusFrame {
   readonly data: OperatorRunStatus
 }
 
+/**
+ * Typed set of reasons a reset frame can carry.
+ * Exhaustive over all reasons emitted by the manager.
+ */
+export type ResetReason = 'no-snapshot' | 'terminal' | 'shutdown' | 'max-duration' | 'writer-error' | 'overflow'
+
 /** A reset frame emitted when no snapshot exists for a run. */
 export interface ResetFrame {
   readonly type: 'reset'
   readonly runId: string
-  readonly reason: string
+  readonly reason: ResetReason
 }
 
 /** A heartbeat keepalive frame. */

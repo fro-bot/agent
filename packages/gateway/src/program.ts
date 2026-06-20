@@ -509,6 +509,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           denylistCache,
           bindingsLookup: bindingsStore,
           runObservationManager,
+          runIndex,
         },
         {
           bindHost: config.operatorWeb.bindHost,
