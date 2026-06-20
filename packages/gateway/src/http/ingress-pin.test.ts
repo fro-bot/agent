@@ -119,6 +119,7 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'GET', path: '/operator/session/csrf'},
   {method: 'GET', path: '/operator/session'},
   {method: 'GET', path: '/operator/runs/:runId/stream'},
+  {method: 'GET', path: '/operator/repos'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -223,6 +224,8 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     runIndex: {
       lookup: vi.fn(async () => undefined),
     },
+    // Provide listBindings so the repos route is registered in the pinned inventory.
+    listBindings: vi.fn(async () => ({success: true as const, data: []})),
   }
 }
 

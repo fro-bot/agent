@@ -22,6 +22,7 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {RepoBinding} from '../bindings/types.js'
 import type {RunIndex} from '../execute/run-index.js'
 import type {DenylistCache} from '../redaction/denylist.js'
 import type {BindingsLookup} from '../redaction/surface-gate.js'
@@ -43,6 +44,7 @@ import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
+import {buildReposRoute} from './operator/repos-route.js'
 import {
   badRequestResponse,
   notFoundResponse,
@@ -164,6 +166,14 @@ export interface OperatorServerDeps {
    * across requests and the GitHub API is not called redundantly.
    */
   readonly repoAuthzCache?: RepoAuthzCache
+  /**
+   * Binding store list function for the repos route.
+   * When present (alongside the browser guard and denylistCache), GET /operator/repos
+   * is registered. When absent, the repos route is not registered (opt-in).
+   */
+  readonly listBindings?: () => Promise<
+    {readonly success: true; readonly data: RepoBinding[]} | {readonly success: false; readonly error: Error}
+  >
 }
 
 export interface OperatorServerConfig {
@@ -564,6 +574,47 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       manager: deps.runObservationManager,
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Repos listing endpoint ─────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND listBindings,
+  // denylistCache, and sessionStore are provided.
+  // Route: GET /operator/repos — privileged (requires session + allowlist).
+  // Returns the set of bound repos the operator is authorized to launch work in.
+  //
+  // Gate ordering:
+  //   1. Guard (browser/session/allowlist) — installed above
+  //   2. Session token resolution
+  //   3. listBindings() — enumerate all bound repos
+  //   4. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
+  //   5. checkRepoAuthz() per surviving binding — keep only authorized repos
+  //   6. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.listBindings !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildReposRoute(app, {
+      sessionStore: deps.sessionStore,
+      listBindings: deps.listBindings,
+      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
       logger: deps.logger,
       now: clock,
     })
