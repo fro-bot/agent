@@ -4265,6 +4265,46 @@ describe('formatTimeoutDuration', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FIX-5: empty-string runId seam — falls back to generated UUID
+// ---------------------------------------------------------------------------
+
+describe('runId seam — empty-string falls back to generated UUID', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('an empty-string request.runId falls back to a generated UUID (not empty string)', async () => {
+    // #given — a request with an empty-string runId (not undefined, not null)
+    // The seam in executeWorkOnHeldSlot must treat '' the same as absent.
+    setupHappyPath()
+
+    // Capture the runId passed to createRun so we can assert it is not empty
+    let capturedRunId: string | undefined
+    mockRuntime.createRun.mockImplementation(async (_cfg, _id, _repo, state) => {
+      capturedRunId = (state as {run_id: string}).run_id
+      return {success: true as const, data: {etag: 'etag-create'}}
+    })
+
+    const binding = makeBinding()
+    const message = makeMessage()
+    const deps = makeDeps()
+    const request: LaunchWorkRequest = {
+      ...makeMinimalRequest(message, binding),
+      runId: '', // empty string — should fall back to generated UUID
+    }
+
+    // #when — launchWork with empty-string runId
+    const {launchWork} = await import('./run.js')
+    await launchWork(request, deps)
+
+    // #then — capturedRunId is a non-empty UUID (not the empty string)
+    expect(capturedRunId).toBeDefined()
+    expect(capturedRunId).not.toBe('')
+    expect(capturedRunId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Characterization tests — pin current Discord behavior as a zero-regression gate.
 //
 // These tests assert CURRENT observable behavior via the existing Message-based

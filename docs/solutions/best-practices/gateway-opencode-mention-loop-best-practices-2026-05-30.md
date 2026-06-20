@@ -32,9 +32,13 @@ tags:
 # Gateway OpenCode mention-loop best practices
 
 Patterns from the gateway `@fro-bot` mention loop — an authorized Discord mention in a
-bound channel drives an OpenCode session against the cloned repo. Captured after the work
-cleared an 11-reviewer review pass plus a Fro Bot review that caught a P0 (recovery lock
-ownership) and a blocking UX gap (partial output discarded on failure). These are the
+bound channel drives an OpenCode session against the cloned repo. This is the **Discord
+transport** of the gateway's transport-neutral execution engine; the engine also drives
+the operator web read (SSE) and write (launch) transports — see
+[gateway-control-surface-spine](gateway-control-surface-spine-2026-06-15.md). Captured
+after the work cleared an 11-reviewer review pass plus a Fro Bot review that caught a P0
+(recovery lock ownership) and a blocking UX gap (partial output discarded on failure).
+These are the
 load-bearing decisions worth reusing in later gateway units.
 
 Adjacent docs (different angle, not duplicates):
