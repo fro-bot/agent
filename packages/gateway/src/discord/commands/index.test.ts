@@ -22,6 +22,7 @@ function makeMockDeps(): FroBotDeps {
     },
     appClient: {
       authForRepo: vi.fn(),
+      getRepoIdentity: vi.fn(),
       invalidateCache: vi.fn(),
     },
     workspaceClient: {

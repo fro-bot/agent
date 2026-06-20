@@ -2,6 +2,30 @@
 
 The Discord-first gateway daemon. Wraps `@fro-bot/runtime` with Effect 3.x as the composition layer.
 
+## Redaction gate
+
+Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot/.github@data`. A repo redacted in that file is never included in operator output and never triggers a per-repo GitHub query — the denylist check happens before any binding lookup, run-state read, or status projection.
+
+**Source:** `fro-bot/.github` repository, `data` branch, `metadata/repos.yaml`. Read via the gateway App client's Contents API (injectable `MetadataReader`; tests inject a fake).
+
+**Deny keys** (`databaseId` / `nodeId`) are captured at ingest time (`add-project`) via `GET /repos/{owner}/{repo}` and stored on the `RepoBinding` (gateway-local; the shared `RunState` is not changed). At surface time the gate resolves run → binding → deny keys — no GitHub call is made to resolve repo identity. This is the denylist-before-query invariant.
+
+**Fail-closed posture:**
+- Cold start (never successfully loaded) → deny all. No last-known-good to fall back to.
+- Refresh failure after a prior good load → serve last-known-good for a bounded grace window while emitting hard alarms (`logger.error`). After the grace window expires without a successful refresh → deny all.
+- Missing deny key (binding has no `databaseId` or `nodeId`, or binding not found) → denied. Never resolved via a surface-time query.
+- A redacted entry in `repos.yaml` with only an `R_`-format `node_id` and no numeric `database_id` → the whole denylist load fails closed (schema error). Every redacted entry must contribute a usable numeric `database_id`.
+
+**Backfill:** Active bindings created before deny-key capture was added are backfilled offline/admin via `src/bindings/backfill-deny-keys.ts` before the first operator consumer ships. Records still missing deny keys after backfill are omitted (fail closed) — never resolved via a surface-time query.
+
+**Stale-redaction window:** A repo redacted in `repos.yaml` after ingest may surface until the next denylist refresh (bounded by TTL + grace window). Long-lived operator streams re-check on each request. This is a documented accepted risk.
+
+**No-oracle:** Redacted repo owner/name are never stored, logged, or returned anywhere in the gate. Only deny keys (`databaseId` / `nodeId`) are retained from redacted entries. Error messages on denial paths are repo-identity-free.
+
+**Composes alongside `checkRepoAuthz`:** authz proves the operator may see a repo; redaction proves the repo is not hidden by policy. Both must pass. The two gates are independent and cannot silently diverge.
+
+**Cross-reference:** `src/operator-contract/redaction.ts` (`REDACTION_OBLIGATION`) is the agent-side authority. See also: `fro-bot/dashboard` `docs/solutions/security-issues/cross-source-redaction-denylist-before-query-2026-06-15.md` — the dashboard's reference implementation of the same invariant.
+
 ## Operator API contract
 
 `packages/gateway/src/operator-contract/` is the **single authority** for operator-surface types (lifecycle, identity, approval-decision, responses) and the contract version. Import from its barrel (`index.ts`); do not re-declare these types elsewhere.
@@ -10,6 +34,8 @@ The Discord-first gateway daemon. Wraps `@fro-bot/runtime` with Effect 3.x as th
 - `OperatorIdentity` is always constructed **server-side** from the authenticated session. It is never deserialized from a request payload.
 - `OPERATOR_CONTRACT_VERSION` is **build-time pinned** and never negotiated over the wire. Any endpoint reading a version header must reject unrecognized versions fail-closed.
 - The dashboard's `operator-client.ts` is a **non-canonical downstream fixture**; it does not define the contract.
+
+This Gateway operator-auth surface (`packages/gateway/src/web/auth/`) is the **single S2 operator-auth authority** (ratified [#951](https://github.com/fro-bot/agent/issues/951); ADR: `docs/decisions/2026-06-19-s2-operator-auth-authority.md`). The dashboard delegates interactive operator auth to it and maintains no parallel operator identity — it rides the gateway session (same-origin via `GATEWAY_OPERATOR_PUBLIC_ORIGIN`) and the gateway's numeric-GitHub-user-ID allowlist is the **single allowlist source of truth**. Do not add a second operator OAuth/session/allowlist anywhere downstream.
 
 ## Effect / Result<> boundary
 
@@ -204,6 +230,8 @@ When the workspace OpenCode config sets any tool to `ask` (rather than the defau
 - **Output is posted at run completion, not streamed incrementally.** The sink accumulates the full agent response in memory and flushes it to the Discord thread when the run completes (or, on failure, best-effort partial output is flushed before the coarse error reply). Output is NOT streamed incrementally to Discord during execution.
 
 - **`heartbeat.stop()` failure can leave a run stuck.** If `heartbeat.stop()` returns an error, the gateway logs a warning and proceeds with last-known etags, but the run may remain in EXECUTING with the lock held until the lease expires. The next startup recovery sweep will detect and heal the stale run automatically.
+
+- **Run-observation cache leak on failed transitions.** If a run's state transition fails after the PENDING observe is sent (so the run never reaches a terminal status), its latest-status cache entry in the run-observation manager is never cleared. A future subscriber for that run would receive the stale cached status rather than a reset frame. The entry is cleared on process restart. A future staleness/reconcile path will evict these entries proactively.
 
 ## Build
 

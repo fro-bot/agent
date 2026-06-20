@@ -384,7 +384,7 @@ describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap 
     // #given — valid session, no Origin, no Sec-Fetch-* headers
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -416,7 +416,7 @@ describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap 
     // #given — valid session, no Origin, GET method
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -446,7 +446,7 @@ describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap 
     // #given — valid session, no Origin but Sec-Fetch-Site: same-origin
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -479,7 +479,7 @@ describe('applyBrowserGuard — absent Origin on mutating requests (Unit 3e gap 
     // #given — valid session + allowlist, no Origin, Sec-Fetch-Site: same-origin, Sec-Fetch-Mode absent
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -520,7 +520,7 @@ describe('applyBrowserGuard — typed audit events (Unit 3e gap #4)', () => {
     // #given — valid session but Authorization header present
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
@@ -561,7 +561,7 @@ describe('applyBrowserGuard — typed audit events (Unit 3e gap #4)', () => {
     // #given — valid session, valid allowlist, wrong Origin
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
@@ -599,7 +599,7 @@ describe('applyBrowserGuard — typed audit events (Unit 3e gap #4)', () => {
     // #given — valid session, valid allowlist, correct Origin, no CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
@@ -638,7 +638,7 @@ describe('applyBrowserGuard — typed audit events (Unit 3e gap #4)', () => {
     // #given — valid session, valid allowlist, correct Origin, invalid CSRF token
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
@@ -683,7 +683,7 @@ describe('applyBrowserGuard — touch not called for non-allowlisted session (Fi
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const touchSpy = vi.spyOn(sessionStore, 'touch')
@@ -717,7 +717,7 @@ describe('applyBrowserGuard — touch not called for non-allowlisted session (Fi
     // #given — session for user 42 who IS in the allowlist
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const touchSpy = vi.spyOn(sessionStore, 'touch')
@@ -757,7 +757,7 @@ describe('applyBrowserGuard — not_allowlisted audit includes githubUserId (Fix
     // #given — session for user 99 who is NOT in the allowlist
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, now)
+    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
@@ -801,7 +801,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Origin: null
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -830,7 +830,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Site: cross-site
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -860,7 +860,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Site: same-site
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -890,7 +890,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Mode: navigate on POST
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -923,7 +923,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Mode: no-cors on POST
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -956,7 +956,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Dest: object
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -986,7 +986,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, Sec-Fetch-Dest: embed
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
@@ -1016,7 +1016,7 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
     // #given — valid session, wrong Origin (will be rejected)
     const sessionStore = createInMemorySessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, now)
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
     if (sessionId === undefined) throw new Error('expected session to be created')
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}

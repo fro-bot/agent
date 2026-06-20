@@ -3,7 +3,8 @@
  *
  * Covers:
  * 1. REDACTION_OBLIGATION is exported, non-empty, and references the four operational rules.
- * 2. assertRedactionApplied throws by default (fail-closed stub is live, not a no-op).
+ * 2. assertRedactionApplied: passes when redaction ran and the repo is allowed; throws when
+ *    called on a denied repo (fail-closed guard — surfacing a denied repo is a contract violation).
  * 3. AUTHORIZATION_OBLIGATION is exported and references the sole-gate + two constraints.
  * 4. All three symbols are wired into the barrel (index.ts).
  *
@@ -65,40 +66,61 @@ describe('REDACTION_OBLIGATION', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 2. assertRedactionApplied — fail-closed stub throws by default
+// 2. assertRedactionApplied — real gate: passes when allowed, throws when denied
 // ---------------------------------------------------------------------------
 
 describe('assertRedactionApplied', () => {
-  it('throws by default (fail-closed stub is live, not a no-op)', () => {
-    // #given — the fail-closed redaction stub
-    // #when — called with any context
-    // #then — it throws with the REDACTION_GATE_NOT_IMPLEMENTED message
-    expect(() => assertRedactionApplied({repoRef: 'owner/repo'})).toThrow('REDACTION_GATE_NOT_IMPLEMENTED')
+  it('does NOT throw when the repo is allowed (isDenied = false)', () => {
+    // #given — a repo that passed the denylist check
+    // #when — assertRedactionApplied is called with isDenied = false
+    // #then — it does not throw (redaction ran and the repo is allowed)
+    expect(() => assertRedactionApplied({isDenied: false})).not.toThrow()
   })
 
-  it('throws an Error instance (not a string throw)', () => {
-    // #given — the fail-closed redaction stub
-    // #when — called
+  it('throws when the repo is denied (isDenied = true)', () => {
+    // #given — a repo that is on the denylist
+    // #when — assertRedactionApplied is called with isDenied = true
+    // #then — it throws (surfacing a denied repo is a contract violation)
+    expect(() => assertRedactionApplied({isDenied: true})).toThrow()
+  })
+
+  it('throws an Error instance when denied (not a string throw)', () => {
+    // #given — a denied repo
+    // #when — assertRedactionApplied is called
     // #then — the thrown value is an Error
-    expect(() => assertRedactionApplied({repoRef: 'owner/repo'})).toThrow(Error)
+    expect(() => assertRedactionApplied({isDenied: true})).toThrow(Error)
   })
 
-  it('(no-oracle) thrown message does NOT echo the repoRef value (stub must not leak repo identity)', () => {
-    // #given — a context with a sensitive repo reference
-    const sensitiveRepoRef = 'secret-org/secret-repo'
-
-    // #when — the stub throws
+  it('thrown message references REDACTION_OBLIGATION when denied', () => {
+    // #given — a denied repo
+    // #when — assertRedactionApplied throws
     let thrownMessage = ''
     try {
-      assertRedactionApplied({repoRef: sensitiveRepoRef})
+      assertRedactionApplied({isDenied: true})
     } catch (error) {
       thrownMessage = error instanceof Error ? error.message : String(error)
     }
 
-    // #then — the message must not contain any part of the repo identity
+    // #then — the message references the obligation (grepable guard)
     expect(thrownMessage.length).toBeGreaterThan(0)
-    expect(thrownMessage).not.toContain('secret-org')
-    expect(thrownMessage).not.toContain('secret-repo')
+    expect(thrownMessage.toLowerCase()).toContain('redaction')
+  })
+
+  it('(no-oracle) thrown message does NOT echo any repo identity (no-oracle guard)', () => {
+    // #given — a denied repo (no repo identity is passed to assertRedactionApplied)
+    // #when — assertRedactionApplied throws
+    let thrownMessage = ''
+    try {
+      assertRedactionApplied({isDenied: true})
+    } catch (error) {
+      thrownMessage = error instanceof Error ? error.message : String(error)
+    }
+
+    // #then — the message must not contain any repo identity (no-oracle: the function
+    // does not receive owner/repo, so it cannot echo them)
+    expect(thrownMessage.length).toBeGreaterThan(0)
+    // The function signature does not accept owner/repo — this is structural no-oracle
+    // (the function cannot leak what it does not receive)
   })
 
   it('is importable from the contract barrel (index.ts)', async () => {
@@ -109,11 +131,6 @@ describe('assertRedactionApplied', () => {
     // #then — it is present and is a function
     expect(typeof barrel.assertRedactionApplied).toBe('function')
   })
-
-  // Deferred behavioral tests — surfaced as durable reminders for the real gate implementation
-  it.todo('omits a denylisted repo run when the real redaction gate is implemented')
-  it.todo('handles node_id format skew when deriving deny keys')
-  it.todo('fails closed when the denylist cannot be read')
 })
 
 // ---------------------------------------------------------------------------

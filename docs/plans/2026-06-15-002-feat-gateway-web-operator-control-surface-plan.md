@@ -5,6 +5,7 @@ status: active
 date: 2026-06-15
 origin: docs/brainstorms/2026-06-15-gateway-control-surface-phase-b-requirements.md
 deepened: 2026-06-15
+revised: 2026-06-19  # added Units 3h/3i prerequisites + reshaped Unit 4 (4a/4b) from SSE design review
 ---
 
 # Gateway web operator API surface
@@ -14,6 +15,8 @@ deepened: 2026-06-15
 Add the Gateway-side API surface that Phase A made possible: GitHub-authenticated allowlisted operators can launch work, observe run state, and approve or reject tool requests through the same execution and approval spine Discord already uses. The surface is browser-only in v1, uses server-side opaque sessions, preserves the gateway ingress/egress boundary, and leaves scoped read-only binding data as an optional Phase B.1 follow-up.
 
 > **Operator-surface types are now owned by `packages/gateway/src/operator-contract/` (the frozen contract at `OPERATOR_CONTRACT_VERSION = '1.0.0'`).** Consuming units in this plan (launch, run-state, approvals) MUST import operator-surface types from that module, not re-declare them. The dashboard's `operator-client.ts` is a non-canonical downstream fixture; the contract barrel is the import authority.
+
+> **S2 authority decision (ratified 2026-06-19, [#951](https://github.com/fro-bot/agent/issues/951); ADR: `docs/decisions/2026-06-19-s2-operator-auth-authority.md`).** This Gateway operator-auth surface is the **single S2 operator-auth authority**. The dashboard delegates interactive operator auth to it and maintains no parallel operator identity. The dashboard's read-only Arctic + signed-cookie session is **retired** (no transitional dual-session period), and the gateway's numeric-GitHub-user-ID allowlist is the **single allowlist source of truth**. Dashboard-side consuming work is tracked at `fro-bot/dashboard#53`.
 
 ## Problem Frame
 
@@ -57,7 +60,7 @@ The missing piece is the authenticated browser-facing API. The existing HTTP ann
 
 ### Deferred to Separate Tasks
 
-- Dashboard UI integration in `fro-bot/dashboard` consumes the Gateway surface after the Gateway API exists.
+- Dashboard UI integration in `fro-bot/dashboard` consumes the Gateway surface after the Gateway API exists. Per the S2 authority decision (`docs/decisions/2026-06-19-s2-operator-auth-authority.md`), the dashboard rides the gateway operator session for all auth (read and interactive), retires its Arctic + signed-cookie session, and keeps no independent allowlist. Tracked at `fro-bot/dashboard#53`.
 - Operator-complete UX ships in the dashboard repo after this API is available; this plan proves the flow through API/smoke coverage, not production UI screens.
 - Machine/API caller support gets a separate token, replay, rate-limit, and audit design.
 - Hot-reloadable or remote operator allowlist management can follow the file-backed v1 allowlist.
@@ -594,7 +597,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Repo authz is deterministic, fail-closed, and covered by typed tests.
 
-- [ ] **Unit 3g: Operator session-info route**
+- [x] **Unit 3g: Operator session-info route** *(shipped via #948, v0.70.0)*
 
   **Goal:** Add the one remaining session-management route the browser flow needs — current session info — and document the operator OAuth deployment surface.
 
@@ -634,51 +637,162 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - The session-info route is wired, tested, coarse on failure, and covered by the route guardrail; the deploy doc reflects the operator OAuth surface.
 
-- [ ] **Unit 4: SSE run observation and safe browser projections**
+- [ ] **Unit 3h: Operator session OAuth token retention** *(prerequisite for repo authorization; added 2026-06-19 from Unit 4 design review)*
 
-  **Goal:** Let authenticated operators observe active and recent runs through a bounded safe status stream.
+  **Goal:** Retain the operator's GitHub OAuth token server-side, bound to the session, so privileged routes can call `checkRepoAuthz` (which requires the user OAuth token).
+
+  **Requirements:** R1, R14, R19
+
+  **Dependencies:** Units 3c, 3d
+
+  **Files:**
+  - Modify: `packages/gateway/src/web/auth/session.ts` (token field on the server-side entry)
+  - Modify: `packages/gateway/src/web/auth/github.ts` (persist the fetched access token into the session at callback)
+  - Modify: `packages/gateway/src/web/auth/session.test.ts`
+  - Modify: `packages/gateway/src/web/auth/github.test.ts`
+
+  **Approach:**
+  - The OAuth callback already fetches `accessToken` (`github.ts`) but stores only `{githubUserId, login}` in the session entry (`session.ts` `SessionEntry`/`SessionIdentity`). `checkRepoAuthz(operatorId, owner, repo, userOAuthToken, logger)` (`web/auth/repo-authz.ts`) requires that token; today there is no source, so any authz-gated route is unbuildable. Add server-side token retention.
+  - Store the access token on the **server-side `SessionEntry` only** — never in the cookie, never in any operator-facing response, never logged. The cookie remains the opaque session id; the token lives in the in-memory session store keyed by session id.
+  - The token is revocation-bound: clearing/revoking the session (logout, revocation hook from Unit 3d) drops the token with the entry. Idle/absolute TTL expiry drops it too.
+  - Expose token access through a narrow accessor (e.g. `store.getOperatorToken(sessionId)`), not by widening the public `SessionIdentity` returned to routes. The session-info route (Unit 3g) and any operator-facing projection must NOT gain the token field — keep `OperatorSessionInfo` unchanged.
+  - **Token/session lifetime coupling (P1 from design review):** the GitHub token can expire or be revoked while the gateway session is still valid (session is up to 8h; the token may not be), stranding an apparently-valid session whose authz calls fail. Define the coupling: when `checkRepoAuthz` (or any token-using path) fails in a way consistent with an expired/revoked token, drop the retained token and surface a re-auth signal to the operator (a distinct response the browser maps to "re-authenticate"), rather than a generic denial that looks like a permissions failure. Do not silently leave a stale credential server-side — drop it on first detected expiry/revocation.
+  - **Minimum scope + at-rest posture (P2 from design review):** request/retain only the OAuth scope `checkRepoAuthz` needs (repo read); document the scope explicitly. The token is an in-memory, session-bound, short-lived secret; v1 keeps it in the existing in-memory session store (no new persistence), and the plan states that the in-memory-only hold is the deliberate at-rest boundary (no disk, no logs, no cookie). Negative tests assert the token never appears in error/diagnostic output.
+  - **Gateway is the ratified S2 auth authority (#951 closed via #956):** the gateway operator-auth surface (`packages/gateway/src/web/auth/`) is the single operator-auth authority — the dashboard delegates to it and keeps no independent allowlist (see `docs/decisions/2026-06-19-s2-operator-auth-authority.md`). So this gateway-owned server-side token retention is the **permanent design**, not a temporary shim: the gateway holds the operator's token for its own `checkRepoAuthz`, and there is no removal/migration criterion to track. Keep the retention a thin session-scoped hold (no token-refresh or long-lived-credential machinery in v1) for simplicity, not because it is provisional.
+
+  **Patterns to follow:**
+  - Existing `SessionEntry`/`SessionStore` shape and revocation hook in `packages/gateway/src/web/auth/session.ts`.
+  - Secret-handling discipline: never log or echo the token (mirror the no-oracle / no-secret-in-logs posture elsewhere in the gateway).
+
+  **Test scenarios:**
+  - Happy path: after a successful OAuth callback, the session store holds the access token for that session id and `getOperatorToken` returns it.
+  - Security: the token is not present in `SessionIdentity` returned to routes, not in any cookie value, and not in the `OperatorSessionInfo` response.
+  - Lifecycle: logout / revocation / TTL expiry drops the token along with the entry (a subsequent `getOperatorToken` returns undefined).
+  - Token expiry coupling: when an authz call fails consistent with an expired/revoked token, the retained token is dropped and a re-auth signal is surfaced (distinct from a generic permissions denial).
+  - Security: the token never appears in a log line or error/diagnostic output (assert via captured logger over the callback + accessor + failure paths).
+
+  **Verification:**
+  - The operator OAuth token is retained server-side, accessible only through the narrow accessor, dropped on session end or on first detected expiry/revocation, scoped to repo-read, and never exposed to clients or logs.
+
+- [ ] **Unit 3i: Server-owned run index for `runId → repo` resolution** *(prerequisite for SSE observation and web launch; added 2026-06-19 from Unit 4 design review)*
+
+  **Goal:** Provide an authoritative, server-side way to resolve a `runId` to its repo (`entity_ref`) so privileged routes can authorize a run by id without trusting client-supplied owner/repo.
+
+  **Requirements:** R7, R10, R14
+
+  **Dependencies:** Unit 1 (shared surface / run-state)
+
+  **Files:**
+  - Create: `packages/gateway/src/execute/run-index.ts`
+  - Create: `packages/gateway/src/execute/run-index.test.ts`
+  - Modify: `packages/gateway/src/execute/run.ts` (register a run in the index when `runId` + run-state exist)
+  - Modify: `packages/gateway/src/execute/program.ts` (wire the index instance, if needed for shared access)
+
+  **Approach:**
+  - Run-state storage is repo-scoped: `getRunKey(config, identity, repo, runId)` (`runtime/src/coordination/run-state.ts`) requires the repo, and there is no exported `readRunState(runId)`. The gateway's existing read path scans bound repos (`execute/recovery.ts` via `bindingsStore.listBindings()` + `findStaleRuns()`). For SSE/launch, a route receives a `runId` and must resolve its repo server-side before authz — scanning all bindings per subscribe is wrong.
+  - **Authority vs accelerator (P0 from design review):** because 4b authorizes a run *from* this resolution, an in-memory cache alone is unsafe — evicting a still-live run would return a false not-found for a run the operator legitimately owns (a correctness bug masquerading as a security pass). So 3i provides a **two-tier `lookup(runId)`**: (1) a bounded in-memory accelerator map `runId → { repo (entity_ref), surface, startedAt }`, populated by `run.ts` at run creation; (2) on a miss, a **canonical fallback** that resolves the run from durable run-state. The fallback uses the existing bound-repo scan path (`bindingsStore.listBindings()` + a run-state read per repo) — the same mechanism `recovery.ts` already uses — so a live run is never lost to eviction. Cache the fallback result back into the accelerator. The accelerator is an optimization; the canonical fallback is the correctness guarantee.
+  - Resolution contract: `lookup(runId)` returns `{repo, surface}` for any run with durable run-state AND a live channel binding, or `undefined` otherwise. A route that gets `undefined` returns the same generic not-authorized/not-found shape as an unauthorized run — it must not become a run-existence oracle. Eviction from the accelerator must NEVER cause `undefined` for a run whose run-state still exists AND whose channel binding still exists. **Binding-removal staleness is acceptable by design:** once a channel is unbound, its runs are intentionally not operator-observable — the binding is the authorization anchor, so an unbound run has no authz path anyway. The P0 invariant is therefore: evicted-but-live AND still-bound always resolves.
+  - Because `launchWork` queues before `runId` exists (`run.ts`), the index only carries runs that have reached run-state creation; queued-but-not-started work is not yet resolvable by runId (acceptable for v1 — observation targets created runs).
+
+  **Patterns to follow:**
+  - Bounded in-memory map with cap + TTL (mirror the approval registry / coordination bounded-map style in the gateway).
+  - Run lifecycle write points in `packages/gateway/src/execute/run.ts` (`createRun` and the phase transitions).
+
+  **Test scenarios:**
+  - Happy path: a run registered at creation resolves `runId → {repo, surface}` from the accelerator.
+  - Edge case: a `runId` with no run-state anywhere returns `undefined` (caller maps to a generic not-found, no oracle).
+  - Security/correctness (P0): a run evicted from the accelerator but still present in durable run-state resolves via the canonical fallback (NOT `undefined`) — a live run is never lost to eviction. The fallback result is re-cached.
+  - Edge case: the accelerator evicts by cap and by TTL (bounding memory), but eviction alone never changes a `lookup` result for a run with durable run-state.
+  - Integration: creating a run through `run.ts` populates the accelerator with the correct repo and surface.
+
+  **Verification:**
+  - `runId → repo` resolves correctly for any run with durable run-state (accelerator hit or canonical fallback), the accelerator is bounded, eviction never false-negatives a live run, and unknown runs never leak existence to unauthorized callers.
+
+- [ ] **Unit 4: SSE run observation and safe browser projections** *(reshaped 2026-06-19 from design review — consumes the operator contract; split into 4a inert core + 4b authz/wiring)*
+
+  **Goal:** Let authenticated operators observe active and recent runs through a bounded, redacted, status-only stream that consumes the operator contract.
 
   **Requirements:** R7, R10, R11, R12, R15, R17
 
-  **Dependencies:** Units 1, 2, and 3
+  **Dependencies:** Units 1, 2, 3 (3a–3i); the operator API contract (`packages/gateway/src/operator-contract/`); Unit 3h (token) and Unit 3i (run index) are hard prerequisites for the 4b authz wiring.
 
-  **Files:**
-  - Create: `packages/gateway/src/web/sse/manager.ts`
-  - Create: `packages/gateway/src/web/sse/projection.ts`
-  - Create: `packages/gateway/src/web/sse/manager.test.ts`
-  - Create: `packages/gateway/src/web/sse/projection.test.ts`
-  - Modify: `packages/gateway/src/web/server.ts`
-  - Modify: `packages/gateway/src/execute/run.ts`
-  - Test: `packages/gateway/src/execute/run.test.ts`
+  **Design-review corrections (2026-06-19, GO-WITH-CHANGES):** the original unit predated the operator contract and assumed an authz token + `runId→repo` path that do not exist. It is reshaped to consume the contract, fix the seams, and split into an inert core (4a) and the authz/route wiring (4b).
 
-  **Approach:**
-  - Build an authenticated SSE manager with per-run subscriptions, keepalive, disconnect cleanup, and capped in-memory replay buffer.
-  - Bound SSE resources: 5 concurrent streams per operator, 1,000 replay events or 256 KB per run, 5-minute replay TTL, 15-second heartbeat, 30-minute max stream duration, and 64 KB buffered-write cap per subscription.
-  - Project runtime phases and approval pending state into the operator taxonomy: queued, running, waiting for approval, blocked, failed, cancelled, succeeded.
-  - Use a positive safe-field allowlist for all browser events.
-  - Treat stream disconnect as client-local; it must not cancel or complete a run.
-  - Treat EOF before terminal run state as an observation failure, not run success.
-  - Snapshot reads combine canonical run state with in-memory approval registry pending state for live runs.
-  - Enforce per-session/operator SSE connection caps and bounded replay buffers.
+  **Split:**
 
-  **Patterns to follow:**
-  - Gateway stream/flush discipline in `packages/gateway/src/discord/streaming.ts`.
-  - Mention-loop best practice around terminal signal correctness and cleanup.
-  - Hono `streamSSE` guidance for `onAbort`, keepalive, and `Last-Event-ID` replay.
+  - [ ] **Unit 4a: Inert SSE core (no public route)**
 
-  **Test scenarios:**
-  - Happy path: authenticated operator subscribes to a run and receives queued/running/terminal events.
-  - Reconnect: a client reconnecting with a last event ID receives buffered missed events before live events.
-  - Reconnect: a last event ID outside the replay window receives a reset event and must snapshot-read.
-  - Cleanup: aborted SSE connections remove subscriptions and timers.
-  - Security: projection excludes raw prompt, raw tool args, workspace path, internal URLs, token values, and secret-bearing payload fragments.
-  - Error path: run stream resolves `runId` server-side to repo/scope before disclosure; unauthorized operators cannot subscribe to an unrelated run by supplying owner/repo context.
-  - Abuse: rapid reconnects do not leak listeners and cannot exceed per-operator connection caps.
-  - Abuse: slow consumers exceeding buffered-write limits are dropped without blocking other subscribers.
-  - Error path: stream writer failure is contained and does not crash the Gateway.
+    **Files:**
+    - Create: `packages/gateway/src/web/sse/manager.ts`
+    - Create: `packages/gateway/src/web/sse/projection.ts`
+    - Create: `packages/gateway/src/web/sse/manager.test.ts`
+    - Create: `packages/gateway/src/web/sse/projection.test.ts`
+    - Modify: `packages/gateway/src/execute/run.ts` (lifecycle observer hook)
+    - Modify: `packages/gateway/src/approvals/registry.ts` (add `hasPendingForScope`)
+    - Test: `packages/gateway/src/execute/run.test.ts`, `packages/gateway/src/approvals/registry.test.ts`
 
-  **Verification:**
-  - SSE streams are bounded, replayable, redacted, and cleaned up on disconnect.
+    **Approach:**
+    - `projection.ts` **consumes** the contract via the gateway bridge: call `projectRunStatus(runState, {nowMs, staleThresholdMs, bindingsLookup, isRepoDenied})` from `packages/gateway/src/redaction/surface-gate.ts`, which resolves the run → its binding → deny keys and calls `toOperatorRunStatus(runState, {nowMs, staleThresholdMs, repoKey, isRepoDenylisted})` internally. The result is an `OperatorRunStatus` (or `null` for a denied/keyless repo). Do NOT call `toOperatorRunStatus` directly from `projection.ts` — the gateway bridge owns the binding resolution. The contract's `OperatorRunStatus.status` is an `OperatorWebStatus` whose base mapping covers five of the seven values (`queued`, `running`, `succeeded`, `failed`, `cancelled`). Layer the two endpoint-only `OperatorWebStatus` values on top of the projected base: `waiting_for_approval` when the run's approval scope has a pending entry, and `blocked` from pre-execution rejection state. The overlaid result is always a valid `OperatorWebStatus` (the contract's canonical 7-value set). Note: `toOperatorRunStatus`'s `isRepoDenylisted` parameter now takes `(repoKey: {readonly databaseId: number | null; readonly nodeId: string | null}) => boolean` (not an entityRef string); the gateway bridge supplies the resolved deny keys from the binding.
+    - **Approval overlay correlation:** add `hasPendingForScope(approvalScopeId): boolean` to the approval registry. `pending()` returns requestIDs (not runIds) and `RegistryEntry` has no runId, so per-run `waiting_for_approval` must derive from the run's approval scope: Discord runs map `runState.thread_id → approvalScopeId`; web runs (Unit 6) register `approvalScopeId = runId`. Do NOT infer via requestID guessing (leaks cross-run state).
+    - **Event source:** add a run-lifecycle observer hook in `run.ts` that the SSE manager subscribes to. `run.ts` already owns the PENDING → ACKNOWLEDGED → EXECUTING → COMPLETED/FAILED transitions; the manager observes the post-transition safe `RunState`, NOT raw OpenCode SDK events. There is no run-state event bus today; this hook is the push source.
+    - **Liveness / staleness detector (P1 from design review):** the observer hook is not a guaranteed terminal signal — if `run.ts` throws between transitions, no terminal event is emitted and the stream would otherwise heartbeat "running" until the 30-minute cap (a misleading lie). The manager derives staleness from the run's `last_heartbeat` (already in `RunState`): if a live run's heartbeat goes stale beyond a grace window with no observed terminal transition, the manager reconciles via a snapshot read of canonical run-state and, if the run is genuinely gone/terminal, emits the terminal/`stale` status instead of waiting for the max-duration guillotine. Polling is used only for this snapshot/reset reconciliation, not as the live source.
+    - **SSE manager (bounded, backpressure-safe):** per-run subscriptions, capped in-memory replay buffer, keepalive, disconnect cleanup. Bounds: 5 concurrent streams per operator, 1,000 replay events OR 256 KB per run (evict by both count and serialized-byte size), 5-minute replay TTL, 15-second heartbeat, 30-minute max stream duration, 64 KB buffered-write cap per subscription. **Backpressure:** one bounded queue + one writer task per subscription; the publisher serializes once and enqueues per subscriber and NEVER awaits a subscriber's write — a slow browser must not stall the publish loop, other subscribers, or the run. A subscriber exceeding its 64 KB queue cap is dropped locally (its stream closed) without affecting others.
+    - **Replay / Last-Event-ID (bounds justified against status-only chatter):** monotonic per-run sequence ids (`${runId}:${seq}`). Reconnect with a matching-run last-event-id inside the window replays `seq > lastSeq`; missing/evicted/restarted → emit `event: reset` (`{runId, reason}`) forcing a snapshot-read. A last-event-id whose runId doesn't match the subscription is rejected. **Bounds rationale:** because v1 is status-only (status transitions + heartbeats, NOT per-token progress), the per-run event rate is low — a handful of phase transitions plus 15 s heartbeats. The 1,000-event / 256 KB / 5-minute window therefore comfortably covers a realistic run's status timeline, so replay is the normal path and `reset` is the exception (brief tab-suspend/network-blip reconnects replay cleanly; only a long disconnect past the TTL resets). **Snapshot-on-gap is first-class:** the `reset` → snapshot-read path is a fully specified, tested API contract (not a degraded afterthought), so correctness never depends on replay succeeding. If future progress streaming raises the event rate, the bounds are re-sized against measured chatter or replay is downgraded to best-effort then.
+    - **Lifecycle separation:** the manager is observer-only. Stream disconnect / `onAbort` removes only the subscription + its timers/queue; it must NEVER touch the run timeout signal, coordinator, lock, or heartbeat. EOF before terminal run state is an observation failure, not run success.
+    - **Safe fields (v1 = status-only):** stream only `OperatorRunStatus`, `reset`, and heartbeat/connection events. Do NOT stream raw output, prompts, tool args, tool titles, workspace paths, approval request details, or internal URLs (the Discord tool-progress path derives from tool input/title and is NOT browser-safe). Coarse progress, if ever needed, is a future contract type with its own allowlist — not in v1.
+    - 4a ships with NO public SSE route — it is inert and safe to land. The route is added in 4b.
+
+    **Patterns to follow:**
+    - Stream/flush + terminal-signal discipline in `packages/gateway/src/discord/streaming.ts` and `status-message.ts` (StatusController), and the mention-loop best-practice doc on terminal correctness + cleanup.
+    - Bounded-map cap/TTL style from the approval registry / coordination layer.
+    - Run lifecycle write points in `packages/gateway/src/execute/run.ts`.
+
+    **Execution note:** implement the manager's replay/eviction/drop and the lifecycle-observer push test-first; the concurrency/backpressure correctness is the load-bearing risk.
+
+    **Test scenarios:**
+    - Happy path: subscribing to a run receives queued → running → terminal status events from the lifecycle hook.
+    - Projection: each `RunPhase` maps to the expected base status; a pending approval scope overlays `waiting_for_approval`; a denylisted repo yields no record (contract omission).
+    - Reconnect: last-event-id inside the window replays missed events in order; outside the window yields a `reset` event; mismatched runId is rejected.
+    - Cleanup: aborted connection removes subscription, timers, and queued bytes; the run is untouched (no cancel/complete/fail).
+    - Abuse: rapid reconnects do not leak listeners and cannot exceed the per-operator stream cap.
+    - Abuse: a slow consumer exceeding its 64 KB write cap is dropped locally without blocking publish or other subscribers.
+    - Error path: a stream writer failure is contained and does not crash the gateway; EOF before terminal status is treated as observation failure, not success.
+    - Registry: `hasPendingForScope` returns true only when an open/claimed entry exists for that scope; false otherwise.
+
+    **Verification:**
+    - The SSE core is bounded, replayable, redacted, backpressure-safe, observer-only, and fully tested — with no public route exposed yet.
+
+  - [ ] **Unit 4b: Authenticated SSE route, authz, and redaction wiring**
+
+    **Files:**
+    - Create: `packages/gateway/src/web/routes/run-stream.ts`
+    - Create: `packages/gateway/src/web/routes/run-stream.test.ts`
+    - Modify: `packages/gateway/src/web/server.ts` (register the route; fix socket timeout)
+
+    **Dependencies:** Unit 4a, Unit 3h (operator token), Unit 3i (run index), `checkRepoAuthz` (Unit 3f), and **the real redaction gate as a HARD prerequisite** — the contract's `assertRedactionApplied` stub throws by default, so 4b cannot ship securely against it. The `metadata/repos.yaml` denylist-before-query gate (tracked under #950) must be live and enforced before 4b exposes the route: either #950 lands first, or 4b implements and tests the real gate as part of its own authz wiring. This is not optional — a route that streams repo-scoped run status without an enforced denylist check is the exact leak the contract's obligation prevents.
+
+    **Approach:**
+    - Add `GET /operator/runs/:runId/stream` via `registerOperatorRoute` (session + allowlist + Origin/Fetch-Metadata guard applies first). Use Hono `streamSSE` (`onAbort`, manual `Last-Event-ID` read — Hono does not implement replay; the route owns it).
+    - **Visibility model (Fork 2 decision):** observation is **repo-scoped**, not owner-scoped — any operator with repo access to a run's repo may observe that run regardless of who launched it. This matches the gateway's repo-centric coordination model (Discord runs are channel/repo-scoped, not user-private). Authorization is therefore purely `checkRepoAuthz` on the run's resolved repo; there is no run-owner comparison.
+    - **Gate ordering before any byte is written:** (1) browser/session guard; (2) resolve `runId → repo` server-side via the Unit 3i two-tier lookup (accelerator + canonical fallback; NEVER from client-supplied owner/repo); (3) apply the redaction predicate (denylist-before-query, fail-closed) — a denylisted repo yields the generic not-found; (4) `checkRepoAuthz(operatorId, owner, repo, operatorToken, logger)` using the token from Unit 3h; (5) only then subscribe + replay/stream. Both authz and redaction must pass. Unauthorized / redacted / unknown runId all return the SAME generic shape — no run-existence oracle.
+    - **Continuous authorization (P1 from design review):** authz at subscribe time alone leaves a TOCTOU hole — a stream started while access was allowed would keep leaking status after the operator's repo access is revoked or the repo is denylisted mid-stream. Enforce a short **authz lease**: re-run the redaction predicate + `checkRepoAuthz` on a bounded interval (e.g. aligned to the heartbeat or a small multiple) for the life of the stream; on a failed re-check, terminate the SSE subscription immediately (the run itself is untouched). A repo added to the denylist mid-stream must drop active subscribers on the next re-check.
+    - **Socket-timeout fix:** the operator server sets a 10 s socket timeout (`web/server.ts`) but the SSE heartbeat is 15 s — idle SSE sockets would be killed. Raise the per-connection socket timeout for the stream route (or lower the heartbeat below the timeout) while the manager enforces the 30-minute max duration itself.
+
+    **Patterns to follow:**
+    - `registerOperatorRoute` wrapper + the coarse-auth-failure shape from signed-webhook ingress.
+    - `checkRepoAuthz` usage and fail-closed posture in `packages/gateway/src/web/auth/repo-authz.ts`.
+
+    **Test scenarios:**
+    - Security: an operator cannot subscribe to a run in a repo they lack access to — `runId` resolves server-side and `checkRepoAuthz` denies before any event is written.
+    - Security: supplying owner/repo context cannot override the server-resolved repo for a `runId`.
+    - Security: a denylisted repo's run returns the generic not-found and writes nothing; unauthorized / unknown / redacted are indistinguishable to the client.
+    - Security: the projection excludes raw prompt, tool args, workspace path, internal URLs, tokens, and secret payloads (status-only).
+    - Happy path: an authorized operator streams a run's status with heartbeats and a clean terminal event; an operator with repo access observes a run launched by a DIFFERENT operator in that repo (repo-scoped visibility).
+    - Security (continuous authz): a stream is terminated on the next re-check after the operator's repo access is revoked mid-stream, or after the run's repo is added to the denylist mid-stream — status stops flowing.
+    - Reliability: the 15 s heartbeat keeps the connection alive past the prior 10 s socket timeout; the 30-minute max duration closes the stream.
+
+    **Verification:**
+    - No SSE byte is written before session auth, redaction, and repo authz all pass; client-supplied repo is never authoritative; access loss or denylisting mid-stream terminates the subscription on the next lease re-check; the stream is bounded and heartbeat-stable.
 
 - [ ] **Unit 5: Web launch adapter**
 
@@ -686,7 +800,7 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
 
   **Requirements:** R5, R6, R10, R11, R12, R13, R14
 
-  **Dependencies:** Units 1, 3, and 4; the route stays feature-disabled until Unit 6 approval handling is available.
+  **Dependencies:** Units 1, 3 (incl. 3h operator token + 3i run index), and 4; the route stays feature-disabled until Unit 6 approval handling is available.
 
   **Files:**
   - Create: `packages/gateway/src/web/routes/launch.ts`

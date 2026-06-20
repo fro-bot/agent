@@ -6,6 +6,20 @@ export interface RepoBinding {
   readonly workspacePath: string
   readonly createdAt: string
   readonly createdByDiscordId: string
+  /**
+   * GitHub numeric repository id (database_id). Captured at ingest via GET /repos/{owner}/{repo}.
+   * Used as the primary deny key for the metadata/repos.yaml redaction gate.
+   * Absent on legacy bindings — absence means "no usable deny key" (fails closed at the gate).
+   * INTERNAL: must NOT appear on any operator-facing projection (e.g. OperatorRunStatus).
+   */
+  readonly databaseId?: number
+  /**
+   * GitHub node_id string for the repository. Captured at ingest via GET /repos/{owner}/{repo}.
+   * Used as the secondary deny key for the metadata/repos.yaml redaction gate.
+   * Absent on legacy bindings — absence means "no usable deny key" (fails closed at the gate).
+   * INTERNAL: must NOT appear on any operator-facing projection (e.g. OperatorRunStatus).
+   */
+  readonly nodeId?: string
 }
 
 export interface ChannelIndex {
@@ -68,15 +82,29 @@ export function hasValidRepoBindingShape(value: unknown): value is RepoBinding {
   }
 
   const candidate = value as Partial<RepoBinding>
-  return (
-    typeof candidate.owner === 'string' &&
-    typeof candidate.repo === 'string' &&
-    typeof candidate.channelId === 'string' &&
-    typeof candidate.channelName === 'string' &&
-    typeof candidate.workspacePath === 'string' &&
-    typeof candidate.createdAt === 'string' &&
-    typeof candidate.createdByDiscordId === 'string'
-  )
+  if (
+    typeof candidate.owner !== 'string' ||
+    typeof candidate.repo !== 'string' ||
+    typeof candidate.channelId !== 'string' ||
+    typeof candidate.channelName !== 'string' ||
+    typeof candidate.workspacePath !== 'string' ||
+    typeof candidate.createdAt !== 'string' ||
+    typeof candidate.createdByDiscordId !== 'string'
+  ) {
+    return false
+  }
+
+  // Optional deny-key fields: when present, must be the correct type.
+  // Absent (undefined) is valid — legacy bindings have no deny keys.
+  if (candidate.databaseId !== undefined && typeof candidate.databaseId !== 'number') {
+    return false
+  }
+
+  if (candidate.nodeId !== undefined && typeof candidate.nodeId !== 'string') {
+    return false
+  }
+
+  return true
 }
 
 export function hasValidChannelIndexShape(value: unknown): value is ChannelIndex {

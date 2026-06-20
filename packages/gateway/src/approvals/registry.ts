@@ -162,6 +162,16 @@ export interface ApprovalRegistry {
   has: (requestID: string) => boolean
   pending: () => readonly string[]
   /**
+   * Returns true if any entry for the given `approvalScopeId` is in an
+   * `open` or `claimed` state (i.e. the run is waiting for approval).
+   *
+   * Returns false when no entry exists for the scope, or when the only
+   * matching entry is `confirmed` (already settled and about to be deleted).
+   *
+   * Boolean only — does not expose entry contents.
+   */
+  hasPendingForScope: (approvalScopeId: string) => boolean
+  /**
    * Transport-neutral decision intake: enforce scope binding, single-winner
    * claim, POST reply. Does NOT edit the embed/notification.
    *
@@ -426,6 +436,15 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     return Array.from(entries.keys())
   }
 
+  function hasPendingForScope(approvalScopeId: string): boolean {
+    for (const entry of entries.values()) {
+      if (entry.approvalScopeId === approvalScopeId && (entry.state === 'open' || entry.state === 'claimed')) {
+        return true
+      }
+    }
+    return false
+  }
+
   // -------------------------------------------------------------------------
   // handleDecision (transport-neutral decision intake)
   // -------------------------------------------------------------------------
@@ -688,6 +707,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     markMessagePostFailed,
     has,
     pending,
+    hasPendingForScope,
     handleDecision,
     confirmReply,
     applySettlement,

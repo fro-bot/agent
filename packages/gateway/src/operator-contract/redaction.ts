@@ -4,13 +4,9 @@
  * This module embeds the metadata/repos.yaml redaction obligation and the authorization obligation
  * as normative contract clauses bound to OPERATOR_CONTRACT_VERSION.
  *
- * It does NOT implement the redaction gate itself. The gate ships with the first
- * repo-data endpoint that needs it. This module provides:
- *   - REDACTION_OBLIGATION: the normative clause stating the four operational rules.
- *   - assertRedactionApplied: a fail-closed structural stub that throws by default,
- *     making the obligation grepable and unskippable.
- *   - AUTHORIZATION_OBLIGATION: the normative clause for operator decision/launch
- *     authorization, including the two documented security constraints.
+ * Cross-reference: fro-bot/dashboard docs/solutions/security-issues/cross-source-redaction-denylist-before-query-2026-06-15.md
+ * — the dashboard's reference implementation of the same invariant. The gateway mirrors the
+ * dashboard's denylist-before-query posture; this module is the agent-side authority.
  */
 
 // ---------------------------------------------------------------------------
@@ -46,7 +42,7 @@
  * for a denylisted repo MUST be omitted (null), not returned with a populated entityRef.
  */
 export const REDACTION_OBLIGATION: string =
-  'Redaction obligation (operator contract v1.0.0): ' +
+  'Redaction obligation (operator contract v1.1.0): ' +
   '(a) denylist-before-query — exclude redacted repos BEFORE any per-repo query ' +
   '(binding lookups, run-state reads, OperatorRunStatus projections); render-time filtering is too late. ' +
   '(b) format-stable deny keys — handle node_id format skew (MDEw… vs R_kgDO… base64 variants); ' +
@@ -55,50 +51,59 @@ export const REDACTION_OBLIGATION: string =
   'never return an unfiltered union. ' +
   '(d) composes alongside checkRepoAuthz (web/auth/repo-authz.ts), NOT instead of: ' +
   'checkRepoAuthz proves the operator MAY see a repo; redaction proves the repo IS NOT hidden by policy; ' +
-  'BOTH must pass. The two gates cannot silently diverge.'
+  'BOTH must pass. The two gates cannot silently diverge. ' +
+  'Cross-reference: fro-bot/dashboard docs/solutions/security-issues/cross-source-redaction-denylist-before-query-2026-06-15.md'
 
 // ---------------------------------------------------------------------------
-// assertRedactionApplied — fail-closed structural stub
+// assertRedactionApplied — real gate guard
 // ---------------------------------------------------------------------------
 
 /**
  * Context passed to assertRedactionApplied.
  *
- * The first repo-data endpoint MUST replace the stub body with the real
- * denylist-before-query gate, accepting this context (or a superset of it)
- * to perform the actual redaction check.
+ * The caller resolves the denylist check (via the gateway bridge / surface-gate)
+ * and passes the result here. The function does NOT receive repo identity (owner/repo)
+ * — structural no-oracle: it cannot echo what it does not receive.
  */
 export interface RedactionContext {
-  /** The repo reference being accessed, e.g. 'owner/repo'. */
-  readonly repoRef: string
+  /**
+   * The result of the denylist check for this repo.
+   * true = repo is denied (on the denylist or no usable deny key — fail closed).
+   * false = repo passed the denylist check and may be surfaced.
+   */
+  readonly isDenied: boolean
 }
 
 /**
- * Fail-closed redaction stub — deliberately throws by default.
+ * Redaction gate guard — asserts that the denylist check ran and the repo is allowed.
  *
- * This is a structural enforcement point, not a no-op placeholder. Its body
- * throws `REDACTION_GATE_NOT_IMPLEMENTED` so that any response path that
- * surfaces repo data without calling this function (or its real replacement)
- * crashes at runtime. This makes the redaction obligation:
- *   - Grepable: search for `assertRedactionApplied` to find every call site.
- *   - Unskippable: a response path that omits the call throws in production.
- *   - Auditable: the call site is visible in code review.
+ * Call this at every repo-data surface point after running the denylist predicate.
+ * It throws if called with a denied repo, making the "surfaced a denied repo" state
+ * a hard runtime error rather than a silent data leak.
  *
- * The first repo-data endpoint MUST replace this stub's body with the real
- * denylist-before-query gate (bound alongside checkRepoAuthz). Until then,
- * calling this function always throws.
+ * Contract:
+ * - `isDenied = false` → no-op (redaction ran, repo is allowed, proceed).
+ * - `isDenied = true`  → throws REDACTION_OBLIGATION_VIOLATED (surfacing a denied
+ *   repo is a contract violation; the caller must not reach this point for denied repos).
  *
- * The real gate implementation is deferred to the redaction gate follow-up.
+ * Structural no-oracle: this function does NOT accept owner/repo — it cannot echo
+ * repo identity in error messages. The caller must not pass repo identity here.
  *
- * @param _context - The repo reference being accessed (unused by the stub; the real gate will use it).
- * @throws {Error} Always — until the real gate replaces this stub body.
+ * Grepable: search for `assertRedactionApplied` to find every call site.
+ * Auditable: the call site is visible in code review.
+ *
+ * @param context - The result of the denylist check.
+ * @throws {Error} When `context.isDenied === true` — surfacing a denied repo is a
+ *   contract violation.
  */
-export function assertRedactionApplied(_context: RedactionContext): void {
-  throw new Error(
-    'REDACTION_GATE_NOT_IMPLEMENTED: redaction check not yet implemented. ' +
-      'The first repo-data endpoint must replace this stub with the real denylist-before-query gate ' +
-      '(bound alongside checkRepoAuthz). See REDACTION_OBLIGATION for the four operational rules.',
-  )
+export function assertRedactionApplied(context: RedactionContext): void {
+  if (context.isDenied === true) {
+    throw new Error(
+      'REDACTION_OBLIGATION_VIOLATED: attempted to surface a repo that failed the denylist check. ' +
+        'The caller must apply the denylist gate (via the surface-gate bridge) and omit denied repos ' +
+        'before reaching this point. See REDACTION_OBLIGATION for the four operational rules.',
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +135,7 @@ export function assertRedactionApplied(_context: RedactionContext): void {
  *     untrusted client input.
  */
 export const AUTHORIZATION_OBLIGATION: string =
-  'Authorization obligation (operator contract v1.0.0): ' +
+  'Authorization obligation (operator contract v1.1.0): ' +
   'An operator decision/launch MUST carry a transport-bound OperatorIdentity and DecisionInput ' +
   '(no free-form decidedBy: string). The contract cannot bypass the fail-closed approval gate. ' +
   'registry.handleDecision is the sole approval gate — all transports settle through it; ' +
