@@ -22,10 +22,13 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {DenylistCache} from '../redaction/denylist.js'
+import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
 import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {RunObservationManager} from './sse/manager.js'
 
 import {serve} from '@hono/node-server'
 import {getConnInfo} from '@hono/node-server/conninfo'
@@ -125,6 +128,25 @@ export interface OperatorServerDeps {
    * Required when allowlist is present; ignored otherwise.
    */
   readonly auditLogger?: AuditLogger
+  /**
+   * Denylist cache for the run-stream route's pre-subscribe redaction check.
+   * Consumed by the run-stream route to verify a repo is not denied before
+   * opening the SSE stream. Optional — omit in tests that don't exercise streaming.
+   */
+  readonly denylistCache?: DenylistCache
+  /**
+   * Bindings lookup for the run-stream route's repo-key resolution.
+   * Used to resolve a run's entity_ref to its binding deny keys before
+   * the pre-subscribe redaction check. Optional — omit in tests that don't exercise streaming.
+   */
+  readonly bindingsLookup?: BindingsLookup
+  /**
+   * Run-observation manager for the run-stream route's SSE subscription.
+   * Provides subscribe/unsubscribe for per-connection streaming; the route
+   * calls subscribe() after all gates pass and unsubscribe() on every exit path.
+   * Optional — omit in tests that don't exercise streaming.
+   */
+  readonly runObservationManager?: RunObservationManager
 }
 
 export interface OperatorServerConfig {
