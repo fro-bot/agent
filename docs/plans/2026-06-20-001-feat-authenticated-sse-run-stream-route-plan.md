@@ -1,9 +1,10 @@
 ---
 title: "feat: Authenticated SSE run-stream route (Unit 4b)"
 type: feat
-status: active
+status: completed
 date: 2026-06-20
 deepened: 2026-06-20
+completed: 2026-06-20
 origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan.md
 ---
 
@@ -107,7 +108,7 @@ GET /operator/runs/:runId/stream
 
 ## Implementation Units
 
-- [ ] **Unit 0: Thread the denylist, bindings, and manager into the operator app deps**
+- [x] **Unit 0: Thread the denylist, bindings, and manager into the operator app deps**
 
   **Goal:** Make the redaction cache, bindings lookup, and observation manager reachable from operator routes — they exist in `program.ts` today but are not in `OperatorServerDeps`.
 
@@ -134,7 +135,7 @@ GET /operator/runs/:runId/stream
 
   **Verification:** The operator app can reach the denylist cache, bindings lookup, and observation manager; no second instance is created; no behavior change.
 
-- [ ] **Unit 1: Gate + authorized SSE open (no standalone success response)**
+- [x] **Unit 1: Gate + authorized SSE open (no standalone success response)**
 
   **Goal:** The authenticated, server-owned, fail-closed gate that resolves the run, enforces redaction + repo authz, and — on success — transitions **directly into the SSE stream**. Every denial is the one generic not-found; there is **no** authorized non-stream response (no oracle).
 
@@ -171,7 +172,7 @@ GET /operator/runs/:runId/stream
 
   **Verification:** No stream and no distinguishable success response unless token + lookup + redaction + authz + slot all pass; every denial is the one generic shape; resolved repo is server-owned; route is guard-wrapped and pinned.
 
-- [ ] **Unit 2: SSE live bridge + socket timeout + single cleanup**
+- [x] **Unit 2: SSE live bridge + socket timeout + single cleanup**
 
   **Goal:** Turn Unit 1's stream-open into a full live stream — live frames, heartbeat, a spike-verified per-connection socket timeout, and one synchronous guarded cleanup that all teardown paths converge on.
 
@@ -203,7 +204,7 @@ GET /operator/runs/:runId/stream
 
   **Verification:** Live frames stream with snapshot-on-subscribe semantics; one synchronous guarded cleanup handles every teardown path; the socket-timeout mechanism is spike-verified and never leaks.
 
-- [ ] **Unit 3: Continuous-authz lease + per-operator stream cap**
+- [x] **Unit 3: Continuous-authz lease + per-operator stream cap**
 
   **Goal:** Keep a live stream honest — periodically re-verify session, token, redaction, and repo authz with a generation guard, terminate on loss, and bound concurrent streams per operator id.
 
