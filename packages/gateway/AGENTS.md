@@ -231,6 +231,8 @@ When the workspace OpenCode config sets any tool to `ask` (rather than the defau
 
 - **`heartbeat.stop()` failure can leave a run stuck.** If `heartbeat.stop()` returns an error, the gateway logs a warning and proceeds with last-known etags, but the run may remain in EXECUTING with the lock held until the lease expires. The next startup recovery sweep will detect and heal the stale run automatically.
 
+- **Run-observation cache leak on failed transitions.** If a run's state transition fails after the PENDING observe is sent (so the run never reaches a terminal status), its latest-status cache entry in the run-observation manager is never cleared. A future subscriber for that run would receive the stale cached status rather than a reset frame. The entry is cleared on process restart. A future staleness/reconcile path will evict these entries proactively.
+
 ## Build
 
 ```bash
