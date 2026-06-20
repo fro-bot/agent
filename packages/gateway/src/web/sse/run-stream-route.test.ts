@@ -24,6 +24,48 @@ import {setOperatorRouteGuard} from '../operator-route.js'
 import {buildRunStreamRoute} from './run-stream-route.js'
 
 // ---------------------------------------------------------------------------
+// Fake timer seam for lease tests
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal fake setInterval/clearInterval pair that lets tests drive ticks
+ * manually without real timers.
+ */
+function makeFakeTimer(): {
+  readonly setInterval: (fn: () => void, _ms: number) => ReturnType<typeof globalThis.setInterval>
+  readonly clearInterval: (id: ReturnType<typeof globalThis.setInterval> | undefined) => void
+  readonly tick: () => Promise<void>
+  readonly tickCount: () => number
+  readonly cleared: () => boolean
+} {
+  let callback: (() => void) | undefined
+  let ticks = 0
+  let isCleared = false
+  let nextId = 1
+
+  return {
+    setInterval: (fn: () => void, _ms: number): ReturnType<typeof globalThis.setInterval> => {
+      callback = fn
+      return nextId++ as unknown as ReturnType<typeof globalThis.setInterval>
+    },
+    clearInterval: (_id: ReturnType<typeof globalThis.setInterval> | undefined): void => {
+      isCleared = true
+      callback = undefined
+    },
+    tick: async (): Promise<void> => {
+      if (callback !== undefined) {
+        ticks++
+        callback()
+        // Yield to let async work inside the tick settle
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+      }
+    },
+    tickCount: () => ticks,
+    cleared: () => isCleared,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Stub factories
 // ---------------------------------------------------------------------------
 
@@ -36,10 +78,19 @@ function makeLogger(): RunStreamRouteDeps['logger'] {
   }
 }
 
+/** A valid session entry returned by the default stub session store. */
+const STUB_SESSION = {
+  githubUserId: 99,
+  login: 'testuser',
+  issuedAt: 0,
+  lastAccessedAt: 0,
+  revoked: false,
+} as const
+
 function makeSessionStore(overrides?: Partial<SessionStore>): SessionStore {
   return {
     create: vi.fn(() => 'session-id'),
-    get: vi.fn(() => undefined),
+    get: vi.fn(() => STUB_SESSION),
     touch: vi.fn(),
     delete: vi.fn(),
     onRevoke: vi.fn(),
@@ -120,6 +171,20 @@ function makeDeps(overrides?: Partial<RunStreamRouteDeps>): RunStreamRouteDeps {
     now: () => 0,
     ...overrides,
   }
+}
+
+/**
+ * Build deps with a fake timer injected for lease tests.
+ */
+function makeDepsWithFakeTimer(
+  fakeTimer: ReturnType<typeof makeFakeTimer>,
+  overrides?: Partial<RunStreamRouteDeps>,
+): RunStreamRouteDeps {
+  return makeDeps({
+    setInterval: fakeTimer.setInterval,
+    clearInterval: fakeTimer.clearInterval,
+    ...overrides,
+  })
 }
 
 /**
@@ -1077,5 +1142,594 @@ describe('GET /operator/runs/:runId/stream — heartbeat', () => {
     const SOCKET_TIMEOUT_MS = 60_000
     const HEARTBEAT_INTERVAL_MS = 15_000
     expect(SOCKET_TIMEOUT_MS).toBeGreaterThan(HEARTBEAT_INTERVAL_MS)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: repo access revoked mid-stream
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: repo access revoked mid-stream', () => {
+  it('closes the stream on the next tick when checkRepoAuthz starts returning authorized:false', async () => {
+    // #given — stream opens with authz passing; after first tick authz is revoked
+    let authzAuthorized = true
+    const repoAuthzDeps: RepoAuthzDeps = {
+      ...makeRepoAuthzDeps(true),
+      cache: {
+        get: vi.fn(() =>
+          authzAuthorized
+            ? {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
+            : {authorized: false as const, reason: 'github_denied' as const, expiresAt: Number.MAX_SAFE_INTEGER},
+        ),
+        set: vi.fn(),
+        getInFlight: vi.fn(() => undefined),
+        setInFlight: vi.fn(),
+        deleteInFlight: vi.fn(),
+        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
+      },
+    }
+
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    // #when — stream opens (authz passes)
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // Revoke access, then fire a lease tick
+    authzAuthorized = false
+    await fakeTimer.tick()
+
+    // #then — cleanup ran: unsubscribe called once (connection closed)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Restore authz and verify the slot was released (new stream succeeds)
+    authzAuthorized = true
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res.body?.cancel()
+  })
+
+  it('does not call dropOperatorToken when checkRepoAuthz returns github_denied', async () => {
+    // #given — gate passes (authorized); lease tick sees github_denied
+    // The cache returns authorized on the first call (gate), denied on subsequent calls (lease)
+    let callCount = 0
+    const repoAuthzDeps: RepoAuthzDeps = {
+      ...makeRepoAuthzDeps(true),
+      cache: {
+        get: vi.fn(() => {
+          callCount++
+          if (callCount === 1) {
+            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
+          }
+          return {authorized: false as const, reason: 'github_denied' as const, expiresAt: Number.MAX_SAFE_INTEGER}
+        }),
+        set: vi.fn(),
+        getInFlight: vi.fn(() => undefined),
+        setInFlight: vi.fn(),
+        deleteInFlight: vi.fn(),
+        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
+      },
+    }
+
+    const dropOperatorToken = vi.fn()
+    const sessionStore = makeSessionStore({dropOperatorToken})
+
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, sessionStore, manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — lease tick fires with github_denied
+    await fakeTimer.tick()
+
+    // #then — dropOperatorToken was NOT called (cannot distinguish revoked token from denied repo)
+    expect(dropOperatorToken).not.toHaveBeenCalled()
+
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: repo denylisted mid-stream
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: repo denylisted mid-stream', () => {
+  it('closes the stream on the next tick when isRepoDenied flips to true', async () => {
+    // #given — stream opens with repo allowed; denylist flips to denied
+    let isDenied = false
+    const denylistCache: DenylistCache = {
+      getDenylistState: vi.fn(async () => undefined),
+      isRepoDenied: vi.fn(() => isDenied),
+    }
+
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {denylistCache, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // Flip denylist, then fire a lease tick
+    isDenied = true
+    await fakeTimer.tick()
+
+    // #then — cleanup ran: unsubscribe called once (connection closed)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Restore denylist and verify the slot was released (new stream succeeds)
+    isDenied = false
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: token dropped / session expired mid-stream
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: token/session loss mid-stream', () => {
+  it('closes the stream on the next tick when getOperatorToken returns undefined', async () => {
+    // #given — token is present at open time; dropped before the lease tick
+    let tokenPresent = true
+    const sessionStore = makeSessionStore({
+      getOperatorToken: vi.fn(() => (tokenPresent ? 'stub-oauth-token' : undefined)),
+    })
+
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {sessionStore, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // Drop the token, then fire a lease tick
+    tokenPresent = false
+    await fakeTimer.tick()
+
+    // #then — cleanup ran: unsubscribe called once (connection closed)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Restore token and verify the slot was released (new stream succeeds)
+    tokenPresent = true
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res.body?.cancel()
+  })
+
+  it('closes the stream on the next tick when session.get returns undefined', async () => {
+    // #given — session is valid at open time; expires before the lease tick
+    let sessionValid = true
+    const sessionStore = makeSessionStore({
+      get: vi.fn(() => (sessionValid ? STUB_SESSION : undefined)),
+    })
+
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {sessionStore, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // Expire the session, then fire a lease tick
+    sessionValid = false
+    await fakeTimer.tick()
+
+    // #then — cleanup ran
+    expect(unsubscribeCalls).toBe(1)
+
+    // Slot released
+    const res2 = await fetchStream(app, 'run-def')
+    expect(res2.status).toBe(200)
+    await res2.body?.cancel()
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: generation guard (late-resolving check is a no-op)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: generation guard', () => {
+  it('a lease tick whose checkRepoAuthz resolves after teardown does nothing (no double cleanup)', async () => {
+    // #given — a slow checkRepoAuthz that we can resolve manually after teardown
+    let resolveAuthz!: (result: {authorized: false; reason: 'github_denied'}) => void
+    const slowAuthzPromise = new Promise<{authorized: false; reason: 'github_denied'}>(resolve => {
+      resolveAuthz = resolve
+    })
+
+    // First call (gate): returns authorized immediately via cache
+    // Subsequent calls (lease tick): returns the slow promise
+    let callCount = 0
+    const repoAuthzDeps: RepoAuthzDeps = {
+      ...makeRepoAuthzDeps(true),
+      cache: {
+        get: vi.fn(() => {
+          callCount++
+          if (callCount === 1) {
+            // Gate call: authorized
+            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
+          }
+          // Lease tick call: cache miss → will go to fetch (which we control via slowAuthzPromise)
+          return undefined
+        }),
+        set: vi.fn(),
+        getInFlight: vi.fn(() => undefined),
+        setInFlight: vi.fn(),
+        deleteInFlight: vi.fn(),
+        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
+      },
+      fetch: vi.fn(async () => {
+        // Block until we manually resolve
+        const result = await slowAuthzPromise
+        return new Response('{}', {status: result.authorized === false ? 403 : 200})
+      }),
+    }
+
+    let unsubscribeCalls = 0
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+    expect(capturedCallbacks).toBeDefined()
+
+    // Start a lease tick — checkRepoAuthz is now in-flight (blocked on slowAuthzPromise)
+    // We do NOT await tick() yet — it's pending
+    const tickPromise = fakeTimer.tick()
+
+    // Tear down the connection via manager onClose BEFORE the tick resolves
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // #then — unsubscribe called once (from onClose teardown)
+    expect(unsubscribeCalls).toBe(1)
+
+    // Now resolve the slow authz check (returns denied)
+    resolveAuthz({authorized: false, reason: 'github_denied'})
+    await tickPromise
+
+    // #then — unsubscribe still called exactly once (generation guard prevented double cleanup)
+    expect(unsubscribeCalls).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: timer cleared on teardown
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: timer cleared on teardown', () => {
+  it('clears the lease timer when the stream ends via manager onClose', async () => {
+    // #given — stream opens with a fake timer
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — stream ends via manager onClose
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // #then — clearInterval was called (timer cleared in cleanup)
+    expect(fakeTimer.cleared()).toBe(true)
+  })
+
+  it('does not fire further ticks after cleanup (advancing timer is a no-op)', async () => {
+    // #given — stream opens; we track how many times the lease check runs after teardown
+    let leaseCheckCount = 0
+    const repoAuthzDeps: RepoAuthzDeps = {
+      ...makeRepoAuthzDeps(true),
+      cache: {
+        get: vi.fn(() => {
+          leaseCheckCount++
+          return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
+        }),
+        set: vi.fn(),
+        getInFlight: vi.fn(() => undefined),
+        setInFlight: vi.fn(),
+        deleteInFlight: vi.fn(),
+        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
+      },
+    }
+
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // Close the stream
+    capturedCallbacks?.onClose('terminal')
+    await res.body?.cancel()
+
+    // Reset the counter after teardown so we only count post-teardown ticks
+    leaseCheckCount = 0
+
+    // #when — advance the timer after teardown (should be a no-op)
+    await fakeTimer.tick()
+    await fakeTimer.tick()
+
+    // #then — no further lease checks fired after teardown
+    expect(leaseCheckCount).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Continuous-authz lease: no false drop (still-authorized stream survives ticks)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — lease: no false drop', () => {
+  it('a still-authorized stream survives multiple lease ticks without cleanup', async () => {
+    // #given — authz always passes; stream stays open
+    let unsubscribeCalls = 0
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+        return () => {
+          unsubscribeCalls++
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager})
+    const app = buildTestApp(deps)
+
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #when — fire multiple lease ticks with authz still passing
+    await fakeTimer.tick()
+    await fakeTimer.tick()
+    await fakeTimer.tick()
+
+    // #then — no cleanup fired; stream still open
+    expect(unsubscribeCalls).toBe(0)
+
+    await res.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cap hardening: reconnect storm
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — cap: reconnect storm', () => {
+  it('active count never exceeds maxStreams during rapid open+close cycles', async () => {
+    // #given — cap of 2; track active count via subscribe/unsubscribe
+    let activeCount = 0
+    let maxObservedCount = 0
+    const callbacks: SubscriberCallbacks[] = []
+
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, cb: SubscriberCallbacks) => {
+        activeCount++
+        if (activeCount > maxObservedCount) maxObservedCount = activeCount
+        callbacks.push(cb)
+        return () => {
+          activeCount--
+        }
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager, maxStreamsPerOperator: 2})
+    const app = buildTestApp(deps)
+
+    // Open 2 streams (at cap)
+    const res1 = await fetchStream(app, 'run-1')
+    const res2 = await fetchStream(app, 'run-2')
+    expect(res1.status).toBe(200)
+    expect(res2.status).toBe(200)
+
+    // Third should be 429
+    const res3 = await fetchStream(app, 'run-3')
+    expect(res3.status).toBe(429)
+    await res3.json()
+
+    // Close stream 1 via onClose (synchronous slot release)
+    callbacks[0]?.onClose('terminal')
+    await res1.body?.cancel()
+
+    // Now a new stream should succeed (slot was released synchronously)
+    const res4 = await fetchStream(app, 'run-4')
+    expect(res4.status).toBe(200)
+
+    // #then — active count never exceeded maxStreams
+    expect(maxObservedCount).toBeLessThanOrEqual(2)
+
+    await res2.body?.cancel()
+    await res4.body?.cancel()
+  })
+
+  it('each close frees exactly one slot (synchronous release in cleanup)', async () => {
+    // #given — cap of 1; open, close, open again — should always succeed
+    let capturedCallbacks: SubscriberCallbacks | undefined
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        capturedCallbacks = callbacks
+        return () => undefined
+      }),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager, maxStreamsPerOperator: 1})
+    const app = buildTestApp(deps)
+
+    for (let i = 0; i < 5; i++) {
+      const res = await fetchStream(app, `run-${i}`)
+      expect(res.status).toBe(200)
+      // Close via onClose (synchronous slot release)
+      capturedCallbacks?.onClose('terminal')
+      await res.body?.cancel()
+    }
+
+    // After all cycles, a new stream should still succeed
+    const finalRes = await fetchStream(app, 'run-final')
+    expect(finalRes.status).toBe(200)
+    await finalRes.body?.cancel()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cap hardening: multi-session same operator shares one cap
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a Hono app where the guard's sessionId is controlled by a mutable ref.
+ * This lets a single app simulate multiple sessions from the same operator.
+ */
+function buildTestAppWithMutableSession(
+  deps: RunStreamRouteDeps,
+  guardUserId: number,
+  sessionIdRef: {current: string},
+): Hono {
+  const app = new Hono()
+  setOperatorRouteGuard(app, async (_c, _method, _path) => ({
+    ok: true as const,
+    githubUserId: guardUserId,
+    sessionId: sessionIdRef.current,
+  }))
+  buildRunStreamRoute(app, deps)
+  return app
+}
+
+describe('GET /operator/runs/:runId/stream — cap: multi-session same operator', () => {
+  it('two streams from the same githubUserId but different sessionIds share one cap', async () => {
+    // #given — cap of 1; same githubUserId (99) with two different sessionIds
+    // A single app with a mutable sessionId ref so both requests share the same activeStreams map
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager, maxStreamsPerOperator: 1})
+
+    const sessionIdRef = {current: 'session-A'}
+    const app = buildTestAppWithMutableSession(deps, 99, sessionIdRef)
+
+    // First stream from session-A (githubUserId=99)
+    sessionIdRef.current = 'session-A'
+    const res1 = await app.fetch(new Request('http://localhost/operator/runs/run-1/stream'))
+    expect(res1.status).toBe(200)
+
+    // #when — second stream from session-B (same githubUserId=99, different session)
+    sessionIdRef.current = 'session-B'
+    const res2 = await app.fetch(new Request('http://localhost/operator/runs/run-2/stream'))
+    const body2 = await res2.json()
+
+    // #then — 429: cap is keyed on githubUserId, not sessionId
+    expect(res2.status).toBe(429)
+    expect(body2).toEqual({error: 'too many streams'})
+
+    await res1.body?.cancel()
+  })
+
+  it('the (maxStreams+1)th stream from the same githubUserId is 429 regardless of session', async () => {
+    // #given — cap of 2; open 2 streams from different sessions, 3rd is 429
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
+    })
+
+    const fakeTimer = makeFakeTimer()
+    const deps = makeDepsWithFakeTimer(fakeTimer, {manager, maxStreamsPerOperator: 2})
+
+    const sessionIdRef = {current: 'session-A'}
+    const app = buildTestAppWithMutableSession(deps, 99, sessionIdRef)
+
+    sessionIdRef.current = 'session-A'
+    const res1 = await app.fetch(new Request('http://localhost/operator/runs/run-1/stream'))
+    sessionIdRef.current = 'session-B'
+    const res2 = await app.fetch(new Request('http://localhost/operator/runs/run-2/stream'))
+    expect(res1.status).toBe(200)
+    expect(res2.status).toBe(200)
+
+    // #when — third stream from a third session (same githubUserId)
+    sessionIdRef.current = 'session-C'
+    const res3 = await app.fetch(new Request('http://localhost/operator/runs/run-3/stream'))
+    const body3 = await res3.json()
+
+    // #then — 429
+    expect(res3.status).toBe(429)
+    expect(body3).toEqual({error: 'too many streams'})
+
+    await res1.body?.cancel()
+    await res2.body?.cancel()
   })
 })

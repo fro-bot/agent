@@ -64,6 +64,21 @@ export interface RunStreamRouteDeps {
    * Defaults to 5 when omitted.
    */
   readonly maxStreamsPerOperator?: number
+  /**
+   * How often (ms) to re-verify session, token, redaction, and repo authz for a live stream.
+   * Defaults to DEFAULT_LEASE_INTERVAL_MS when omitted.
+   */
+  readonly leaseIntervalMs?: number
+  /**
+   * Injectable setInterval — defaults to globalThis.setInterval.
+   * Injected in tests to drive lease ticks manually without real timers.
+   */
+  readonly setInterval?: (fn: () => void, ms: number) => ReturnType<typeof globalThis.setInterval>
+  /**
+   * Injectable clearInterval — defaults to globalThis.clearInterval.
+   * Injected in tests to verify the timer is cleared on teardown.
+   */
+  readonly clearInterval?: (id: ReturnType<typeof globalThis.setInterval> | undefined) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +95,13 @@ const DEFAULT_MAX_STREAMS_PER_OPERATOR = 5
  * bounds idle pre-auth sockets and is intentionally left unchanged.
  */
 const SOCKET_TIMEOUT_MS = 60_000
+
+/**
+ * How often to re-verify session, token, redaction, and repo authz for a live stream.
+ * A small multiple of the 15s heartbeat interval. Revocation detection is bounded by
+ * checkRepoAuthz's positive cache TTL (~5m + 10% jitter) plus this interval.
+ */
+const DEFAULT_LEASE_INTERVAL_MS = 30_000
 
 // ---------------------------------------------------------------------------
 // Socket timeout helpers
@@ -180,6 +202,71 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
 }
 
 // ---------------------------------------------------------------------------
+// Continuous-authz lease check
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-verify session, token, redaction, and repo authz for a live stream.
+ *
+ * Called on each lease tick. On any failure, invokes onFail() to close this
+ * connection. Each await point is followed by a generation guard: if the
+ * connection was already torn down (isCleaned() === true) before the async
+ * work resolved, the tick is a no-op — no double cleanup, no late close.
+ *
+ * Does NOT call dropOperatorToken() on a generic github_denied result because
+ * that result cannot distinguish a revoked token from a denied repo.
+ */
+async function runLeaseCheck(
+  githubUserId: number,
+  sessionId: string,
+  owner: string,
+  repo: string,
+  deps: RunStreamRouteDeps,
+  isCleaned: () => boolean,
+  onFail: () => void,
+): Promise<void> {
+  const nowMs = deps.now()
+
+  // ── Check 1: Session still valid ─────────────────────────────────────────
+  const session = deps.sessionStore.get(sessionId, nowMs)
+  if (isCleaned() === true) return
+  if (session === undefined) {
+    onFail()
+    return
+  }
+
+  // ── Check 2: OAuth token still present ───────────────────────────────────
+  const freshToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
+  if (isCleaned() === true) return
+  if (freshToken === undefined) {
+    onFail()
+    return
+  }
+
+  // ── Check 3: Repo still not denylisted ───────────────────────────────────
+  const denyKeys = await resolveRepoDenyKeys(owner, repo, deps.bindingsLookup)
+  if (isCleaned() === true) return
+  await deps.denylistCache.getDenylistState()
+  if (isCleaned() === true) return
+  if (deps.denylistCache.isRepoDenied(denyKeys) === true) {
+    onFail()
+    return
+  }
+
+  // ── Check 4: Repo authz still passes ─────────────────────────────────────
+  // Goes through checkRepoAuthz's cache; revocation detection is bounded by
+  // the positive cache TTL (~5m + 10% jitter) plus the lease interval.
+  // No cache-bypass — accepted for v1 (status-only data).
+  const authzResult = await checkRepoAuthz(githubUserId, owner, repo, freshToken, deps.repoAuthzDeps)
+  if (isCleaned() === true) return
+  if (authzResult.authorized === false) {
+    // Do NOT call dropOperatorToken here — github_denied cannot distinguish
+    // a revoked token from a denied repo. Only drop on a token-specific signal.
+    onFail()
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
 
@@ -273,11 +360,19 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
     const socket = getConnectionSocket(c)
     const priorSocketTimeout = raiseSocketTimeout(socket)
 
+    const setIntervalFn = deps.setInterval ?? globalThis.setInterval.bind(globalThis)
+    const clearIntervalFn = deps.clearInterval ?? globalThis.clearInterval.bind(globalThis)
+    const leaseIntervalMs = deps.leaseIntervalMs ?? DEFAULT_LEASE_INTERVAL_MS
+
     let cleaned = false
+    // Declared before cleanup so cleanup can clear it; assigned when the stream opens.
+    let leaseTimer: ReturnType<typeof globalThis.setInterval> | undefined
 
     const cleanup = (unsubscribe: () => void): void => {
       if (cleaned === true) return
       cleaned = true
+      // Clear the lease timer before unsubscribing so no tick fires during teardown.
+      clearIntervalFn(leaseTimer)
       unsubscribe()
       // Restore the socket timeout to its pre-stream value so it never leaks
       // to a reused keep-alive socket.
@@ -319,6 +414,26 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
             cleanup(unsubscribe)
             resolve()
           })
+
+          // Start the continuous-authz lease timer.
+          // Re-verifies session, token, redaction, and repo authz on each tick.
+          // On any failure, closes this connection only (not run-wide).
+          leaseTimer = setIntervalFn((): void => {
+            // runLeaseCheck is async; fire-and-forget with a no-op error handler
+            // (errors inside are handled by the generation guard + cleanup path).
+            runLeaseCheck(
+              githubUserId,
+              sessionId,
+              owner,
+              repo,
+              deps,
+              () => cleaned,
+              () => {
+                cleanup(unsubscribe)
+                resolve()
+              },
+            ).catch(() => {})
+          }, leaseIntervalMs)
         })
       } finally {
         // Safety net: restore the socket timeout if cleanup() was never called
