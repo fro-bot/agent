@@ -2330,6 +2330,192 @@ describe('GET /operator/auth/github/callback — OAuth token retention', () => {
 })
 
 // ---------------------------------------------------------------------------
+// OAuth callback — return_to redirect on session-minted success path
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/auth/github/callback — return_to redirect after session mint', () => {
+  it('redirects to allowlisted return_to path (302) with Set-Cookie on session-minted success', async () => {
+    // #given — state has a redirectTarget that is in the allowlist
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: '/operator/dashboard',
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig() // allowedReturnPaths includes '/operator/dashboard'
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — 302 redirect to the validated return path
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator/dashboard')
+
+    // #and — session cookie is still set on the redirect response
+    const setCookieHeaders = res.headers.getSetCookie()
+    const sessionCookie = setCookieHeaders.find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`))
+    expect(sessionCookie).toBeDefined()
+
+    // #and — session was minted in the store
+    expect(sessionStore.size()).toBe(1)
+  })
+
+  it('falls back to 200 JSON when state has no redirectTarget (no return_to)', async () => {
+    // #given — state has no redirectTarget
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      // no redirectTarget
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — falls back to existing 200 JSON behavior
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({githubUserId: 42, login: 'octocat'})
+
+    // #and — session cookie is still set
+    const setCookieHeaders = res.headers.getSetCookie()
+    const sessionCookie = setCookieHeaders.find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`))
+    expect(sessionCookie).toBeDefined()
+  })
+
+  it('falls back to 200 JSON when redirectTarget is NOT in allowedReturnPaths (security: no unvalidated redirect)', async () => {
+    // #given — state has a redirectTarget that is NOT in the allowlist
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: '/some/unlisted/path',
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig() // allowedReturnPaths: ['/operator/dashboard', '/operator/runs']
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — MUST NOT redirect; falls back to 200 JSON (security-critical assertion)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({githubUserId: 42, login: 'octocat'})
+
+    // #and — session was still minted (allowlist failure only affects redirect, not session)
+    expect(sessionStore.size()).toBe(1)
+  })
+
+  it('falls back to 200 JSON when redirectTarget is an absolute URL (cross-origin attempt)', async () => {
+    // #given — state has an absolute URL as redirectTarget (should be rejected by validateReturnPath)
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: 'https://evil.attacker.com/steal',
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — MUST NOT redirect to cross-origin URL; falls back to 200 JSON
+    expect(res.status).toBe(200)
+    expect(res.headers.get('location')).toBeNull()
+
+    // #and — session was still minted
+    expect(sessionStore.size()).toBe(1)
+  })
+
+  it('no-session-store path still returns 200 JSON regardless of redirectTarget', async () => {
+    // #given — no session store wired; state has a redirectTarget
+    const stateStore = createInMemoryStateStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: '/operator/dashboard',
+    })
+
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const config = makeStubConfig()
+    const app = buildTestApp(deps, config) // no session store
+
+    // #when
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+
+    // #then — no-session path is unchanged: always 200 JSON
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({githubUserId: 42, login: 'octocat'})
+  })
+})
+
+// ---------------------------------------------------------------------------
 // OAuth callback — allowlist check before session creation (Fix 2)
 // ---------------------------------------------------------------------------
 
