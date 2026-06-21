@@ -176,6 +176,8 @@ function makeDeps(overrides?: Partial<LaunchRouteDeps>): LaunchRouteDeps {
     // Pass-through rate limiters (always allow) for most tests
     perMinRateLimiter: {allow: () => true},
     perHrRateLimiter: {allow: () => true},
+    // runObservationManager absent by default — tests that exercise output routing
+    // pass it explicitly via overrides.
     ...overrides,
   }
 }
@@ -1034,5 +1036,104 @@ describe('LaunchAdmission type — compile-time shape check', () => {
     const rejected: LaunchAdmission = {accepted: false, reason: 'cap'}
     expect(rejected.accepted).toBe(false)
     expect((rejected as {accepted: false; reason: string}).reason).toBe('cap')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ReplySink wired to runObservationManager — output routing
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — replySink wired to runObservationManager', () => {
+  it('replySink append routes output delta to manager.observeOutput with the route runId', async () => {
+    // #given — a manager spy and a captured replySink from launchWork
+    const observeOutput = vi.fn()
+    const runObservationManager = {observeOutput}
+
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        capturedRunId = request.runId
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps({runObservationManager})
+    const app = buildApp(deps)
+
+    // #when — launch the route so launchWork captures the replySink
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined || capturedRunId === undefined)
+      throw new Error('launchWork did not capture replySink/runId')
+
+    // #when — simulate the engine appending output text
+    capturedReplySink.append('hello ')
+    capturedReplySink.append('world')
+
+    // #then — each append pushed a delta to the manager with the route's runId
+    // opts is undefined for delta frames (no final flag)
+    expect(observeOutput).toHaveBeenCalledTimes(2)
+    expect(observeOutput).toHaveBeenNthCalledWith(1, capturedRunId, 'hello ', undefined)
+    expect(observeOutput).toHaveBeenNthCalledWith(2, capturedRunId, 'world', undefined)
+  })
+
+  it('replySink flush routes final answer to manager.observeOutput with final:true', async () => {
+    // #given — a manager spy and a captured replySink from launchWork
+    const observeOutput = vi.fn()
+    const runObservationManager = {observeOutput}
+
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        capturedRunId = request.runId
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps({runObservationManager})
+    const app = buildApp(deps)
+
+    // #when — launch and simulate engine output
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined || capturedRunId === undefined)
+      throw new Error('launchWork did not capture replySink/runId')
+    capturedReplySink.append('the answer')
+    observeOutput.mockClear() // clear the append delta call
+
+    // #when — engine flushes (terminal)
+    await capturedReplySink.flush()
+
+    // #then — final frame pushed with the full buffer and final:true
+    expect(observeOutput).toHaveBeenCalledTimes(1)
+    expect(observeOutput).toHaveBeenCalledWith(capturedRunId, 'the answer', {final: true})
+  })
+
+  it('replySink degrades to a no-op when runObservationManager is absent', async () => {
+    // #given — no manager in deps
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps() // no runObservationManager
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined) throw new Error('launchWork did not capture replySink')
+    const sink = capturedReplySink
+
+    // #when — append and flush do not throw (graceful no-op)
+    expect(() => sink.append('some text')).not.toThrow()
+    await expect(sink.flush()).resolves.toBeUndefined()
   })
 })

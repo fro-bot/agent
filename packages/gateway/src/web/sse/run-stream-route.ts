@@ -183,6 +183,8 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
   } else if (frame.type === 'heartbeat') {
     // SSE comment line — keepalive, not a named event
     await stream.write(': heartbeat\n\n')
+  } else if (frame.type === 'output') {
+    await stream.writeSSE({event: 'output', data: JSON.stringify(frame.data)})
   } else {
     // Exhaustiveness guard: a new ObservationFrame variant must be handled above.
     const EXHAUSTIVE_CHECK: never = frame

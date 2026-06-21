@@ -695,6 +695,11 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
       now: clock,
+      // Wire the observation manager so the web ReplySink pushes output deltas
+      // and the final answer frame to SSE subscribers. Optional — when absent
+      // (e.g. in tests that don't exercise streaming), the sink degrades to a
+      // buffering no-op. Mirrors the optional pattern used by buildRunStreamRoute.
+      runObservationManager: deps.runObservationManager,
     })
   }
 
