@@ -49,6 +49,13 @@ export const DEFAULT_TERMINAL_REPLAY_TTL_MS = 10 * 60 * 1000
  */
 export const DEFAULT_TERMINAL_REPLAY_MAX_ENTRIES = 500
 
+/**
+ * Maximum total byte budget for the terminal replay cache (8 MB).
+ * When inserting an entry would exceed this budget, oldest entries are evicted
+ * until the budget is satisfied. Works in tandem with the entry-count cap.
+ */
+export const DEFAULT_TERMINAL_REPLAY_MAX_BYTES = 8 * 1024 * 1024
+
 // ---------------------------------------------------------------------------
 // Terminal statuses
 // ---------------------------------------------------------------------------
@@ -153,6 +160,8 @@ export interface RunObservationManagerDeps {
   readonly subscriberQueueCapBytes?: number
   readonly terminalReplayTtlMs?: number
   readonly terminalReplayMaxEntries?: number
+  /** Total byte budget for the terminal replay cache. Defaults to DEFAULT_TERMINAL_REPLAY_MAX_BYTES. */
+  readonly terminalReplayMaxBytes?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +301,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   const subscriberQueueCapBytes = deps.subscriberQueueCapBytes ?? DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES
   const terminalReplayTtlMs = deps.terminalReplayTtlMs ?? DEFAULT_TERMINAL_REPLAY_TTL_MS
   const terminalReplayMaxEntries = deps.terminalReplayMaxEntries ?? DEFAULT_TERMINAL_REPLAY_MAX_ENTRIES
+  const terminalReplayMaxBytes = deps.terminalReplayMaxBytes ?? DEFAULT_TERMINAL_REPLAY_MAX_BYTES
 
   // ---------------------------------------------------------------------------
   // State
@@ -336,9 +346,37 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   /** Whether the manager has been shut down. */
   let isShutdown = false
 
+  /**
+   * Tracks which runIds have reached terminal state. Used to guard against
+   * stale non-terminal observe() calls that arrive out of causal order after
+   * a terminal observe() has already committed the replay cache entry.
+   */
+  const terminalRuns = new Set<string>()
+
+  /** Running total of estimated bytes stored in terminalReplayCache. */
+  let terminalReplayCacheBytes = 0
+
   // ---------------------------------------------------------------------------
   // Internal: terminal replay cache management
   // ---------------------------------------------------------------------------
+
+  /**
+   * Estimate the byte cost of a terminal replay cache entry.
+   * Accounts for the final output frame (if any) plus a small overhead for the
+   * terminal status object.
+   */
+  function estimateReplayCacheEntryBytes(entry: TerminalReplayCacheEntry): number {
+    let bytes = 0
+    if (entry.finalOutput !== undefined) {
+      const outputFrame: OutputFrame = {type: 'output', data: entry.finalOutput}
+      bytes += estimateFrameBytes(outputFrame)
+    }
+    if (entry.terminalStatus !== undefined) {
+      const statusFrame: StatusFrame = {type: 'status', data: entry.terminalStatus}
+      bytes += estimateFrameBytes(statusFrame)
+    }
+    return bytes
+  }
 
   function evictTerminalReplayEntry(runId: string): void {
     const entry = terminalReplayCache.get(runId)
@@ -347,25 +385,37 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
         deps.clearTimeout(entry.evictionTimer)
       }
       terminalReplayCache.delete(runId)
+      // Keep byte accounting in sync with the evicted entry
+      terminalReplayCacheBytes = Math.max(0, terminalReplayCacheBytes - estimateReplayCacheEntryBytes(entry))
+      // Belt-and-suspenders: clear the seq counter so a re-used runId starts fresh
+      outputSeqCounters.delete(runId)
+      // Clear the terminal guard so a re-used runId is not permanently blocked
+      terminalRuns.delete(runId)
     }
   }
 
   function enforceTerminalReplayCap(): void {
-    if (terminalReplayCache.size <= terminalReplayMaxEntries) {
-      return
+    // Enforce entry-count cap: evict oldest entries until within the limit
+    if (terminalReplayCache.size > terminalReplayMaxEntries) {
+      const toEvict = terminalReplayCache.size - terminalReplayMaxEntries
+      let evicted = 0
+      for (const [runId] of terminalReplayCache) {
+        if (evicted >= toEvict) {
+          break
+        }
+        // evictTerminalReplayEntry handles byte accounting, seq counter, and terminalRuns cleanup
+        evictTerminalReplayEntry(runId)
+        evicted++
+      }
     }
-    // Evict oldest entries (by insertion order — Map preserves insertion order)
-    const toEvict = terminalReplayCache.size - terminalReplayMaxEntries
-    let evicted = 0
-    for (const [runId, entry] of terminalReplayCache) {
-      if (evicted >= toEvict) {
+
+    // Enforce byte budget: evict oldest entries until total bytes are within budget
+    while (terminalReplayCacheBytes > terminalReplayMaxBytes && terminalReplayCache.size > 0) {
+      const firstRunId = terminalReplayCache.keys().next().value
+      if (firstRunId === undefined) {
         break
       }
-      if (entry.evictionTimer !== undefined) {
-        deps.clearTimeout(entry.evictionTimer)
-      }
-      terminalReplayCache.delete(runId)
-      evicted++
+      evictTerminalReplayEntry(firstRunId)
     }
   }
 
@@ -653,22 +703,26 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       return false
     }
 
-    const frameBytes = estimateFrameBytes(frame)
+    // Build the effective frame BEFORE the cap check so the byte measurement used
+    // for the cap comparison is the same value added to queueBytes on enqueue.
+    // Without this, the cap check uses frameBytes but queueBytes grows by effectiveBytes
+    // (which is larger when coalescedDropCount > 0), causing queueBytes to drift above
+    // the cap and triggering spurious coalescing on frames that actually fit.
+    const effectiveFrame: OutputFrame =
+      sub.coalescedDropCount > 0
+        ? {
+            type: 'output',
+            data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
+          }
+        : frame
+    const effectiveBytes = estimateFrameBytes(effectiveFrame)
 
-    // If the frame fits, enqueue it directly (carrying any accumulated droppedCount)
-    if (sub.queueBytes + frameBytes <= subscriberQueueCapBytes) {
-      // Carry accumulated droppedCount into the frame if any coalescing happened
-      const effectiveFrame: OutputFrame =
-        sub.coalescedDropCount > 0
-          ? {
-              type: 'output',
-              data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
-            }
-          : frame
+    // If the effective frame fits, enqueue it directly
+    if (sub.queueBytes + effectiveBytes <= subscriberQueueCapBytes) {
       sub.coalescedDropCount = 0
 
       sub.queue.push(effectiveFrame)
-      sub.queueBytes += estimateFrameBytes(effectiveFrame)
+      sub.queueBytes += effectiveBytes
 
       if (sub.writerRunning === false) {
         sub.writerRunning = true
@@ -692,19 +746,23 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     sub.queueBytes = Math.max(0, sub.queueBytes - removedBytes)
     sub.coalescedDropCount += removedCount
 
-    // Try again after coalescing
-    if (sub.queueBytes + frameBytes <= subscriberQueueCapBytes) {
-      const effectiveFrame: OutputFrame =
-        sub.coalescedDropCount > 0
-          ? {
-              type: 'output',
-              data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
-            }
-          : frame
+    // Rebuild the effective frame after coalescing (coalescedDropCount has grown)
+    const effectiveFrameAfterCoalesce: OutputFrame =
+      sub.coalescedDropCount > 0
+        ? {
+            type: 'output',
+            data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
+          }
+        : frame
+    const effectiveBytesAfterCoalesce = estimateFrameBytes(effectiveFrameAfterCoalesce)
+
+    // Try again after coalescing — use the post-coalesce effective bytes for both
+    // the cap check and the queueBytes increment so accounting stays accurate.
+    if (sub.queueBytes + effectiveBytesAfterCoalesce <= subscriberQueueCapBytes) {
       sub.coalescedDropCount = 0
 
-      sub.queue.push(effectiveFrame)
-      sub.queueBytes += estimateFrameBytes(effectiveFrame)
+      sub.queue.push(effectiveFrameAfterCoalesce)
+      sub.queueBytes += effectiveBytesAfterCoalesce
 
       logger.warn(
         {subId: sub.id, runId: sub.runId, removedCount, queueBytes: sub.queueBytes},
@@ -775,10 +833,32 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
       sub.closingReason = 'terminal'
 
-      // If the writer is not running and the queue is empty, finalize immediately.
-      // If the writer is running, it will finalize when the queue drains.
-      if (sub.writerRunning === false && sub.queue.length === 0) {
+      // Cancel the maxDuration and heartbeat timers now that we are in graceful-drain
+      // mode. Without this, a maxDuration timer firing during the drain window would
+      // call dropSubscriber('max-duration'), clearing the queue and reporting the wrong
+      // close reason. The heartbeat callback already early-returns on closingReason===
+      // 'terminal', but cancelling it here is cleaner and avoids the macrotask entirely.
+      if (sub.maxDurationTimer !== undefined) {
+        deps.clearTimeout(sub.maxDurationTimer)
+        sub.maxDurationTimer = undefined
+      }
+      if (sub.heartbeatTimer !== undefined) {
+        deps.clearInterval(sub.heartbeatTimer)
+        sub.heartbeatTimer = undefined
+      }
+
+      // Drain-state invariant:
+      //   queue empty              → finalize immediately (nothing to deliver)
+      //   queue non-empty, writer running  → trust drainQueue to finalize on empty
+      //   queue non-empty, writer NOT running → start the drain so queued frames
+      //                                         are delivered and finalize is called
+      if (sub.queue.length === 0) {
         finalizeTerminalSubscriber(sub)
+      } else if (sub.writerRunning === false) {
+        // Writer stopped but queue is non-empty — start the drain so the queued
+        // frames (including the terminal status) are delivered before closing.
+        sub.writerRunning = true
+        drainQueue(sub).catch(() => {})
       }
       // If writerRunning === true, drainQueue will call finalizeTerminalSubscriber
       // when the queue empties.
@@ -830,8 +910,21 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
     const runId = runState.run_id
 
+    // Guard against stale non-terminal observations arriving out of causal order.
+    // If two concurrent observe() calls resolve out of order (COMPLETED resolves first,
+    // then EXECUTING resolves), the non-terminal path must not overwrite the terminal
+    // replay entry or regress the cached status.
+    if (isTerminal(projected.status) === false && terminalRuns.has(runId) === true) {
+      logger.warn(
+        {runId, status: projected.status},
+        'manager: non-terminal observe arrived after terminal — dropping stale observation',
+      )
+      return
+    }
+
     // On a non-terminal status, clear any stale terminal replay cache entry for this
     // runId (avoids stale replay if runId is reused after a previous terminal run).
+    // Only reached when terminalRuns does NOT contain this runId (guard above).
     if (isTerminal(projected.status) === false) {
       evictTerminalReplayEntry(runId)
     }
@@ -863,19 +956,27 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       // Evict any existing entry for this runId before creating a new one
       evictTerminalReplayEntry(runId)
 
+      // Mark this runId as terminal so stale non-terminal observations are rejected
+      terminalRuns.add(runId)
+
       const expiresAt = deps.now() + terminalReplayTtlMs
+      // Use evictTerminalReplayEntry in the TTL callback so byte accounting,
+      // seq counter, and terminalRuns are all cleaned up on natural expiry.
       const evictionTimer = deps.setTimeout(() => {
-        terminalReplayCache.delete(runId)
+        evictTerminalReplayEntry(runId)
       }, terminalReplayTtlMs)
 
-      terminalReplayCache.set(runId, {
+      const newEntry: TerminalReplayCacheEntry = {
         finalOutput,
         terminalStatus: projected,
         expiresAt,
         evictionTimer,
-      })
+      }
+      terminalReplayCache.set(runId, newEntry)
+      // Track the byte cost of this new entry for the byte-budget cap
+      terminalReplayCacheBytes += estimateReplayCacheEntryBytes(newEntry)
 
-      // Enforce the hard cap on replay cache size
+      // Enforce both the entry-count cap and the byte budget
       enforceTerminalReplayCap()
 
       // Graceful drain: deliver all queued frames (including terminal status) then close
@@ -966,10 +1067,17 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
         enqueueFrame(sub, statusFrame)
       }
 
-      // Mark for graceful terminal drain — delivers queued frames then closes with 'terminal'
+      // Mark for graceful terminal drain — delivers queued frames then closes with 'terminal'.
+      // Apply the same drain-state invariant as markRunSubscribersForTerminalDrain:
+      //   queue empty              → finalize immediately
+      //   queue non-empty, writer running  → trust drainQueue
+      //   queue non-empty, writer NOT running → start the drain
       sub.closingReason = 'terminal'
-      if (sub.writerRunning === false && sub.queue.length === 0) {
+      if (sub.queue.length === 0) {
         finalizeTerminalSubscriber(sub)
+      } else if (sub.writerRunning === false) {
+        sub.writerRunning = true
+        drainQueue(sub).catch(() => {})
       }
 
       // Return a clean-disconnect function
@@ -1096,6 +1204,8 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
     }
     terminalReplayCache.clear()
+    terminalReplayCacheBytes = 0
+    terminalRuns.clear()
   }
 
   return {observe, observeOutput, subscribe, abortSubscription, shutdown}
