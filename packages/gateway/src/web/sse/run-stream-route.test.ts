@@ -2185,3 +2185,144 @@ describe('GET /operator/runs/:runId/stream — contract version ready frame', ()
     expect(res.headers.get('content-type')).not.toContain('text/event-stream')
   })
 })
+
+// ---------------------------------------------------------------------------
+// output frame — writeFrame 'output' branch + ready-first ordering
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — output frame written to SSE stream', () => {
+  it("writes an output frame as event:'output' with JSON-serialized frame data", async () => {
+    // #given — manager delivers an output frame via the subscriber callback
+    const outputData = {
+      runId: 'run-abc',
+      text: 'Hello from the agent',
+      final: false,
+      seq: 1,
+    }
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        // Deliver the output frame immediately (mirrors the status-frame happy-path pattern)
+        Promise.resolve(callbacks.onEvent({type: 'output', data: outputData})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — SSE stream contains event: output with the serialized frame data
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 10; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes('event: output')) break
+    }
+    await reader.cancel()
+
+    expect(text).toContain('event: output')
+    expect(text).toContain('"runId":"run-abc"')
+    expect(text).toContain('"text":"Hello from the agent"')
+    expect(text).toContain('"final":false')
+    expect(text).toContain('"seq":1')
+  })
+
+  it("writes a final output frame (final:true) as event:'output' carrying final:true", async () => {
+    // #given — manager delivers a terminal output frame (final: true)
+    const outputData = {
+      runId: 'run-abc',
+      text: 'Final answer from the agent',
+      final: true,
+      seq: 5,
+    }
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        Promise.resolve(callbacks.onEvent({type: 'output', data: outputData})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — event: output with final:true in the serialized data
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 10; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes('event: output')) break
+    }
+    await reader.cancel()
+
+    expect(text).toContain('event: output')
+    expect(text).toContain('"final":true')
+    expect(text).toContain('"seq":5')
+    expect(text).toContain('"text":"Final answer from the agent"')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ready-first ordering — ready frame precedes any output frame
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs/:runId/stream — ready frame precedes output frame (ordering regression guard)', () => {
+  it('emits the ready frame before any output frame pushed through the subscriber callback', async () => {
+    // #given — manager delivers an output frame; ready is emitted before subscribe is called
+    const outputData = {
+      runId: 'run-abc',
+      text: 'Agent output text',
+      final: false,
+      seq: 1,
+    }
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        // Deliver the output frame immediately after subscribe is called.
+        // The ready frame is fire-and-forget BEFORE subscribe, so it must appear first.
+        Promise.resolve(callbacks.onEvent({type: 'output', data: outputData})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — read enough chunks to capture both ready and output events
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 15; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      // Stop once we have both events
+      if (text.includes('event: ready') && text.includes('event: output')) break
+    }
+    await reader.cancel()
+
+    // Both events must be present
+    expect(text).toContain('event: ready')
+    expect(text).toContain('event: output')
+
+    // ready must appear before output in the stream
+    const readyIndex = text.indexOf('event: ready')
+    const outputIndex = text.indexOf('event: output')
+    expect(readyIndex).toBeLessThan(outputIndex)
+  })
+})
