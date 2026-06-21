@@ -59,6 +59,7 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
     lockTtlSeconds: 900,
     heartbeatIntervalMs: 30_000,
     staleThresholdMs: 60_000,
+    pendingStaleThresholdMs: 30 * 60_000,
   }
 }
 
@@ -374,7 +375,7 @@ describe('run-state coordination', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Transition table — early-FAILED/CANCELLED edges (R4)
+  // Transition table — early-FAILED/CANCELLED edges
   // ---------------------------------------------------------------------------
 
   it('allows PENDING to transition directly to FAILED', async () => {
@@ -502,10 +503,10 @@ describe('run-state coordination', () => {
   // findStaleRuns — PENDING and ACKNOWLEDGED extension
   // ---------------------------------------------------------------------------
 
-  it('returns stale PENDING runs older than the configured threshold', async () => {
-    // #given — system time is 2026-04-24T18:15:00Z; threshold = 60 s → cutoff = 18:14:00Z
-    // A PENDING run with last_heartbeat at 18:13:00Z is 2 min old → stale
-    const stalePending = createRunState({phase: 'PENDING', last_heartbeat: '2026-04-24T18:13:00.000Z'})
+  it('returns stale PENDING runs older than the pending staleness threshold', async () => {
+    // #given — system time is 2026-04-24T18:15:00Z; pendingStaleThresholdMs = 30 min → cutoff = 17:45:00Z
+    // A PENDING run with last_heartbeat at 17:40:00Z is 35 min old → stale by the long threshold
+    const stalePending = createRunState({phase: 'PENDING', last_heartbeat: '2026-04-24T17:40:00.000Z'})
     const storeAdapter = createStoreAdapter({
       list: vi.fn(async () => ok(['fro-bot-state/coordination/owner/repo/runs/run-1.json'])),
       getObject: vi.fn(async () => ok({data: JSON.stringify(stalePending), etag: 'etag-1'})),
@@ -516,13 +517,14 @@ describe('run-state coordination', () => {
     // #when
     const result = await findStaleRuns(config, 'coordination', 'owner/repo', logger)
 
-    // #then — stale PENDING is included
+    // #then — stale PENDING is included (genuinely orphaned — older than 30 min)
     expect(result).toEqual(ok([stalePending]))
   })
 
-  it('returns stale ACKNOWLEDGED runs older than the configured threshold', async () => {
-    // #given — stale ACKNOWLEDGED (last_heartbeat 2 min ago)
-    const staleAcknowledged = createRunState({phase: 'ACKNOWLEDGED', last_heartbeat: '2026-04-24T18:13:00.000Z'})
+  it('returns stale ACKNOWLEDGED runs older than the pending staleness threshold', async () => {
+    // #given — system time is 2026-04-24T18:15:00Z; pendingStaleThresholdMs = 30 min → cutoff = 17:45:00Z
+    // A stale ACKNOWLEDGED run with last_heartbeat at 17:40:00Z is 35 min old → stale
+    const staleAcknowledged = createRunState({phase: 'ACKNOWLEDGED', last_heartbeat: '2026-04-24T17:40:00.000Z'})
     const storeAdapter = createStoreAdapter({
       list: vi.fn(async () => ok(['fro-bot-state/coordination/owner/repo/runs/run-1.json'])),
       getObject: vi.fn(async () => ok({data: JSON.stringify(staleAcknowledged), etag: 'etag-1'})),
@@ -533,12 +535,12 @@ describe('run-state coordination', () => {
     // #when
     const result = await findStaleRuns(config, 'coordination', 'owner/repo', logger)
 
-    // #then — stale ACKNOWLEDGED is included
+    // #then — stale ACKNOWLEDGED is included (genuinely orphaned — older than 30 min)
     expect(result).toEqual(ok([staleAcknowledged]))
   })
 
   it('excludes a FRESH PENDING run within the staleness threshold (run-killing-race guard)', async () => {
-    // #given — system time is 2026-04-24T18:15:00Z; threshold = 60 s → cutoff = 18:14:00Z
+    // #given — system time is 2026-04-24T18:15:00Z; pendingStaleThresholdMs = 30 min → cutoff = 17:45:00Z
     // A PENDING run with last_heartbeat at 18:14:30Z is only 30 s old → NOT stale
     // This is the critical guard: a just-admitted PENDING must NOT be killed by the sweep.
     const freshPending = createRunState({phase: 'PENDING', last_heartbeat: '2026-04-24T18:14:30.000Z'})
@@ -556,8 +558,41 @@ describe('run-state coordination', () => {
     expect(result).toEqual(ok([]))
   })
 
-  it('returns stale EXECUTING + stale PENDING + stale ACKNOWLEDGED together, excludes fresh PENDING', async () => {
-    // #given — four runs: stale EXECUTING, stale PENDING, stale ACKNOWLEDGED, fresh PENDING
+  it('does not recover a PENDING run stale by the short threshold but fresh by the long threshold (queued-behind-long-run case)', async () => {
+    // #given — system time is 2026-04-24T18:15:00Z
+    // staleThresholdMs = 60 s → short cutoff = 18:14:00Z
+    // pendingStaleThresholdMs = 30 min → long cutoff = 17:45:00Z
+    //
+    // A PENDING run with last_heartbeat at 18:13:00Z is 2 min old:
+    //   - stale by the short (60 s) threshold → would be killed if PENDING used staleThresholdMs
+    //   - FRESH by the long (30 min) threshold → must NOT be killed (it is queued behind a long task)
+    //
+    // This is the core regression guard: before the fix, this run would be incorrectly recovered.
+    const queuedPending = createRunState({phase: 'PENDING', last_heartbeat: '2026-04-24T18:13:00.000Z'})
+    const storeAdapter = createStoreAdapter({
+      list: vi.fn(async () => ok(['fro-bot-state/coordination/owner/repo/runs/run-1.json'])),
+      getObject: vi.fn(async () => ok({data: JSON.stringify(queuedPending), etag: 'etag-1'})),
+    })
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const result = await findStaleRuns(config, 'coordination', 'owner/repo', logger)
+
+    // #then — queued PENDING is NOT recovered (fresh by the long threshold)
+    expect(result).toEqual(ok([]))
+  })
+
+  it('returns stale EXECUTING + stale PENDING + stale ACKNOWLEDGED together, excludes queued-behind-long-run PENDING', async () => {
+    // #given — system time is 2026-04-24T18:15:00Z
+    // staleThresholdMs = 60 s → EXECUTING cutoff = 18:14:00Z
+    // pendingStaleThresholdMs = 30 min → PENDING/ACKNOWLEDGED cutoff = 17:45:00Z
+    //
+    // Four runs:
+    //   staleExecuting  — EXECUTING, 2 min old (stale by 60 s threshold) → recovered
+    //   stalePending    — PENDING, 35 min old (stale by 30 min threshold) → recovered
+    //   staleAcknowledged — ACKNOWLEDGED, 35 min old → recovered
+    //   queuedPending   — PENDING, 2 min old (stale by 60 s but fresh by 30 min) → NOT recovered
     const staleExecuting = createRunState({
       run_id: 'run-exec',
       phase: 'EXECUTING',
@@ -566,17 +601,17 @@ describe('run-state coordination', () => {
     const stalePending = createRunState({
       run_id: 'run-pend',
       phase: 'PENDING',
-      last_heartbeat: '2026-04-24T18:13:00.000Z',
+      last_heartbeat: '2026-04-24T17:40:00.000Z',
     })
     const staleAcknowledged = createRunState({
       run_id: 'run-ack',
       phase: 'ACKNOWLEDGED',
-      last_heartbeat: '2026-04-24T18:13:00.000Z',
+      last_heartbeat: '2026-04-24T17:40:00.000Z',
     })
-    const freshPending = createRunState({
-      run_id: 'run-fresh',
+    const queuedPending = createRunState({
+      run_id: 'run-queued',
       phase: 'PENDING',
-      last_heartbeat: '2026-04-24T18:14:30.000Z',
+      last_heartbeat: '2026-04-24T18:13:00.000Z',
     })
     const storeAdapter = createStoreAdapter({
       list: vi.fn(async () =>
@@ -584,7 +619,7 @@ describe('run-state coordination', () => {
           'fro-bot-state/coordination/owner/repo/runs/run-exec.json',
           'fro-bot-state/coordination/owner/repo/runs/run-pend.json',
           'fro-bot-state/coordination/owner/repo/runs/run-ack.json',
-          'fro-bot-state/coordination/owner/repo/runs/run-fresh.json',
+          'fro-bot-state/coordination/owner/repo/runs/run-queued.json',
         ]),
       ),
       getObject: vi
@@ -592,7 +627,7 @@ describe('run-state coordination', () => {
         .mockResolvedValueOnce(ok({data: JSON.stringify(staleExecuting), etag: 'etag-exec'}))
         .mockResolvedValueOnce(ok({data: JSON.stringify(stalePending), etag: 'etag-pend'}))
         .mockResolvedValueOnce(ok({data: JSON.stringify(staleAcknowledged), etag: 'etag-ack'}))
-        .mockResolvedValueOnce(ok({data: JSON.stringify(freshPending), etag: 'etag-fresh'})),
+        .mockResolvedValueOnce(ok({data: JSON.stringify(queuedPending), etag: 'etag-queued'})),
     })
     const config = createCoordinationConfig(storeAdapter)
     const logger = createLogger()
@@ -600,7 +635,7 @@ describe('run-state coordination', () => {
     // #when
     const result = await findStaleRuns(config, 'coordination', 'owner/repo', logger)
 
-    // #then — three stale runs returned; fresh PENDING excluded
+    // #then — three genuinely stale runs returned; queued-behind-long-run PENDING excluded
     expect(result).toEqual(
       ok(
         expect.arrayContaining([
@@ -610,8 +645,8 @@ describe('run-state coordination', () => {
         ]),
       ),
     )
-    // Fresh PENDING must not appear and total count must be exactly 3
-    expect(result.success === true ? result.data.map(r => r.run_id) : []).not.toContain('run-fresh')
+    // Queued PENDING must not appear; total count must be exactly 3
+    expect(result.success === true ? result.data.map(r => r.run_id) : []).not.toContain('run-queued')
     expect(result.success === true ? result.data : []).toHaveLength(3)
   })
 

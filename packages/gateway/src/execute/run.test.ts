@@ -433,6 +433,27 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     ...overrides,
   }
 }
+/**
+ * Build a minimal mock RunState with required fields filled in.
+ * Localises the single `as RunState` cast so tests don't scatter double-casts.
+ */
+function buildMockRunState(
+  overrides: Partial<import('@fro-bot/runtime').RunState> = {},
+): import('@fro-bot/runtime').RunState {
+  return {
+    run_id: 'r1',
+    surface: 'discord',
+    thread_id: '',
+    entity_ref: 'acme/widget',
+    phase: 'PENDING',
+    started_at: '2026-01-01T00:00:00.000Z',
+    last_heartbeat: '2026-01-01T00:00:00.000Z',
+    holder_id: 'discord-gateway',
+    details: {},
+    ...overrides,
+  }
+}
+
 /** Set up default happy-path returns for all runtime mocks. */
 function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; stop?: ReturnType<typeof vi.fn>}) {
   mockRuntime.acquireLock.mockResolvedValue({
@@ -443,7 +464,7 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
   mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
   mockRuntime.transitionRun.mockResolvedValue({
     success: true as const,
-    data: {etag: 'run-etag-v2', state: {} as unknown as import('@fro-bot/runtime').RunState},
+    data: {etag: 'run-etag-v2', state: buildMockRunState()},
   })
   mockRuntime.createHeartbeatController.mockReturnValue({
     start: (heartbeatOverrides?.start ?? vi.fn()) as unknown as HeartbeatController['start'],
@@ -453,7 +474,7 @@ function setupHappyPath(heartbeatOverrides?: {start?: ReturnType<typeof vi.fn>; 
         data: {
           runEtag: 'run-etag-after-heartbeat',
           lockEtag: 'lock-etag-after-heartbeat',
-          runState: {} as unknown as import('@fro-bot/runtime').RunState,
+          runState: buildMockRunState(),
         },
       })) as unknown as HeartbeatController['stop'],
     isRunning: false,
@@ -1427,7 +1448,7 @@ describe('runMention', () => {
       mockRuntime.transitionRun
         .mockResolvedValueOnce({
           success: true as const,
-          data: {etag: 'ack-etag', state: {} as unknown as import('@fro-bot/runtime').RunState},
+          data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
         }) // ACKNOWLEDGED
         .mockRejectedValueOnce(new Error('EXECUTING transition threw')) // EXECUTING
 
@@ -2757,9 +2778,9 @@ describe('runMention', () => {
       // #given
       const {runMention} = await import('./run.js')
 
-      const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
-      const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
-      const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+      const ackState = buildMockRunState({phase: 'ACKNOWLEDGED'})
+      const execState = buildMockRunState({phase: 'EXECUTING'})
+      const completedState = buildMockRunState({phase: 'COMPLETED'})
 
       mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
       mockRuntime.acquireLock.mockResolvedValue({
@@ -2803,9 +2824,9 @@ describe('runMention', () => {
     it('failure path: observe called with FAILED state on error', async () => {
       // #given
       const {runMention} = await import('./run.js')
-      const failedState = {run_id: 'r1', phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState
-      const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
-      const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
+      const failedState = buildMockRunState({phase: 'FAILED'})
+      const ackState = buildMockRunState({phase: 'ACKNOWLEDGED'})
+      const execState = buildMockRunState({phase: 'EXECUTING'})
 
       mockRuntime.acquireLock.mockResolvedValue({
         success: true as const,
@@ -6019,7 +6040,7 @@ describe('launchWork admission', () => {
     // transitionRun mock for the FAILED terminalization
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const registerFn = vi.fn(() => {
@@ -6044,9 +6065,9 @@ describe('launchWork admission', () => {
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
-  // ── R9: exactly ONE createRun per run ──────────────────────────────────────
+  // ── Exactly ONE createRun per run ──────────────────────────────────────────
 
-  it('r9: exactly one createRun per run; ifNoneMatch:"*" header is set', async () => {
+  it('exactly one createRun per run with PENDING initial state', async () => {
     // #given — happy path
     const {launchWork} = await import('./run.js')
     setupHappyPath()
@@ -6072,9 +6093,9 @@ describe('launchWork admission', () => {
     // #given — observer that records phases in order
     const {launchWork} = await import('./run.js')
 
-    const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
-    const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
-    const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+    const ackState = buildMockRunState({phase: 'ACKNOWLEDGED'})
+    const execState = buildMockRunState({phase: 'EXECUTING'})
+    const completedState = buildMockRunState({phase: 'COMPLETED'})
 
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.acquireLock.mockResolvedValue({
@@ -6210,7 +6231,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     // transitionRun mock for the FAILED terminalization (best-effort)
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const ensureClone = makeEnsureCloneFn('failure')
@@ -6249,7 +6270,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-2'}})
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const readyz = makeReadyzFn('not-ready')
@@ -6286,7 +6307,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-3a'}})
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6326,7 +6347,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-3b'}})
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6368,7 +6389,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     })
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6410,7 +6431,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6459,7 +6480,7 @@ describe('early-abort gates terminalize to FAILED', () => {
       })
       .mockResolvedValueOnce({
         success: true as const,
-        data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+        data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
       })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6502,7 +6523,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-throw'}})
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     // ensureClone THROWS (not returns {success:false})
@@ -6537,7 +6558,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-r8'}})
     mockRuntime.transitionRun.mockResolvedValue({
       success: true as const,
-      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      data: {etag: 'fail-etag', state: buildMockRunState({phase: 'FAILED'})},
     })
 
     const ensureClone = makeEnsureCloneFn('failure')
@@ -6570,9 +6591,9 @@ describe('early-abort gates terminalize to FAILED', () => {
     const {launchWork} = await import('./run.js')
     setupHappyPath()
 
-    const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
-    const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
-    const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+    const ackState = buildMockRunState({phase: 'ACKNOWLEDGED'})
+    const execState = buildMockRunState({phase: 'EXECUTING'})
+    const completedState = buildMockRunState({phase: 'COMPLETED'})
 
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
     mockRuntime.transitionRun

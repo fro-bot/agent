@@ -337,10 +337,12 @@ export type ReplySinkTarget = 'source' | 'thread'
  *   `RunState` was created, no `runId` to poll.
  *   - `'cap'`          — global concurrency cap reached; no slot AND queue full.
  *   - `'empty-prompt'` — prompt was empty; rejected before any queue/cap work.
+ *   - `'queue-full'`   — run was admitted (PENDING created) but the channel queue
+ *                        was full; the PENDING run-state was terminalized to FAILED.
  */
 export type LaunchAdmission =
   | {readonly accepted: true; readonly runId: string; readonly runPromise?: Promise<void>}
-  | {readonly accepted: false; readonly reason: 'cap' | 'empty-prompt'}
+  | {readonly accepted: false; readonly reason: 'cap' | 'empty-prompt' | 'queue-full'}
 
 // ---------------------------------------------------------------------------
 // LaunchWorkRequest — transport-neutral engine input

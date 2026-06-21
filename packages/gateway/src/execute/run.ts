@@ -1,4 +1,4 @@
-import type {CoordinationConfig, Result} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {PermissionRequest} from '../approvals/coordinator.js'
 import type {ApprovalRegistry} from '../approvals/registry.js'
@@ -95,7 +95,7 @@ export interface RunMentionDeps {
    * Narrow interface: only `observe` is exposed here so run.ts cannot call
    * subscribe, shutdown, or abortSubscription on the manager.
    */
-  readonly runObserver?: {readonly observe: (runState: import('@fro-bot/runtime').RunState) => Promise<void>}
+  readonly runObserver?: {readonly observe: (runState: RunState) => Promise<void>}
   /**
    * Ensure the workspace checkout exists for the given owner/repo.
    * Called after the concurrency gate acquires a slot, before readyz/execution.
@@ -288,7 +288,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'run: workspace clone unavailable — aborting',
       )
       // Gate 1 failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('source', {
         content: 'The workspace is not available right now. Please try again later.',
       })
@@ -315,7 +315,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
       // Gate 2 failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('source', {
         content: 'The workspace is not reachable right now. Please try again later.',
       })
@@ -352,14 +352,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           'run: threadFactory threw or timed out — aborting',
         )
         // Gate 3 (throw/timeout) failure: terminalize the admitted run to FAILED before replying.
-        await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+        await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
       }
       if (threadResult.ok === false) {
         logger.error({channelId, repo, err: threadResult.error}, 'run: threadFactory failed — aborting')
         // Gate 3 (ok:false) failure: terminalize the admitted run to FAILED before replying.
-        await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+        await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
       }
@@ -373,7 +373,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
       // Gate 4 (lock error) failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       return
     }
@@ -382,7 +382,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
       logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
       // Gate 4 (lock not acquired) failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {
         content: 'Another task is already in progress for this repo. Try again when it completes.',
       })
@@ -411,7 +411,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (ackResult.success === false) {
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
       // Gate 5 (ACK fail): run is still PENDING; terminalize to FAILED using adoptionEtag.
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
@@ -423,7 +423,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     let runEtag = ackResult.data.etag
 
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
-    notifyObserverBestEffort(deps, repo, runId, logger, ackResult.data.state)
+    notifyObserverBestEffort(deps, ackResult.data.state)
 
     const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
     heartbeat.start()
@@ -448,7 +448,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       runEtag = execResult.data.etag
 
       // Push the EXECUTING state to the observation pipeline (best-effort, fire-and-forget).
-      notifyObserverBestEffort(deps, repo, runId, logger, execResult.data.state)
+      notifyObserverBestEffort(deps, execResult.data.state)
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
       statusSink.setReaction('working')
@@ -628,7 +628,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Non-fatal: continue to flush sink and release resources
       } else {
         // Push the COMPLETED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserverBestEffort(deps, repo, runId, logger, completedResult.data.state)
+        notifyObserverBestEffort(deps, completedResult.data.state)
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
@@ -694,7 +694,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
       } else {
         // Push the FAILED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserverBestEffort(deps, repo, runId, logger, failedResult.data.state)
+        notifyObserverBestEffort(deps, failedResult.data.state)
       }
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
@@ -768,7 +768,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         {repo, runId, err: gateError instanceof Error ? gateError.message : String(gateError)},
         'run: pre-ACK gate threw — terminalizing admitted run to FAILED',
       )
-      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
     }
     throw gateError
   } finally {
@@ -803,12 +803,26 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // all channels and all queued tasks across the queue, which is complex and
       // fragile. The freshness window in findStaleRuns ensures a just-admitted
       // PENDING is not killed prematurely.
-      concurrency.release(channelId)
+      try {
+        concurrency.release(channelId)
+      } catch (releaseError: unknown) {
+        logger.warn(
+          {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+          'run: concurrency.release threw during shutdown — slot may leak',
+        )
+      }
     } else {
       const nextTask = queue.takeNext(channelId)
       if (nextTask === undefined) {
         // Queue is empty — release the slot now.
-        concurrency.release(channelId)
+        try {
+          concurrency.release(channelId)
+        } catch (releaseError: unknown) {
+          logger.warn(
+            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+            'run: concurrency.release threw — slot may leak',
+          )
+        }
       } else {
         // Slot ownership transfers to the next run — do NOT call concurrency.release.
         // eslint-disable-next-line no-void
@@ -975,14 +989,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
 
     // Notify the observation pipeline of the initial PENDING state.
     // Fire-and-forget: neither a sync throw nor an async rejection must abort admission.
-    notifyObserverBestEffort(deps, repo, runId, logger, initialRunState)
+    notifyObserverBestEffort(deps, initialRunState)
   } catch (admissionError: unknown) {
     // Fail-closed: terminalize the run to FAILED before propagating.
     logger.error(
       {repo, runId, err: admissionError instanceof Error ? admissionError.message : String(admissionError)},
       'run: admission block threw after createRun — terminalizing to FAILED',
     )
-    await failAdmittedRun(coordinationConfig, identity, repo, runId, adoptionEtag, deps, logger, coordLogger)
+    await failAdmittedRun(deps, repo, runId, adoptionEtag)
     // Release the slot if we acquired it.
     if (slotResult === 'ok') {
       concurrency.release(channelId)
@@ -1019,6 +1033,18 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   // Queued path (slotResult === 'busy' or hasPending was true).
   // The slot was NOT acquired (tryAcquire returned 'busy' or was skipped due to FIFO gate).
   const enqueueResult = queue.enqueue(channelId, task)
+
+  if (enqueueResult === 'full') {
+    // Queue is full — the just-admitted PENDING run-state is now orphaned.
+    // Terminalize it to FAILED so the recovery sweep never sees it as a ghost.
+    logger.warn({repo, runId, channelId}, 'run: queue full after admission — terminalizing PENDING to FAILED')
+    await failAdmittedRun(deps, repo, runId, adoptionEtag)
+    await request.replySink.send('source', {
+      content: 'The queue is full for this channel — please wait for pending tasks to complete.',
+    })
+    return {accepted: false, reason: 'queue-full'}
+  }
+
   await ackEnqueueResult(request, enqueueResult)
   return {accepted: true, runId}
 }
@@ -1031,19 +1057,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
  * Notify the observation pipeline of a run-state transition.
  * Fire-and-forget: neither a sync throw nor an async rejection must abort the caller.
  */
-function notifyObserverBestEffort(
-  deps: RunMentionDeps,
-  repo: string,
-  runId: string,
-  logger: GatewayLogger,
-  state: import('@fro-bot/runtime').RunState,
-): void {
+function notifyObserverBestEffort(deps: RunMentionDeps, state: RunState): void {
+  const logger = deps.logger
   try {
     deps.runObserver?.observe(state)?.catch((error: unknown) => {
-      logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed')
+      logger.warn({err: String(error)}, 'run: runObserver.observe failed')
     })
   } catch (observeError: unknown) {
-    logger.warn({repo, runId, err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
+    logger.warn({err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
   }
 }
 
@@ -1061,21 +1082,14 @@ function notifyObserverBestEffort(
  * a failure to transition is logged but not propagated — the caller's error
  * takes precedence.
  */
-async function failAdmittedRun(
-  coordinationConfig: import('@fro-bot/runtime').CoordinationConfig,
-  identity: string,
-  repo: string,
-  runId: string,
-  currentEtag: string,
-  deps: RunMentionDeps,
-  logger: GatewayLogger,
-  coordLogger: {debug: (message: string, context?: Record<string, unknown>) => void},
-): Promise<void> {
+async function failAdmittedRun(deps: RunMentionDeps, repo: string, runId: string, currentEtag: string): Promise<void> {
+  const {coordinationConfig, identity, logger} = deps
+  const coordLogger = toCoordLogger(logger)
   const failResult = await transitionRun(coordinationConfig, identity, repo, runId, 'FAILED', currentEtag, coordLogger)
   if (failResult.success === false) {
     logger.error({repo, runId, err: failResult.error.message}, 'run: failAdmittedRun — transitionRun FAILED failed')
   } else {
-    notifyObserverBestEffort(deps, repo, runId, logger, failResult.data.state)
+    notifyObserverBestEffort(deps, failResult.data.state)
   }
 }
 

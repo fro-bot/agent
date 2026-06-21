@@ -180,7 +180,12 @@ export async function findStaleRuns(
     return err(listed.error)
   }
 
-  const threshold = Date.now() - config.staleThresholdMs
+  const executingThreshold = Date.now() - config.staleThresholdMs
+  // PENDING and ACKNOWLEDGED runs do not refresh their heartbeat while queued —
+  // last_heartbeat is set once at admission and stays frozen until the heartbeat
+  // controller starts post-ACKNOWLEDGED. Use a much longer threshold so a run
+  // legitimately queued behind a long task is not mistakenly recovered.
+  const pendingThreshold = Date.now() - config.pendingStaleThresholdMs
   const staleRuns: RunState[] = []
   for (const key of listed.data) {
     const current = await getObject.data(key)
@@ -197,14 +202,20 @@ export async function findStaleRuns(
 
     // Surface stale runs in any pre-terminal active phase: EXECUTING, PENDING, or ACKNOWLEDGED.
     // PENDING and ACKNOWLEDGED can be stranded when a crash or shutdown occurs after admission
-    // but before the run reaches EXECUTING. The heartbeat threshold provides the freshness
-    // window for all three phases — a just-admitted PENDING (last_heartbeat = now) is naturally
-    // excluded by the threshold and will NOT be killed by the recovery sweep.
+    // but before the run reaches EXECUTING.
+    //
+    // EXECUTING uses the short staleThresholdMs (60 s) — the heartbeat controller refreshes
+    // last_heartbeat every heartbeatIntervalMs, so a missed heartbeat is a reliable signal.
+    //
+    // PENDING and ACKNOWLEDGED use the much longer pendingStaleThresholdMs (30 min) because
+    // queued runs do NOT refresh their heartbeat while waiting. A run queued behind a 10-min
+    // task will have a stale-by-60s heartbeat but is NOT orphaned — it is legitimately waiting.
     const phase = parsedCurrent.data.phase
     if (phase !== 'EXECUTING' && phase !== 'PENDING' && phase !== 'ACKNOWLEDGED') {
       continue
     }
 
+    const threshold = phase === 'EXECUTING' ? executingThreshold : pendingThreshold
     if (new Date(parsedCurrent.data.last_heartbeat).getTime() < threshold) {
       staleRuns.push(parsedCurrent.data)
     }

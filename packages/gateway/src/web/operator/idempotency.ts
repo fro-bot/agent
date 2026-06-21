@@ -28,10 +28,6 @@
  *
  *   3. `rollback(githubUserId, clientKey)` — removes the reservation entry. No-op if
  *      the key is gone. Guarantees that a rejected launch does not echo a dead runId.
- *
- * The `record` method is kept for backward compatibility with existing callers that
- * do not need the two-phase lifecycle. It behaves identically to `reserve` followed
- * immediately by `commit` (i.e. it writes a committed entry directly).
  */
 
 // ---------------------------------------------------------------------------
@@ -67,17 +63,6 @@ export interface IdempotencyGuard {
    * so a concurrent duplicate does NOT launch twice.
    */
   readonly check: (githubUserId: number, clientKey: string) => string | undefined
-
-  /**
-   * Record a runId for a namespaced key (committed immediately).
-   *
-   * Kept for backward compatibility. Equivalent to `reserve` followed by `commit`.
-   * Prefer the two-phase `reserve`/`commit`/`rollback` lifecycle for new callers.
-   *
-   * If the key already exists (update-in-place), the entry is updated without
-   * triggering capacity eviction of a different live key.
-   */
-  readonly record: (githubUserId: number, clientKey: string, runId: string) => void
 
   /**
    * Reserve a runId for a namespaced key (two-phase lifecycle, phase 1).
@@ -197,10 +182,6 @@ export function createIdempotencyGuard(deps?: IdempotencyGuardDeps): Idempotency
     store.set(key, {runId, expiresAt: now() + ttlMs, status})
   }
 
-  function record(githubUserId: number, clientKey: string, runId: string): void {
-    writeEntry(makeKey(githubUserId, clientKey), runId, 'committed')
-  }
-
   function reserve(githubUserId: number, clientKey: string, runId: string): void {
     writeEntry(makeKey(githubUserId, clientKey), runId, 'reserved')
   }
@@ -223,5 +204,5 @@ export function createIdempotencyGuard(deps?: IdempotencyGuardDeps): Idempotency
     store.delete(key)
   }
 
-  return {check, record, reserve, commit, rollback}
+  return {check, reserve, commit, rollback}
 }
