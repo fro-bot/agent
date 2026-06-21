@@ -21,7 +21,7 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus} from '../../operator-contract/index.js'
+import type {OperatorOutputFrame, OperatorRunStatus} from '../../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
 // Constants (injectable for tests)
@@ -74,8 +74,14 @@ export interface HeartbeatFrame {
   readonly type: 'heartbeat'
 }
 
+/** An output frame carrying the agent's visible text. */
+export interface OutputFrame {
+  readonly type: 'output'
+  readonly data: OperatorOutputFrame
+}
+
 /** The closed union of all frame types the manager can emit. */
-export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame
+export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame | OutputFrame
 
 // ---------------------------------------------------------------------------
 // Subscriber callbacks
@@ -157,6 +163,22 @@ export interface RunObservationManager {
   readonly subscribe: (runId: string, callbacks: SubscriberCallbacks) => () => void
 
   /**
+   * Observe an output text fragment for a run. Observer-only / best-effort.
+   *
+   * Builds an OutputFrame with a per-run monotonic seq counter and fans it out to
+   * all current subscribers of the run via the same enqueueFrame path. On overflow,
+   * output frames COALESCE (do not drop the subscriber): pending output frames are
+   * merged and a droppedCount is accumulated onto the next successfully-enqueued
+   * output frame for that subscriber, keeping the connection alive.
+   *
+   * On opts.final === true, caches the frame in latestOutputCache so late subscribers
+   * receive the final answer on subscribe.
+   *
+   * Does NOT add any mutating run API to the deps — observer-only by construction.
+   */
+  readonly observeOutput: (runId: string, text: string, opts?: {final?: boolean; droppedCount?: number}) => void
+
+  /**
    * Abort a subscription with a given reason (e.g., 'observation-failed' for EOF).
    * Calls onClose(reason) and removes the subscription + its timers/queue.
    * Used by the route layer to signal connection drops before a terminal status.
@@ -191,6 +213,13 @@ interface SubscriberState {
   heartbeatTimer: ReturnType<typeof globalThis.setInterval> | undefined
   /** Max-duration timeout timer ID. */
   maxDurationTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+  /**
+   * Accumulated count of output frames coalesced/dropped for this subscriber.
+   * Carried onto the next successfully-enqueued output frame as droppedCount.
+   * Keeps the connection alive under output overflow (unlike status frames which
+   * drop the subscriber).
+   */
+  coalescedDropCount: number
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +266,20 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // staleness/reconcile path will evict these entries; for now the leak is bounded
   // by the number of active runs and is cleared on process restart.
   const latestStatusCache = new Map<string, OperatorRunStatus>()
+
+  /**
+   * Latest final output frame per run. Set only when observeOutput is called with
+   * final:true. Cleared on the same teardown paths as latestStatusCache (terminal
+   * cleanup in observe(), shutdown). Delivered to late subscribers on subscribe.
+   */
+  const latestOutputCache = new Map<string, OperatorOutputFrame>()
+
+  /**
+   * Monotonic seq counter per run for output frames. Incremented on each
+   * observeOutput call. Cleared on terminal teardown so a re-used runId starts
+   * at seq 0 again.
+   */
+  const outputSeqCounters = new Map<string, number>()
 
   /** Active subscribers per run. Map<runId, Map<subId, SubscriberState>>. */
   const runSubscribers = new Map<string, Map<string, SubscriberState>>()
@@ -390,6 +433,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       dropped: false,
       heartbeatTimer: undefined,
       maxDurationTimer: undefined,
+      coalescedDropCount: 0,
     }
 
     // Heartbeat timer: emit a heartbeat frame every heartbeatIntervalMs
@@ -433,6 +477,119 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     const snapshot = Array.from(subs.values())
     for (const sub of snapshot) {
       enqueueFrame(sub, frame)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: enqueue an output frame with coalescing on overflow
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enqueue an output frame to a subscriber with coalescing on overflow.
+   *
+   * Unlike status frames (which drop the subscriber on overflow), output frames
+   * coalesce: when the queue would overflow, pending output frames in the queue
+   * are removed and their count is accumulated in sub.coalescedDropCount. The
+   * next successfully-enqueued output frame carries that count as droppedCount,
+   * keeping the connection alive.
+   *
+   * Returns true if the frame was enqueued (possibly after coalescing), false if
+   * the subscriber was already dropped.
+   */
+  function enqueueOutputFrame(sub: SubscriberState, frame: OutputFrame): boolean {
+    if (sub.dropped === true) {
+      return false
+    }
+
+    const frameBytes = estimateFrameBytes(frame)
+
+    // If the frame fits, enqueue it directly (carrying any accumulated droppedCount)
+    if (sub.queueBytes + frameBytes <= subscriberQueueCapBytes) {
+      // Carry accumulated droppedCount into the frame if any coalescing happened
+      const effectiveFrame: OutputFrame =
+        sub.coalescedDropCount > 0
+          ? {
+              type: 'output',
+              data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
+            }
+          : frame
+      sub.coalescedDropCount = 0
+
+      sub.queue.push(effectiveFrame)
+      sub.queueBytes += estimateFrameBytes(effectiveFrame)
+
+      if (sub.writerRunning === false) {
+        sub.writerRunning = true
+        drainQueue(sub).catch(() => {})
+      }
+      return true
+    }
+
+    // Overflow: coalesce — remove pending output frames from the queue to make room,
+    // accumulating their count. Keep non-output frames (status, reset, heartbeat) intact.
+    let removedCount = 0
+    let removedBytes = 0
+    for (let i = sub.queue.length - 1; i >= 0; i--) {
+      const queued = sub.queue[i]
+      if (queued !== undefined && queued.type === 'output') {
+        removedBytes += estimateFrameBytes(queued)
+        sub.queue.splice(i, 1)
+        removedCount++
+      }
+    }
+    sub.queueBytes = Math.max(0, sub.queueBytes - removedBytes)
+    sub.coalescedDropCount += removedCount
+
+    // Try again after coalescing
+    if (sub.queueBytes + frameBytes <= subscriberQueueCapBytes) {
+      const effectiveFrame: OutputFrame =
+        sub.coalescedDropCount > 0
+          ? {
+              type: 'output',
+              data: {...frame.data, droppedCount: (frame.data.droppedCount ?? 0) + sub.coalescedDropCount},
+            }
+          : frame
+      sub.coalescedDropCount = 0
+
+      sub.queue.push(effectiveFrame)
+      sub.queueBytes += estimateFrameBytes(effectiveFrame)
+
+      logger.warn(
+        {subId: sub.id, runId: sub.runId, removedCount, queueBytes: sub.queueBytes},
+        'manager: output frame coalesced — dropped pending output frames to keep connection alive',
+      )
+
+      if (sub.writerRunning === false) {
+        sub.writerRunning = true
+        drainQueue(sub).catch(() => {})
+      }
+      return true
+    }
+
+    // Even after coalescing all output frames, the new frame still doesn't fit.
+    // Accumulate the drop count and discard this frame too (connection stays alive).
+    sub.coalescedDropCount++
+    logger.warn(
+      {subId: sub.id, runId: sub.runId, coalescedDropCount: sub.coalescedDropCount},
+      'manager: output frame discarded after coalescing — queue still full, accumulating droppedCount',
+    )
+    return false
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: fan-out an output frame to all subscribers of a run (with coalescing)
+  // ---------------------------------------------------------------------------
+
+  function fanOutOutput(runId: string, frame: OutputFrame): void {
+    const subs = runSubscribers.get(runId)
+    if (subs === undefined || subs.size === 0) {
+      return
+    }
+
+    // Snapshot the subscriber set before iterating
+    const snapshot = Array.from(subs.values())
+    for (const sub of snapshot) {
+      enqueueOutputFrame(sub, frame)
     }
   }
 
@@ -501,8 +658,44 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // discard the terminal frame for any subscriber whose writer task hadn't started yet.
     if (isTerminal(projected.status) === true) {
       latestStatusCache.delete(runId)
+      latestOutputCache.delete(runId)
+      outputSeqCounters.delete(runId)
       closeRunSubscribers(runId, 'terminal')
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // observeOutput
+  // ---------------------------------------------------------------------------
+
+  const observeOutput = (runId: string, text: string, opts?: {final?: boolean; droppedCount?: number}): void => {
+    if (isShutdown === true) {
+      return
+    }
+
+    // Increment the per-run seq counter
+    const seq = outputSeqCounters.get(runId) ?? 0
+    outputSeqCounters.set(runId, seq + 1)
+
+    const isFinal = opts?.final ?? false
+
+    const outputData: OperatorOutputFrame = {
+      runId,
+      text,
+      final: isFinal,
+      seq,
+      ...(opts?.droppedCount === undefined ? {} : {droppedCount: opts.droppedCount}),
+    }
+
+    const frame: OutputFrame = {type: 'output', data: outputData}
+
+    // Cache the final frame for late subscribers
+    if (isFinal === true) {
+      latestOutputCache.set(runId, outputData)
+    }
+
+    // Fan out to all current subscribers with coalescing on overflow
+    fanOutOutput(runId, frame)
   }
 
   // ---------------------------------------------------------------------------
@@ -542,6 +735,15 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     } else {
       const snapshotFrame: StatusFrame = {type: 'status', data: cached}
       enqueueFrame(sub, snapshotFrame)
+    }
+
+    // Deliver the cached final output frame (if any) after the status snapshot.
+    // This ensures a late subscriber (connecting after the run's final output frame)
+    // receives the complete answer. Order: status/reset first, then cached output.
+    const cachedOutput = latestOutputCache.get(runId)
+    if (cachedOutput !== undefined) {
+      const outputFrame: OutputFrame = {type: 'output', data: cachedOutput}
+      enqueueOutputFrame(sub, outputFrame)
     }
 
     // Return a clean-disconnect function (no onClose called)
@@ -598,9 +800,11 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       closeRunSubscribers(runId, 'shutdown')
     }
 
-    // Clear the latest-status cache
+    // Clear all caches
     latestStatusCache.clear()
+    latestOutputCache.clear()
+    outputSeqCounters.clear()
   }
 
-  return {observe, subscribe, abortSubscription, shutdown}
+  return {observe, observeOutput, subscribe, abortSubscription, shutdown}
 }

@@ -152,6 +152,7 @@ function makeRepoAuthzDeps(authorized = true): RepoAuthzDeps {
 function makeManager(overrides?: Partial<RunObservationManager>): RunObservationManager {
   return {
     observe: vi.fn(async () => undefined),
+    observeOutput: vi.fn(),
     subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
     abortSubscription: vi.fn(),
     shutdown: vi.fn(),

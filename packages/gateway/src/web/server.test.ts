@@ -1635,6 +1635,7 @@ describe('buildOperatorApp — optional streaming deps accepted without error', 
     }
     const stubRunObservationManager: import('./server.js').OperatorServerDeps['runObservationManager'] = {
       observe: async () => undefined,
+      observeOutput: () => undefined,
       subscribe: () => () => undefined,
       abortSubscription: () => undefined,
       shutdown: () => undefined,
