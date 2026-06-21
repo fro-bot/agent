@@ -8,7 +8,7 @@ import type {SinkThread} from '../discord/streaming.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
-import type {LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
+import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {ChannelQueue} from './queue.js'
 import type {RunIndex} from './run-index.js'
 
@@ -123,10 +123,23 @@ export interface RunMentionDeps {
  *
  * `deps` is still carried so the inner execution primitive can access
  * coordination config, identity, concurrency, queue, and other deps.
+ *
+ * `runId` and `adoptionEtag` are set by `launchWork` during the admission block
+ * (after `createRun` succeeds). `executeWorkOnHeldSlot` uses them to adopt the
+ * already-created run (`PENDING → ACKNOWLEDGED`) instead of calling `createRun`.
  */
 export interface RunTask {
   readonly request: LaunchWorkRequest
   readonly deps: RunMentionDeps
+  /** Stable UUID for this run. Set by `launchWork` during admission. */
+  readonly runId: string
+  /**
+   * The etag returned by `createRun` (the admission create-etag).
+   * Used by `executeWorkOnHeldSlot` to adopt the run (`PENDING → ACKNOWLEDGED`).
+   * After the ACK transition the etag is refreshed; subsequent transitions use
+   * the latest etag, never this create-etag.
+   */
+  readonly adoptionEtag: string
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +253,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   const channelId = request.channelId
   const binding = request.binding
   const repo = `${binding.owner}/${binding.repo}`
+  // runId and adoptionEtag are set by launchWork during admission.
+  const runId = task.runId
+  const coordLogger = toCoordLogger(logger)
 
   // ── Budget origin — single source of truth for hard abort and approval deadline ──
   // Captured once at run entry so both the AbortSignal.timeout and the approval
@@ -333,11 +349,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       threadId = threadResult.threadId
     }
 
-    const runId = request.runId !== undefined && request.runId !== '' ? request.runId : crypto.randomUUID()
-
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
-    const coordLogger = toCoordLogger(logger)
     const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger)
 
     if (lockResult.success === false) {
@@ -358,70 +371,20 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Lock acquired — must release in inner finally
     let lockEtag = lockResult.data.etag
 
-    // ── Run-state lifecycle + heartbeat ────────────────────────────────────────────────────────
-
-    const now = new Date().toISOString()
-    const initialRunState = {
-      run_id: runId,
-      surface: request.surface,
-      thread_id: threadId, // empty string for non-Discord/in-memory paths
-      entity_ref: repo,
-      phase: 'PENDING' as const,
-      started_at: now,
-      last_heartbeat: now,
-      holder_id: identity,
-      details: {channelId, owner: binding.owner, repo: binding.repo},
-    }
-
-    const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
-    if (createResult.success === false) {
-      logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed')
-      await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
-      await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
-      return
-    }
-
-    // Register the run in the server-owned index so privileged routes can resolve
-    // runId → {repo, surface} without trusting client-supplied owner/repo.
-    // Best-effort: index is optional and register() is synchronous — never blocks execution.
-    // Wrapped in try/catch so a buggy register() implementation never aborts the run.
-    try {
-      deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
-    } catch (registerError: unknown) {
-      logger.warn(
-        {repo, runId, err: registerError instanceof Error ? registerError.message : String(registerError)},
-        'run: runIndex.register threw — continuing (best-effort)',
-      )
-    }
-
-    // Notify the observation pipeline of a run-state transition.
-    // Fire-and-forget: neither a sync throw nor an async rejection must abort the run.
-    // Optional-chaining the .catch() ensures undefined-observer is a clean no-op (no TypeError).
-    function notifyObserver(state: import('@fro-bot/runtime').RunState): void {
-      try {
-        deps.runObserver?.observe(state)?.catch((error: unknown) => {
-          logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed')
-        })
-      } catch (observeError: unknown) {
-        logger.warn(
-          {repo, runId, err: String(observeError)},
-          'run: runObserver.observe threw — continuing (best-effort)',
-        )
-      }
-    }
-
-    // Push the initial PENDING state to the observation pipeline.
-    notifyObserver(initialRunState)
-
-    let runEtag = createResult.data.etag
-
+    // ── Run-state adoption: PENDING → ACKNOWLEDGED ────────────────────────────────────────────
+    // The run was already created (PENDING) by launchWork during admission.
+    // Adopt it here by transitioning PENDING → ACKNOWLEDGED using the adoption etag.
+    // This is the seam between admission (launchWork) and execution (here).
+    // The thread_id is updated via the transition so the run-state reflects the actual thread.
+    // NOTE: transitionRun does not update thread_id — the thread_id was set at createRun time
+    // with an empty string (pre-thread). This is acceptable for now; Unit 3 may refine.
     const ackResult = await transitionRun(
       coordinationConfig,
       identity,
       repo,
       runId,
       'ACKNOWLEDGED',
-      runEtag,
+      task.adoptionEtag,
       coordLogger,
     )
     if (ackResult.success === false) {
@@ -430,10 +393,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
-    runEtag = ackResult.data.etag
+    let runEtag = ackResult.data.etag
 
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
-    notifyObserver(ackResult.data.state)
+    notifyObserverBestEffort(deps, repo, runId, logger, ackResult.data.state)
 
     const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
     heartbeat.start()
@@ -458,7 +421,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       runEtag = execResult.data.etag
 
       // Push the EXECUTING state to the observation pipeline (best-effort, fire-and-forget).
-      notifyObserver(execResult.data.state)
+      notifyObserverBestEffort(deps, repo, runId, logger, execResult.data.state)
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
       statusSink.setReaction('working')
@@ -638,7 +601,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Non-fatal: continue to flush sink and release resources
       } else {
         // Push the COMPLETED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserver(completedResult.data.state)
+        notifyObserverBestEffort(deps, repo, runId, logger, completedResult.data.state)
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
@@ -704,7 +667,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
       } else {
         // Push the FAILED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserver(failedResult.data.state)
+        notifyObserverBestEffort(deps, repo, runId, logger, failedResult.data.state)
       }
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
@@ -812,6 +775,34 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 // launchWork — the public, queue-and-cap-preserving front door
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Gateway in-flight set — owns immediate-path run promises
+// ---------------------------------------------------------------------------
+
+/**
+ * Gateway-owned set of in-flight immediate-run promises.
+ *
+ * When `launchWork` takes the immediate path (slot acquired), it registers the
+ * `executeWorkOnHeldSlot` promise here and removes it on settle. This keeps the
+ * run alive after `launchWork` returns admission early — the caller's `await` no
+ * longer owns the run.
+ *
+ * Graceful shutdown (Unit 5) will drain this set by awaiting all in-flight promises.
+ * For this unit, the set is created and populated; shutdown drain is a future step.
+ *
+ * Module-scoped so it survives across `launchWork` calls within the same process.
+ * Tests that need to inspect or drain it can import `getInFlightRuns`.
+ */
+const inFlightRuns = new Set<Promise<void>>()
+
+/**
+ * Returns the current set of in-flight immediate-run promises.
+ * Exported for shutdown drain (Unit 5) and test inspection.
+ */
+export function getInFlightRuns(): ReadonlySet<Promise<void>> {
+  return inFlightRuns
+}
+
 /**
  * Public front door for launching a unit of work.
  *
@@ -824,25 +815,33 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
  * web caller goes through THIS and cannot bypass the queue/cap.
  *
  * Decides whether to run immediately or enqueue, in this order:
- * 1. If `queue.pendingCount(channelId) > 0` → enqueue + queued ack (pending work has
- *    priority; never take an immediate slot ahead of it).
- * 2. Else `concurrency.tryAcquire(channelId)`:
- *    - `'ok'`   → `executeWorkOnHeldSlot(task)` (slot held).
- *    - `'busy'` → enqueue + queued ack (or "queue is full" if at capacity). Return without blocking.
- *    - `'cap'`  → terminal capacity reply, no enqueue (global cap stays terminal).
+ * 1. Empty-prompt guard — returns `{accepted:false,'empty-prompt'}` before any admission.
+ * 2. Decide disposition FIRST (without admitting):
+ *    - `'cap'` (no slot AND queue full) → capacity reply, return `{accepted:false,'cap'}`, NO createRun.
+ * 3. For accepted dispositions (queued or immediate), run the fail-closed admission block:
+ *    `createRun(PENDING)` → `runIndex.register` → `notifyObserver(PENDING)`.
+ *    If anything after `createRun` throws, terminalize to FAILED before propagating.
+ * 4. Disposition:
+ *    - Queued → `enqueue(task{runId, adoptionEtag})`; return `{accepted:true, runId}`.
+ *    - Immediate → register `executeWorkOnHeldSlot(task)` in the in-flight set; return `{accepted:true, runId}`.
  *
  * Hard invariants:
- * - `'cap'` is TERMINAL — no queue, no retry.
+ * - `'cap'` is TERMINAL — no queue, no retry, no createRun.
  * - Internal identifiers (lock etags, holder IDs, workspace URLs, run IDs,
  *   raw errors) are logged but NEVER posted to the transport.
  * - Bearer token (`attachToken`) is never logged.
+ * - Exactly ONE `createRun` per admitted run (ifNoneMatch:'*' preserved).
  *
  * @param request - Transport-neutral engine input (prompt, sinks, binding, identity).
  * @param deps - Runtime dependencies (concurrency, queue, coordination config, etc.).
+ * @returns `LaunchAdmission` — the admission decision, resolved before the run completes.
  */
-export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDeps): Promise<void> {
-  const {concurrency, queue} = deps
+export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDeps): Promise<LaunchAdmission> {
+  const {concurrency, queue, coordinationConfig, identity, logger} = deps
   const channelId = request.channelId
+  const binding = request.binding
+  const repo = `${binding.owner}/${binding.repo}`
+  const coordLogger = toCoordLogger(logger)
 
   // ── Empty-prompt front-door guard ────────────────────────────────────────────
   // Fail fast before any queue/concurrency/lock/run-state work.
@@ -856,37 +855,176 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   // non-leading-mention edge case. Both checks are intentional and complementary.
   if (request.promptText.trim().length === 0) {
     await request.replySink.send('source', {content: 'Nothing to do — please include a task in your message.'})
-    return
+    return {accepted: false, reason: 'empty-prompt'}
   }
 
-  const task: RunTask = {request, deps}
+  // ── Decide disposition FIRST (before admitting) ──────────────────────────────
+  // The FIFO gate and concurrency cap determine disposition without creating any run-state.
+  // Only after we know the run will be accepted do we run the admission block.
 
   // ── FIFO gate: if pending work exists, enqueue without consulting tryAcquire ──
   // A new request must never leapfrog older queued work, even if a slot is free.
   // Only the handoff path (executeWorkOnHeldSlot's outer finally) may start the next task.
-  if (queue.pendingCount(channelId) > 0) {
-    const enqueueResult = queue.enqueue(channelId, task)
-    await ackEnqueueResult(request, enqueueResult)
-    return
-  }
+  const hasPending = queue.pendingCount(channelId) > 0
 
   // ── Concurrency cap + per-channel in-flight guard ──────────────────────────
-  const slotResult = concurrency.tryAcquire(channelId)
+  // Only consult tryAcquire when there is no pending work (FIFO gate takes priority).
+  const slotResult = hasPending === false ? concurrency.tryAcquire(channelId) : 'busy'
 
   if (slotResult === 'cap') {
+    // Hard capacity reject — non-admitted, no createRun.
     await request.replySink.send('source', {content: 'fro-bot is at capacity right now — please try again shortly.'})
-    return
+    return {accepted: false, reason: 'cap'}
   }
 
-  if (slotResult === 'busy') {
-    // Channel has an in-flight run — enqueue instead of rejecting.
-    const enqueueResult = queue.enqueue(channelId, task)
-    await ackEnqueueResult(request, enqueueResult)
-    return
+  // ── Admission block (fail-closed) ────────────────────────────────────────────
+  // For both queued and immediate dispositions, admit the run now:
+  //   1. createRun(PENDING) — single creator, ifNoneMatch:'*'
+  //   2. runIndex.register — best-effort index entry
+  //   3. notifyObserver(PENDING) — SSE shows 'queued'
+  // If anything after createRun throws, terminalize to FAILED before propagating.
+
+  const runId = request.runId !== undefined && request.runId !== '' ? request.runId : crypto.randomUUID()
+  const now = new Date().toISOString()
+
+  const initialRunState = {
+    run_id: runId,
+    surface: request.surface,
+    thread_id: '', // thread not yet created at admission time; updated after threadFactory runs
+    entity_ref: repo,
+    phase: 'PENDING' as const,
+    started_at: now,
+    last_heartbeat: now,
+    holder_id: identity,
+    details: {channelId, owner: binding.owner, repo: binding.repo},
   }
 
-  // Slot acquired — executeWorkOnHeldSlot owns the release (via atomic handoff in its outer finally).
-  await executeWorkOnHeldSlot(task)
+  const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
+  if (createResult.success === false) {
+    logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed during admission')
+    await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
+    // Capacity was acquired (slotResult === 'ok') — release it since we're not proceeding.
+    if (slotResult === 'ok') {
+      concurrency.release(channelId)
+    }
+    // createRun failed — no run-state to terminalize; just reject admission.
+    throw new Error(`createRun failed: ${createResult.error.message}`)
+  }
+
+  const adoptionEtag = createResult.data.etag
+
+  // Fail-closed: if register or notifyObserver throws after createRun succeeds,
+  // terminalize the just-created run to FAILED so it is never orphaned as PENDING.
+  try {
+    // Register the run in the server-owned index so privileged routes can resolve
+    // runId → {repo, surface} without trusting client-supplied owner/repo.
+    // Best-effort: index is optional and register() is synchronous — never blocks execution.
+    deps.runIndex?.register(runId, {repo, surface: request.surface, startedAt: now})
+
+    // Notify the observation pipeline of the initial PENDING state.
+    // Fire-and-forget: neither a sync throw nor an async rejection must abort admission.
+    notifyObserverBestEffort(deps, repo, runId, logger, initialRunState)
+  } catch (admissionError: unknown) {
+    // Fail-closed: terminalize the run to FAILED before propagating.
+    logger.error(
+      {repo, runId, err: admissionError instanceof Error ? admissionError.message : String(admissionError)},
+      'run: admission block threw after createRun — terminalizing to FAILED',
+    )
+    await failAdmittedRun(coordinationConfig, identity, repo, runId, adoptionEtag, deps, logger, coordLogger)
+    // Release the slot if we acquired it.
+    if (slotResult === 'ok') {
+      concurrency.release(channelId)
+    }
+    throw admissionError
+  }
+
+  // ── Dispatch based on disposition ────────────────────────────────────────────
+
+  const task: RunTask = {request, deps, runId, adoptionEtag}
+
+  if (slotResult === 'ok') {
+    // Immediate path — slot already acquired; register the run promise in the in-flight set.
+    // The gateway in-flight set owns the promise; launchWork returns admission early.
+    // Graceful shutdown (Unit 5) will drain this set.
+    //
+    // runPromise is also returned in the LaunchAdmission result so callers that need
+    // to await the full run (e.g. the Discord adapter for backward compatibility) can
+    // do so without polling the in-flight set. The web launch route ignores it.
+    const runPromise = executeWorkOnHeldSlot(task).catch((error: unknown) => {
+      logger.error(
+        {repo, runId, err: error instanceof Error ? error.message : String(error)},
+        'run: immediate executeWorkOnHeldSlot failed',
+      )
+    })
+    inFlightRuns.add(runPromise)
+    // eslint-disable-next-line no-void
+    void runPromise.finally(() => {
+      inFlightRuns.delete(runPromise)
+    })
+    return {accepted: true, runId, runPromise}
+  }
+
+  // Queued path (slotResult === 'busy' or hasPending was true).
+  // The slot was NOT acquired (tryAcquire returned 'busy' or was skipped due to FIFO gate).
+  const enqueueResult = queue.enqueue(channelId, task)
+  await ackEnqueueResult(request, enqueueResult)
+  return {accepted: true, runId}
+}
+
+// ---------------------------------------------------------------------------
+// notifyObserverBestEffort — fire-and-forget observer notification
+// ---------------------------------------------------------------------------
+
+/**
+ * Notify the observation pipeline of a run-state transition.
+ * Fire-and-forget: neither a sync throw nor an async rejection must abort the caller.
+ */
+function notifyObserverBestEffort(
+  deps: RunMentionDeps,
+  repo: string,
+  runId: string,
+  logger: GatewayLogger,
+  state: import('@fro-bot/runtime').RunState,
+): void {
+  try {
+    deps.runObserver?.observe(state)?.catch((error: unknown) => {
+      logger.warn({repo, runId, err: String(error)}, 'run: runObserver.observe failed')
+    })
+  } catch (observeError: unknown) {
+    logger.warn({repo, runId, err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// failAdmittedRun — terminalize an admitted run to FAILED (best-effort)
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminalize an admitted run to FAILED.
+ *
+ * Used by the fail-closed admission block when register/observer throws after
+ * `createRun` succeeds, and by `executeWorkOnHeldSlot` early-abort gates (Unit 3).
+ *
+ * Uses the provided etag (the latest known etag for this run). Best-effort:
+ * a failure to transition is logged but not propagated — the caller's error
+ * takes precedence.
+ */
+async function failAdmittedRun(
+  coordinationConfig: import('@fro-bot/runtime').CoordinationConfig,
+  identity: string,
+  repo: string,
+  runId: string,
+  currentEtag: string,
+  deps: RunMentionDeps,
+  logger: GatewayLogger,
+  coordLogger: {debug: (message: string, context?: Record<string, unknown>) => void},
+): Promise<void> {
+  const failResult = await transitionRun(coordinationConfig, identity, repo, runId, 'FAILED', currentEtag, coordLogger)
+  if (failResult.success === false) {
+    logger.error({repo, runId, err: failResult.error.message}, 'run: failAdmittedRun — transitionRun FAILED failed')
+  } else {
+    notifyObserverBestEffort(deps, repo, runId, logger, failResult.data.state)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,5 +1227,21 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // ── Delegate to launchWork (the transport-agnostic front door) ────────────
   // Pre-thread acks (cap/queue) go via replySink.send('source', ...) which
   // routes to sendMessage(message, ...) above. The engine handles everything else.
-  await launchWork(request, deps)
+  //
+  // launchWork returns a LaunchAdmission result immediately after the run is
+  // admitted (or rejected) — it does NOT await the run itself. The gateway
+  // in-flight set owns the immediate-path promise.
+  //
+  // runMention awaits the admission result, then awaits the runPromise (if present)
+  // so the Discord event handler sees the run complete before returning. This
+  // preserves the existing Discord behavior (reply timing unchanged) while
+  // allowing the web launch route (Unit 4) to return 202 after admission only.
+  const admission = await launchWork(request, deps)
+
+  // For the immediate path, await the run promise so the Discord handler sees
+  // the full run lifecycle before returning (reply timing unchanged).
+  // For cap/queue/empty-prompt paths, runPromise is absent and this is a no-op.
+  if (admission.accepted === true && admission.runPromise !== undefined) {
+    await admission.runPromise
+  }
 }

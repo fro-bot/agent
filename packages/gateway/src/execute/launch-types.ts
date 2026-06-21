@@ -317,6 +317,32 @@ export interface ReplySink {
 export type ReplySinkTarget = 'source' | 'thread'
 
 // ---------------------------------------------------------------------------
+// LaunchAdmission — result returned by launchWork
+// ---------------------------------------------------------------------------
+
+/**
+ * Result returned by `launchWork` after the admission decision is made.
+ *
+ * `launchWork` returns as soon as the run is admitted (or rejected) — it does
+ * NOT await the run itself. The gateway in-flight set owns the immediate-path
+ * promise; graceful shutdown drains it.
+ *
+ * - `{accepted: true, runId}` — run was admitted (immediate or queued); the
+ *   caller can use `runId` to poll the SSE observation pipeline.
+ *   - `runPromise` (immediate path only): the in-flight run promise. Present
+ *     when the run was started immediately (not queued). Callers that need to
+ *     await the full run (e.g. the Discord adapter for backward compatibility)
+ *     can await this promise. The web launch route ignores it and returns 202.
+ * - `{accepted: false, reason}` — run was rejected before admission; no
+ *   `RunState` was created, no `runId` to poll.
+ *   - `'cap'`          — global concurrency cap reached; no slot AND queue full.
+ *   - `'empty-prompt'` — prompt was empty; rejected before any queue/cap work.
+ */
+export type LaunchAdmission =
+  | {readonly accepted: true; readonly runId: string; readonly runPromise?: Promise<void>}
+  | {readonly accepted: false; readonly reason: 'cap' | 'empty-prompt'}
+
+// ---------------------------------------------------------------------------
 // LaunchWorkRequest — transport-neutral engine input
 // ---------------------------------------------------------------------------
 

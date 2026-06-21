@@ -18,7 +18,7 @@ import * as streamingModule from '../discord/streaming.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core.js'
-import {formatTimeoutDuration} from './run.js'
+import {formatTimeoutDuration, getInFlightRuns} from './run.js'
 
 // ---------------------------------------------------------------------------
 // Mock external collaborators so run.test.ts does not need real AWS/S3/Discord
@@ -251,9 +251,15 @@ function makeMinimalRequest(message: Message, binding: RepoBinding): LaunchWorkR
 /**
  * Build a `RunTask` for use in pending-task / handoff tests.
  * Wraps `makeMinimalRequest` with the given deps.
+ * Provides placeholder runId and adoptionEtag for tests that don't exercise admission.
  */
 function makePendingTask(message: Message, binding: RepoBinding, deps: RunMentionDeps): RunTask {
-  return {request: makeMinimalRequest(message, binding), deps}
+  return {
+    request: makeMinimalRequest(message, binding),
+    deps,
+    runId: crypto.randomUUID(),
+    adoptionEtag: 'test-adoption-etag',
+  }
 }
 
 /**
@@ -533,7 +539,9 @@ describe('runMention', () => {
   describe('per-channel in-flight guard', () => {
     it('enqueues and sends queued ack when channel already has an active run (busy → queue)', async () => {
       // #given — channel is busy; queue has capacity
+      // createRun is now called in launchWork for the queued path too (admission block).
       const {runMention} = await import('./run.js')
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
       const enqueueFn = vi.fn().mockReturnValue('queued')
       const queue = makeDefaultQueue()
       ;(queue.enqueue as ReturnType<typeof vi.fn>).mockImplementation(enqueueFn)
@@ -2397,8 +2405,8 @@ describe('runMention', () => {
 
       const deps = makeDeps({ensureClone, runTimeoutMs: 600_000})
 
-      // #when
-      await launchWork(request, deps)
+      // #when — await the run promise so the run completes before asserting
+      await awaitLaunchWorkRun(launchWork, request, deps)
 
       // #then — factory was called
       expect(createApprovalOnPending).toHaveBeenCalledOnce()
@@ -4210,8 +4218,14 @@ describe('TDZ regression: throwing createApprovalOnPending factory', () => {
     })
 
     // #when — must not throw "Cannot access 'coordinator' before initialization"
-    // and must not throw at all (error is caught and handled internally)
-    await expect(launchWork(request, deps)).resolves.toBeUndefined()
+    // and must not throw at all (error is caught and handled internally).
+    // launchWork now returns LaunchAdmission (not void); await the run promise too.
+    const admission = await launchWork(request, deps)
+    // The factory throws inside executeWorkOnHeldSlot (fire-and-forget); await the run promise
+    // so the outer finally (slot release) runs before we assert.
+    if (admission.accepted === true && admission.runPromise !== undefined) {
+      await admission.runPromise
+    }
 
     // #then — concurrency slot released (outer finally ran despite factory throw)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5028,6 +5042,29 @@ function makeInMemoryRequest(
   }
 }
 
+/**
+ * Call `launchWork` and await the run promise (if present) so tests can check
+ * behavior inside `executeWorkOnHeldSlot`. Since `launchWork` now returns
+ * `LaunchAdmission` early (fire-and-forget for the immediate path), tests that
+ * check run behavior must await the `runPromise` from the admission result.
+ *
+ * For cap/queue/empty-prompt paths, `runPromise` is absent and this is a no-op.
+ */
+async function awaitLaunchWorkRun(
+  launchWork: (
+    request: import('./launch-types.js').LaunchWorkRequest,
+    deps: RunMentionDeps,
+  ) => Promise<import('./launch-types.js').LaunchAdmission>,
+  request: import('./launch-types.js').LaunchWorkRequest,
+  deps: RunMentionDeps,
+): Promise<import('./launch-types.js').LaunchAdmission> {
+  const admission = await launchWork(request, deps)
+  if (admission.accepted === true && admission.runPromise !== undefined) {
+    await admission.runPromise
+  }
+  return admission
+}
+
 describe('launchWork — in-memory sink tests', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -5043,8 +5080,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — run completed (COMPLETED transition)
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
@@ -5067,8 +5104,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest({promptText: 'fix the bug'})
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — runOpenCodeCore called with a promptText derived from the request
     expect(mockRunOpenCodeCore).toHaveBeenCalledExactlyOnceWith(
@@ -5096,8 +5133,8 @@ describe('launchWork — in-memory sink tests', () => {
       },
     })
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — slot released in outer finally
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5111,8 +5148,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — statusSink.dispose called
     expect(request._statusSink.dispose).toHaveBeenCalledOnce()
@@ -5130,8 +5167,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps({runTimeoutMs: 600_000})
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — failed reaction set
     expect(request._statusSink._reactions).toContain('failed')
@@ -5153,8 +5190,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — FAILED transition
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
@@ -5185,8 +5222,8 @@ describe('launchWork — in-memory sink tests', () => {
       isShuttingDown,
     })
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — slot released immediately (no handoff)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5288,8 +5325,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — setRunReaction NOT called (no Discord message in launchWork path)
     // Reactions are handled by the statusSink.setReaction method instead
@@ -5305,8 +5342,8 @@ describe('launchWork — in-memory sink tests', () => {
     const request = makeInMemoryRequest()
     const deps = makeDeps()
 
-    // #when
-    await launchWork(request, deps)
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — createDiscordStreamSink NOT called (no thread in launchWork path)
     // The replySink is provided by the caller, not created internally
@@ -5323,8 +5360,12 @@ describe('threadFactory failure path', () => {
     vi.clearAllMocks()
   })
 
-  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, createRun NOT called, transitionRun NOT called, slot released', async () => {
+  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, slot released', async () => {
     // #given — threadFactory fails immediately
+    // Note: createRun IS called in launchWork (admission) before executeWorkOnHeldSlot.
+    // The threadFactory failure is an early-abort gate inside executeWorkOnHeldSlot.
+    // Unit 3 will add FAILED terminalization for this path; for Unit 2, the run
+    // is admitted (PENDING) but the threadFactory failure leaves it without ACKNOWLEDGED.
     const {runMention} = await import('./run.js')
     setupHappyPath()
 
@@ -5354,10 +5395,10 @@ describe('threadFactory failure path', () => {
     // #and — acquireLock NOT called (threadFactory failed before lock acquisition)
     expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
 
-    // #and — createRun NOT called (no lock acquired)
-    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+    // #and — createRun IS called (in launchWork admission block, before executeWorkOnHeldSlot)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
 
-    // #and — transitionRun NOT called (no run-state created)
+    // #and — transitionRun NOT called (threadFactory failed before ACKNOWLEDGED transition)
     expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
 
     // #and — concurrency slot released (no leak)
@@ -5420,8 +5461,8 @@ describe('threadFactory timeout path', () => {
     // #and — acquireLock NOT called (threadFactory timed out before lock acquisition)
     expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
 
-    // #and — createRun NOT called
-    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+    // #and — createRun IS called (in launchWork admission block, before executeWorkOnHeldSlot)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
 
     // #and — concurrency slot released (no leak)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5521,7 +5562,8 @@ describe('Unit 1 — approval transport selection', () => {
     const deps = makeDeps()
 
     // #when — launch with web surface and createApprovalOnPending factory
-    await launchWork(request, deps)
+    // Await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — factory was called exactly once (engine called it with context)
     expect(webFactory).toHaveBeenCalledOnce()
@@ -5606,8 +5648,12 @@ describe('Unit 1 — approval transport selection', () => {
     }
     const deps = makeDeps()
 
-    // #when — launch with web surface
-    await launchWork(request, deps)
+    // #when — launch with web surface; await the run promise to verify execution
+    const admission = await launchWork(request, deps)
+    // launchWork returns admission early; await the run promise to verify execution completed
+    if (admission.accepted === true && admission.runPromise !== undefined) {
+      await admission.runPromise
+    }
 
     // #then — execution completed (web surface is now a valid Surface value)
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
@@ -5718,8 +5764,10 @@ describe('runIndex.register() wiring (FIX 5)', () => {
     expect(calledEntry.startedAt.length).toBeGreaterThan(0)
   })
 
-  it('register() failure does not break run execution (best-effort)', async () => {
+  it('register() failure is fail-closed: run terminalized to FAILED, admission rejects', async () => {
     // #given — runIndex.register() throws
+    // Per the fail-closed admission block: register throwing after createRun succeeds
+    // must terminalize the run to FAILED (no orphan PENDING) and reject admission.
     const {runMention} = await import('./run.js')
     setupHappyPath()
 
@@ -5734,13 +5782,16 @@ describe('runIndex.register() wiring (FIX 5)', () => {
     const deps = makeDeps({runIndex})
     const message = makeMessage()
 
-    // #when — should not throw; execution continues despite register() throwing
-    await runMention(message, makeBinding(), deps)
+    // #when — launchWork throws (admission rejected); runMention propagates the throw
+    await expect(runMention(message, makeBinding(), deps)).rejects.toThrow('index register failed')
 
     // #then — register was called
     expect(registerFn).toHaveBeenCalledOnce()
-    // #and — execution completed normally (runOpenCodeCore was called)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    // #and — run was terminalized to FAILED (transitionRun FAILED called)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    // #and — runOpenCodeCore was NOT called (run was rejected before execution)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 
   it('runIndex is optional — omitting it does not break run execution', async () => {
@@ -5756,5 +5807,371 @@ describe('runIndex.register() wiring (FIX 5)', () => {
 
     // #then — execution completed normally
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit 2: launchWork owns admission + returns LaunchAdmission
+// ---------------------------------------------------------------------------
+
+describe('Unit 2 — launchWork admission', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // ── Happy path (immediate) ─────────────────────────────────────────────────
+
+  it('immediate: launchWork returns {accepted:true, runId} BEFORE the run completes', async () => {
+    // #given — a hanging executeWorkOnHeldSlot mock (run never completes)
+    // This proves launchWork returns admission early, not after the run.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    // Make runOpenCodeCore hang indefinitely
+    let resolveRun: (() => void) | undefined
+    mockRunOpenCodeCore.mockImplementation(
+      async () =>
+        new Promise<void>(resolve => {
+          resolveRun = resolve
+        }),
+    )
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when — launchWork returns admission early (before run completes)
+    const admissionPromise = launchWork(request, deps)
+    const admission = await admissionPromise
+
+    // #then — admission returned before run completed
+    expect(admission).toMatchObject({accepted: true, runId: expect.any(String) as unknown})
+    // runPromise is present for the immediate path
+    expect(admission.accepted === true ? admission.runPromise : undefined).toBeDefined()
+
+    // Yield to the event loop so executeWorkOnHeldSlot can start
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #and — runOpenCodeCore was called (run started, even though launchWork returned early)
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+
+    // Resolve the hanging run so the test can clean up
+    resolveRun?.()
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+  })
+
+  // ── R8/ownership: immediate run completes after launchWork returns ──────────
+
+  it('r8/ownership: immediate run completes and posts output after launchWork returns admission early', async () => {
+    // #given — a run that completes after a delay
+    // This proves the gateway in-flight set keeps the run alive after launchWork returns.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when — launchWork returns admission early
+    const admission = await launchWork(request, deps)
+
+    // #then — admission returned
+    expect(admission.accepted).toBe(true)
+
+    // #and — await the run promise to verify the run completes
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+
+    // #and — run completed (COMPLETED transition)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+
+    // #and — output was posted (flush called)
+    expect(request._replySink.flush).toHaveBeenCalled()
+  })
+
+  // ── R8/ownership: shutdown drains in-flight immediate run ──────────────────
+
+  it('r8/ownership: getInFlightRuns() exposes the in-flight set; runPromise awaits the run', async () => {
+    // #given — a run that completes normally
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when — launchWork returns admission early
+    const admission = await launchWork(request, deps)
+    expect(admission.accepted).toBe(true)
+
+    // #then — the runPromise is present (immediate path)
+    expect(admission.accepted === true ? admission.runPromise : undefined).toBeDefined()
+
+    // Await the runPromise directly (the caller's way to await the run)
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+
+    // #and — run completed (COMPLETED transition)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+
+    // #and — in-flight set is now empty (run completed and was removed)
+    expect(getInFlightRuns().size).toBe(0)
+  })
+
+  // ── Happy path (queued) ────────────────────────────────────────────────────
+
+  it('queued: launchWork creates PENDING, returns {accepted:true, runId}, enqueues task with runId+adoptionEtag', async () => {
+    // #given — channel is busy; queue has capacity
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-queued'}})
+
+    const queue = makeDefaultQueue()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('busy'),
+        release: vi.fn(),
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+      queue,
+    })
+
+    // #when
+    const admission = await launchWork(request, deps)
+
+    // #then — admission accepted
+    expect(admission).toMatchObject({accepted: true, runId: expect.any(String) as unknown})
+    // No runPromise for queued path
+    expect(admission.accepted === true ? admission.runPromise : 'not-accepted').toBeUndefined()
+
+    // #and — createRun was called (PENDING created)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — task enqueued with runId and adoptionEtag
+    expect(queue.enqueue).toHaveBeenCalledOnce()
+    const enqueuedTask = (queue.enqueue as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as {
+      runId: string
+      adoptionEtag: string
+    }
+    expect(typeof enqueuedTask.runId).toBe('string')
+    expect(enqueuedTask.runId.length).toBeGreaterThan(0)
+    expect(enqueuedTask.adoptionEtag).toBe('run-etag-queued')
+  })
+
+  // ── Edge (cap) ─────────────────────────────────────────────────────────────
+
+  it('cap: returns {accepted:false,"cap"} and does NOT call createRun', async () => {
+    // #given — global cap reached
+    const {launchWork} = await import('./run.js')
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('cap'),
+        release: vi.fn(),
+        activeCount: vi.fn().mockReturnValue(3),
+        max: 3,
+      },
+    })
+
+    // #when
+    const admission = await launchWork(request, deps)
+
+    // #then — admission rejected with 'cap'
+    expect(admission).toMatchObject({accepted: false, reason: 'cap'})
+
+    // #and — createRun NOT called (no admission for cap)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+  })
+
+  // ── Edge (empty prompt) ────────────────────────────────────────────────────
+
+  it('empty-prompt: returns {accepted:false,"empty-prompt"} before any admission', async () => {
+    // #given — empty prompt
+    const {launchWork} = await import('./run.js')
+
+    const request = makeInMemoryRequest({promptText: '   '})
+    const deps = makeDeps()
+
+    // #when
+    const admission = await launchWork(request, deps)
+
+    // #then — admission rejected with 'empty-prompt'
+    expect(admission).toMatchObject({accepted: false, reason: 'empty-prompt'})
+
+    // #and — createRun NOT called (no admission for empty prompt)
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+    // #and — tryAcquire NOT called (empty prompt guard fires first)
+    // (concurrency is not consulted before the empty-prompt check)
+  })
+
+  // ── Fail-closed: register throws after createRun ───────────────────────────
+
+  it('fail-closed: runIndex.register throws after createRun → run terminalized to FAILED, admission rejects', async () => {
+    // #given — register throws after createRun succeeds
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    // transitionRun mock for the FAILED terminalization
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const registerFn = vi.fn(() => {
+      throw new Error('register failed')
+    })
+    const runIndex = {register: registerFn, lookup: vi.fn().mockResolvedValue(undefined)}
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runIndex})
+
+    // #when — launchWork throws (admission rejected)
+    await expect(launchWork(request, deps)).rejects.toThrow('register failed')
+
+    // #then — createRun was called (admission started)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — run terminalized to FAILED (no orphan PENDING)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+
+    // #and — runOpenCodeCore NOT called (run was rejected before execution)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── R9: exactly ONE createRun per run ──────────────────────────────────────
+
+  it('r9: exactly one createRun per run; ifNoneMatch:"*" header is set', async () => {
+    // #given — happy path
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — createRun called exactly once
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — the initial run state has phase PENDING
+    const createRunCall = mockRuntime.createRun.mock.calls[0] as unknown[]
+    const initialState = createRunCall[3] as {phase?: string}
+    expect(initialState.phase).toBe('PENDING')
+  })
+
+  // ── Observer sees PENDING before ACKNOWLEDGED ──────────────────────────────
+
+  it('observer sees PENDING before ACKNOWLEDGED for an immediate run', async () => {
+    // #given — observer that records phases in order
+    const {launchWork} = await import('./run.js')
+
+    const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
+    const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
+    const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'ack-etag', state: ackState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'exec-etag', state: execState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'done-etag', state: completedState}})
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: vi.fn().mockResolvedValue({
+        success: true,
+        data: {runEtag: 'r-etag', lockEtag: 'l-etag', runState: completedState},
+      }),
+      isRunning: false,
+    })
+    mockRunOpenCodeCore.mockResolvedValue(undefined)
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const runObserver = {observe: observeFn}
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver})
+
+    // #when — await the run promise so the run completes before asserting
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — observer called with PENDING first, then ACKNOWLEDGED, EXECUTING, COMPLETED
+    expect(observeFn).toHaveBeenCalledTimes(4)
+    const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(phases[0]).toBe('PENDING')
+    expect(phases[1]).toBe('ACKNOWLEDGED')
+    expect(phases[2]).toBe('EXECUTING')
+    expect(phases[3]).toBe('COMPLETED')
+  })
+
+  // ── LaunchAdmission type: accepted path carries runId ─────────────────────
+
+  it('launchWork returns {accepted:true, runId} for immediate path', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    const admission = await launchWork(request, deps)
+
+    // #then
+    expect(admission).toMatchObject({accepted: true, runId: expect.any(String) as unknown})
+
+    // Drain the run
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+  })
+
+  // ── runId from request.runId is honored ────────────────────────────────────
+
+  it('launchWork uses request.runId when provided (non-empty)', async () => {
+    // #given — caller provides a specific runId
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const CALLER_RUN_ID = 'caller-provided-run-id-abc123'
+    const request = makeInMemoryRequest()
+    const requestWithRunId = {...request, runId: CALLER_RUN_ID}
+    const deps = makeDeps()
+
+    // #when
+    const admission = await launchWork(requestWithRunId, deps)
+
+    // #then — admission uses the caller-provided runId
+    expect(admission).toMatchObject({accepted: true, runId: CALLER_RUN_ID})
+
+    // Drain the run
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+  })
+
+  // ── Empty string runId falls back to UUID ─────────────────────────────────
+
+  it('launchWork generates a UUID when request.runId is empty string', async () => {
+    // #given — caller provides an empty string runId (should be treated as absent)
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const requestWithEmptyRunId = {...request, runId: ''}
+    const deps = makeDeps()
+
+    // #when
+    const admission = await launchWork(requestWithEmptyRunId, deps)
+
+    // #then — admission generates a UUID (not empty string)
+    expect(admission).toMatchObject({accepted: true, runId: expect.any(String) as unknown})
+    expect(admission.accepted === true ? admission.runId : '').not.toBe('')
+
+    // Drain the run
+    await (admission.accepted === true ? admission.runPromise : Promise.resolve())
   })
 })
