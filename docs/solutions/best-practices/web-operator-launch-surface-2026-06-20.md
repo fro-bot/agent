@@ -49,14 +49,19 @@ const request = {
   createApprovalOnPending: createWebAutoDenyApproval(deps.logger),
   promptBuilder: buildWebPrompt,
 }
-const launchWorkPromise = launchWork(request, deps.launchWorkDeps) // NOT awaited
-void launchWorkPromise.catch((error: unknown) =>
-  deps.logger.error(
-    {githubUserId, runId, owner, repo, err: error instanceof Error ? error.message : String(error)},
-    'launch: background run failed',
-  ),
-)
-return c.json({runId}, 202)
+// Admission is awaited (fast, bounded); the run itself is NOT awaited —
+// launchWork registers the immediate run in a gateway-owned in-flight set.
+idempotency.reserve(key, runId)
+let committed = false
+try {
+  const admission = await launchWork(request, deps.launchWorkDeps)
+  if (admission.accepted === false) return rejectResponse(admission.reason)
+  idempotency.commit(key)
+  committed = true
+  return c.json({runId}, 202)
+} finally {
+  if (committed === false) idempotency.rollback(key) // no stuck reservation, no dead runId
+}
 ```
 
 Run admission was later moved into `launchWork` itself, so a queued run and a run that fails before execution both produce an observable `RunState` from the moment they are accepted (the route awaits admission, then commits idempotency). A `202`'d `runId` is therefore observable over SSE for every accepted disposition, not just the immediate-run happy path.

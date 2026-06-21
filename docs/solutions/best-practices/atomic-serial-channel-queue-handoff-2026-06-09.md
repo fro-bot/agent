@@ -177,6 +177,11 @@ in-memory and lossy. Dropping the queue on shutdown therefore strands those `PEN
 records; the startup stale-run sweep recovers them to `FAILED` using a heartbeat-staleness
 freshness window (a just-admitted `PENDING` is excluded so it is never killed mid-admission).
 The lossy-queue contract stands; the durable admission record just gains a recovery owner.
+The gateway also drains an in-flight-run set on shutdown via `Promise.all([...set])`, which
+snapshots the set at call time — a handoff that fires mid-drain escapes the await. That is the
+same snapshot shape this doc warns about, but here it is accepted: the bounded drain has a hard
+deadline and the startup recovery sweep terminalizes any run the drain misses, so a missed
+handoff degrades to a recovered `FAILED`, not a lost run.
 
 ## When to Apply
 
