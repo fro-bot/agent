@@ -624,12 +624,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         runEtag,
         coordLogger,
       )
+      // Capture the COMPLETED state now so we can notify AFTER the final-answer flush.
+      // The notify is deferred to guarantee the web sink's flush() → final output frame
+      // is pushed before observe(terminalState) fans the terminal status frame (which
+      // closes run subscribers). For Discord, the reorder is inert: Discord does not
+      // observe these frames; its flush posts to the thread independently.
+      let completedStateForNotify: RunState | undefined
       if (completedResult.success === false) {
         logger.error({repo, runId, err: completedResult.error.message}, 'run: transitionRun COMPLETED failed')
         // Non-fatal: continue to flush sink and release resources
       } else {
-        // Push the COMPLETED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserverBestEffort(deps, completedResult.data.state)
+        completedStateForNotify = completedResult.data.state
       }
 
       // ── Status controller final-answer transition ─────────────────────────────────────────────
@@ -643,6 +648,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         await replySink.flush()
       }
       // 'handled': answer is already in the status message — do not flush (would double-post).
+
+      // Push the COMPLETED state to the observation pipeline AFTER the final-answer flush.
+      // This guarantees the web sink's final output frame is delivered before the terminal
+      // status frame (which closes run subscribers). Best-effort, fire-and-forget.
+      if (completedStateForNotify !== undefined) {
+        notifyObserverBestEffort(deps, completedStateForNotify)
+      }
     } catch (execError: unknown) {
       // ── Error classification ───────────────────────────────────────────────
 
@@ -691,11 +703,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         runEtag,
         coordLogger,
       )
+      // Capture the FAILED state now so we can notify AFTER the partial-output flush.
+      // The notify is deferred to guarantee the web sink's flush() → final output frame
+      // is pushed before observe(terminalState) fans the terminal status frame (which
+      // closes run subscribers). For Discord, the reorder is inert.
+      let failedStateForNotify: RunState | undefined
       if (failedResult.success === false) {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
       } else {
-        // Push the FAILED state to the observation pipeline (best-effort, fire-and-forget).
-        notifyObserverBestEffort(deps, failedResult.data.state)
+        failedStateForNotify = failedResult.data.state
       }
 
       // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
@@ -703,6 +719,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       await replySink.flush().catch((flushError: unknown) => {
         logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
       })
+
+      // Push the FAILED state to the observation pipeline AFTER the partial-output flush.
+      // This guarantees the web sink's final output frame is delivered before the terminal
+      // status frame (which closes run subscribers). Best-effort, fire-and-forget.
+      if (failedStateForNotify !== undefined) {
+        notifyObserverBestEffort(deps, failedStateForNotify)
+      }
 
       // Coarse user message — no internal detail
       const timeoutDuration = formatTimeoutDuration(runTimeoutMs)

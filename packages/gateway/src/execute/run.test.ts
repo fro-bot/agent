@@ -2916,6 +2916,167 @@ describe('runMention', () => {
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).toContain('COMPLETED')
     })
+
+    // ── Observer notification ordering (the race fix) ────────────────────────
+    //
+    // Characterization: Discord successful run → flush posts output AND run completes normally.
+    // This pins the existing Discord behavior so the reorder is provably inert for Discord.
+    //
+    // Ordering: for a run with an observer, the final output flush fires BEFORE the observer
+    // receives the terminal COMPLETED/FAILED state. This is the load-bearing guarantee that
+    // the web sink's final output frame is delivered before the terminal status frame closes
+    // run subscribers.
+
+    it('characterization (Discord regression): successful Discord run completes and replySink.flush posts output — reorder is inert', async () => {
+      // #given — Discord surface; happy path; delegated answer path (flush posts the answer)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const flushMock = vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 42})
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('the agent answer'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const completedState = buildMockRunState({phase: 'COMPLETED'})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+        })
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING'})},
+        })
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'done-etag', state: completedState}})
+
+      const observeFn = vi.fn().mockResolvedValue(undefined)
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — run completed (COMPLETED transition happened)
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('COMPLETED')
+
+      // #and — replySink.flush was called (Discord posts the answer via flush)
+      expect(flushMock).toHaveBeenCalledOnce()
+
+      // #and — observer was called with the COMPLETED state (Discord behavior unchanged)
+      const phases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+      expect(phases).toContain('COMPLETED')
+    })
+
+    it('ordering (COMPLETED path): replySink.flush is called BEFORE the observer receives the terminal COMPLETED state', async () => {
+      // #given — track call order between flush and observe(COMPLETED)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+
+      const callOrder: string[] = []
+
+      const flushMock = vi.fn().mockImplementation(async () => {
+        callOrder.push('flush')
+        return {kind: 'sent' as const, charCount: 10}
+      })
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('answer'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const completedState = buildMockRunState({phase: 'COMPLETED'})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+        })
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING'})},
+        })
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'done-etag', state: completedState}})
+
+      const observeFn = vi.fn().mockImplementation(async (state: {phase?: string}) => {
+        if (state.phase === 'COMPLETED') {
+          callOrder.push('observe-COMPLETED')
+        }
+        return Promise.resolve()
+      })
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush happened before observe(COMPLETED)
+      const flushIdx = callOrder.indexOf('flush')
+      const observeIdx = callOrder.indexOf('observe-COMPLETED')
+      expect(flushIdx).toBeGreaterThanOrEqual(0)
+      expect(observeIdx).toBeGreaterThanOrEqual(0)
+      expect(flushIdx).toBeLessThan(observeIdx)
+    })
+
+    it('ordering (FAILED path): replySink.flush is called BEFORE the observer receives the terminal FAILED state', async () => {
+      // #given — track call order between flush and observe(FAILED)
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+
+      const callOrder: string[] = []
+
+      const flushMock = vi.fn().mockImplementation(async () => {
+        callOrder.push('flush')
+        return {kind: 'sent' as const, charCount: 5}
+      })
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: flushMock,
+        buffered: vi.fn().mockReturnValue('partial'),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      const failedState = buildMockRunState({phase: 'FAILED'})
+      mockRuntime.transitionRun
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED'})},
+        })
+        .mockResolvedValueOnce({
+          success: true as const,
+          data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING'})},
+        })
+        .mockResolvedValueOnce({success: true as const, data: {etag: 'fail-etag', state: failedState}})
+
+      const observeFn = vi.fn().mockImplementation(async (state: {phase?: string}) => {
+        if (state.phase === 'FAILED') {
+          callOrder.push('observe-FAILED')
+        }
+        return Promise.resolve()
+      })
+      const deps = makeDeps({runObserver: {observe: observeFn}})
+      const message = makeMessage()
+
+      // #when
+      await runMention(message, makeBinding(), deps)
+
+      // #then — flush happened before observe(FAILED)
+      const flushIdx = callOrder.indexOf('flush')
+      const observeIdx = callOrder.indexOf('observe-FAILED')
+      expect(flushIdx).toBeGreaterThanOrEqual(0)
+      expect(observeIdx).toBeGreaterThanOrEqual(0)
+      expect(flushIdx).toBeLessThan(observeIdx)
+    })
   })
 
   // ── Status controller wiring ─────────────────────────────────────────────
