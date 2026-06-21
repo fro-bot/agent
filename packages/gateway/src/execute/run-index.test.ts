@@ -69,6 +69,7 @@ function makeCoordinationConfig(): CoordinationConfig {
     lockTtlSeconds: 60,
     heartbeatIntervalMs: 10_000,
     staleThresholdMs: 300_000,
+    pendingStaleThresholdMs: 30 * 60_000,
   }
 }
 

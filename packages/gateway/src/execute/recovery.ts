@@ -1,14 +1,16 @@
 /**
  * Startup stale-run recovery.
  *
- * On gateway boot, scans every bound repo for execution runs that were left
- * in the EXECUTING phase by a prior crash (the only phase that can be stranded
- * with a held lock+lease, since PENDING→ACKNOWLEDGED→EXECUTING all complete
- * within a synchronous setup block before any interruptible await).
+ * On gateway boot, scans every bound repo for runs that were left in a
+ * non-terminal active phase (EXECUTING, PENDING, or ACKNOWLEDGED) by a prior
+ * crash or shutdown. EXECUTING runs hold a lock+lease; PENDING and ACKNOWLEDGED
+ * runs can be stranded when a crash or shutdown occurs after admission but
+ * before the run reaches EXECUTING.
  *
  * For each stranded run the sweep:
  *  1. Transitions the run state to FAILED.
- *  2. Releases the repo lock (frees the next mention to proceed).
+ *  2. Releases the repo lock — only for EXECUTING runs (PENDING and ACKNOWLEDGED
+ *     runs have not yet acquired the lock, so no release is needed).
  *  3. Posts a brief "previous task interrupted" note to the original thread
  *     (best-effort — skipped if the thread cannot be resolved).
  *
@@ -237,35 +239,41 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     }
   }
 
-  // ── 2. Release the repo lock ─────────────────────────────────────────────
+  // ── 2. Release the repo lock (EXECUTING only) ───────────────────────────
+  //
+  // Only EXECUTING runs hold the repo lock. PENDING and ACKNOWLEDGED runs have
+  // not yet reached the lock-acquisition step, so attempting a lock release for
+  // them would be incorrect (and could release a lock held by a different run).
 
-  const lockKeyResult = getLockKey(coordinationConfig, repo)
+  if (run.phase === 'EXECUTING') {
+    const lockKeyResult = getLockKey(coordinationConfig, repo)
 
-  if (lockKeyResult.success === false) {
-    logger.warn({runId: run.run_id, repo, err: lockKeyResult.error.message}, 'recovery: could not build lock key')
-  } else {
-    const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
+    if (lockKeyResult.success === false) {
+      logger.warn({runId: run.run_id, repo, err: lockKeyResult.error.message}, 'recovery: could not build lock key')
+    } else {
+      const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
 
-    if (lockFetch !== null) {
-      // Only release the lock when it belongs to this stale run. If another run
-      // acquired the lock after the stale run's lease expired, releasing here would
-      // delete an active run's lock and allow concurrent execution.
-      if (lockFetch.runId === run.run_id) {
-        const releaseResult = await releaseLock(coordinationConfig, repo, lockFetch.etag, coordLogger)
+      if (lockFetch !== null) {
+        // Only release the lock when it belongs to this stale run. If another run
+        // acquired the lock after the stale run's lease expired, releasing here would
+        // delete an active run's lock and allow concurrent execution.
+        if (lockFetch.runId === run.run_id) {
+          const releaseResult = await releaseLock(coordinationConfig, repo, lockFetch.etag, coordLogger)
 
-        if (releaseResult.success === false) {
-          logger.warn(
-            {runId: run.run_id, repo, err: releaseResult.error.message},
-            'recovery: releaseLock failed — continuing',
-          )
+          if (releaseResult.success === false) {
+            logger.warn(
+              {runId: run.run_id, repo, err: releaseResult.error.message},
+              'recovery: releaseLock failed — continuing',
+            )
+          } else {
+            logger.info({runId: run.run_id, repo}, 'recovery: lock released')
+          }
         } else {
-          logger.info({runId: run.run_id, repo}, 'recovery: lock released')
+          logger.warn(
+            {runId: run.run_id, repo, lockRunId: lockFetch.runId},
+            'recovery: lock.run_id does not match stale run — skipping release (lock belongs to a different run)',
+          )
         }
-      } else {
-        logger.warn(
-          {runId: run.run_id, repo, lockRunId: lockFetch.runId},
-          'recovery: lock.run_id does not match stale run — skipping release (lock belongs to a different run)',
-        )
       }
     }
   }

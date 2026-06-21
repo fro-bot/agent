@@ -13,6 +13,7 @@ import {
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
+  DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
 } from '@fro-bot/runtime'
 import {getConnInfo} from '@hono/node-server/conninfo'
@@ -28,12 +29,13 @@ import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createRunIndex} from './execute/run-index.js'
+import {getInFlightRuns} from './execute/run.js'
 import {createAppClient} from './github/app-client.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
-import {installShutdownHandlers, isShuttingDown} from './shutdown.js'
+import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createInMemorySessionStore} from './web/auth/session.js'
 import {createRunObservationManager} from './web/sse/manager.js'
@@ -54,6 +56,7 @@ function makeCoordinationConfig(s3Adapter: ObjectStoreAdapter, config: GatewayCo
     lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
     heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
     staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+    pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
   }
 }
 
@@ -577,7 +580,27 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // its finally block. The per-run coordinator.dispose() is the authoritative backstop
       // for approvals registered after this global drain.
       await approvalRegistry.disposeAll('gateway shutdown')
-      await Promise.all(inFlightRuns)
+
+      // Drain in-flight runs with a bounded timeout so a hung S3/network call
+      // (e.g. in acquireLock/ensureClone/readyz) cannot stall shutdown forever.
+      // The recovery sweep (recoverStaleRuns) is the backstop for any run that
+      // does not complete before the deadline.
+      const drainDeadline = new Promise<void>(resolve => {
+        setTimeout(() => {
+          const discordCount = inFlightRuns.size
+          const webCount = getInFlightRuns().size
+          const total = discordCount + webCount
+          if (total > 0) {
+            logger.warn({discordCount, webCount}, `shutdown drain timed out with ${total} run(s) still in flight`)
+          }
+          resolve()
+        }, DEFAULT_DRAIN_MS)
+      })
+
+      // Drain Discord mention runs (owned by this program-scoped set).
+      // Drain web immediate runs (owned by run.ts's module-scoped in-flight set).
+      // Both sets are drained concurrently; the deadline races both.
+      await Promise.race([Promise.all([...inFlightRuns, ...getInFlightRuns()]), drainDeadline])
     })
 
     // i. Login
