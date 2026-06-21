@@ -36,6 +36,19 @@ export const DEFAULT_MAX_STREAM_DURATION_MS = 30 * 60 * 1000
 /** Default per-subscriber queue cap in bytes (64 KB). */
 export const DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES = 64 * 1024
 
+/**
+ * Default TTL for the terminal replay cache (10 minutes).
+ * Late subscribers connecting within this window receive the final output
+ * and terminal status, then the stream closes gracefully.
+ */
+export const DEFAULT_TERMINAL_REPLAY_TTL_MS = 10 * 60 * 1000
+
+/**
+ * Maximum number of entries in the terminal replay cache.
+ * Oldest entries are evicted when this cap is exceeded.
+ */
+export const DEFAULT_TERMINAL_REPLAY_MAX_ENTRIES = 500
+
 // ---------------------------------------------------------------------------
 // Terminal statuses
 // ---------------------------------------------------------------------------
@@ -138,6 +151,8 @@ export interface RunObservationManagerDeps {
   readonly heartbeatIntervalMs?: number
   readonly maxStreamDurationMs?: number
   readonly subscriberQueueCapBytes?: number
+  readonly terminalReplayTtlMs?: number
+  readonly terminalReplayMaxEntries?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +186,8 @@ export interface RunObservationManager {
    * merged and a droppedCount is accumulated onto the next successfully-enqueued
    * output frame for that subscriber, keeping the connection alive.
    *
-   * On opts.final === true, caches the frame in latestOutputCache so late subscribers
-   * receive the final answer on subscribe.
+   * On opts.final === true, caches the frame in the terminal replay cache so late
+   * subscribers receive the final answer on subscribe.
    *
    * Does NOT add any mutating run API to the deps — observer-only by construction.
    */
@@ -220,6 +235,26 @@ interface SubscriberState {
    * drop the subscriber).
    */
   coalescedDropCount: number
+  /**
+   * When set to 'terminal', this subscriber is in graceful-drain mode:
+   * - No new frames are accepted (heartbeat enqueue is skipped).
+   * - The queue is NOT cleared; drainQueue delivers all already-queued frames.
+   * - When the queue empties, drainQueue finalizes: removes from runSubscribers,
+   *   clears timers, calls onClose('terminal').
+   * - dropped is NOT set to true until finalization.
+   */
+  closingReason: 'terminal' | undefined
+}
+
+// ---------------------------------------------------------------------------
+// Terminal replay cache entry
+// ---------------------------------------------------------------------------
+
+interface TerminalReplayCacheEntry {
+  finalOutput: OperatorOutputFrame | undefined
+  terminalStatus: OperatorRunStatus | undefined
+  expiresAt: number
+  evictionTimer: ReturnType<typeof globalThis.setTimeout> | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +290,8 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
   const maxStreamDurationMs = deps.maxStreamDurationMs ?? DEFAULT_MAX_STREAM_DURATION_MS
   const subscriberQueueCapBytes = deps.subscriberQueueCapBytes ?? DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES
+  const terminalReplayTtlMs = deps.terminalReplayTtlMs ?? DEFAULT_TERMINAL_REPLAY_TTL_MS
+  const terminalReplayMaxEntries = deps.terminalReplayMaxEntries ?? DEFAULT_TERMINAL_REPLAY_MAX_ENTRIES
 
   // ---------------------------------------------------------------------------
   // State
@@ -268,9 +305,21 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   const latestStatusCache = new Map<string, OperatorRunStatus>()
 
   /**
+   * Terminal replay cache: persists the final output frame AND terminal status
+   * for a bounded TTL after a run reaches terminal state. Late subscribers
+   * connecting within the TTL receive the cached final output then terminal status,
+   * then the stream closes gracefully with 'terminal'.
+   *
+   * Replaces latestOutputCache for the terminal path. Active (non-terminal) runs
+   * still use latestOutputCache for the live-subscriber snapshot path.
+   */
+  const terminalReplayCache = new Map<string, TerminalReplayCacheEntry>()
+
+  /**
    * Latest final output frame per run. Set only when observeOutput is called with
-   * final:true. Cleared on the same teardown paths as latestStatusCache (terminal
-   * cleanup in observe(), shutdown). Delivered to late subscribers on subscribe.
+   * final:true AND the run is still active (not yet terminal). Cleared when the
+   * run reaches terminal (entry moves to terminalReplayCache) or on shutdown.
+   * Delivered to late subscribers on subscribe for active runs.
    */
   const latestOutputCache = new Map<string, OperatorOutputFrame>()
 
@@ -286,6 +335,79 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
   /** Whether the manager has been shut down. */
   let isShutdown = false
+
+  // ---------------------------------------------------------------------------
+  // Internal: terminal replay cache management
+  // ---------------------------------------------------------------------------
+
+  function evictTerminalReplayEntry(runId: string): void {
+    const entry = terminalReplayCache.get(runId)
+    if (entry !== undefined) {
+      if (entry.evictionTimer !== undefined) {
+        deps.clearTimeout(entry.evictionTimer)
+      }
+      terminalReplayCache.delete(runId)
+    }
+  }
+
+  function enforceTerminalReplayCap(): void {
+    if (terminalReplayCache.size <= terminalReplayMaxEntries) {
+      return
+    }
+    // Evict oldest entries (by insertion order — Map preserves insertion order)
+    const toEvict = terminalReplayCache.size - terminalReplayMaxEntries
+    let evicted = 0
+    for (const [runId, entry] of terminalReplayCache) {
+      if (evicted >= toEvict) {
+        break
+      }
+      if (entry.evictionTimer !== undefined) {
+        deps.clearTimeout(entry.evictionTimer)
+      }
+      terminalReplayCache.delete(runId)
+      evicted++
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: finalize a subscriber in graceful-terminal-drain mode
+  // ---------------------------------------------------------------------------
+
+  function finalizeTerminalSubscriber(sub: SubscriberState): void {
+    if (sub.dropped === true) {
+      return
+    }
+    sub.dropped = true
+
+    // Clear timers
+    if (sub.heartbeatTimer !== undefined) {
+      deps.clearInterval(sub.heartbeatTimer)
+      sub.heartbeatTimer = undefined
+    }
+    if (sub.maxDurationTimer !== undefined) {
+      deps.clearTimeout(sub.maxDurationTimer)
+      sub.maxDurationTimer = undefined
+    }
+
+    // Remove from the run's subscriber set
+    const subs = runSubscribers.get(sub.runId)
+    if (subs !== undefined) {
+      subs.delete(sub.id)
+      if (subs.size === 0) {
+        runSubscribers.delete(sub.runId)
+      }
+    }
+
+    // Schedule onClose via queueMicrotask so a slow or synchronous onClose callback
+    // cannot block observe() from returning.
+    queueMicrotask(() => {
+      try {
+        sub.callbacks.onClose('terminal')
+      } catch (error) {
+        logger.warn({subId: sub.id, runId: sub.runId, err: String(error)}, 'manager: onClose threw — ignoring')
+      }
+    })
+  }
 
   // ---------------------------------------------------------------------------
   // Internal: drop a subscriber (overflow, error, close, shutdown)
@@ -307,7 +429,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       sub.maxDurationTimer = undefined
     }
 
-    // Clear queue
+    // Clear queue (hard abort — discard in-flight frames)
     sub.queue.length = 0
     sub.queueBytes = 0
 
@@ -347,6 +469,12 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     if (sub.dropped === true) {
       return false
     }
+    // In graceful-terminal-drain mode, do not accept new frames (except the
+    // terminal status frame itself, which was already enqueued before this mode
+    // was set). Heartbeats and other frames are silently dropped.
+    if (sub.closingReason === 'terminal') {
+      return false
+    }
 
     const frameBytes = estimateFrameBytes(frame)
     if (sub.queueBytes + frameBytes > subscriberQueueCapBytes) {
@@ -378,11 +506,16 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // ---------------------------------------------------------------------------
 
   async function drainQueue(sub: SubscriberState): Promise<void> {
-    while (sub.dropped === false && sub.queue.length > 0) {
-      const frame = sub.queue[0]
+    while (sub.queue.length > 0) {
+      // Dequeue BEFORE the await so the writer owns the frame.
+      // Coalescing (enqueueOutputFrame) splices the queue during the await;
+      // dequeue-before-await means the in-flight frame is no longer in the queue
+      // so coalescing cannot touch it. queueBytes is decremented on dequeue.
+      const frame = sub.queue.shift()
       if (frame === undefined) {
         break
       }
+      sub.queueBytes = Math.max(0, sub.queueBytes - estimateFrameBytes(frame))
 
       try {
         await sub.callbacks.onEvent(frame)
@@ -401,20 +534,30 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
       // Re-check dropped: dropSubscriber may have been called from another path
       // (e.g., heartbeat timer) while onEvent was awaited.
-      // TypeScript's control flow doesn't track mutations through function calls,
-      // so we use a local re-read via the queue length as the guard.
-      if (sub.queue.length === 0 || sub.dropped !== false) {
+      if (sub.dropped === true) {
         sub.writerRunning = false
         return
       }
 
-      // Remove the delivered frame from the queue
-      sub.queue.shift()
-      const frameBytes = estimateFrameBytes(frame)
-      sub.queueBytes = Math.max(0, sub.queueBytes - frameBytes)
+      // Graceful terminal drain — when the queue is empty and closingReason
+      // is 'terminal', finalize the subscriber (remove from runSubscribers, clear
+      // timers, call onClose('terminal')). This delivers all already-queued frames
+      // (including the terminal status) before closing.
+      if (sub.queue.length === 0 && sub.closingReason === 'terminal') {
+        sub.writerRunning = false
+        finalizeTerminalSubscriber(sub)
+        return
+      }
     }
 
     sub.writerRunning = false
+
+    // Final check after the loop: if we exited because queue is empty and
+    // closingReason is 'terminal', finalize now (handles the case where the
+    // queue was empty when we entered the loop).
+    if (sub.dropped === false && sub.closingReason === 'terminal') {
+      finalizeTerminalSubscriber(sub)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -434,11 +577,16 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       heartbeatTimer: undefined,
       maxDurationTimer: undefined,
       coalescedDropCount: 0,
+      closingReason: undefined,
     }
 
     // Heartbeat timer: emit a heartbeat frame every heartbeatIntervalMs
     sub.heartbeatTimer = deps.setInterval(() => {
       if (sub.dropped === true) {
+        return
+      }
+      // Do not enqueue heartbeats during graceful terminal drain
+      if (sub.closingReason === 'terminal') {
         return
       }
       const heartbeat: HeartbeatFrame = {type: 'heartbeat'}
@@ -498,6 +646,10 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
    */
   function enqueueOutputFrame(sub: SubscriberState, frame: OutputFrame): boolean {
     if (sub.dropped === true) {
+      return false
+    }
+    // In graceful-terminal-drain mode, do not accept new output frames
+    if (sub.closingReason === 'terminal') {
       return false
     }
 
@@ -594,7 +746,47 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   }
 
   // ---------------------------------------------------------------------------
-  // Internal: close all subscribers of a run with a given reason
+  // Internal: mark all subscribers of a run for graceful terminal drain
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Mark all subscribers of a run for graceful terminal drain.
+   *
+   * Unlike closeRunSubscribers (hard abort), this path:
+   * 1. Sets closingReason = 'terminal' (stops accepting new frames, stops heartbeats).
+   * 2. Does NOT clear the queue — drainQueue delivers all already-queued frames.
+   * 3. Does NOT set dropped = true — drainQueue's completion path finalizes.
+   * 4. If the queue is already empty (writerRunning === false), finalizes immediately.
+   *
+   * This guarantees the terminal status frame (already enqueued via fanOut before
+   * this is called) is delivered before the subscriber is closed.
+   */
+  function markRunSubscribersForTerminalDrain(runId: string): void {
+    const subs = runSubscribers.get(runId)
+    if (subs === undefined || subs.size === 0) {
+      return
+    }
+
+    // Snapshot before iterating (finalization modifies the map)
+    const snapshot = Array.from(subs.values())
+    for (const sub of snapshot) {
+      if (sub.dropped === true) {
+        continue
+      }
+      sub.closingReason = 'terminal'
+
+      // If the writer is not running and the queue is empty, finalize immediately.
+      // If the writer is running, it will finalize when the queue drains.
+      if (sub.writerRunning === false && sub.queue.length === 0) {
+        finalizeTerminalSubscriber(sub)
+      }
+      // If writerRunning === true, drainQueue will call finalizeTerminalSubscriber
+      // when the queue empties.
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: close all subscribers of a run with a given reason (hard abort)
   // ---------------------------------------------------------------------------
 
   function closeRunSubscribers(runId: string, reason: string): void {
@@ -638,6 +830,12 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
     const runId = runState.run_id
 
+    // On a non-terminal status, clear any stale terminal replay cache entry for this
+    // runId (avoids stale replay if runId is reused after a previous terminal run).
+    if (isTerminal(projected.status) === false) {
+      evictTerminalReplayEntry(runId)
+    }
+
     // Build the status frame (closed DTO — only the contract fields)
     // The projection already returns a closed OperatorRunStatus; we wrap it in a frame.
     const frame: StatusFrame = {type: 'status', data: projected}
@@ -648,19 +846,40 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Fan out to all current subscribers (non-blocking — never awaits writes)
     fanOut(runId, frame)
 
-    // On terminal status: clear the cache entry AFTER fan-out and close subscribers.
-    // Order matters: fanOut() above calls enqueueFrame() → drainQueue() fire-and-forget.
-    // drainQueue() captures `frame` in a local variable and calls onEvent(frame) before
-    // its first `await` suspends — so the terminal frame is already in-flight when
-    // closeRunSubscribers() runs synchronously below and clears each subscriber's queue.
-    // The queue clear does NOT drop the in-flight frame because drainQueue() holds a
-    // direct reference to it; reordering fanOut and closeRunSubscribers would silently
-    // discard the terminal frame for any subscriber whose writer task hadn't started yet.
+    // On terminal status: transition to graceful drain instead of hard abort.
+    // markRunSubscribersForTerminalDrain does NOT clear queues — it lets
+    // drainQueue deliver all already-queued frames (including the terminal status
+    // frame just enqueued above) before finalizing the subscriber.
     if (isTerminal(projected.status) === true) {
       latestStatusCache.delete(runId)
-      latestOutputCache.delete(runId)
       outputSeqCounters.delete(runId)
-      closeRunSubscribers(runId, 'terminal')
+
+      // Move final output to terminal replay cache (with TTL) instead of
+      // deleting it. Late subscribers connecting within the TTL receive the cached
+      // final output then terminal status, then the stream closes gracefully.
+      const finalOutput = latestOutputCache.get(runId)
+      latestOutputCache.delete(runId)
+
+      // Evict any existing entry for this runId before creating a new one
+      evictTerminalReplayEntry(runId)
+
+      const expiresAt = deps.now() + terminalReplayTtlMs
+      const evictionTimer = deps.setTimeout(() => {
+        terminalReplayCache.delete(runId)
+      }, terminalReplayTtlMs)
+
+      terminalReplayCache.set(runId, {
+        finalOutput,
+        terminalStatus: projected,
+        expiresAt,
+        evictionTimer,
+      })
+
+      // Enforce the hard cap on replay cache size
+      enforceTerminalReplayCap()
+
+      // Graceful drain: deliver all queued frames (including terminal status) then close
+      markRunSubscribersForTerminalDrain(runId)
     }
   }
 
@@ -670,6 +889,13 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
   const observeOutput = (runId: string, text: string, opts?: {final?: boolean; droppedCount?: number}): void => {
     if (isShutdown === true) {
+      return
+    }
+
+    // If the run has already reached terminal (replay cache entry exists), drop
+    // any further output observations — the run is done.
+    if (terminalReplayCache.has(runId) === true) {
+      logger.warn({runId}, 'manager: observeOutput called after terminal — dropping')
       return
     }
 
@@ -689,7 +915,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
     const frame: OutputFrame = {type: 'output', data: outputData}
 
-    // Cache the final frame for late subscribers
+    // Cache the final frame for late subscribers (active run path)
     if (isFinal === true) {
       latestOutputCache.set(runId, outputData)
     }
@@ -712,6 +938,63 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
       return () => {
         // no-op
+      }
+    }
+
+    // Check terminal replay cache first. If the run has already terminated,
+    // replay the final output and terminal status, then close gracefully.
+    const replayEntry = terminalReplayCache.get(runId)
+    if (replayEntry !== undefined) {
+      // Create a subscriber for the replay path (with timers, so cleanup is consistent)
+      const sub = createSubscriber(runId, callbacks)
+
+      // Register in the run's subscriber set
+      let subs = runSubscribers.get(runId)
+      if (subs === undefined) {
+        subs = new Map()
+        runSubscribers.set(runId, subs)
+      }
+      subs.set(sub.id, sub)
+
+      // Enqueue: final output (if any) then terminal status, then mark for terminal drain
+      if (replayEntry.finalOutput !== undefined) {
+        const outputFrame: OutputFrame = {type: 'output', data: replayEntry.finalOutput}
+        enqueueOutputFrame(sub, outputFrame)
+      }
+      if (replayEntry.terminalStatus !== undefined) {
+        const statusFrame: StatusFrame = {type: 'status', data: replayEntry.terminalStatus}
+        enqueueFrame(sub, statusFrame)
+      }
+
+      // Mark for graceful terminal drain — delivers queued frames then closes with 'terminal'
+      sub.closingReason = 'terminal'
+      if (sub.writerRunning === false && sub.queue.length === 0) {
+        finalizeTerminalSubscriber(sub)
+      }
+
+      // Return a clean-disconnect function
+      return () => {
+        if (sub.dropped === true) {
+          return
+        }
+        sub.dropped = true
+        if (sub.heartbeatTimer !== undefined) {
+          deps.clearInterval(sub.heartbeatTimer)
+          sub.heartbeatTimer = undefined
+        }
+        if (sub.maxDurationTimer !== undefined) {
+          deps.clearTimeout(sub.maxDurationTimer)
+          sub.maxDurationTimer = undefined
+        }
+        sub.queue.length = 0
+        sub.queueBytes = 0
+        const runSubs = runSubscribers.get(runId)
+        if (runSubs !== undefined) {
+          runSubs.delete(sub.id)
+          if (runSubs.size === 0) {
+            runSubscribers.delete(runId)
+          }
+        }
       }
     }
 
@@ -738,8 +1021,9 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     // Deliver the cached final output frame (if any) after the status snapshot.
-    // This ensures a late subscriber (connecting after the run's final output frame)
-    // receives the complete answer. Order: status/reset first, then cached output.
+    // This ensures a late subscriber (connecting after the run's final output frame
+    // but before terminal) receives the complete answer.
+    // Order: status/reset first, then cached output.
     const cachedOutput = latestOutputCache.get(runId)
     if (cachedOutput !== undefined) {
       const outputFrame: OutputFrame = {type: 'output', data: cachedOutput}
@@ -804,6 +1088,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     latestStatusCache.clear()
     latestOutputCache.clear()
     outputSeqCounters.clear()
+
+    // Clear terminal replay cache (cancel all eviction timers)
+    for (const entry of terminalReplayCache.values()) {
+      if (entry.evictionTimer !== undefined) {
+        deps.clearTimeout(entry.evictionTimer)
+      }
+    }
+    terminalReplayCache.clear()
   }
 
   return {observe, observeOutput, subscribe, abortSubscription, shutdown}

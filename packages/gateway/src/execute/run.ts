@@ -645,7 +645,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       const finalText = replySink.buffered()
       const answerResult = await statusSink.resolveToAnswer(finalText)
       if (answerResult.transition === 'delegated') {
-        await replySink.flush()
+        await replySink.flush().catch((flushError: unknown) => {
+          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in completed path')
+        })
       }
       // 'handled': answer is already in the status message — do not flush (would double-post).
 

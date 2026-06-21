@@ -95,11 +95,19 @@ export function createWebReplySink(deps: {
   return {
     append: (text: string): void => {
       buffer += text
-      deps.observeOutput(text)
+      try {
+        deps.observeOutput(text)
+      } catch {
+        // Fail-soft: a manager error must never break the run's streaming loop.
+      }
     },
 
     flush: async (): Promise<unknown> => {
-      deps.observeOutput(buffer, {final: true})
+      try {
+        deps.observeOutput(buffer, {final: true})
+      } catch {
+        // Fail-soft: a manager error must never break the run's streaming loop.
+      }
       return undefined
     },
 
