@@ -792,6 +792,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // logic — so the chain continues and a thrown handoff still releases.
     if (deps.isShuttingDown?.() === true) {
       // Shutdown in progress — drop pending queued tasks; release the slot.
+      //
+      // Queued tasks that are dropped here each have an admitted PENDING run-state
+      // (created in launchWork). These PENDING records are NOT terminalized here
+      // because the queue has no drain loop on shutdown — tasks are abandoned
+      // in-memory and the ChannelQueue is not iterated. The recovery sweep
+      // (recoverStaleRuns / findStaleRuns) will terminalize these orphan PENDING
+      // records on next boot, once they age past the staleness threshold. This is
+      // the correct backstop: adding a per-task drain here would require iterating
+      // all channels and all queued tasks across the queue, which is complex and
+      // fragile. The freshness window in findStaleRuns ensures a just-admitted
+      // PENDING is not killed prematurely.
       concurrency.release(channelId)
     } else {
       const nextTask = queue.takeNext(channelId)

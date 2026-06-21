@@ -28,6 +28,7 @@ import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createRunIndex} from './execute/run-index.js'
+import {getInFlightRuns} from './execute/run.js'
 import {createAppClient} from './github/app-client.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
@@ -577,7 +578,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // its finally block. The per-run coordinator.dispose() is the authoritative backstop
       // for approvals registered after this global drain.
       await approvalRegistry.disposeAll('gateway shutdown')
+      // Drain Discord mention runs (owned by this program-scoped set).
       await Promise.all(inFlightRuns)
+      // Drain web immediate runs (owned by run.ts's module-scoped in-flight set).
+      // These are registered by launchWork when the web launch route takes the
+      // immediate path; they are not in the Discord inFlightRuns set above.
+      await Promise.all([...getInFlightRuns()])
     })
 
     // i. Login

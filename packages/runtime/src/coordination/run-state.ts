@@ -195,7 +195,13 @@ export async function findStaleRuns(
       continue
     }
 
-    if (parsedCurrent.data.phase !== 'EXECUTING') {
+    // Surface stale runs in any pre-terminal active phase: EXECUTING, PENDING, or ACKNOWLEDGED.
+    // PENDING and ACKNOWLEDGED can be stranded when a crash or shutdown occurs after admission
+    // but before the run reaches EXECUTING. The heartbeat threshold provides the freshness
+    // window for all three phases — a just-admitted PENDING (last_heartbeat = now) is naturally
+    // excluded by the threshold and will NOT be killed by the recovery sweep.
+    const phase = parsedCurrent.data.phase
+    if (phase !== 'EXECUTING' && phase !== 'PENDING' && phase !== 'ACKNOWLEDGED') {
       continue
     }
 

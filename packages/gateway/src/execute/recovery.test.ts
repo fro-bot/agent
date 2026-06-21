@@ -375,6 +375,132 @@ describe('recoverStaleRuns', () => {
     })
   })
 
+  describe('stale PENDING and ACKNOWLEDGED recovery', () => {
+    it('transitions a stale PENDING run to FAILED without attempting lock release', async () => {
+      // #given — a stale PENDING run (no lock held by PENDING runs)
+      const stalePending = makeStaleRun({phase: 'PENDING'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [stalePending]})
+
+      const logger = makeLogger()
+      const deps = makeDeps({logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — run transitioned to FAILED
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      // PENDING runs do not hold a lock — lock release must NOT be attempted
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('transitions a stale ACKNOWLEDGED run to FAILED without attempting lock release', async () => {
+      // #given — a stale ACKNOWLEDGED run (no lock held by ACKNOWLEDGED runs)
+      const staleAcknowledged = makeStaleRun({phase: 'ACKNOWLEDGED'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleAcknowledged]})
+
+      const logger = makeLogger()
+      const deps = makeDeps({logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — run transitioned to FAILED
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      // ACKNOWLEDGED runs do not hold a lock — lock release must NOT be attempted
+      expect(mockReleaseLock).not.toHaveBeenCalled()
+    })
+
+    it('handles a mix of stale EXECUTING, PENDING, and ACKNOWLEDGED runs in one sweep', async () => {
+      // #given — three stale runs of different phases
+      const staleExecuting = makeStaleRun({run_id: 'run-exec', phase: 'EXECUTING'})
+      const stalePending = makeStaleRun({run_id: 'run-pend', phase: 'PENDING'})
+      const staleAcknowledged = makeStaleRun({run_id: 'run-ack', phase: 'ACKNOWLEDGED'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleExecuting, stalePending, staleAcknowledged]})
+
+      const RUN_KEY_EXEC = 'state/identity/acme/widget/runs/run-exec.json'
+      const RUN_KEY_PEND = 'state/identity/acme/widget/runs/run-pend.json'
+      const RUN_KEY_ACK = 'state/identity/acme/widget/runs/run-ack.json'
+
+      mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => {
+        if (runId === 'run-exec') return okKey(RUN_KEY_EXEC)
+        if (runId === 'run-pend') return okKey(RUN_KEY_PEND)
+        if (runId === 'run-ack') return okKey(RUN_KEY_ACK)
+        return errKey('unexpected run key')
+      })
+
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY_EXEC) return {success: true, data: {data: '{}', etag: 'etag-exec'}}
+        if (key === RUN_KEY_PEND) return {success: true, data: {data: '{}', etag: 'etag-pend'}}
+        if (key === RUN_KEY_ACK) return {success: true, data: {data: '{}', etag: 'etag-ack'}}
+        // Lock belongs to the EXECUTING run
+        if (key === LOCK_KEY)
+          return {success: true, data: {data: JSON.stringify({run_id: 'run-exec'}), etag: LOCK_ETAG}}
+        return {success: false, error: new Error('not found')}
+      })
+      const coordConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {...makeCoordinationConfig().storeAdapter, getObject: getObjectFn},
+      }
+
+      mockTransitionRun.mockResolvedValue({
+        success: true,
+        data: {etag: 'new-etag', state: makeStaleRun({phase: 'FAILED'})},
+      })
+
+      const deps = makeDeps({coordinationConfig: coordConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — all three runs transitioned to FAILED
+      expect(mockTransitionRun).toHaveBeenCalledTimes(3)
+      // Only the EXECUTING run's lock is released (it owns the lock)
+      expect(mockReleaseLock).toHaveBeenCalledTimes(1)
+    })
+
+    it('regression: existing stale EXECUTING recovery still works after PENDING extension', async () => {
+      // #given — a stale EXECUTING run with a held lock (the original recovery path)
+      const staleExecuting = makeStaleRun({phase: 'EXECUTING'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleExecuting]})
+
+      const thread = makeThread()
+      const resolveThread = makeResolveThread(thread)
+      const deps = makeDeps({resolveThread})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — EXECUTING run transitioned to FAILED, lock released, thread notified
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        REPO_SLUG,
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
+      expect(thread.send).toHaveBeenCalled()
+    })
+  })
+
   describe('integration — boot with stale run and held lock', () => {
     it('leaves run as FAILED and lock released so a new mention can proceed', async () => {
       // #given — simulate a stale EXECUTING run with a held lock
