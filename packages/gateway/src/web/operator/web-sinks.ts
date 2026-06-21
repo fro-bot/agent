@@ -78,8 +78,9 @@ export function createWebStatusSink(): StatusSink {
  * buffered() returns the accumulated text so the engine can pass it to
  * statusSink.resolveToAnswer — even though the web status sink ignores it.
  *
- * hasVisibleOutput() returns false so the engine does not suppress the
- * "no output" placeholder path (which is also a no-op for web).
+ * hasVisibleOutput() reflects whether visible output was sent or is in flight
+ * (visibleOutputSent || pendingCount > 0), so the engine's timeout/no-output
+ * classification matches what the operator actually saw.
  *
  * The deps.observeOutput callback is already run-scoped by the caller (the
  * caller binds runId); the sink receives a narrow callback, not the full manager.
