@@ -103,8 +103,12 @@ if (authorized === false) { res.writeHead(401, {'Content-Type': 'text/plain'}); 
 
 ### 3. Gate stale-run lock release on `run_id` ownership
 
-Startup recovery sweeps runs left `EXECUTING` by a crash → transitions them `FAILED` and
-releases the repo lock. But it must **verify the current lock record's `run_id` matches the
+Startup recovery sweeps runs left in a non-terminal phase by a crash → transitions them
+`FAILED`. The sweep now covers `PENDING` and `ACKNOWLEDGED` (pre-execution admitted runs)
+in addition to `EXECUTING`, since admission writes a durable `PENDING` before execution; the
+heartbeat-staleness window excludes a just-admitted run so it is never killed mid-admission.
+Only `EXECUTING` runs hold a repo lock, so lock release applies to that phase alone. When
+releasing, it must **verify the current lock record's `run_id` matches the
 stale run before releasing**. A stale run-state whose lease already expired may have had its
 lock re-acquired by a newer, live run; releasing blindly deletes the newer run's lock and
 permits concurrent execution against the same repo. This was a P0.

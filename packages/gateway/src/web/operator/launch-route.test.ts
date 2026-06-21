@@ -2,23 +2,59 @@
  * Tests for the authenticated launch route: POST /operator/runs
  *
  * Load-bearing tests (written first):
- *   1. FIRE-AND-RETURN: route returns 202 {runId} immediately even when launchWork hangs.
+ *   1. AWAIT-ADMISSION: route awaits launchWork admission (not the full run) and returns 202.
  *   2. AUTO-DENY: web createApprovalOnPending denies; Discord transport NOT used.
  *   3. IDEMPOTENCY ISOLATION: operator A key 'x' and operator B key 'x' → two runIds.
+ *
+ * launchWork is mocked at the module level so route tests do not need real
+ * AWS/S3/coordination deps. Route tests verify the route's behavior (idempotency
+ * lifecycle, HTTP status codes, request shaping) — not launchWork internals
+ * (those are tested in run.test.ts).
  */
 
 import type {ApprovalRegistry} from '../../approvals/registry.js'
 import type {RepoBinding} from '../../bindings/types.js'
-import type {RunIndex} from '../../execute/run-index.js'
+import type {LaunchAdmission} from '../../execute/launch-types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {LaunchRouteBindingsLookup, LaunchRouteDeps, LaunchRouteSessionStore} from './launch-route.js'
 import {Hono} from 'hono'
-import {describe, expect, it, vi} from 'vitest'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {launchWork} from '../../execute/run.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
 import {createIdempotencyGuard} from './idempotency.js'
 import {buildLaunchRoute} from './launch-route.js'
+
+// vi.mock is hoisted by Vitest before imports — mock launchWork so route tests
+// do not need real AWS/S3/coordination deps.
+vi.mock('../../execute/run.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../execute/run.js')>()
+  return {
+    ...actual,
+    launchWork: vi.fn(
+      async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
+        accepted: true,
+        runId: request.runId ?? 'mock-run-id',
+      }),
+    ),
+  }
+})
+
+// Typed reference to the mocked launchWork for per-test overrides.
+const mockLaunchWork = vi.mocked(launchWork)
+
+// Reset the mock before each test so call counts don't accumulate across tests.
+beforeEach(() => {
+  mockLaunchWork.mockClear()
+  // Restore the default implementation (accepted:true, echoes request.runId).
+  mockLaunchWork.mockImplementation(
+    async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
+      accepted: true,
+      runId: request.runId ?? 'mock-run-id',
+    }),
+  )
+})
 
 // ---------------------------------------------------------------------------
 // Stub factories
@@ -127,12 +163,6 @@ function makeLaunchWorkDeps(): RunMentionDeps {
   }
 }
 
-function makeRunIndex(): Pick<RunIndex, 'register'> {
-  return {
-    register: vi.fn(),
-  }
-}
-
 function makeDeps(overrides?: Partial<LaunchRouteDeps>): LaunchRouteDeps {
   return {
     sessionStore: makeSessionStore(),
@@ -140,13 +170,14 @@ function makeDeps(overrides?: Partial<LaunchRouteDeps>): LaunchRouteDeps {
     isRepoDenied: vi.fn(() => false),
     repoAuthzDeps: makeRepoAuthzDeps(),
     idempotencyGuard: createIdempotencyGuard(),
-    runIndex: makeRunIndex(),
     launchWorkDeps: makeLaunchWorkDeps(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 0,
     // Pass-through rate limiters (always allow) for most tests
     perMinRateLimiter: {allow: () => true},
     perHrRateLimiter: {allow: () => true},
+    // runObservationManager absent by default — tests that exercise output routing
+    // pass it explicitly via overrides.
     ...overrides,
   }
 }
@@ -188,64 +219,51 @@ async function postRuns(
 }
 
 // ---------------------------------------------------------------------------
-// LOAD-BEARING TEST 1: FIRE-AND-RETURN
+// LOAD-BEARING TEST 1: AWAIT-ADMISSION (replaces FIRE-AND-RETURN)
 // ---------------------------------------------------------------------------
 
-describe('POST /operator/runs — FIRE-AND-RETURN (load-bearing)', () => {
-  it('returns 202 {runId} immediately even when launchWork never resolves', async () => {
-    // #given — launchWork mock that hangs forever (simulated via ensureClone that never resolves)
-    const launchWorkDeps = makeLaunchWorkDeps()
-    // Override ensureClone to hang so the engine never completes
-    const deps = makeDeps({
-      launchWorkDeps: {
-        ...launchWorkDeps,
-        ensureClone: vi.fn(async () => new Promise<never>(() => {})),
-      },
-    })
-
-    // Patch launchWork by replacing the module-level function via the deps
-    // We test fire-and-return by checking the response arrives before launchWork resolves.
-    // Since we can't easily mock the module, we verify timing via the route's behavior:
-    // the route must NOT await launchWork.
-    const app = buildApp(deps)
-
-    // #when — measure response time
-    const start = Date.now()
-    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
-    const elapsed = Date.now() - start
-
-    // #then — 202 returned immediately (well under 100ms)
-    expect(response.status).toBe(202)
-    const body = (await response.json()) as {runId: string}
-    expect(typeof body.runId).toBe('string')
-    expect(body.runId.length).toBeGreaterThan(0)
-    expect(elapsed).toBeLessThan(500) // generous bound; real fire-and-return is <10ms
-  })
-
-  it('registers PENDING in runIndex BEFORE launchWork is fired', async () => {
-    // #given
-    const registerCalls: string[] = []
-
-    const runIndex = {
-      register: vi.fn((runId: string) => {
-        registerCalls.push(runId)
-      }),
-    }
-
-    // We verify ordering by checking that register was called before the response
-    // (which is after launchWork is fired but not awaited).
-    const deps = makeDeps({runIndex})
+describe('POST /operator/runs — AWAIT-ADMISSION (load-bearing)', () => {
+  it('returns 202 {runId} after awaiting launchWork admission (not the full run)', async () => {
+    // #given — launchWork mock returns accepted admission immediately
+    mockLaunchWork.mockResolvedValueOnce({accepted: true, runId: 'run-from-admission'})
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
     const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
 
-    // #then — register was called
+    // #then — 202 returned with the runId from admission
     expect(response.status).toBe(202)
-    expect(registerCalls.length).toBe(1)
     const body = (await response.json()) as {runId: string}
-    // The registered runId matches the returned runId
-    expect(registerCalls[0]).toBe(body.runId)
+    expect(body.runId).toBe('run-from-admission')
+  })
+
+  it('runIndex.register is called ONCE (in launchWork, not in the route)', async () => {
+    // #given — the mock launchWork simulates calling runIndex.register once
+    const launchWorkRunIndex = {
+      register: vi.fn(),
+      lookup: vi.fn(async () => undefined),
+    }
+    mockLaunchWork.mockImplementationOnce(async (request: {readonly runId?: string}) => {
+      launchWorkRunIndex.register(request.runId, {repo: 'acme/widget', surface: 'web', startedAt: 'now'})
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps({
+      launchWorkDeps: {
+        ...makeLaunchWorkDeps(),
+        runIndex: launchWorkRunIndex,
+      },
+    })
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — register called exactly once (in launchWork), not twice
+    expect(response.status).toBe(202)
+    expect(launchWorkRunIndex.register).toHaveBeenCalledTimes(1)
+    const body = (await response.json()) as {runId: string}
+    expect(launchWorkRunIndex.register).toHaveBeenCalledWith(body.runId, expect.any(Object))
   })
 })
 
@@ -256,7 +274,6 @@ describe('POST /operator/runs — FIRE-AND-RETURN (load-bearing)', () => {
 describe('POST /operator/runs — AUTO-DENY (load-bearing)', () => {
   it('uses web auto-deny createApprovalOnPending (not Discord transport)', async () => {
     // #given — the web route always supplies createApprovalOnPending (not undefined).
-    // The auto-deny behavior is tested in web-approval.test.ts.
     const deps = makeDeps()
     const app = buildApp(deps)
 
@@ -265,16 +282,16 @@ describe('POST /operator/runs — AUTO-DENY (load-bearing)', () => {
 
     // #then — 202 returned; the route wired createApprovalOnPending
     expect(response.status).toBe(202)
-    // The auto-deny behavior is tested in web-approval.test.ts.
-    // Here we verify the route returns 202 (not a Discord-transport-caused hang/error).
   })
 
   it('surface is web (not discord) — run is attributed to web surface', async () => {
-    // #given — we verify via the runIndex registration that surface:'web' is used
-    const runIndex = {
-      register: vi.fn(),
-    }
-    const deps = makeDeps({runIndex})
+    // #given — capture the request passed to launchWork to verify surface:'web'
+    let capturedSurface: string | undefined
+    mockLaunchWork.mockImplementationOnce(async (request: {readonly surface?: string; readonly runId?: string}) => {
+      capturedSurface = request.surface
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
@@ -282,7 +299,7 @@ describe('POST /operator/runs — AUTO-DENY (load-bearing)', () => {
 
     // #then
     expect(response.status).toBe(202)
-    expect(runIndex.register).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({surface: 'web'}))
+    expect(capturedSurface).toBe('web')
   })
 })
 
@@ -328,8 +345,7 @@ describe('POST /operator/runs — IDEMPOTENCY ISOLATION (load-bearing)', () => {
   it('same operator + same key twice → one launchWork call, second echoes the runId', async () => {
     // #given
     const idempotencyGuard = createIdempotencyGuard()
-    const runIndex = {register: vi.fn()}
-    const deps = makeDeps({idempotencyGuard, runIndex})
+    const deps = makeDeps({idempotencyGuard})
     const app = buildApp(deps)
 
     // #when — first launch
@@ -340,11 +356,11 @@ describe('POST /operator/runs — IDEMPOTENCY ISOLATION (load-bearing)', () => {
     const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'my-key'})
     const body2 = (await response2.json()) as {runId: string}
 
-    // #then — both 202; same runId; runIndex.register called only once
+    // #then — both 202; same runId; launchWork called only once
     expect(response1.status).toBe(202)
     expect(response2.status).toBe(202)
     expect(body1.runId).toBe(body2.runId)
-    expect(runIndex.register).toHaveBeenCalledTimes(1)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -368,44 +384,30 @@ describe('POST /operator/runs — happy path', () => {
     expect(body.runId).toMatch(/^[0-9a-f-]{36}$/)
   })
 
-  it('registers the run with surface:web and the correct repo', async () => {
-    // #given
-    const runIndex = {register: vi.fn()}
-    const deps = makeDeps({runIndex})
+  it('registers the run with surface:web and the correct repo (via launchWork)', async () => {
+    // #given — capture the request passed to launchWork
+    let capturedRequest: {surface?: string; runId?: string} | undefined
+    mockLaunchWork.mockImplementationOnce(async request => {
+      capturedRequest = {surface: request.surface, runId: request.runId}
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
     const response = await postRuns(app, {repo: 'acme/widget', prompt: 'fix the bug'})
     const body = (await response.json()) as {runId: string}
 
-    // #then
-    expect(runIndex.register).toHaveBeenCalledWith(body.runId, {
-      repo: 'acme/widget',
-      surface: 'web',
-      startedAt: expect.any(String) as string,
-    })
+    // #then — launchWork received surface:'web' and the route-generated runId
+    expect(response.status).toBe(202)
+    expect(capturedRequest?.surface).toBe('web')
+    expect(capturedRequest?.runId).toBe(body.runId)
   })
 
   it('queued case: slot busy → still 202 with runId (never 404/500)', async () => {
-    // #given — concurrency returns 'busy' (slot occupied)
-    const launchWorkDeps = makeLaunchWorkDeps()
-    const deps = makeDeps({
-      launchWorkDeps: {
-        ...launchWorkDeps,
-        concurrency: {
-          tryAcquire: vi.fn(() => 'busy' as const),
-          release: vi.fn(),
-          activeCount: vi.fn(() => 1),
-          max: 3,
-        },
-        queue: {
-          enqueue: vi.fn(() => 'queued' as const),
-          takeNext: vi.fn(() => undefined),
-          pendingCount: vi.fn(() => 0),
-          clear: vi.fn(() => 0),
-        },
-      },
-    })
+    // #given — launchWork returns accepted (queued disposition)
+    mockLaunchWork.mockResolvedValueOnce({accepted: true, runId: 'queued-run-id'})
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
@@ -414,7 +416,7 @@ describe('POST /operator/runs — happy path', () => {
     // #then — 202 with runId even when queued
     expect(response.status).toBe(202)
     const body = (await response.json()) as {runId: string}
-    expect(typeof body.runId).toBe('string')
+    expect(body.runId).toBe('queued-run-id')
   })
 })
 
@@ -439,22 +441,16 @@ describe('POST /operator/runs — R10 unbound repo', () => {
 
   it('does NOT call launchWork when repo is unbound', async () => {
     // #given
-    const launchWorkDeps = makeLaunchWorkDeps()
-    const concurrencyTryAcquire = vi.fn(() => 'ok' as const)
     const deps = makeDeps({
       bindingsLookup: makeBindingsLookup(null),
-      launchWorkDeps: {
-        ...launchWorkDeps,
-        concurrency: {...launchWorkDeps.concurrency, tryAcquire: concurrencyTryAcquire},
-      },
     })
     const app = buildApp(deps)
 
     // #when
     await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
 
-    // #then — concurrency never acquired (launchWork not called)
-    expect(concurrencyTryAcquire).not.toHaveBeenCalled()
+    // #then — launchWork never called
+    expect(mockLaunchWork).not.toHaveBeenCalled()
   })
 })
 
@@ -463,7 +459,6 @@ describe('POST /operator/runs — R19 unauthorized repo', () => {
     // #given — authz denied (GitHub returns 403)
     const repoAuthzDeps: RepoAuthzDeps = {
       ...makeRepoAuthzDeps(),
-      // Override fetch to return 403 so checkRepoAuthz denies
       fetch: vi.fn(async () => new Response('', {status: 403})),
     }
     const deps = makeDeps({repoAuthzDeps})
@@ -594,21 +589,22 @@ describe('POST /operator/runs — rate limit', () => {
 
 describe('POST /operator/runs — prompt uses web builder (not buildDiscordPrompt)', () => {
   it('web prompt builder is used (no Discord-thread guidance in prompt)', async () => {
-    // #given — we verify via the route returning 202 with surface:'web'
-    // The promptBuilder is set to buildWebPrompt (not buildDiscordPrompt).
-    // We verify this indirectly: the route registers surface:'web' and returns 202.
-    const runIndex = {register: vi.fn()}
-    const deps = makeDeps({runIndex})
+    // #given — capture the request passed to launchWork
+    let capturedRequest: {surface?: string; runId?: string; promptBuilder?: unknown} | undefined
+    mockLaunchWork.mockImplementationOnce(async request => {
+      capturedRequest = {surface: request.surface, runId: request.runId, promptBuilder: request.promptBuilder}
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
     const response = await postRuns(app, {repo: 'acme/widget', prompt: 'fix the bug'})
 
-    // #then — 202 with web surface
+    // #then — 202 with web surface; promptBuilder is set (not undefined)
     expect(response.status).toBe(202)
-    expect(runIndex.register).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({surface: 'web'}))
-    // The promptBuilder is set in the LaunchWorkRequest; the engine uses it
-    // instead of buildDiscordPrompt. This is verified in run.ts seam tests.
+    expect(capturedRequest?.surface).toBe('web')
+    expect(typeof capturedRequest?.promptBuilder).toBe('function')
   })
 })
 
@@ -642,7 +638,6 @@ describe('POST /operator/runs — security', () => {
     const response = await postRuns(app, {
       repo: 'acme/widget',
       prompt: 'do something',
-      // Client cannot supply binding/path — only repo name is accepted
     })
 
     // #then — 202; getBindingByRepo was called with the parsed owner/repo
@@ -690,58 +685,184 @@ describe('POST /operator/runs — bad request bodies', () => {
 })
 
 // ---------------------------------------------------------------------------
-// FIX-1: idempotency commit-after-fire — entry recorded before fire, not before
+// Two-phase idempotency: reserve → commit / rollback
 // ---------------------------------------------------------------------------
 
-describe('POST /operator/runs — idempotency commit-after-fire', () => {
-  it('idempotency entry is recorded AFTER runId generation (commit-after-fire ordering)', async () => {
-    // #given — track when idempotency.record is called relative to runIndex.register
-    const callOrder: string[] = []
-    const idempotencyGuard = createIdempotencyGuard()
-    const originalRecord = idempotencyGuard.record.bind(idempotencyGuard)
-    const recordSpy = vi.fn((...args: Parameters<typeof originalRecord>) => {
-      callOrder.push('idempotency.record')
-      return originalRecord(...args)
-    })
-    const runIndex = {
-      register: vi.fn((..._args: unknown[]) => {
-        callOrder.push('runIndex.register')
-      }),
-    }
-    const deps = makeDeps({
-      idempotencyGuard: {...idempotencyGuard, record: recordSpy},
-      runIndex,
-    })
+describe('POST /operator/runs — two-phase idempotency', () => {
+  it('happy path: accepted admission → idempotency committed, 202 {runId}', async () => {
+    // #given — track reserve/commit/rollback calls
+    const guard = createIdempotencyGuard()
+    const reserveSpy = vi.spyOn(guard, 'reserve')
+    const commitSpy = vi.spyOn(guard, 'commit')
+    const rollbackSpy = vi.spyOn(guard, 'rollback')
+    const deps = makeDeps({idempotencyGuard: guard})
     const app = buildApp(deps)
 
     // #when
-    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'order-key'})
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'my-key'})
 
-    // #then — 202 returned; runIndex.register called before idempotency.record
+    // #then — 202; reserve called before launchWork; commit called after acceptance; rollback NOT called
     expect(response.status).toBe(202)
-    expect(callOrder).toEqual(['runIndex.register', 'idempotency.record'])
+    expect(reserveSpy).toHaveBeenCalledTimes(1)
+    expect(commitSpy).toHaveBeenCalledTimes(1)
+    expect(rollbackSpy).not.toHaveBeenCalled()
+    const body = (await response.json()) as {runId: string}
+    expect(typeof body.runId).toBe('string')
   })
 
-  it('same operator + same key twice → second echoes the runId (idempotency entry survives fire)', async () => {
-    // #given — verify the idempotency entry is committed and survives the fire
-    const idempotencyGuard = createIdempotencyGuard()
-    const runIndex = {register: vi.fn()}
-    const deps = makeDeps({idempotencyGuard, runIndex})
+  it('reject (cap): launchWork returns {accepted:false,"cap"} → rollback, coarse non-202', async () => {
+    // #given — launchWork returns cap-rejected
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'cap'})
+    const guard = createIdempotencyGuard()
+    const rollbackSpy = vi.spyOn(guard, 'rollback')
+    const commitSpy = vi.spyOn(guard, 'commit')
+    const deps = makeDeps({idempotencyGuard: guard})
+    const app = buildApp(deps)
+
+    // #when — first request (gets cap-rejected)
+    const response1 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'cap-key'})
+
+    // #then — 503; rollback called; commit NOT called
+    expect(response1.status).toBe(503)
+    expect(rollbackSpy).toHaveBeenCalledTimes(1)
+    expect(commitSpy).not.toHaveBeenCalled()
+
+    // #then — subsequent same-key request is NOT treated as a duplicate (no dead runId echoed)
+    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'cap-key'})
+    expect(response2.status).toBe(202)
+  })
+
+  it('launchWork throws → rollback + coarse error (no stuck reservation)', async () => {
+    // #given — launchWork throws
+    mockLaunchWork.mockRejectedValueOnce(new Error('simulated launchWork failure'))
+    const guard = createIdempotencyGuard()
+    const rollbackSpy = vi.spyOn(guard, 'rollback')
+    const commitSpy = vi.spyOn(guard, 'commit')
+    const deps = makeDeps({idempotencyGuard: guard})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'throw-key'})
+
+    // #then — coarse error; rollback called; commit NOT called
+    expect(response.status).toBe(500)
+    expect(rollbackSpy).toHaveBeenCalledTimes(1)
+    expect(commitSpy).not.toHaveBeenCalled()
+
+    // #then — subsequent same-key request is NOT blocked by a dangling reservation
+    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'throw-key'})
+    expect(response2.status).toBe(202)
+  })
+
+  it('duplicate (reserved window): second same-key request while first is reserved-not-committed echoes reserved runId', async () => {
+    // #given — simulate the reservation window by manually reserving
+    const guard = createIdempotencyGuard()
+    guard.reserve(1001, 'window-key', 'run-in-flight')
+
+    const deps = makeDeps({idempotencyGuard: guard})
+    const app = buildApp(deps)
+
+    // #when — second request arrives while first is reserved (not committed)
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'window-key'})
+
+    // #then — echoes the reserved runId (does NOT launch twice)
+    expect(response.status).toBe(202)
+    const body = (await response.json()) as {runId: string}
+    expect(body.runId).toBe('run-in-flight')
+    // launchWork was NOT called (idempotency check short-circuited)
+    expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it('duplicate (committed): same op+key twice both accepted → one launch, second echoes runId', async () => {
+    // #given
+    const guard = createIdempotencyGuard()
+    const deps = makeDeps({idempotencyGuard: guard})
     const app = buildApp(deps)
 
     // #when — first launch
-    const response1 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'fire-key'})
+    const response1 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'dup-key'})
     const body1 = (await response1.json()) as {runId: string}
 
     // #when — second launch with same key
-    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'fire-key'})
+    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'dup-key'})
     const body2 = (await response2.json()) as {runId: string}
 
-    // #then — both 202; same runId echoed; runIndex.register called only once
+    // #then — both 202; same runId; launchWork called only once
     expect(response1.status).toBe(202)
     expect(response2.status).toBe(202)
     expect(body1.runId).toBe(body2.runId)
-    expect(runIndex.register).toHaveBeenCalledTimes(1)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it('no idempotency key → reserve/commit/rollback not called', async () => {
+    // #given
+    const guard = createIdempotencyGuard()
+    const reserveSpy = vi.spyOn(guard, 'reserve')
+    const commitSpy = vi.spyOn(guard, 'commit')
+    const rollbackSpy = vi.spyOn(guard, 'rollback')
+    const deps = makeDeps({idempotencyGuard: guard})
+    const app = buildApp(deps)
+
+    // #when — no idempotencyKey in body
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — 202; no idempotency lifecycle calls
+    expect(response.status).toBe(202)
+    expect(reserveSpy).not.toHaveBeenCalled()
+    expect(commitSpy).not.toHaveBeenCalled()
+    expect(rollbackSpy).not.toHaveBeenCalled()
+  })
+
+  it('isolation: operator A key x and operator B key x → distinct runs (namespace preserved)', async () => {
+    // #given — two operators with the same client key
+    const guard = createIdempotencyGuard()
+    const deps = makeDeps({idempotencyGuard: guard})
+
+    const appA = buildAppWithGuardResult({ok: true, githubUserId: 1, sessionId: 'sess-a'}, deps)
+    const appB = buildAppWithGuardResult({ok: true, githubUserId: 2, sessionId: 'sess-b'}, deps)
+
+    // #when — operator A launches with key 'x'
+    const responseA = await appA.fetch(
+      new Request('http://localhost/operator/runs', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({repo: 'acme/widget', prompt: 'task A', idempotencyKey: 'x'}),
+      }),
+    )
+
+    // #when — operator B launches with the same key 'x'
+    const responseB = await appB.fetch(
+      new Request('http://localhost/operator/runs', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({repo: 'acme/widget', prompt: 'task B', idempotencyKey: 'x'}),
+      }),
+    )
+
+    // #then — both get 202 with distinct runIds
+    expect(responseA.status).toBe(202)
+    expect(responseB.status).toBe(202)
+    const bodyA = (await responseA.json()) as {runId: string}
+    const bodyB = (await responseB.json()) as {runId: string}
+    expect(bodyA.runId).not.toBe(bodyB.runId)
+  })
+
+  it('integration: runIndex.register called ONCE (in launchWork), not twice', async () => {
+    // #given — track register calls via the mock
+    const registerCalls: string[] = []
+    mockLaunchWork.mockImplementationOnce(async (request: {readonly runId?: string}) => {
+      registerCalls.push(request.runId ?? 'mock-run-id')
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'reg-key'})
+
+    // #then — register called exactly once (launchWork owns it; route no longer registers)
+    expect(response.status).toBe(202)
+    expect(registerCalls).toHaveLength(1)
   })
 })
 
@@ -793,11 +914,13 @@ describe('POST /operator/runs — array and null body rejection', () => {
 
 describe('Discord-path regression — absent runId/promptBuilder/createApprovalOnPending', () => {
   it('launchWorkRequest without runId uses crypto.randomUUID (Discord path unchanged)', async () => {
-    // #given — verify the seam: when runId is absent, engine generates its own UUID.
-    // This is tested at the run.ts level; here we verify the route always supplies runId.
-    // The route always generates a runId and passes it in the request.
-    const runIndex = {register: vi.fn()}
-    const deps = makeDeps({runIndex})
+    // #given — capture the request passed to launchWork
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(async (request: {readonly runId?: string}) => {
+      capturedRunId = request.runId
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
@@ -806,7 +929,211 @@ describe('Discord-path regression — absent runId/promptBuilder/createApprovalO
 
     // #then — route always supplies a runId (UUID format)
     expect(body.runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
-    // runIndex.register was called with the same runId
-    expect(runIndex.register).toHaveBeenCalledWith(body.runId, expect.any(Object))
+    // The runId passed to launchWork matches the one returned in the response
+    expect(capturedRunId).toBe(body.runId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Capacity reject (cap) → 503
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — capacity reject', () => {
+  it('returns 503 when launchWork returns {accepted:false, reason:"cap"}', async () => {
+    // #given — launchWork returns cap-rejected
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'cap'})
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — 503 unavailable
+    expect(response.status).toBe(503)
+  })
+
+  it('returns 503 when launchWork returns {accepted:false, reason:"queue-full"}', async () => {
+    // #given — launchWork returns queue-full-rejected (transient capacity condition, not a client error)
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'queue-full'})
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — 503 unavailable (same as cap; queue depth is full, retry later)
+    expect(response.status).toBe(503)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stuck-reservation: route/launchWork throws AFTER reserve but BEFORE commit
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — stuck-reservation guard', () => {
+  it('finally rolls back if launchWork throws (subsequent same-key NOT blocked)', async () => {
+    // #given — launchWork throws on first call
+    mockLaunchWork.mockRejectedValueOnce(new Error('simulated throw'))
+    const guard = createIdempotencyGuard()
+    const rollbackSpy = vi.spyOn(guard, 'rollback')
+    const deps = makeDeps({idempotencyGuard: guard})
+    const app = buildApp(deps)
+
+    // #when — first request throws
+    const response1 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'stuck-key'})
+    expect(response1.status).toBe(500)
+    expect(rollbackSpy).toHaveBeenCalledTimes(1)
+
+    // #when — second request with same key (should NOT be blocked by a dangling reservation)
+    // mockLaunchWork defaults to returning accepted:true for subsequent calls
+    const response2 = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'stuck-key'})
+
+    // #then — second request proceeds normally (not echoing a dead runId)
+    expect(response2.status).toBe(202)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Admission result: route uses admission.runId (not its own generated runId)
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — admission runId', () => {
+  it('202 response runId matches the runId from launchWork admission', async () => {
+    // #given — launchWork returns a specific runId (same as the route-generated one)
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(async (request: {readonly runId?: string}) => {
+      capturedRunId = request.runId
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    const body = (await response.json()) as {runId: string}
+
+    // #then — the runId in the response matches what launchWork returned
+    expect(response.status).toBe(202)
+    expect(body.runId).toBe(capturedRunId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Backward compat: LaunchAdmission type import (compile-time check)
+// ---------------------------------------------------------------------------
+
+describe('LaunchAdmission type — compile-time shape check', () => {
+  it('launchAdmission accepted shape has runId', () => {
+    // #given — type-level check (runtime assertion on the shape)
+    const accepted: LaunchAdmission = {accepted: true, runId: 'run-abc'}
+    // Use type assertion to access the narrowed field without a conditional
+    expect(accepted.accepted).toBe(true)
+    expect((accepted as {accepted: true; runId: string}).runId).toBe('run-abc')
+  })
+
+  it('launchAdmission rejected shape has reason', () => {
+    // #given
+    const rejected: LaunchAdmission = {accepted: false, reason: 'cap'}
+    expect(rejected.accepted).toBe(false)
+    expect((rejected as {accepted: false; reason: string}).reason).toBe('cap')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ReplySink wired to runObservationManager — output routing
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — replySink wired to runObservationManager', () => {
+  it('replySink append routes output delta to manager.observeOutput with the route runId', async () => {
+    // #given — a manager spy and a captured replySink from launchWork
+    const observeOutput = vi.fn()
+    const runObservationManager = {observeOutput}
+
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        capturedRunId = request.runId
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps({runObservationManager})
+    const app = buildApp(deps)
+
+    // #when — launch the route so launchWork captures the replySink
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined || capturedRunId === undefined)
+      throw new Error('launchWork did not capture replySink/runId')
+
+    // #when — simulate the engine appending output text
+    capturedReplySink.append('hello ')
+    capturedReplySink.append('world')
+
+    // #then — each append pushed a delta to the manager with the route's runId
+    // opts is undefined for delta frames (no final flag)
+    expect(observeOutput).toHaveBeenCalledTimes(2)
+    expect(observeOutput).toHaveBeenNthCalledWith(1, capturedRunId, 'hello ', undefined)
+    expect(observeOutput).toHaveBeenNthCalledWith(2, capturedRunId, 'world', undefined)
+  })
+
+  it('replySink flush routes final answer to manager.observeOutput with final:true', async () => {
+    // #given — a manager spy and a captured replySink from launchWork
+    const observeOutput = vi.fn()
+    const runObservationManager = {observeOutput}
+
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    let capturedRunId: string | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        capturedRunId = request.runId
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps({runObservationManager})
+    const app = buildApp(deps)
+
+    // #when — launch and simulate engine output
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined || capturedRunId === undefined)
+      throw new Error('launchWork did not capture replySink/runId')
+    capturedReplySink.append('the answer')
+    observeOutput.mockClear() // clear the append delta call
+
+    // #when — engine flushes (terminal)
+    await capturedReplySink.flush()
+
+    // #then — final frame pushed with the full buffer and final:true
+    expect(observeOutput).toHaveBeenCalledTimes(1)
+    expect(observeOutput).toHaveBeenCalledWith(capturedRunId, 'the answer', {final: true})
+  })
+
+  it('replySink degrades to a no-op when runObservationManager is absent', async () => {
+    // #given — no manager in deps
+    let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
+    mockLaunchWork.mockImplementationOnce(
+      async (request: {readonly runId?: string; readonly replySink?: typeof capturedReplySink}) => {
+        capturedReplySink = request.replySink
+        return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+      },
+    )
+
+    const deps = makeDeps() // no runObservationManager
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    expect(response.status).toBe(202)
+    if (capturedReplySink === undefined) throw new Error('launchWork did not capture replySink')
+    const sink = capturedReplySink
+
+    // #when — append and flush do not throw (graceful no-op)
+    expect(() => sink.append('some text')).not.toThrow()
+    await expect(sink.flush()).resolves.toBeUndefined()
   })
 })

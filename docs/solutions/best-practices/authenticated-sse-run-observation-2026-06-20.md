@@ -171,6 +171,8 @@ if (authzResult.authorized === false) { onFail(); return }
 
 > ⚠️ The ~6-minute revocation window (the ~5.5m positive-authz cache TTL plus the 30s lease interval) is accepted **only because the streamed data is status-only** (run phase/status/timestamps). A surface streaming sensitive data — logs, file contents, secrets — must NOT reuse this window: it needs a cache-bypass re-check, a zero-TTL authz cache, or a much shorter lease interval.
 
+> **Update (#965 — `output` frame):** the stream now also carries an `output` frame with the agent's conversational text. This reuses the same lease window, accepted because the text is the *sink-routed visible output* (reasoning suppressed, tools summarized) the operator could already see in the Discord thread — it is operator-safe by the repo-authz boundary the stream already enforces, not by field-closure. **Foot-gun:** if a future change streams raw file contents, command output, or secrets through this frame, it must tighten the lease per the warning above — the current window is only acceptable for the existing sink-routed visible text.
+
 The lease is **fail-closed**: an unexpected throw inside the lease tick closes the stream (`onFail`), it does not silently leave the connection open. This is the opposite polarity from the fail-*soft* boundaries in [effect-failure-channel-discipline](effect-failure-channel-discipline-2026-06-10.md), but uses the same "one boundary, defect-proof" discipline — here the boundary must deny by default.
 
 ### 9. Per-operator stream cap keyed on the numeric user id
@@ -191,6 +193,8 @@ stream.writeSSE({event: 'ready', data: JSON.stringify({contractVersion: OPERATOR
 
 export type ResetReason = 'no-snapshot' | 'terminal' | 'shutdown' | 'max-duration' | 'writer-error' | 'overflow'
 ```
+
+The closed frame union is additive-by-contract: #965 added an `output` frame (`{ runId, text, final, seq, droppedCount? }`) and bumped `OPERATOR_CONTRACT_VERSION` to `1.3.0`. The frame's `text` is **sink-routed** (emitted by the engine through the operator-bound `ReplySink`), not extracted from `RunState` by the projection — so the closed-DTO discipline (rule 5) is unchanged: a new *frame type* is added, not a new *projected field*. Under per-subscriber backpressure, `output` frames **coalesce** (drop pending output, carry a cumulative `droppedCount`) rather than dropping the connection like status frames, and a `final: true` frame is cached so a late subscriber still receives the complete answer.
 
 ## Why This Matters
 
@@ -225,6 +229,7 @@ else enqueueFrame(sub, {type: 'status', data: cached})
 
 ## Related
 
+- [sse-output-streaming-terminal-drain-2026-06-21.md](sse-output-streaming-terminal-drain-2026-06-21.md) — the **output/completeness layer** built directly on top of this surface: terminal-as-graceful-drain, ordering the final answer before terminal status, the bounded replay cache for late subscribers, and coalescing under backpressure (PR #974, #965). This doc covers auth/redaction/teardown; that one covers how ordered output reaches the consumer completely.
 - [gateway-control-surface-spine-2026-06-15.md](gateway-control-surface-spine-2026-06-15.md) — the transport-neutral execution/approval seam this SSE surface is the first transport on (the spine carved the seam; this instantiates it one layer up). Cross-link both ways.
 - [signed-webhook-ingress-hardening-2026-05-29.md](signed-webhook-ingress-hardening-2026-05-29.md) — the HTTP no-oracle "identical 401" rule; rule 1 here is its SSE analogue.
 - [centralize-s3-key-identity-construction-2026-06-09.md](centralize-s3-key-identity-construction-2026-06-09.md) — server-owned identity resolution; rule 3 applies it to `runId → repo`.
