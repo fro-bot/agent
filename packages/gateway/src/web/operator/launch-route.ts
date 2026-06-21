@@ -5,10 +5,13 @@
  * chosen repo through the transport-neutral launchWork engine. The run is
  * recorded as surface:'web' and attributed to the operator's GitHub identity.
  *
- * The route returns 202 {runId} IMMEDIATELY (fire-and-return). The operator
- * observes the run via the SSE run-stream route (GET /operator/runs/:runId/stream).
+ * The route returns 202 {runId} after awaiting launchWork admission. Admission
+ * is fast and bounded — launchWork returns after the run is admitted (or
+ * rejected), not after the run completes. The gateway in-flight set owns the
+ * immediate-run promise; the operator observes the run via the SSE run-stream
+ * route (GET /operator/runs/:runId/stream).
  *
- * Gate ordering (all must pass before launchWork is fired):
+ * Gate ordering (all must pass before launchWork is called):
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
  *   2. Operator rate limit (3/min, 10/hr, operator-keyed)
  *   3. Resolve OAuth token via session store
@@ -18,9 +21,10 @@
  *   7. checkRepoAuthz (allowlist + GitHub repo access)
  *   8. Empty-prompt fail-fast
  *   9. Per-operator idempotency guard (${githubUserId}:${clientKey})
- *  10. Generate runId + register PENDING in run index
- *  11. Record idempotency entry (runId)
- *  12. Fire launchWork WITHOUT await (.catch logs) → return 202 {runId}
+ *  10. Generate runId + reserve idempotency key (if present)
+ *  11. Await launchWork admission (returns LaunchAdmission, not the full run)
+ *  12. On accepted: commit idempotency + return 202 {runId}
+ *      On rejected/throw: rollback idempotency + return coarse error
  *
  * Security invariants:
  *   - Server-owned repo resolution: client body names a repo; server resolves
@@ -35,7 +39,6 @@
 
 import type {Hono} from 'hono'
 import type {RepoBinding} from '../../bindings/types.js'
-import type {RunIndex} from '../../execute/run-index.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {RepoKey} from '../../redaction/denylist.js'
@@ -106,9 +109,7 @@ export interface LaunchRouteDeps {
   readonly repoAuthzDeps: RepoAuthzDeps
   /** Per-operator idempotency guard. */
   readonly idempotencyGuard: IdempotencyGuard
-  /** Server-owned run index for registering PENDING entries before launchWork. */
-  readonly runIndex: Pick<RunIndex, 'register'>
-  /** Engine dependencies for launchWork. */
+  /** Engine dependencies for launchWork. launchWork owns run index registration. */
   readonly launchWorkDeps: RunMentionDeps
   /** Structured logger. */
   readonly logger: OperatorLogger
@@ -287,6 +288,9 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     // ── Gate 9: Per-operator idempotency guard ────────────────────────────────
     // Key is namespaced: ${githubUserId}:${clientKey} so operator A cannot
     // suppress operator B's launch with the same client key.
+    // check() returns the runId for BOTH reserved AND committed live entries —
+    // a concurrent duplicate arriving while the first is reserved-not-committed
+    // echoes the reserved runId and does NOT launch twice.
     if (idempotencyKey !== undefined) {
       const priorRunId = deps.idempotencyGuard.check(githubUserId, idempotencyKey)
       if (priorRunId !== undefined) {
@@ -296,33 +300,18 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       }
     }
 
-    // ── Gate 10: Generate runId + register PENDING in run index ──────────────
-    // The route owns the runId so it can return 202 {runId} immediately.
-    // Register BEFORE firing launchWork so the run is visible to the SSE route.
+    // ── Gate 10: Generate runId + reserve idempotency key ────────────────────
+    // The route owns the runId so it can return 202 {runId} and pass it to
+    // launchWork (which uses it for admission and run-index registration).
+    // Reserve BEFORE launchWork so a concurrent duplicate during the admission
+    // window echoes this runId and does NOT launch twice.
     const runId = randomUUID()
-    const startedAt = new Date().toISOString()
 
-    try {
-      deps.runIndex.register(runId, {
-        repo: `${owner}/${repo}`,
-        surface: 'web',
-        startedAt,
-      })
-    } catch (registerError: unknown) {
-      deps.logger.warn(
-        {githubUserId, runId, err: registerError instanceof Error ? registerError.message : String(registerError)},
-        'launch: runIndex.register threw — continuing (best-effort)',
-      )
-    }
-
-    // ── Gate 11: Record idempotency entry AFTER generating the runId ──────────
-    // Committed here (after runId is generated). A failed background run's key
-    // persists until TTL; failure-aware cleanup needs run-state lifecycle tracking.
     if (idempotencyKey !== undefined) {
-      deps.idempotencyGuard.record(githubUserId, idempotencyKey, runId)
+      deps.idempotencyGuard.reserve(githubUserId, idempotencyKey, runId)
     }
 
-    // ── Gate 12: Fire launchWork WITHOUT await (fire-and-return) ─────────────
+    // ── Gate 11: Await launchWork admission ───────────────────────────────────
     // Build the LaunchWorkRequest with web-specific sinks, auto-deny approval,
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.
@@ -331,6 +320,9 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     // text is not streamed to the operator yet (a follow-up). The web replySink
     // accumulates text in memory but does not deliver it — the operator observes
     // run phase/status via GET /operator/runs/:runId/stream.
+    //
+    // launchWork returns after ADMISSION (not after the run). The gateway in-flight
+    // set owns the immediate-run promise; awaiting here does NOT hang the connection.
     const operatorIdentity = {
       kind: 'web-operator' as const,
       githubUserId,
@@ -352,22 +344,56 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       promptBuilder: buildWebPrompt,
     }
 
-    // Fire-and-return: do NOT await launchWork. The engine awaits the whole run
-    // on the immediate-slot path. Awaiting here would hang the HTTP connection.
-    // launchWork is async — all failures arrive via the returned Promise.
-    const launchWorkPromise = launchWork(request, deps.launchWorkDeps)
+    // Await admission (fast, bounded — does NOT await the run itself).
+    // The finally block guarantees rollback on ANY non-commit exit:
+    //   - launchWork returns {accepted:false} → rollback
+    //   - launchWork throws → rollback
+    //   - any post-admission/pre-commit route error → rollback
+    // This prevents a reserved-but-never-resolved key from blocking the operator's own key.
+    let committed = false
+    try {
+      const admission = await launchWork(request, deps.launchWorkDeps)
 
-    // eslint-disable-next-line no-void
-    void launchWorkPromise.catch((error: unknown) => {
+      if (admission.accepted === true) {
+        // Commit the idempotency entry now that admission succeeded.
+        if (idempotencyKey !== undefined) {
+          deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
+        }
+        committed = true
+        deps.logger.info({githubUserId, runId: admission.runId, owner, repo}, 'launch: accepted')
+        return c.json({runId: admission.runId}, 202)
+      }
+
+      // Admission rejected — map reason to a coarse HTTP error.
+      // rollback happens in finally.
+      if (admission.reason === 'cap') {
+        deps.logger.warn({githubUserId, owner, repo, gate: 'cap'}, 'launch: rejected — at capacity')
+        return c.json({error: 'unavailable'}, 503)
+      }
+
+      // 'empty-prompt' — defensive; the route already validates empty prompt above.
+      deps.logger.warn({githubUserId, owner, repo, gate: 'empty-prompt'}, 'launch: rejected — empty prompt')
+      return c.json({error: 'bad request'}, 400)
+    } catch (launchError: unknown) {
       deps.logger.error(
-        {githubUserId, runId, owner, repo, err: error instanceof Error ? error.message : String(error)},
-        'launch: background run failed',
+        {
+          githubUserId,
+          runId,
+          owner,
+          repo,
+          err: launchError instanceof Error ? launchError.message : String(launchError),
+        },
+        'launch: launchWork threw — rolling back idempotency',
       )
-    })
-
-    deps.logger.info({githubUserId, runId, owner, repo}, 'launch: accepted')
-
-    // Return 202 Accepted immediately with the runId.
-    return c.json({runId}, 202)
+      // rollback happens in finally; return a coarse 500.
+      return c.json({error: 'internal error'}, 500)
+    } finally {
+      // Guarantee rollback on any non-commit exit (rejected, thrown, or any
+      // post-admission/pre-commit route error). No-op if already committed or
+      // if no idempotency key was supplied.
+      if (committed === false && idempotencyKey !== undefined) {
+        deps.idempotencyGuard.rollback(githubUserId, idempotencyKey)
+      }
+    }
   })
 }
