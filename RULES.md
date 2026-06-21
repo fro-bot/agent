@@ -730,7 +730,8 @@ lint-staged        # Runs on staged files
 - **Bundle (setup)**: `dist/setup.js` (ESM, minified)
 - **Bundle (post)**: `dist/post.js` (ESM, minified) - post-action cache hook
 - **Bundle (plugin)**: `dist/plugin/fro-bot-agent.js` (ESM, self-contained)
-- **Licenses**: `dist/licenses.txt` (auto-extracted)
+- **Third-party notices**: `dist/THIRD_PARTY_NOTICES.txt` (auto-generated, committed attribution for the bundled dependencies)
+- **SBOM**: a CycloneDX dependency SBOM is generated in CI (`pnpm sbom`) and uploaded as a build artifact (not committed)
 - **Source maps**: Not included in production
 
 ### dist/ Directory Rules

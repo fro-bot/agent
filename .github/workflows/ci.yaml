@@ -95,13 +95,9 @@ jobs:
         run: pnpm build
       - name: Compare the expected and actual dist/ directories
         run: |
-          DIFF_TARGETS="dist/"
-          if [[ "${{ github.head_ref || github.ref_name }}" == renovate/* ]]; then
-            DIFF_TARGETS="dist/ ':!dist/licenses.txt'"
-          fi
-          if [ "$(eval git diff --ignore-space-at-eol $DIFF_TARGETS | wc -l)" -gt "0" ]; then
+          if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
             echo "Detected uncommitted changes after build.  See status below:"
-            eval git diff --text $DIFF_TARGETS
+            git diff --text dist/
             exit 1
           fi
         id: diff
@@ -111,6 +107,17 @@ jobs:
         with:
           name: dist
           path: dist/
+      # The SBOM is an informational artifact, not a build gate — a generation
+      # failure must not fail the build.
+      - name: Generate the dependency SBOM
+        id: sbom
+        continue-on-error: true
+        run: pnpm sbom --sbom-format cyclonedx --prod > sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.sbom.outcome == 'success' }}
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
 
   test:
     name: Test
