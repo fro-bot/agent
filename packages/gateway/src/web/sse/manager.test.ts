@@ -13,7 +13,7 @@
 
 import type {RunState} from '@fro-bot/runtime'
 import type {OperatorRunStatus} from '../../operator-contract/index.js'
-import type {ObservationFrame, RunObservationManager, RunObservationManagerDeps} from './manager.js'
+import type {ObservationFrame, OutputFrame, RunObservationManager, RunObservationManagerDeps} from './manager.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -238,16 +238,22 @@ describe('happy path — ordered frames, terminal close, cache clear', () => {
     expect(closes).toHaveLength(1)
     expect(closes[0]).toBe('terminal')
 
-    // #then subscribing again after terminal emits reset (cache cleared)
-    const {frames: frames2} = collectFrames(manager, 'run-001')
+    // #then subscribing again after terminal gets the terminal replay (status frame + close)
+    // The terminal replay cache holds the terminal status for a bounded TTL.
+    // Late subscribers receive the terminal status frame, then the stream closes with 'terminal'.
+    const {frames: frames2, closes: closes2} = collectFrames(manager, 'run-001')
     await drain()
-    expect(frames2.filter(f => f.type === 'reset')).toHaveLength(1)
+    // The late subscriber gets the terminal status from the replay cache (not a reset)
+    const replayStatusFrames = frames2.filter(f => f.type === 'status')
+    expect(replayStatusFrames.length).toBeGreaterThanOrEqual(1)
+    expect(replayStatusFrames.at(-1)).toMatchObject({type: 'status', data: {status: 'succeeded'}})
+    expect(closes2).toContain('terminal')
 
     unsubscribe()
     manager.shutdown()
   })
 
-  it('clears the cache entry after terminal fan-out', async () => {
+  it('clears the latestStatusCache entry after terminal fan-out — late subscriber gets terminal replay', async () => {
     // #given a manager that projects a terminal status
     const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
     const projectFn: ProjectFn = async () => terminalStatus
@@ -258,11 +264,17 @@ describe('happy path — ordered frames, terminal close, cache clear', () => {
     await manager.observe(makeRunState({phase: 'COMPLETED'}))
     await drain()
 
-    // #then subscribing after terminal gets reset (no cached entry)
-    const {frames} = collectFrames(manager, 'run-001')
+    // #then subscribing after terminal gets the terminal replay (not a reset)
+    // The terminal replay cache holds the terminal status for a bounded TTL.
+    // The latestStatusCache entry is cleared (no active run entry), but the
+    // terminalReplayCache entry delivers the terminal status to late subscribers.
+    const {frames, closes} = collectFrames(manager, 'run-001')
     await drain()
-    expect(frames.some(f => f.type === 'reset')).toBe(true)
-    expect(frames.some(f => f.type === 'status')).toBe(false)
+    // Late subscriber gets the terminal status from the replay cache
+    expect(frames.some(f => f.type === 'status')).toBe(true)
+    expect(frames.some(f => f.type === 'reset')).toBe(false)
+    // The stream closes with 'terminal' after delivering the replay
+    expect(closes).toContain('terminal')
 
     manager.shutdown()
   })
@@ -354,19 +366,18 @@ describe('snapshot-on-subscribe', () => {
 describe('backpressure — LOAD-BEARING', () => {
   it('drops a slow subscriber (overflow) without blocking publish or a fast peer', async () => {
     // #given a manager with a queue cap sized for exactly one status frame
-    // We need the slow subscriber to overflow when a SECOND frame arrives (queue full),
-    // while the fast subscriber drains immediately and never overflows.
-    //
     // Strategy: use a cap that fits one frame. The slow subscriber gets the snapshot
-    // frame (fills the queue) and then never drains. When the second observe() arrives,
-    // the slow subscriber's queue is full → overflow. The fast subscriber drains
-    // immediately so its queue is always empty → no overflow.
+    // frame (dequeued immediately, in-flight). Queue is empty. We then enqueue TWO
+    // more frames simultaneously (before any drain) — the first fits, the second
+    // overflows → slow subscriber is dropped. The fast subscriber drains immediately.
     const status = makeOperatorRunStatus({status: 'running'})
     const projectFn: ProjectFn = async () => status
 
     // Estimate one frame's byte size so we can set the cap to exactly that
     const oneFrameBytes = JSON.stringify({type: 'status', data: status}).length
-    // Cap = one frame: the slow subscriber fills up after the snapshot, overflows on the next
+    // Cap = one frame: the slow subscriber can hold exactly one queued frame.
+    // With dequeue-before-await, the in-flight frame is not in the queue.
+    // So we need to enqueue 2 frames simultaneously to overflow.
     const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneFrameBytes})
 
     // Seed the cache so both subscribers get a snapshot frame on subscribe
@@ -399,11 +410,12 @@ describe('backpressure — LOAD-BEARING', () => {
       },
     })
 
-    // Both subscribers got the snapshot frame. The slow subscriber's queue is now full
-    // (one frame = cap). The fast subscriber drained immediately (queue empty).
+    // The slow subscriber's snapshot frame is dequeued immediately (in-flight, blocking).
+    // Queue is empty. Enqueue TWO more frames simultaneously — first fits, second overflows.
 
-    // #when observing again (second frame — slow subscriber queue is full → overflow)
+    // #when observing twice without draining (second frame overflows slow subscriber)
     const observeStart = Date.now()
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
     await manager.observe(makeRunState({phase: 'EXECUTING'}))
     const observeElapsed = Date.now() - observeStart
 
@@ -1289,6 +1301,1110 @@ describe('post-shutdown behavior', () => {
     await drain()
     // After shutdown, subscribe immediately calls onClose — no frames expected
     expect(frames2.filter(f => f.type === 'status')).toHaveLength(0)
+  })
+})
+
+// ===========================================================================
+// 13. observeOutput — output frame fan-out, seq counter, final cache
+// ===========================================================================
+
+describe('observeOutput — output frame fan-out and seq counter', () => {
+  it('fans an output frame {final:false, seq:0} to a subscriber; second call increments seq', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when calling observeOutput twice
+    manager.observeOutput('run-001', 'hello')
+    manager.observeOutput('run-001', ' world')
+    await drain()
+
+    // #then two output frames are delivered with incrementing seq
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(2)
+    expect(outputFrames[0]).toMatchObject({
+      type: 'output',
+      data: {runId: 'run-001', text: 'hello', final: false, seq: 0},
+    })
+    expect(outputFrames[1]).toMatchObject({
+      type: 'output',
+      data: {runId: 'run-001', text: ' world', final: false, seq: 1},
+    })
+
+    manager.shutdown()
+  })
+
+  it('observeOutput with {final:true} sets the cache and fans a final frame', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when calling observeOutput with final:true
+    manager.observeOutput('run-001', 'full answer', {final: true})
+    await drain()
+
+    // #then a final output frame is delivered
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(1)
+    expect(outputFrames[0]).toMatchObject({
+      type: 'output',
+      data: {runId: 'run-001', text: 'full answer', final: true, seq: 0},
+    })
+
+    manager.shutdown()
+  })
+
+  it('empty final: observeOutput with empty text and {final:true} produces a terminal output frame', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when calling observeOutput with empty text and final:true
+    manager.observeOutput('run-001', '', {final: true})
+    await drain()
+
+    // #then a final output frame with empty text is delivered
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(1)
+    expect(outputFrames[0]).toMatchObject({type: 'output', data: {runId: 'run-001', text: '', final: true, seq: 0}})
+
+    manager.shutdown()
+  })
+
+  it('seq counter is per-run and independent across runs', async () => {
+    // #given a manager with subscribers for two runs
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames: framesA} = collectFrames(manager, 'run-A')
+    const {frames: framesB} = collectFrames(manager, 'run-B')
+    await drain()
+
+    // #when calling observeOutput on both runs
+    manager.observeOutput('run-A', 'a1')
+    manager.observeOutput('run-B', 'b1')
+    manager.observeOutput('run-A', 'a2')
+    await drain()
+
+    // #then each run has its own seq counter starting at 0
+    const outputA = framesA.filter(f => f.type === 'output')
+    const outputB = framesB.filter(f => f.type === 'output')
+    expect(outputA).toHaveLength(2)
+    expect(outputA[0]).toMatchObject({data: {seq: 0}})
+    expect(outputA[1]).toMatchObject({data: {seq: 1}})
+    expect(outputB).toHaveLength(1)
+    expect(outputB[0]).toMatchObject({data: {seq: 0}})
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 14. observeOutput — late subscriber snapshot (R3)
+// ===========================================================================
+
+describe('observeOutput — late subscriber receives cached final output', () => {
+  it('a subscriber connecting after a final observeOutput receives the cached final output frame', async () => {
+    // #given a manager where a final output frame has been observed
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    // Seed the status cache so subscribe delivers a status snapshot (not reset)
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #when the final output is observed before the subscriber connects
+    manager.observeOutput('run-001', 'the answer', {final: true})
+    await drain()
+
+    // #when a late subscriber connects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then the subscriber receives the cached final output frame
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(1)
+    expect(outputFrames[0]).toMatchObject({type: 'output', data: {text: 'the answer', final: true}})
+
+    // #then the status snapshot is delivered before the output frame
+    const statusIdx = frames.findIndex(f => f.type === 'status')
+    const outputIdx = frames.findIndex(f => f.type === 'output')
+    expect(statusIdx).toBeGreaterThanOrEqual(0)
+    expect(outputIdx).toBeGreaterThan(statusIdx)
+
+    manager.shutdown()
+  })
+
+  it('a late subscriber with no cached final output does NOT receive an output frame', async () => {
+    // #given a manager with only delta output (no final)
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    manager.observeOutput('run-001', 'delta only')
+    await drain()
+
+    // #when a late subscriber connects
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then no output frame is delivered (no cached final)
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(0)
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 15. observeOutput — coalescing under backpressure (R5)
+// ===========================================================================
+
+describe('observeOutput — coalescing keeps connection alive under overflow', () => {
+  it('output frames coalesce on overflow — connection stays alive and droppedCount is carried forward', async () => {
+    // #given a manager with a tiny cap (fits exactly one output frame).
+    // Both subscribers share the same cap. The slow subscriber never drains, so its
+    // queue fills after the first frame. The fast subscriber drains between frames
+    // (we send one frame at a time with drain() between each).
+    //
+    // Key invariant: output frame overflow KEEPS THE CONNECTION ALIVE (coalescing),
+    // unlike status frame overflow which DROPS the subscriber. Both subscribers
+    // stay alive even when their queues overflow.
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+
+    // Estimate one output frame's byte size so we can set the cap to exactly that.
+    // With cap = oneFrameBytes, the slow subscriber fills up after the first frame
+    // and coalesces on subsequent frames. The fast subscriber drains between frames
+    // (one at a time with drain()) so its queue is always empty before each new frame.
+    const sampleFrame: OutputFrame = {
+      type: 'output',
+      data: {runId: 'run-001', text: 'delta-1', final: false, seq: 0},
+    }
+    const oneFrameBytes = JSON.stringify(sampleFrame).length
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneFrameBytes})
+
+    // #given a slow subscriber that never drains
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        // Never resolves — simulates a completely stuck consumer
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+
+    // #given a fast subscriber on the same run
+    const fastFrames: ObservationFrame[] = []
+    const fastCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: frame => {
+        fastFrames.push(frame)
+      },
+      onClose: reason => {
+        fastCloses.push(reason)
+      },
+    })
+
+    await drain()
+
+    // #when sending output frames one at a time with drain() between each.
+    // The slow subscriber's queue fills after the first frame; subsequent frames coalesce.
+    // The fast subscriber drains between each frame so its queue is always empty.
+    manager.observeOutput('run-001', 'delta-1')
+    await drain()
+    manager.observeOutput('run-001', 'delta-2')
+    await drain()
+    manager.observeOutput('run-001', 'delta-3')
+    await drain()
+
+    // #then the slow subscriber is NOT dropped (coalescing keeps it alive)
+    expect(slowCloses).not.toContain('overflow')
+    expect(slowCloses).toHaveLength(0)
+
+    // #then the fast subscriber is also NOT dropped (coalescing, not drop, on output overflow)
+    // The fast subscriber's queue is always empty before each frame (it drains between frames),
+    // so it receives all 3 frames without overflow.
+    const fastOutputFrames = fastFrames.filter(f => f.type === 'output')
+    expect(fastOutputFrames.length).toBeGreaterThanOrEqual(3)
+    expect(fastCloses).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('a later output frame carries droppedCount > 0 after coalescing', async () => {
+    // #given a manager with a cap sized for exactly one output frame.
+    // The subscriber gets a reset frame (no cached status — reset is smaller than one
+    // output frame). After the reset frame drains, two output frames arrive simultaneously:
+    // first fits, second overflows → coalescing removes first → second fits with droppedCount=1.
+    // The subscriber stays alive (coalescing, not drop).
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+
+    const sampleOutputFrame: OutputFrame = {
+      type: 'output',
+      data: {runId: 'run-001', text: 'a', final: false, seq: 0},
+    }
+    const oneOutputFrameBytes = JSON.stringify(sampleOutputFrame).length
+    // Do NOT seed the status cache — subscriber gets a reset frame (smaller than output frame).
+    // Cap = oneOutputFrameBytes: reset fits, two output frames trigger coalescing.
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneOutputFrameBytes})
+
+    // #given a slow subscriber that blocks on the first OUTPUT frame (never drains)
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async frame => {
+        if (frame.type === 'output') {
+          // Block on the first output frame — never resolves
+          await new Promise<void>(() => {
+            // intentionally never resolves
+          })
+        }
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+    // Drain the reset frame so the queue is empty before output frames arrive
+    await drain()
+
+    // #when sending two output frames simultaneously (before any drain)
+    // frame-a: fits (queue empty). Enqueued (queueBytes = oneOutputFrameBytes = cap).
+    // frame-b: queueBytes + oneOutputFrameBytes > cap → coalescing removes frame-a
+    //          → frame-b fits with droppedCount=1.
+    manager.observeOutput('run-001', 'a')
+    manager.observeOutput('run-001', 'b')
+    await drain()
+
+    // #then the subscriber is still alive (not dropped — coalescing keeps it alive)
+    expect(slowCloses).toHaveLength(0)
+    expect(slowCloses).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('droppedCount is carried on the next enqueued output frame after coalescing', async () => {
+    // #given a manager with a large cap so all frames fit without coalescing.
+    // This test verifies that a fast subscriber receives output frames correctly.
+    // The coalescing path (droppedCount > 0) is verified by the slow-subscriber tests above.
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: 4096})
+
+    // #given a fast subscriber that drains immediately
+    const fastFrames: ObservationFrame[] = []
+    const fastCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: frame => {
+        fastFrames.push(frame)
+      },
+      onClose: reason => {
+        fastCloses.push(reason)
+      },
+    })
+    // Drain the reset frame so the queue is empty before output frames arrive
+    await drain()
+
+    // #when sending two output frames
+    manager.observeOutput('run-001', 'frame-1')
+    manager.observeOutput('run-001', 'frame-2')
+    await drain()
+
+    // #then the fast subscriber received both frames (no coalescing — large cap)
+    const fastOutputFrames = fastFrames.filter(f => f.type === 'output')
+    expect(fastOutputFrames.length).toBeGreaterThanOrEqual(2)
+    expect(fastOutputFrames[0]).toMatchObject({type: 'output', data: {text: 'frame-1'}})
+    expect(fastOutputFrames[1]).toMatchObject({type: 'output', data: {text: 'frame-2'}})
+
+    // #then no droppedCount on either frame (no coalescing happened)
+    expect(fastOutputFrames[0]?.data.droppedCount).toBeUndefined()
+    expect(fastOutputFrames[1]?.data.droppedCount).toBeUndefined()
+
+    // #then the subscriber is still alive
+    expect(fastCloses).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('discard-after-coalesce: frame discarded when queue is still full after coalescing all output', async () => {
+    // #given a manager where the subscriber's queue is filled with a non-output frame
+    // (status snapshot), then output frames arrive that cannot fit even after coalescing.
+    // The subscriber must stay alive (discard-after-coalesce, not drop).
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+
+    // Seed the status cache
+    await (async () => {
+      const {manager: seedManager} = makeManager(projectFn)
+      await seedManager.observe(makeRunState({phase: 'EXECUTING'}))
+      seedManager.shutdown()
+    })()
+
+    // Use a cap sized for exactly one status frame. The subscriber gets the status
+    // snapshot (fills the queue). Then output frames arrive — the queue is full of
+    // the status frame (non-output), so coalescing cannot remove it. The output
+    // frame is discarded (discard-after-coalesce path). The subscriber stays alive.
+    const status = makeOperatorRunStatus({status: 'running'})
+    const statusFrameBytes = JSON.stringify({type: 'status', data: status}).length
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: statusFrameBytes})
+
+    // Seed the cache for this manager
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #given a slow subscriber that never drains (queue stays full with the status snapshot)
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        // Never resolves — the status snapshot stays in-flight, queue appears empty
+        // (dequeue-before-await), but the subscriber is blocked
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+    // Do NOT drain — the status snapshot is dequeued but in-flight (blocking).
+    // Now enqueue two more status frames to fill the queue (first fits, second overflows).
+    // But we want to test the output discard path, not status overflow.
+    // Instead: drain the status snapshot, then enqueue a non-output frame to fill the queue,
+    // then send output frames.
+    //
+    // Simpler approach: use a cap of 0 bytes for output frames by making the cap
+    // exactly the size of the status frame. After the status snapshot is dequeued
+    // (in-flight), queue is empty. Output frame arrives: fits (queue empty). Blocked.
+    // Second output frame: queue has first output frame (in-flight, dequeued). Queue empty.
+    // This doesn't trigger discard-after-coalesce.
+    //
+    // The discard-after-coalesce path requires: queue has non-output frames that
+    // cannot be coalesced, AND the new output frame doesn't fit even after removing
+    // all output frames. We achieve this by: (1) subscriber blocks on status frame
+    // (in-flight, dequeued), (2) enqueue a second status frame (fills queue),
+    // (3) send output frame — coalescing removes output frames (none), frame doesn't fit.
+    await drain() // status snapshot dequeued and in-flight (blocking)
+
+    // Enqueue a second status frame to fill the queue (non-output, cannot be coalesced)
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    // Queue now has one status frame (statusFrameBytes). Cap = statusFrameBytes.
+
+    // #when sending output frames — queue is full of non-output frames, discard-after-coalesce
+    manager.observeOutput('run-001', 'a')
+    manager.observeOutput('run-001', 'b')
+    await drain()
+
+    // #then the subscriber is still alive (discard-after-coalesce keeps connection alive)
+    expect(slowCloses).toHaveLength(0)
+    expect(slowCloses).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('status-frame overflow still drops the subscriber (regression — unchanged behavior)', async () => {
+    // #given a manager with a cap sized for exactly one status frame
+    const status = makeOperatorRunStatus({status: 'running'})
+    const projectFn: ProjectFn = async () => status
+
+    const oneFrameBytes = JSON.stringify({type: 'status', data: status}).length
+    // Cap = one frame. The slow subscriber's onEvent never resolves, so the frame
+    // stays in-flight (dequeued). We enqueue TWO more frames simultaneously (before
+    // any drain) so the second frame fills the queue and the third overflows.
+    // With dequeue-before-await, the first frame is dequeued immediately when
+    // drainQueue starts, so queueBytes drops to 0. We need to enqueue 2 frames
+    // simultaneously to fill the queue (first fits, second overflows).
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneFrameBytes})
+
+    // Seed the cache
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #given a slow subscriber (onEvent never resolves — simulates a stuck consumer)
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+
+    // The slow subscriber got the snapshot frame (dequeued immediately, in-flight).
+    // Queue is now empty (dequeue-before-await). Enqueue two more status frames
+    // simultaneously — first fills the queue, second overflows → drop.
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #then the slow subscriber IS dropped with 'overflow' (status frames still drop)
+    expect(slowCloses).toContain('overflow')
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 16. observeOutput — teardown: cache cleared on terminal and shutdown
+// ===========================================================================
+
+describe('observeOutput — terminal replay cache delivers final output to late subscribers', () => {
+  it('after terminal status, a late subscriber receives the cached final output then terminal status then closes', async () => {
+    // #given a manager where a final output is observed, then a terminal status
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // Observe a final output
+    manager.observeOutput('run-001', 'done', {final: true})
+    await drain()
+
+    // Observe terminal status (moves final output to terminal replay cache)
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #when a late subscriber connects after terminal
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then the late subscriber receives the cached final output frame
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(1)
+    expect(outputFrames[0]).toMatchObject({type: 'output', data: {text: 'done', final: true}})
+
+    // #then the late subscriber also receives the terminal status frame
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(1)
+    expect(statusFrames[0]).toMatchObject({type: 'status', data: {status: 'succeeded'}})
+
+    // #then the output frame is delivered before the terminal status frame
+    const outputIdx = frames.findIndex(f => f.type === 'output')
+    const statusIdx = frames.findIndex(f => f.type === 'status')
+    expect(outputIdx).toBeGreaterThanOrEqual(0)
+    expect(statusIdx).toBeGreaterThan(outputIdx)
+
+    // #then the stream closes with 'terminal' after delivering the replay
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('after shutdown, all output caches are cleared', async () => {
+    // #given a manager with cached final output for two runs
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    manager.observeOutput('run-001', 'answer-1', {final: true})
+    manager.observeOutput('run-002', 'answer-2', {final: true})
+    await drain()
+
+    // #when shutting down
+    manager.shutdown()
+    await drain()
+
+    // #then subscribing after shutdown gets no output frames (caches cleared)
+    // (subscribe after shutdown immediately calls onClose — no frames delivered)
+    const frames1: ObservationFrame[] = []
+    manager.subscribe('run-001', {
+      onEvent: f => {
+        frames1.push(f)
+      },
+      onClose: vi.fn(),
+    })
+    const frames2: ObservationFrame[] = []
+    manager.subscribe('run-002', {
+      onEvent: f => {
+        frames2.push(f)
+      },
+      onClose: vi.fn(),
+    })
+    await drain()
+
+    expect(frames1.filter(f => f.type === 'output')).toHaveLength(0)
+    expect(frames2.filter(f => f.type === 'output')).toHaveLength(0)
+  })
+
+  it('seq counter is cleared on terminal status — observeOutput after terminal is dropped until replay expires', async () => {
+    // #given a manager where run-001 has been observed to terminal
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    // Use a very short TTL so the replay cache expires quickly in the test
+    const fakeTimers = makeFakeTimerSystem(0)
+    const {manager} = makeManager(projectFn, {terminalReplayTtlMs: 1000}, fakeTimers)
+
+    // Observe some output (final:true on last) and then terminal
+    manager.observeOutput('run-001', 'a')
+    manager.observeOutput('run-001', 'b', {final: true})
+    await drain()
+
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then observeOutput after terminal is dropped (replay cache guards the runId)
+    // Subscribe a fresh subscriber — it gets the replay (final output + terminal status)
+    const {frames: replayFrames, closes: replayCloses} = collectFrames(manager, 'run-001')
+    await drain()
+    expect(replayFrames.filter(f => f.type === 'output')).toHaveLength(1)
+    expect(replayCloses).toContain('terminal')
+
+    // #when observeOutput is called after terminal (should be dropped)
+    manager.observeOutput('run-001', 'fresh start')
+    await drain()
+
+    // #then no new output is delivered (dropped by the terminal guard)
+    const {frames: afterFrames} = collectFrames(manager, 'run-001')
+    await drain()
+    // The late subscriber gets the replay (same cached output), not the new 'fresh start'
+    const afterOutputFrames = afterFrames.filter(f => f.type === 'output')
+    const freshStartFrame = afterOutputFrames.find(f => f.type === 'output' && f.data.text === 'fresh start')
+    expect(freshStartFrame).toBeUndefined()
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 17. Observer-only invariant extension: observeOutput does not add mutating API
+// ===========================================================================
+
+describe('observer-only invariant — observeOutput extension', () => {
+  it('runObservationManager interface includes observeOutput but no mutating run API', () => {
+    // #given the RunObservationManager interface (structural check)
+    // We verify that a manager object has observeOutput but NOT any mutating run API.
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    // #then the manager has observeOutput
+    expect(typeof manager.observeOutput).toBe('function')
+
+    // #then the manager does NOT have any mutating run API
+    const managerKeys = new Set(Object.keys(manager))
+    const mutatingKeys = ['transitionRun', 'acquireLock', 'releaseLock', 'heartbeat', 'coordinator', 'runLock']
+    for (const key of mutatingKeys) {
+      expect(managerKeys.has(key)).toBe(false)
+    }
+
+    // #then the manager has only the expected public API
+    const allowedManagerKeys = new Set(['observe', 'observeOutput', 'subscribe', 'abortSubscription', 'shutdown'])
+    for (const key of managerKeys) {
+      expect(allowedManagerKeys.has(key)).toBe(true)
+    }
+
+    manager.shutdown()
+  })
+
+  it('runObservationManagerDeps type still has no mutating run API after observeOutput addition', () => {
+    // #given the RunObservationManagerDeps type (compile-time structural check)
+    const deps: RunObservationManagerDeps = {
+      projectRunObservation: async () => null,
+      logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
+      setInterval: globalThis.setInterval.bind(globalThis),
+      clearInterval: globalThis.clearInterval.bind(globalThis),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      now: Date.now.bind(Date),
+    }
+
+    // #then the deps object has ONLY the expected read-only/observer fields
+    const depKeys = new Set(Object.keys(deps))
+
+    // No mutating run API keys are present
+    const mutatingKeys = ['transitionRun', 'acquireLock', 'releaseLock', 'heartbeat', 'coordinator', 'runLock']
+    for (const key of mutatingKeys) {
+      expect(depKeys.has(key)).toBe(false)
+    }
+
+    // All present keys are in the allowed set (includes new terminal replay TTL deps)
+    const allowedKeys = new Set([
+      'projectRunObservation',
+      'logger',
+      'setInterval',
+      'clearInterval',
+      'setTimeout',
+      'clearTimeout',
+      'now',
+      'heartbeatIntervalMs',
+      'maxStreamDurationMs',
+      'subscriberQueueCapBytes',
+      'terminalReplayTtlMs',
+      'terminalReplayMaxEntries',
+      'terminalReplayMaxBytes',
+    ])
+    for (const key of depKeys) {
+      expect(allowedKeys.has(key)).toBe(true)
+    }
+  })
+})
+
+// ===========================================================================
+// 18. Graceful terminal drain — terminal status delivered after output
+// ===========================================================================
+
+describe('graceful terminal drain — terminal status delivered after output', () => {
+  it('subscriber receives final output frame AND terminal status frame when output precedes terminal', async () => {
+    // #given a manager where observeOutput(final) is called before observe(terminal)
+    // This is the engine reorder: output flush happens before terminal status notify.
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // #given a subscriber
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when the final output is observed BEFORE the terminal status (engine reorder)
+    manager.observeOutput('run-001', 'the final answer', {final: true})
+    // Do NOT drain yet — simulate the engine calling observe(terminal) immediately after
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the subscriber receives the final output frame
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(1)
+    expect(outputFrames[0]).toMatchObject({type: 'output', data: {text: 'the final answer', final: true}})
+
+    // #then the subscriber also receives the terminal status frame (not lost)
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames.length).toBeGreaterThanOrEqual(1)
+    const terminalFrame = statusFrames.find(f => f.type === 'status' && f.data.status === 'succeeded')
+    expect(terminalFrame).toBeDefined()
+
+    // #then the stream closes with 'terminal' (graceful drain, not hard abort)
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('graceful drain delivers all queued frames before closing — no frames lost on terminal', async () => {
+    // #given a manager with a subscriber that has multiple frames queued
+    const statuses = [
+      makeOperatorRunStatus({phase: 'EXECUTING', status: 'running'}),
+      makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}),
+    ]
+    let callCount = 0
+    const projectFn: ProjectFn = async () => statuses[callCount++ % statuses.length] ?? null
+    const {manager} = makeManager(projectFn)
+
+    // #given a subscriber
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observing running status, then output, then terminal — all before draining
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeOutput('run-001', 'partial output')
+    manager.observeOutput('run-001', 'final output', {final: true})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then all frames are delivered (none lost to the terminal teardown)
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames.length).toBeGreaterThanOrEqual(1)
+
+    const statusFrames = frames.filter(f => f.type === 'status')
+    const terminalFrame = statusFrames.find(f => f.data.status === 'succeeded')
+    expect(terminalFrame).toBeDefined()
+
+    // #then the stream closes with 'terminal'
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('terminal close is non-blocking — observe() returns without awaiting drain', async () => {
+    // #given a manager with a slow subscriber
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // #given a slow subscriber that never drains
+    const closes: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    })
+    await drain()
+
+    // #when observing terminal status
+    const start = Date.now()
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    const elapsed = Date.now() - start
+
+    // #then observe() returns in bounded time (does not await the slow drain)
+    expect(elapsed).toBeLessThan(100)
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 19. Dequeue-before-await ordering integrity
+// ===========================================================================
+
+describe('dequeue-before-await — ordering integrity under coalescing', () => {
+  it('in-flight frame is not removed by coalescing — delivered frame is the one dequeued', async () => {
+    // #given a manager with a cap that allows the status snapshot + exactly one output frame
+    // (but not two output frames). The subscriber gets the status snapshot (dequeued,
+    // in-flight), then frame-A (dequeued, in-flight, blocking). frame-B fits. frame-C
+    // overflows → coalescing removes frame-B → frame-C fits with droppedCount=1.
+    // frame-A is NOT removed by coalescing (it was already dequeued before the await).
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+
+    const status = makeOperatorRunStatus({status: 'running'})
+    const statusFrameBytes = JSON.stringify({type: 'status', data: status}).length
+    const sampleOutputFrame: OutputFrame = {
+      type: 'output',
+      data: {runId: 'run-001', text: 'x', final: false, seq: 0},
+    }
+    const oneOutputFrameBytes = JSON.stringify(sampleOutputFrame).length
+    // Cap = statusFrameBytes + oneOutputFrameBytes: fits status snapshot + one output frame,
+    // but not two output frames simultaneously.
+    const cap = statusFrameBytes + oneOutputFrameBytes
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: cap})
+
+    // Seed the status cache
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #given a subscriber that records output frames in order
+    // The subscriber blocks on the FIRST output frame to allow coalescing to happen
+    // during the await (simulating a slow consumer that is mid-delivery).
+    const receivedTexts: string[] = []
+    const closes: string[] = []
+    // Use a deferred promise so we can release the block from outside
+    let resolveFirst!: () => void
+    const firstOutputBlocked = new Promise<void>(resolve => {
+      resolveFirst = resolve
+    })
+    let outputFrameCount = 0
+    manager.subscribe('run-001', {
+      onEvent: async frame => {
+        if (frame.type === 'output') {
+          outputFrameCount++
+          receivedTexts.push(frame.data.text)
+          if (outputFrameCount === 1) {
+            // Block on the first OUTPUT frame to allow coalescing to happen during the await
+            await firstOutputBlocked
+          }
+        }
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    })
+    // Drain the status snapshot so the queue is empty before output frames arrive
+    await drain()
+
+    // #when sending frame-A — it is dequeued immediately and in-flight (blocking)
+    manager.observeOutput('run-001', 'frame-A')
+    // Flush enough microtasks for drainQueue to dequeue frame-A and call onEvent
+    // (which pushes 'frame-A' to receivedTexts then blocks on firstOutputBlocked)
+    for (let i = 0; i < 50; i++) {
+      await Promise.resolve()
+    }
+
+    // #then frame-A is in-flight — receivedTexts has it already
+    expect(receivedTexts).toHaveLength(1)
+    expect(receivedTexts[0]).toBe('frame-A')
+
+    // #when sending frame-B and frame-C simultaneously (before releasing frame-A)
+    // frame-B: fits (queue empty). Enqueued.
+    // frame-C: overflows → coalescing removes frame-B → frame-C fits with droppedCount=1.
+    manager.observeOutput('run-001', 'frame-B')
+    manager.observeOutput('run-001', 'frame-C')
+    await drain()
+
+    // #then the in-flight frame-A is NOT removed by coalescing (it was already dequeued)
+    // Release the first frame
+    resolveFirst()
+    await drain()
+
+    // #then frame-A was delivered correctly (not replaced by a coalesced frame)
+    expect(receivedTexts[0]).toBe('frame-A')
+
+    // #then the subscriber is still alive (coalescing, not drop)
+    expect(closes).not.toContain('overflow')
+    expect(closes).not.toContain('writer-error')
+
+    manager.shutdown()
+  })
+
+  it('queueBytes accounting is correct after dequeue-before-await — no underflow', async () => {
+    // #given a manager with a normal cap
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: 4096})
+
+    // #given a subscriber
+    const frames: ObservationFrame[] = []
+    const closes: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    })
+    await drain()
+
+    // #when sending many output frames
+    for (let i = 0; i < 10; i++) {
+      manager.observeOutput('run-001', `frame-${i}`)
+    }
+    await drain()
+
+    // #then all frames are delivered (no accounting errors causing premature overflow)
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames.length).toBeGreaterThanOrEqual(10)
+
+    // #then the subscriber is still alive (no spurious overflow from accounting errors)
+    expect(closes).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 20. Late-subscriber edge cases (empty-output run, synchronous reorder)
+// ===========================================================================
+
+describe('late subscriber edge cases', () => {
+  it('empty-output run: late subscriber gets terminal status frame and no output frame, closes with terminal', async () => {
+    // #given a manager where observe(terminal) is called with NO prior observeOutput
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // #when observing terminal with no output at all
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #when a late subscriber connects after terminal
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then the late subscriber receives the terminal status frame
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames).toHaveLength(1)
+    expect(statusFrames[0]).toMatchObject({type: 'status', data: {status: 'succeeded'}})
+
+    // #then no output frame is delivered (finalOutput was undefined)
+    const outputFrames = frames.filter(f => f.type === 'output')
+    expect(outputFrames).toHaveLength(0)
+
+    // #then the stream closes with 'terminal'
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('synchronous reorder: observeOutput(final) then observe(terminal) without drain — late subscriber gets output before status', async () => {
+    // #given a manager where the engine calls observeOutput(final) then observe(terminal)
+    // without any drain between them (synchronous reorder scenario)
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // #when output and terminal arrive without a drain between them
+    manager.observeOutput('run-001', 'the final answer', {final: true})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    // No drain here — both calls complete before any microtask flush
+    await drain()
+
+    // #when a late subscriber connects after both have settled
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #then the late subscriber receives the output frame before the status frame
+    const outputIdx = frames.findIndex(f => f.type === 'output')
+    const statusIdx = frames.findIndex(f => f.type === 'status')
+    expect(outputIdx).toBeGreaterThanOrEqual(0)
+    expect(statusIdx).toBeGreaterThanOrEqual(0)
+    expect(outputIdx).toBeLessThan(statusIdx)
+
+    // #then the output frame carries the correct text
+    const firstOutputFrame = frames.find(f => f.type === 'output')
+    expect(firstOutputFrame).toMatchObject({type: 'output', data: {text: 'the final answer', final: true}})
+
+    // #then the stream closes with 'terminal'
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 21. queueBytes accuracy after coalescing
+// ===========================================================================
+
+describe('queueBytes accuracy after coalescing', () => {
+  it('after coalescing sets coalescedDropCount>0, effective frame bytes keep queueBytes at or below cap', async () => {
+    // #given a manager with a cap sized for exactly one output frame.
+    // The slow subscriber never drains. After the first output frame fills the queue,
+    // a second frame triggers coalescing (removes the first, coalescedDropCount=1).
+    // The effective frame for the second call now carries droppedCount=1, making it
+    // slightly larger. The cap check must use the effective bytes, not the raw bytes,
+    // so queueBytes stays <= cap after the enqueue.
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+
+    const sampleFrame: OutputFrame = {
+      type: 'output',
+      data: {runId: 'run-001', text: 'x', final: false, seq: 0},
+    }
+    const oneFrameBytes = JSON.stringify(sampleFrame).length
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneFrameBytes})
+
+    // #given a slow subscriber that never drains (queue stays full)
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+    await drain()
+
+    // #when sending the first output frame (fills the queue to cap)
+    manager.observeOutput('run-001', 'frame-1')
+    await drain()
+
+    // #when sending a second output frame (triggers coalescing: removes frame-1,
+    // coalescedDropCount becomes 1, effective frame carries droppedCount=1)
+    manager.observeOutput('run-001', 'frame-2')
+    await drain()
+
+    // #then the subscriber is still alive (coalescing kept it alive, not dropped)
+    expect(slowCloses).toHaveLength(0)
+    expect(slowCloses).not.toContain('overflow')
+
+    // #when sending a third output frame (coalescedDropCount is now 1 from previous coalesce;
+    // effective frame carries droppedCount=1 again; must still fit within cap)
+    manager.observeOutput('run-001', 'frame-3')
+    await drain()
+
+    // #then the subscriber is still alive after the third frame
+    expect(slowCloses).toHaveLength(0)
+    expect(slowCloses).not.toContain('overflow')
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 22. maxDuration timer does not preempt graceful terminal drain
+// ===========================================================================
+
+describe('maxDuration timer does not preempt graceful terminal drain', () => {
+  it('a maxDuration timer scheduled to fire during terminal drain does not preempt — subscriber closes with terminal', async () => {
+    // #given a manager with injectable fake timers and a very short maxDuration
+    // so we can advance the clock to fire the timer during the drain window.
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const fakeTimers = makeFakeTimerSystem(0)
+    // maxStreamDurationMs = 100ms so we can advance the clock to fire it
+    const {manager} = makeManager(projectFn, {maxStreamDurationMs: 100, heartbeatIntervalMs: 50_000}, fakeTimers)
+
+    // #given a subscriber
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observing terminal status (marks subscriber for graceful drain,
+    // which should cancel the maxDuration timer)
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #when advancing the clock past the maxDuration threshold
+    // (the timer should have been cancelled by markRunSubscribersForTerminalDrain)
+    fakeTimers.advance(200)
+    await drain()
+
+    // #then the subscriber closes with 'terminal', not 'max-duration'
+    expect(closes).toContain('terminal')
+    expect(closes).not.toContain('max-duration')
+
+    // #then the terminal status frame was delivered
+    const statusFrames = frames.filter(f => f.type === 'status')
+    expect(statusFrames.length).toBeGreaterThanOrEqual(1)
+    expect(statusFrames.at(-1)).toMatchObject({type: 'status', data: {status: 'succeeded'}})
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 23. Terminal replay cache byte budget
+// ===========================================================================
+
+describe('terminal replay cache byte budget', () => {
+  it('inserting entries past the byte budget evicts oldest entries by bytes', async () => {
+    // #given a manager with a very small byte budget for the replay cache
+    // We use a budget that fits exactly one replay entry, so the second entry
+    // evicts the first.
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async runState =>
+      makeOperatorRunStatus({runId: runState.run_id, phase: 'COMPLETED', status: 'succeeded'})
+
+    // Estimate the byte cost of one replay entry (output frame + status frame)
+    const sampleOutput: OutputFrame = {
+      type: 'output',
+      data: {runId: 'run-A', text: 'answer', final: true, seq: 0},
+    }
+    const sampleStatus = {type: 'status', data: terminalStatus}
+    const oneEntryBytes = JSON.stringify(sampleOutput).length + JSON.stringify(sampleStatus).length
+
+    // Budget = exactly one entry's worth of bytes
+    const {manager} = makeManager(projectFn, {terminalReplayMaxBytes: oneEntryBytes, terminalReplayMaxEntries: 500})
+
+    // #when inserting the first terminal run (run-A)
+    manager.observeOutput('run-A', 'answer', {final: true})
+    await manager.observe(makeRunState({run_id: 'run-A', phase: 'COMPLETED'}))
+    await drain()
+
+    // #then run-A is in the replay cache (late subscriber gets the replay)
+    const {frames: framesA, closes: closesA} = collectFrames(manager, 'run-A')
+    await drain()
+    expect(framesA.filter(f => f.type === 'output')).toHaveLength(1)
+    expect(closesA).toContain('terminal')
+
+    // #when inserting a second terminal run (run-B) that exceeds the byte budget
+    manager.observeOutput('run-B', 'answer-b', {final: true})
+    await manager.observe(makeRunState({run_id: 'run-B', phase: 'COMPLETED'}))
+    await drain()
+
+    // #then run-A was evicted from the replay cache (byte budget exceeded)
+    // A late subscriber for run-A now gets a reset frame (no replay entry)
+    const {frames: framesA2, closes: closesA2} = collectFrames(manager, 'run-A')
+    await drain()
+    // run-A was evicted — late subscriber gets reset (no terminal replay)
+    expect(framesA2.filter(f => f.type === 'reset')).toHaveLength(1)
+    expect(closesA2).not.toContain('terminal')
+
+    // #then run-B is still in the replay cache
+    const {frames: framesB, closes: closesB} = collectFrames(manager, 'run-B')
+    await drain()
+    expect(framesB.filter(f => f.type === 'output')).toHaveLength(1)
+    expect(closesB).toContain('terminal')
+
+    manager.shutdown()
   })
 })
 

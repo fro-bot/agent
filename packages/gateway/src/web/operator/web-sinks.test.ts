@@ -2,7 +2,7 @@
  * Tests for the minimal web StatusSink and ReplySink implementations.
  */
 
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {createWebReplySink, createWebStatusSink} from './web-sinks.js'
 
 describe('createWebStatusSink', () => {
@@ -66,9 +66,18 @@ describe('createWebStatusSink', () => {
 })
 
 describe('createWebReplySink', () => {
+  type ObserveOutputFn = (text: string, opts?: {final?: boolean; droppedCount?: number}) => void
+
+  function makeDeps(overrides?: {observeOutput?: ObserveOutputFn}) {
+    return {
+      runId: 'run-abc-123',
+      observeOutput: overrides?.observeOutput ?? vi.fn<ObserveOutputFn>(),
+    }
+  }
+
   it('append accumulates text in the buffer', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     sink.append('hello ')
@@ -78,21 +87,55 @@ describe('createWebReplySink', () => {
     expect(sink.buffered()).toBe('hello world')
   })
 
-  it('flush is a no-op and resolves', async () => {
+  it('append calls observeOutput with each delta text', () => {
     // #given
-    const sink = createWebReplySink()
-    sink.append('some output')
+    const observeOutput = vi.fn<ObserveOutputFn>()
+    const sink = createWebReplySink(makeDeps({observeOutput}))
+
+    // #when
+    sink.append('a')
+    sink.append('b')
+
+    // #then — two delta calls, each with the appended text
+    expect(observeOutput).toHaveBeenCalledTimes(2)
+    expect(observeOutput).toHaveBeenNthCalledWith(1, 'a')
+    expect(observeOutput).toHaveBeenNthCalledWith(2, 'b')
+  })
+
+  it('flush calls observeOutput with the full buffer and final:true', async () => {
+    // #given
+    const observeOutput = vi.fn<ObserveOutputFn>()
+    const sink = createWebReplySink(makeDeps({observeOutput}))
+    sink.append('hello ')
+    sink.append('world')
+    observeOutput.mockClear() // clear the append calls
 
     // #when
     const result = await sink.flush()
 
-    // #then — no-op, returns undefined
+    // #then — one final call with the full buffer
+    expect(observeOutput).toHaveBeenCalledTimes(1)
+    expect(observeOutput).toHaveBeenCalledWith('hello world', {final: true})
+    expect(result).toBeUndefined()
+  })
+
+  it('flush with empty buffer still calls observeOutput with empty string and final:true', async () => {
+    // #given — no appends before flush
+    const observeOutput = vi.fn<ObserveOutputFn>()
+    const sink = createWebReplySink(makeDeps({observeOutput}))
+
+    // #when
+    const result = await sink.flush()
+
+    // #then — empty-final backstop: guarantees a terminal output frame even with no output
+    expect(observeOutput).toHaveBeenCalledTimes(1)
+    expect(observeOutput).toHaveBeenCalledWith('', {final: true})
     expect(result).toBeUndefined()
   })
 
   it('buffered returns accumulated text without flushing', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
     sink.append('partial')
 
     // #when
@@ -105,7 +148,7 @@ describe('createWebReplySink', () => {
 
   it('hasVisibleOutput returns false initially', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when / #then
     expect(sink.hasVisibleOutput()).toBe(false)
@@ -113,7 +156,7 @@ describe('createWebReplySink', () => {
 
   it('markVisibleOutputSent causes hasVisibleOutput to return true', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     sink.markVisibleOutputSent()
@@ -124,7 +167,7 @@ describe('createWebReplySink', () => {
 
   it('markVisibleOutputPending causes hasVisibleOutput to return true while pending', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     const settle = sink.markVisibleOutputPending()
@@ -141,7 +184,7 @@ describe('createWebReplySink', () => {
 
   it('markVisibleOutputPending settle(false) retracts the pending claim', () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     const settle = sink.markVisibleOutputPending()
@@ -156,7 +199,7 @@ describe('createWebReplySink', () => {
 
   it('send is a no-op and resolves', async () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     const result = await sink.send('source', {content: 'hello'})
@@ -167,7 +210,7 @@ describe('createWebReplySink', () => {
 
   it('send with thread target is also a no-op', async () => {
     // #given
-    const sink = createWebReplySink()
+    const sink = createWebReplySink(makeDeps())
 
     // #when
     const result = await sink.send('thread', {content: 'error message'})

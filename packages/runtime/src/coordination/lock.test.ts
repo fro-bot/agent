@@ -66,6 +66,7 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
     lockTtlSeconds: 900,
     heartbeatIntervalMs: 30_000,
     staleThresholdMs: 60_000,
+    pendingStaleThresholdMs: 30 * 60_000,
   }
 }
 

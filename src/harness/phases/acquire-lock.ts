@@ -1,6 +1,12 @@
 import type {LockRecord, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import {acquireLock, createS3Adapter, DEFAULT_LOCK_TTL_SECONDS, DEFAULT_STALE_THRESHOLD_MS} from '@fro-bot/runtime'
+import {
+  acquireLock,
+  createS3Adapter,
+  DEFAULT_LOCK_TTL_SECONDS,
+  DEFAULT_PENDING_STALE_THRESHOLD_MS,
+  DEFAULT_STALE_THRESHOLD_MS,
+} from '@fro-bot/runtime'
 import {createLogger} from '../../shared/logger.js'
 
 /**
@@ -56,6 +62,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
       lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
       heartbeatIntervalMs: 0,
       staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+      pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
     },
     repo,
     holderId,

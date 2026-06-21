@@ -159,9 +159,9 @@ export interface OperatorServerDeps {
   /**
    * Server-owned run index for runId → {repo, surface} resolution.
    * Required by the run-stream route to resolve a runId to its repo without
-   * trusting any client-supplied value. The launch route uses register() to
-   * record PENDING entries before firing launchWork. Optional — omit in tests
-   * that don't exercise the run-stream or launch routes.
+   * trusting any client-supplied value. Run-index registration is owned by
+   * launchWork (via launchWorkDeps.runIndex). Optional — omit in tests
+   * that don't exercise the run-stream route.
    */
   readonly runIndex?: Pick<RunIndex, 'lookup' | 'register'>
   /**
@@ -662,14 +662,12 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   6. Denylist check (before authz, no oracle)
   //   7. checkRepoAuthz (allowlist + GitHub repo access)
   //   8. Empty-prompt fail-fast
-  //   9. Per-operator idempotency guard
-  //  10. Generate runId + register PENDING in run index
-  //  11. Fire launchWork WITHOUT await → return 202 {runId}
-  // The launch route requires deps.runIndex to register PENDING entries before
-  // firing launchWork. Without it, run registrations would be silently dropped,
-  // breaking the SSE observation path. Gate on runIndex being present so a
-  // misconfiguration fails loudly at startup (route not registered) rather than
-  // silently at runtime (runs not observable).
+  //   9. Per-operator idempotency guard (reserve before launchWork)
+  //  10. Generate runId + reserve idempotency key
+  //  11. Await launchWork admission (returns LaunchAdmission, not the full run)
+  //  12. On accepted: commit idempotency + return 202 {runId}
+  //      On rejected/throw: rollback idempotency + return coarse error
+  // launchWork owns run-index registration (via deps.launchWorkDeps.runIndex).
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -677,8 +675,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.getBindingByRepo !== undefined &&
     deps.launchWorkDeps !== undefined &&
     deps.allowlist !== undefined &&
-    deps.auditLogger !== undefined &&
-    deps.runIndex !== undefined
+    deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildLaunchRoute(app, {
@@ -695,10 +692,14 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard(),
-      runIndex: deps.runIndex,
       launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
       now: clock,
+      // Wire the observation manager so the web ReplySink pushes output deltas
+      // and the final answer frame to SSE subscribers. Optional — when absent
+      // (e.g. in tests that don't exercise streaming), the sink degrades to a
+      // buffering no-op. Mirrors the optional pattern used by buildRunStreamRoute.
+      runObservationManager: deps.runObservationManager,
     })
   }
 
