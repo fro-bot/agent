@@ -5360,12 +5360,11 @@ describe('threadFactory failure path', () => {
     vi.clearAllMocks()
   })
 
-  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, slot released', async () => {
+  it('threadFactory returns {ok:false} → replySink.send called with error message, acquireLock NOT called, slot released, run terminalized to FAILED', async () => {
     // #given — threadFactory fails immediately
     // Note: createRun IS called in launchWork (admission) before executeWorkOnHeldSlot.
     // The threadFactory failure is an early-abort gate inside executeWorkOnHeldSlot.
-    // Unit 3 will add FAILED terminalization for this path; for Unit 2, the run
-    // is admitted (PENDING) but the threadFactory failure leaves it without ACKNOWLEDGED.
+    // The run is admitted (PENDING) and the threadFactory failure terminalizes it to FAILED.
     const {runMention} = await import('./run.js')
     setupHappyPath()
 
@@ -5398,8 +5397,11 @@ describe('threadFactory failure path', () => {
     // #and — createRun IS called (in launchWork admission block, before executeWorkOnHeldSlot)
     expect(mockRuntime.createRun).toHaveBeenCalledOnce()
 
-    // #and — transitionRun NOT called (threadFactory failed before ACKNOWLEDGED transition)
-    expect(mockRuntime.transitionRun).not.toHaveBeenCalled()
+    // #and — run terminalized to FAILED (no orphan PENDING)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    // ACKNOWLEDGED was NOT reached (threadFactory failed before ACK)
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
 
     // #and — concurrency slot released (no leak)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5422,7 +5424,7 @@ describe('threadFactory timeout path', () => {
     vi.useRealTimers()
   })
 
-  it('threadFactory that never resolves → times out, replySink.send called with error, acquireLock NOT called, slot released', async () => {
+  it('threadFactory that never resolves → times out, replySink.send called with error, acquireLock NOT called, slot released, run terminalized to FAILED', async () => {
     // #given — threadFactory hangs indefinitely (simulates a hung Discord API call)
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -5463,6 +5465,11 @@ describe('threadFactory timeout path', () => {
 
     // #and — createRun IS called (in launchWork admission block, before executeWorkOnHeldSlot)
     expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — run terminalized to FAILED (no orphan PENDING)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
 
     // #and — concurrency slot released (no leak)
     expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
@@ -5811,10 +5818,10 @@ describe('runIndex.register() wiring (FIX 5)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit 2: launchWork owns admission + returns LaunchAdmission
+
 // ---------------------------------------------------------------------------
 
-describe('Unit 2 — launchWork admission', () => {
+describe('launchWork admission', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -6173,5 +6180,429 @@ describe('Unit 2 — launchWork admission', () => {
 
     // Drain the run
     await (admission.accepted === true ? admission.runPromise : Promise.resolve())
+  })
+})
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//
+// Each early-abort gate in executeWorkOnHeldSlot must:
+//   1. Call failAdmittedRun (PENDING → FAILED) before returning.
+//   2. Send the same user reply as before (unchanged text).
+//   3. Leave no orphan PENDING run-state.
+//
+// The dual-finally requirement: a gate that THROWS (not just returns) must also
+// terminalize to FAILED. This is covered by the "gate throws" test below.
+// ---------------------------------------------------------------------------
+
+describe('early-abort gates terminalize to FAILED', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // ── Gate 1: ensureClone fail ───────────────────────────────────────────────
+
+  it('gate 1 (ensureClone fail): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — ensureClone fails; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-1'}})
+    // transitionRun mock for the FAILED terminalization (best-effort)
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const ensureClone = makeEnsureCloneFn('failure')
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+
+    // #when — await the run promise so executeWorkOnHeldSlot completes
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — run terminalized to FAILED (no orphan PENDING)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    // ACKNOWLEDGED was NOT reached (ensureClone failed before ACK)
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED state
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before (unchanged)
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('workspace'))
+    expect(errorSend).toBeDefined()
+    expect(errorSend?.content).toContain('not available')
+
+    // #and — runOpenCodeCore NOT called (gate fired before execution)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 2: readyz not-ready ───────────────────────────────────────────────
+
+  it('gate 2 (readyz not-ready): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — readyz returns not-ready; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-2'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const readyz = makeReadyzFn('not-ready')
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({readyz, runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — run terminalized to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('not reachable'))
+    expect(errorSend).toBeDefined()
+
+    // #and — runOpenCodeCore NOT called
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 3a: threadFactory throws ─────────────────────────────────────────
+
+  it('gate 3a (threadFactory throws): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — threadFactory throws; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-3a'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest({
+      // threadFactory that throws
+    })
+    const threadFactory = vi.fn().mockRejectedValue(new Error('Discord API error'))
+    const requestWithFactory = {...request, threadFactory}
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, requestWithFactory, deps)
+
+    // #then — run terminalized to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('Could not start'))
+    expect(errorSend).toBeDefined()
+
+    // #and — acquireLock NOT called (threadFactory failed before lock)
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 3b: threadFactory ok:false ───────────────────────────────────────
+
+  it('gate 3b (threadFactory ok:false): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — threadFactory returns {ok:false}; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-3b'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const threadFactory = vi.fn().mockResolvedValue({ok: false as const, error: 'thread creation failed'})
+    const requestWithFactory = {...request, threadFactory}
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, requestWithFactory, deps)
+
+    // #then — run terminalized to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('Could not start'))
+    expect(errorSend).toBeDefined()
+
+    // #and — acquireLock NOT called
+    expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 4a: lock acquisition error ───────────────────────────────────────
+
+  it('gate 4a (lock acquisition error): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — acquireLock returns success:false; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-4a'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: false as const,
+      error: new Error('S3 timeout'),
+    })
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — run terminalized to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before (coarse error, no S3 detail)
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('Could not start'))
+    expect(errorSend).toBeDefined()
+    // No S3 detail leaked
+    expect(sends.every(s => !s.content.includes('S3'))).toBe(true)
+
+    // #and — runOpenCodeCore NOT called
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 4b: lock not acquired (held by another) ───────────────────────────
+
+  it('gate 4b (lock not acquired): run terminalized to FAILED, same reply text, no orphan PENDING', async () => {
+    // #given — acquireLock returns acquired:false; run was admitted (PENDING) by launchWork
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-4b'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+    } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — run terminalized to FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('ACKNOWLEDGED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before ("in progress")
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('in progress'))
+    expect(errorSend).toBeDefined()
+    // Holder ID NOT leaked
+    expect(sends.every(s => !s.content.includes('other-gateway'))).toBe(true)
+
+    // #and — runOpenCodeCore NOT called
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── Gate 5: ACK transition fail ────────────────────────────────────────────
+
+  it('gate 5 (ACK transition fail): run terminalized to FAILED, lock released, same reply text', async () => {
+    // #given — transitionRun PENDING→ACKNOWLEDGED fails; run is still PENDING
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-5'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    // First transitionRun call (ACKNOWLEDGED) fails; second (FAILED terminalization) succeeds
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: false as const,
+        error: new Error('ACK transition conflict'),
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+      })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — run terminalized to FAILED (using adoptionEtag since ACK failed)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    // ACKNOWLEDGED was attempted but failed
+    expect(transitionPhases[0]).toBe('ACKNOWLEDGED')
+    expect(transitionPhases[1]).toBe('FAILED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — lock released (even though ACK failed)
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+
+    // #and — same reply text as before
+    const sends = request._replySink._sends
+    const errorSend = sends.find(s => s.content.includes('Could not start'))
+    expect(errorSend).toBeDefined()
+
+    // #and — runOpenCodeCore NOT called
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  // ── Dual-finally: gate that THROWS still terminalizes ─────────────────────
+
+  it('dual-finally: a gate that THROWS (not returns) still terminalizes to FAILED', async () => {
+    // #given — ensureClone THROWS (not just returns failure); run was admitted (PENDING)
+    // This tests the dual-finally wrapper: a thrown error in a gate must still
+    // terminalize the run to FAILED before propagating.
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-throw'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    // ensureClone THROWS (not returns {success:false})
+    const ensureClone = vi.fn().mockRejectedValue(new Error('ensureClone threw unexpectedly'))
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+
+    // #when — the run promise may reject (the throw propagates after terminalization)
+    const admission = await launchWork(request, deps)
+    if (admission.accepted === true && admission.runPromise !== undefined) {
+      // The run promise may reject — catch it so the test doesn't fail on the rejection
+      await admission.runPromise.catch(() => {
+        /* expected: gate threw */
+      })
+    }
+
+    // #then — run terminalized to FAILED (dual-finally caught the throw)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+  })
+
+  // ── R8 Discord: Discord run whose early gate fails writes FAILED run-state ─
+
+  it('r8 Discord: Discord run whose ensureClone fails now writes FAILED run-state (previously just replied)', async () => {
+    // #given — Discord mention; ensureClone fails; run was admitted (PENDING) by launchWork
+    const {runMention} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-r8'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'fail-etag', state: {phase: 'FAILED'} as unknown as import('@fro-bot/runtime').RunState},
+    })
+
+    const ensureClone = makeEnsureCloneFn('failure')
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const message = makeMessage()
+    const deps = makeDeps({ensureClone, runObserver: {observe: observeFn}})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — FAILED run-state written (new behavior: observable failure)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+
+    // #and — observer notified of FAILED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — same reply text as before (unchanged)
+    expect(message.reply).toHaveBeenCalledOnce()
+    const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
+    expect(call.content).toContain('workspace')
+    expect(call.content).toContain('not available')
+  })
+
+  // ── Regression: successful run unchanged ───────────────────────────────────
+
+  it('regression: successful run still goes PENDING→ACKNOWLEDGED→EXECUTING→COMPLETED unchanged', async () => {
+    // #given — happy path; all gates pass
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const ackState = {run_id: 'r1', phase: 'ACKNOWLEDGED'} as unknown as import('@fro-bot/runtime').RunState
+    const execState = {run_id: 'r1', phase: 'EXECUTING'} as unknown as import('@fro-bot/runtime').RunState
+    const completedState = {run_id: 'r1', phase: 'COMPLETED'} as unknown as import('@fro-bot/runtime').RunState
+
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'ack-etag', state: ackState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'exec-etag', state: execState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'done-etag', state: completedState}})
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — full lifecycle: PENDING→ACKNOWLEDGED→EXECUTING→COMPLETED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toEqual(['ACKNOWLEDGED', 'EXECUTING', 'COMPLETED'])
+
+    // #and — observer sees PENDING (from launchWork), then ACKNOWLEDGED, EXECUTING, COMPLETED
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases[0]).toBe('PENDING')
+    expect(observedPhases).toContain('ACKNOWLEDGED')
+    expect(observedPhases).toContain('EXECUTING')
+    expect(observedPhases).toContain('COMPLETED')
+    expect(observedPhases).not.toContain('FAILED')
+
+    // #and — exactly one createRun (no double-create)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+
+    // #and — execution happened
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
   })
 })

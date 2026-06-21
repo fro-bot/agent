@@ -262,6 +262,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // deadline clearance are computed from the same wall-clock reference.
   const runStartMs = Date.now()
 
+  // ── Pre-ACK gate section — dual-finally wrapper ──────────────────────────────────────────────
+  // Gates 1-4 (ensureClone, readyz, threadFactory, lock) and gate 5 (ACK transition) all fire
+  // while the run is still PENDING (task.adoptionEtag is the current etag). Each explicit-return
+  // failure path calls failAdmittedRun before returning. The try/catch below handles the case
+  // where a gate THROWS (not just returns) — it terminalizes to FAILED then rethrows.
+  // Once the ACK transition succeeds, the existing EXECUTING catch owns FAILED; this wrapper
+  // must NOT run after a successful ACK (it only wraps the pre-ACK section).
+  let preAckCompleted = false
+
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
     // Rehydrates a missing checkout (e.g. after container recreation) before OpenCode can start.
@@ -278,6 +287,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         },
         'run: workspace clone unavailable — aborting',
       )
+      // Gate 1 failure: terminalize the admitted run to FAILED before replying.
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
       await request.replySink.send('source', {
         content: 'The workspace is not available right now. Please try again later.',
       })
@@ -303,6 +314,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
+      // Gate 2 failure: terminalize the admitted run to FAILED before replying.
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
       await request.replySink.send('source', {
         content: 'The workspace is not reachable right now. Please try again later.',
       })
@@ -338,11 +351,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           {channelId, repo, err: threadError instanceof Error ? threadError.message : String(threadError)},
           'run: threadFactory threw or timed out — aborting',
         )
+        // Gate 3 (throw/timeout) failure: terminalize the admitted run to FAILED before replying.
+        await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
       }
       if (threadResult.ok === false) {
         logger.error({channelId, repo, err: threadResult.error}, 'run: threadFactory failed — aborting')
+        // Gate 3 (ok:false) failure: terminalize the admitted run to FAILED before replying.
+        await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
         await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
         return
       }
@@ -355,6 +372,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     if (lockResult.success === false) {
       logger.error({repo, runId, err: lockResult.error.message}, 'run: lock acquisition error')
+      // Gate 4 (lock error) failure: terminalize the admitted run to FAILED before replying.
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       return
     }
@@ -362,6 +381,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (lockResult.data.acquired === false) {
       // Lock held — terminal "waiting" reply; do NOT expose holder ID to Discord
       logger.info({repo, runId, holder: lockResult.data.holder?.holder_id ?? 'unknown'}, 'run: lock held by another')
+      // Gate 4 (lock not acquired) failure: terminalize the admitted run to FAILED before replying.
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
       await request.replySink.send('thread', {
         content: 'Another task is already in progress for this repo. Try again when it completes.',
       })
@@ -377,7 +398,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // This is the seam between admission (launchWork) and execution (here).
     // The thread_id is updated via the transition so the run-state reflects the actual thread.
     // NOTE: transitionRun does not update thread_id — the thread_id was set at createRun time
-    // with an empty string (pre-thread). This is acceptable for now; Unit 3 may refine.
+    // with an empty string (pre-thread). This is acceptable — the thread_id is not load-bearing for run-state.
     const ackResult = await transitionRun(
       coordinationConfig,
       identity,
@@ -389,10 +410,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     )
     if (ackResult.success === false) {
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
+      // Gate 5 (ACK fail): run is still PENDING; terminalize to FAILED using adoptionEtag.
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
       await request.replySink.send('thread', {content: 'Could not start the task — please try again.'})
       await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
       return
     }
+
+    // ACK succeeded — mark pre-ACK section complete so the dual-finally catch does not run.
+    preAckCompleted = true
+
     let runEtag = ackResult.data.etag
 
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
@@ -730,6 +757,20 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
       }
     }
+  } catch (gateError: unknown) {
+    // ── Dual-finally: terminalize on thrown errors in the pre-ACK gate section ──────────────
+    // If a gate THROWS (not just returns) before the ACK transition succeeds, the run is still
+    // PENDING and must be terminalized to FAILED. The explicit-return paths already call
+    // failAdmittedRun before returning, so they never reach this catch.
+    // Once preAckCompleted is true (ACK succeeded), the existing EXECUTING catch owns FAILED.
+    if (preAckCompleted === false) {
+      logger.error(
+        {repo, runId, err: gateError instanceof Error ? gateError.message : String(gateError)},
+        'run: pre-ACK gate threw — terminalizing admitted run to FAILED',
+      )
+      await failAdmittedRun(coordinationConfig, identity, repo, runId, task.adoptionEtag, deps, logger, coordLogger)
+    }
+    throw gateError
   } finally {
     // ── Atomic handoff — replaces bare concurrency.release ──────────────────
     //
@@ -787,7 +828,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
  * run alive after `launchWork` returns admission early — the caller's `await` no
  * longer owns the run.
  *
- * Graceful shutdown (Unit 5) will drain this set by awaiting all in-flight promises.
+ * Graceful shutdown drains this set by awaiting all in-flight promises.
  * For this unit, the set is created and populated; shutdown drain is a future step.
  *
  * Module-scoped so it survives across `launchWork` calls within the same process.
@@ -797,7 +838,7 @@ const inFlightRuns = new Set<Promise<void>>()
 
 /**
  * Returns the current set of in-flight immediate-run promises.
- * Exported for shutdown drain (Unit 5) and test inspection.
+ * Exported for the graceful-shutdown drain and test inspection.
  */
 export function getInFlightRuns(): ReadonlySet<Promise<void>> {
   return inFlightRuns
@@ -945,7 +986,7 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   if (slotResult === 'ok') {
     // Immediate path — slot already acquired; register the run promise in the in-flight set.
     // The gateway in-flight set owns the promise; launchWork returns admission early.
-    // Graceful shutdown (Unit 5) will drain this set.
+    // Graceful shutdown drains this set.
     //
     // runPromise is also returned in the LaunchAdmission result so callers that need
     // to await the full run (e.g. the Discord adapter for backward compatibility) can
@@ -1003,7 +1044,7 @@ function notifyObserverBestEffort(
  * Terminalize an admitted run to FAILED.
  *
  * Used by the fail-closed admission block when register/observer throws after
- * `createRun` succeeds, and by `executeWorkOnHeldSlot` early-abort gates (Unit 3).
+ * `createRun` succeeds, and by the `executeWorkOnHeldSlot` early-abort gates.
  *
  * Uses the provided etag (the latest known etag for this run). Best-effort:
  * a failure to transition is logged but not propagated — the caller's error
@@ -1235,7 +1276,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
   // runMention awaits the admission result, then awaits the runPromise (if present)
   // so the Discord event handler sees the run complete before returning. This
   // preserves the existing Discord behavior (reply timing unchanged) while
-  // allowing the web launch route (Unit 4) to return 202 after admission only.
+  // allowing a web launch route to return 202 after admission only.
   const admission = await launchWork(request, deps)
 
   // For the immediate path, await the run promise so the Discord handler sees
