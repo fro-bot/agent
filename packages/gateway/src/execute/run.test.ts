@@ -6550,6 +6550,43 @@ describe('early-abort gates terminalize to FAILED', () => {
     expect(observedPhases).toContain('FAILED')
   })
 
+  // ── Dual-finally: gate THROWS after lock acquisition releases the lock ─────
+
+  it('dual-finally: a gate that THROWS after lock acquisition releases the lock', async () => {
+    // #given — lock is acquired, then transitionRun THROWS (not returns failure)
+    // This tests the lock-leak fix: a thrown error after acquireLock must still release the lock.
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-throw-post-lock'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-throw', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    // transitionRun THROWS on the ACKNOWLEDGED call (not returns {success:false})
+    mockRuntime.transitionRun.mockRejectedValueOnce(new Error('transitionRun threw unexpectedly'))
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({runObserver: {observe: observeFn}})
+
+    // #when — the run promise rejects (the throw propagates after terminalization)
+    const admission = await launchWork(request, deps)
+    if (admission.accepted === true && admission.runPromise !== undefined) {
+      await admission.runPromise.catch(() => {
+        /* expected: gate threw */
+      })
+    }
+
+    // #then — run terminalized to FAILED (dual-finally caught the throw)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+
+    // #and — lock IS released (not leaked)
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    const releaseCall = mockRuntime.releaseLock.mock.calls[0] as unknown[]
+    expect(releaseCall[2]).toBe('lock-etag-throw')
+  })
+
   // ── R8 Discord: Discord run whose early gate fails writes FAILED run-state ─
 
   it('r8 Discord: Discord run whose ensureClone fails now writes FAILED run-state (previously just replied)', async () => {

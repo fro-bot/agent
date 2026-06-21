@@ -366,8 +366,8 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
 
       // Admission rejected — map reason to a coarse HTTP error.
       // rollback happens in finally.
-      if (admission.reason === 'cap') {
-        deps.logger.warn({githubUserId, owner, repo, gate: 'cap'}, 'launch: rejected — at capacity')
+      if (admission.reason === 'cap' || admission.reason === 'queue-full') {
+        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — at capacity')
         return c.json({error: 'unavailable'}, 503)
       }
 

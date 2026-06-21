@@ -949,6 +949,19 @@ describe('POST /operator/runs — capacity reject', () => {
     // #then — 503 unavailable
     expect(response.status).toBe(503)
   })
+
+  it('returns 503 when launchWork returns {accepted:false, reason:"queue-full"}', async () => {
+    // #given — launchWork returns queue-full-rejected (transient capacity condition, not a client error)
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'queue-full'})
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — 503 unavailable (same as cap; queue depth is full, retry later)
+    expect(response.status).toBe(503)
+  })
 })
 
 // ---------------------------------------------------------------------------

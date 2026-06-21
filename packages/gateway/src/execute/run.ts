@@ -270,6 +270,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // Once the ACK transition succeeds, the existing EXECUTING catch owns FAILED; this wrapper
   // must NOT run after a successful ACK (it only wraps the pre-ACK section).
   let preAckCompleted = false
+  let lockEtag: string | null = null
 
   try {
     // ── Ensure workspace checkout exists ──────────────────────────────────────────────────────
@@ -390,7 +391,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     }
 
     // Lock acquired — must release in inner finally
-    let lockEtag = lockResult.data.etag
+    lockEtag = lockResult.data.etag
 
     // ── Run-state adoption: PENDING → ACKNOWLEDGED ────────────────────────────────────────────
     // The run was already created (PENDING) by launchWork during admission.
@@ -769,6 +770,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'run: pre-ACK gate threw — terminalizing admitted run to FAILED',
       )
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
+      // Release the lock if it was acquired before the throw (best-effort — never let cleanup throw).
+      if (lockEtag !== null) {
+        await releaseLock(coordinationConfig, repo, lockEtag, coordLogger).catch((error: unknown) => {
+          logger.warn(
+            {repo, runId, err: String(error)},
+            'run: releaseLock failed in dual-finally catch — lock will expire via TTL',
+          )
+        })
+      }
     }
     throw gateError
   } finally {
