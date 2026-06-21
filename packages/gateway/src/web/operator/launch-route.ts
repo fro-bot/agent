@@ -44,6 +44,7 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
+import type {RunObservationManager} from '../sse/manager.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import {randomUUID} from 'node:crypto'
 import {launchWork} from '../../execute/run.js'
@@ -125,6 +126,14 @@ export interface LaunchRouteDeps {
    * When absent, a fresh limiter is created with LAUNCH_RATE_LIMIT_PER_HR.
    */
   readonly perHrRateLimiter?: RateLimiter
+  /**
+   * Run-observation manager for wiring the web ReplySink's output to the SSE
+   * run-stream. When present, append() pushes live deltas and flush() pushes
+   * the final answer frame via manager.observeOutput(runId, text, opts).
+   * When absent (e.g. in tests that don't exercise streaming), output is
+   * buffered but not streamed — the sink degrades gracefully to a no-op.
+   */
+  readonly runObservationManager?: Pick<RunObservationManager, 'observeOutput'>
 }
 
 // ---------------------------------------------------------------------------
@@ -316,10 +325,10 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.
     //
-    // v1 web launches deliver run STATUS via the SSE stream only; agent output
-    // text is not streamed to the operator yet (a follow-up). The web replySink
-    // accumulates text in memory but does not deliver it — the operator observes
-    // run phase/status via GET /operator/runs/:runId/stream.
+    // The web replySink is wired to the run-observation manager so subscribers
+    // on GET /operator/runs/:runId/stream receive live output deltas and a
+    // terminal final-answer frame. When the manager is absent (e.g. in tests
+    // that don't exercise streaming), the sink degrades to a buffering no-op.
     //
     // launchWork returns after ADMISSION (not after the run). The gateway in-flight
     // set owns the immediate-run promise; awaiting here does NOT hang the connection.
@@ -330,6 +339,15 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       sessionCorrelationId: sessionId,
     }
 
+    const manager = deps.runObservationManager
+    const observeOutput =
+      manager === undefined
+        ? (_text: string, _opts?: {final?: boolean; droppedCount?: number}): void => {
+            // No-op: manager absent (e.g. in tests that don't exercise streaming).
+          }
+        : (text: string, opts?: {final?: boolean; droppedCount?: number}): void =>
+            manager.observeOutput(runId, text, opts)
+
     const request = {
       promptText: promptField,
       runId,
@@ -339,7 +357,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       binding,
       requester: operatorIdentity,
       statusSink: createWebStatusSink(),
-      replySink: createWebReplySink(),
+      replySink: createWebReplySink({runId, observeOutput}),
       createApprovalOnPending: createWebAutoDenyApproval(deps.logger),
       promptBuilder: buildWebPrompt,
     }

@@ -8,10 +8,9 @@
  * The web surface has no Discord thread, no typing indicator, and no reaction
  * emoji. All methods are no-ops or return the minimal required values.
  *
- * v1 limitation: web launches deliver run STATUS via the SSE stream only.
- * Agent output text is accumulated in the ReplySink buffer but is not streamed
- * to the operator — the web replySink is a no-op for delivery. A follow-up will
- * wire agent output text to the SSE stream so operators can observe it in real time.
+ * The web ReplySink is wired to the run-observation manager: append() pushes
+ * live deltas and flush() pushes the final answer frame. Subscribers on the
+ * SSE run-stream route receive output frames as the agent produces them.
  */
 
 import type {MessageContentOptions} from '../../discord/io.js'
@@ -67,19 +66,28 @@ export function createWebStatusSink(): StatusSink {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a minimal web ReplySink.
+ * Create a minimal web ReplySink wired to the run-observation manager.
  *
- * Streaming output (append/flush) and acks are no-ops for the web
- * surface. The operator observes run output via the SSE run-stream route,
- * not via inline response content.
+ * append(text) buffers the text AND pushes a live delta to the manager via
+ * deps.observeOutput(text) so subscribers see output as it arrives.
+ *
+ * flush() pushes the final answer frame deps.observeOutput(buffer, {final:true})
+ * before returning undefined. This fires even when the buffer is empty (the
+ * empty-final backstop — guarantees every run produces a terminal output frame).
  *
  * buffered() returns the accumulated text so the engine can pass it to
  * statusSink.resolveToAnswer — even though the web status sink ignores it.
  *
  * hasVisibleOutput() returns false so the engine does not suppress the
  * "no output" placeholder path (which is also a no-op for web).
+ *
+ * The deps.observeOutput callback is already run-scoped by the caller (the
+ * caller binds runId); the sink receives a narrow callback, not the full manager.
  */
-export function createWebReplySink(): ReplySink {
+export function createWebReplySink(deps: {
+  readonly runId: string
+  readonly observeOutput: (text: string, opts?: {final?: boolean; droppedCount?: number}) => void
+}): ReplySink {
   let buffer = ''
   let visibleOutputSent = false
   let pendingCount = 0
@@ -87,10 +95,11 @@ export function createWebReplySink(): ReplySink {
   return {
     append: (text: string): void => {
       buffer += text
+      deps.observeOutput(text)
     },
 
     flush: async (): Promise<unknown> => {
-      // No-op: web surface does not deliver output inline.
+      deps.observeOutput(buffer, {final: true})
       return undefined
     },
 
