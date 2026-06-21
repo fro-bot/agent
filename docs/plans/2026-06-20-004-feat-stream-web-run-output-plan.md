@@ -121,7 +121,7 @@ Late subscriber connects after terminal:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Output frame contract type + version bump**
+- [x] **Unit 1: Output frame contract type + version bump**
 
 **Goal:** Add the `output` frame type to the operator contract and bump the version.
 
@@ -144,7 +144,7 @@ Late subscriber connects after terminal:
 
 **Verification:** Contract barrel exports `OperatorOutputFrame`; `version.test.ts` green at `1.3.0`.
 
-- [ ] **Unit 2: Manager `output` frame + `observeOutput` + terminal-output cache**
+- [x] **Unit 2: Manager `output` frame + `observeOutput` + terminal-output cache**
 
 **Goal:** Extend the manager's closed union with an `output` frame, add the `observeOutput` entry point, the `latestOutputCache`, explicit coalescing, and snapshot-on-subscribe for the cached final output.
 
@@ -173,7 +173,7 @@ Late subscriber connects after terminal:
 
 **Verification:** `output` frames fan out and coalesce as specified; `latestOutputCache` delivers to late subscribers; observer-only invariant holds; manager tests green.
 
-- [ ] **Unit 3: Run-stream route `output` SSE event mapping**
+- [x] **Unit 3: Run-stream route `output` SSE event mapping**
 
 **Goal:** Map the `output` frame to a named SSE event on the wire.
 
@@ -196,7 +196,7 @@ Late subscriber connects after terminal:
 
 **Verification:** `output` frames reach the wire as `event: 'output'`; `ready`-first preserved; route tests green.
 
-- [ ] **Unit 4: Wire the web ReplySink to push output (construction-order)**
+- [x] **Unit 4: Wire the web ReplySink to push output (construction-order)**
 
 **Goal:** Make `createWebReplySink` push deltas + the final answer through `observeOutput`, and thread the manager into the launch route.
 
@@ -217,7 +217,7 @@ Late subscriber connects after terminal:
 
 **Verification:** the web sink pushes deltas + final answer to the manager; the launch route wires the manager + runId; Discord launch path untouched (its sink is a different construction).
 
-- [ ] **Unit 5: Engine-side ordering reorder**
+- [x] **Unit 5: Engine-side ordering reorder**
 
 **Goal:** Ensure the final `output` frame is delivered before the terminal status frame by reordering the terminal observer notification after the final answer flush.
 
@@ -240,7 +240,7 @@ Late subscriber connects after terminal:
 
 **Verification:** terminal output precedes terminal status for web runs; Discord behavior byte-identical; run tests green.
 
-- [ ] **Unit 6: Docs refresh**
+- [x] **Unit 6: Docs refresh**
 
 **Goal:** Update the SSE solution doc and operator-contract notes to reflect the new `output` frame, and document the lease foot-gun.
 
