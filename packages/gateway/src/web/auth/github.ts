@@ -666,6 +666,18 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       c.header('Set-Cookie', buildSessionCookieValue(newSessionId), {append: true})
 
       deps.sessionDeps.logger.info({githubUserId}, 'oauth callback: session minted')
+
+      // Redirect to the validated return path if one was captured at flow start.
+      // Re-validate here as defense-in-depth — the allowlist config could differ
+      // from what was checked at /start, and stored targets must never be trusted
+      // unconditionally. Use the returned validated path, not the raw stored value.
+      if (stateEntry.redirectTarget !== undefined && stateEntry.redirectTarget !== '') {
+        const validatedPath = validateReturnPath(stateEntry.redirectTarget, config.allowedReturnPaths)
+        if (validatedPath !== null) {
+          return c.redirect(validatedPath, 302)
+        }
+      }
+
       return c.json({githubUserId, login}, 200)
     }
 
