@@ -133,7 +133,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
 ## Implementation Units
 
-- [ ] **Unit 1: Runtime transition table — add early-FAILED edges**
+- [x] **Unit 1: Runtime transition table — add early-FAILED edges**
 
   **Goal:** Allow `PENDING/ACKNOWLEDGED → FAILED` (and `→ CANCELLED`) so admitted runs can terminalize before execution.
 
@@ -156,7 +156,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
   **Verification:** The transition map allows the new edges and rejects the still-illegal ones; existing run-state tests pass.
 
-- [ ] **Unit 2: `launchWork` owns admission + returns an admission result**
+- [x] **Unit 2: `launchWork` owns admission + returns an admission result**
 
   **Goal:** `launchWork` decides disposition first, runs a fail-closed admission block for the two accepted dispositions (immediate, queued), returns a `LaunchAdmission` without awaiting the run, and hands immediate-run ownership to a gateway in-flight set.
 
@@ -187,7 +187,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
   **Verification:** `launchWork` returns admission synchronously-fast for all dispositions; exactly one `createRun`; observer sees `PENDING` first.
 
-- [ ] **Unit 3: `executeWorkOnHeldSlot` adopts the run; early-abort gates terminalize to FAILED**
+- [x] **Unit 3: `executeWorkOnHeldSlot` adopts the run; early-abort gates terminalize to FAILED**
 
   **Goal:** The private primitive no longer creates the run; it adopts it (`PENDING → ACKNOWLEDGED`) and terminalizes to `FAILED` at every early-abort gate without orphaning a `PENDING`.
 
@@ -215,7 +215,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
   **Verification:** No `createRun` in `executeWorkOnHeldSlot`; every early-abort path (including throw) yields a terminal `FAILED` and the same user reply; successful run unchanged.
 
-- [ ] **Unit 4: Two-phase idempotency in the web launch route**
+- [x] **Unit 4: Two-phase idempotency in the web launch route**
 
   **Goal:** The launch route reserves the idempotency key, awaits `launchWork` admission, and commits only on accept / rolls back on reject — so a rejected launch never echoes a dead runId.
 
@@ -246,7 +246,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
   **Verification:** A rejected launch leaves no idempotency entry and no dead runId; the run index is registered once.
 
-- [ ] **Unit 5: Shutdown queue-drop + recovery sweep terminalize orphan PENDING**
+- [x] **Unit 5: Shutdown queue-drop + recovery sweep terminalize orphan PENDING**
 
   **Goal:** Dropped queued runs (shutdown), in-flight immediate runs (shutdown), and orphan `PENDING` records (crash / admit-before-enqueue) are terminalized to `FAILED` or drained — no slot held by an orphan, operator sees `failed` not a stuck `queued`.
 
@@ -275,7 +275,7 @@ recovery sweep:       stale PENDING (+ existing EXECUTING) → FAILED
 
   **Verification:** No orphan `PENDING` survives shutdown or recovery; a fresh just-admitted PENDING is never killed; slots are not held by orphans.
 
-- [ ] **Unit 6: Verify the operator read surface projects PENDING/FAILED + docs refresh**
+- [x] **Unit 6: Verify the operator read surface projects PENDING/FAILED + docs refresh**
 
   **Goal:** Confirm `toOperatorRunStatus` surfaces the now-produced `PENDING`/`FAILED` states cleanly (overlay guard allows `PENDING`), and (ancillary, not requirement-bearing) refresh the docs the fix makes stale.
 

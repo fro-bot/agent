@@ -171,6 +171,13 @@ if (authorized === false) {
 tasks (the in-flight run and its lock are unaffected). Multi-replica deployments need a
 durable queue (Redis/SQS) — that boundary is acknowledged, not solved here.
 
+**Durable admission corollary.** Once run admission moved into the launch front door, a
+queued task carries a durable `PENDING` run-state even though the queue entry itself is
+in-memory and lossy. Dropping the queue on shutdown therefore strands those `PENDING`
+records; the startup stale-run sweep recovers them to `FAILED` using a heartbeat-staleness
+freshness window (a just-admitted `PENDING` is excluded so it is never killed mid-admission).
+The lossy-queue contract stands; the durable admission record just gains a recovery owner.
+
 ## When to Apply
 
 Reach for this pattern when building a per-key serial work queue in a long-running daemon

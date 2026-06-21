@@ -59,7 +59,7 @@ void launchWorkPromise.catch((error: unknown) =>
 return c.json({runId}, 202)
 ```
 
-Be honest about the limit: a `202`'d `runId` is "dead" if the background run fails immediately, and a run that queues behind the per-repo concurrency cap is not yet observable. The route logs the failure at error level; the operator-visible fix (a lifecycle that surfaces queued/failed runs over SSE) is a deliberate follow-up, not a silent gap.
+Run admission was later moved into `launchWork` itself, so a queued run and a run that fails before execution both produce an observable `RunState` from the moment they are accepted (the route awaits admission, then commits idempotency). A `202`'d `runId` is therefore observable over SSE for every accepted disposition, not just the immediate-run happy path.
 
 ### 2. Server-owned repo resolution on a write route
 
@@ -139,7 +139,7 @@ function makeKey(githubUserId: number, clientKey: string): string {
 }
 ```
 
-Residual risk to state plainly: the in-memory table is lost on restart (a client retrying within the window can double-launch), and a failed run's key persists until TTL because failure-aware cleanup needs run-state lifecycle tracking.
+Residual risk to state plainly: the in-memory table is lost on restart (a client retrying within the window can double-launch). The two-phase reserve/commit lifecycle (reserve before admission, commit on accept, roll back on reject or throw) means a rejected launch no longer leaves a key echoing a dead runId.
 
 ### 7. Centralize the binding deny-key extraction (one owner)
 
@@ -191,4 +191,4 @@ if (body === null || typeof body !== 'object' || Array.isArray(body)) return c.j
 - [authenticated-sse-run-observation-2026-06-20.md](authenticated-sse-run-observation-2026-06-20.md) — the **read counterpart** on the same operator surface. Its rules (redaction-before-authz, server-owned resolution, closed-DTO, denylist-prime) apply unchanged here; the difference is fire-and-return vs long-lived stream and the allowance for differentiated post-acceptance errors.
 - [centralize-s3-key-identity-construction-2026-06-09.md](centralize-s3-key-identity-construction-2026-06-09.md) — `bindingToRepoKey` is a third key family under the same one-owner-one-builder discipline.
 - [atomic-serial-channel-queue-handoff-2026-06-09.md](atomic-serial-channel-queue-handoff-2026-06-09.md) — the launch surface threads `launchWork` with a synthetic per-operator/per-repo `channelId`; the FIFO + cap + shutdown discipline is respected by reuse, not extended.
-- Shipped via PR #968 under issue #907; the redaction-before-authz invariant is anchored by #950 and the operator-auth authority by #951. Deferred follow-ups: #965 (stream web-launched run output to the operator) and #966 (move run lifecycle admission into `launchWork` so queued/failed runs are observable).
+- Shipped via PR #968 under issue #907; the redaction-before-authz invariant is anchored by #950 and the operator-auth authority by #951. Run lifecycle admission moved into `launchWork` (queued/failed runs observable, two-phase idempotency) as a follow-up. Remaining deferred work: #965 (stream web-launched run output to the operator).
