@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-14"
-updated-by: "7065ca0"
+last-updated: "2026-06-21"
+updated-by: "aaaf91d"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
@@ -55,6 +55,8 @@ On restore, the cache module performs several safety checks:
 - **Credential cleanup** — Deletes any `auth.json` that might have been accidentally included in a previous cache save. Credentials are ephemeral and should never persist.
 
 Cache saves happen twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`). The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history.
+
+Before saving, `saveCache` in `src/services/cache/save.ts` checks whether there is anything worth caching — but this check is subtler than "is the storage directory non-empty." Recent OpenCode versions persist sessions in an `opencode.db` SQLite file in the _parent_ of the storage directory, not inside it, so a naive empty-directory check would skip the save on every real run. The guard therefore also treats any non-empty SQLite DB-family file (`opencode.db`, `opencode.db-wal`, `opencode.db-shm`) as evidence of cacheable content. The WAL file matters specifically: because server shutdown kills the process without awaiting a checkpoint, a valid session can leave `opencode.db` at zero bytes with all data still in the `-wal` file, so any one non-empty member of the family is sufficient to proceed with the save.
 
 ## Object Store (S3 Backup)
 

@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-06-07"
-updated-by: "cbc7008"
+last-updated: "2026-06-21"
+updated-by: "aaaf91d"
 sources:
   - src/main.ts
   - src/post.ts
@@ -14,6 +14,7 @@ sources:
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/http/server.ts
+  - packages/gateway/src/web/server.ts
   - packages/gateway/src/approvals/coordinator.ts
   - packages/runtime/src/agent/remote-client.ts
   - apps/workspace-agent/src/main.ts
@@ -86,6 +87,8 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
 **HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
+
+**Web** (`web/`, `operator-contract/`) — The authenticated operator web control surface: a browser-facing Hono server that lets a signed-in human launch and observe agent runs over HTTP and Server-Sent Events. It owns GitHub OAuth, server-side sessions, a numeric-user-ID allowlist, per-repo authorization, CSRF protection, and the SSE observation pipeline, all speaking a frozen operator contract. This is a second entry point into the same execution engine the Discord mention handler uses. See [[Operator Web Control Surface]].
 
 **Workspace API** (`workspace-api/`) — Client for calling the workspace-agent's clone and OpenCode-proxy endpoints (`client.ts`, `types.ts`).
 
