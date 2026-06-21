@@ -229,6 +229,7 @@ else enqueueFrame(sub, {type: 'status', data: cached})
 
 ## Related
 
+- [sse-output-streaming-terminal-drain-2026-06-21.md](sse-output-streaming-terminal-drain-2026-06-21.md) — the **output/completeness layer** built directly on top of this surface: terminal-as-graceful-drain, ordering the final answer before terminal status, the bounded replay cache for late subscribers, and coalescing under backpressure (PR #974, #965). This doc covers auth/redaction/teardown; that one covers how ordered output reaches the consumer completely.
 - [gateway-control-surface-spine-2026-06-15.md](gateway-control-surface-spine-2026-06-15.md) — the transport-neutral execution/approval seam this SSE surface is the first transport on (the spine carved the seam; this instantiates it one layer up). Cross-link both ways.
 - [signed-webhook-ingress-hardening-2026-05-29.md](signed-webhook-ingress-hardening-2026-05-29.md) — the HTTP no-oracle "identical 401" rule; rule 1 here is its SSE analogue.
 - [centralize-s3-key-identity-construction-2026-06-09.md](centralize-s3-key-identity-construction-2026-06-09.md) — server-owned identity resolution; rule 3 applies it to `runId → repo`.
