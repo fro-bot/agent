@@ -2,11 +2,11 @@ import {describe, expect, it} from 'vitest'
 import {OPERATOR_CONTRACT_VERSION} from './version.js'
 
 describe('OPERATOR_CONTRACT_VERSION', () => {
-  it('is pinned to 1.2.0', () => {
+  it('is pinned to 1.3.0', () => {
     // #given the contract version constant
     // #when read at import time
     // #then it is exactly the pinned literal
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.2.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.3.0')
   })
 
   it('is importable from the contract barrel', async () => {
