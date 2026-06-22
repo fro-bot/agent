@@ -696,6 +696,7 @@ describe('POST decision — audit', () => {
   it('emits approval.rejected (not approval.decision) for non-ok outcomes (already-claimed)', async () => {
     // FIX 4: non-ok outcomes emit approval.rejected with the mapped reason,
     // not approval.decision. This preserves the rejection cause in the audit log.
+    // Note: already_claimed is a benign reason → logs at INFO (not WARN) per FIX A.
     const auditLogger = makeAuditLogger()
     const deps = makeDeps({auditLogger, registry: makeRegistry('already-claimed')})
     const app = buildApp(deps)
@@ -709,9 +710,8 @@ describe('POST decision — audit', () => {
     )
     expect(decisionAudit).toBeUndefined()
 
-    // approval.rejected IS emitted with the mapped reason
-    const auditWarnCalls = vi.mocked(auditLogger.warn).mock.calls
-    const rejectedAudit = auditWarnCalls.find(
+    // approval.rejected IS emitted with the mapped reason — at INFO (benign reason)
+    const rejectedAudit = auditInfoCalls.find(
       ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.rejected',
     )
     expect(rejectedAudit).toBeDefined()
@@ -719,24 +719,48 @@ describe('POST decision — audit', () => {
     expect(rejectedCtx.reason).toBe('already_claimed')
   })
 
+  it('always decision with outcome ok records decision:"always" in approval.decision audit (FIX C)', async () => {
+    // #given — 'always' is the higher-blast-radius grant; must be audited distinctly from 'once'/'reject'
+    const auditLogger = makeAuditLogger()
+    const registry = makeRegistry('ok')
+    const deps = makeDeps({auditLogger, registry})
+    const app = buildApp(deps)
+
+    // #when
+    await postDecision(app, 'run-abc', 'req-always-fidelity', {decision: 'always'})
+
+    // #then — approval.decision emitted with decision:'always', not 'once' or 'reject'
+    const auditInfoCalls = vi.mocked(auditLogger.info).mock.calls
+    const decisionAudit = auditInfoCalls.find(
+      ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.decision',
+    )
+    expect(decisionAudit).toBeDefined()
+    const auditCtx = decisionAudit?.[0] as Record<string, unknown>
+    expect(auditCtx.decision).toBe('always')
+    expect(auditCtx.decision).not.toBe('once')
+    expect(auditCtx.decision).not.toBe('reject')
+  })
+
   it('maps each DecisionOutcome to the correct ApprovalRejectedReason (FIX 4 taxonomy)', async () => {
-    // Verify the full mapping: DecisionOutcome → ApprovalRejectedReason
-    const cases: {outcome: DecisionOutcome; expectedReason: string}[] = [
-      {outcome: 'already-claimed', expectedReason: 'already_claimed'},
-      {outcome: 'not-found', expectedReason: 'not_found'},
-      {outcome: 'channel-mismatch', expectedReason: 'scope_mismatch'},
-      {outcome: 'reply-failed', expectedReason: 'unknown'},
+    // Verify the full mapping: DecisionOutcome → ApprovalRejectedReason.
+    // Per FIX A, benign reasons (already_claimed, not_found) log at INFO;
+    // anomalous reasons (scope_mismatch, unknown) log at WARN.
+    const cases: {outcome: DecisionOutcome; expectedReason: string; expectedLevel: 'info' | 'warn'}[] = [
+      {outcome: 'already-claimed', expectedReason: 'already_claimed', expectedLevel: 'info'},
+      {outcome: 'not-found', expectedReason: 'not_found', expectedLevel: 'info'},
+      {outcome: 'channel-mismatch', expectedReason: 'scope_mismatch', expectedLevel: 'warn'},
+      {outcome: 'reply-failed', expectedReason: 'unknown', expectedLevel: 'warn'},
     ]
 
-    for (const {outcome, expectedReason} of cases) {
+    for (const {outcome, expectedReason, expectedLevel} of cases) {
       const auditLogger = makeAuditLogger()
       const deps = makeDeps({auditLogger, registry: makeRegistry(outcome)})
       const app = buildApp(deps)
 
       await postDecision(app, 'run-abc', `req-${outcome}`, {decision: 'once'})
 
-      const auditWarnCalls = vi.mocked(auditLogger.warn).mock.calls
-      const rejectedAudit = auditWarnCalls.find(
+      const calls = vi.mocked(auditLogger[expectedLevel]).mock.calls
+      const rejectedAudit = calls.find(
         ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.rejected',
       )
       expect(rejectedAudit).toBeDefined()

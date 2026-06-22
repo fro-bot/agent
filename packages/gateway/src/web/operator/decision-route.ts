@@ -93,6 +93,12 @@ function isPermissionReply(value: unknown): value is PermissionReply {
  * Map a non-ok DecisionOutcome to the ApprovalRejectedReason taxonomy.
  *
  * 'ok' is excluded — callers must only call this for non-ok outcomes.
+ *
+ * Note: 'deadline_expired' is intentionally absent from this switch. Deadline
+ * settlement is owned internally by the registry (it expires pending requests
+ * on its own timer) and never surfaces as a DecisionOutcome returned by
+ * handleDecision. The 'deadline_expired' reason exists in the ApprovalRejectedReason
+ * taxonomy for the registry's own internal audit path, not for this route.
  */
 function decisionOutcomeToRejectedReason(outcome: Exclude<DecisionOutcome, 'ok'>): ApprovalRejectedReason {
   switch (outcome) {

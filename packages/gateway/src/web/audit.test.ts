@@ -592,11 +592,11 @@ describe('emitAudit — approval.decision', () => {
 })
 
 // ---------------------------------------------------------------------------
-// approval.rejected
+// approval.rejected — per-reason log level
 // ---------------------------------------------------------------------------
 
 describe('emitAudit — approval.rejected', () => {
-  it('emits a structured warn record with expected fields', () => {
+  it('already_claimed → INFO (benign: expected single-winner race outcome)', () => {
     // #given
     const logger = makeLogger()
     const event: AuditEvent = {
@@ -610,17 +610,97 @@ describe('emitAudit — approval.rejected', () => {
     // #when
     emitAudit(event, logger)
 
-    // #then
-    expect(logger.warn).toHaveBeenCalledOnce()
-    expect(logger.info).not.toHaveBeenCalled()
-    expect(firstCallMsg(logger.warn)).toBe('audit: approval.rejected')
-    expect(firstCallCtx(logger.warn)).toMatchObject({
+    // #then — benign reason logs at INFO, not WARN
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: approval.rejected')
+    expect(firstCallCtx(logger.info)).toMatchObject({
       kind: 'approval.rejected',
       correlationId: 'corr-010',
       githubUserId: 42,
       requestId: 'req-abc',
       reason: 'already_claimed',
     })
+  })
+
+  it('not_found → INFO (benign: stale or duplicate request)', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.rejected',
+      correlationId: 'corr-010b',
+      githubUserId: 42,
+      requestId: 'req-gone',
+      reason: 'not_found',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then — benign reason logs at INFO, not WARN
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({reason: 'not_found'})
+  })
+
+  it('scope_mismatch → WARN (security signal: cross-scope settlement attempt)', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.rejected',
+      correlationId: 'corr-010c',
+      githubUserId: 42,
+      requestId: 'req-cross',
+      reason: 'scope_mismatch',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then — anomalous reason logs at WARN
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toMatchObject({reason: 'scope_mismatch'})
+  })
+
+  it('unknown → WARN (operational anomaly: settlement failure)', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.rejected',
+      correlationId: 'corr-010d',
+      githubUserId: 42,
+      requestId: 'req-fail',
+      reason: 'unknown',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then — operational anomaly logs at WARN
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toMatchObject({reason: 'unknown'})
+  })
+
+  it('deadline_expired → WARN (registry-internal path; kept in taxonomy)', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.rejected',
+      correlationId: 'corr-010e',
+      githubUserId: 42,
+      requestId: 'req-expired',
+      reason: 'deadline_expired',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then — deadline expiry logs at WARN
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toMatchObject({reason: 'deadline_expired'})
   })
 
   it('redacts sensitive values planted in correlationId and requestId; reason enum is preserved', () => {
