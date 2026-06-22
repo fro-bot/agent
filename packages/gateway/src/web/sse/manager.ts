@@ -21,7 +21,7 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorOutputFrame, OperatorRunStatus} from '../../operator-contract/index.js'
+import type {ApprovalFrameData, OperatorOutputFrame, OperatorRunStatus} from '../../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
 // Constants (injectable for tests)
@@ -100,8 +100,25 @@ export interface OutputFrame {
   readonly data: OperatorOutputFrame
 }
 
+/**
+ * An approval frame carrying a pending tool-permission request (or its
+ * settle/clear signal) to the browser.
+ *
+ * Open frames (`data.settled === false`) carry the full request detail.
+ * Settle/clear frames (`data.settled === true`) carry only the requestID so
+ * the browser can dismiss the prompt.
+ *
+ * Approval frames are NOT coalesced — they are rare and must arrive intact.
+ * They fan out via the non-coalescing `enqueueFrame` path.
+ */
+export interface ApprovalFrame {
+  readonly type: 'approval'
+  readonly runId: string
+  readonly data: ApprovalFrameData
+}
+
 /** The closed union of all frame types the manager can emit. */
-export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame | OutputFrame
+export type ObservationFrame = StatusFrame | ResetFrame | HeartbeatFrame | OutputFrame | ApprovalFrame
 
 // ---------------------------------------------------------------------------
 // Subscriber callbacks
@@ -201,6 +218,24 @@ export interface RunObservationManager {
    * Does NOT add any mutating run API to the deps — observer-only by construction.
    */
   readonly observeOutput: (runId: string, text: string, opts?: {final?: boolean; droppedCount?: number}) => void
+
+  /**
+   * Observe a pending or settled approval request for a run. Observer-only / best-effort.
+   *
+   * Fans an ApprovalFrame to all current subscribers of the run via the
+   * non-coalescing `enqueueFrame` path — approval frames are rare and must
+   * arrive intact (unlike output frames, they are NOT coalesced on overflow).
+   *
+   * Call with `data.settled === false` when a permission gate opens, and with
+   * `data.settled === true` when the request is resolved (approved or rejected).
+   * The settle/clear frame should be enqueued BEFORE the terminal status fans
+   * out so the browser can dismiss the prompt before the run closes.
+   *
+   * Does NOT add any mutating run API to the deps — observer-only by construction.
+   * Drops silently when the manager is shut down or the run has already reached
+   * terminal state (out-of-order async guard).
+   */
+  readonly observeApproval: (runId: string, data: ApprovalFrameData) => void
 
   /**
    * Abort a subscription with a given reason (e.g., 'observation-failed' for EOF).
@@ -1026,6 +1061,31 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   }
 
   // ---------------------------------------------------------------------------
+  // observeApproval
+  // ---------------------------------------------------------------------------
+
+  const observeApproval = (runId: string, data: ApprovalFrameData): void => {
+    if (isShutdown === true) {
+      return
+    }
+
+    // Out-of-order async guard: if the run has already reached terminal state,
+    // drop any further approval observations — a stale approval frame must not
+    // arrive after the terminal status has committed the replay cache entry.
+    if (terminalRuns.has(runId) === true) {
+      logger.warn({runId}, 'manager: observeApproval called after terminal — dropping')
+      return
+    }
+
+    const frame: ApprovalFrame = {type: 'approval', runId, data}
+
+    // Fan out via the non-coalescing path — approval frames are rare and must
+    // arrive intact. Overflow drops the subscriber (same as status frames),
+    // not the frame (unlike output frames which coalesce).
+    fanOut(runId, frame)
+  }
+
+  // ---------------------------------------------------------------------------
   // subscribe
   // ---------------------------------------------------------------------------
 
@@ -1208,5 +1268,5 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     terminalRuns.clear()
   }
 
-  return {observe, observeOutput, subscribe, abortSubscription, shutdown}
+  return {observe, observeOutput, observeApproval, subscribe, abortSubscription, shutdown}
 }

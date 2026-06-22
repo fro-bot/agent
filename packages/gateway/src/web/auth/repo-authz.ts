@@ -42,24 +42,38 @@ export type RepoAuthzResult =
   | {readonly authorized: true}
   | {readonly authorized: false; readonly reason: RepoAuthzDeniedReason}
 
+/** Result of a write-level repo authorization check. */
+export type RepoWriteAuthzResult =
+  | {readonly authorized: true; readonly level: 'write' | 'admin'}
+  | {readonly authorized: false; readonly reason: RepoAuthzDeniedReason}
+
 type AuditableRepoAuthzDeniedReason<T extends AuthzDeniedReason> = T
 
 /**
- * Reasons for repo authorization denial surfaced by checkRepoAuthz.
+ * Reasons for repo authorization denial surfaced by checkRepoAuthz and checkRepoWriteAuthz.
  *
  * Intentionally excludes audit-only outer reasons like `unknown` and `suspended`
  * until this helper owns those paths.
+ *
+ * `insufficient_permission` is returned by checkRepoWriteAuthz when the GitHub
+ * response confirms repo access but the operator lacks push/admin permission.
  */
 export type RepoAuthzDeniedReason = AuditableRepoAuthzDeniedReason<
-  'invalid_repo_name' | 'not_allowlisted' | 'github_denied' | 'rate_limited' | 'lookup_error'
+  | 'invalid_repo_name'
+  | 'not_allowlisted'
+  | 'github_denied'
+  | 'rate_limited'
+  | 'lookup_error'
+  | 'insufficient_permission'
 >
 
 /**
  * A single cache entry — discriminated union to make impossible states impossible.
  * Authorized entries never carry a reason; denied entries always carry one.
+ * Write-level authorized entries carry an optional `level` field.
  */
 type CacheEntry =
-  | {readonly authorized: true; readonly expiresAt: number}
+  | {readonly authorized: true; readonly level?: 'write' | 'admin'; readonly expiresAt: number}
   | {readonly authorized: false; readonly reason: RepoAuthzDeniedReason; readonly expiresAt: number}
 
 /** In-flight coalescing promise for a cache key. */
@@ -115,8 +129,27 @@ export interface RepoAuthzDeps {
 /** Positive authz TTL: 5 minutes in ms. */
 const POSITIVE_TTL_MS = 5 * 60 * 1000
 
+/**
+ * Positive write-authz TTL: 60 seconds in ms.
+ *
+ * Shorter than the read TTL because a write→read demotion (e.g. repo access
+ * revoked or permission downgraded) must not let an approve succeed for minutes.
+ * Revocation-safety is the primary constraint here.
+ */
+const WRITE_POSITIVE_TTL_MS = 60 * 1000
+
 /** Negative authz TTL: 30 seconds in ms. */
 const NEGATIVE_TTL_MS = 30 * 1000
+
+/**
+ * Cache key prefix for write-level authz entries.
+ *
+ * Distinct from the read-level prefix so write and read entries never collide
+ * in the shared cache instance. Read entries use no prefix (bare key); write
+ * entries use "w:" so a cached read-authorized result cannot satisfy a
+ * write-level check and vice versa.
+ */
+const WRITE_CACHE_KEY_PREFIX = 'w:'
 
 /** Maximum TTL jitter: 10% of the base TTL. */
 const JITTER_FRACTION = 0.1
@@ -551,4 +584,294 @@ function isRateLimitResponse(response: {headers: {get: (name: string) => string 
 
   const reset = response.headers.get('x-ratelimit-reset')
   return reset !== null && reset !== ''
+}
+
+// ---------------------------------------------------------------------------
+// Write-level authorization
+// ---------------------------------------------------------------------------
+
+/**
+ * Module-level in-flight coalescing map for write-level authorization checks.
+ *
+ * Separate from the cache's read-level in-flight map so the coalesced result
+ * is typed as `RepoWriteAuthzResult` without a cast. The cache's
+ * `setInFlight`/`getInFlight` are used for read-level only.
+ *
+ * Keyed by the write-level cache key (same key used for the cache entry).
+ */
+const writeInFlight = new Map<string, Promise<RepoWriteAuthzResult>>()
+
+/**
+ * Check whether the given operator has WRITE or ADMIN permission on the given repo.
+ *
+ * Distinct from checkRepoAuthz (read-level). Used by the approval decision route
+ * where submitting a decision requires a strictly higher bar than read access.
+ *
+ * v1 rule:
+ *   1. Validate owner/repo names — reject malformed names immediately.
+ *   2. Check operator allowlist — deny without GitHub call if not allowlisted.
+ *   3. Check cache (write-level key prefix "w:") — return cached result if present.
+ *   4. Coalesce concurrent misses — wait for in-flight request if one exists.
+ *   5. Call GitHub repos API and READ the response body to inspect `permissions`.
+ *      - `permissions.admin === true` → level 'admin'
+ *      - `permissions.push === true` → level 'write'
+ *      - otherwise → {authorized: false, reason: 'insufficient_permission'}
+ *      - missing/malformed body → {authorized: false, reason: 'insufficient_permission'}
+ *   6. Cache the result with a SHORT positive TTL (~60 s) and return.
+ *
+ * Permission source decision: we use the existing GET /repos/{owner}/{repo} endpoint
+ * (same URL as checkRepoAuthz) and READ the response body's `permissions` object.
+ * This is one fewer network call than the collaborator-permission endpoint
+ * (GET /repos/{owner}/{repo}/collaborators/{username}/permission), and the
+ * `permissions` field is reliably present for authenticated users with any access.
+ * The body is parsed defensively — missing/malformed/non-object permissions are
+ * treated as insufficient_permission (fail closed), never as an error that throws.
+ *
+ * Cache key uses the "w:" prefix to prevent collision with read-level entries.
+ * Positive TTL is 60 s (vs 5 min for read) for revocation safety.
+ * Negative TTL is 30 s (same as read).
+ *
+ * @param operatorId - Stable numeric GitHub user ID of the operator.
+ * @param owner - Repository owner (GitHub org or user login).
+ * @param repo - Repository name.
+ * @param userOAuthToken - User OAuth token. NEVER logged, persisted, or passed outside this function.
+ * @param deps - Injectable dependencies (same as checkRepoAuthz).
+ */
+export async function checkRepoWriteAuthz(
+  operatorId: number,
+  owner: string,
+  repo: string,
+  userOAuthToken: string,
+  deps: RepoAuthzDeps,
+): Promise<RepoWriteAuthzResult> {
+  const {allowlist, clock, auditLogger, logger, cache} = deps
+
+  // ── Step 1: Validate owner/repo names ──────────────────────────────────────
+  if (isValidOwner(owner) === false || isValidRepo(repo) === false) {
+    logger.warn({githubUserId: operatorId}, 'repo-write-authz: invalid owner/repo name — rejecting before authz')
+    emitAudit(
+      {
+        kind: 'authz.denied',
+        correlationId: 'repo-write-authz:invalid-repo-name',
+        githubUserId: operatorId,
+        reason: 'invalid_repo_name',
+      },
+      auditLogger,
+    )
+    return {authorized: false, reason: 'invalid_repo_name'}
+  }
+
+  // ── Step 2: Allowlist check ─────────────────────────────────────────────────
+  if (allowlist.isAuthorized(operatorId) === false) {
+    logger.warn({githubUserId: operatorId, owner, repo}, 'repo-write-authz: operator not in allowlist')
+    emitAudit(
+      {
+        kind: 'authz.denied',
+        correlationId: `repo-write-authz:${operatorId}:${owner}/${repo}`,
+        githubUserId: operatorId,
+        reason: 'not_allowlisted',
+      },
+      auditLogger,
+    )
+    return {authorized: false, reason: 'not_allowlisted'}
+  }
+
+  // ── Step 3: Cache lookup (write-level key) ──────────────────────────────────
+  const tokenIdentity = cache.tokenIdentityFor(userOAuthToken)
+  const cacheKey = WRITE_CACHE_KEY_PREFIX + buildCacheKey(operatorId, owner, repo, tokenIdentity)
+  const nowMs = clock()
+  const cached = cache.get(cacheKey, nowMs)
+  if (cached !== undefined) {
+    if (cached.authorized === true) {
+      // level is always present on write-level authorized entries
+      const level = cached.level ?? 'write'
+      return {authorized: true, level}
+    }
+    const cachedReason = cached.reason
+    logger.warn({githubUserId: operatorId, owner, repo, reason: cachedReason}, 'repo-write-authz: cached denial')
+    emitAudit(
+      {
+        kind: 'authz.denied',
+        correlationId: `repo-write-authz:${operatorId}:${owner}/${repo}`,
+        githubUserId: operatorId,
+        reason: cachedReason,
+      },
+      auditLogger,
+    )
+    return {authorized: false, reason: cachedReason}
+  }
+
+  // ── Step 4: Coalesce concurrent misses ─────────────────────────────────────
+  // The write-level in-flight map is separate from the cache's read-level
+  // in-flight map so the coalesced result is typed as RepoWriteAuthzResult
+  // without a cast. The cache's setInFlight/getInFlight are used for read-level
+  // only; write-level uses writeInFlight (module-level, keyed by cacheKey).
+  const existingWrite = writeInFlight.get(cacheKey)
+  if (existingWrite !== undefined) {
+    const coalesced = await existingWrite
+    if (coalesced.authorized === false) {
+      emitAudit(
+        {
+          kind: 'authz.denied',
+          correlationId: `repo-write-authz:${operatorId}:${owner}/${repo}`,
+          githubUserId: operatorId,
+          reason: coalesced.reason,
+        },
+        auditLogger,
+      )
+    }
+    return coalesced
+  }
+
+  // ── Step 5: GitHub API call (reads body for permissions) ───────────────────
+  const promise = performGitHubWriteCheck(operatorId, owner, repo, userOAuthToken, cacheKey, deps)
+  writeInFlight.set(cacheKey, promise)
+
+  try {
+    return await promise
+  } finally {
+    writeInFlight.delete(cacheKey)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub write check (inner — reads permissions body)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the GitHub repo permissions object from a parsed JSON body.
+ *
+ * Returns 'admin' | 'write' | null.
+ * - null means insufficient permission or unreadable body.
+ * - Strict boolean checks: only `=== true` counts; truthy strings like "true" do not.
+ * - Prototype-safe: only own-property access via Object.prototype.hasOwnProperty.
+ */
+function parseWriteLevel(body: unknown): 'admin' | 'write' | null {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return null
+
+  const record = body as Record<string, unknown>
+  const permissions = Object.prototype.hasOwnProperty.call(record, 'permissions') ? record.permissions : undefined
+  if (permissions === null || typeof permissions !== 'object' || Array.isArray(permissions)) return null
+
+  const perms = permissions as Record<string, unknown>
+
+  // Strict boolean checks — string "true" or number 1 are not accepted.
+  const admin = Object.prototype.hasOwnProperty.call(perms, 'admin') ? perms.admin : undefined
+  if (admin === true) return 'admin'
+
+  const push = Object.prototype.hasOwnProperty.call(perms, 'push') ? perms.push : undefined
+  if (push === true) return 'write'
+
+  return null
+}
+
+async function performGitHubWriteCheck(
+  operatorId: number,
+  owner: string,
+  repo: string,
+  userOAuthToken: string,
+  cacheKey: string,
+  deps: RepoAuthzDeps,
+): Promise<RepoWriteAuthzResult> {
+  const {fetch: fetchFn, random, auditLogger, logger, cache} = deps
+
+  const deny = (reason: RepoAuthzDeniedReason, ttlMs: number, writeTimeMs: number): RepoWriteAuthzResult => {
+    const expiresAt = writeTimeMs + withJitter(ttlMs, random)
+    cache.set(cacheKey, {authorized: false, reason, expiresAt})
+    emitAudit(
+      {
+        kind: 'authz.denied',
+        correlationId: `repo-write-authz:${operatorId}:${owner}/${repo}`,
+        githubUserId: operatorId,
+        reason,
+      },
+      auditLogger,
+    )
+    return {authorized: false, reason}
+  }
+
+  let response: Response | undefined
+  try {
+    response = await fetchFn(`https://api.github.com/repos/${owner}/${repo}`, {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${userOAuthToken}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+      },
+      signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS),
+    })
+
+    const {clock} = deps
+    const writeTimeMs = clock()
+
+    // Rate-limit handling: 429 always; 403 only when Retry-After or (remaining=0 + reset)
+    if (response.status === 429 || (response.status === 403 && isRateLimitResponse(response))) {
+      const windowMs = parseRateLimitWindowMs(response.headers, writeTimeMs)
+      const ttlMs = windowMs === null ? NEGATIVE_TTL_MS : windowMs
+      logger.warn(
+        {githubUserId: operatorId, owner, repo, status: response.status},
+        'repo-write-authz: GitHub rate limited',
+      )
+      cancelResponseBody(response)
+      return deny('rate_limited', ttlMs, writeTimeMs)
+    }
+
+    if (response.ok === true) {
+      // Read the body to inspect permissions — this is the key difference from checkRepoAuthz.
+      let body: unknown
+      try {
+        body = await response.json()
+      } catch {
+        // Malformed JSON — fail closed as insufficient_permission (not a network error).
+        logger.warn(
+          {githubUserId: operatorId, owner, repo},
+          'repo-write-authz: failed to parse GitHub response body — treating as insufficient_permission',
+        )
+        return deny('insufficient_permission', NEGATIVE_TTL_MS, writeTimeMs)
+      }
+
+      const level = parseWriteLevel(body)
+      if (level === null) {
+        logger.warn(
+          {githubUserId: operatorId, owner, repo},
+          'repo-write-authz: permissions.push/admin not true — insufficient_permission',
+        )
+        return deny('insufficient_permission', NEGATIVE_TTL_MS, writeTimeMs)
+      }
+
+      // Authorized — cache with short positive TTL for revocation safety.
+      const expiresAt = writeTimeMs + withJitter(WRITE_POSITIVE_TTL_MS, random)
+      cache.set(cacheKey, {authorized: true, level, expiresAt})
+      logger.info({githubUserId: operatorId, owner, repo, level}, 'repo-write-authz: authorized')
+      return {authorized: true, level}
+    }
+
+    // 5xx — server error, fail closed
+    if (response.status >= 500) {
+      logger.warn(
+        {githubUserId: operatorId, owner, repo, status: response.status},
+        'repo-write-authz: GitHub server error — failing closed',
+      )
+      cancelResponseBody(response)
+      return deny('lookup_error', NEGATIVE_TTL_MS, writeTimeMs)
+    }
+
+    // Non-2xx, non-rate-limit, non-5xx — denied
+    logger.warn(
+      {githubUserId: operatorId, owner, repo, status: response.status},
+      'repo-write-authz: GitHub denied access',
+    )
+    cancelResponseBody(response)
+    return deny('github_denied', NEGATIVE_TTL_MS, writeTimeMs)
+  } catch (error: unknown) {
+    const errorKind =
+      error instanceof Error ? (error.constructor.name === 'Error' ? 'Error' : error.constructor.name) : typeof error
+    logger.warn(
+      {githubUserId: operatorId, owner, repo, errorKind},
+      'repo-write-authz: GitHub API lookup failed — failing closed',
+    )
+    const {clock} = deps
+    return deny('lookup_error', NEGATIVE_TTL_MS, clock())
+  }
 }

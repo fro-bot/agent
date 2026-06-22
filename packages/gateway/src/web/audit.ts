@@ -27,6 +27,7 @@ export type AuthzDeniedReason =
   | 'github_denied'
   | 'rate_limited'
   | 'lookup_error'
+  | 'insufficient_permission'
   | 'unknown'
 
 /** Safe reasons for launch rejection. */
@@ -123,8 +124,12 @@ export interface ApprovalDecisionEvent {
   readonly correlationId: string
   readonly githubUserId: number
   readonly requestId: string
-  /** Pass-through enum: 'approve' | 'deny' — never a free-form string. */
-  readonly decision: 'approve' | 'deny'
+  /**
+   * Pass-through enum: 'once' | 'always' | 'reject' — never a free-form string.
+   * 'always' is the higher-blast-radius grant (persists as an OpenCode always-rule).
+   * 'once' approves for this request only. 'reject' denies.
+   */
+  readonly decision: 'once' | 'always' | 'reject'
 }
 
 /** Approval submission rejected (already claimed, not found, etc.). */
@@ -234,8 +239,11 @@ function redactIfSensitive(value: string): string {
 /**
  * Exhaustive log-level map: every AuditEvent kind must be present.
  * Adding a new variant without updating this map is a compile-time error.
+ *
+ * Note: 'approval.rejected' is intentionally absent — its level is reason-dependent.
+ * See approvalRejectedLevel() below.
  */
-const LOG_LEVEL: Record<AuditEvent['kind'], 'info' | 'warn'> = {
+const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected'>, 'info' | 'warn'> = {
   'auth.start': 'info',
   'auth.callback.success': 'info',
   'auth.callback.failure': 'warn',
@@ -245,10 +253,32 @@ const LOG_LEVEL: Record<AuditEvent['kind'], 'info' | 'warn'> = {
   'launch.accepted': 'info',
   'launch.rejected': 'warn',
   'approval.decision': 'info',
-  'approval.rejected': 'warn',
   'binding.read': 'info',
   'bearer.rejected': 'warn',
   'browser.guard.rejected': 'warn',
+}
+
+/**
+ * Per-reason log level for 'approval.rejected' events.
+ *
+ * - 'already_claimed' / 'not_found': INFO — expected outcomes of concurrent submit
+ *   (single-winner race) or a stale/duplicate request. Benign operational noise.
+ * - 'scope_mismatch': WARN — genuine security signal: an operator tried to settle
+ *   a request outside their run's scope. Warrants attention.
+ * - 'unknown': WARN — operational anomaly (settlement failure); warrants attention.
+ * - 'deadline_expired': WARN — registry-internal deadline path; not produced by the
+ *   decision route but kept in the taxonomy for completeness.
+ */
+function approvalRejectedLevel(reason: ApprovalRejectedReason): 'info' | 'warn' {
+  switch (reason) {
+    case 'already_claimed':
+    case 'not_found':
+      return 'info'
+    case 'scope_mismatch':
+    case 'unknown':
+    case 'deadline_expired':
+      return 'warn'
+  }
 }
 
 /** Compile-time exhaustiveness guard — unreachable at runtime. */
@@ -294,7 +324,8 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
   }
 
   try {
-    if (LOG_LEVEL[event.kind] === 'warn') {
+    const level = event.kind === 'approval.rejected' ? approvalRejectedLevel(event.reason) : LOG_LEVEL[event.kind]
+    if (level === 'warn') {
       logger.warn(ctx, msg)
     } else {
       logger.info(ctx, msg)
