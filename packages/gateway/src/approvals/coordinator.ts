@@ -58,6 +58,19 @@ export interface PermissionRequest {
   readonly patterns: readonly string[]
   /** Human-readable, redaction-safe summary for the Discord embed. */
   readonly title: string
+  /**
+   * Raw command string from `metadata.command` (e.g. for `bash` gates).
+   * Present only when the engine supplied it. Kept raw here so the Discord
+   * transport is unaffected; apply `boundApprovalDetail` at the SSE frame-build
+   * site before serialising to the browser.
+   */
+  readonly command?: string
+  /**
+   * Raw filepath string from `metadata.filepath` (e.g. for `external_directory`
+   * and `edit` gates). Present only when the engine supplied it. Same raw/bound
+   * split as `command`.
+   */
+  readonly filepath?: string
 }
 
 /** Parsed `permission.replied` payload — the authoritative settlement. */
@@ -181,12 +194,20 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
   const permission = getString(payload, 'permission') ?? 'unknown'
   const patterns = getStringArray(payload, 'patterns')
   const metadata = getObject(payload, 'metadata')
+  // Extract raw command/filepath via the prototype-safe accessor so prototype-
+  // polluted metadata objects cannot inject values through the prototype chain.
+  const rawCommand = getString(metadata, 'command')
+  const rawFilepath = getString(metadata, 'filepath')
   return {
     requestID,
     sessionID,
     permission,
     patterns,
     title: deriveTitle(permission, patterns, metadata),
+    // Omit the optional fields entirely when absent (undefined is not emitted
+    // in the object literal when the conditional spread is used).
+    ...(rawCommand !== null && {command: rawCommand}),
+    ...(rawFilepath !== null && {filepath: rawFilepath}),
   }
 }
 
