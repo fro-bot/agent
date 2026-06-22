@@ -18,7 +18,14 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  PartTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { testEffect } from "./lib/effect"
 
 const database = Database.layerFromPath(":memory:")
@@ -613,6 +620,209 @@ describe("SessionProjector", () => {
           time: { created },
         }),
       ])
+    }),
+  )
+})
+
+describe("SessionProjector orphan-part tolerance", () => {
+  const it = testEffect(Layer.mergeAll(database, events, projector))
+  const sessionID = SessionV2.ID.make("ses_orphan_test")
+  const messageID = SessionV1.MessageID.make("msg_orphan")
+  const partID = SessionV1.PartID.make("prt_orphan")
+
+  it.effect("does not throw and does not insert part when parent message is gone", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "orphan-test",
+          directory: "/project",
+          title: "orphan test",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      // Insert a message row directly, then delete it to simulate cascade-delete
+      yield* db
+        .insert(MessageTable)
+        .values({ id: messageID, session_id: sessionID, time_created: 0, data: {} as never })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db.delete(MessageTable).where(eq(MessageTable.id, messageID)).run().pipe(Effect.orDie)
+
+      const evts = yield* EventV2.Service
+
+      // Late PartUpdated arrives after the parent was deleted
+      const exit = yield* evts
+        .publish(SessionV1.Event.PartUpdated, {
+          sessionID,
+          time: 0,
+          part: {
+            id: partID,
+            sessionID,
+            messageID,
+            type: "text",
+            text: "late orphan part",
+          } as SessionV1.TextPart,
+        })
+        .pipe(Effect.exit)
+
+      // Must not defect
+      expect(exit._tag).toBe("Success")
+
+      // Part row must NOT exist in PartTable
+      const row = yield* db.select().from(PartTable).where(eq(PartTable.id, partID)).get().pipe(Effect.orDie)
+      expect(row).toBeUndefined()
+    }),
+  )
+})
+
+describe("SessionProjector orphan-message tolerance", () => {
+  const it = testEffect(Layer.mergeAll(database, events, projector))
+  const sessionID = SessionV2.ID.make("ses_orphan_msg_test")
+  const messageID = SessionV1.MessageID.make("msg_orphan_session")
+
+  it.effect("does not throw and does not insert message when parent session is gone", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      // Create a session row, then delete it to simulate a removal cascade.
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "orphan-msg-test",
+          directory: "/project",
+          title: "orphan msg test",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+
+      const evts = yield* EventV2.Service
+
+      // Late MessageUpdated arrives after the parent session was deleted.
+      const exit = yield* evts
+        .publish(SessionV1.Event.MessageUpdated, {
+          sessionID,
+          info: {
+            id: messageID,
+            sessionID,
+            role: "user",
+            time: { created: 0 },
+            agent: "orchestrator",
+            model: { providerID: ProviderV2.ID.make("homelab"), modelID: ModelV2.ID.make("test/model") },
+          } as SessionV1.User,
+        })
+        .pipe(Effect.exit)
+
+      // Must not defect.
+      expect(exit._tag).toBe("Success")
+
+      // Message row must NOT exist in MessageTable.
+      const row = yield* db.select().from(MessageTable).where(eq(MessageTable.id, messageID)).get().pipe(Effect.orDie)
+      expect(row).toBeUndefined()
+    }),
+  )
+})
+
+describe("SessionProjector orphan session-scoped writes", () => {
+  const it = testEffect(Layer.mergeAll(database, events, projector))
+  const model = { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") }
+  const created = DateTime.makeUnsafe(0)
+
+  const seedAndDeleteSession = (id: SessionV2.ID) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id,
+          project_id: Project.ID.global,
+          slug: "orphan-scoped",
+          directory: "/project",
+          title: "orphan scoped",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db.delete(SessionTable).where(eq(SessionTable.id, id)).run().pipe(Effect.orDie)
+    })
+
+  it.effect("skips session_message append when parent session is gone", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionV2.ID.make("ses_orphan_smsg")
+      yield* seedAndDeleteSession(sessionID)
+      const { db } = yield* Database.Service
+      const evts = yield* EventV2.Service
+      const id = SessionMessage.ID.make("msg_orphan_append")
+
+      // Step.Started appends an assistant session_message via insertMessage.
+      const exit = yield* evts
+        .publish(SessionEvent.Step.Started, {
+          sessionID,
+          assistantMessageID: id,
+          timestamp: created,
+          agent: "build",
+          model,
+        })
+        .pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Success")
+      const row = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(row).toBeUndefined()
+    }),
+  )
+
+  it.effect("skips session_input admit when parent session is gone", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionV2.ID.make("ses_orphan_sinput")
+      yield* seedAndDeleteSession(sessionID)
+      const { db } = yield* Database.Service
+      const evts = yield* EventV2.Service
+      const id = SessionMessage.ID.make("msg_orphan_admit")
+
+      const exit = yield* SessionInput.admit(db, evts, {
+        id,
+        sessionID,
+        prompt: new Prompt({ text: "orphan admit" }),
+        delivery: "steer",
+      }).pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Success")
+      const row = yield* db
+        .select()
+        .from(SessionInputTable)
+        .where(eq(SessionInputTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(row).toBeUndefined()
     }),
   )
 })

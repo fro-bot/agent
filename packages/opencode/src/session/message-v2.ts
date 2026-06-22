@@ -22,6 +22,7 @@ import {
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { Database } from "@opencode-ai/core/database/database"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
 import { desc } from "drizzle-orm"
@@ -37,6 +38,8 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+
+export const node = LayerNode.group([Database.node])
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -529,30 +532,45 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   }
 })
 
-export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
-  for (const msg of msgs) {
-    result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+type CompactedScan = {
+  result: WithParts[]
+  completed: Set<string>
+  retain: MessageID | undefined
+  done: boolean
+}
+
+function compactedScan() {
+  return {
+    result: [] as WithParts[],
+    completed: new Set<string>(),
+    retain: undefined,
+    done: false,
+  } satisfies CompactedScan
+}
+
+function scanCompacted(scan: CompactedScan, msg: WithParts) {
+  scan.result.push(msg)
+  if (scan.retain) {
+    if (msg.info.id === scan.retain) scan.done = true
+    return
   }
-  result.reverse()
+  if (msg.info.role === "user" && scan.completed.has(msg.info.id)) {
+    const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+    if (!part) return
+    if (!part.tail_start_id) {
+      scan.done = true
+      return
+    }
+    scan.retain = part.tail_start_id
+    if (msg.info.id === scan.retain) scan.done = true
+    return
+  }
+  if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+    scan.completed.add(msg.info.parentID)
+}
+
+function finishCompactedScan(scan: CompactedScan) {
+  const result = scan.result.reverse()
   const compactionIndex = result.findLastIndex(
     (msg) =>
       msg.info.role === "user" &&
@@ -582,8 +600,36 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   return result
 }
 
+export function filterCompacted(msgs: Iterable<WithParts>) {
+  const scan = compactedScan()
+  for (const msg of msgs) {
+    scanCompacted(scan, msg)
+    if (scan.done) break
+  }
+  return finishCompactedScan(scan)
+}
+
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
-  return filterCompacted(yield* stream(sessionID))
+  const scan = compactedScan()
+  const size = 50
+  let before: string | undefined
+  while (!scan.done) {
+    const next = yield* page({ sessionID, limit: size, before }).pipe(
+      Effect.catchIf(NotFoundError.isInstance, () =>
+        Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
+      ),
+    )
+    if (next.items.length === 0) break
+    for (let i = next.items.length - 1; i >= 0; i--) {
+      const item = next.items[i]
+      if (!item) continue
+      scanCompacted(scan, item)
+      if (scan.done) break
+    }
+    if (scan.done || !next.more || !next.cursor) break
+    before = next.cursor
+  }
+  return finishCompactedScan(scan)
 })
 
 // filterCompacted reorders messages for model consumption
