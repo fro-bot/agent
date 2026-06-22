@@ -3,8 +3,11 @@
  *
  * Gate: OPENCODE_LIVE_PROBE=1 (skipped in normal CI)
  *
- * Proves the real harness consumer path (createOpencode → processEventStream →
- * arming → wait) works end-to-end against a stock isolated 1.17.9 server.
+ * Proves the real harness consumer path (createOpencode → event.subscribe →
+ * promptAsync → runPromptAttempt) works end-to-end against a stock isolated
+ * 1.17.9 server. The prompt is sent directly via promptAsync (not through the
+ * arming/startPrompt path); runPromptAttempt handles stream processing and the
+ * poll/v2-wait completion signal.
  *
  * Run: OPENCODE_LIVE_PROBE=1 pnpm vitest run src/features/agent/live-probe-1.17.9.test.ts
  */
@@ -126,6 +129,10 @@ function cleanupIsolatedEnv(env: IsolatedEnv): void {
 // Probe suite
 // ---------------------------------------------------------------------------
 
+// IMPORTANT: This suite MUST remain gated behind OPENCODE_LIVE_PROBE (describe.skipIf)
+// because createIsolatedEnv mutates global process.env (HOME, PATH, XDG_*) and restores
+// it in a finally block. Running concurrently with the normal suite (Vitest parallel
+// file execution) would cause env bleed into sibling test files.
 describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.9 live integration probe', {timeout: PROBE_TIMEOUT_MS}, () => {
   const logger = createLogger({component: 'probe'})
 
@@ -341,7 +348,7 @@ describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.9 live integration probe', {timeo
       //   a) resolve with a response (success or structured error)
       //   b) throw (ServiceUnavailableError or similar)
       // Either way, the harness poll-watchdog fallback handles it.
-      let waitResult: 'resolved' | 'threw' = 'threw'
+      let waitResult: 'resolved' | 'threw'
       let waitError: string | null = null
       let waitResponse: unknown = null
 
