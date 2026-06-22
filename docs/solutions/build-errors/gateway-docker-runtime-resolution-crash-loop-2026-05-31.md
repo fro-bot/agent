@@ -103,3 +103,4 @@ Inlining removes the bare `@fro-bot/runtime` specifier from `dist/main.mjs`, so 
 - Issue #707 (fixed by PR #708, `721f213`).
 - [Adding a Config-Declared Plugin to the Versioned Tool Pattern](../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md) — the same "verify how a dependency is actually resolved before copying a pattern" discipline, applied to workspace-package bundling.
 - [Tool Binary Caching Across Ephemeral Runners](./tool-binary-caching-ephemeral-runners.md) — related CI-hygiene angle; note that cache optimization does not address image-only packaging gaps.
+- [Committed-bundle attribution and SBOM hygiene](../workflow-issues/committed-dist-attribution-and-sbom-hygiene-2026-06-21.md) — the same "build a concrete invariant into the bundler, then let a CI self-check prove it" discipline, applied to a committed dist/ attribution file.
