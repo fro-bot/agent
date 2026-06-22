@@ -19,7 +19,14 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionRequest} from './coordinator.js'
-import type {ApprovalActor, ApprovalSideEffects, DecisionOutcome, RegisterParams, RenderFn} from './registry.js'
+import type {
+  ApprovalActor,
+  ApprovalSideEffects,
+  DecisionOutcome,
+  PendingApprovalDTO,
+  RegisterParams,
+  RenderFn,
+} from './registry.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -1093,5 +1100,249 @@ describe('hasPendingForScope', () => {
     // #when called with various inputs #then it returns a boolean and never throws
     expect(typeof registry.hasPendingForScope('')).toBe('boolean')
     expect(typeof registry.hasPendingForScope('any-scope')).toBe('boolean')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Scenario 10: describePendingForScope — full bounded DTO enumeration
+// ---------------------------------------------------------------------------
+
+describe('describePendingForScope', () => {
+  it('returns empty array when no entries exist for the scope', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+
+    const result = registry.describePendingForScope('scope_X')
+
+    expect(result).toEqual([])
+  })
+
+  it('returns empty array when entries exist for a different scope', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams({approvalScopeId: 'scope_A'}))
+
+    const result = registry.describePendingForScope('scope_B')
+
+    expect(result).toEqual([])
+  })
+
+  it('returns the DTO for a single open entry in the matching scope', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'bash'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    expect(result).toHaveLength(1)
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.requestID).toBe('per_1')
+    expect(dto.permission).toBe('bash')
+  })
+
+  it('returns only entries for the matching scope (not other scopes)', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'}),
+      }),
+    )
+    registry.register(
+      makeParams({
+        requestID: 'per_2',
+        sessionID: 'ses_2',
+        approvalScopeId: 'scope_B',
+        request: makeRequest({requestID: 'per_2', sessionID: 'ses_2'}),
+      }),
+    )
+
+    const resultA = registry.describePendingForScope('scope_A')
+    const resultB = registry.describePendingForScope('scope_B')
+
+    expect(resultA).toHaveLength(1)
+    expect((resultA[0] as PendingApprovalDTO).requestID).toBe('per_1')
+    expect(resultB).toHaveLength(1)
+    expect((resultB[0] as PendingApprovalDTO).requestID).toBe('per_2')
+  })
+
+  it('returns multiple concurrent open requests for the same scope', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', sessionID: 'ses_1'}),
+      }),
+    )
+    registry.register(
+      makeParams({
+        requestID: 'per_2',
+        sessionID: 'ses_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_2', sessionID: 'ses_1'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    expect(result).toHaveLength(2)
+    const ids = result.map(d => d.requestID)
+    expect(ids).toContain('per_1')
+    expect(ids).toContain('per_2')
+  })
+
+  it('includes bounded command field when the request has a command', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'bash', command: 'echo hello'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    expect(result).toHaveLength(1)
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.command).toBe('echo hello')
+    expect(dto.filepath).toBeUndefined()
+  })
+
+  it('includes bounded filepath field when the request has a filepath', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'external_directory', filepath: '/tmp/foo'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    expect(result).toHaveLength(1)
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.filepath).toBe('/tmp/foo')
+    expect(dto.command).toBeUndefined()
+  })
+
+  it('strips control characters from command/filepath (boundApprovalDetail applied)', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'bash', command: 'echo\u0000hello\u001Fworld'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.command).toBe('echohelloworld')
+  })
+
+  it('truncates oversized command to APPROVAL_DETAIL_MAX_LENGTH', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const oversized = 'x'.repeat(5000)
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'bash', command: oversized}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.command?.length).toBeLessThanOrEqual(4096)
+  })
+
+  it('does not include confirmed (already-settled) entries', async () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects = makeEffects()
+    registry.register(makeParams({approvalScopeId: 'scope_A', effects}))
+
+    await registry.applySettlement({requestID: 'per_1', decision: 'once', reason: 'replied'})
+
+    const result = registry.describePendingForScope('scope_A')
+    expect(result).toEqual([])
+  })
+
+  it('does NOT include claimed (mid-decision) entries — only open entries are actionable', async () => {
+    // #given a registry with one open and one claimed entry for the same scope
+    const registry = createApprovalRegistry({logger: makeLogger()})
+
+    // Entry A: open
+    registry.register(
+      makeParams({
+        requestID: 'per_open',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_open', permission: 'bash'}),
+      }),
+    )
+
+    // Entry B: claimed (decision in-flight — postReply held pending)
+    let resolveB!: (v: {ok: boolean}) => void
+    const replyPromiseB = new Promise<{ok: boolean}>(res => {
+      resolveB = res
+    })
+    const effectsB = makeEffects({postReply: vi.fn().mockReturnValue(replyPromiseB)})
+    registry.register(
+      makeParams({
+        requestID: 'per_claimed',
+        // Use scope_A so handleDecision can claim it (scope must match)
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_claimed', permission: 'edit'}),
+        effects: effectsB,
+      }),
+    )
+    // Transition per_claimed to claimed state (decision in-flight)
+    const claimPromise = registry.handleDecision({
+      requestID: 'per_claimed',
+      approvalScopeId: 'scope_A',
+      decision: 'once',
+      actor: makeActor(),
+    })
+
+    // #when describePendingForScope is called
+    const result = registry.describePendingForScope('scope_A')
+
+    // #then only the open entry is returned — claimed entry is excluded
+    expect(result).toHaveLength(1)
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.requestID).toBe('per_open')
+    // per_claimed must NOT appear
+    const claimedDto = result.find(d => d.requestID === 'per_claimed')
+    expect(claimedDto).toBeUndefined()
+
+    // Cleanup: resolve the in-flight reply
+    resolveB({ok: true})
+    await claimPromise
+  })
+
+  it('returns detail (not just IDs) — DTO has requestID, permission, and optional fields', () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(
+      makeParams({
+        requestID: 'per_1',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_1', permission: 'bash', command: 'ls -la'}),
+      }),
+    )
+
+    const result = registry.describePendingForScope('scope_A')
+
+    const dto = result[0] as PendingApprovalDTO
+    expect(typeof dto.requestID).toBe('string')
+    expect(typeof dto.permission).toBe('string')
+    expect(dto.command).toBe('ls -la')
   })
 })

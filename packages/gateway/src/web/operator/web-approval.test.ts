@@ -1,17 +1,28 @@
 /**
- * Tests for the web auto-deny approval transport.
+ * Tests for the web approval transport.
  *
  * Verifies that:
- * - The web createApprovalOnPending auto-denies with 'reject' immediately.
- * - It does NOT use the Discord approval transport.
- * - It does NOT hold (fire-and-forget, no await on the reply POST).
+ * - `onPending(req)` registers the entry in the approval registry with
+ *   `approvalScopeId = ctx.runId` (register-before-fan-out).
+ * - `onPending(req)` calls `observeApproval` with the bounded frame data.
+ * - `observeApproval` throwing is fail-soft: registration still happened,
+ *   no throw escapes `onPending`, a warn is logged.
+ * - Oversized command/filepath values are bounded before the frame is built.
+ * - The transport does NOT call any visible-output tracking methods.
  */
 
 import type {PermissionRequest} from '../../approvals/coordinator.js'
 import type {ApprovalRegistry} from '../../approvals/registry.js'
 import type {ApprovalTransportContext} from '../../execute/launch-types.js'
+import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
+import type {WebApprovalTransportDeps} from './web-approval.js'
 import {describe, expect, it, vi} from 'vitest'
-import {createWebAutoDenyApproval} from './web-approval.js'
+import {APPROVAL_DETAIL_MAX_LENGTH} from '../../approvals/approval-detail.js'
+import {createWebApprovalOnPending} from './web-approval.js'
+
+// ---------------------------------------------------------------------------
+// Stub factories
+// ---------------------------------------------------------------------------
 
 function makePermissionRequest(overrides?: Partial<PermissionRequest>): PermissionRequest {
   return {
@@ -32,6 +43,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     has: vi.fn(() => false),
     pending: vi.fn(() => []),
     hasPendingForScope: vi.fn(() => false),
+    describePendingForScope: vi.fn(() => []),
     handleDecision: vi.fn(async () => 'ok' as const),
     confirmReply: vi.fn(),
     applySettlement: vi.fn(async () => undefined),
@@ -64,102 +76,471 @@ function makeApprovalTransportContext(overrides?: Partial<ApprovalTransportConte
   }
 }
 
-describe('createWebAutoDenyApproval', () => {
-  describe('auto-deny behavior', () => {
-    it('calls postReplyFactory with the request sessionID', async () => {
+function makeDeps(overrides?: Partial<WebApprovalTransportDeps>): WebApprovalTransportDeps {
+  return {
+    observeApproval: vi.fn(),
+    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Happy path: register + observe
+// ---------------------------------------------------------------------------
+
+describe('createWebApprovalOnPending', () => {
+  describe('happy path: register-before-fan-out', () => {
+    it('registers the entry in the approval registry with approvalScopeId = ctx.runId', () => {
       // #given
       const ctx = makeApprovalTransportContext()
-      const req = makePermissionRequest({sessionID: 'sess-xyz'})
-      const factory = createWebAutoDenyApproval()
+      const deps = makeDeps()
+      const req = makePermissionRequest({requestID: 'req-abc', sessionID: 'sess-xyz'})
+      const factory = createWebApprovalOnPending(deps)
       const onPending = factory(ctx)
 
       // #when
       onPending(req)
 
-      // Allow the fire-and-forget to settle
-      await new Promise(resolve => setTimeout(resolve, 0))
+      // #then — registry.register called with approvalScopeId = ctx.runId
+      expect(ctx.approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          requestID: 'req-abc',
+          sessionID: 'sess-xyz',
+          approvalScopeId: 'run-uuid-1234',
+          directory: '/workspace/owner/repo',
+        }),
+      )
+    })
+
+    it('calls observeApproval with the bounded frame data (settled: false)', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({
+        requestID: 'req-abc',
+        permission: 'bash',
+        command: 'echo hello',
+      })
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — observeApproval called with the correct frame data
+      expect(deps.observeApproval).toHaveBeenCalledExactlyOnceWith('run-uuid-1234', {
+        requestID: 'req-abc',
+        permission: 'bash',
+        command: 'echo hello',
+        settled: false,
+      })
+    })
+
+    it('register is called BEFORE observeApproval (register-before-fan-out order)', () => {
+      // #given
+      const callOrder: string[] = []
+      const registry = makeApprovalRegistry()
+      ;(registry.register as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('register')
+      })
+      const ctx = makeApprovalTransportContext({approvalRegistry: registry})
+      const deps = makeDeps({
+        observeApproval: vi.fn(() => {
+          callOrder.push('observeApproval')
+        }),
+      })
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — register precedes observeApproval
+      expect(callOrder).toStrictEqual(['register', 'observeApproval'])
+    })
+
+    it('passes the postReplyFactory-derived postReply to the registry effects', () => {
+      // #given
+      const postReply = vi.fn(async () => ({ok: true as const}))
+      const postReplyFactory = vi.fn((_sessionID: string) => postReply)
+      const ctx = makeApprovalTransportContext({postReplyFactory})
+      const deps = makeDeps()
+      const req = makePermissionRequest({sessionID: 'sess-xyz'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
 
       // #then — postReplyFactory called with the request's sessionID
-      expect(ctx.postReplyFactory).toHaveBeenCalledWith('sess-xyz')
+      expect(postReplyFactory).toHaveBeenCalledWith('sess-xyz')
+      // registry.register received the effects with the postReply closure
+      const registerCall = (ctx.approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]
+      const registeredEffects = (registerCall as [{effects: {postReply: unknown}}])[0].effects
+      expect(registeredEffects.postReply).toBe(postReply)
     })
 
-    it('posts reject (deny) for the permission request', async () => {
-      // #given
-      const postReply = vi.fn(async () => ({ok: true as const}))
-      const postReplyFactory = vi.fn((_sessionID: string) => postReply)
-      const ctx = makeApprovalTransportContext({postReplyFactory})
-      const req = makePermissionRequest({requestID: 'req-abc', sessionID: 'sess-1'})
-      const factory = createWebAutoDenyApproval()
-      const onPending = factory(ctx)
-
-      // #when
-      onPending(req)
-
-      // Allow the fire-and-forget to settle
-      await new Promise(resolve => setTimeout(resolve, 0))
-
-      // #then — postReply called with requestID, directory, and 'reject'
-      expect(postReply).toHaveBeenCalledWith('req-abc', '/workspace/owner/repo', 'reject')
-    })
-
-    it('does NOT register in the approval registry (no Discord transport behavior)', () => {
+    it('includes filepath in the frame when the request has a filepath', () => {
       // #given
       const ctx = makeApprovalTransportContext()
-      const req = makePermissionRequest()
-      const factory = createWebAutoDenyApproval()
+      const deps = makeDeps()
+      const req = makePermissionRequest({
+        permission: 'external_directory',
+        filepath: '/some/path/file.ts',
+      })
+      const factory = createWebApprovalOnPending(deps)
       const onPending = factory(ctx)
 
       // #when
       onPending(req)
 
-      // #then — registry.register is NOT called (no Discord transport)
-      expect(ctx.approvalRegistry.register).not.toHaveBeenCalled()
+      // #then — filepath present in the frame (open frame, settled: false)
+      expect(deps.observeApproval).toHaveBeenCalledWith(
+        'run-uuid-1234',
+        expect.objectContaining({settled: false, filepath: '/some/path/file.ts'}),
+      )
     })
 
-    it('does NOT throw when the reply POST fails (fire-and-forget, best-effort)', async () => {
-      // #given — postReply rejects
-      const postReply = vi.fn(async () => {
-        throw new Error('network error')
-      })
-      const postReplyFactory = vi.fn((_sessionID: string) => postReply)
-      const ctx = makeApprovalTransportContext({postReplyFactory})
-      const req = makePermissionRequest()
-      const factory = createWebAutoDenyApproval()
-      const onPending = factory(ctx)
-
-      // #when / #then — no throw, even when the reply POST fails
-      expect(() => onPending(req)).not.toThrow()
-
-      // Allow the fire-and-forget to settle (and swallow the error)
-      await new Promise(resolve => setTimeout(resolve, 10))
-    })
-
-    it('handles multiple permission requests independently', async () => {
+    it('omits command and filepath from the frame when the request has neither', () => {
       // #given
-      const postReply = vi.fn(async () => ({ok: true as const}))
-      const postReplyFactory = vi.fn((_sessionID: string) => postReply)
-      const ctx = makeApprovalTransportContext({postReplyFactory})
-      const factory = createWebAutoDenyApproval()
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({permission: 'bash'})
+      // no command or filepath
+      const factory = createWebApprovalOnPending(deps)
       const onPending = factory(ctx)
 
-      // #when — two permission requests
-      onPending(makePermissionRequest({requestID: 'req-1', sessionID: 'sess-1'}))
-      onPending(makePermissionRequest({requestID: 'req-2', sessionID: 'sess-2'}))
+      // #when
+      onPending(req)
 
-      await new Promise(resolve => setTimeout(resolve, 0))
-
-      // #then — both are denied
-      expect(postReplyFactory).toHaveBeenCalledTimes(2)
-      expect(postReply).toHaveBeenCalledTimes(2)
-      expect(postReply).toHaveBeenCalledWith('req-1', ctx.directory, 'reject')
-      expect(postReply).toHaveBeenCalledWith('req-2', ctx.directory, 'reject')
+      // #then — neither command nor filepath in the frame (open frame, settled: false)
+      expect(deps.observeApproval).toHaveBeenCalledWith('run-uuid-1234', expect.objectContaining({settled: false}))
+      const capturedFrame = vi.mocked(deps.observeApproval).mock.calls.at(0)?.[1]
+      expect(capturedFrame).toBeDefined()
+      expect((capturedFrame as Extract<ApprovalFrameData, {settled: false}>).command).toBeUndefined()
+      expect((capturedFrame as Extract<ApprovalFrameData, {settled: false}>).filepath).toBeUndefined()
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // Edge: fail-soft observeApproval
+  // ---------------------------------------------------------------------------
+
+  describe('edge: observeApproval fail-soft', () => {
+    it('does NOT throw when observeApproval throws synchronously', () => {
+      // #given — observeApproval throws
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps({
+        observeApproval: vi.fn(() => {
+          throw new Error('SSE fan-out failed')
+        }),
+      })
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when / #then — no throw escapes onPending
+      expect(() => onPending(req)).not.toThrow()
+    })
+
+    it('still registers in the registry even when observeApproval throws', () => {
+      // #given — observeApproval throws
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps({
+        observeApproval: vi.fn(() => {
+          throw new Error('SSE fan-out failed')
+        }),
+      })
+      const req = makePermissionRequest({requestID: 'req-fail'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — registry.register was still called (registration happened before fan-out)
+      expect(ctx.approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({requestID: 'req-fail'}),
+      )
+    })
+
+    it('logs a warn when observeApproval throws', () => {
+      // #given — observeApproval throws
+      const ctx = makeApprovalTransportContext()
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const deps = makeDeps({
+        observeApproval: vi.fn(() => {
+          throw new Error('SSE fan-out failed')
+        }),
+        logger,
+      })
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — warn logged
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({runId: 'run-uuid-1234', requestID: 'req-123'}),
+        expect.stringContaining('observeApproval threw'),
+      )
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Edge: bounding applied to command/filepath
+  // ---------------------------------------------------------------------------
+
+  describe('edge: bounding applied to command and filepath', () => {
+    it('truncates an oversized command to APPROVAL_DETAIL_MAX_LENGTH in the frame', () => {
+      // #given — command exceeds the cap
+      const oversizedCommand = 'x'.repeat(APPROVAL_DETAIL_MAX_LENGTH + 100)
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({command: oversizedCommand})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — command in the frame is capped (open frame, settled: false)
+      expect(deps.observeApproval).toHaveBeenCalledOnce()
+      const capturedFrame1 = vi.mocked(deps.observeApproval).mock.calls.at(0)?.[1] as Extract<
+        ApprovalFrameData,
+        {settled: false}
+      >
+      expect(capturedFrame1.settled).toBe(false)
+      expect(capturedFrame1.command).toBeDefined()
+      expect(capturedFrame1.command?.length).toBe(APPROVAL_DETAIL_MAX_LENGTH)
+    })
+
+    it('strips control characters from command in the frame', () => {
+      // #given — command with embedded control chars
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({command: 'echo\u0000hello\u001Fworld'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — control chars stripped in the frame (open frame, settled: false)
+      expect(deps.observeApproval).toHaveBeenCalledWith(
+        'run-uuid-1234',
+        expect.objectContaining({settled: false, command: 'echohelloworld'}),
+      )
+    })
+
+    it('omits command from the frame when the bounded result is empty', () => {
+      // #given — command is only control chars (strips to empty)
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({command: '\u0000\u0001\u0002'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — command omitted from the frame (empty after bounding, open frame)
+      expect(deps.observeApproval).toHaveBeenCalledOnce()
+      const capturedFrame2 = vi.mocked(deps.observeApproval).mock.calls.at(0)?.[1] as Extract<
+        ApprovalFrameData,
+        {settled: false}
+      >
+      expect(capturedFrame2.settled).toBe(false)
+      expect(capturedFrame2.command).toBeUndefined()
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // No visible-output tracking
+  // ---------------------------------------------------------------------------
+
+  describe('no visible-output tracking', () => {
+    it('does NOT call markVisibleOutputPending or markVisibleOutputSent', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — no visible-output tracking calls
+      expect(ctx.replySink.markVisibleOutputPending).not.toHaveBeenCalled()
+      expect(ctx.replySink.markVisibleOutputSent).not.toHaveBeenCalled()
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Settle frame: attachMessage + renderFn (Oracle-required tests 1–4)
+  // ---------------------------------------------------------------------------
+
+  describe('settle frame: attachMessage wired for all settlement paths', () => {
+    it('calls attachMessage on the registry after register (Oracle test 1: settle frame wired)', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({requestID: 'req-settle'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — attachMessage called with the requestID and a renderFn
+      expect(ctx.approvalRegistry.attachMessage).toHaveBeenCalledExactlyOnceWith('req-settle', expect.any(Function))
+    })
+
+    it('renderFn emits settled:true SSE frame via observeApproval (Oracle test 1: confirmReply path)', async () => {
+      // #given — capture the renderFn passed to attachMessage
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-settle'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      // Extract the renderFn from the attachMessage call
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+      expect(renderFn).toBeDefined()
+
+      // #when — renderFn is called (simulating confirmReply settlement)
+      await renderFn?.(req, 'once', null, 'replied')
+
+      // #then — observeApproval emitted the settle frame (settled:true)
+      // The open frame was emitted first (call 1), settle frame is call 2
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-settle',
+        settled: true,
+      })
+    })
+
+    it('renderFn emits settle frame on deadline expiry (Oracle test 2: settleByDeadline path)', async () => {
+      // #given — capture the renderFn
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-deadline'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called with 'deadline' reason (simulating settleByDeadline)
+      await renderFn?.(req, 'reject', null, 'deadline')
+
+      // #then — settle frame emitted regardless of reason
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-deadline',
+        settled: true,
+      })
+    })
+
+    it('renderFn emits settle frame for cascade-rejected sibling (Oracle test 3: cascade path)', async () => {
+      // #given — capture the renderFn
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-cascade'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called with 'cascade' reason (simulating cascadeReject)
+      await renderFn?.(req, 'reject', null, 'cascade')
+
+      // #then — settle frame emitted for the cascade-rejected sibling
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-cascade',
+        settled: true,
+      })
+    })
+
+    it('renderFn settle frame is fail-soft: observeApproval throw is caught and logged (Oracle test 4)', async () => {
+      // #given — observeApproval throws on the settle call
+      let callCount = 0
+      const observeApproval = vi.fn(() => {
+        callCount++
+        if (callCount === 2) {
+          // Second call is the settle frame — throw to test fail-soft
+          throw new Error('SSE settle fan-out failed')
+        }
+      })
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps({observeApproval, logger})
+      const req = makePermissionRequest({requestID: 'req-settle-fail'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called; observeApproval throws on the settle call
+      // #then — renderFn does NOT throw (fail-soft)
+      await expect(renderFn?.(req, 'once', null, 'replied')).resolves.not.toThrow()
+
+      // #then — warn logged for the settle failure
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'req-settle-fail'}),
+        expect.stringContaining('renderFn settle-frame threw'),
+      )
+    })
+
+    it('attachMessage is called AFTER register (register-before-attachMessage order)', () => {
+      // #given
+      const callOrder: string[] = []
+      const registry = makeApprovalRegistry()
+      ;(registry.register as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('register')
+      })
+      ;(registry.attachMessage as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('attachMessage')
+      })
+      const ctx = makeApprovalTransportContext({approvalRegistry: registry})
+      const deps = makeDeps()
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — register precedes attachMessage
+      expect(callOrder[0]).toBe('register')
+      expect(callOrder[1]).toBe('attachMessage')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Factory shape
+  // ---------------------------------------------------------------------------
 
   describe('factory shape', () => {
     it('returns a function (createApprovalOnPending) that returns a callback (onPending)', () => {
       // #given
-      const factory = createWebAutoDenyApproval()
+      const deps = makeDeps()
+      const factory = createWebApprovalOnPending(deps)
 
       // #when
       const ctx = makeApprovalTransportContext()
@@ -168,6 +549,32 @@ describe('createWebAutoDenyApproval', () => {
       // #then — both are functions
       expect(typeof factory).toBe('function')
       expect(typeof onPending).toBe('function')
+    })
+
+    it('handles multiple permission requests independently', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when — two permission requests
+      onPending(makePermissionRequest({requestID: 'req-1', sessionID: 'sess-1', command: 'echo 1'}))
+      onPending(makePermissionRequest({requestID: 'req-2', sessionID: 'sess-2', command: 'echo 2'}))
+
+      // #then — both registered and observed
+      expect(ctx.approvalRegistry.register).toHaveBeenCalledTimes(2)
+      expect(deps.observeApproval).toHaveBeenCalledTimes(2)
+      expect(deps.observeApproval).toHaveBeenNthCalledWith(
+        1,
+        'run-uuid-1234',
+        expect.objectContaining({requestID: 'req-1', command: 'echo 1'}),
+      )
+      expect(deps.observeApproval).toHaveBeenNthCalledWith(
+        2,
+        'run-uuid-1234',
+        expect.objectContaining({requestID: 'req-2', command: 'echo 2'}),
+      )
     })
   })
 })

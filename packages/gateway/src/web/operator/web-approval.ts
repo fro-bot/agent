@@ -1,61 +1,158 @@
 /**
- * Web auto-deny approval transport for the launch route.
+ * Web approval transport for the launch route.
  *
- * Web launches have no interactive approval transport yet. Without an explicit
- * createApprovalOnPending, the engine would default to the Discord approval
- * transport — which posts to a non-existent thread and holds the repo lock until
- * the ~13m deadline, blocking ALL runs in that repo.
+ * Registers each tool-permission request in the approval registry and fans out
+ * an SSE approval frame so the operator can see and decide it.
  *
- * This module provides a web createApprovalOnPending that auto-denies every
- * tool permission request immediately (fail-fast, no lock hold, no Discord
- * transport, no cross-surface confusion).
+ * ### register-before-fan-out
  *
- * A web-launched run can therefore only complete work that needs no tool
- * approval. Tool-gated steps are denied and the run proceeds/fails accordingly.
+ * The registry entry is registered BEFORE the SSE frame is emitted. This
+ * ensures a decision can settle even if the SSE send is dropped — the registry
+ * is the authoritative fail-closed gate; the frame is advisory.
+ *
+ * ### fail-soft fan-out
+ *
+ * If `observeApproval` throws or rejects, the error is logged at warn level
+ * and swallowed. The registration already happened and the deadline still
+ * settles fail-closed.
+ *
+ * ### no visible-output claim
+ *
+ * The approval frame is a UI event, not agent output. This transport does NOT
+ * call `markVisibleOutputPending` or `markVisibleOutputSent` — those are
+ * Discord-specific concerns for the waiting-status message.
  */
 
-import type {PermissionRequest} from '../../approvals/coordinator.js'
+import type {PermissionReply, PermissionRequest, SettlementReason} from '../../approvals/coordinator.js'
+import type {ApprovalActor} from '../../approvals/registry.js'
 import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/launch-types.js'
+import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {OperatorLogger} from '../server.js'
+import {boundApprovalDetail} from '../../approvals/approval-detail.js'
 
 // ---------------------------------------------------------------------------
-// Web auto-deny createApprovalOnPending
+// Deps
+// ---------------------------------------------------------------------------
+
+export interface WebApprovalTransportDeps {
+  /**
+   * Fan-out function for approval frames. Mirrors the per-run closure wired
+   * at the launch route (same pattern as observeOutput).
+   *
+   * Called with the runId and the bounded ApprovalFrameData after the registry
+   * entry is registered. Fail-soft: errors are logged at warn and swallowed.
+   */
+  readonly observeApproval: (runId: string, data: ApprovalFrameData) => void
+  /** Structured logger. */
+  readonly logger: OperatorLogger
+}
+
+// ---------------------------------------------------------------------------
+// createWebApprovalOnPending
 // ---------------------------------------------------------------------------
 
 /**
- * Factory for the web auto-deny approval transport.
+ * Factory for the web approval transport.
  *
- * Returns a createApprovalOnPending function suitable for LaunchWorkRequest.
- * When the engine calls this factory with the ApprovalTransportContext, it
- * returns an onPending callback that immediately denies every PermissionRequest
- * by posting 'reject' via postReplyFactory.
+ * Returns a `createApprovalOnPending` function suitable for
+ * `LaunchWorkRequest.createApprovalOnPending`. When the engine calls this
+ * factory with the `ApprovalTransportContext`, it returns an `onPending`
+ * callback that:
  *
- * The deny is fire-and-forget: the callback does not await the reply POST
- * (the coordinator wraps it defensively). This ensures no lock hold and no
- * deadlock regardless of the reply POST outcome.
+ * 1. Registers the request in the approval registry with
+ *    `approvalScopeId = ctx.runId` (register-before-fan-out).
+ * 2. Calls `observeApproval(ctx.runId, boundDetail)` to fan out the SSE
+ *    approval frame, applying `boundApprovalDetail` to command/filepath.
  *
- * A logger may be provided to surface failed deny POSTs at warn level.
- * When absent, failed deny POSTs are silently swallowed (the coordinator's
- * deadline will eventually settle the entry fail-closed).
+ * The fan-out is fail-soft: if `observeApproval` throws, the error is logged
+ * at warn and swallowed. The registration already happened and the deadline
+ * still settles fail-closed.
  */
-export function createWebAutoDenyApproval(
-  logger?: OperatorLogger,
+export function createWebApprovalOnPending(
+  deps: WebApprovalTransportDeps,
 ): NonNullable<LaunchWorkRequest['createApprovalOnPending']> {
+  const {observeApproval, logger} = deps
+
   return (ctx: ApprovalTransportContext): ((request: PermissionRequest) => void) => {
     return (req: PermissionRequest): void => {
-      // Auto-deny: immediately reject the permission request.
-      // Fire-and-forget: do not await — the coordinator wraps defensively.
-      // 'reject' is the deny reply value (OpenCode PermissionReply enum).
-      const postReply = ctx.postReplyFactory(req.sessionID)
-      // eslint-disable-next-line no-void
-      void postReply(req.requestID, ctx.directory, 'reject').catch((error: unknown) => {
-        if (logger !== undefined) {
-          logger.warn(
-            {runId: ctx.runId, repo: ctx.repo, err: error instanceof Error ? error.message : String(error)},
-            'web-approval: auto-deny postReply failed (best-effort; coordinator deadline will settle fail-closed)',
-          )
-        }
+      const {requestID, sessionID} = req
+
+      // Per-request postReply closure — captures sessionID for the SDK call.
+      const postReplyForRequest = ctx.postReplyFactory(sessionID)
+
+      // register-before-fan-out: register the entry in the shared registry
+      // BEFORE emitting the SSE frame. This ensures a decision can settle
+      // even if the SSE send is dropped.
+      ctx.approvalRegistry.register({
+        requestID,
+        sessionID,
+        approvalScopeId: ctx.runId,
+        directory: ctx.directory,
+        request: req,
+        effects: {postReply: postReplyForRequest},
+        deadlineMs: ctx.approvalDeadlineMs,
       })
+
+      // Attach the settle/clear render function so the registry calls it on
+      // EVERY settlement path (confirmReply, settleByDeadline, failCloseNow,
+      // cascadeReject, applySettlement, disposeRun). The renderFn emits the
+      // settled:true SSE frame so the browser dismisses the approval prompt.
+      //
+      // Fail-soft: errors are logged at warn and swallowed — the settlement
+      // itself already happened; the frame is advisory.
+      ctx.approvalRegistry.attachMessage(
+        requestID,
+        async (
+          _permReq: PermissionRequest,
+          _decision: PermissionReply,
+          _actor: ApprovalActor | null,
+          _reason: SettlementReason,
+        ): Promise<void> => {
+          try {
+            observeApproval(ctx.runId, {requestID, settled: true})
+          } catch (error: unknown) {
+            logger.warn(
+              {
+                runId: ctx.runId,
+                requestID,
+                err: error instanceof Error ? error.message : String(error),
+              },
+              'web-approval: renderFn settle-frame threw (fail-soft; settlement already applied)',
+            )
+          }
+        },
+      )
+
+      // Build the bounded frame data. Apply boundApprovalDetail to command and
+      // filepath here — the caller (this transport) is responsible for bounding
+      // per the U2 contract.
+      const boundedCommand = boundApprovalDetail(req.command)
+      const boundedFilepath = boundApprovalDetail(req.filepath)
+
+      const frameData: ApprovalFrameData = {
+        requestID,
+        permission: req.permission,
+        ...(boundedCommand !== undefined && boundedCommand.length > 0 ? {command: boundedCommand} : {}),
+        ...(boundedFilepath !== undefined && boundedFilepath.length > 0 ? {filepath: boundedFilepath} : {}),
+        settled: false,
+      }
+
+      // Fan out the SSE approval frame. Fail-soft: if observeApproval throws,
+      // log at warn and continue — the registration already happened and the
+      // deadline still settles fail-closed.
+      try {
+        observeApproval(ctx.runId, frameData)
+      } catch (error: unknown) {
+        logger.warn(
+          {
+            runId: ctx.runId,
+            repo: ctx.repo,
+            requestID,
+            err: error instanceof Error ? error.message : String(error),
+          },
+          'web-approval: observeApproval threw (fail-soft; registry entry registered, deadline will settle)',
+        )
+      }
     }
   }
 }

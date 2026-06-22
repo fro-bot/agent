@@ -146,6 +146,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       has: vi.fn().mockReturnValue(false),
       pending: vi.fn().mockReturnValue([]),
       hasPendingForScope: vi.fn().mockReturnValue(false),
+      describePendingForScope: vi.fn().mockReturnValue([]),
       handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn(),
       attachMessage: vi.fn(),

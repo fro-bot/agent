@@ -21,9 +21,9 @@
 
 import type {AuditLogger} from '../audit.js'
 import type {OperatorAllowlist} from './allowlist.js'
-import type {RepoAuthzDeniedReason, RepoAuthzDeps, RepoAuthzLogger} from './repo-authz.js'
+import type {RepoAuthzDeniedReason, RepoAuthzDeps, RepoAuthzLogger, RepoWriteAuthzResult} from './repo-authz.js'
 import {describe, expect, it, vi, type Mock} from 'vitest'
-import {checkRepoAuthz, createRepoAuthzCache} from './repo-authz.js'
+import {checkRepoAuthz, checkRepoWriteAuthz, createRepoAuthzCache} from './repo-authz.js'
 
 // ---------------------------------------------------------------------------
 // Typed mock helpers (following audit.test.ts pattern)
@@ -1721,5 +1721,452 @@ describe('checkRepoAuthz — rate-limit strict numeric parsing', () => {
 
     // #then — cache expired after NEGATIVE_TTL_MS, second call made
     expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkRepoWriteAuthz — write-level authorization
+// ---------------------------------------------------------------------------
+
+/** Build a JSON Response body with a permissions object. */
+function makePermissionsResponse(
+  permissions: Record<string, boolean>,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
+  const body = JSON.stringify({id: 1, name: REPO, permissions})
+  return new Response(body, {
+    status,
+    headers: {'content-type': 'application/json', ...headers},
+  })
+}
+
+/** Build a fetch stub that returns a permissions body. */
+function makePermissionsFetch(permissions: Record<string, boolean>, status = 200): FetchMock {
+  return vi.fn<typeof globalThis.fetch>().mockResolvedValue(makePermissionsResponse(permissions, status))
+}
+
+function makeWriteDeps(overrides: Partial<RepoAuthzDeps> = {}): RepoAuthzDeps {
+  return {
+    allowlist: makeAllowlist([OPERATOR_ID]),
+    fetch: makePermissionsFetch({pull: true, push: true, maintain: false, admin: false, triage: false}),
+    clock: () => 0,
+    random: () => 0.5,
+    auditLogger: makeAuditLogger(),
+    logger: makeLogger(),
+    cache: createRepoAuthzCache(),
+    ...overrides,
+  }
+}
+
+describe('checkRepoWriteAuthz — happy path', () => {
+  it('returns {authorized:true, level:"write"} when push is true and admin is false', async () => {
+    // #given
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: true, maintain: false, admin: false, triage: false}),
+    })
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: true, level: 'write'})
+  })
+
+  it('returns {authorized:true, level:"admin"} when admin is true', async () => {
+    // #given
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: true, maintain: true, admin: true, triage: true}),
+    })
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: true, level: 'admin'})
+  })
+
+  it('admin:true takes precedence over push:true → level is "admin"', async () => {
+    // #given — both push and admin are true
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: true, maintain: false, admin: true, triage: false}),
+    })
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — admin wins
+    expect(result).toMatchObject({authorized: true, level: 'admin'})
+  })
+
+  it('calls GitHub repos API with correct URL and auth header', async () => {
+    // #given
+    const fetchSpy = makePermissionsFetch({pull: true, push: true, maintain: false, admin: false, triage: false})
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    const firstCall = fetchSpy.mock.calls[0]
+    if (firstCall === undefined) throw new Error('expected fetch to be called')
+    const [url, init] = firstCall
+    expect(url).toBe(`https://api.github.com/repos/${OWNER}/${REPO}`)
+    const headers = init?.headers as Record<string, string>
+    expect(headers.authorization).toBe(`Bearer ${TOKEN}`)
+  })
+
+  it('does not emit audit event on successful write authorization', async () => {
+    // #given
+    const auditLogger = makeAuditLogger()
+    const deps = makeWriteDeps({auditLogger})
+
+    // #when
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    const deniedCalls = auditLogger.warn.mock.calls.filter(c => c[0]?.kind === 'authz.denied')
+    expect(deniedCalls).toHaveLength(0)
+  })
+})
+
+describe('checkRepoWriteAuthz — insufficient_permission (read-only)', () => {
+  it('returns {authorized:false, reason:"insufficient_permission"} when only pull is true', async () => {
+    // #given — read-only operator: pull=true, push=false, admin=false
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: false, maintain: false, admin: false, triage: false}),
+    })
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('returns insufficient_permission when push and admin are both false', async () => {
+    // #given
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: false, push: false, maintain: false, admin: false, triage: false}),
+    })
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('emits authz.denied audit event with reason insufficient_permission', async () => {
+    // #given
+    const auditLogger = makeAuditLogger()
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: false, maintain: false, admin: false, triage: false}),
+      auditLogger,
+    })
+
+    // #when
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(auditLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining<Partial<{kind: string; githubUserId: number; reason: RepoAuthzDeniedReason}>>({
+        kind: 'authz.denied',
+        githubUserId: OPERATOR_ID,
+        reason: 'insufficient_permission',
+      }),
+      expect.stringContaining('audit:'),
+    )
+  })
+})
+
+describe('checkRepoWriteAuthz — defensive body parsing', () => {
+  it('returns insufficient_permission when permissions field is missing from body', async () => {
+    // #given — body without permissions field
+    const fetchSpy = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+      new Response(JSON.stringify({id: 1, name: REPO}), {
+        status: 200,
+        headers: {'content-type': 'application/json'},
+      }),
+    )
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — missing permissions → insufficient_permission (fail closed)
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('returns insufficient_permission when body is not valid JSON', async () => {
+    // #given — malformed JSON body
+    const fetchSpy = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(new Response('not-json', {status: 200, headers: {'content-type': 'application/json'}}))
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — malformed body → insufficient_permission (fail closed)
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('returns insufficient_permission when permissions is not an object', async () => {
+    // #given — permissions is a string, not an object
+    const fetchSpy = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+      new Response(JSON.stringify({id: 1, permissions: 'admin'}), {
+        status: 200,
+        headers: {'content-type': 'application/json'},
+      }),
+    )
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('returns insufficient_permission when permissions.push is not a boolean', async () => {
+    // #given — push is a string "true" not boolean true
+    const fetchSpy = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+      new Response(JSON.stringify({id: 1, permissions: {pull: true, push: 'true', admin: false}}), {
+        status: 200,
+        headers: {'content-type': 'application/json'},
+      }),
+    )
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — non-boolean push → insufficient_permission (strict boolean check)
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+
+  it('returns insufficient_permission when body is null JSON', async () => {
+    // #given — body is JSON null
+    const fetchSpy = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(new Response('null', {status: 200, headers: {'content-type': 'application/json'}}))
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'insufficient_permission'})
+  })
+})
+
+describe('checkRepoWriteAuthz — preserved denial reasons', () => {
+  it('returns not_allowlisted for non-allowlisted operator without GitHub call', async () => {
+    // #given
+    const fetchSpy = makePermissionsFetch({pull: true, push: true, admin: false})
+    const deps = makeWriteDeps({fetch: fetchSpy})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OTHER_OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'not_allowlisted'})
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('returns invalid_repo_name for malformed owner', async () => {
+    // #given
+    const deps = makeWriteDeps()
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, 'owner<script>', REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'invalid_repo_name'})
+    expect(deps.fetch).not.toHaveBeenCalled()
+  })
+
+  it('returns github_denied on 404 from GitHub', async () => {
+    // #given
+    const deps = makeWriteDeps({fetch: makeFetch(404)})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'github_denied'})
+  })
+
+  it('returns rate_limited on 429 with Retry-After', async () => {
+    // #given
+    const deps = makeWriteDeps({fetch: makeFetch(429, {'retry-after': '60'})})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'rate_limited'})
+  })
+
+  it('returns lookup_error on network failure', async () => {
+    // #given
+    const deps = makeWriteDeps({fetch: makeThrowingFetch(new Error('network error'))})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'lookup_error'})
+  })
+
+  it('returns lookup_error on 5xx', async () => {
+    // #given
+    const deps = makeWriteDeps({fetch: makeFetch(503)})
+
+    // #when
+    const result = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    expect(result).toMatchObject({authorized: false, reason: 'lookup_error'})
+  })
+})
+
+describe('checkRepoWriteAuthz — short TTL and distinct cache key', () => {
+  it('caches positive write-authz result for ~60 seconds (not 5 minutes)', async () => {
+    // #given — clock starts at 0; jitter=0 so TTL is exactly 60s
+    let now = 0
+    const cache = createRepoAuthzCache()
+    const fetchSpy = makePermissionsFetch({pull: true, push: true, admin: false})
+    const deps = makeWriteDeps({fetch: fetchSpy, clock: () => now, cache, random: () => 0})
+
+    // #when — first call
+    const result1 = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+    expect(result1).toMatchObject({authorized: true, level: 'write'})
+
+    // #when — 59 seconds later (within 60s TTL)
+    now = 59_000
+    const result2 = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — cached, only one GitHub call
+    expect(result2).toMatchObject({authorized: true, level: 'write'})
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-fetches after 60-second positive TTL expires', async () => {
+    // #given
+    let now = 0
+    const cache = createRepoAuthzCache()
+    const fetchSpy = makePermissionsFetch({pull: true, push: true, admin: false})
+    const deps = makeWriteDeps({fetch: fetchSpy, clock: () => now, cache, random: () => 0})
+
+    // #when — first call
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #when — 60 seconds + 1ms later (past TTL)
+    now = 60_000 + 1
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — two GitHub calls (TTL expired)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('write-level cache does not collide with read-level cache for same operator/repo/token', async () => {
+    // #given — shared cache instance
+    const cache = createRepoAuthzCache()
+    const readFetch = makeFetch(200)
+    const writeFetch = makePermissionsFetch({pull: true, push: true, admin: false})
+    const readDeps = makeDeps({fetch: readFetch, cache})
+    const writeDeps = makeWriteDeps({fetch: writeFetch, cache})
+
+    // #when — read-level check populates cache
+    const readResult = await checkRepoAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, readDeps)
+    expect(readResult.authorized).toBe(true)
+
+    // #when — write-level check on same operator/repo/token
+    const writeResult = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, writeDeps)
+
+    // #then — write check makes its own GitHub call (distinct cache key)
+    expect(writeResult).toMatchObject({authorized: true, level: 'write'})
+    expect(readFetch).toHaveBeenCalledTimes(1)
+    expect(writeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('write-level TTL is shorter than read-level TTL (60s vs 5min)', async () => {
+    // #given — both checks succeed; advance clock to 2 minutes
+    let now = 0
+    const cache = createRepoAuthzCache()
+    const readFetch = makeFetch(200)
+    const writeFetch = makePermissionsFetch({pull: true, push: true, admin: false})
+    const readDeps = makeDeps({fetch: readFetch, clock: () => now, cache, random: () => 0})
+    const writeDeps = makeWriteDeps({fetch: writeFetch, clock: () => now, cache, random: () => 0})
+
+    // #when — prime both caches
+    await checkRepoAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, readDeps)
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, writeDeps)
+
+    // #when — advance to 90 seconds (past write TTL of 60s, within read TTL of 5min)
+    now = 90_000
+    await checkRepoAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, readDeps)
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, writeDeps)
+
+    // #then — read still cached (1 call total), write re-fetched (2 calls total)
+    expect(readFetch).toHaveBeenCalledTimes(1)
+    expect(writeFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('write-level cache level field is preserved on cache hit', async () => {
+    // #given
+    let now = 0
+    const cache = createRepoAuthzCache()
+    const fetchSpy = makePermissionsFetch({pull: true, push: false, admin: true})
+    const deps = makeWriteDeps({fetch: fetchSpy, clock: () => now, cache})
+
+    // #when — first call (admin)
+    const result1 = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+    expect(result1).toMatchObject({authorized: true, level: 'admin'})
+
+    // #when — second call (cache hit)
+    now = 1_000
+    const result2 = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — level preserved from cache
+    expect(result2).toMatchObject({authorized: true, level: 'admin'})
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('audit event on write-level denial never includes token value', async () => {
+    // #given
+    const auditLogger = makeAuditLogger()
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: false, admin: false}),
+      auditLogger,
+    })
+
+    // #when
+    await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then
+    const serialized = serializeAuditCalls(auditLogger)
+    expect(serialized).not.toContain(TOKEN)
+    expect(serialized).not.toContain('ghp_')
+  })
+})
+
+describe('checkRepoWriteAuthz — RepoWriteAuthzResult type', () => {
+  it('result type carries level on authorized:true', async () => {
+    // #given
+    const deps = makeWriteDeps({
+      fetch: makePermissionsFetch({pull: true, push: true, admin: false}),
+    })
+
+    // #when
+    const result: RepoWriteAuthzResult = await checkRepoWriteAuthz(OPERATOR_ID, OWNER, REPO, TOKEN, deps)
+
+    // #then — TypeScript narrowing works
+    expect(result.authorized).toBe(true)
+    // Narrow for the type-level assertion; the expect above is the behavioral check.
+    const authorized = result as Extract<RepoWriteAuthzResult, {authorized: true}>
+    expect(['write', 'admin']).toContain(authorized.level)
   })
 })

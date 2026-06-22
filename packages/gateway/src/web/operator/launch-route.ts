@@ -41,6 +41,7 @@ import type {Hono} from 'hono'
 import type {RepoBinding} from '../../bindings/types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
+import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
@@ -53,7 +54,7 @@ import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
-import {createWebAutoDenyApproval} from './web-approval.js'
+import {createWebApprovalOnPending} from './web-approval.js'
 import {createWebReplySink, createWebStatusSink} from './web-sinks.js'
 
 // ---------------------------------------------------------------------------
@@ -127,13 +128,18 @@ export interface LaunchRouteDeps {
    */
   readonly perHrRateLimiter?: RateLimiter
   /**
-   * Run-observation manager for wiring the web ReplySink's output to the SSE
-   * run-stream. When present, append() pushes live deltas and flush() pushes
-   * the final answer frame via manager.observeOutput(runId, text, opts).
+   * Run-observation manager for wiring the web ReplySink's output and approval
+   * frames to the SSE run-stream.
+   *
+   * When present:
+   * - `observeOutput` pushes live output deltas and the final answer frame.
+   * - `observeApproval` fans out approval frames to subscribers.
+   *
    * When absent (e.g. in tests that don't exercise streaming), output is
-   * buffered but not streamed — the sink degrades gracefully to a no-op.
+   * buffered but not streamed — the sink degrades gracefully to a no-op, and
+   * approval frames are silently dropped.
    */
-  readonly runObservationManager?: Pick<RunObservationManager, 'observeOutput'>
+  readonly runObservationManager?: Pick<RunObservationManager, 'observeOutput' | 'observeApproval'>
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +327,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     }
 
     // ── Gate 11: Await launchWork admission ───────────────────────────────────
-    // Build the LaunchWorkRequest with web-specific sinks, auto-deny approval,
+    // Build the LaunchWorkRequest with web-specific sinks, real approval transport,
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.
     //
@@ -348,6 +354,18 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
         : (text: string, opts?: {final?: boolean; droppedCount?: number}): void =>
             manager.observeOutput(runId, text, opts)
 
+    // Mirror the observeOutput closure pattern: build a per-run observeApproval
+    // closure that captures runId and delegates to the manager. When the manager
+    // is absent (e.g. in tests that don't exercise streaming), approval frames
+    // are silently dropped — the registry registration still happens and the
+    // deadline still settles fail-closed.
+    const observeApproval =
+      manager === undefined
+        ? (_runId: string, _data: ApprovalFrameData): void => {
+            // No-op: manager absent (e.g. in tests that don't exercise streaming).
+          }
+        : (approvalRunId: string, data: ApprovalFrameData): void => manager.observeApproval(approvalRunId, data)
+
     const request = {
       promptText: promptField,
       runId,
@@ -358,7 +376,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       requester: operatorIdentity,
       statusSink: createWebStatusSink(),
       replySink: createWebReplySink({runId, observeOutput}),
-      createApprovalOnPending: createWebAutoDenyApproval(deps.logger),
+      createApprovalOnPending: createWebApprovalOnPending({observeApproval, logger: deps.logger}),
       promptBuilder: buildWebPrompt,
     }
 
