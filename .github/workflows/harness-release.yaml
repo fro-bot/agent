@@ -51,6 +51,7 @@ jobs:
       base_version: ${{ steps.render.outputs.base_version }}
       rendered_prompt: ${{ steps.render.outputs.rendered_prompt }}
       has_refs: ${{ steps.render.outputs.has_refs }}
+      carries: ${{ steps.render.outputs.carries }}
 
     steps:
       - name: Checkout harness repo
@@ -149,6 +150,16 @@ jobs:
           fi
           echo "has_refs=${HAS_REFS}" >> "$GITHUB_OUTPUT"
           echo "has_refs: ${HAS_REFS}"
+
+          # --- Emit carries: the comma-joined carry labels for the release notes ---
+          # Same set `harness patches` reports (the integrationRefs labels), e.g.
+          # "anomalyco/opencode#19961, anomalyco/opencode#31859, anomalyco/opencode#31638".
+          {
+            echo "carries<<EOF_CARRIES"
+            printf '%s\n' "${BRANCHES}"
+            echo "EOF_CARRIES"
+          } >> "$GITHUB_OUTPUT"
+          echo "carries: ${BRANCHES}"
 
           # --- Render the prompt template ---
           PROMPT_TPL=$(cat packages/harness/prompt.txt)
@@ -736,6 +747,8 @@ jobs:
           RELEASE_TAG: ${{ steps.params.outputs.release_tag }}
           BASE_VERSION: ${{ steps.params.outputs.base_version }}
           SHORT_SHA: ${{ steps.params.outputs.short_sha }}
+          # Comma-joined carry labels (the same set `harness patches` reports).
+          CARRIES: ${{ needs.prepare-integrate.outputs.carries }}
         run: |
           set -euo pipefail
           cd /tmp/harness-release-assets
@@ -756,11 +769,30 @@ jobs:
               --clobber
             echo "Assets re-uploaded (clobber) for: ${RELEASE_TAG}"
           else
+            # Build the release notes: a summary line plus a bulleted list of the
+            # carried upstream refs (one per comma-separated label).
+            NOTES_FILE="$(mktemp)"
+            {
+              printf '%s\n\n' "Harness build of OpenCode ${BASE_VERSION} (integration ${SHORT_SHA})."
+              if [ -n "${CARRIES:-}" ]; then
+                printf '%s\n' "### Carries"
+                IFS=','
+                for CARRY in ${CARRIES}; do
+                  TRIMMED="$(echo "${CARRY}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+                  [ -n "${TRIMMED}" ] && printf -- '- %s\n' "${TRIMMED}"
+                done
+                unset IFS
+              fi
+            } > "${NOTES_FILE}"
+
             # Quote the tag — it contains '+' which some shells/tools misinterpret.
+            # --latest=false: a harness release must never take GitHub's "latest"
+            # pointer from the product agent releases.
             echo "Creating GitHub Release: ${RELEASE_TAG}"
             gh release create "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
-              --notes "Harness build of OpenCode ${BASE_VERSION} (integration ${SHORT_SHA})." \
+              --notes-file "${NOTES_FILE}" \
+              --latest=false \
               opencode-linux-x64.tar.gz \
               opencode-linux-arm64.tar.gz \
               opencode-darwin-x64.zip \
