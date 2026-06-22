@@ -22,6 +22,7 @@
  */
 
 import type {ServerType} from '@hono/node-server'
+import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {RunIndex} from '../execute/run-index.js'
 import type {RunMentionDeps} from '../execute/run.js'
@@ -46,6 +47,7 @@ import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
+import {buildDecisionRoute} from './operator/decision-route.js'
 import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
 import {buildReposRoute} from './operator/repos-route.js'
@@ -200,6 +202,13 @@ export interface OperatorServerDeps {
    * When absent and the launch route is registered, a fresh in-memory guard is created.
    */
   readonly idempotencyGuard?: IdempotencyGuard
+  /**
+   * Approval registry for the decision route.
+   * When present (alongside the browser guard, runIndex, denylistCache, bindingsLookup,
+   * and auditLogger), POST /operator/runs/:runId/approvals/:requestId/decision is registered.
+   * When absent, the decision route is not registered (opt-in).
+   */
+  readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision'>
 }
 
 export interface OperatorServerConfig {
@@ -700,6 +709,61 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       // (e.g. in tests that don't exercise streaming), the sink degrades to a
       // buffering no-op. Mirrors the optional pattern used by buildRunStreamRoute.
       runObservationManager: deps.runObservationManager,
+    })
+  }
+
+  // ── Decision route ─────────────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND the approval
+  // registry, runIndex, denylistCache, bindingsLookup, and auditLogger are provided.
+  // Route: POST /operator/runs/:runId/approvals/:requestId/decision — privileged
+  //   (requires session + allowlist + CSRF; write-level repo authz).
+  //
+  // Gate ordering:
+  //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
+  //   2. Session token resolution
+  //   3. RunIndex.lookup (server-owned runId → repo resolution)
+  //   4. Split owner/repo
+  //   5. Denylist check (before authz, no oracle)
+  //   6. checkRepoWriteAuthz (WRITE-level — not read)
+  //   7. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
+  //   8. Build WebOperatorActor from session
+  //   9. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
+  //  10. Emit ApprovalDecisionEvent audit record
+  //  11. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
+  //
+  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // A gate throw degrades to the same denial, not a distinguishable 500.
+  // No continuous-authz lease — a decision is a single HTTP request.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.bindingsLookup !== undefined &&
+    deps.runIndex !== undefined &&
+    deps.approvalRegistry !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildDecisionRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      registry: deps.approvalRegistry,
+      auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      now: clock,
     })
   }
 
