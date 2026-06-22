@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-06-07"
-updated-by: "cbc7008"
+last-updated: "2026-06-21"
+updated-by: "aaaf91d"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -73,7 +73,9 @@ A lightweight guard against duplicate runs for the same entity within a configur
 
 ## 4. Acquire Lock
 
-When the S3 object store is enabled, the harness acquires a per-repo coordination lock (`src/harness/phases/acquire-lock.ts`) so that multiple surfaces — the GitHub Action and a future Discord gateway — cannot execute concurrently against the same repository. The lock is an S3 object (JSON `LockRecord`) written with conditional-put semantics (`If-None-Match: *` for initial acquisition).
+When the S3 object store is enabled, the harness acquires a per-repo coordination lock (`src/harness/phases/acquire-lock.ts`) so that multiple surfaces — the GitHub Action, the Discord gateway, and the [[Operator Web Control Surface|operator web surface]] — cannot execute concurrently against the same repository. The lock is an S3 object (JSON `LockRecord`) written with conditional-put semantics (`If-None-Match: *` for initial acquisition).
+
+The lock config carries two staleness thresholds. The ordinary stale threshold governs takeover of a lock held by a _running_ surface that stopped heartbeating, while a separate **pending** stale threshold (`pendingStaleThresholdMs`) governs runs that were admitted but never progressed. This second threshold exists because the gateway now records queued and failed runs through the same admission path, so a run that is reserved but stuck must eventually become reclaimable without waiting out the full running-lease TTL. Both the acquire and cleanup phases pass this threshold so the two surfaces agree on when a pending lock may be taken over.
 
 The lock result is a discriminated union with four outcomes:
 

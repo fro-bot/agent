@@ -130,6 +130,7 @@ The harness base-version site was added to the `versioned-tool` skill inventory 
 
 ## Related
 
+- `docs/solutions/workflow-issues/committed-dist-attribution-and-sbom-hygiene-2026-06-21.md` — applies the same meta-rule (remove the exception that can drift, don't add a drift-detection check) to a CI dist-diff carve-out exempting a generated notice file.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — the single-source version pattern and Renovate `customManager` wiring for a config-declared plugin. Same prevention discipline (single source, track the consumed value), different root cause (plugin-config wiring vs. a Renovate-tracked dead sentinel). Consider reading both together when touching version management.
 - PR #867 — the fix (delete sentinel, retarget Renovate, remove provenance literals, inventory the site).
 - PR #866 — the Renovate bump against the soon-deleted sentinel, closed as moot; the concrete symptom of tracking the wrong file.
