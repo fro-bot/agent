@@ -4,9 +4,10 @@
     "composite": true,
     "tsBuildInfoFile": "./node_modules/.cache/tsconfig.tsbuildinfo",
     "rootDir": "../../src",
+    "allowImportingTsExtensions": true,
     "noEmit": true
   },
   "references": [{"path": "../../packages/runtime"}],
-  "include": ["../../src/**/*.ts", "../../tsdown.config.ts", "../../eslint.config.ts"],
+  "include": ["../../src/**/*.ts", "../../tsdown.config.ts", "../../eslint.config.ts", "../../scripts/**/*.ts"],
   "exclude": ["../../dist", "../../node_modules"]
 }

@@ -5,6 +5,7 @@ import {join} from 'node:path'
 import {promisify} from 'node:util'
 import {getProjectLicenses} from 'generate-license-file'
 import {defineConfig} from 'tsdown'
+import {BINARY_EXTENSIONS, HIDDEN_UNICODE_REPLACE_RE, HIDDEN_UNICODE_TEST_RE} from './scripts/dist-hidden-unicode.ts'
 
 function parsePackageName(dep: string): string {
   const name = dep.split('@').find(Boolean) ?? ''
@@ -123,31 +124,6 @@ function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
   return map
 }
 
-// Character class mirrors renovatebot/renovate's `lib/util/unicode.ts`. The
-// `/g`-flagged instance is for `.replaceAll`; the unflagged one is for the
-// per-file guard, since stateful regexes leak `lastIndex` across concurrent
-// `Promise.all` iterations and silently skip matches.
-const HIDDEN_UNICODE_TEST_RE =
-  /[\u00A0\u00AD\u1680\u2000-\u200C\u200E\u200F\u2028\u2029\u202A-\u202F\u205F\u3000\uFEFF]/
-const HIDDEN_UNICODE_RE = /[\u00A0\u00AD\u1680\u2000-\u200C\u200E\u200F\u2028\u2029\u202A-\u202F\u205F\u3000\uFEFF]/g
-
-const BINARY_EXTENSIONS = new Set([
-  'br',
-  'gif',
-  'gz',
-  'ico',
-  'jpeg',
-  'jpg',
-  'otf',
-  'pdf',
-  'png',
-  'tar',
-  'ttf',
-  'woff',
-  'woff2',
-  'zip',
-])
-
 function escapeHiddenUnicodePlugin(): Plugin {
   return {
     name: 'escape-hidden-unicode',
@@ -163,7 +139,9 @@ function escapeHiddenUnicodePlugin(): Plugin {
           const path = join(dir, entry.name)
           const content = await readFile(path, 'utf8')
           if (!HIDDEN_UNICODE_TEST_RE.test(content)) return
-          const fixed = content.replaceAll(HIDDEN_UNICODE_RE, char => {
+          // Fresh /g regex per file to avoid lastIndex leakage across concurrent Promise.all iterations
+          const re = new RegExp(HIDDEN_UNICODE_REPLACE_RE.source, 'g')
+          const fixed = content.replaceAll(re, char => {
             const code = char.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')
             return String.raw`\u${code}`
           })
