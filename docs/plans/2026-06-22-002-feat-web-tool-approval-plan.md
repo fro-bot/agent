@@ -139,7 +139,7 @@ operator decides (write-authz)                                             [Unit
 
 ## Implementation Units
 
-- [ ] **Unit 1: Surface command/filepath on PermissionRequest + escaping helper**
+- [x] **Unit 1: Surface command/filepath on PermissionRequest + escaping helper**
 
 **Goal:** Carry the gated `command`/`filepath` through to the transport, bounded and escaped.
 
@@ -164,7 +164,7 @@ operator decides (write-authz)                                             [Unit
 
 **Verification:** `PermissionRequest` carries `command`/`filepath` when present; the bound helper caps + escapes; existing coordinator tests still pass.
 
-- [ ] **Unit 2: SSE ApprovalFrame + observeApproval (contract bump)**
+- [x] **Unit 2: SSE ApprovalFrame + observeApproval (contract bump)**
 
 **Goal:** Deliver the pending request to the browser as a new SSE frame and a settle/clear frame, with terminal-drain safety.
 
@@ -193,7 +193,7 @@ operator decides (write-authz)                                             [Unit
 
 **Verification:** New frame type compiles through the exhaustiveness guard; contract version bumped; terminal-drain ordering holds; existing SSE tests pass.
 
-- [ ] **Unit 3: Write-level repo authz + audit enum**
+- [x] **Unit 3: Write-level repo authz + audit enum**
 
 **Goal:** A revocation-safe write/admin authz check distinct from the read check, and audit fidelity for once/always/reject.
 
@@ -217,7 +217,7 @@ operator decides (write-authz)                                             [Unit
 
 **Verification:** `checkRepoWriteAuthz` distinguishes read/write/admin with a short TTL; audit preserves once/always/reject; read-path authz unchanged.
 
-- [ ] **Unit 4: Web approval transport (swap auto-deny)**
+- [x] **Unit 4: Web approval transport (swap auto-deny)**
 
 **Goal:** Hand the engine a real `createApprovalOnPending` that registers + fans out the frame; delete the auto-deny path.
 
@@ -241,7 +241,7 @@ operator decides (write-authz)                                             [Unit
 
 **Verification:** The launch route uses the real transport; auto-deny is deleted; registration precedes fan-out.
 
-- [ ] **Unit 5: Decision route (POST once/always/reject)**
+- [x] **Unit 5: Decision route (POST once/always/reject)**
 
 **Goal:** The privileged write-gated route that settles a decision through the registry.
 
@@ -269,7 +269,7 @@ operator decides (write-authz)                                             [Unit
 
 **Verification:** A write-authorized decision settles the run's request; read-only is denied; cross-scope/stale are no-ops; tested through the real route.
 
-- [ ] **Unit 6: GET pending-approvals reconciliation endpoint**
+- [x] **Unit 6: GET pending-approvals reconciliation endpoint**
 
 **Goal:** A read-gated enumeration route so a reconnecting browser recovers open requests, with no existence oracle.
 
