@@ -178,12 +178,15 @@ post.ts → harness/post.ts
 ## COMMANDS
 
 ```bash
-pnpm install        # Install dependencies
-pnpm test           # Run all tests (vitest)
-pnpm lint           # ESLint check
-pnpm fix            # ESLint auto-fix
-pnpm check-types    # TypeScript type check (tsc --noEmit)
-pnpm build          # Type check + bundle to dist/ (must stay in sync)
+pnpm install                          # Install dependencies
+pnpm test                             # Run workspace + scripts/ tests (vitest from repo root)
+pnpm run test:scripts                 # Run only scripts/ tests
+pnpm lint                             # ESLint check (also checks the committed dist/ for hidden Unicode)
+pnpm fix                              # ESLint auto-fix
+pnpm check-types                      # TypeScript type check (tsc --noEmit)
+pnpm build                            # Type check + bundle to dist/ (also scrubs dist/ hidden Unicode)
+pnpm run dist:escape-hidden-unicode   # Scrub hidden Unicode from dist/ (run by build)
+pnpm run dist:check-hidden-unicode    # Verify dist/ has no raw hidden Unicode (lint checks committed dist/; the CI Build job checks freshly built dist/)
 ```
 
 ## NOTES

@@ -165,7 +165,9 @@
     },
   ],
   postUpgradeTasks: {
-    commands: ['pnpm install', 'pnpm run build', 'pnpm run fix'],
+    // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
+    // update branches stays free of characters Renovate would otherwise flag.
+    commands: ['pnpm install', 'pnpm run fix', 'pnpm run build'],
     executionMode: 'branch',
   },
 }
