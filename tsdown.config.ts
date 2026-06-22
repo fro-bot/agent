@@ -174,21 +174,48 @@ function escapeHiddenUnicodePlugin(): Plugin {
   }
 }
 
+export interface LicenseEntry {
+  readonly version: string
+  readonly license: string
+  readonly content: string
+}
+
+/**
+ * Formats collected license entries into the THIRD_PARTY_NOTICES output string.
+ * Sorts by package name (locale-aware), normalizes line endings to LF.
+ * Exported for unit testing.
+ *
+ * Attribution keeps the highest resolved version's license text per package.
+ * This is safe when the license text is identical across resolved versions of
+ * the same package, which holds for the vast majority of npm packages. The CI
+ * CycloneDX SBOM (pnpm sbom) is the complete per-version inventory.
+ */
+export function formatThirdPartyNotices(entries: ReadonlyMap<string, LicenseEntry>): string {
+  return Array.from(entries.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, {version, license, content}]) => `${name}@${version}\n${license}\n${content}`)
+    .join('\n\n')
+    .replaceAll('\r\n', '\n')
+}
+
 function licenseCollectorPlugin(): Plugin {
   return {
     name: 'license-collector',
     async writeBundle() {
-      const highestVersions = new Map<string, {version: string; license: string; content: string}>()
+      const highestVersions = new Map<string, LicenseEntry>()
       const licenseTypeMap = buildLicenseTypeMap(await getPnpmLicensesJson())
 
+      // Fail closed: license collection reads resolved license text from installed
+      // node_modules, so a total failure here means the notice would be incomplete.
+      // Throw rather than write nothing (a missing per-dependency license is handled
+      // by generate-license-file and does not reach this catch).
       let licenses: Awaited<ReturnType<typeof getProjectLicenses>>
       try {
         licenses = await getProjectLicenses('./package.json')
       } catch (error) {
-        console.warn(
-          `[license-collector] getProjectLicenses failed (${error instanceof Error ? error.message : String(error)}); preserving existing licenses.txt`,
+        throw new Error(
+          `[license-collector] license collection failed; cannot produce THIRD_PARTY_NOTICES.txt: ${error instanceof Error ? error.message : String(error)}`,
         )
-        return
       }
 
       for (const license of licenses) {
@@ -203,7 +230,6 @@ function licenseCollectorPlugin(): Plugin {
               highestVersions.set(pkgName, {
                 version,
                 license: licenseType,
-
                 content: license.content,
               })
             }
@@ -211,12 +237,7 @@ function licenseCollectorPlugin(): Plugin {
         }
       }
 
-      const output = Array.from(highestVersions.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([name, {version, license, content}]) => `${name}@${version}\n${license}\n${content}`)
-        .join('\n\n')
-
-      await writeFile('dist/licenses.txt', output.replaceAll('\r\n', '\n'))
+      await writeFile('dist/THIRD_PARTY_NOTICES.txt', formatThirdPartyNotices(highestVersions))
     },
   }
 }
