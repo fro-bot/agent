@@ -27,6 +27,7 @@ export type AuthzDeniedReason =
   | 'github_denied'
   | 'rate_limited'
   | 'lookup_error'
+  | 'insufficient_permission'
   | 'unknown'
 
 /** Safe reasons for launch rejection. */
@@ -123,8 +124,12 @@ export interface ApprovalDecisionEvent {
   readonly correlationId: string
   readonly githubUserId: number
   readonly requestId: string
-  /** Pass-through enum: 'approve' | 'deny' — never a free-form string. */
-  readonly decision: 'approve' | 'deny'
+  /**
+   * Pass-through enum: 'once' | 'always' | 'reject' — never a free-form string.
+   * 'always' is the higher-blast-radius grant (persists as an OpenCode always-rule).
+   * 'once' approves for this request only. 'reject' denies.
+   */
+  readonly decision: 'once' | 'always' | 'reject'
 }
 
 /** Approval submission rejected (already claimed, not found, etc.). */

@@ -544,7 +544,7 @@ describe('emitAudit — approval.decision', () => {
       correlationId: 'corr-009',
       githubUserId: 42,
       requestId: 'req-abc',
-      decision: 'approve',
+      decision: 'once',
     }
 
     // #when
@@ -559,7 +559,7 @@ describe('emitAudit — approval.decision', () => {
       correlationId: 'corr-009',
       githubUserId: 42,
       requestId: 'req-abc',
-      decision: 'approve',
+      decision: 'once',
     })
   })
 
@@ -579,7 +579,7 @@ describe('emitAudit — approval.decision', () => {
         correlationId: planted,
         githubUserId: 42,
         requestId: planted,
-        decision: 'deny',
+        decision: 'reject',
       }
 
       // #when
@@ -982,6 +982,176 @@ describe('emitAudit — browser.guard.rejected', () => {
       assertNoSensitiveValues(logger)
       expect(serializeAllCalls(logger)).toContain('fetch_site_cross_site')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// approval.decision — extended decision enum (once | always | reject)
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — approval.decision with once/always/reject', () => {
+  it('emits a structured info record with decision:"once"', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.decision',
+      correlationId: 'corr-once',
+      githubUserId: 42,
+      requestId: 'req-once',
+      decision: 'once',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: approval.decision')
+    expect(firstCallCtx(logger.info)).toMatchObject({
+      kind: 'approval.decision',
+      decision: 'once',
+      requestId: 'req-once',
+    })
+  })
+
+  it('emits a structured info record with decision:"always"', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.decision',
+      correlationId: 'corr-always',
+      githubUserId: 42,
+      requestId: 'req-always',
+      decision: 'always',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({decision: 'always'})
+  })
+
+  it('emits a structured info record with decision:"reject"', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'approval.decision',
+      correlationId: 'corr-reject',
+      githubUserId: 42,
+      requestId: 'req-reject',
+      decision: 'reject',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({decision: 'reject'})
+  })
+
+  it('"always" and "once" emit distinctly (different decision field values)', () => {
+    // #given
+    const loggerOnce = makeLogger()
+    const loggerAlways = makeLogger()
+    const eventOnce: AuditEvent = {
+      kind: 'approval.decision',
+      correlationId: 'corr-d1',
+      githubUserId: 42,
+      requestId: 'req-d1',
+      decision: 'once',
+    }
+    const eventAlways: AuditEvent = {
+      kind: 'approval.decision',
+      correlationId: 'corr-d2',
+      githubUserId: 42,
+      requestId: 'req-d2',
+      decision: 'always',
+    }
+
+    // #when
+    emitAudit(eventOnce, loggerOnce)
+    emitAudit(eventAlways, loggerAlways)
+
+    // #then — decision values are distinct
+    expect(firstCallCtx(loggerOnce.info)).toMatchObject({decision: 'once'})
+    expect(firstCallCtx(loggerAlways.info)).toMatchObject({decision: 'always'})
+    expect(firstCallCtx(loggerOnce.info).decision).not.toBe(firstCallCtx(loggerAlways.info).decision)
+  })
+
+  it('redacts sensitive values in correlationId and requestId for all new decision values', () => {
+    // #given
+    for (const decision of ['once', 'always', 'reject'] as const) {
+      for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET]) {
+        const logger = makeLogger()
+        const event: AuditEvent = {
+          kind: 'approval.decision',
+          correlationId: planted,
+          githubUserId: 42,
+          requestId: planted,
+          decision,
+        }
+
+        // #when
+        emitAudit(event, logger)
+
+        // #then
+        assertNoSensitiveValues(logger)
+        // decision enum value must survive
+        expect(serializeAllCalls(logger)).toContain(decision)
+      }
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// authz.denied — insufficient_permission reason
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — authz.denied with insufficient_permission', () => {
+  it('emits a structured warn record with reason:"insufficient_permission"', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'authz.denied',
+      correlationId: 'corr-insuf',
+      githubUserId: 42,
+      reason: 'insufficient_permission',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toMatchObject({
+      kind: 'authz.denied',
+      reason: 'insufficient_permission',
+    })
+  })
+
+  it('reason enum "insufficient_permission" survives redaction', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'authz.denied',
+      correlationId: PLANTED_TOKEN,
+      githubUserId: 42,
+      reason: 'insufficient_permission',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    assertNoSensitiveValues(logger)
+    expect(serializeAllCalls(logger)).toContain('insufficient_permission')
   })
 })
 
