@@ -43,6 +43,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     has: vi.fn(() => false),
     pending: vi.fn(() => []),
     hasPendingForScope: vi.fn(() => false),
+    describePendingForScope: vi.fn(() => []),
     handleDecision: vi.fn(async () => 'ok' as const),
     confirmReply: vi.fn(),
     applySettlement: vi.fn(async () => undefined),

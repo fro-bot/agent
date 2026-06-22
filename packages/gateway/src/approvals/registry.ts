@@ -47,10 +47,39 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {OperatorIdentity} from '../operator-contract/identity.js'
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
+import {boundApprovalDetail} from './approval-detail.js'
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/**
+ * Bounded DTO for a single pending approval request.
+ *
+ * Returned by `describePendingForScope` for the GET pending-approvals endpoint.
+ * Mirrors the open variant of `ApprovalFrameData` (minus the `settled` discriminant)
+ * so the browser can reconstruct the approval prompt from either the SSE frame or
+ * this enumeration response.
+ *
+ * `command` and `filepath` are already bounded (length-capped + control-char-stripped)
+ * by `boundApprovalDetail` before being placed here — safe for direct JSON serialisation.
+ */
+export interface PendingApprovalDTO {
+  /** The unique request identifier — matches the registry entry. */
+  readonly requestID: string
+  /** Gate category, e.g. `bash`, `external_directory`, `edit`. */
+  readonly permission: string
+  /**
+   * Bounded command string (for `bash` gates). Present only when the engine
+   * supplied it and the value is non-empty after bounding.
+   */
+  readonly command?: string
+  /**
+   * Bounded filepath string (for `external_directory`/`edit` gates). Present
+   * only when the engine supplied it and the value is non-empty after bounding.
+   */
+  readonly filepath?: string
+}
 
 // ---------------------------------------------------------------------------
 // ApprovalActor — transport-neutral actor/operator identity
@@ -171,6 +200,19 @@ export interface ApprovalRegistry {
    * Boolean only — does not expose entry contents.
    */
   hasPendingForScope: (approvalScopeId: string) => boolean
+  /**
+   * Returns the full bounded detail for each open or claimed request in the
+   * given `approvalScopeId`. Used by the GET pending-approvals endpoint to
+   * recover open requests for a reconnecting browser.
+   *
+   * Returns an empty array when no open/claimed entries exist for the scope.
+   * The returned DTOs carry bounded (length-capped + control-char-stripped)
+   * `command` and `filepath` values — safe for direct JSON serialisation.
+   *
+   * Does NOT expose entry contents to unauthorised callers — the route layer
+   * is responsible for authorisation before calling this method.
+   */
+  describePendingForScope: (approvalScopeId: string) => readonly PendingApprovalDTO[]
   /**
    * Transport-neutral decision intake: enforce scope binding, single-winner
    * claim, POST reply. Does NOT edit the embed/notification.
@@ -445,6 +487,26 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     return false
   }
 
+  function describePendingForScope(approvalScopeId: string): readonly PendingApprovalDTO[] {
+    const result: PendingApprovalDTO[] = []
+    for (const [requestID, entry] of entries) {
+      if (entry.approvalScopeId !== approvalScopeId) continue
+      if (entry.state !== 'open' && entry.state !== 'claimed') continue
+
+      const command = boundApprovalDetail(entry.request.command)
+      const filepath = boundApprovalDetail(entry.request.filepath)
+
+      const dto: PendingApprovalDTO = {
+        requestID,
+        permission: entry.request.permission,
+        ...(command !== undefined && command.length > 0 ? {command} : {}),
+        ...(filepath !== undefined && filepath.length > 0 ? {filepath} : {}),
+      }
+      result.push(dto)
+    }
+    return result
+  }
+
   // -------------------------------------------------------------------------
   // handleDecision (transport-neutral decision intake)
   // -------------------------------------------------------------------------
@@ -708,6 +770,7 @@ export function createApprovalRegistry(deps: {readonly logger: GatewayLogger}): 
     has,
     pending,
     hasPendingForScope,
+    describePendingForScope,
     handleDecision,
     confirmReply,
     applySettlement,

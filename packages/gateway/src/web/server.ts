@@ -50,6 +50,7 @@ import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteG
 import {buildDecisionRoute} from './operator/decision-route.js'
 import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
+import {buildPendingApprovalsRoute} from './operator/pending-approvals-route.js'
 import {buildReposRoute} from './operator/repos-route.js'
 import {
   badRequestResponse,
@@ -203,12 +204,14 @@ export interface OperatorServerDeps {
    */
   readonly idempotencyGuard?: IdempotencyGuard
   /**
-   * Approval registry for the decision route.
+   * Approval registry for the decision and pending-approvals routes.
    * When present (alongside the browser guard, runIndex, denylistCache, bindingsLookup,
-   * and auditLogger), POST /operator/runs/:runId/approvals/:requestId/decision is registered.
-   * When absent, the decision route is not registered (opt-in).
+   * and auditLogger), the following routes are registered:
+   *   - POST /operator/runs/:runId/approvals/:requestId/decision (write-gated)
+   *   - GET  /operator/runs/:runId/approvals (read-gated, enumeration)
+   * When absent, neither route is registered (opt-in).
    */
-  readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision'>
+  readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision' | 'describePendingForScope'>
 }
 
 export interface OperatorServerConfig {
@@ -762,6 +765,57 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       },
       registry: deps.approvalRegistry,
       auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Pending-approvals route ────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND the approval
+  // registry, runIndex, denylistCache, and bindingsLookup are provided.
+  // Route: GET /operator/runs/:runId/approvals — privileged (requires session + allowlist).
+  //   Read-level repo authz (observing/reconnecting needs only read access).
+  //
+  // Gate ordering:
+  //   1. Guard (browser/session/allowlist) — installed above (GET → requireCsrf=false)
+  //   2. Session token resolution
+  //   3. RunIndex.lookup (server-owned runId → repo resolution)
+  //   4. Split owner/repo
+  //   5. Denylist check (before authz, no oracle)
+  //   6. checkRepoAuthz (READ-level — not write)
+  //   7. Per-operator rate limit (operator-keyed)
+  //   8. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
+  //
+  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // A gate throw degrades to the same denial, not a distinguishable 500.
+  // An authorized operator with no open requests returns 200 {approvals: []}.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.bindingsLookup !== undefined &&
+    deps.runIndex !== undefined &&
+    deps.approvalRegistry !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildPendingApprovalsRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      registry: deps.approvalRegistry,
       logger: deps.logger,
       now: clock,
     })
