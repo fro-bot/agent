@@ -121,6 +121,8 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'GET', path: '/operator/repos'},
   {method: 'POST', path: '/operator/runs'},
+  {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
+  {method: 'GET', path: '/operator/runs/:runId/approvals'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -219,6 +221,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     runObservationManager: {
       observe: vi.fn(async () => undefined),
       observeOutput: vi.fn(),
+      observeApproval: vi.fn(),
       subscribe: vi.fn(() => () => undefined),
       abortSubscription: vi.fn(),
       shutdown: vi.fn(),
@@ -229,6 +232,11 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     },
     // Provide listBindings so the repos route is registered in the pinned inventory.
     listBindings: vi.fn(async () => ({success: true as const, data: []})),
+    // Provide approvalRegistry so the decision and pending-approvals routes are registered.
+    approvalRegistry: {
+      handleDecision: vi.fn(async () => 'ok' as const),
+      describePendingForScope: vi.fn(() => []),
+    },
     // Provide getBindingByRepo and launchWorkDeps so the launch route is registered.
     getBindingByRepo: vi.fn(async () => ({success: true as const, data: null})),
     launchWorkDeps: {
@@ -254,6 +262,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
         has: vi.fn(() => false),
         pending: vi.fn(() => []),
         hasPendingForScope: vi.fn(() => false),
+        describePendingForScope: vi.fn(() => []),
         handleDecision: vi.fn(async () => 'ok' as const),
         confirmReply: vi.fn(),
         applySettlement: vi.fn(async () => undefined),

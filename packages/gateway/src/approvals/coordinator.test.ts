@@ -91,6 +91,151 @@ describe('parsePermissionRequest', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// parsePermissionRequest — command/filepath fields (Unit 1)
+// ---------------------------------------------------------------------------
+
+describe('parsePermissionRequest — command/filepath fields', () => {
+  it('populates command for a bash permission.asked with metadata.command', () => {
+    // #given a bash gate with metadata.command
+    const payload = {
+      id: 'per_bash_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      patterns: [],
+      metadata: {command: 'git status'},
+    }
+    // #when parsed
+    const result = parsePermissionRequest(payload)
+    // #then command is populated and filepath is absent
+    expect(result).not.toBeNull()
+    expect(result?.command).toBe('git status')
+    expect(result?.filepath).toBeUndefined()
+  })
+
+  it('populates filepath for an external_directory permission.asked with metadata.filepath', () => {
+    // #given an external_directory gate with metadata.filepath
+    const payload = {
+      id: 'per_dir_1',
+      sessionID: 'ses_1',
+      permission: 'external_directory',
+      patterns: ['/tmp/*'],
+      metadata: {filepath: '/tmp/secret.txt', parentDir: '/tmp'},
+    }
+    // #when parsed
+    const result = parsePermissionRequest(payload)
+    // #then filepath is populated and command is absent
+    expect(result).not.toBeNull()
+    expect(result?.filepath).toBe('/tmp/secret.txt')
+    expect(result?.command).toBeUndefined()
+  })
+
+  it('populates filepath for an edit gate with metadata.filepath', () => {
+    // #given an edit gate (not bash, not external_directory) with metadata.filepath
+    const payload = {
+      id: 'per_edit_1',
+      sessionID: 'ses_1',
+      permission: 'edit',
+      patterns: [],
+      metadata: {filepath: '/workspace/src/main.ts'},
+    }
+    const result = parsePermissionRequest(payload)
+    expect(result?.filepath).toBe('/workspace/src/main.ts')
+    expect(result?.command).toBeUndefined()
+  })
+
+  it('leaves both fields undefined when metadata is absent', () => {
+    // #given a payload with no metadata at all
+    const payload = {id: 'per_1', sessionID: 'ses_1', permission: 'bash'}
+    const result = parsePermissionRequest(payload)
+    expect(result).not.toBeNull()
+    expect(result?.command).toBeUndefined()
+    expect(result?.filepath).toBeUndefined()
+  })
+
+  it('leaves both fields undefined when metadata has no command or filepath', () => {
+    // #given metadata that exists but lacks the relevant keys
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      metadata: {someOtherKey: 'value'},
+    }
+    const result = parsePermissionRequest(payload)
+    expect(result?.command).toBeUndefined()
+    expect(result?.filepath).toBeUndefined()
+  })
+
+  it('does NOT read command from the prototype chain (prototype-pollution guard)', () => {
+    // #given an object whose prototype has a `command` property
+    const proto = {command: 'injected-command'}
+    const metadata = Object.create(proto) as Record<string, unknown>
+    // metadata itself has no own `command` property — only the prototype does
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      metadata,
+    }
+    // #when parsed
+    const result = parsePermissionRequest(payload)
+    // #then the prototype-inherited value is NOT read
+    expect(result?.command).toBeUndefined()
+  })
+
+  it('does NOT read filepath from the prototype chain (prototype-pollution guard)', () => {
+    // #given an object whose prototype has a `filepath` property
+    const proto = {filepath: '/injected/path'}
+    const metadata = Object.create(proto) as Record<string, unknown>
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'external_directory',
+      metadata,
+    }
+    const result = parsePermissionRequest(payload)
+    expect(result?.filepath).toBeUndefined()
+  })
+
+  it('populates both command and filepath when metadata has both', () => {
+    // #given metadata with both keys (unusual but valid)
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      metadata: {command: 'cat /etc/passwd', filepath: '/etc/passwd'},
+    }
+    const result = parsePermissionRequest(payload)
+    expect(result?.command).toBe('cat /etc/passwd')
+    expect(result?.filepath).toBe('/etc/passwd')
+  })
+
+  it('ignores non-string command values in metadata', () => {
+    // #given metadata.command is a number (not a string)
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      metadata: {command: 42},
+    }
+    const result = parsePermissionRequest(payload)
+    // #then the non-string value is not surfaced
+    expect(result?.command).toBeUndefined()
+  })
+
+  it('ignores non-string filepath values in metadata', () => {
+    // #given metadata.filepath is an object
+    const payload = {
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'external_directory',
+      metadata: {filepath: {nested: true}},
+    }
+    const result = parsePermissionRequest(payload)
+    expect(result?.filepath).toBeUndefined()
+  })
+})
+
 describe('parsePermissionReply', () => {
   it('parses a well-formed permission.replied payload', () => {
     const result = parsePermissionReply({sessionID: 'ses_1', requestID: 'per_1', reply: 'once'})

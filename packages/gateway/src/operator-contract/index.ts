@@ -14,6 +14,8 @@
  * redaction modules land.
  */
 
+export type {PendingApprovalDTO} from '../approvals/registry.js'
+export type {ApprovalFrameData, ApprovalRequestDetail} from './approval-frame.js'
 export type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'

@@ -652,6 +652,7 @@ describe('button interaction handler (approval flow)', () => {
       has: vi.fn().mockReturnValue(false),
       pending: vi.fn().mockReturnValue([]),
       hasPendingForScope: vi.fn().mockReturnValue(false),
+      describePendingForScope: vi.fn().mockReturnValue([]),
       handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
       attachMessage: vi.fn(),
