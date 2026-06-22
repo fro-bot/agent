@@ -327,7 +327,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     }
 
     // ── Gate 11: Await launchWork admission ───────────────────────────────────
-    // Build the LaunchWorkRequest with web-specific sinks, auto-deny approval,
+    // Build the LaunchWorkRequest with web-specific sinks, real approval transport,
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.
     //

@@ -587,6 +587,91 @@ describe('POST decision — decision validation', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Oracle test 5: post-authz gate throw → uniform notFoundResponse (not 500)
+// ---------------------------------------------------------------------------
+
+describe('POST decision — post-authz gate throw (Oracle test 5)', () => {
+  it('handleDecision throwing → 404 not-found, not a 500 (gates 8-11 try/catch)', async () => {
+    // #given — handleDecision throws unexpectedly (simulates a bug in gates 8-11)
+    const throwingRegistry = makeRegistry('ok')
+    vi.mocked(throwingRegistry.handleDecision).mockRejectedValue(new Error('unexpected registry failure'))
+    const deps = makeDeps({registry: throwingRegistry})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDecision(app, 'run-abc', 'req-123')
+
+    // #then — 404 not-found (no-oracle), NOT a 500
+    expect(response.status).toBe(404)
+    const body = (await response.json()) as {error: string}
+    expect(body.error).toBe('not-found')
+  })
+
+  it('post-authz throw is indistinguishable from a runIndex miss (same shape)', async () => {
+    // #given — handleDecision throws (post-authz) vs runIndex miss (pre-authz)
+    const throwingRegistry = makeRegistry('ok')
+    vi.mocked(throwingRegistry.handleDecision).mockRejectedValue(new Error('unexpected registry failure'))
+    const postAuthzDeps = makeDeps({registry: throwingRegistry})
+    const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
+
+    const postAuthzApp = buildApp(postAuthzDeps)
+    const missApp = buildApp(missDeps)
+
+    const postAuthzResponse = await postDecision(postAuthzApp, 'run-abc', 'req-123')
+    const missResponse = await postDecision(missApp, 'run-abc', 'req-123')
+
+    // #then — both return the same status and body (no oracle)
+    expect(postAuthzResponse.status).toBe(missResponse.status)
+    const postAuthzBody = (await postAuthzResponse.json()) as {error: string}
+    const missBody = (await missResponse.json()) as {error: string}
+    expect(postAuthzBody.error).toBe(missBody.error)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Byte-identical denial assertions (testing reviewer finding)
+// ---------------------------------------------------------------------------
+
+describe('POST decision — byte-identical denial assertions', () => {
+  it('guard failure denial is byte-identical to runIndex miss denial', async () => {
+    const guardFailDeps = makeDeps()
+    const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
+
+    const guardFailApp = buildAppWithGuardResult(
+      {ok: false, response: new Response(JSON.stringify({error: 'not-found'}), {status: 404})},
+      guardFailDeps,
+    )
+    const missApp = buildApp(missDeps)
+
+    const guardFailResponse = await postDecision(guardFailApp, 'run-abc', 'req-123')
+    const missResponse = await postDecision(missApp, 'run-abc', 'req-123')
+
+    expect(guardFailResponse.status).toBe(missResponse.status)
+    const guardFailText = await guardFailResponse.text()
+    const missText = await missResponse.text()
+    expect(guardFailText).toBe(missText)
+  })
+
+  it('missing token denial is byte-identical to runIndex miss denial', async () => {
+    const missingTokenDeps = makeDeps({
+      sessionStore: makeSessionStore({getOperatorToken: vi.fn(() => undefined)}),
+    })
+    const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
+
+    const missingTokenApp = buildApp(missingTokenDeps)
+    const missApp = buildApp(missDeps)
+
+    const missingTokenResponse = await postDecision(missingTokenApp, 'run-abc', 'req-123')
+    const missResponse = await postDecision(missApp, 'run-abc', 'req-123')
+
+    expect(missingTokenResponse.status).toBe(missResponse.status)
+    const missingTokenText = await missingTokenResponse.text()
+    const missText = await missResponse.text()
+    expect(missingTokenText).toBe(missText)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
 
@@ -608,20 +693,56 @@ describe('POST decision — audit', () => {
     expect(auditCtx.githubUserId).toBe(1001)
   })
 
-  it('emits approval.decision audit even on non-ok outcomes (always/reject preserved)', async () => {
+  it('emits approval.rejected (not approval.decision) for non-ok outcomes (already-claimed)', async () => {
+    // FIX 4: non-ok outcomes emit approval.rejected with the mapped reason,
+    // not approval.decision. This preserves the rejection cause in the audit log.
     const auditLogger = makeAuditLogger()
     const deps = makeDeps({auditLogger, registry: makeRegistry('already-claimed')})
     const app = buildApp(deps)
 
     await postDecision(app, 'run-abc', 'req-123', {decision: 'always'})
 
+    // approval.decision must NOT be emitted for non-ok outcomes
     const auditInfoCalls = vi.mocked(auditLogger.info).mock.calls
     const decisionAudit = auditInfoCalls.find(
       ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.decision',
     )
-    expect(decisionAudit).toBeDefined()
-    const auditCtx = decisionAudit?.[0] as Record<string, unknown>
-    expect(auditCtx.decision).toBe('always')
+    expect(decisionAudit).toBeUndefined()
+
+    // approval.rejected IS emitted with the mapped reason
+    const auditWarnCalls = vi.mocked(auditLogger.warn).mock.calls
+    const rejectedAudit = auditWarnCalls.find(
+      ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.rejected',
+    )
+    expect(rejectedAudit).toBeDefined()
+    const rejectedCtx = rejectedAudit?.[0] as Record<string, unknown>
+    expect(rejectedCtx.reason).toBe('already_claimed')
+  })
+
+  it('maps each DecisionOutcome to the correct ApprovalRejectedReason (FIX 4 taxonomy)', async () => {
+    // Verify the full mapping: DecisionOutcome → ApprovalRejectedReason
+    const cases: {outcome: DecisionOutcome; expectedReason: string}[] = [
+      {outcome: 'already-claimed', expectedReason: 'already_claimed'},
+      {outcome: 'not-found', expectedReason: 'not_found'},
+      {outcome: 'channel-mismatch', expectedReason: 'scope_mismatch'},
+      {outcome: 'reply-failed', expectedReason: 'unknown'},
+    ]
+
+    for (const {outcome, expectedReason} of cases) {
+      const auditLogger = makeAuditLogger()
+      const deps = makeDeps({auditLogger, registry: makeRegistry(outcome)})
+      const app = buildApp(deps)
+
+      await postDecision(app, 'run-abc', `req-${outcome}`, {decision: 'once'})
+
+      const auditWarnCalls = vi.mocked(auditLogger.warn).mock.calls
+      const rejectedAudit = auditWarnCalls.find(
+        ([ctx]) => typeof ctx === 'object' && ctx !== null && ctx.kind === 'approval.rejected',
+      )
+      expect(rejectedAudit).toBeDefined()
+      const rejectedCtx = rejectedAudit?.[0] as Record<string, unknown>
+      expect(rejectedCtx.reason).toBe(expectedReason)
+    }
   })
 })
 

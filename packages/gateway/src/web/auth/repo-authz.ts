@@ -591,10 +591,21 @@ function isRateLimitResponse(response: {headers: {get: (name: string) => string 
 // ---------------------------------------------------------------------------
 
 /**
+ * Module-level in-flight coalescing map for write-level authorization checks.
+ *
+ * Separate from the cache's read-level in-flight map so the coalesced result
+ * is typed as `RepoWriteAuthzResult` without a cast. The cache's
+ * `setInFlight`/`getInFlight` are used for read-level only.
+ *
+ * Keyed by the write-level cache key (same key used for the cache entry).
+ */
+const writeInFlight = new Map<string, Promise<RepoWriteAuthzResult>>()
+
+/**
  * Check whether the given operator has WRITE or ADMIN permission on the given repo.
  *
  * Distinct from checkRepoAuthz (read-level). Used by the approval decision route
- * where submitting a decision requires write/admin access (R7).
+ * where submitting a decision requires a strictly higher bar than read access.
  *
  * v1 rule:
  *   1. Validate owner/repo names — reject malformed names immediately.
@@ -691,9 +702,13 @@ export async function checkRepoWriteAuthz(
   }
 
   // ── Step 4: Coalesce concurrent misses ─────────────────────────────────────
-  const existing = cache.getInFlight(cacheKey)
-  if (existing !== undefined) {
-    const coalesced = await existing
+  // The write-level in-flight map is separate from the cache's read-level
+  // in-flight map so the coalesced result is typed as RepoWriteAuthzResult
+  // without a cast. The cache's setInFlight/getInFlight are used for read-level
+  // only; write-level uses writeInFlight (module-level, keyed by cacheKey).
+  const existingWrite = writeInFlight.get(cacheKey)
+  if (existingWrite !== undefined) {
+    const coalesced = await existingWrite
     if (coalesced.authorized === false) {
       emitAudit(
         {
@@ -705,17 +720,17 @@ export async function checkRepoWriteAuthz(
         auditLogger,
       )
     }
-    return coalesced as RepoWriteAuthzResult
+    return coalesced
   }
 
   // ── Step 5: GitHub API call (reads body for permissions) ───────────────────
   const promise = performGitHubWriteCheck(operatorId, owner, repo, userOAuthToken, cacheKey, deps)
-  cache.setInFlight(cacheKey, promise)
+  writeInFlight.set(cacheKey, promise)
 
   try {
     return await promise
   } finally {
-    cache.deleteInFlight(cacheKey)
+    writeInFlight.delete(cacheKey)
   }
 }
 

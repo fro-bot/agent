@@ -381,6 +381,158 @@ describe('createWebApprovalOnPending', () => {
   })
 
   // ---------------------------------------------------------------------------
+  // Settle frame: attachMessage + renderFn (Oracle-required tests 1–4)
+  // ---------------------------------------------------------------------------
+
+  describe('settle frame: attachMessage wired for all settlement paths', () => {
+    it('calls attachMessage on the registry after register (Oracle test 1: settle frame wired)', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps()
+      const req = makePermissionRequest({requestID: 'req-settle'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — attachMessage called with the requestID and a renderFn
+      expect(ctx.approvalRegistry.attachMessage).toHaveBeenCalledExactlyOnceWith('req-settle', expect.any(Function))
+    })
+
+    it('renderFn emits settled:true SSE frame via observeApproval (Oracle test 1: confirmReply path)', async () => {
+      // #given — capture the renderFn passed to attachMessage
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-settle'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      // Extract the renderFn from the attachMessage call
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+      expect(renderFn).toBeDefined()
+
+      // #when — renderFn is called (simulating confirmReply settlement)
+      await renderFn?.(req, 'once', null, 'replied')
+
+      // #then — observeApproval emitted the settle frame (settled:true)
+      // The open frame was emitted first (call 1), settle frame is call 2
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-settle',
+        settled: true,
+      })
+    })
+
+    it('renderFn emits settle frame on deadline expiry (Oracle test 2: settleByDeadline path)', async () => {
+      // #given — capture the renderFn
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-deadline'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called with 'deadline' reason (simulating settleByDeadline)
+      await renderFn?.(req, 'reject', null, 'deadline')
+
+      // #then — settle frame emitted regardless of reason
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-deadline',
+        settled: true,
+      })
+    })
+
+    it('renderFn emits settle frame for cascade-rejected sibling (Oracle test 3: cascade path)', async () => {
+      // #given — capture the renderFn
+      const ctx = makeApprovalTransportContext()
+      const observeApproval = vi.fn()
+      const deps = makeDeps({observeApproval})
+      const req = makePermissionRequest({requestID: 'req-cascade'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called with 'cascade' reason (simulating cascadeReject)
+      await renderFn?.(req, 'reject', null, 'cascade')
+
+      // #then — settle frame emitted for the cascade-rejected sibling
+      expect(observeApproval).toHaveBeenCalledTimes(2)
+      expect(observeApproval).toHaveBeenNthCalledWith(2, 'run-uuid-1234', {
+        requestID: 'req-cascade',
+        settled: true,
+      })
+    })
+
+    it('renderFn settle frame is fail-soft: observeApproval throw is caught and logged (Oracle test 4)', async () => {
+      // #given — observeApproval throws on the settle call
+      let callCount = 0
+      const observeApproval = vi.fn(() => {
+        callCount++
+        if (callCount === 2) {
+          // Second call is the settle frame — throw to test fail-soft
+          throw new Error('SSE settle fan-out failed')
+        }
+      })
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const ctx = makeApprovalTransportContext()
+      const deps = makeDeps({observeApproval, logger})
+      const req = makePermissionRequest({requestID: 'req-settle-fail'})
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+      onPending(req)
+
+      const attachCall = vi.mocked(ctx.approvalRegistry.attachMessage).mock.calls[0]
+      const renderFn = attachCall?.[1]
+
+      // #when — renderFn called; observeApproval throws on the settle call
+      // #then — renderFn does NOT throw (fail-soft)
+      await expect(renderFn?.(req, 'once', null, 'replied')).resolves.not.toThrow()
+
+      // #then — warn logged for the settle failure
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({requestID: 'req-settle-fail'}),
+        expect.stringContaining('renderFn settle-frame threw'),
+      )
+    })
+
+    it('attachMessage is called AFTER register (register-before-attachMessage order)', () => {
+      // #given
+      const callOrder: string[] = []
+      const registry = makeApprovalRegistry()
+      ;(registry.register as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('register')
+      })
+      ;(registry.attachMessage as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('attachMessage')
+      })
+      const ctx = makeApprovalTransportContext({approvalRegistry: registry})
+      const deps = makeDeps()
+      const req = makePermissionRequest()
+      const factory = createWebApprovalOnPending(deps)
+      const onPending = factory(ctx)
+
+      // #when
+      onPending(req)
+
+      // #then — register precedes attachMessage
+      expect(callOrder[0]).toBe('register')
+      expect(callOrder[1]).toBe('attachMessage')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
   // Factory shape
   // ---------------------------------------------------------------------------
 

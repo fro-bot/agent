@@ -15,6 +15,39 @@
  */
 
 // ---------------------------------------------------------------------------
+// ApprovalRequestDetail — shared field shape (single source of truth)
+// ---------------------------------------------------------------------------
+
+/**
+ * The shared field shape for an approval request detail.
+ *
+ * This is the single source of truth for the fields that appear in both the
+ * open variant of `ApprovalFrameData` (SSE frame) and `PendingApprovalDTO`
+ * (GET pending-approvals REST response). Defining it once prevents the two
+ * surfaces from drifting when a new field is added.
+ *
+ * `command` and `filepath` are pre-bounded (length-capped + control-char
+ * stripped) by the frame-build site before being placed here.
+ */
+export interface ApprovalRequestDetail {
+  /** The unique request identifier — matches the registry entry. */
+  readonly requestID: string
+  /** Gate category, e.g. `bash`, `external_directory`, `edit`. */
+  readonly permission: string
+  /**
+   * Bounded command string (for `bash` gates). Present only when the
+   * engine supplied it and the value is non-empty after bounding.
+   */
+  readonly command?: string
+  /**
+   * Bounded filepath string (for `external_directory`/`edit` gates).
+   * Present only when the engine supplied it and the value is non-empty
+   * after bounding.
+   */
+  readonly filepath?: string
+}
+
+// ---------------------------------------------------------------------------
 // ApprovalFrameData — operator-facing approval frame payload
 // ---------------------------------------------------------------------------
 
@@ -30,25 +63,10 @@
  * stripped) by the frame-build site before being placed here.
  */
 export type ApprovalFrameData =
-  | {
-      /** The unique request identifier — matches the registry entry. */
-      readonly requestID: string
-      /** Gate category, e.g. `bash`, `external_directory`, `edit`. */
-      readonly permission: string
-      /**
-       * Bounded command string (for `bash` gates). Present only when the
-       * engine supplied it and the value is non-empty after bounding.
-       */
-      readonly command?: string
-      /**
-       * Bounded filepath string (for `external_directory`/`edit` gates).
-       * Present only when the engine supplied it and the value is non-empty
-       * after bounding.
-       */
-      readonly filepath?: string
+  | (ApprovalRequestDetail & {
       /** Discriminant: false for open (pending) frames. */
       readonly settled: false
-    }
+    })
   | {
       /** The unique request identifier — matches the registry entry. */
       readonly requestID: string

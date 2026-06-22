@@ -23,7 +23,8 @@
  * Discord-specific concerns for the waiting-status message.
  */
 
-import type {PermissionRequest} from '../../approvals/coordinator.js'
+import type {PermissionReply, PermissionRequest, SettlementReason} from '../../approvals/coordinator.js'
+import type {ApprovalActor} from '../../approvals/registry.js'
 import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {OperatorLogger} from '../server.js'
@@ -91,6 +92,36 @@ export function createWebApprovalOnPending(
         effects: {postReply: postReplyForRequest},
         deadlineMs: ctx.approvalDeadlineMs,
       })
+
+      // Attach the settle/clear render function so the registry calls it on
+      // EVERY settlement path (confirmReply, settleByDeadline, failCloseNow,
+      // cascadeReject, applySettlement, disposeRun). The renderFn emits the
+      // settled:true SSE frame so the browser dismisses the approval prompt.
+      //
+      // Fail-soft: errors are logged at warn and swallowed — the settlement
+      // itself already happened; the frame is advisory.
+      ctx.approvalRegistry.attachMessage(
+        requestID,
+        async (
+          _permReq: PermissionRequest,
+          _decision: PermissionReply,
+          _actor: ApprovalActor | null,
+          _reason: SettlementReason,
+        ): Promise<void> => {
+          try {
+            observeApproval(ctx.runId, {requestID, settled: true})
+          } catch (error: unknown) {
+            logger.warn(
+              {
+                runId: ctx.runId,
+                requestID,
+                err: error instanceof Error ? error.message : String(error),
+              },
+              'web-approval: renderFn settle-frame threw (fail-soft; settlement already applied)',
+            )
+          }
+        },
+      )
 
       // Build the bounded frame data. Apply boundApprovalDetail to command and
       // filepath here — the caller (this transport) is responsible for bounding

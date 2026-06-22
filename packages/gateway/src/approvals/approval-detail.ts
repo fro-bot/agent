@@ -1,7 +1,7 @@
 /**
  * Approval detail bounding helper.
  *
- * Applied at the SSE frame-build site (Unit 2) before the value is serialised
+ * Applied at the SSE frame-build site before the value is serialised
  * into an ApprovalFrame. The parser (coordinator.ts) keeps raw values so the
  * Discord transport is unaffected.
  *

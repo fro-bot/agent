@@ -39,10 +39,10 @@ import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {resolveBindingDenyKeys} from '../../redaction/surface-gate.js'
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -148,39 +148,22 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
         return notFoundResponse(c)
       }
 
-      // ── Gate 3: Resolve runId → repo (server-owned) ──────────────────────
+      // ── Gates 3–4: Resolve runId → {owner, repo} (server-owned) ────────────
       // The repo is NEVER taken from the client. RunIndex.lookup is the sole authority.
+      // resolveRepoFromRunIndex handles the lookup + owner/repo split in one call.
       runId = c.req.param('runId') ?? ''
-      const location = await deps.runIndex.lookup(runId)
-      if (location === undefined) {
-        deps.logger.warn({githubUserId, runId, gate: 'runIndex-miss'}, 'pending-approvals: denied')
+      const resolved = await resolveRepoFromRunIndex(runId, deps.runIndex)
+      if (resolved === null) {
+        deps.logger.warn({githubUserId, runId, gate: 'runIndex-miss-or-malformed'}, 'pending-approvals: denied')
         return notFoundResponse(c)
       }
-
-      // ── Gate 4: Split owner/repo ─────────────────────────────────────────
-      // Strip any trailing `#...` suffix before splitting so future entity_ref
-      // formats with a fragment do not bleed into the repo name.
-      const repoPath = location.repo.split('#')[0] ?? location.repo
-      const slashIdx = repoPath.indexOf('/')
-      if (slashIdx === -1) {
-        deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'pending-approvals: denied')
-        return notFoundResponse(c)
-      }
-      const owner = repoPath.slice(0, slashIdx)
-      const repo = repoPath.slice(slashIdx + 1)
-      if (owner.length === 0 || repo.length === 0) {
-        deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'pending-approvals: denied')
-        return notFoundResponse(c)
-      }
+      const {owner, repo} = resolved
 
       // ── Gate 5: Redaction check (denylist before authz, fail-closed) ─────
-      // Resolve deny-keys from the binding store (fail-closed on error/missing).
-      // Prime/refresh the denylist cache, then check synchronously.
       // This runs BEFORE checkRepoAuthz so a denylisted repo never triggers
       // a GitHub call.
-      const denyKeys = await resolveBindingDenyKeys(owner, repo, deps.bindingsLookup)
-      await deps.denylistCache.getDenylistState()
-      if (deps.denylistCache.isRepoDenied(denyKeys) === true) {
+      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
+      if (isDenied === true) {
         deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'pending-approvals: denied')
         return notFoundResponse(c)
       }

@@ -1276,6 +1276,58 @@ describe('describePendingForScope', () => {
     expect(result).toEqual([])
   })
 
+  it('does NOT include claimed (mid-decision) entries — only open entries are actionable', async () => {
+    // #given a registry with one open and one claimed entry for the same scope
+    const registry = createApprovalRegistry({logger: makeLogger()})
+
+    // Entry A: open
+    registry.register(
+      makeParams({
+        requestID: 'per_open',
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_open', permission: 'bash'}),
+      }),
+    )
+
+    // Entry B: claimed (decision in-flight — postReply held pending)
+    let resolveB!: (v: {ok: boolean}) => void
+    const replyPromiseB = new Promise<{ok: boolean}>(res => {
+      resolveB = res
+    })
+    const effectsB = makeEffects({postReply: vi.fn().mockReturnValue(replyPromiseB)})
+    registry.register(
+      makeParams({
+        requestID: 'per_claimed',
+        // Use scope_A so handleDecision can claim it (scope must match)
+        approvalScopeId: 'scope_A',
+        request: makeRequest({requestID: 'per_claimed', permission: 'edit'}),
+        effects: effectsB,
+      }),
+    )
+    // Transition per_claimed to claimed state (decision in-flight)
+    const claimPromise = registry.handleDecision({
+      requestID: 'per_claimed',
+      approvalScopeId: 'scope_A',
+      decision: 'once',
+      actor: makeActor(),
+    })
+
+    // #when describePendingForScope is called
+    const result = registry.describePendingForScope('scope_A')
+
+    // #then only the open entry is returned — claimed entry is excluded
+    expect(result).toHaveLength(1)
+    const dto = result[0] as PendingApprovalDTO
+    expect(dto.requestID).toBe('per_open')
+    // per_claimed must NOT appear
+    const claimedDto = result.find(d => d.requestID === 'per_claimed')
+    expect(claimedDto).toBeUndefined()
+
+    // Cleanup: resolve the in-flight reply
+    resolveB({ok: true})
+    await claimPromise
+  })
+
   it('returns detail (not just IDs) — DTO has requestID, permission, and optional fields', () => {
     const registry = createApprovalRegistry({logger: makeLogger()})
     registry.register(

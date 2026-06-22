@@ -32,21 +32,21 @@
  */
 
 import type {Hono} from 'hono'
-import type {ApprovalRegistry} from '../../approvals/registry.js'
+import type {ApprovalRegistry, DecisionOutcome} from '../../approvals/registry.js'
 import type {RunIndex} from '../../execute/run-index.js'
 import type {PermissionReply} from '../../operator-contract/approval.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {AuditLogger} from '../audit.js'
+import type {ApprovalRejectedReason, AuditLogger} from '../audit.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {toOperatorDecisionState} from '../../operator-contract/approval.js'
-import {resolveBindingDenyKeys} from '../../redaction/surface-gate.js'
 import {emitAudit} from '../audit.js'
 import {checkRepoWriteAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse} from '../safe-response.js'
+import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,6 +83,28 @@ const ALLOWED_DECISIONS: ReadonlySet<string> = new Set<PermissionReply>(['once',
 
 function isPermissionReply(value: unknown): value is PermissionReply {
   return typeof value === 'string' && ALLOWED_DECISIONS.has(value)
+}
+
+// ---------------------------------------------------------------------------
+// Audit helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a non-ok DecisionOutcome to the ApprovalRejectedReason taxonomy.
+ *
+ * 'ok' is excluded — callers must only call this for non-ok outcomes.
+ */
+function decisionOutcomeToRejectedReason(outcome: Exclude<DecisionOutcome, 'ok'>): ApprovalRejectedReason {
+  switch (outcome) {
+    case 'already-claimed':
+      return 'already_claimed'
+    case 'not-found':
+      return 'not_found'
+    case 'channel-mismatch':
+      return 'scope_mismatch'
+    case 'reply-failed':
+      return 'unknown'
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,39 +153,23 @@ export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
       }
       token = resolvedToken
 
-      // ── Gate 3: Resolve runId → repo (server-owned) ──────────────────────
+      // ── Gates 3–4: Resolve runId → {owner, repo} (server-owned) ────────────
       // The repo is NEVER taken from the client. RunIndex.lookup is the sole authority.
+      // resolveRepoFromRunIndex handles the lookup + owner/repo split in one call.
       runId = c.req.param('runId') ?? ''
-      const location = await deps.runIndex.lookup(runId)
-      if (location === undefined) {
-        deps.logger.warn({githubUserId, runId, gate: 'runIndex-miss'}, 'decision: denied')
+      const resolved = await resolveRepoFromRunIndex(runId, deps.runIndex)
+      if (resolved === null) {
+        deps.logger.warn({githubUserId, runId, gate: 'runIndex-miss-or-malformed'}, 'decision: denied')
         return notFoundResponse(c)
       }
-
-      // ── Gate 4: Split owner/repo ─────────────────────────────────────────
-      // Strip any trailing `#...` suffix before splitting so future entity_ref
-      // formats with a fragment do not bleed into the repo name.
-      const repoPath = location.repo.split('#')[0] ?? location.repo
-      const slashIdx = repoPath.indexOf('/')
-      if (slashIdx === -1) {
-        deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'decision: denied')
-        return notFoundResponse(c)
-      }
-      owner = repoPath.slice(0, slashIdx)
-      repo = repoPath.slice(slashIdx + 1)
-      if (owner.length === 0 || repo.length === 0) {
-        deps.logger.warn({githubUserId, runId, gate: 'malformed-repo'}, 'decision: denied')
-        return notFoundResponse(c)
-      }
+      owner = resolved.owner
+      repo = resolved.repo
 
       // ── Gate 5: Redaction check (denylist before authz, fail-closed) ─────
-      // Resolve deny-keys from the binding store (fail-closed on error/missing).
-      // Prime/refresh the denylist cache, then check synchronously.
       // This runs BEFORE checkRepoWriteAuthz so a denylisted repo never triggers
       // a GitHub call.
-      const denyKeys = await resolveBindingDenyKeys(owner, repo, deps.bindingsLookup)
-      await deps.denylistCache.getDenylistState()
-      if (deps.denylistCache.isRepoDenied(denyKeys) === true) {
+      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
+      if (isDenied === true) {
         deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'decision: denied')
         return notFoundResponse(c)
       }
@@ -207,52 +213,77 @@ export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
 
     const decision: PermissionReply = decisionField
 
-    // ── Gate 8: Build WebOperatorActor from the operator auth context ────────
-    // The actor is the typed identity for attribution (R9). We need the login
-    // from the session store.
-    const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
-    if (sessionEntry === undefined) {
-      deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'decision: denied — session missing')
+    // ── Gates 8–11: Post-authz settlement gates ──────────────────────────────
+    // Wrapped in try/catch so any unexpected throw (e.g. toOperatorDecisionState
+    // on an unhandled DecisionOutcome variant) returns the uniform not-found
+    // shape rather than propagating to Hono as a distinguishable 500.
+    // Gate 7 (decision validation) is intentionally OUTSIDE this block — it is
+    // a legitimate client error (400) that stays before the post-authz gates.
+    try {
+      // ── Gate 8: Build WebOperatorActor from the operator auth context ──────
+      // The actor is the typed identity for attribution on the settled decision.
+      // We need the login from the session store.
+      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      if (sessionEntry === undefined) {
+        deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'decision: denied — session missing')
+        return notFoundResponse(c)
+      }
+
+      const actor = {
+        kind: 'web-operator' as const,
+        githubUserId,
+        login: sessionEntry.login,
+        sessionCorrelationId: sessionId,
+      }
+
+      // ── Gate 9: Settle through the registry ───────────────────────────────
+      // handleDecision is the ONLY settlement path. approvalScopeId is run.run_id
+      // resolved server-side — NEVER from the client.
+      // The requestId comes from the URL param (not the body).
+      const requestId = c.req.param('requestId') ?? ''
+
+      const outcome = await deps.registry.handleDecision({
+        requestID: requestId,
+        approvalScopeId: runId,
+        decision,
+        actor,
+      })
+
+      // ── Gate 10: Emit audit record ─────────────────────────────────────────
+      // Emit approval.decision only when the registry accepted the decision (ok).
+      // For non-ok outcomes emit approval.rejected with the mapped reason so the
+      // audit taxonomy preserves the rejection cause.
+      if (outcome === 'ok') {
+        emitAudit(
+          {
+            kind: 'approval.decision',
+            correlationId: `decision:${githubUserId}:${runId}:${requestId}`,
+            githubUserId,
+            requestId,
+            decision,
+          },
+          deps.auditLogger,
+        )
+      } else {
+        const rejectedReason = decisionOutcomeToRejectedReason(outcome)
+        emitAudit(
+          {
+            kind: 'approval.rejected',
+            correlationId: `decision:${githubUserId}:${runId}:${requestId}`,
+            githubUserId,
+            requestId,
+            reason: rejectedReason,
+          },
+          deps.auditLogger,
+        )
+      }
+
+      // ── Gate 11: Map outcome → JSON response ───────────────────────────────
+      const state = toOperatorDecisionState(outcome)
+      return c.json({state}, 200)
+    } catch (error: unknown) {
+      deps.logger.warn({runId, githubUserId, error}, 'decision: post-authz gate threw — denying (no-oracle)')
       return notFoundResponse(c)
     }
-
-    const actor = {
-      kind: 'web-operator' as const,
-      githubUserId,
-      login: sessionEntry.login,
-      sessionCorrelationId: sessionId,
-    }
-
-    // ── Gate 9: Settle through the registry ─────────────────────────────────
-    // handleDecision is the ONLY settlement path. approvalScopeId is run.run_id
-    // resolved server-side — NEVER from the client.
-    // The requestId comes from the URL param (not the body).
-    const requestId = c.req.param('requestId') ?? ''
-
-    const outcome = await deps.registry.handleDecision({
-      requestID: requestId,
-      approvalScopeId: runId,
-      decision,
-      actor,
-    })
-
-    // ── Gate 10: Emit audit record ───────────────────────────────────────────
-    // Emit on every outcome — the audit record captures the decision attempt
-    // regardless of whether it settled (ok) or was rejected (scope_mismatch,
-    // already_claimed, etc.).
-    emitAudit(
-      {
-        kind: 'approval.decision',
-        correlationId: `decision:${githubUserId}:${runId}:${requestId}`,
-        githubUserId,
-        requestId,
-        decision,
-      },
-      deps.auditLogger,
-    )
-
-    // ── Gate 11: Map outcome → JSON response ─────────────────────────────────
-    const state = toOperatorDecisionState(outcome)
-    return c.json({state}, 200)
   })
 }
