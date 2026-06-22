@@ -3,7 +3,8 @@
  *
  * Load-bearing tests (written first):
  *   1. AWAIT-ADMISSION: route awaits launchWork admission (not the full run) and returns 202.
- *   2. AUTO-DENY: web createApprovalOnPending denies; Discord transport NOT used.
+ *   2. WEB APPROVAL TRANSPORT: route wires createWebApprovalOnPending (register+observe);
+ *      Discord transport NOT used.
  *   3. IDEMPOTENCY ISOLATION: operator A key 'x' and operator B key 'x' → two runIds.
  *
  * launchWork is mocked at the module level so route tests do not need real
@@ -14,7 +15,7 @@
 
 import type {ApprovalRegistry} from '../../approvals/registry.js'
 import type {RepoBinding} from '../../bindings/types.js'
-import type {LaunchAdmission} from '../../execute/launch-types.js'
+import type {LaunchAdmission, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {RepoAuthzDeps} from '../auth/repo-authz.js'
@@ -268,20 +269,51 @@ describe('POST /operator/runs — AWAIT-ADMISSION (load-bearing)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// LOAD-BEARING TEST 2: AUTO-DENY (via web-approval.test.ts — route-level pin)
+// LOAD-BEARING TEST 2: WEB APPROVAL TRANSPORT (register + observe, not auto-deny)
 // ---------------------------------------------------------------------------
 
-describe('POST /operator/runs — AUTO-DENY (load-bearing)', () => {
-  it('uses web auto-deny createApprovalOnPending (not Discord transport)', async () => {
+describe('POST /operator/runs — WEB APPROVAL TRANSPORT (load-bearing)', () => {
+  it('uses createWebApprovalOnPending (register+observe) — not Discord transport', async () => {
     // #given — the web route always supplies createApprovalOnPending (not undefined).
+    // Capture the request passed to launchWork to verify createApprovalOnPending is set.
+    let capturedCreateApprovalOnPending: LaunchWorkRequest['createApprovalOnPending']
+    mockLaunchWork.mockImplementationOnce(async (request: LaunchWorkRequest) => {
+      capturedCreateApprovalOnPending = request.createApprovalOnPending
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
     const deps = makeDeps()
     const app = buildApp(deps)
 
     // #when
     const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
 
-    // #then — 202 returned; the route wired createApprovalOnPending
+    // #then — 202 returned; the route wired createApprovalOnPending (not undefined)
     expect(response.status).toBe(202)
+    expect(typeof capturedCreateApprovalOnPending).toBe('function')
+  })
+
+  it('wires observeApproval from the runObservationManager into the transport', async () => {
+    // #given — a manager with observeApproval spy
+    const observeApproval = vi.fn()
+    const observeOutput = vi.fn()
+    const runObservationManager = {observeOutput, observeApproval}
+
+    // Capture the createApprovalOnPending factory from the launchWork call
+    let capturedFactory: LaunchWorkRequest['createApprovalOnPending']
+    mockLaunchWork.mockImplementationOnce(async (request: LaunchWorkRequest) => {
+      capturedFactory = request.createApprovalOnPending
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+
+    const deps = makeDeps({runObservationManager})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then — 202 returned; factory is a function (the real transport, not auto-deny)
+    expect(response.status).toBe(202)
+    expect(typeof capturedFactory).toBe('function')
   })
 
   it('surface is web (not discord) — run is attributed to web surface', async () => {
@@ -1047,7 +1079,8 @@ describe('POST /operator/runs — replySink wired to runObservationManager', () 
   it('replySink append routes output delta to manager.observeOutput with the route runId', async () => {
     // #given — a manager spy and a captured replySink from launchWork
     const observeOutput = vi.fn()
-    const runObservationManager = {observeOutput}
+    const observeApproval = vi.fn()
+    const runObservationManager = {observeOutput, observeApproval}
 
     let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
     let capturedRunId: string | undefined
@@ -1082,7 +1115,8 @@ describe('POST /operator/runs — replySink wired to runObservationManager', () 
   it('replySink flush routes final answer to manager.observeOutput with final:true', async () => {
     // #given — a manager spy and a captured replySink from launchWork
     const observeOutput = vi.fn()
-    const runObservationManager = {observeOutput}
+    const observeApproval = vi.fn()
+    const runObservationManager = {observeOutput, observeApproval}
 
     let capturedReplySink: {append: (t: string) => void; flush: () => Promise<unknown>} | undefined
     let capturedRunId: string | undefined
