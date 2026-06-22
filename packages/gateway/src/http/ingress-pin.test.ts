@@ -219,6 +219,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     runObservationManager: {
       observe: vi.fn(async () => undefined),
       observeOutput: vi.fn(),
+      observeApproval: vi.fn(),
       subscribe: vi.fn(() => () => undefined),
       abortSubscription: vi.fn(),
       shutdown: vi.fn(),

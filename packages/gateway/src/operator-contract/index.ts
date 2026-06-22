@@ -14,6 +14,7 @@
  * redaction modules land.
  */
 
+export type {ApprovalFrameData} from './approval-frame.js'
 export type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'

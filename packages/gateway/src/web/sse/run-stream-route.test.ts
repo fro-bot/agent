@@ -153,6 +153,7 @@ function makeManager(overrides?: Partial<RunObservationManager>): RunObservation
   return {
     observe: vi.fn(async () => undefined),
     observeOutput: vi.fn(),
+    observeApproval: vi.fn(),
     subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
     abortSubscription: vi.fn(),
     shutdown: vi.fn(),
@@ -2324,5 +2325,100 @@ describe('GET /operator/runs/:runId/stream — ready frame precedes output frame
     const readyIndex = text.indexOf('event: ready')
     const outputIndex = text.indexOf('event: output')
     expect(readyIndex).toBeLessThan(outputIndex)
+  })
+})
+
+// ===========================================================================
+// writeFrame — approval frame serialization and exhaustiveness guard
+// ===========================================================================
+
+describe('writeFrame — approval frame serialization', () => {
+  it('serializes an open ApprovalFrame (settled:false) as an SSE approval event', async () => {
+    // #given — manager delivers an open approval frame
+    const approvalData = {
+      requestID: 'req-abc',
+      permission: 'bash',
+      command: 'ls -la',
+      settled: false as const,
+    }
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        Promise.resolve(callbacks.onEvent({type: 'approval', runId: 'run-abc', data: approvalData})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — read enough chunks to capture the approval event
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 15; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes('event: approval')) break
+    }
+    await reader.cancel()
+
+    // #then the approval event is present in the stream
+    expect(text).toContain('event: approval')
+
+    // #then the data payload contains the expected fields
+    const approvalEventMatch = /event: approval\ndata: (.+)\n/.exec(text)
+    expect(approvalEventMatch).not.toBeNull()
+    const parsed = JSON.parse(approvalEventMatch![1]!) as Record<string, unknown>
+    expect(parsed.requestID).toBe('req-abc')
+    expect(parsed.permission).toBe('bash')
+    expect(parsed.command).toBe('ls -la')
+    expect(parsed.settled).toBe(false)
+    expect(parsed.runId).toBe('run-abc')
+  })
+
+  it('serializes a settle/clear ApprovalFrame (settled:true) as an SSE approval event', async () => {
+    // #given — manager delivers a settle/clear approval frame
+    const settleData = {requestID: 'req-abc', settled: true as const}
+    const manager = makeManager({
+      subscribe: vi.fn((_runId: string, callbacks: SubscriberCallbacks) => {
+        Promise.resolve(callbacks.onEvent({type: 'approval', runId: 'run-abc', data: settleData})).catch(() => {})
+        return () => undefined
+      }),
+    })
+    const deps = makeDeps({manager})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await fetchStream(app, 'run-abc')
+    expect(res.status).toBe(200)
+
+    // #then — read enough chunks to capture the approval event
+    const reader = res.body?.getReader()
+    if (reader === undefined) throw new Error('Expected a readable body')
+    const decoder = new TextDecoder()
+    let text = ''
+    for (let i = 0; i < 15; i++) {
+      const result = await reader.read()
+      if (result.done === true) break
+      text += decoder.decode(result.value as Uint8Array, {stream: true})
+      if (text.includes('event: approval')) break
+    }
+    await reader.cancel()
+
+    // #then the approval event is present
+    expect(text).toContain('event: approval')
+
+    // #then the data payload contains settled:true and requestID
+    const approvalEventMatch = /event: approval\ndata: (.+)\n/.exec(text)
+    expect(approvalEventMatch).not.toBeNull()
+    const parsed = JSON.parse(approvalEventMatch![1]!) as Record<string, unknown>
+    expect(parsed.requestID).toBe('req-abc')
+    expect(parsed.settled).toBe(true)
+    expect(parsed.runId).toBe('run-abc')
   })
 })

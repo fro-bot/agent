@@ -1895,7 +1895,14 @@ describe('observer-only invariant — observeOutput extension', () => {
     }
 
     // #then the manager has only the expected public API
-    const allowedManagerKeys = new Set(['observe', 'observeOutput', 'subscribe', 'abortSubscription', 'shutdown'])
+    const allowedManagerKeys = new Set([
+      'observe',
+      'observeOutput',
+      'observeApproval',
+      'subscribe',
+      'abortSubscription',
+      'shutdown',
+    ])
     for (const key of managerKeys) {
       expect(allowedManagerKeys.has(key)).toBe(true)
     }
@@ -2403,6 +2410,281 @@ describe('terminal replay cache byte budget', () => {
     await drain()
     expect(framesB.filter(f => f.type === 'output')).toHaveLength(1)
     expect(closesB).toContain('terminal')
+
+    manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// 20. observeApproval — approval frame fan-out and terminal-drain safety
+// ===========================================================================
+
+describe('observeApproval — approval frame fan-out', () => {
+  it('fans an open ApprovalFrame (settled:false) to live subscribers', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observeApproval is called with an open (pending) frame
+    manager.observeApproval('run-001', {
+      requestID: 'req-abc',
+      permission: 'bash',
+      command: 'ls -la',
+      settled: false,
+    })
+    await drain()
+
+    // #then an approval frame is delivered to the subscriber
+    const approvalFrames = frames.filter(f => f.type === 'approval')
+    expect(approvalFrames).toHaveLength(1)
+    expect(approvalFrames[0]).toMatchObject({
+      type: 'approval',
+      runId: 'run-001',
+      data: {requestID: 'req-abc', permission: 'bash', command: 'ls -la', settled: false},
+    })
+
+    manager.shutdown()
+  })
+
+  it('fans a settle/clear ApprovalFrame (settled:true) to live subscribers', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observeApproval is called with a settle/clear frame
+    manager.observeApproval('run-001', {requestID: 'req-abc', settled: true})
+    await drain()
+
+    // #then a settle/clear approval frame is delivered
+    const approvalFrames = frames.filter(f => f.type === 'approval')
+    expect(approvalFrames).toHaveLength(1)
+    expect(approvalFrames[0]).toMatchObject({
+      type: 'approval',
+      runId: 'run-001',
+      data: {requestID: 'req-abc', settled: true},
+    })
+
+    manager.shutdown()
+  })
+
+  it('fans approval frames with filepath (external_directory gate)', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observeApproval is called with a filepath
+    manager.observeApproval('run-001', {
+      requestID: 'req-xyz',
+      permission: 'external_directory',
+      filepath: '/home/user/project',
+      settled: false,
+    })
+    await drain()
+
+    // #then the approval frame carries the filepath
+    const approvalFrames = frames.filter(f => f.type === 'approval')
+    expect(approvalFrames).toHaveLength(1)
+    expect(approvalFrames[0]).toMatchObject({
+      type: 'approval',
+      runId: 'run-001',
+      data: {requestID: 'req-xyz', permission: 'external_directory', filepath: '/home/user/project', settled: false},
+    })
+
+    manager.shutdown()
+  })
+
+  it('fans approval frames to multiple subscribers simultaneously', async () => {
+    // #given a manager with two subscribers
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames: frames1} = collectFrames(manager, 'run-001')
+    const {frames: frames2} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when observeApproval is called
+    manager.observeApproval('run-001', {requestID: 'req-multi', permission: 'bash', settled: false})
+    await drain()
+
+    // #then both subscribers receive the approval frame
+    expect(frames1.filter(f => f.type === 'approval')).toHaveLength(1)
+    expect(frames2.filter(f => f.type === 'approval')).toHaveLength(1)
+
+    manager.shutdown()
+  })
+
+  it('open frame followed by settle/clear frame — both arrive in order', async () => {
+    // #given a manager with a subscriber
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when an open frame is followed by a settle/clear frame
+    manager.observeApproval('run-001', {requestID: 'req-seq', permission: 'bash', settled: false})
+    manager.observeApproval('run-001', {requestID: 'req-seq', settled: true})
+    await drain()
+
+    // #then both frames arrive in order
+    const approvalFrames = frames.filter(f => f.type === 'approval')
+    expect(approvalFrames).toHaveLength(2)
+    expect(approvalFrames[0]).toMatchObject({data: {settled: false}})
+    expect(approvalFrames[1]).toMatchObject({data: {settled: true}})
+
+    manager.shutdown()
+  })
+
+  it('approval frame followed by terminal status drains in order (terminal-drain safety)', async () => {
+    // #given a manager with a subscriber
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    let callCount = 0
+    const projectFn: ProjectFn = async () => (callCount++ === 0 ? makeOperatorRunStatus() : terminalStatus)
+    const {manager} = makeManager(projectFn)
+
+    // Seed the cache
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    const {frames, closes} = collectFrames(manager, 'run-001')
+    await drain()
+
+    // #when an approval frame is enqueued, then the run reaches terminal
+    manager.observeApproval('run-001', {requestID: 'req-drain', permission: 'bash', settled: false})
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #then the approval frame arrives before the terminal status frame
+    const approvalIdx = frames.findIndex(f => f.type === 'approval')
+    const terminalIdx = frames.findIndex(f => f.type === 'status' && f.data.status === 'succeeded')
+    expect(approvalIdx).toBeGreaterThanOrEqual(0)
+    expect(terminalIdx).toBeGreaterThan(approvalIdx)
+
+    // #then the stream closes with 'terminal' after draining all frames
+    expect(closes).toContain('terminal')
+
+    manager.shutdown()
+  })
+
+  it('stale approval frame after terminal is dropped (out-of-order async guard)', async () => {
+    // #given a manager where the run has already reached terminal
+    const terminalStatus = makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'})
+    const projectFn: ProjectFn = async () => terminalStatus
+    const {manager} = makeManager(projectFn)
+
+    // Drive the run to terminal
+    await manager.observe(makeRunState({phase: 'COMPLETED'}))
+    await drain()
+
+    // #given a subscriber (will get the terminal replay)
+    const {frames} = collectFrames(manager, 'run-001')
+    await drain()
+
+    const frameCountBeforeStale = frames.length
+
+    // #when a stale approval frame arrives after terminal
+    manager.observeApproval('run-001', {requestID: 'req-stale', permission: 'bash', settled: false})
+    await drain()
+
+    // #then no new approval frame was delivered (dropped by the out-of-order guard)
+    const approvalFrames = frames.filter(f => f.type === 'approval')
+    expect(approvalFrames).toHaveLength(0)
+
+    // #then the frame count did not increase beyond the terminal replay frames
+    expect(frames.length).toBe(frameCountBeforeStale)
+
+    manager.shutdown()
+  })
+
+  it('observeApproval after shutdown is a no-op', async () => {
+    // #given a manager that has been shut down
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+    manager.shutdown()
+
+    // #when observeApproval is called after shutdown
+    // #then it does not throw
+    expect(() => {
+      manager.observeApproval('run-001', {requestID: 'req-noop', permission: 'bash', settled: false})
+    }).not.toThrow()
+  })
+
+  it('approval frame overflow drops the subscriber (non-coalescing path)', async () => {
+    // #given a manager with a cap sized for exactly one approval frame.
+    // Strategy: seed the status cache so the subscriber gets a status snapshot on subscribe.
+    // The subscriber blocks on the status snapshot (never drains). Queue is empty after
+    // dequeue-before-await. We then enqueue TWO approval frames simultaneously — first fits,
+    // second overflows → subscriber is dropped (approval frames do NOT coalesce).
+    const status = makeOperatorRunStatus({status: 'running'})
+    const projectFn: ProjectFn = async () => status
+
+    const sampleApprovalFrame = {
+      type: 'approval' as const,
+      runId: 'run-001',
+      data: {requestID: 'req-cap', permission: 'bash', settled: false as const},
+    }
+    const oneApprovalFrameBytes = JSON.stringify(sampleApprovalFrame).length
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneApprovalFrameBytes})
+
+    // Seed the status cache
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    await drain()
+
+    // #given a slow subscriber that blocks on the status snapshot (never drains)
+    const slowCloses: string[] = []
+    manager.subscribe('run-001', {
+      onEvent: async () => {
+        // Block on every frame — never resolves
+        await new Promise<void>(() => {
+          // intentionally never resolves
+        })
+      },
+      onClose: reason => {
+        slowCloses.push(reason)
+      },
+    })
+    // The status snapshot is dequeued immediately (in-flight, blocking).
+    // Queue is now empty (dequeue-before-await). Enqueue TWO approval frames
+    // simultaneously — first fills the queue, second overflows → drop.
+
+    // #when two approval frames arrive simultaneously (first fits, second overflows)
+    manager.observeApproval('run-001', {requestID: 'req-cap', permission: 'bash', settled: false})
+    manager.observeApproval('run-001', {requestID: 'req-cap', settled: true})
+    await drain()
+
+    // #then the subscriber is dropped with 'overflow' (approval frames do NOT coalesce)
+    expect(slowCloses).toContain('overflow')
+
+    manager.shutdown()
+  })
+
+  it('approval frames are isolated per run — run-A approval does not appear in run-B subscriber', async () => {
+    // #given a manager with subscribers for two runs
+    const projectFn: ProjectFn = async () => makeOperatorRunStatus()
+    const {manager} = makeManager(projectFn)
+
+    const {frames: framesA} = collectFrames(manager, 'run-A')
+    const {frames: framesB} = collectFrames(manager, 'run-B')
+    await drain()
+
+    // #when observeApproval is called for run-A
+    manager.observeApproval('run-A', {requestID: 'req-a', permission: 'bash', settled: false})
+    await drain()
+
+    // #then run-A subscriber gets the approval frame
+    expect(framesA.filter(f => f.type === 'approval')).toHaveLength(1)
+
+    // #then run-B subscriber does NOT get run-A's approval frame
+    expect(framesB.filter(f => f.type === 'approval')).toHaveLength(0)
 
     manager.shutdown()
   })
