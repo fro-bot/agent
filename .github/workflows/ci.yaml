@@ -66,6 +66,7 @@ jobs:
               - added|modified: *config
               - added|modified: *dist-changed
               - added|modified: *src-changed
+              - scripts/** # Build changes to CI scripts trigger build+test (scripts tests run in Test job)
 
   lint:
     if: ${{ needs.setup.outputs.should-lint == 'true' }}
@@ -93,6 +94,8 @@ jobs:
         uses: ./.github/actions/setup
       - name: Rebuild the dist/ directory
         run: pnpm build
+      - name: Check dist/ for hidden Unicode characters
+        run: pnpm run dist:check-hidden-unicode
       - name: Compare the expected and actual dist/ directories
         run: |
           if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
