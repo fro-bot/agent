@@ -1,7 +1,8 @@
 ---
 title: 'feat: Gateway web operator API surface'
 type: feat
-status: active
+status: completed
+completed: 2026-06-23
 date: 2026-06-15
 origin: docs/brainstorms/2026-06-15-gateway-control-surface-phase-b-requirements.md
 deepened: 2026-06-15
@@ -9,6 +10,8 @@ revised: 2026-06-19  # added Units 3h/3i prerequisites + reshaped Unit 4 (4a/4b)
 ---
 
 # Gateway web operator API surface
+
+> **Status (2026-06-23):** Operator control-surface spine is functionally complete. Units 4b/5/6 shipped at contract v1.4.0; Unit 7 cut (superseded by Unit 5's `GET /operator/repos`); Unit 8 shipped incrementally across unit PRs (deploy docs + per-route tests), with a consolidated runbook and full CI operator smoke still outstanding.
 
 ## Overview
 
@@ -762,7 +765,9 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
     **Verification:**
     - The SSE core is bounded, replayable, redacted, backpressure-safe, observer-only, and fully tested — with no public route exposed yet.
 
-  - [ ] **Unit 4b: Authenticated SSE route, authz, and redaction wiring**
+  - [x] **Unit 4b: Authenticated SSE route, authz, and redaction wiring** *(shipped via #962, v0.72.0)*
+
+    > **Reconciliation:** shipped path is `web/sse/run-stream-route.ts`, not the planned `web/routes/run-stream.ts`.
 
     **Files:**
     - Create: `packages/gateway/src/web/routes/run-stream.ts`
@@ -794,7 +799,9 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
     **Verification:**
     - No SSE byte is written before session auth, redaction, and repo authz all pass; client-supplied repo is never authoritative; access loss or denylisting mid-stream terminates the subscription on the next lease re-check; the stream is bounded and heartbeat-stable.
 
-- [ ] **Unit 5: Web launch adapter**
+- [x] **Unit 5: Web launch adapter** *(shipped via #968, v0.72.x)*
+
+  > **Reconciliation:** Unit 5 also shipped the `GET /operator/repos` scoped repo selector (`RepoSummary` DTO via `packages/gateway/src/web/operator/repos-route.ts`), originally planned as Unit 7 scope. Follow-ups #966 (run lifecycle admission) and #965 (web run output streaming) shipped as part of completing the launch surface.
 
   **Goal:** Let an authenticated operator launch work through `launchWork` with web sinks and idempotent pre-launch validation.
 
@@ -839,7 +846,9 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Web-launched work follows the same coordination behavior as Discord work.
 
-- [ ] **Unit 6: Approval notification hub and web approval transport**
+- [x] **Unit 6: Approval notification hub and web approval transport** *(shipped via #986, contract v1.4.0)*
+
+  > **Reconciliation:** the shipped approach used `attachMessage`/`renderFn` settle frames on the `ApprovalRegistry` (transport-neutral) rather than a separate notification-hub module — the "notification hub" was realized as registry settle-frame hooks, not a standalone hub module.
 
   **Goal:** Let authorized web operators discover, receive, and settle OpenCode permission requests through the existing approval registry.
 
@@ -896,7 +905,9 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   **Verification:**
   - Web and Discord approvals settle through one registry with the same fail-closed behavior.
 
-- [ ] **Unit 7: Scoped read-only bindings (cuttable follow-up)**
+- [x] **(CUT — superseded) Unit 7: Scoped read-only bindings (cuttable follow-up)**
+
+  > **CUT 2026-06-23:** superseded by Unit 5's `GET /operator/repos` route (`RepoSummary` DTO), which already delivers the authz'd, denylist-filtered bound-repo list the operator web client needs. Raw binding-record reads (S3 keys, channelId, deny-keys) must never reach the browser, so a separate `GET /operator/bindings` route adds risk without a consumer need. The plan's own 'Cut line' is exercised.
 
   **Goal:** Expose binding reads needed by the operator web client without adding mutation or broad enumeration.
 
@@ -936,6 +947,8 @@ The web listener is an adapter layer. It authenticates the operator, projects sa
   - If auth/listener/launch/approval scope grows too large, defer Unit 7 to a follow-up PR on the same authenticated surface without blocking core Phase B API readiness.
 
 - [ ] **Unit 8: Documentation, smoke coverage, and operational readiness**
+
+  > **Status (2026-06-23):** Deploy docs and per-route tests shipped incrementally across unit PRs (Units 3g/4b/5/6 each added deploy doc sections and colocated `.test.ts` files). However, the deploy/README.md operator API surface table still only covers auth/session routes (through Unit 3g) — the launch, repos, run-stream, pending-approvals, and decision routes are not yet documented in the table. The CI gateway-smoke covers config loading and module resolution but not operator-specific route behavior. A consolidated operator runbook (`docs/solutions/best-practices/gateway-web-operator-auth-2026-06-15.md`) has not been created. **Remaining gaps:** (1) update deploy/README.md operator API surface table with Units 4b/5/6 routes; (2) create the consolidated operator runbook; (3) extend CI gateway-smoke with operator-listener vertical-slice coverage.
 
   **Goal:** Make the new control surface operable, reviewable, and safe to deploy.
 
