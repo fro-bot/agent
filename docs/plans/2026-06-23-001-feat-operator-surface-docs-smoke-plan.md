@@ -1,7 +1,7 @@
 ---
 title: "feat: Operator control-surface documentation and smoke coverage (Unit 8)"
 type: feat
-status: active
+status: completed
 date: 2026-06-23
 origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan.md
 ---
@@ -76,7 +76,7 @@ Per the reconciled operator control-surface plan (`docs/plans/2026-06-15-002-...
 
 ## Implementation Units
 
-- [ ] **Unit 1: Complete the deploy/README operator API surface table**
+- [x] **Unit 1: Complete the deploy/README operator API surface table**
 
 **Goal:** The operator API table lists every shipped privileged route with accurate method, path, auth, and purpose.
 
@@ -98,7 +98,7 @@ Per the reconciled operator control-surface plan (`docs/plans/2026-06-15-002-...
 
 **Verification:** The table matches the routes registered in `server.ts`; no shipped operator route is missing.
 
-- [ ] **Unit 2: Consolidated operator runbook / index**
+- [x] **Unit 2: Consolidated operator runbook / index**
 
 **Goal:** A single entry point an operator follows to deploy and operate the web surface, linking the deploy/README sections and relevant solution docs without duplicating them.
 
@@ -119,7 +119,7 @@ Per the reconciled operator control-surface plan (`docs/plans/2026-06-15-002-...
 
 **Verification:** An operator can follow one document end-to-end; no route/env table is duplicated across two files (single source of truth).
 
-- [ ] **Unit 3: Operator route-registration smoke / drift guard**
+- [x] **Unit 3: Operator route-registration smoke / drift guard**
 
 **Goal:** A test asserts the full privileged operator route set registers when all deps are present, doubling as drift protection for the deploy/README table.
 
