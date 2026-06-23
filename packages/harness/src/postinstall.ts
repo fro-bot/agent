@@ -10,7 +10,9 @@
  *   4. Print a clear status message.
  *
  * Exits 0 on success or when no platform binary is available (optional dep not installed).
- * The `|| true` in package.json scripts.postinstall ensures install never fails here.
+ * The postinstall hook is invoked via bin/postinstall.mjs, which is self-contained-non-fatal:
+ * it catches import errors and always exits 0 when dist is absent, so install never fails
+ * regardless of this module's behavior.
  *
  * A missing binary is NOT a fatal install error — the harness falls back to the
  * dev scaffold (opencode on PATH). The action setup fails loud if the binary is

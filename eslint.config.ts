@@ -33,6 +33,16 @@ export default defineConfig(
     },
   },
   {
+    name: 'packages/harness/bin plain-Node-ESM overrides',
+    files: ['packages/harness/bin/**/*.mjs'],
+    rules: {
+      // bin shims are plain Node ESM — no TypeScript project reference
+      'node/prefer-global/process': 'off',
+      // import ordering is not enforced in plain-Node-ESM shims
+      'perfectionist/sort-imports': 'off',
+    },
+  },
+  {
     name: 'deploy/scripts plain-Node-ESM overrides',
     files: ['deploy/scripts/**/*.mjs'],
     rules: {
