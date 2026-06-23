@@ -16,6 +16,47 @@ import {getProjectLicenses} from 'generate-license-file'
 
 const execFileAsync = promisify(execFile)
 
+/**
+ * Formats the real diagnostics from a failed child-process invocation.
+ *
+ * execFile rejections carry `stderr`, `stdout`, `code`, and `signal` alongside
+ * `message`, but `message` alone is just the generic "Command failed: ..." line.
+ * When a license-tooling command fails in a constrained environment (e.g. a
+ * Renovate runner), the actual reason lives in `stderr`/`stdout` — so surface
+ * all of it instead of swallowing it behind the generic message.
+ */
+export function formatChildProcessError(error: unknown): string {
+  if (error == null || typeof error !== 'object') {
+    return String(error)
+  }
+  const record = error as {
+    message?: unknown
+    stderr?: unknown
+    stdout?: unknown
+    code?: unknown
+    signal?: unknown
+  }
+  const parts: string[] = []
+  if (typeof record.message === 'string' && record.message.length > 0) {
+    parts.push(record.message)
+  }
+  if (record.code != null) {
+    parts.push(`exitCode=${String(record.code)}`)
+  }
+  if (record.signal != null) {
+    parts.push(`signal=${String(record.signal)}`)
+  }
+  const stderr = typeof record.stderr === 'string' ? record.stderr.trim() : ''
+  if (stderr.length > 0) {
+    parts.push(`stderr:\n${stderr}`)
+  }
+  const stdout = typeof record.stdout === 'string' ? record.stdout.trim() : ''
+  if (stdout.length > 0) {
+    parts.push(`stdout:\n${stdout}`)
+  }
+  return parts.length > 0 ? parts.join('\n') : String(error)
+}
+
 export interface LicenseEntry {
   readonly version: string
   readonly license: string
@@ -108,7 +149,7 @@ async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
     return parsed
   } catch (error) {
     console.warn(
-      `[license-collector] pnpm licenses list failed (${error instanceof Error ? error.message : String(error)}); license types will be "Unknown"`,
+      `[license-collector] pnpm licenses list failed; license types will be "Unknown"\n${formatChildProcessError(error)}`,
     )
     return {}
   }
@@ -205,10 +246,11 @@ export async function collectThirdPartyNotices(packageJsonPath = './package.json
   try {
     licenses = await getProjectLicenses(packageJsonPath)
   } catch (error) {
-    const cause = error instanceof Error ? error.message : String(error)
-    throw new Error(`[license-collector] license collection failed; cannot produce THIRD_PARTY_NOTICES.txt: ${cause}`, {
-      cause: error instanceof Error ? error : new Error(cause),
-    })
+    const diagnostics = formatChildProcessError(error)
+    throw new Error(
+      `[license-collector] license collection failed; cannot produce THIRD_PARTY_NOTICES.txt:\n${diagnostics}`,
+      {cause: error instanceof Error ? error : new Error(diagnostics)},
+    )
   }
 
   for (const license of licenses) {

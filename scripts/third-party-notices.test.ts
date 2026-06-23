@@ -1,7 +1,7 @@
 import {execFile} from 'node:child_process'
 import {getProjectLicenses} from 'generate-license-file'
 import {describe, expect, it, vi} from 'vitest'
-import {collectThirdPartyNotices, formatThirdPartyNotices} from './third-party-notices.js'
+import {collectThirdPartyNotices, formatChildProcessError, formatThirdPartyNotices} from './third-party-notices.js'
 
 // All mocks use .js imports (Vitest convention for this project)
 vi.mock('generate-license-file', () => ({
@@ -141,7 +141,7 @@ describe('collectThirdPartyNotices — error path', () => {
 
     // #when / #then throws with cause in message
     await expect(collectThirdPartyNotices()).rejects.toThrow(
-      /license collection failed.*ENOENT.*no such file or directory/,
+      /license collection failed[\s\S]*ENOENT[\s\S]*no such file or directory/,
     )
   })
 
@@ -175,7 +175,58 @@ describe('collectThirdPartyNotices — error path', () => {
     mockGetProjectLicenses.mockRejectedValue('string rejection reason')
 
     // #when / #then message includes the string value
-    await expect(collectThirdPartyNotices()).rejects.toThrow(/license collection failed.*string rejection reason/)
+    await expect(collectThirdPartyNotices()).rejects.toThrow(/license collection failed[\s\S]*string rejection reason/)
+  })
+})
+
+describe('formatChildProcessError', () => {
+  it('surfaces stderr, stdout, exit code, and signal from an execFile-style error', () => {
+    // #given an execFile rejection carrying the diagnostics that the generic
+    // "Command failed" message alone hides
+    const execError = Object.assign(new Error('Command failed: pnpm licenses list --json --prod'), {
+      code: 1,
+      signal: 'SIGTERM',
+      stderr: '  ERR_PNPM_LICENSES_NO_LOCKFILE  the real underlying reason\n',
+      stdout: '  partial stdout content  ',
+    })
+
+    // #when formatted
+    const formatted = formatChildProcessError(execError)
+
+    // #then every diagnostic field is surfaced (stderr/stdout trimmed)
+    expect(formatted).toContain('Command failed: pnpm licenses list --json --prod')
+    expect(formatted).toContain('exitCode=1')
+    expect(formatted).toContain('signal=SIGTERM')
+    expect(formatted).toContain('stderr:\nERR_PNPM_LICENSES_NO_LOCKFILE  the real underlying reason')
+    expect(formatted).toContain('stdout:\npartial stdout content')
+  })
+
+  it('falls back to the message alone when no child-process fields are present', () => {
+    // #given a plain Error with no stderr/stdout/code
+    const plain = new Error('plain failure')
+
+    // #when / #then only the message is returned
+    expect(formatChildProcessError(plain)).toBe('plain failure')
+  })
+
+  it('stringifies a non-object rejection value', () => {
+    // #given a string rejection
+    // #when / #then the raw value is stringified
+    expect(formatChildProcessError('string reason')).toBe('string reason')
+  })
+
+  it('omits empty stderr/stdout and reports only present fields', () => {
+    // #given an error with an exit code but empty stream output
+    const execError = Object.assign(new Error('boom'), {code: 2, stderr: '', stdout: '   '})
+
+    // #when formatted
+    const formatted = formatChildProcessError(execError)
+
+    // #then empty streams are omitted, code is present
+    expect(formatted).toContain('boom')
+    expect(formatted).toContain('exitCode=2')
+    expect(formatted).not.toContain('stderr:')
+    expect(formatted).not.toContain('stdout:')
   })
 })
 
