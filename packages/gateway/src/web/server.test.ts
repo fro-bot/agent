@@ -1672,3 +1672,177 @@ describe('buildOperatorApp — optional streaming deps accepted without error', 
     expect(() => buildOperatorApp(makeStubDeps(), makeStubConfig())).not.toThrow()
   })
 })
+
+// ---------------------------------------------------------------------------
+// buildOperatorApp — v1.4.0 full route-registration smoke / drift guard
+//
+// Asserts the registered operator route SET (method + path) equals exactly the
+// expected v1.4.0 surface when all privileged deps are present. If a route is
+// added or removed, this exact-set assertion fails, forcing a deliberate update
+// of this test and the deploy/README Operator API surface table. It guards the
+// route set only — per-route auth semantics (Session / CSRF / repo authz) are
+// covered by each route's own unit tests, not pinned here.
+// ---------------------------------------------------------------------------
+
+/** Shared stub for denylist cache — fail-open for registration tests. */
+function makeStubDenylistCache(): NonNullable<OperatorServerDeps['denylistCache']> {
+  return {
+    getDenylistState: async () => undefined,
+    isRepoDenied: () => false,
+  }
+}
+
+/** Shared stub for bindings lookup — returns null (no binding) for registration tests. */
+function makeStubBindingsLookup(): NonNullable<OperatorServerDeps['bindingsLookup']> {
+  return {
+    getBindingByRepo: async () => ({success: true, data: null}),
+  }
+}
+
+/** Shared stub for run-observation manager — no-op for registration tests. */
+function makeStubRunObservationManager(): NonNullable<OperatorServerDeps['runObservationManager']> {
+  return {
+    observe: async () => undefined,
+    observeOutput: () => undefined,
+    observeApproval: () => undefined,
+    subscribe: () => () => undefined,
+    abortSubscription: () => undefined,
+    shutdown: () => undefined,
+  }
+}
+
+/** Shared stub for run index — never finds a run (registration tests don't exercise lookup). */
+function makeStubRunIndex(): NonNullable<OperatorServerDeps['runIndex']> {
+  return {
+    register: () => undefined,
+    lookup: async () => undefined,
+  }
+}
+
+/** Shared stub for approval registry — no-op for registration tests. */
+function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalRegistry']> {
+  return {
+    handleDecision: async () => 'not-found' as const,
+    describePendingForScope: () => [],
+  }
+}
+
+/** Shared stub for launchWorkDeps — opaque sentinel for registration tests only. */
+function makeStubLaunchWorkDeps(): NonNullable<OperatorServerDeps['launchWorkDeps']> {
+  // Registration only checks `deps.launchWorkDeps !== undefined`; the actual
+  // shape is not inspected at construction time. Cast to satisfy the type.
+  return {} as unknown as NonNullable<OperatorServerDeps['launchWorkDeps']>
+}
+
+/** Build a full-deps OperatorServerDeps with all privileged routes enabled. */
+function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>): OperatorServerDeps {
+  const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+  return makeStubDeps({
+    logger,
+    auditLogger,
+    allowlist,
+    csrfSecret,
+    sessionStore,
+    sessionDeps: makeStubSessionDeps(),
+    githubOAuth: makeStubGitHubOAuthDeps(),
+    denylistCache: makeStubDenylistCache(),
+    bindingsLookup: makeStubBindingsLookup(),
+    runObservationManager: makeStubRunObservationManager(),
+    runIndex: makeStubRunIndex(),
+    listBindings: async () => ({success: true, data: []}),
+    getBindingByRepo: async () => ({success: true, data: null}),
+    launchWorkDeps: makeStubLaunchWorkDeps(),
+    approvalRegistry: makeStubApprovalRegistry(),
+    rateLimiter: {allow: () => true},
+  })
+}
+
+/** Extract unique logical routes from a Hono app (excludes ALL /* middleware entries). */
+function extractRoutes(app: import('hono').Hono): {method: string; path: string}[] {
+  const seen = new Set<string>()
+  return app.routes
+    .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+    .filter((route: RouteEntry) => {
+      if (route.method === 'ALL' && route.path === '/*') return false
+      const key = `${route.method}:${route.path}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+describe('buildOperatorApp — v1.4.0 full route-registration smoke (drift guard)', () => {
+  it('registers exactly the expected v1.4.0 operator route set when all privileged deps are present', () => {
+    // #given — all privileged deps present
+    const sessionStore = createInMemorySessionStore()
+    const app = buildOperatorApp(
+      makeFullPrivilegedDeps(sessionStore),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — extract registered routes
+    const routes = extractRoutes(app)
+
+    // #then — exact v1.4.0 set (order-independent)
+    // If this assertion fails, a route was added or removed. Update BOTH this test
+    // AND the deploy/README "Operator API surface" table to keep them in sync.
+    const routeSet = new Set(routes.map(r => `${r.method}:${r.path}`))
+    const expectedV14Routes = new Set([
+      'GET:/operator/health',
+      'GET:/operator/auth/github/start',
+      'GET:/operator/auth/github/callback',
+      'POST:/operator/auth/logout',
+      'GET:/operator/session/csrf',
+      'GET:/operator/session',
+      'GET:/operator/repos',
+      'POST:/operator/runs',
+      'GET:/operator/runs/:runId/stream',
+      'POST:/operator/runs/:runId/approvals/:requestId/decision',
+      'GET:/operator/runs/:runId/approvals',
+    ])
+
+    expect(routeSet).toEqual(expectedV14Routes)
+    expect(routes).toHaveLength(expectedV14Routes.size)
+  })
+
+  it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {
+    // #given — only OAuth + session/browser-guard deps (no launchWorkDeps, runIndex,
+    // denylistCache, bindingsLookup, runObservationManager, approvalRegistry)
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        logger,
+        auditLogger,
+        allowlist,
+        csrfSecret,
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        githubOAuth: makeStubGitHubOAuthDeps(),
+        rateLimiter: {allow: () => true},
+        // Intentionally absent: denylistCache, bindingsLookup, runObservationManager,
+        // runIndex, listBindings, getBindingByRepo, launchWorkDeps, approvalRegistry
+      }),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — extract registered routes
+    const routes = extractRoutes(app)
+    const routePaths = routes.map(r => `${r.method}:${r.path}`)
+
+    // #then — run/approval routes are NOT registered (conditional gating is real)
+    expect(routePaths).not.toContain('GET:/operator/repos')
+    expect(routePaths).not.toContain('POST:/operator/runs')
+    expect(routePaths).not.toContain('GET:/operator/runs/:runId/stream')
+    expect(routePaths).not.toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')
+    expect(routePaths).not.toContain('GET:/operator/runs/:runId/approvals')
+
+    // #and — health, auth, session routes ARE registered
+    expect(routePaths).toContain('GET:/operator/health')
+    expect(routePaths).toContain('GET:/operator/auth/github/start')
+    expect(routePaths).toContain('GET:/operator/auth/github/callback')
+    expect(routePaths).toContain('POST:/operator/auth/logout')
+    expect(routePaths).toContain('GET:/operator/session/csrf')
+    expect(routePaths).toContain('GET:/operator/session')
+  })
+})

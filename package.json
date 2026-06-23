@@ -21,12 +21,15 @@
   ],
   "scripts": {
     "bootstrap": "SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
-    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build && pnpm --filter @fro.bot/harness build",
+    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build && pnpm --filter @fro.bot/harness build && pnpm run dist:escape-hidden-unicode",
     "check-types": "pnpm --filter @fro-bot/runtime check-types && pnpm --filter @fro-bot/action check-types && pnpm --filter @fro.bot/harness check-types",
+    "dist:check-hidden-unicode": "node --experimental-strip-types scripts/check-dist-hidden-unicode.ts",
+    "dist:escape-hidden-unicode": "node --experimental-strip-types scripts/escape-dist-hidden-unicode.ts",
     "fix": "pnpm --filter @fro-bot/runtime fix && pnpm --filter @fro-bot/action fix && pnpm --filter @fro.bot/harness fix",
     "postinstall": "simple-git-hooks",
-    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint && pnpm --filter @fro.bot/harness lint",
-    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test && pnpm --filter @fro.bot/harness test"
+    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint && pnpm --filter @fro.bot/harness lint && pnpm run dist:check-hidden-unicode",
+    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test && pnpm --filter @fro.bot/harness test",
+    "test:scripts": "vitest run scripts/"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged",

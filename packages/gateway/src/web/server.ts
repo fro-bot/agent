@@ -321,8 +321,17 @@ function validateForwardedHeaders(
  * where operator HTTP routes are registered — any new route added here is
  * immediately visible to the ingress-pin test.
  *
- * Currently registers only GET /operator/health. Privileged routes (auth, launch,
- * approvals, SSE) are added only after the auth boundary is in place.
+ * Registers GET /operator/health unconditionally. Privileged routes are registered
+ * conditionally when their deps are present:
+ *   - GitHub OAuth (start + callback): when deps.githubOAuth + config.githubOAuth are set
+ *   - POST /operator/auth/logout: when sessionStore + sessionDeps + browser guard deps are set
+ *   - GET /operator/session/csrf: when browser guard deps are set
+ *   - GET /operator/session: when browser guard deps are set
+ *   - GET /operator/repos: when browser guard + sessionStore + denylistCache + listBindings are set
+ *   - POST /operator/runs: when browser guard + sessionStore + denylistCache + getBindingByRepo + launchWorkDeps are set
+ *   - GET /operator/runs/:runId/stream: when browser guard + sessionStore + denylistCache + bindingsLookup + runObservationManager + runIndex are set
+ *   - POST /operator/runs/:runId/approvals/:requestId/decision: when browser guard + sessionStore + denylistCache + bindingsLookup + runIndex + approvalRegistry are set
+ *   - GET /operator/runs/:runId/approvals: when browser guard + sessionStore + denylistCache + bindingsLookup + runIndex + approvalRegistry are set
  */
 export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServerConfig): Hono {
   const checkShuttingDown = deps.isShuttingDown ?? (() => false)

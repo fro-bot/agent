@@ -304,16 +304,35 @@ chmod 0600 deploy/secrets/github-oauth-client-id \
 
 All privileged operator endpoints are under `/operator/` and require a valid session cookie. The browser guard enforces session validity, allowlist membership, and origin/Fetch Metadata checks on every request.
 
-| Method | Path                             | Auth           | Purpose                                                 |
-| ------ | -------------------------------- | -------------- | ------------------------------------------------------- |
-| `GET`  | `/operator/health`               | None           | Health check                                            |
-| `GET`  | `/operator/auth/github/start`    | None           | Start OAuth login                                       |
-| `GET`  | `/operator/auth/github/callback` | None           | OAuth callback (GitHub redirects here)                  |
-| `POST` | `/operator/auth/logout`          | Session + CSRF | Invalidate session and clear cookie                     |
-| `GET`  | `/operator/session/csrf`         | Session        | Get a signed CSRF token for mutating requests           |
-| `GET`  | `/operator/session`              | Session        | Get current session info (operatorId, login, expiresAt) |
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/operator/health` | None | Health check |
+| `GET` | `/operator/auth/github/start` | None | Start OAuth login |
+| `GET` | `/operator/auth/github/callback` | None | OAuth callback (GitHub redirects here) |
+| `POST` | `/operator/auth/logout` | Session + CSRF | Invalidate session and clear cookie |
+| `GET` | `/operator/session/csrf` | Session | Get a signed CSRF token for mutating requests |
+| `GET` | `/operator/session` | Session | Get current session info (operatorId, login, expiresAt) |
+| `GET` | `/operator/repos` | Session | Scoped, denylist-filtered list of bound repos the operator may launch against |
+| `POST` | `/operator/runs` | Session + CSRF | Launch a run against a bound repo (returns 202 `{runId}`) |
+| `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
+| `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
+| `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
+
+Operator contract: v1.4.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
+
+### Operator runbook
+
+Follow these steps in order to deploy and operate the web surface:
+
+1. **Deploy the gateway image** — see [One-Time Setup](#one-time-setup) and [Starting the Stack](#starting-the-stack) for the Docker Compose setup and image build.
+2. **Set `GATEWAY_OPERATOR_PUBLIC_ORIGIN` and OAuth env** — see [Operator OAuth (Web Surface)](#operator-oauth-web-surface) for the required environment variables and secrets.
+3. **Register the GitHub OAuth app callback URL** — the callback path is `/operator/auth/github/callback` on your public origin; see the OAuth App setup instructions in [Operator OAuth (Web Surface)](#operator-oauth-web-surface).
+4. **Configure the operator allowlist** — add one numeric GitHub user ID per line to `deploy/secrets/gateway-operator-allowlist`; see the allowlist note in [Operator OAuth (Web Surface)](#operator-oauth-web-surface).
+5. **Verify** — confirm `GET /operator/health` returns `{ok:true}`, complete an OAuth login via `/operator/auth/github/start`, then exercise the [Operator API surface](#operator-api-surface) above.
+
+The route table and env table are the single source of truth — this runbook links to them rather than restating them.
 
 ## Workspace Port Model
 

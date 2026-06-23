@@ -1,6 +1,7 @@
 ---
 title: 'Committed-bundle attribution and SBOM hygiene'
 date: 2026-06-21
+last_updated: 2026-06-22
 problem_type: workflow_issue
 component: tooling
 severity: medium
@@ -78,18 +79,18 @@ The carve-out existed to paper over a fail-soft generator interacting with an un
 
 ### 5. Know your Renovate mechanics: `ignorePaths` is scan-only, not a commit filter
 
-Removing the CI carve-out is only safe because Renovate already regenerates the file. `ignorePaths: ['dist/**']` excludes `dist/` from Renovate's *scanning* (so it won't open update PRs for vendored code, and the hidden-Unicode detector skips it) — it does **not** stop Renovate from committing rebuilt `dist/`. `postUpgradeTasks` runs the build on every dependency PR:
+Removing the CI carve-out is only safe because Renovate already regenerates the file. `ignorePaths: ['dist/**']` excludes `dist/` from Renovate's *dependency extraction* (so it won't open update PRs for vendored code) — it does **not** stop Renovate from committing rebuilt `dist/`, and it does **not** suppress Renovate's hidden-Unicode safety scan, which runs on the same files independently. `postUpgradeTasks` runs the build on every dependency PR:
 
 ```json5
 // .github/renovate.json5
-ignorePaths: ['dist/**'],          // scan exclusion only
+ignorePaths: ['dist/**'],          // scan exclusion only (extraction, not the safety scan)
 postUpgradeTasks: {
-  commands: ['pnpm install', 'pnpm run build', 'pnpm run fix'],  // regenerates + commits dist on dep PRs
+  commands: ['pnpm install', 'pnpm run fix', 'pnpm run build'],  // regenerates + commits dist on dep PRs
   executionMode: 'branch',
 }
 ```
 
-So dependency PRs regenerate the notice deterministically and the unconditional dist-diff gate verifies it — no exception required.
+These three commands are the ones `bfra-me/renovate-action` allowlists for `postUpgradeTasks`; a bespoke command outside the allowlist is silently dropped, so any dist transform must ride inside an allowlisted command (e.g. as the final step of `build`). So dependency PRs regenerate the notice deterministically and the unconditional dist-diff gate verifies it — no exception required. The same allowlist constraint, and why committed-dist transforms must live in `build` rather than only a bundler hook, is covered in [Escape committed dist/ artifacts independently of the bundler lifecycle](durable-dist-hidden-unicode-fix-2026-06-22.md).
 
 ### 6. SBOM is a separate lane from the NOTICE — ship it as a non-blocking CI artifact
 
@@ -142,5 +143,7 @@ Any project that commits a bundled or vendored `dist/` and redistributes third-p
 - [versioned-tool-config-plugin-pattern](../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md) — Renovate customManager / config-source-of-truth discipline behind Rule 5.
 - [gateway-docker-runtime-resolution-crash-loop](../build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md) — the sibling "build-time invariant in the bundler + CI self-check" pattern; the dist-diff-gate-as-proof here is the same discipline.
 - [tool-binary-caching-ephemeral-runners](../build-errors/tool-binary-caching-ephemeral-runners.md) — the dist/ rebuild-verification convention this builds on.
+- [durable-dist-hidden-unicode-fix](durable-dist-hidden-unicode-fix-2026-06-22.md) — the durability fix for the hidden-Unicode scan Rule 5 alludes to: escape `dist/` in `build` so the scanner is irrelevant, not load-bearing.
+- [build-pipeline-fallible-preflight-and-finally-cleanup](build-pipeline-fallible-preflight-and-finally-cleanup-2026-06-22.md) — the lifecycle placement of Rule 3's fail-closed collection: run it as a preflight *before* the bundler mutates `dist/`, not inside a late hook the bundler may skip.
 
 Source: PR #978 (no issue — arose from a maintainer question on why `dist/licenses.txt` was untracked and the modern SBOM/license approach). Files: `tsdown.config.ts`, `.github/workflows/ci.yaml`, `.github/renovate.json5`, `RULES.md`.
