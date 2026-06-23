@@ -16,11 +16,12 @@
   "author": "Fro Bot <agent@fro.bot>",
   "type": "module",
   "bin": {
-    "harness": "./dist/cli.mjs"
+    "harness": "./bin/harness.mjs"
   },
   "files": [
     "LICENSE",
     "README.md",
+    "bin",
     "dist",
     "provenance.json"
   ],
@@ -29,7 +30,7 @@
     "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
     "fix": "pnpm --dir ../.. exec eslint --fix packages/harness/src packages/harness/scripts",
     "lint": "pnpm --dir ../.. exec eslint packages/harness/src packages/harness/scripts",
-    "postinstall": "node dist/postinstall.mjs || true",
+    "postinstall": "node bin/postinstall.mjs",
     "test": "pnpm exec vitest run --passWithNoTests src scripts"
   },
   "engines": {
