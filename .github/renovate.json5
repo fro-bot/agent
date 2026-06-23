@@ -166,9 +166,13 @@
     },
   ],
   postUpgradeTasks: {
+    // `install --force` repairs the pnpm content-addressable store before the
+    // build. Renovate restores a cached store that can be missing package index
+    // files (ERR_PNPM_MISSING_PACKAGE_INDEX_FILE); a plain `install` no-ops
+    // against that partial store and the build's license collection then fails.
     // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
     // update branches stays free of characters Renovate would otherwise flag.
-    commands: ['pnpm install', 'pnpm run fix', 'pnpm run build'],
+    commands: ['pnpm install --force', 'pnpm run fix', 'pnpm run build'],
     executionMode: 'branch',
   },
 }
