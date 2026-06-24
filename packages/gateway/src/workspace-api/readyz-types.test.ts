@@ -19,7 +19,7 @@
  *
  * NOTE: The workspace-agent shape is mirrored locally (NOT imported across the package/container
  * boundary). The gateway Docker image builds in isolation without apps/workspace-agent present,
- * so cross-package imports would break `pnpm --filter @fro-bot/gateway build`. This follows the
+ * so cross-package imports would break `bun run --filter @fro-bot/gateway build`. This follows the
  * same convention as client.ts. Keep `WorkspaceReadyzResponse` in sync with the source of truth:
  * apps/workspace-agent/src/types.ts `ReadyzResponse`.
  */
@@ -61,7 +61,7 @@ type AssertAssignable<A, B> = A extends B ? true : never
  * assignable to the workspace-agent flat ReadyzResponse (the looser producer shape).
  *
  * If this type resolves to `never`, the `assertAssignable` variable below will fail to compile,
- * surfacing the drift as a type error in `pnpm check-types`.
+ * surfacing the drift as a type error in `bun run check-types`.
  */
 type GatewayAssignableToWorkspace = AssertAssignable<GatewayReadyzResponse, WorkspaceReadyzResponse>
 

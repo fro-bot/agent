@@ -87,7 +87,7 @@ jobs:
             git commit --no-verify -m 'skip: merge main [skip release] (conflict-resolved)'
           fi
 
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
 
       - id: release-preview

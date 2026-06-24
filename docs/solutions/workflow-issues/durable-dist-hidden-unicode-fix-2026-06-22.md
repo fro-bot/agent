@@ -1,8 +1,7 @@
 ---
 title: Escape committed dist/ artifacts independently of the bundler lifecycle
 date: 2026-06-22
-category: workflow-issues
-module: build
+last_updated: 2026-06-24
 problem_type: workflow_issue
 component: tooling
 severity: low
@@ -41,14 +40,14 @@ PR #988 fixed it by moving the guarantee out of the bundler and into the `build`
 
 ### 1. Put a dist-tree invariant in the command every consumer runs, not in the bundler hook
 
-A `writeBundle` hook is invisible to any path that commits `dist/` without re-emitting every chunk — Renovate update branches, partial caches, hand-edits. Wire the transform into `pnpm run build` so local dev, the CI Build job, and Renovate's `postUpgradeTasks` all apply it:
+A `writeBundle` hook is invisible to any path that commits `dist/` without re-emitting every chunk — Renovate update branches, partial caches, hand-edits. Wire the transform into `bun run build` so local dev, the CI Build job, and Renovate's `postUpgradeTasks` all apply it:
 
 ```json
 // package.json — the scrub is the FINAL step of build
-"build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build && pnpm --filter @fro.bot/harness build && pnpm run dist:escape-hidden-unicode"
+"build": "bun run --filter @fro-bot/runtime build && bun run --filter @fro-bot/action build && bun run --filter @fro.bot/harness build && bun run dist:escape-hidden-unicode"
 ```
 
-A `pnpm run build` that exits zero is, by construction, free of the flagged codepoints.
+A `bun run build` that exits zero is, by construction, free of the flagged codepoints.
 
 ### 2. `ignorePaths` is extraction-only — fix the artifact, not the scanner config
 
@@ -61,7 +60,7 @@ Renovate's `ignorePaths: ['dist/**']` stops dependency extraction from the bundl
 ```json5
 // .github/renovate.json5 — only allowlisted commands; build does the scrubbing
 postUpgradeTasks: {
-  commands: ['pnpm install', 'pnpm run fix', 'pnpm run build'],
+  commands: ['bun install', 'bun run fix', 'bun run build'],
   executionMode: 'branch',
 }
 ```
@@ -108,9 +107,9 @@ const fixed = content.replaceAll(re, escapeChar) // escapeChar: char => `\\u${he
 ```yaml
 # .github/workflows/ci.yaml — Build job
 - name: Rebuild the dist/ directory
-  run: pnpm build
+  run: bun run build
 - name: Check dist/ for hidden Unicode characters
-  run: pnpm run dist:check-hidden-unicode
+  run: bun run dist:check-hidden-unicode
 ```
 
 ### 9. Reference the real config; trigger scripts tests on script changes
@@ -139,4 +138,5 @@ The action build pointed at a nonexistent `apps/action/tsdown.config.ts` and sil
 - [Harness base-version source of truth](harness-base-version-source-of-truth-2026-06-12.md) — the "delete the source of drift, don't add a detection test" meta-rule behind the single-source-of-truth dedup.
 - [Gateway Docker runtime-resolution crash-loop](../build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md) — the "build-time invariant + CI self-check" template this refines with the bundler-lifecycle caveat.
 - [Build pipelines — fallible work is a preflight, cleanup is a finally](build-pipeline-fallible-preflight-and-finally-cleanup-2026-06-22.md) — the lifecycle-ordering refinement: *where in the build command* fail-closed work and cleanup run (preflight before the bundler, escape in a finally after it), not just that they run in `build`.
+- [Migrating a pnpm workspace to Bun](migrate-pnpm-to-bun-monorepo-2026-06-24.md) — the pnpm→Bun migration that replaced the `pnpm run build` / `pnpm install` tokens in the Renovate allowlist and the build command chain with their Bun equivalents.
 - Failed-attempt trail: PR #554 (ignorePaths), PR #571 (escape plugin), PR #654 (widen to text files); PR #988 is the durable fix.

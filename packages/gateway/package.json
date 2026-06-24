@@ -5,17 +5,19 @@
   "type": "module",
   "main": "src/main.ts",
   "scripts": {
-    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/main.ts --format esm --out-dir dist",
-    "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
-    "fix": "pnpm --dir ../.. exec eslint --fix packages/gateway/src",
-    "lint": "pnpm --dir ../.. exec eslint packages/gateway/src",
-    "test": "pnpm exec vitest run --passWithNoTests src"
+    "build": "bunx tsc -p tsconfig.json --noEmit && bunx tsdown src/main.ts --format esm --out-dir dist",
+    "check-types": "bunx tsc -p tsconfig.json --noEmit",
+    "fix": "bunx eslint --fix src",
+    "lint": "bunx eslint src",
+    "test": "bunx vitest run --passWithNoTests src"
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*",
     "@hono/node-server": "1.19.14",
+    "@octokit/core": "7.0.6",
     "discord.js": "14.26.4",
     "effect": "3.21.3",
-    "hono": "4.12.26"
+    "hono": "4.12.26",
+    "yaml": "2.8.3"
   }
 }

@@ -1,8 +1,7 @@
 ---
 title: Build pipelines — fallible work is a preflight, cleanup is a finally
 date: 2026-06-22
-category: workflow-issues
-module: build
+last_updated: 2026-06-24
 problem_type: workflow_issue
 component: tooling
 severity: low
@@ -114,7 +113,7 @@ The same lifecycle shape — fallible generation → destructive mutation → mu
 // tsdown.config.ts
 plugins: [licenseCollectorPlugin() /* throws in writeBundle */, escapeHiddenUnicodePlugin(), ...]
 // package.json
-"build": "... && tsdown ... && pnpm run dist:escape-hidden-unicode"  // escape skipped if tsdown throws
+"build": "... && tsdown ... && bun run dist:escape-hidden-unicode"  // escape skipped if tsdown throws
 ```
 
 A Renovate build where license collection fails: tsdown's `writeBundle` throws after emitting `dist/`, the `&&` short-circuits, the escape never runs, and the notice is dropped.
@@ -138,4 +137,5 @@ A Renovate build where license collection fails: the preflight throws before tsd
 - [Atomic serial channel queue handoff](../best-practices/atomic-serial-channel-queue-handoff-2026-06-09.md) and [Authenticated SSE run observation](../best-practices/authenticated-sse-run-observation-2026-06-20.md) — the runtime dual-`finally` cleanup canon this borrows for the build's finally slot.
 - [Compose topology egress guard hardening](../best-practices/compose-topology-egress-guard-hardening-2026-06-14.md) — the "a bypassable guard is worse than none" canon; a late-hook fail-closed check is its build-pipeline variant.
 - [Gateway Docker runtime-resolution crash-loop](../build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md) — the "build-time invariant + CI self-check" template this refines with lifecycle placement.
+- [Migrating a pnpm workspace to Bun](migrate-pnpm-to-bun-monorepo-2026-06-24.md) — the pnpm→Bun migration that kept this preflight→mutator→finally lifecycle unchanged while replacing the package manager.
 - Source: PR #991.

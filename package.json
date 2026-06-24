@@ -20,27 +20,43 @@
     "packages/*"
   ],
   "scripts": {
-    "bootstrap": "SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --no-strict-peer-dependencies --prefer-offline --loglevel warn",
-    "build": "pnpm --filter @fro-bot/runtime build && pnpm --filter @fro-bot/action build && pnpm --filter @fro.bot/harness build && pnpm run dist:escape-hidden-unicode",
-    "check-types": "pnpm --filter @fro-bot/runtime check-types && pnpm --filter @fro-bot/action check-types && pnpm --filter @fro.bot/harness check-types",
+    "bootstrap": "bun install",
+    "build": "bun run --filter @fro-bot/runtime build && bun run --filter @fro-bot/action build && bun run --filter @fro.bot/harness build && bun run dist:escape-hidden-unicode",
+    "check-types": "bun run --filter @fro-bot/runtime check-types && bun run --filter @fro-bot/action check-types && bun run --filter @fro.bot/harness check-types",
     "dist:check-hidden-unicode": "node --experimental-strip-types scripts/check-dist-hidden-unicode.ts",
     "dist:escape-hidden-unicode": "node --experimental-strip-types scripts/escape-dist-hidden-unicode.ts",
-    "fix": "pnpm --filter @fro-bot/runtime fix && pnpm --filter @fro-bot/action fix && pnpm --filter @fro.bot/harness fix",
+    "fix": "bun run --filter @fro-bot/runtime fix && bun run --filter @fro-bot/action fix && bun run --filter @fro.bot/harness fix",
     "postinstall": "simple-git-hooks",
-    "lint": "pnpm --filter @fro-bot/runtime lint && pnpm --filter @fro-bot/action lint && pnpm --filter @fro.bot/harness lint && pnpm run dist:check-hidden-unicode",
-    "test": "pnpm --filter @fro-bot/runtime test && pnpm --filter @fro-bot/action test && pnpm --filter @fro.bot/harness test",
+    "lint": "bun run --filter @fro-bot/runtime lint && bun run --filter @fro-bot/action lint && bun run --filter @fro.bot/harness lint && bun run dist:check-hidden-unicode",
+    "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test",
     "test:scripts": "vitest run scripts/"
   },
   "simple-git-hooks": {
-    "pre-commit": "pnpm exec lint-staged",
-    "pre-push": "pnpm lint && pnpm build"
+    "pre-commit": "bunx lint-staged",
+    "pre-push": "bun run lint && bun run build"
   },
   "lint-staged": {
     "*.{ts,js,jsx,tsx,css,md,json,yaml,yml}": [
-      "pnpm run fix"
+      "bunx eslint --fix --no-warn-ignored"
     ]
   },
   "prettier": "@bfra.me/prettier-config/120-proof",
+  "overrides": {
+    "brace-expansion": ">=5.0.6",
+    "fast-uri": ">=3.1.2",
+    "fast-xml-builder": ">=1.1.7",
+    "fast-xml-parser": ">=5.7.0",
+    "flatted": "3.4.2",
+    "handlebars": ">=4.7.9",
+    "ip-address": ">=10.1.1",
+    "lodash": ">=4.18.0",
+    "lodash-es": ">=4.18.0",
+    "picomatch": ">=4.0.4",
+    "tar": ">=7.5.11",
+    "undici": ">=7.24.0",
+    "vite": "8.0.16",
+    "yaml": ">=2.8.3"
+  },
   "dependencies": {
     "@actions/artifact": "6.2.1",
     "@actions/cache": "6.0.1",
@@ -67,7 +83,6 @@
     "eslint": "10.5.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.6",
-    "generate-license-file": "4.2.1",
     "jiti": "2.7.0",
     "js-yaml": "4.2.0",
     "lint-staged": "17.0.7",
@@ -79,5 +94,10 @@
     "typescript": "6.0.3",
     "vitest": "4.1.9"
   },
-  "packageManager": "pnpm@11.8.0"
+  "packageManager": "bun@1.3.14",
+  "trustedDependencies": [
+    "esbuild",
+    "simple-git-hooks",
+    "unrs-resolver"
+  ]
 }

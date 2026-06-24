@@ -21,17 +21,95 @@ FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d
 
 WORKDIR /workspace
 
-RUN corepack enable
+ARG BUN_VERSION=1.3.14
+
+# curl + unzip to fetch and extract the verified Bun release archive.
+RUN apk add --no-cache curl unzip
+
+# Install Bun from the official oven-sh/bun GitHub release, verified against the
+# release SHASUMS256.txt fail-closed — matching the verified-binary posture used
+# for the OpenCode install below (and CI's oven-sh/setup-bun), rather than
+# pulling the unverified `bun` npm wrapper. TARGETARCH is provided automatically
+# by BuildKit; x64 uses the AVX2-independent baseline+musl variant so the image
+# runs on any x86 host, arm64 uses the musl variant. Both are musl for Alpine.
+#
+# Any download failure, checksum-fetch failure, missing entry, or hash mismatch
+# aborts the build (no fallback, no retry-around-mismatch).
+#
+# NOTE: keep this block in sync with the same block in deploy/gateway.Dockerfile.
+ARG TARGETARCH
+RUN set -euo pipefail \
+    # Validate the version before URL interpolation (parity with the OpenCode block).
+    && case "${BUN_VERSION}" in \
+         *[!0-9A-Za-z._-]*) echo "BUN_VERSION contains disallowed characters: ${BUN_VERSION}" >&2; exit 1 ;; \
+         [0-9]*.[0-9]*.[0-9]*) : ;; \
+         *) echo "BUN_VERSION is not a semver-like version: ${BUN_VERSION}" >&2; exit 1 ;; \
+       esac \
+    && case "${TARGETARCH}" in \
+         amd64) bun_asset="bun-linux-x64-musl-baseline" ;; \
+         arm64) bun_asset="bun-linux-aarch64-musl" ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && bun_base="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${bun_asset}.zip" "${bun_base}/${bun_asset}.zip" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHASUMS256.txt "${bun_base}/SHASUMS256.txt" \
+    && expected_hash="$(awk -v f="${bun_asset}.zip" '$2 == f || $2 == "./" f {print $1}' /tmp/SHASUMS256.txt)" \
+    && if [ -z "${expected_hash}" ]; then \
+         echo "SHASUMS256.txt has no entry for ${bun_asset}.zip" >&2; exit 1; \
+       fi \
+    && actual_hash="$(sha256sum "/tmp/${bun_asset}.zip" | awk '{print $1}')" \
+    && if [ "${actual_hash}" != "${expected_hash}" ]; then \
+         echo "SHA256 mismatch for ${bun_asset}.zip: expected ${expected_hash}, got ${actual_hash}" >&2; exit 1; \
+       fi \
+    && unzip -q "/tmp/${bun_asset}.zip" -d /tmp/bun \
+    && mv "/tmp/bun/${bun_asset}/bun" /usr/local/bin/bun \
+    && chmod 755 /usr/local/bin/bun \
+    # bunx is bun's package-runner alias (the npm wrapper installs both); the raw
+    # release archive ships only `bun`, so symlink it for `bunx tsc`/`bunx tsdown`.
+    && ln -s /usr/local/bin/bun /usr/local/bin/bunx \
+    && rm -rf "/tmp/${bun_asset}.zip" /tmp/SHASUMS256.txt /tmp/bun \
+    && bun --version \
+    && bunx --version
 
 # Workspace root manifests first (layer-cache friendly)
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
 
-# Only the workspace-agent package is needed (it has no @fro-bot/runtime dep)
+# Copy every workspace package manifest so `bun install --frozen-lockfile` can
+# validate the full workspace graph against bun.lock. Bun (unlike pnpm) checks
+# the complete manifest set even for a filtered install, so a missing manifest
+# reads as lockfile drift and fails the frozen install.
+COPY apps/action/package.json apps/action/package.json
+COPY apps/workspace-agent/package.json apps/workspace-agent/package.json
+COPY packages/runtime/package.json packages/runtime/package.json
+COPY packages/gateway/package.json packages/gateway/package.json
+COPY packages/harness/package.json packages/harness/package.json
+
+# Install the full workspace (including devDependencies). The build typechecks
+# test files (which import vitest) and runs tsc/tsdown, so the build toolchain
+# and dev dependencies must be present. A filtered install omits root
+# devDependencies and breaks the typecheck.
+RUN bun install --frozen-lockfile
+
+# Source for the package we actually build
 COPY apps/workspace-agent/ apps/workspace-agent/
 
-RUN pnpm install --frozen-lockfile --filter @fro-bot/workspace-agent...
+RUN bun run --filter @fro-bot/workspace-agent build
 
-RUN pnpm --filter @fro-bot/workspace-agent build
+# Trim the runtime image: re-resolve node_modules to production-only so the
+# final image does not carry the dev toolchain (vitest, tsdown, eslint, …). The
+# full install above is required for the build typecheck (which imports vitest).
+# Bun's --production does NOT prune an already-populated node_modules, so the
+# workspace node_modules are removed first for a clean production-only install
+# (the rm globs cover the current flat apps/* + packages/* workspace layout).
+# --ignore-scripts is required: bun still runs the ROOT postinstall under
+# --production (workspace mode), and that script invokes simple-git-hooks — a
+# devDependency that is absent under --production, so it would fail with exit
+# 127. The flag is a blanket suppression of all lifecycle scripts; that is safe
+# today because no production dependency declares a postinstall, but a future
+# prod dep that needs one would be silently skipped (caught only by the smoke
+# tests booting the image). The runtime stage copies this trimmed tree.
+RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
+    && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS runtime
@@ -91,8 +169,8 @@ RUN set -euo pipefail \
     && base_url="https://github.com/fro-bot/agent/releases/download/${encoded_version}" \
     # Download the asset archive and the SHA256SUMS file for this release.
     # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
-    && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
-    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
     # Verify the asset's SHA256 against the SHA256SUMS entry — fail closed on any mismatch.
     && expected_hash="$(awk -v f="${oc_asset}.tar.gz" '$2 == f {print $1}' /tmp/SHA256SUMS)" \
     && if [ -z "${expected_hash}" ]; then \
