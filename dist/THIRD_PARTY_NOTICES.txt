@@ -12315,7 +12315,7 @@ eastasianwidth@0.2.0
 MIT
 MIT
 
-effect@3.21.3
+effect@3.21.4
 MIT
 MIT License
 
