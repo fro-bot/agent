@@ -3,24 +3,39 @@ FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d
 
 WORKDIR /workspace
 
-# Enable corepack for pnpm
-RUN corepack enable
+ARG BUN_VERSION=1.3.14
+
+# Install Bun (matches packageManager: bun@${BUN_VERSION})
+RUN npm i -g bun@${BUN_VERSION}
 
 # Copy workspace root manifests first (layer-cache friendly)
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
 
-# Copy only the packages we need for the gateway build
+# Copy every workspace package manifest so `bun install --frozen-lockfile` can
+# validate the full workspace graph against bun.lock. Bun (unlike pnpm) checks
+# the complete manifest set even for a filtered install, so a missing manifest
+# reads as lockfile drift and fails the frozen install.
+COPY apps/action/package.json apps/action/package.json
+COPY apps/workspace-agent/package.json apps/workspace-agent/package.json
+COPY packages/runtime/package.json packages/runtime/package.json
+COPY packages/gateway/package.json packages/gateway/package.json
+COPY packages/harness/package.json packages/harness/package.json
+
+# Install the full workspace (including devDependencies). The build typechecks
+# test files (which import vitest) and runs tsc/tsdown, so the build toolchain
+# and dev dependencies must be present. A filtered install omits root
+# devDependencies and breaks the typecheck.
+RUN bun install --frozen-lockfile
+
+# Copy the source for the packages we actually build
 COPY packages/runtime/ packages/runtime/
 COPY packages/gateway/ packages/gateway/
 
-# Install dependencies for gateway and its workspace deps only
-RUN pnpm install --frozen-lockfile --filter @fro-bot/gateway...
-
 # Build runtime first (gateway depends on it)
-RUN pnpm --filter @fro-bot/runtime build
+RUN bun run --filter @fro-bot/runtime build
 
 # Build gateway
-RUN pnpm --filter @fro-bot/gateway build
+RUN bun run --filter @fro-bot/gateway build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS runtime

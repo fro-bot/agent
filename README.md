@@ -621,22 +621,22 @@ If the agent times out before completing:
 ### Prerequisites
 
 - Node.js 24 (see `.node-version`)
-- pnpm 10+
+- Bun 1.3.14+ (see `package.json` `packageManager`)
 
 ### Setup
 
 ```bash
 # Install dependencies
-pnpm install
+bun install
 
 # Run tests
-pnpm test
+bun run test
 
 # Build action
-pnpm build
+bun run build
 
 # Lint code
-pnpm lint
+bun run lint
 ```
 
 ### Project Structure
@@ -667,13 +667,13 @@ The project uses Vitest with comprehensive test coverage:
 
 ```bash
 # Run all tests
-pnpm test
+bun run test
 
 # Run specific test file
-pnpm test src/lib/agent/prompt.test.ts
+bunx vitest run src/lib/agent/prompt.test.ts
 
 # Watch mode (for development)
-pnpm test --watch
+bunx vitest --watch
 ```
 
 ### Contributing
@@ -683,7 +683,7 @@ This project follows test-driven development (TDD):
 1. Write failing test first
 2. Implement minimal code to pass
 3. Refactor while keeping tests green
-4. Never commit without running `pnpm build` (dist/ must stay in sync)
+4. Never commit without running `bun run build` (dist/ must stay in sync)
 
 See `AGENTS.md` for detailed development guidelines and architecture overview.
 

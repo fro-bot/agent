@@ -22,7 +22,7 @@ sources:
   - apps/workspace-agent/src/opencode-server.ts
   - AGENTS.md
   - action.yaml
-  - pnpm-workspace.yaml
+  - bunfig.toml
 summary: "Monorepo structure, action + harness + gateway + workspace-agent packages, and module map"
 ---
 
@@ -32,7 +32,7 @@ Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode, optiona
 
 ## Monorepo Structure
 
-The project is organized as a pnpm workspace monorepo with two workspace areas:
+The project is organized as a Bun workspace monorepo with two workspace areas:
 
 | Package | Path | Purpose |
 | --- | --- | --- |
@@ -142,7 +142,7 @@ The runtime package exports five module groups:
 
 ## Build and Bundle
 
-The project uses `tsdown` (an esbuild-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `pnpm build` and checking for diffs.
+The project uses `tsdown` (an esbuild-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
 
 The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
 

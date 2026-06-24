@@ -9,7 +9,7 @@
  * arming/startPrompt path); runPromptAttempt handles stream processing and the
  * poll/v2-wait completion signal.
  *
- * Run: OPENCODE_LIVE_PROBE=1 pnpm vitest run src/features/agent/live-probe-1.17.9.test.ts
+ * Run: OPENCODE_LIVE_PROBE=1 bunx vitest run src/features/agent/live-probe-1.17.9.test.ts
  */
 import type {Event} from '@opencode-ai/sdk'
 import * as childProcess from 'node:child_process'

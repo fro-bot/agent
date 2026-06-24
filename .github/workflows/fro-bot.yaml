@@ -211,7 +211,7 @@ jobs:
             }}
           token: ${{ secrets.FRO_BOT_PAT }}
 
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
 
       - name: Run Fro Bot

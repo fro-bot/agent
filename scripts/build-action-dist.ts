@@ -111,11 +111,11 @@ async function runBundle(): Promise<StepResult> {
   try {
     // Mirror apps/action/package.json build: tsc --noEmit then tsdown.
     // REPO_ROOT is resolved from this script's location, not from process.cwd().
-    await execFileAsync('pnpm', ['exec', 'tsc', '--noEmit'], {
+    await execFileAsync('bunx', ['tsc', '--noEmit', '-p', 'tsconfig.json'], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
     })
-    await execFileAsync('pnpm', ['exec', 'tsdown', '-c', 'tsdown.config.ts'], {
+    await execFileAsync('bunx', ['tsdown', '-c', 'tsdown.config.ts'], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
     })

@@ -1,0 +1,20 @@
+# Bun configuration for the workspace.
+# Workspace packages, overrides, and trustedDependencies live in package.json.
+
+[install]
+# Hoisted (flat) node_modules layout. The isolated linker places packages under
+# non-portable `node_modules/.bun/<pkg>@<hash>/` paths, which makes TypeScript
+# unable to name deep dependency types (TS2883 on eslint.config.ts referencing
+# @eslint/core) and produces duplicate dependency instances. Hoisting keeps the
+# toolchain's type resolution portable.
+linker = "hoisted"
+
+# Supply-chain age gate: refuse dependency versions published within this window.
+# Mirrors the prior pnpm minimumReleaseAge policy. Seconds (3 days).
+minimumReleaseAge = 259200
+
+# The age gate now applies to all packages. Add per-version exclusions here only
+# when deliberately fast-tracking a specific release (e.g. a critical security fix
+# that has not yet cleared the 3-day window). Remove the exclusion once the version
+# is past the gate.
+minimumReleaseAgeExcludes = []

@@ -31,7 +31,7 @@ const distMainPath = path.join(projectRoot, 'dist', 'main.js')
 
 function assertDistBundle(): void {
   if (existsSync(distMainPath)) return
-  throw new Error('dist/main.js is missing. Run pnpm build to generate the action bundle before testing.')
+  throw new Error('dist/main.js is missing. Run bun run build to generate the action bundle before testing.')
 }
 
 /**

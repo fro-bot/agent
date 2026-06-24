@@ -13,11 +13,11 @@
   "main": "src/index.ts",
   "module": "src/index.ts",
   "scripts": {
-    "build": "pnpm exec tsc -p tsconfig.json --noEmit && pnpm exec tsdown src/index.ts --format esm --dts --out-dir dist",
-    "check-types": "pnpm exec tsc -p tsconfig.json --noEmit",
-    "fix": "pnpm --dir ../.. exec eslint --fix packages/runtime/src",
-    "lint": "pnpm --dir ../.. exec eslint packages/runtime/src",
-    "test": "pnpm exec vitest run --passWithNoTests src"
+    "build": "bunx tsc -p tsconfig.json --noEmit && bunx tsdown src/index.ts --format esm --dts --out-dir dist",
+    "check-types": "bunx tsc -p tsconfig.json --noEmit",
+    "fix": "bunx eslint --fix src",
+    "lint": "bunx eslint src",
+    "test": "bunx vitest run --passWithNoTests src"
   },
   "dependencies": {
     "@bfra.me/es": "0.1.0",

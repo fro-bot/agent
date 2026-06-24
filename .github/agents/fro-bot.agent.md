@@ -40,7 +40,7 @@ These files are large and interconnected. Grep for existing patterns before modi
 Run before every commit:
 
 ```bash
-pnpm test && pnpm lint && pnpm build && git diff --exit-code dist/
+bun run test && bun run lint && bun run build && git diff --exit-code dist/
 ```
 
-The pre-push hook enforces this, but run it yourself first. `pnpm build` includes `check-types` — don't run them separately.
+The pre-push hook enforces this, but run it yourself first. `bun run build` includes `check-types` — don't run them separately.
