@@ -93,8 +93,8 @@ healthcheck:
 ## Development
 
 ```bash
-pnpm --filter @fro-bot/workspace-agent build
-pnpm --filter @fro-bot/workspace-agent test
-pnpm --filter @fro-bot/workspace-agent check-types
-pnpm --filter @fro-bot/workspace-agent lint
+bun run --filter @fro-bot/workspace-agent build
+bun run --filter @fro-bot/workspace-agent test
+bun run --filter @fro-bot/workspace-agent check-types
+bun run --filter @fro-bot/workspace-agent lint
 ```

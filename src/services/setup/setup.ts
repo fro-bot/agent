@@ -65,6 +65,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const toolsCacheResult = await restoreToolsCache({
       logger,
       os: runnerOS,
+      bunVersion: DEFAULT_BUN_VERSION,
       opencodeVersion: version,
       omoVersion,
       systematicVersion,
@@ -278,6 +279,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       await saveToolsCache({
         logger,
         os: runnerOS,
+        bunVersion: DEFAULT_BUN_VERSION,
         opencodeVersion: version,
         omoVersion,
         systematicVersion,

@@ -243,9 +243,9 @@ When the workspace OpenCode config sets any tool to `ask` (rather than the defau
 ## Build
 
 ```bash
-pnpm --filter @fro-bot/gateway build
-pnpm --filter @fro-bot/gateway test
-pnpm --filter @fro-bot/gateway lint
+bun run --filter @fro-bot/gateway build
+bun run --filter @fro-bot/gateway test
+bun run --filter @fro-bot/gateway lint
 ```
 
 The build runs `tsc --noEmit` for type checking, then `tsdown` to bundle `src/main.ts` into `dist/main.js` (single ESM file). Production deployment runs that bundle inside the container image — see `deploy/gateway.Dockerfile`.

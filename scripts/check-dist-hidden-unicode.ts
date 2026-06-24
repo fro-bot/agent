@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   process.stderr.write(
     `[dist:check-hidden-unicode] found ${violations.length} hidden Unicode character(s) in ${dir}/\n`,
   )
-  process.stderr.write(`[dist:check-hidden-unicode] run 'pnpm run dist:escape-hidden-unicode' to fix\n`)
+  process.stderr.write(`[dist:check-hidden-unicode] run 'bun run dist:escape-hidden-unicode' to fix\n`)
   process.exitCode = 1
 }
 

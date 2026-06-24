@@ -53,7 +53,7 @@ Fro Bot Agent is a GitHub Action + Discord bot harness for OpenCode with persist
 | --------------- | ------------------ | -------------------------------------------- |
 | Node.js         | **24.x** (24.12.0) | Bleeding-edge; matches `action.yaml` runtime |
 | TypeScript      | **5.9.x**          | Strict mode enabled                          |
-| Package Manager | **pnpm** (v10+)    | Workspace-enabled                            |
+| Package Manager | **Bun** (1.3.14)   | Workspace-enabled                            |
 
 ### Core Dependencies
 
@@ -660,11 +660,11 @@ export default defineConfig({
 4. REPEAT - Next test case
 ```
 
-| Phase        | Action                                   | Verification                         |
-| ------------ | ---------------------------------------- | ------------------------------------ |
-| **RED**      | Write test describing expected behavior  | `pnpm test` → FAIL (expected)        |
-| **GREEN**    | Implement minimum code to pass           | `pnpm test` → PASS                   |
-| **REFACTOR** | Improve code quality, remove duplication | `pnpm test` → PASS (must stay green) |
+| Phase        | Action                                   | Verification                              |
+| ------------ | ---------------------------------------- | ----------------------------------------- |
+| **RED**      | Write test describing expected behavior  | `bun run test` → FAIL (expected)          |
+| **GREEN**    | Implement minimum code to pass           | `bun run test` → PASS                     |
+| **REFACTOR** | Improve code quality, remove duplication | `bun run test` → PASS (must stay green)   |
 
 **Rules:**
 
@@ -714,14 +714,14 @@ function createMockClient(options: {sessionIdle?: boolean; sessionError?: boolea
 
 ```bash
 # Development
-pnpm install       # Install dependencies
-pnpm build         # Bundle to dist/
-pnpm check-types   # TypeScript validation
-pnpm lint          # ESLint check
-pnpm test          # Run tests
+bun install          # Install dependencies
+bun run build        # Bundle to dist/
+bun run check-types  # TypeScript validation
+bun run lint         # ESLint check
+bun run test         # Run tests
 
 # Pre-commit (automatic via simple-git-hooks)
-lint-staged        # Runs on staged files
+lint-staged          # Runs on staged files
 ```
 
 ### Build Output
@@ -731,7 +731,7 @@ lint-staged        # Runs on staged files
 - **Bundle (post)**: `dist/post.js` (ESM, minified) - post-action cache hook
 - **Bundle (plugin)**: `dist/plugin/fro-bot-agent.js` (ESM, self-contained)
 - **Third-party notices**: `dist/THIRD_PARTY_NOTICES.txt` (auto-generated, committed attribution for the bundled dependencies)
-- **SBOM**: a CycloneDX dependency SBOM is generated in CI (`pnpm sbom`) and uploaded as a build artifact (not committed)
+- **SBOM**: a CycloneDX dependency SBOM is generated in CI (`bunx @cyclonedx/cyclonedx-npm`) and uploaded as a build artifact (not committed)
 - **Source maps**: Not included in production
 
 ### dist/ Directory Rules
@@ -967,7 +967,7 @@ export async function executeOpenCode(
 | `require()`              | CJS in ESM project                  | `import` statements                |
 | Empty catch blocks       | Swallows errors silently            | Log or rethrow                     |
 | Global mutable state     | Testing difficulties                | Dependency injection               |
-| Committing without build | CI will fail                        | Always `pnpm build` first          |
+| Committing without build | CI will fail                        | Always `bun run build` first       |
 | Caching auth.json        | Security risk                       | Populate fresh each run            |
 | Polling without timeout  | Resource exhaustion                 | Always set max timeout             |
 
@@ -1064,16 +1064,16 @@ export async function executeOpenCode(
 1. **Type everything** - no implicit any
 2. **Handle errors** - never swallow exceptions
 3. **Test new code** - add tests for new functionality using TDD
-4. **Run checks** - `pnpm lint && pnpm check-types && pnpm test`
+4. **Run checks** - `bun run lint && bun run check-types && bun run test`
 
 ### Before Submitting Changes
 
 ```bash
 # Required before any PR
-pnpm build        # Must run - dist/ is committed
-pnpm check-types  # No type errors
-pnpm lint         # No lint errors
-pnpm test         # All tests pass
+bun run build        # Must run - dist/ is committed
+bun run check-types  # No type errors
+bun run lint         # No lint errors
+bun run test         # All tests pass
 ```
 
 ### Uncertainty Protocol
@@ -1104,12 +1104,12 @@ docs(readme): add SDK execution configuration
 ### Commands
 
 ```bash
-pnpm install      # Install deps
-pnpm build        # Bundle
-pnpm check-types  # Type check
-pnpm lint         # Lint
-pnpm fix          # Auto-fix lint
-pnpm test         # Run tests
+bun install          # Install deps
+bun run build        # Bundle
+bun run check-types  # Type check
+bun run lint         # Lint
+bun run fix          # Auto-fix lint
+bun run test         # Run tests
 ```
 
 ### Key Files
