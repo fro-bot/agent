@@ -1,6 +1,16 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
+  // The Renovate runner image (bfra-me/renovate-action) bakes Bun 1.3.6 and runs
+  // as a non-root user. Without this, the bun manager derives its lockfile-update
+  // tool version from package.json's `packageManager: bun@<newer>` and runs
+  // `install-tool bun <newer>`, which fails EACCES trying to write the root-owned
+  // containerbase tool dir — failing the `renovate/artifacts` check. Pinning the
+  // constraint to the baked version keeps `bun.lock` updates on the installed Bun.
+  // Bump this when the runner image's baked Bun advances.
+  constraints: {
+    bun: '1.3.6',
+  },
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
   // ignorePaths excludes it from dependency extraction only — it does NOT
   // suppress the hidden-Unicode safety scan, which runs on these files
