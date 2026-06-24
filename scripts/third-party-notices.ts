@@ -294,6 +294,12 @@ export function collectProdClosureFromBunLock(
   return result
 }
 
+// Compares the dot-split parts numerically, coercing any non-numeric segment
+// (NaN) to 0 via `|| 0`. Prerelease/build metadata is therefore dropped rather
+// than ordered semantically — e.g. "1.0.0-rc.1" parses to [1,0,0,1]. That is
+// acceptable here because license TEXT is version-independent; this comparator
+// only picks which version LABEL to display when the same package appears at
+// multiple resolved versions.
 function compareVersions(a: string, b: string): number {
   const aParts = a.split('.').map(Number)
   const bParts = b.split('.').map(Number)

@@ -41,133 +41,182 @@ function createMockToolsCacheAdapter(options: {
 }
 
 describe('buildToolsCacheKey', () => {
-  it('builds enabled key with mode, opencode version, oMo version, and Systematic version', () => {
+  it('builds enabled key with mode, opencode version, oMo version, Systematic version, and Bun version', () => {
     // #given version info with enabled mode
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const key = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then key uses opencode-tools prefix with enabled mode, includes oMo version
-    expect(key).toBe('opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0')
+    // #then key uses opencode-tools prefix with enabled mode, includes oMo version and Bun version
+    expect(key).toBe('opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14')
     expect(key).toMatch(/^opencode-tools-/)
     expect(key).toContain('-enabled-')
     expect(key).toContain('-omo-')
+    expect(key).toContain('-bun-')
   })
 
-  it('builds disabled key with mode, opencode version, and Systematic version but NOT oMo version', () => {
+  it('builds disabled key with mode, opencode version, Systematic version, and Bun version but NOT oMo version', () => {
     // #given version info with disabled mode
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'disabled'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const key = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then key uses opencode-tools prefix with disabled mode, no oMo version
-    expect(key).toBe('opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0')
+    // #then key uses opencode-tools prefix with disabled mode, no oMo version, includes Bun version
+    expect(key).toBe('opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0-bun-1.3.14')
     expect(key).toMatch(/^opencode-tools-/)
     expect(key).toContain('-disabled-')
     expect(key).not.toContain('-omo-')
+    expect(key).toContain('-bun-')
   })
 
   it('handles latest version in enabled mode', () => {
     // #given latest opencodeVersion
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = 'latest'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const key = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then key includes latest with enabled mode
-    expect(key).toBe('opencode-tools-Linux-enabled-oc-latest-omo-3.5.5-sys-2.1.0')
+    // #then key includes latest with enabled mode and Bun version
+    expect(key).toBe('opencode-tools-Linux-enabled-oc-latest-omo-3.5.5-sys-2.1.0-bun-1.3.14')
   })
 
   it('handles latest version in disabled mode', () => {
     // #given latest opencodeVersion
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = 'latest'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'disabled'
 
     // #when building cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const key = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then disabled key omits oMo even with latest
-    expect(key).toBe('opencode-tools-Linux-disabled-oc-latest-sys-2.1.0')
+    // #then disabled key omits oMo even with latest, includes Bun version
+    expect(key).toBe('opencode-tools-Linux-disabled-oc-latest-sys-2.1.0-bun-1.3.14')
     expect(key).not.toContain('-omo-')
   })
 
   it('preserves raw +harness.<sha> build-metadata in the cache key for harness versions', () => {
     // #given a harness OpenCode version with +harness.<sha> build-metadata suffix
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.17.3+harness.2c9cdbd2'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building the cache key
-    const key = buildToolsCacheKey({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const key = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
     // #then the raw +harness.<sha> form is embedded verbatim in the key (NOT the -harness. identity form
     // used by toolCache.find/cacheDir — the cache KEY intentionally uses the raw semver metadata so
     // harness builds never collide with stock builds of the same base version)
     expect(key).toContain('+harness.2c9cdbd2')
-    expect(key).toBe('opencode-tools-Linux-enabled-oc-1.17.3+harness.2c9cdbd2-omo-3.5.5-sys-2.1.0')
+    expect(key).toBe('opencode-tools-Linux-enabled-oc-1.17.3+harness.2c9cdbd2-omo-3.5.5-sys-2.1.0-bun-1.3.14')
+  })
+
+  it('different bunVersion values produce different keys (cache invalidation)', () => {
+    // #given same components except bunVersion
+    const base = {
+      os: 'Linux',
+      opencodeVersion: '1.0.0',
+      omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
+      cacheMode: 'enabled' as CacheMode,
+    }
+
+    // #when building keys with different Bun versions
+    const keyA = buildToolsCacheKey({...base, bunVersion: '1.3.14'})
+    const keyB = buildToolsCacheKey({...base, bunVersion: '1.4.0'})
+
+    // #then keys differ — a Bun upgrade invalidates the cache
+    expect(keyA).not.toBe(keyB)
+    expect(keyA).toContain('-bun-1.3.14')
+    expect(keyB).toContain('-bun-1.4.0')
+  })
+
+  it('same components always produce the same key (stability)', () => {
+    // #given identical components
+    const components = {
+      os: 'Linux',
+      bunVersion: '1.3.14',
+      opencodeVersion: '1.0.0',
+      omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
+      cacheMode: 'enabled' as CacheMode,
+    }
+
+    // #when building the key twice
+    const key1 = buildToolsCacheKey(components)
+    const key2 = buildToolsCacheKey(components)
+
+    // #then the key is stable
+    expect(key1).toBe(key2)
   })
 })
 
 describe('buildToolsRestoreKeys', () => {
-  it('generates enabled restore keys scoped to exact opencode+omo versions only', () => {
+  it('generates enabled restore keys scoped to exact opencode+omo+bun versions only', () => {
     // #given version info with enabled mode
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const keys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then only version-specific prefix key with enabled mode is returned
-    expect(keys).toEqual(['opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-'])
+    // #then only version-specific prefix key with enabled mode is returned, includes bun segment
+    expect(keys).toEqual(['opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14-'])
   })
 
-  it('generates disabled restore keys scoped to opencode+systematic versions without oMo', () => {
+  it('generates disabled restore keys scoped to opencode+systematic+bun versions without oMo', () => {
     // #given version info with disabled mode
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'disabled'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const keys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then only version-specific prefix key with disabled mode, no oMo version
-    expect(keys).toEqual(['opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0-'])
+    // #then only version-specific prefix key with disabled mode, no oMo version, includes bun segment
+    expect(keys).toEqual(['opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0-bun-1.3.14-'])
   })
 
   it('does not include broad OS-only fallback key for enabled mode', () => {
     // #given version info with enabled mode
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const keys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
     // #then no OS-only key that could match stale versions
     const broadKeys = [...keys].filter(k => k === `opencode-tools-${os}-`)
@@ -177,36 +226,39 @@ describe('buildToolsRestoreKeys', () => {
   it('generates enabled restore keys for different OS', () => {
     // #given macOS version info
     const os = 'macOS'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'enabled'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const keys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then keys include macOS prefix with enabled mode
-    expect(keys[0]).toBe('opencode-tools-macOS-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-')
+    // #then keys include macOS prefix with enabled mode and bun segment
+    expect(keys[0]).toBe('opencode-tools-macOS-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14-')
   })
 
   it('generates disabled restore keys for different OS', () => {
     // #given macOS version info
     const os = 'macOS'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
     const cacheMode: CacheMode = 'disabled'
 
     // #when building restore keys
-    const keys = buildToolsRestoreKeys({os, opencodeVersion, omoVersion, systematicVersion, cacheMode})
+    const keys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
 
-    // #then keys include macOS prefix with disabled mode, no oMo
-    expect(keys[0]).toBe('opencode-tools-macOS-disabled-oc-1.0.0-sys-2.1.0-')
+    // #then keys include macOS prefix with disabled mode, no oMo, includes bun segment
+    expect(keys[0]).toBe('opencode-tools-macOS-disabled-oc-1.0.0-sys-2.1.0-bun-1.3.14-')
   })
 
   it('enabled and disabled restore keys cannot cross-match each other', () => {
     // #given same version info for both modes
     const os = 'Linux'
+    const bunVersion = '1.3.14'
     const opencodeVersion = '1.0.0'
     const omoVersion = '3.5.5'
     const systematicVersion = '2.1.0'
@@ -214,6 +266,7 @@ describe('buildToolsRestoreKeys', () => {
     // #when building restore keys for both modes
     const enabledKeys = buildToolsRestoreKeys({
       os,
+      bunVersion,
       opencodeVersion,
       omoVersion,
       systematicVersion,
@@ -221,6 +274,7 @@ describe('buildToolsRestoreKeys', () => {
     })
     const disabledKeys = buildToolsRestoreKeys({
       os,
+      bunVersion,
       opencodeVersion,
       omoVersion,
       systematicVersion,
@@ -237,6 +291,26 @@ describe('buildToolsRestoreKeys', () => {
         expect(dk.startsWith(ekPrefix)).toBe(false)
       }
     }
+  })
+
+  it('different bunVersion values produce different restore keys', () => {
+    // #given same components except bunVersion
+    const base = {
+      os: 'Linux',
+      opencodeVersion: '1.0.0',
+      omoVersion: '3.5.5',
+      systematicVersion: '2.1.0',
+      cacheMode: 'enabled' as CacheMode,
+    }
+
+    // #when building restore keys with different Bun versions
+    const keysA = buildToolsRestoreKeys({...base, bunVersion: '1.3.14'})
+    const keysB = buildToolsRestoreKeys({...base, bunVersion: '1.4.0'})
+
+    // #then restore keys differ — a Bun upgrade invalidates the restore prefix
+    expect(keysA[0]).not.toBe(keysB[0])
+    expect(keysA[0]).toContain('-bun-1.3.14-')
+    expect(keysB[0]).toContain('-bun-1.4.0-')
   })
 })
 
@@ -308,6 +382,7 @@ describe('restoreToolsCache', () => {
     const result = await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -332,6 +407,7 @@ describe('restoreToolsCache', () => {
     const result = await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -350,13 +426,14 @@ describe('restoreToolsCache', () => {
 
   it('returns hit: true with key on cache hit in enabled mode', async () => {
     // #given a cache adapter that returns a key (hit)
-    const restoredKey = 'opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0'
+    const restoredKey = 'opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14'
     const adapter = createMockToolsCacheAdapter({restoreResult: restoredKey})
 
     // #when restoring cache
     const result = await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -388,6 +465,7 @@ describe('restoreToolsCache', () => {
     await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -418,6 +496,7 @@ describe('restoreToolsCache', () => {
     await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -448,6 +527,7 @@ describe('restoreToolsCache', () => {
     const result = await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -477,6 +557,7 @@ describe('restoreToolsCache', () => {
     const result = await restoreToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -521,6 +602,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -544,6 +626,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -574,6 +657,7 @@ describe('saveToolsCache', () => {
     await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -604,6 +688,7 @@ describe('saveToolsCache', () => {
     await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -636,6 +721,7 @@ describe('saveToolsCache', () => {
     await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -648,7 +734,7 @@ describe('saveToolsCache', () => {
     })
 
     // #then uses correct enabled key
-    expect(capturedKey).toBe('opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0')
+    expect(capturedKey).toBe('opencode-tools-Linux-enabled-oc-1.0.0-omo-3.5.5-sys-2.1.0-bun-1.3.14')
   })
 
   it('uses correct disabled save key (no oMo version)', async () => {
@@ -666,6 +752,7 @@ describe('saveToolsCache', () => {
     await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -677,8 +764,8 @@ describe('saveToolsCache', () => {
       cacheAdapter: adapter,
     })
 
-    // #then uses correct disabled key without oMo version
-    expect(capturedKey).toBe('opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0')
+    // #then uses correct disabled key without oMo version, includes Bun version
+    expect(capturedKey).toBe('opencode-tools-Linux-disabled-oc-1.0.0-sys-2.1.0-bun-1.3.14')
   })
 
   it('handles cache already exists error in enabled mode', async () => {
@@ -691,6 +778,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -716,6 +804,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -741,6 +830,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
@@ -766,6 +856,7 @@ describe('saveToolsCache', () => {
     const result = await saveToolsCache({
       logger: createTestLogger(),
       os: 'Linux',
+      bunVersion: '1.3.14',
       opencodeVersion: '1.0.0',
       omoVersion: '3.5.5',
       systematicVersion: '2.1.0',
