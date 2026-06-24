@@ -23,8 +23,45 @@ WORKDIR /workspace
 
 ARG BUN_VERSION=1.3.14
 
-# Install Bun (matches packageManager: bun@${BUN_VERSION})
-RUN npm i -g bun@${BUN_VERSION}
+# curl + unzip to fetch and extract the verified Bun release archive.
+RUN apk add --no-cache curl unzip
+
+# Install Bun from the official oven-sh/bun GitHub release, verified against the
+# release SHASUMS256.txt fail-closed — matching the verified-binary posture used
+# for the OpenCode install below (and CI's oven-sh/setup-bun), rather than
+# pulling the unverified `bun` npm wrapper. TARGETARCH is provided automatically
+# by BuildKit; x64 uses the AVX2-independent baseline+musl variant so the image
+# runs on any x86 host, arm64 uses the musl variant. Both are musl for Alpine.
+#
+# Any download failure, checksum-fetch failure, missing entry, or hash mismatch
+# aborts the build (no fallback, no retry-around-mismatch).
+ARG TARGETARCH
+RUN set -euo pipefail \
+    && case "${TARGETARCH}" in \
+         amd64) bun_asset="bun-linux-x64-musl-baseline" ;; \
+         arm64) bun_asset="bun-linux-aarch64-musl" ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && bun_base="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}" \
+    && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${bun_asset}.zip" "${bun_base}/${bun_asset}.zip" \
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHASUMS256.txt "${bun_base}/SHASUMS256.txt" \
+    && expected_hash="$(awk -v f="${bun_asset}.zip" '$2 == f {print $1}' /tmp/SHASUMS256.txt)" \
+    && if [ -z "${expected_hash}" ]; then \
+         echo "SHASUMS256.txt has no entry for ${bun_asset}.zip" >&2; exit 1; \
+       fi \
+    && actual_hash="$(sha256sum "/tmp/${bun_asset}.zip" | awk '{print $1}')" \
+    && if [ "${actual_hash}" != "${expected_hash}" ]; then \
+         echo "SHA256 mismatch for ${bun_asset}.zip: expected ${expected_hash}, got ${actual_hash}" >&2; exit 1; \
+       fi \
+    && unzip -q "/tmp/${bun_asset}.zip" -d /tmp/bun \
+    && mv "/tmp/bun/${bun_asset}/bun" /usr/local/bin/bun \
+    && chmod 755 /usr/local/bin/bun \
+    # bunx is bun's package-runner alias (the npm wrapper installs both); the raw
+    # release archive ships only `bun`, so symlink it for `bunx tsc`/`bunx tsdown`.
+    && ln -s /usr/local/bin/bun /usr/local/bin/bunx \
+    && rm -rf "/tmp/${bun_asset}.zip" /tmp/SHASUMS256.txt /tmp/bun \
+    && bun --version \
+    && bunx --version
 
 # Workspace root manifests first (layer-cache friendly)
 COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
@@ -49,6 +86,17 @@ RUN bun install --frozen-lockfile
 COPY apps/workspace-agent/ apps/workspace-agent/
 
 RUN bun run --filter @fro-bot/workspace-agent build
+
+# Trim the runtime image: re-resolve node_modules to production-only so the
+# final image does not carry the dev toolchain (vitest, tsdown, eslint, …). The
+# full install above is required for the build typecheck (which imports vitest).
+# Bun's --production does NOT prune an already-populated node_modules, so the
+# workspace node_modules are removed first for a clean production-only install.
+# --ignore-scripts skips the root simple-git-hooks postinstall (a devDependency
+# that would otherwise fail under --production). The runtime stage copies this
+# trimmed tree.
+RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
+    && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS runtime

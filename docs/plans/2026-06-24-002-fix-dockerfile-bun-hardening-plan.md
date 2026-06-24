@@ -71,7 +71,7 @@ The pnpm→Bun migration installed Bun in both `deploy/gateway.Dockerfile` and `
 
 ## Implementation Units
 
-- [ ] **Unit 1: Verified Bun binary install — gateway Dockerfile**
+- [x] **Unit 1: Verified Bun binary install — gateway Dockerfile**
 
 **Goal:** Replace `npm i -g bun@${BUN_VERSION}` in `deploy/gateway.Dockerfile` with a checksum-verified download of the official Bun musl binary.
 
@@ -91,7 +91,7 @@ The pnpm→Bun migration installed Bun in both `deploy/gateway.Dockerfile` and `
 
 **Verification:** `docker build -f deploy/gateway.Dockerfile .` succeeds; the Bun step prints the pinned version; a deliberately wrong asset name or corrupted checksum aborts the build (spot-check during implementation).
 
-- [ ] **Unit 2: Verified Bun binary install — workspace Dockerfile**
+- [x] **Unit 2: Verified Bun binary install — workspace Dockerfile**
 
 **Goal:** Same verified-Bun-install change in `deploy/workspace.Dockerfile`.
 
@@ -111,7 +111,7 @@ The pnpm→Bun migration installed Bun in both `deploy/gateway.Dockerfile` and `
 
 **Verification:** `docker build -f deploy/workspace.Dockerfile .` succeeds; Bun version reported; image boots and `/healthz` responds (existing smoke).
 
-- [ ] **Unit 3: Production-only node_modules in runtime stage — both Dockerfiles**
+- [x] **Unit 3: Production-only node_modules in runtime stage — both Dockerfiles**
 
 **Goal:** Ship a prod-only `node_modules` (devDependencies excluded) in both runtime images.
 
@@ -131,7 +131,7 @@ The pnpm→Bun migration installed Bun in both `deploy/gateway.Dockerfile` and `
 
 **Verification:** Both images build; the runtime `node_modules` excludes `vitest`/`tsdown`/`eslint`; both smoke tests pass (proving no runtime dependency was trimmed away). Spot-check final image size is reduced.
 
-- [ ] **Unit 4: Docs / comment reconciliation**
+- [x] **Unit 4: Docs / comment reconciliation**
 
 **Goal:** Update the Dockerfile comments to reflect the verified-Bun install and the prod-trim, and note any deploy-doc references.
 
