@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         id: setup
         uses: ./.github/actions/setup
       - id: filter
@@ -77,9 +77,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
-      - run: pnpm lint
+      - run: bun run lint
 
   build:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}
@@ -90,12 +90,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
       - name: Rebuild the dist/ directory
-        run: pnpm build
+        run: bun run build
       - name: Check dist/ for hidden Unicode characters
-        run: pnpm run dist:check-hidden-unicode
+        run: bun run dist:check-hidden-unicode
       - name: Compare the expected and actual dist/ directories
         run: |
           if [ "$(git diff --ignore-space-at-eol dist/ | wc -l)" -gt "0" ]; then
@@ -112,10 +112,11 @@ jobs:
           path: dist/
       # The SBOM is an informational artifact, not a build gate — a generation
       # failure must not fail the build.
+      # pnpm sbom has no Bun equivalent; using @cyclonedx/cyclonedx-npm as a non-blocking substitute.
       - name: Generate the dependency SBOM
         id: sbom
         continue-on-error: true
-        run: pnpm sbom --sbom-format cyclonedx --prod > sbom.cdx.json
+        run: bunx @cyclonedx/cyclonedx-npm --output-format JSON --output-file sbom.cdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ steps.sbom.outcome == 'success' }}
         with:
@@ -130,10 +131,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
       - name: Run tests
-        run: pnpm test
+        run: bun run test
 
   test-action:
     if: >-
@@ -186,7 +187,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || '' }}
           token: ${{ secrets.FRO_BOT_PAT }}
 
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
 
       - name: Test main action
@@ -257,12 +258,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
       - name: Build runtime
-        run: pnpm --filter @fro-bot/runtime build
+        run: bun run --filter @fro-bot/runtime build
       - name: Build gateway
-        run: pnpm --filter @fro-bot/gateway build
+        run: bun run --filter @fro-bot/gateway build
       - name: Assert no bare @fro-bot/runtime import in gateway bundle
         run: |
           if grep -q 'from "@fro-bot/runtime"' packages/gateway/dist/main.mjs; then
@@ -357,7 +358,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
       - name: Run deploy/scripts unit tests
         run: node --test deploy/scripts/*.test.mjs
@@ -374,7 +375,7 @@ jobs:
           # copies only apps/workspace-agent/ and never sees the repo-root src/.
           # The tsdown post-build guard (bundleSymbolGuardPlugin) fails the build if the
           # wrong entry is bundled; the grep assertions below give a clear CI failure message.
-          pnpm --filter @fro-bot/workspace-agent build
+          bun run --filter @fro-bot/workspace-agent build
       - name: Assert workspace-agent bundle contains expected symbol (not action harness)
         run: |
           if ! grep -q "startWorkspaceAgent" apps/workspace-agent/dist/main.mjs; then
@@ -749,7 +750,7 @@ jobs:
         run: |
           git merge --no-ff -Xtheirs -m 'skip: merge (${{ github.sha }}) [skip release]' ${{ github.sha }}
           echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
       - id: release-preview
         name: Release Preview

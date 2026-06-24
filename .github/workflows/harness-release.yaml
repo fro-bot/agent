@@ -275,23 +275,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Bun (pinned to upstream packageManager version)
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Setup Node.js and Bun
+        uses: ./.github/actions/setup
         with:
           # Pinned to match anomalyco/opencode packageManager: bun@1.3.14
           # Keep in step with HARNESS_BUN_VERSION in packages/harness/src/bun-version.ts
           bun-version: 1.3.14
-
-      - name: Setup Node.js and pnpm
-        uses: ./.github/actions/setup
-        with:
           install-dependencies: 'false'
 
       - name: Install harness dependencies
-        run: pnpm install --filter @fro.bot/harness --frozen-lockfile
+        run: bun install --filter @fro.bot/harness --frozen-lockfile
 
       - name: Build harness package (for scripts/verify-binary.ts import)
-        run: pnpm --filter @fro.bot/harness build
+        run: bun run --filter @fro.bot/harness build
 
       - name: Fetch integration ref and resolve commit SHA
         id: fetch-integrate
@@ -849,14 +845,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Bun (pinned)
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
         with:
+          bun-version: 1.3.14
           install-dependencies: 'false'
 
       - name: Setup Node.js (for npm trusted publishing via OIDC)
@@ -871,10 +863,10 @@ jobs:
         run: npm install -g npm@11.17.0
 
       - name: Install harness dependencies
-        run: pnpm install --filter @fro.bot/harness --frozen-lockfile
+        run: bun install --filter @fro.bot/harness --frozen-lockfile
 
       - name: Build harness package
-        run: pnpm --filter @fro.bot/harness build
+        run: bun run --filter @fro.bot/harness build
 
       - name: Resolve params
         id: params
@@ -1060,7 +1052,7 @@ jobs:
           set -euo pipefail
           # Inject version + optionalDependencies before publish.
           # Source package.json intentionally omits optionalDependencies so the
-          # workspace pnpm-lock.yaml stays clean (packages don't exist on npm yet).
+          # workspace bun.lock stays clean (packages don't exist on npm yet).
           # We inject them here so the PUBLISHED package.json has them.
           # NPM_VERSION is passed via env (not interpolated into the script body).
           # All 5 packages use the identical prerelease string so optionalDependencies
@@ -1156,7 +1148,7 @@ jobs:
         with:
           token: ${{ steps.get-app-token.outputs.token }}
 
-      - name: Setup Node.js and pnpm
+      - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
         with:
           install-dependencies: 'true'
@@ -1268,10 +1260,10 @@ jobs:
             console.log('Updated workspace OPENCODE_VERSION to: ' + newVersion);
           "
 
-      - name: Rebuild action dist (pnpm build)
+      - name: Rebuild action dist
         id: build
         if: steps.version.outputs.skip != 'true'
-        run: pnpm build
+        run: bun run build
 
       - name: Open PR via peter-evans/create-pull-request
         if: steps.version.outputs.skip != 'true' && steps.build.outcome == 'success' && steps.dockerfile.outcome == 'success'

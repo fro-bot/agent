@@ -218,7 +218,28 @@ Migration phases and their gate relationship:
 
 **Verification:** A decision artifact with every blocker resolved and an explicit go/no-go; the cutover proceeds only on go.
 
-### Phase 2 — Cutover (only after the spike go)
+### Phase 2 — Cutover (spike GO confirmed; notice collector proven)
+
+- [ ] **Unit 6a: Bun-native notice collector (replaces generate-license-file)**
+
+**Goal:** Replace the `generate-license-file` + `pnpm licenses list` path with a `bun.lock`-based collector that reproduces the committed `THIRD_PARTY_NOTICES.txt` package set. Proven in the sub-spike; this unit finalizes and reviews it.
+
+**Requirements:** R4 (and folds in the deferred store-independent collector).
+
+**Dependencies:** Unit 6 config (bun.lock present).
+
+**Files:** Modify: `scripts/third-party-notices.ts`, `scripts/third-party-notices.test.ts`.
+
+**Approach:** `collectThirdPartyNotices()` auto-detects `bun.lock` and routes to `collectThirdPartyNoticesBun` (parse `bun.lock` packages map → prod closure via BFS over all workspace `dependencies`, nested-aware `parent/dep` keys + optional deps → read `node_modules` LICENSE/license-field → fail-closed on missing package dir → existing `formatThirdPartyNotices`). Legacy pnpm path uses dynamic `import('generate-license-file')` so arborist never loads under Bun. Remove the `pnpm licenses list` call.
+
+**Execution note:** Already implemented in the spike branch; verify byte-faithful package-set reproduction (zero committed names missing) before trusting.
+
+**Test scenarios:**
+- Happy path: prod-closure extraction from `bun.lock` (seeds, transitive, optional, nested `parent/dep`, workspace exclusion, version dedup).
+- Error path: missing package dir fails closed; missing license field falls back to "Unknown" with a warning.
+- Integration: generated notices reproduce all committed package names (verified: 214/214 present, 6 explained new names).
+
+**Verification:** `bunx vitest run scripts/third-party-notices.test.ts` passes; name-level diff vs committed file shows zero missing committed packages.
 
 - [ ] **Unit 6: Config relocation + lockfile**
 
@@ -229,11 +250,11 @@ Migration phases and their gate relationship:
 **Dependencies:** Unit 5 (go).
 
 **Files:**
-- Modify: `package.json` (workspaces, trustedDependencies, overrides, packageManager), `.github/renovate.json5` (minimumReleaseAge exclude).
+- Modify: `package.json` (workspaces, trustedDependencies, overrides, packageManager), `packages/gateway/package.json` (add phantom deps `@octokit/core`, `yaml`), `.github/renovate.json5` (minimumReleaseAge exclude).
 - Create: `bunfig.toml`, `bun.lock`.
 - Delete: `pnpm-workspace.yaml`, `pnpm-lock.yaml`.
 
-**Approach:** Apply the Unit 1 branch config as the real commit, using the linker decision from Unit 5. Confirm the dual-source Bun version pin discipline if a new workspace pin is introduced (it likely is not — reuse `DEFAULT_BUN_VERSION` via `packageManager`).
+**Approach:** Apply the Unit 1 branch config as the real commit (isolated linker per U5). Add the two gateway phantom deps surfaced by the spike (`@octokit/core`, `yaml` — imported but undeclared, masked by pnpm hoisting). Widen the two `name@range` overrides to bare `tar`/`undici` (CVE floor makes this correct). `packageManager: bun@1.3.14` reuses the harness Bun pin; no new workspace version pin introduced.
 
 **Test scenarios:**
 - Happy path: `bun install --frozen-lockfile` succeeds against the committed `bun.lock`.

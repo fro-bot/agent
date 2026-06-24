@@ -7,10 +7,10 @@
   "module": "dist/main.js",
   "scripts": {
     "build": "node --experimental-strip-types ../../scripts/build-action-dist.ts",
-    "check-types": "pnpm --dir ../.. exec tsc --noEmit",
-    "fix": "pnpm --dir ../.. exec eslint --fix src tsdown.config.ts eslint.config.ts",
-    "lint": "pnpm --dir ../.. exec eslint src tsdown.config.ts eslint.config.ts",
-    "test": "pnpm --dir ../.. exec vitest run"
+    "check-types": "bunx tsc --noEmit -p ../../tsconfig.json",
+    "fix": "bunx eslint --fix ../../src ../../tsdown.config.ts ../../eslint.config.ts",
+    "lint": "bunx eslint ../../src ../../tsdown.config.ts ../../eslint.config.ts",
+    "test": "bunx vitest run --root ../.. src"
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*"

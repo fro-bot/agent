@@ -3,24 +3,24 @@ FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d
 
 WORKDIR /workspace
 
-# Enable corepack for pnpm
-RUN corepack enable
+# Install Bun (matches packageManager: bun@1.3.14)
+RUN npm i -g bun@1.3.14
 
 # Copy workspace root manifests first (layer-cache friendly)
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json bun.lock tsconfig.base.json ./
 
 # Copy only the packages we need for the gateway build
 COPY packages/runtime/ packages/runtime/
 COPY packages/gateway/ packages/gateway/
 
 # Install dependencies for gateway and its workspace deps only
-RUN pnpm install --frozen-lockfile --filter @fro-bot/gateway...
+RUN bun install --frozen-lockfile --filter '@fro-bot/gateway'
 
 # Build runtime first (gateway depends on it)
-RUN pnpm --filter @fro-bot/runtime build
+RUN bun run --filter @fro-bot/runtime build
 
 # Build gateway
-RUN pnpm --filter @fro-bot/gateway build
+RUN bun run --filter @fro-bot/gateway build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS runtime

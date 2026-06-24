@@ -63,5 +63,5 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 ## COMMANDS
 
 ```bash
-pnpm test src/services/setup/   # Run setup-specific tests
+bun run test src/services/setup/   # Run setup-specific tests
 ```

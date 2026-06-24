@@ -1,321 +1,311 @@
-import {execFile} from 'node:child_process'
-import {getProjectLicenses} from 'generate-license-file'
+import {existsSync, readdirSync, readFileSync} from 'node:fs'
 import {describe, expect, it, vi} from 'vitest'
-import {collectThirdPartyNotices, formatChildProcessError, formatThirdPartyNotices} from './third-party-notices.js'
+import {
+  collectProdClosureFromBunLock,
+  collectThirdPartyNotices,
+  collectThirdPartyNoticesBun,
+  formatThirdPartyNotices,
+} from './third-party-notices.js'
 
-// All mocks use .js imports (Vitest convention for this project)
-vi.mock('generate-license-file', () => ({
-  getProjectLicenses: vi.fn(),
-}))
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal()
+  const mod = actual as typeof import('node:fs')
+  return {
+    ...mod,
+    existsSync: vi.fn(mod.existsSync),
+    readdirSync: vi.fn(mod.readdirSync),
+    readFileSync: vi.fn(mod.readFileSync),
+  }
+})
 
-vi.mock('node:child_process', () => ({
-  execFile: vi.fn(),
-}))
+const mockExistsSync = vi.mocked(existsSync)
+const mockReaddirSync = vi.mocked(readdirSync)
+const mockReadFileSync = vi.mocked(readFileSync)
 
-vi.mock('node:util', () => ({
-  promisify:
-    (fn: (...args: unknown[]) => unknown) =>
-    (...args: unknown[]) =>
-      fn(...args),
-}))
-
-const mockGetProjectLicenses = vi.mocked(getProjectLicenses)
-const mockExecFile = vi.mocked(execFile)
-
-// Simulate pnpm licenses list returning empty (fail-soft path)
-function stubPnpmLicensesEmpty() {
-  mockExecFile.mockImplementation((_cmd, _args, _opts, cb) => {
-    if (typeof cb === 'function') {
-      cb(null, JSON.stringify({}), '')
-    }
-    return {} as ReturnType<typeof execFile>
-  })
+function makeBunLock(workspaceDeps: Record<string, string>, packages: Record<string, unknown>): string {
+  return JSON.stringify(
+    {
+      lockfileVersion: 1,
+      configVersion: 1,
+      workspaces: {
+        '': {
+          name: '@test/workspace',
+          dependencies: workspaceDeps,
+        },
+      },
+      packages,
+    },
+    null,
+    2,
+  )
 }
 
 describe('formatThirdPartyNotices', () => {
   it('formats entries sorted by package name with LF line endings', () => {
-    // #given two entries in reverse alphabetical order
     const entries = new Map([
       ['zebra', {version: '1.0.0', license: 'MIT', content: 'MIT License text'}],
       ['alpha', {version: '2.0.0', license: 'Apache-2.0', content: 'Apache License text'}],
     ])
-
-    // #when formatted
     const result = formatThirdPartyNotices(entries)
-
-    // #then alpha sorts before zebra and no CRLF
     expect(result.indexOf('alpha')).toBeLessThan(result.indexOf('zebra'))
     expect(result).toContain('alpha@2.0.0\nApache-2.0\nApache License text')
     expect(result).toContain('zebra@1.0.0\nMIT\nMIT License text')
-    // No CRLF
     expect(result).not.toContain('\r\n')
   })
 
   it('normalizes CRLF to LF in license content', () => {
-    // #given content with CRLF line endings
     const entries = new Map([['pkg', {version: '1.0.0', license: 'MIT', content: 'line1\r\nline2\r\n'}]])
-
-    // #when formatted
     const result = formatThirdPartyNotices(entries)
-
-    // #then CRLF is normalized to LF
     expect(result).not.toContain('\r\n')
     expect(result).toContain('line1\nline2\n')
   })
 
   it('returns empty string for empty map', () => {
-    // #given / #when / #then
-    const result = formatThirdPartyNotices(new Map())
-    expect(result).toBe('')
+    expect(formatThirdPartyNotices(new Map())).toBe('')
   })
 })
 
-describe('collectThirdPartyNotices — happy path', () => {
-  it('returns formatted notice string from a fake license dataset', async () => {
-    // #given pnpm licenses returns empty and getProjectLicenses returns two entries
-    stubPnpmLicensesEmpty()
-
-    mockGetProjectLicenses.mockResolvedValue([
+describe('collectProdClosureFromBunLock', () => {
+  it('extracts prod deps from workspace dependencies', () => {
+    const lockContent = makeBunLock(
+      {react: '18.2.0', typescript: '5.0.0'},
       {
-        content: 'MIT License\n\nCopyright (c) 2024',
-        notices: [],
-        dependencies: ['react@18.2.0', 'react-dom@18.2.0'],
+        react: ['react@18.2.0', '', {dependencies: {}}],
+        typescript: ['typescript@5.0.0', '', {}],
       },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('react')).toBe(true)
+    expect(closure.has('typescript')).toBe(true)
+    expect(closure.get('react')?.version).toBe('18.2.0')
+  })
+
+  it('traverses transitive dependencies', () => {
+    const lockContent = makeBunLock(
+      {react: '18.2.0'},
       {
-        content: 'Apache License 2.0',
-        notices: [],
-        dependencies: ['typescript@5.0.0'],
+        react: ['react@18.2.0', '', {dependencies: {'loose-envify': '^1.0.0'}}],
+        'loose-envify': ['loose-envify@1.4.0', '', {dependencies: {'js-tokens': '^3.0.0'}}],
+        'js-tokens': ['js-tokens@4.0.0', '', {}],
       },
-    ])
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('react')).toBe(true)
+    expect(closure.has('loose-envify')).toBe(true)
+    expect(closure.has('js-tokens')).toBe(true)
+  })
 
-    // #when collected
-    const result = await collectThirdPartyNotices()
+  it('includes optional dependencies', () => {
+    const lockContent = makeBunLock(
+      {jackspeak: '3.4.3'},
+      {
+        jackspeak: [
+          'jackspeak@3.4.3',
+          '',
+          {
+            dependencies: {'@isaacs/cliui': '^8.0.2'},
+            optionalDependencies: {'@pkgjs/parseargs': '^0.11.0'},
+          },
+        ],
+        '@isaacs/cliui': ['@isaacs/cliui@8.0.2', '', {}],
+        '@pkgjs/parseargs': ['@pkgjs/parseargs@0.11.0', '', {}],
+      },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('@pkgjs/parseargs')).toBe(true)
+  })
 
-    // #then result is a non-empty string with expected packages sorted
-    expect(typeof result).toBe('string')
-    expect(result.length).toBeGreaterThan(0)
+  it('resolves nested package versions (Bun hoisting)', () => {
+    const lockContent = makeBunLock(
+      {'archiver-utils': '5.0.2'},
+      {
+        'archiver-utils': ['archiver-utils@5.0.2', '', {dependencies: {glob: '^10.0.0'}}],
+        glob: ['glob@13.0.6', '', {}],
+        'archiver-utils/glob': ['glob@10.5.0', '', {dependencies: {'foreground-child': '^3.1.0', jackspeak: '^3.1.2'}}],
+        'foreground-child': ['foreground-child@3.3.1', '', {}],
+        jackspeak: ['jackspeak@3.4.3', '', {}],
+      },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('foreground-child')).toBe(true)
+    expect(closure.has('jackspeak')).toBe(true)
+    expect(closure.has('glob')).toBe(true)
+  })
 
-    // react and typescript should appear (highest-version dedup: react@18.2.0, react-dom@18.2.0, typescript@5.0.0)
+  it('excludes workspace packages from prod seeds', () => {
+    const lockContent = JSON.stringify({
+      lockfileVersion: 1,
+      configVersion: 1,
+      workspaces: {
+        '': {
+          name: '@test/root',
+          dependencies: {'@test/lib': 'workspace:*', react: '18.2.0'},
+        },
+        'packages/lib': {
+          name: '@test/lib',
+          dependencies: {lodash: '4.17.21'},
+        },
+      },
+      packages: {
+        react: ['react@18.2.0', '', {}],
+        lodash: ['lodash@4.17.21', '', {}],
+      },
+    })
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('@test/lib')).toBe(false)
+    expect(closure.has('react')).toBe(true)
+    expect(closure.has('lodash')).toBe(true)
+  })
+
+  it('deduplicates to highest version per package', () => {
+    const lockContent = makeBunLock(
+      {pkgA: '1.0.0', pkgB: '1.0.0'},
+      {
+        pkgA: ['pkgA@1.0.0', '', {dependencies: {shared: '^1.0.0'}}],
+        pkgB: ['pkgB@1.0.0', '', {dependencies: {shared: '^2.0.0'}}],
+        shared: ['shared@1.5.0', '', {}],
+        'pkgB/shared': ['shared@2.0.0', '', {}],
+      },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.get('shared')?.version).toBe('2.0.0')
+  })
+})
+
+describe('collectThirdPartyNoticesBun', () => {
+  it('returns formatted notices for a simple prod closure', async () => {
+    const lockContent = makeBunLock({react: '18.2.0'}, {react: ['react@18.2.0', '', {}]})
+
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return (
+        path.endsWith('bun.lock') ||
+        path.endsWith('/react') ||
+        path.endsWith('/react/LICENSE') ||
+        path.endsWith('/react/package.json')
+      )
+    })
+
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      if (path.endsWith('/react/LICENSE')) return 'MIT License\n\nCopyright (c) Facebook'
+      if (path.endsWith('/react/package.json'))
+        return JSON.stringify({name: 'react', version: '18.2.0', license: 'MIT'})
+      return ''
+    })
+
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      if (String(p).endsWith('/react')) return ['LICENSE', 'package.json'] as unknown as ReturnType<typeof readdirSync>
+      return []
+    })
+
+    const result = await collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')
     expect(result).toContain('react@18.2.0')
-    expect(result).toContain('typescript@5.0.0')
-
-    // Sorted: react < react-dom < typescript
-    expect(result.indexOf('react@')).toBeLessThan(result.indexOf('typescript@'))
+    expect(result).toContain('MIT')
+    expect(result).toContain('MIT License')
   })
 
-  it('deduplicates to highest version per package', async () => {
-    // #given two entries for the same package at different versions
-    stubPnpmLicensesEmpty()
-
-    mockGetProjectLicenses.mockResolvedValue([
-      {
-        content: 'MIT License v1',
-        notices: [],
-        dependencies: ['lodash@4.0.0'],
-      },
-      {
-        content: 'MIT License v2',
-        notices: [],
-        dependencies: ['lodash@4.17.21'],
-      },
-    ])
-
-    // #when collected
-    const result = await collectThirdPartyNotices()
-
-    // #then only the highest version appears
-    expect(result).toContain('lodash@4.17.21')
-    expect(result).not.toContain('lodash@4.0.0')
-    // Content from the highest version entry
-    expect(result).toContain('MIT License v2')
-  })
-})
-
-describe('collectThirdPartyNotices — error path', () => {
-  it('throws when getProjectLicenses fails, with the underlying cause in the message', async () => {
-    // #given getProjectLicenses rejects with an ENOENT error
-    stubPnpmLicensesEmpty()
-
-    const underlyingError = new Error('ENOENT: no such file or directory, open node_modules/foo/LICENSE')
-    mockGetProjectLicenses.mockRejectedValue(underlyingError)
-
-    // #when / #then throws with cause in message
-    await expect(collectThirdPartyNotices()).rejects.toThrow(
-      /license collection failed[\s\S]*ENOENT[\s\S]*no such file or directory/,
+  it('throws when bun.lock does not exist', async () => {
+    mockExistsSync.mockReturnValue(false)
+    await expect(collectThirdPartyNoticesBun('/nonexistent/bun.lock', '/fake/node_modules')).rejects.toThrow(
+      /bun\.lock not found/,
     )
   })
 
-  it('error thrown by collectThirdPartyNotices includes the underlying cause', async () => {
-    // #given getProjectLicenses rejects
-    stubPnpmLicensesEmpty()
+  it('throws when a prod package directory is missing (fail-closed)', async () => {
+    const lockContent = makeBunLock({react: '18.2.0'}, {react: ['react@18.2.0', '', {}]})
 
-    const underlyingError = new Error('stderr: permission denied')
-    mockGetProjectLicenses.mockRejectedValue(underlyingError)
-
-    // #when caught
-    let caught: unknown
-    try {
-      await collectThirdPartyNotices()
-    } catch (error_) {
-      caught = error_
-    }
-
-    // #then error has cause and message contains both
-    expect(caught).toBeInstanceOf(Error)
-    const error = caught as Error
-    expect(error.message).toContain('license collection failed')
-    expect(error.message).toContain('stderr: permission denied')
-    expect(error.cause).toBe(underlyingError)
-  })
-
-  it('throws with a non-Error rejection value included in the message', async () => {
-    // #given getProjectLicenses rejects with a string
-    stubPnpmLicensesEmpty()
-
-    mockGetProjectLicenses.mockRejectedValue('string rejection reason')
-
-    // #when / #then message includes the string value
-    await expect(collectThirdPartyNotices()).rejects.toThrow(/license collection failed[\s\S]*string rejection reason/)
-  })
-})
-
-describe('formatChildProcessError', () => {
-  it('surfaces stderr, stdout, exit code, and signal from an execFile-style error', () => {
-    // #given an execFile rejection carrying the diagnostics that the generic
-    // "Command failed" message alone hides
-    const execError = Object.assign(new Error('Command failed: pnpm licenses list --json --prod'), {
-      code: 1,
-      signal: 'SIGTERM',
-      stderr: '  ERR_PNPM_LICENSES_NO_LOCKFILE  the real underlying reason\n',
-      stdout: '  partial stdout content  ',
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return path.endsWith('bun.lock')
     })
 
-    // #when formatted
-    const formatted = formatChildProcessError(execError)
-
-    // #then every diagnostic field is surfaced (stderr/stdout trimmed)
-    expect(formatted).toContain('Command failed: pnpm licenses list --json --prod')
-    expect(formatted).toContain('exitCode=1')
-    expect(formatted).toContain('signal=SIGTERM')
-    expect(formatted).toContain('stderr:\nERR_PNPM_LICENSES_NO_LOCKFILE  the real underlying reason')
-    expect(formatted).toContain('stdout:\npartial stdout content')
-  })
-
-  it('falls back to the message alone when no child-process fields are present', () => {
-    // #given a plain Error with no stderr/stdout/code
-    const plain = new Error('plain failure')
-
-    // #when / #then only the message is returned
-    expect(formatChildProcessError(plain)).toBe('plain failure')
-  })
-
-  it('stringifies a non-object rejection value', () => {
-    // #given a string rejection
-    // #when / #then the raw value is stringified
-    expect(formatChildProcessError('string reason')).toBe('string reason')
-  })
-
-  it('omits empty stderr/stdout and reports only present fields', () => {
-    // #given an error with an exit code but empty stream output
-    const execError = Object.assign(new Error('boom'), {code: 2, stderr: '', stdout: '   '})
-
-    // #when formatted
-    const formatted = formatChildProcessError(execError)
-
-    // #then empty streams are omitted, code is present
-    expect(formatted).toContain('boom')
-    expect(formatted).toContain('exitCode=2')
-    expect(formatted).not.toContain('stderr:')
-    expect(formatted).not.toContain('stdout:')
-  })
-})
-
-describe('collectThirdPartyNotices — edge cases', () => {
-  it('produces a valid notice when pnpm licenses list fails (Unknown license types)', async () => {
-    // #given pnpm licenses list fails → all types become "Unknown"
-    mockExecFile.mockImplementation((_cmd, _args, _opts, cb) => {
-      if (typeof cb === 'function') {
-        cb(new Error('pnpm not found'), '', 'command not found: pnpm')
-      }
-      return {} as ReturnType<typeof execFile>
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      if (String(p).endsWith('bun.lock')) return lockContent
+      return ''
     })
 
-    mockGetProjectLicenses.mockResolvedValue([
-      {
-        content: 'Some license text',
-        notices: [],
-        dependencies: ['some-pkg@1.0.0'],
-      },
-    ])
+    await expect(collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')).rejects.toThrow(
+      /missing from node_modules/,
+    )
+  })
 
-    // #when collected
-    const result = await collectThirdPartyNotices()
+  it('uses Unknown license type for packages with no license file or field', async () => {
+    const lockContent = makeBunLock({oldpkg: '0.1.1'}, {oldpkg: ['oldpkg@0.1.1', '', {}]})
 
-    // #then result is valid with Unknown license type
-    expect(typeof result).toBe('string')
-    expect(result).toContain('some-pkg@1.0.0')
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return path.endsWith('bun.lock') || path.endsWith('/oldpkg') || path.endsWith('/oldpkg/package.json')
+    })
+
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      if (path.endsWith('/oldpkg/package.json')) return JSON.stringify({name: 'oldpkg', version: '0.1.1'})
+      return ''
+    })
+
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      if (String(p).endsWith('/oldpkg')) return ['package.json'] as unknown as ReturnType<typeof readdirSync>
+      return []
+    })
+
+    const result = await collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')
+    expect(result).toContain('oldpkg@0.1.1')
     expect(result).toContain('Unknown')
   })
 
-  it('returns empty string when there are no license entries', async () => {
-    // #given / #when / #then
-    stubPnpmLicensesEmpty()
-    mockGetProjectLicenses.mockResolvedValue([])
-
-    const result = await collectThirdPartyNotices()
-
-    expect(result).toBe('')
+  it('throws when bun.lock is malformed', async () => {
+    mockExistsSync.mockReturnValue(true)
+    mockReadFileSync.mockReturnValue('not valid json at all {{{')
+    await expect(collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')).rejects.toThrow(
+      /failed to parse bun\.lock/,
+    )
   })
+})
 
-  it('skips dependencies with no version segment', async () => {
-    // #given an unscoped and a scoped dep with no version, plus a valid dep
-    stubPnpmLicensesEmpty()
+describe('collectThirdPartyNotices', () => {
+  it('uses Bun-native path when bun.lock is present', async () => {
+    const lockContent = makeBunLock({react: '18.2.0'}, {react: ['react@18.2.0', '', {}]})
 
-    mockGetProjectLicenses.mockResolvedValue([
-      {
-        content: 'MIT',
-        notices: [],
-        // deps with no @version — must not produce bogus name@name entries
-        dependencies: ['no-version-dep', '@scope/no-version-pkg'],
-      },
-      {
-        content: 'Apache-2.0',
-        notices: [],
-        dependencies: ['valid-pkg@2.0.0'],
-      },
-    ])
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return (
+        path.endsWith('bun.lock') ||
+        path.endsWith('/react') ||
+        path.endsWith('/react/LICENSE') ||
+        path.endsWith('/react/package.json')
+      )
+    })
 
-    // #when collected
-    const result = await collectThirdPartyNotices()
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      if (path.endsWith('/react/LICENSE')) return 'MIT License'
+      if (path.endsWith('/react/package.json'))
+        return JSON.stringify({name: 'react', version: '18.2.0', license: 'MIT'})
+      return ''
+    })
 
-    // #then valid-pkg appears; both version-less deps are skipped entirely
-    expect(result).toContain('valid-pkg@2.0.0')
-    expect(result).not.toContain('no-version-dep')
-    expect(result).not.toContain('@scope/no-version-pkg')
-  })
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      if (String(p).endsWith('/react')) return ['LICENSE', 'package.json'] as unknown as ReturnType<typeof readdirSync>
+      return []
+    })
 
-  it('does not let a malformed entry latch over a later valid version', async () => {
-    // #given a malformed (non-numeric) version of a package before its real version
-    stubPnpmLicensesEmpty()
-
-    mockGetProjectLicenses.mockResolvedValue([
-      {
-        content: 'MIT',
-        notices: [],
-        dependencies: ['pkg@not-a-version'],
-      },
-      {
-        content: 'Apache-2.0',
-        notices: [],
-        dependencies: ['pkg@1.2.3'],
-      },
-    ])
-
-    // #when collected
-    const result = await collectThirdPartyNotices()
-
-    // #then the real version replaces the malformed one (no NaN-comparison latch)
-    expect(result).toContain('pkg@1.2.3')
-    expect(result).not.toContain('pkg@not-a-version')
+    const result = await collectThirdPartyNotices('./package.json')
+    expect(result).toContain('react@18.2.0')
   })
 })

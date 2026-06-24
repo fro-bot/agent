@@ -10,52 +10,8 @@
 // This file uses .ts imports because it runs directly under Node's
 // --experimental-strip-types. Test files use .js imports for Vitest.
 
-import {execFile} from 'node:child_process'
-import {promisify} from 'node:util'
-import {getProjectLicenses} from 'generate-license-file'
-
-const execFileAsync = promisify(execFile)
-
-/**
- * Formats the real diagnostics from a failed child-process invocation.
- *
- * execFile rejections carry `stderr`, `stdout`, `code`, and `signal` alongside
- * `message`, but `message` alone is just the generic "Command failed: ..." line.
- * When a license-tooling command fails in a constrained environment (e.g. a
- * Renovate runner), the actual reason lives in `stderr`/`stdout` — so surface
- * all of it instead of swallowing it behind the generic message.
- */
-export function formatChildProcessError(error: unknown): string {
-  if (error == null || typeof error !== 'object') {
-    return String(error)
-  }
-  const record = error as {
-    message?: unknown
-    stderr?: unknown
-    stdout?: unknown
-    code?: unknown
-    signal?: unknown
-  }
-  const parts: string[] = []
-  if (typeof record.message === 'string' && record.message.length > 0) {
-    parts.push(record.message)
-  }
-  if (record.code != null) {
-    parts.push(`exitCode=${String(record.code)}`)
-  }
-  if (record.signal != null) {
-    parts.push(`signal=${String(record.signal)}`)
-  }
-  const stderr = typeof record.stderr === 'string' ? record.stderr.trim() : ''
-  if (stderr.length > 0) {
-    parts.push(`stderr:\n${stderr}`)
-  }
-  const stdout = typeof record.stdout === 'string' ? record.stdout.trim() : ''
-  if (stdout.length > 0) {
-    parts.push(`stdout:\n${stdout}`)
-  }
-  return parts.length > 0 ? parts.join('\n') : String(error)
-}
+import {existsSync, readdirSync, readFileSync} from 'node:fs'
+import {join, resolve} from 'node:path'
 
 export interface LicenseEntry {
   readonly version: string
@@ -81,119 +37,236 @@ export function formatThirdPartyNotices(entries: ReadonlyMap<string, LicenseEntr
     .replaceAll('\r\n', '\n')
 }
 
-interface PnpmLicenseEntry {
-  readonly name: string
-  readonly versions?: readonly string[]
+// ---------------------------------------------------------------------------
+// Bun-native license collector
+// ---------------------------------------------------------------------------
+
+/**
+ * Raw structure of a bun.lock v1 package entry.
+ * Format: [resolvedVersion, registry, meta, integrity?]
+ * where meta has optional dependencies/optionalDependencies/peerDependencies.
+ */
+interface BunLockPackageMeta {
+  readonly dependencies?: Record<string, string>
+  readonly optionalDependencies?: Record<string, string>
+  readonly peerDependencies?: Record<string, string>
+  readonly devDependencies?: Record<string, string>
+}
+
+type BunLockPackageEntry = readonly [string, string, BunLockPackageMeta?, string?]
+
+interface BunLockWorkspace {
+  readonly name?: string
   readonly version?: string
-  readonly license?: string | null
+  readonly dependencies?: Record<string, string>
+  readonly devDependencies?: Record<string, string>
 }
 
-interface PnpmLicensesJson extends Record<string, readonly PnpmLicenseEntry[]> {}
-
-interface PnpmLicenseEntryCandidate {
-  readonly name?: unknown
-  readonly versions?: unknown
-  readonly version?: unknown
-  readonly license?: unknown
+interface BunLock {
+  readonly lockfileVersion: number
+  readonly workspaces?: Record<string, BunLockWorkspace>
+  readonly packages?: Record<string, BunLockPackageEntry>
 }
 
-function isPnpmLicensesJson(value: unknown): value is PnpmLicensesJson {
-  if (value == null || typeof value !== 'object') {
-    return false
+/** LICENSE/LICENCE/COPYING/NOTICE file name pattern (case-insensitive). */
+const LICENSE_FILE_RE = /^(?:LICENSE|LICENCE|COPYING|NOTICE)(?:\.md|\.txt|\.rst)?$/i
+
+/**
+ * Reads the license text for a package from its node_modules directory.
+ * Prefers LICENSE/LICENCE/COPYING files; falls back to the `license` field
+ * in package.json. Returns null when no attribution source is found.
+ */
+function readPackageLicense(pkgDir: string): {readonly text: string; readonly type: string} | null {
+  if (!existsSync(pkgDir)) {
+    return null
   }
 
-  return Object.values(value).every(entries => {
-    if (!Array.isArray(entries)) {
-      return false
-    }
-
-    return entries.every(entry => {
-      if (entry == null || typeof entry !== 'object') {
-        return false
-      }
-
-      const candidate = entry as PnpmLicenseEntryCandidate
-      if (typeof candidate.name !== 'string') {
-        return false
-      }
-
-      if (candidate.versions != null && !Array.isArray(candidate.versions)) {
-        return false
-      }
-
-      if (candidate.version != null && typeof candidate.version !== 'string') {
-        return false
-      }
-
-      if (candidate.license != null && typeof candidate.license !== 'string') {
-        return false
-      }
-
-      return true
-    })
-  })
-}
-
-async function getPnpmLicensesJson(): Promise<PnpmLicensesJson> {
+  let files: string[]
   try {
-    const {stdout} = await execFileAsync('pnpm', ['licenses', 'list', '--json', '--prod'], {
-      encoding: 'utf8',
-    })
-
-    const parsed: unknown = JSON.parse(stdout)
-    if (!isPnpmLicensesJson(parsed)) {
-      console.warn('[license-collector] pnpm licenses list returned invalid JSON; falling back to empty map')
-      return {}
-    }
-
-    return parsed
-  } catch (error) {
-    console.warn(
-      `[license-collector] pnpm licenses list failed; license types will be "Unknown"\n${formatChildProcessError(error)}`,
-    )
-    return {}
-  }
-}
-
-function buildLicenseTypeMap(entries: PnpmLicensesJson): Map<string, string> {
-  const map = new Map<string, string>()
-
-  for (const [licenseKey, items] of Object.entries(entries)) {
-    for (const item of items) {
-      let versions = item.versions
-      if (versions == null) {
-        const singleVersion = item.version
-        versions = singleVersion == null ? [] : [singleVersion]
-      }
-      const licenseType = item.license ?? licenseKey
-
-      for (const version of versions) {
-        map.set(`${item.name}@${version}`, licenseType)
-      }
-    }
+    files = readdirSync(pkgDir)
+  } catch {
+    return null
   }
 
-  return map
-}
+  // Prefer LICENSE/LICENCE/COPYING/NOTICE files
+  const licenseFiles = files.filter(f => LICENSE_FILE_RE.test(f))
+  if (licenseFiles.length > 0) {
+    // Prefer LICENSE over NOTICE; sort to get deterministic order
+    const sorted = licenseFiles.sort()
+    const licenseFile = sorted.find(f => /^(?:LICENSE|LICENCE|COPYING)/i.test(f)) ?? sorted[0]!
+    try {
+      const text = readFileSync(join(pkgDir, licenseFile), 'utf8')
+      // Try to get the license type from package.json
+      const pkgJsonPath = join(pkgDir, 'package.json')
+      let licenseType = 'Unknown'
+      if (existsSync(pkgJsonPath)) {
+        try {
+          const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as {
+            license?: unknown
+            licenses?: unknown
+          }
+          if (typeof pkgJson.license === 'string' && pkgJson.license.length > 0) {
+            licenseType = pkgJson.license
+          } else if (Array.isArray(pkgJson.licenses) && pkgJson.licenses.length > 0) {
+            const first = pkgJson.licenses[0] as {type?: unknown}
+            if (typeof first?.type === 'string') {
+              licenseType = first.type
+            }
+          }
+        } catch {
+          // ignore parse errors
+        }
+      }
+      return {text, type: licenseType}
+    } catch {
+      return null
+    }
+  }
 
-function parsePackageName(dep: string): string {
-  const name = dep.split('@').find(Boolean) ?? ''
-  return dep.startsWith('@') ? `@${name}` : name
+  // Fall back to package.json license field
+  const pkgJsonPath = join(pkgDir, 'package.json')
+  if (existsSync(pkgJsonPath)) {
+    try {
+      const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as {
+        license?: unknown
+        licenses?: unknown
+      }
+      let licenseType = ''
+      if (typeof pkgJson.license === 'string' && pkgJson.license.length > 0) {
+        licenseType = pkgJson.license
+      } else if (Array.isArray(pkgJson.licenses) && pkgJson.licenses.length > 0) {
+        const first = pkgJson.licenses[0] as {type?: unknown}
+        if (typeof first?.type === 'string') {
+          licenseType = first.type
+        }
+      }
+      if (licenseType.length > 0) {
+        return {text: licenseType, type: licenseType}
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  return null
 }
 
 /**
- * Splits a `name@version` (or `@scope/name@version`) dependency string into its
- * version segment, or `null` when there is no version segment. A scoped name's
- * leading `@` is ignored so `@scope/pkg` (no version) yields `null` rather than
- * mistaking the scope/name for a version.
+ * Strips trailing commas from JSON-like content (bun.lock uses JSON5-style
+ * trailing commas that standard JSON.parse rejects).
  */
-function parseDepVersion(dep: string): string | null {
-  const atIndex = dep.lastIndexOf('@')
-  if (atIndex <= 0) {
-    return null
+function stripTrailingCommas(content: string): string {
+  return content.replaceAll(/,(\s*[}\]])/g, '$1')
+}
+
+/**
+ * Resolves the lockfile key for a dependency given the current package's key.
+ * Bun uses nested keys like "parent/dep" when a package uses a different version
+ * of a dep than the hoisted top-level version.
+ */
+function resolveDepKey(
+  depName: string,
+  currentKey: string,
+  packages: Record<string, BunLockPackageEntry>,
+): string | null {
+  const nestedKey = `${currentKey}/${depName}`
+  if (packages[nestedKey] !== undefined) {
+    return nestedKey
   }
-  const version = dep.slice(atIndex + 1)
-  return version === '' ? null : version
+  if (packages[depName] !== undefined) {
+    return depName
+  }
+  return null
+}
+
+/**
+ * Collects the prod dependency closure from bun.lock.
+ *
+ * Strategy:
+ * 1. Parse bun.lock (JSON5 with trailing commas) to get the packages map.
+ * 2. Collect prod seeds from ALL workspace packages (matches pnpm --prod behavior
+ *    in a monorepo — includes all workspace prod deps, not just root).
+ * 3. BFS traversal using nested-aware resolution: when a package uses a nested
+ *    version of a dep (e.g., "archiver-utils/glob"), traverse THAT version's deps.
+ * 4. Include optional dependencies (pnpm --prod includes them).
+ * 5. Extract the actual package name from the resolved version string.
+ *
+ * Returns a Map<packageName, {version, pkgDir}> for all prod packages.
+ */
+export function collectProdClosureFromBunLock(
+  lockfilePath: string,
+  nodeModulesDir: string,
+): Map<string, {readonly version: string; readonly pkgDir: string}> {
+  const lockContent = readFileSync(lockfilePath, 'utf8')
+  const cleaned = stripTrailingCommas(lockContent)
+  const lock = JSON.parse(cleaned) as BunLock
+
+  const packages = lock.packages ?? {}
+  const workspaces = lock.workspaces ?? {}
+
+  // Collect all workspace package names so we can exclude them from prod seeds
+  const workspaceNames = new Set(
+    Object.values(workspaces)
+      .map(ws => ws.name)
+      .filter((n): n is string => typeof n === 'string'),
+  )
+
+  // Collect prod seeds from ALL workspace packages (not just root)
+  // This matches pnpm --prod behavior in a monorepo
+  const allProdSeeds = new Set<string>()
+  for (const wsInfo of Object.values(workspaces)) {
+    for (const dep of Object.keys(wsInfo.dependencies ?? {})) {
+      if (!workspaceNames.has(dep)) {
+        allProdSeeds.add(dep)
+      }
+    }
+  }
+
+  // BFS with nested-aware resolution
+  const visitedKeys = new Set<string>()
+  const result = new Map<string, {readonly version: string; readonly pkgDir: string}>()
+  const queue: string[] = [...allProdSeeds]
+
+  while (queue.length > 0) {
+    const key = queue.shift()!
+    if (visitedKeys.has(key)) {
+      continue
+    }
+    visitedKeys.add(key)
+
+    const entry = packages[key]
+    if (entry === undefined) {
+      continue
+    }
+
+    const [resolvedVer, , meta] = entry
+    // resolvedVer is like "glob@10.5.0" or "@actions/core@3.0.1"
+    const atIdx = resolvedVer.lastIndexOf('@')
+    const actualName = resolvedVer.slice(0, atIdx)
+    const version = resolvedVer.slice(atIdx + 1)
+
+    // Only record the highest version per package name (matches existing dedup logic)
+    const existing = result.get(actualName)
+    if (existing === undefined || compareVersions(existing.version, version) < 0) {
+      const pkgDir = join(nodeModulesDir, actualName)
+      result.set(actualName, {version, pkgDir})
+    }
+
+    // Traverse required + optional deps
+    const allDeps: Record<string, string> = {
+      ...(meta?.dependencies ?? {}),
+      ...(meta?.optionalDependencies ?? {}),
+    }
+
+    for (const dep of Object.keys(allDeps)) {
+      const depKey = resolveDepKey(dep, key, packages)
+      if (depKey !== null && !visitedKeys.has(depKey)) {
+        queue.push(depKey)
+      }
+    }
+  }
+
+  return result
 }
 
 function compareVersions(a: string, b: string): number {
@@ -224,14 +297,89 @@ function compareVersions(a: string, b: string): number {
 }
 
 /**
+ * Collects third-party license notices using the Bun-native lockfile reader.
+ *
+ * Reads the prod dependency closure from bun.lock, resolves each package's
+ * license from node_modules, and formats the result using formatThirdPartyNotices.
+ *
+ * Fail-closed: throws if any prod package is missing or has no resolvable
+ * license attribution.
+ *
+ * @param lockfilePath - Path to bun.lock (default: './bun.lock').
+ * @param nodeModulesDir - Path to node_modules (default: './node_modules').
+ */
+export async function collectThirdPartyNoticesBun(
+  lockfilePath = './bun.lock',
+  nodeModulesDir = './node_modules',
+): Promise<string> {
+  const absLockfile = resolve(lockfilePath)
+  const absNodeModules = resolve(nodeModulesDir)
+
+  if (!existsSync(absLockfile)) {
+    throw new Error(`[license-collector] bun.lock not found at ${absLockfile}; cannot produce THIRD_PARTY_NOTICES.txt`)
+  }
+
+  let prodClosure: Map<string, {readonly version: string; readonly pkgDir: string}>
+  try {
+    prodClosure = collectProdClosureFromBunLock(absLockfile, absNodeModules)
+  } catch (error) {
+    throw new Error(
+      `[license-collector] failed to parse bun.lock: ${error instanceof Error ? error.message : String(error)}`,
+      {cause: error instanceof Error ? error : new Error(String(error))},
+    )
+  }
+
+  const highestVersions = new Map<string, LicenseEntry>()
+  const missingDir: string[] = []
+
+  for (const [pkgName, {version, pkgDir}] of prodClosure) {
+    if (!existsSync(pkgDir)) {
+      // Fail-closed: a missing package directory means the install is incomplete
+      missingDir.push(`${pkgName}@${version} (expected: ${pkgDir})`)
+      continue
+    }
+
+    const licenseResult = readPackageLicense(pkgDir)
+    if (licenseResult === null) {
+      // No license file or field found — use "Unknown" as the license type
+      // and a minimal attribution notice. This matches pnpm's behavior for
+      // packages that predate the npm license field convention.
+      console.warn(`[license-collector] ${pkgName}@${version}: no license file or field found; using "Unknown"`)
+      highestVersions.set(pkgName, {
+        version,
+        license: 'Unknown',
+        content: '(No license file found in package)',
+      })
+    } else {
+      highestVersions.set(pkgName, {
+        version,
+        license: licenseResult.type,
+        content: licenseResult.text,
+      })
+    }
+  }
+
+  if (missingDir.length > 0) {
+    throw new Error(
+      `[license-collector] license collection failed; cannot produce THIRD_PARTY_NOTICES.txt:\n` +
+        `The following prod packages are missing from node_modules (incomplete install?):\n${missingDir
+          .map(m => `  - ${m}`)
+          .join('\n')}`,
+    )
+  }
+
+  return formatThirdPartyNotices(highestVersions)
+}
+
+/**
  * Collects third-party license notices from the installed node_modules and
  * returns the formatted THIRD_PARTY_NOTICES.txt content as a string.
  *
- * - getPnpmLicensesJson() is fail-soft: per-dependency gaps produce "Unknown"
- *   license types rather than throwing.
- * - getProjectLicenses() is fail-closed: a total failure here means the notice
- *   would be incomplete, so this function throws with a rich error including the
- *   underlying cause/stderr.
+ * Uses the Bun-native lockfile reader (collectThirdPartyNoticesBun).
+ *
+ * - The license collection is fail-closed: a total failure here means the
+ *   notice would be incomplete, so this function throws with a rich error
+ *   including the underlying cause.
  *
  * @param packageJsonPath - Path to the root package.json (default: './package.json').
  *   Pass an absolute path when the caller's cwd differs from the repo root.
@@ -239,38 +387,8 @@ function compareVersions(a: string, b: string): number {
  * Does NOT write any files. Callers decide what to do with the result.
  */
 export async function collectThirdPartyNotices(packageJsonPath = './package.json'): Promise<string> {
-  const highestVersions = new Map<string, LicenseEntry>()
-  const licenseTypeMap = buildLicenseTypeMap(await getPnpmLicensesJson())
-
-  let licenses: Awaited<ReturnType<typeof getProjectLicenses>>
-  try {
-    licenses = await getProjectLicenses(packageJsonPath)
-  } catch (error) {
-    const diagnostics = formatChildProcessError(error)
-    throw new Error(
-      `[license-collector] license collection failed; cannot produce THIRD_PARTY_NOTICES.txt:\n${diagnostics}`,
-      {cause: error instanceof Error ? error : new Error(diagnostics)},
-    )
-  }
-
-  for (const license of licenses) {
-    for (const dep of license.dependencies) {
-      const pkgName = parsePackageName(dep)
-      const version = parseDepVersion(dep)
-
-      if (version != null) {
-        const existing = highestVersions.get(pkgName)
-        if (existing == null || compareVersions(existing.version, version) < 0) {
-          const licenseType = licenseTypeMap.get(`${pkgName}@${version}`) ?? 'Unknown'
-          highestVersions.set(pkgName, {
-            version,
-            license: licenseType,
-            content: license.content,
-          })
-        }
-      }
-    }
-  }
-
-  return formatThirdPartyNotices(highestVersions)
+  const packageDir = packageJsonPath.replace(/[/\\]?package\.json$/, '') || '.'
+  const bunLockPath = join(packageDir, 'bun.lock')
+  const nodeModulesDir = join(packageDir, 'node_modules')
+  return collectThirdPartyNoticesBun(bunLockPath, nodeModulesDir)
 }

@@ -17,7 +17,7 @@
  *
  * Or via the package script (if added):
  *
- *   pnpm --filter @fro-bot/gateway exec tsx src/bindings/backfill-deny-keys-cli.ts
+ *   bun run --filter @fro-bot/gateway exec tsx src/bindings/backfill-deny-keys-cli.ts
  *
  * Required env vars (same as the gateway daemon):
  *   GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (or _FILE variants)

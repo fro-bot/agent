@@ -139,10 +139,6 @@
       allowedVersions: '<=1.3.14',
     },
     {
-      matchUpdateTypes: ['lockFileMaintenance'],
-      semanticCommitType: 'build',
-    },
-    {
       // Let release-pipeline packages settle before they reach the release job. A
       // broken same-day publish (e.g. semantic-release 25.0.4 shipped a missing
       // @semantic-release/core import) would otherwise break Perform Release before
@@ -168,7 +164,7 @@
   postUpgradeTasks: {
     // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
     // update branches stays free of characters Renovate would otherwise flag.
-    commands: ['pnpm install', 'pnpm run fix', 'pnpm run build'],
+    commands: ['bun install', 'bun run fix', 'bun run build'],
     executionMode: 'branch',
   },
 }
