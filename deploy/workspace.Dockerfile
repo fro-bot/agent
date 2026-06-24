@@ -169,8 +169,8 @@ RUN set -euo pipefail \
     && base_url="https://github.com/fro-bot/agent/releases/download/${encoded_version}" \
     # Download the asset archive and the SHA256SUMS file for this release.
     # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
-    && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
-    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
     # Verify the asset's SHA256 against the SHA256SUMS entry — fail closed on any mismatch.
     && expected_hash="$(awk -v f="${oc_asset}.tar.gz" '$2 == f {print $1}' /tmp/SHA256SUMS)" \
     && if [ -z "${expected_hash}" ]; then \
