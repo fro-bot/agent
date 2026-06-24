@@ -1003,6 +1003,38 @@ describe('button interaction handler (approval flow)', () => {
     expect(serverConfig.publicOrigin).toBe('https://operator.example.com')
   })
 
+  it('wires listBindings into the operator server so GET /operator/repos mounts', async () => {
+    // #given — config has operatorWeb present
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — listBindings must be wired, otherwise server.ts gates out the
+    // repos-route mount and GET /operator/repos returns 404 instead of mounting.
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.listBindings).toBeDefined()
+    expect(typeof serverDeps.listBindings).toBe('function')
+  })
+
   it('operator server does NOT start when operatorWeb is absent', async () => {
     // #given — config has no operatorWeb block
     const fakeConfig = makeFakeConfig({announce: undefined, operatorWeb: undefined})

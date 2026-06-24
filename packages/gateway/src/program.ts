@@ -511,6 +511,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           // can reach them without creating second copies.
           denylistCache,
           bindingsLookup: bindingsStore,
+          // listBindings is a distinct dep from bindingsLookup: server.ts gates the
+          // GET /operator/repos mount on listBindings, so omitting it leaves that
+          // route unmounted (404). bindingsLookup only covers the run-stream route.
+          listBindings: bindingsStore.listBindings.bind(bindingsStore),
           runObservationManager,
           runIndex,
         },
