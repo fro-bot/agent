@@ -113,6 +113,8 @@ jobs:
       # The SBOM is an informational artifact, not a build gate — a generation
       # failure must not fail the build.
       # pnpm sbom has no Bun equivalent; using @cyclonedx/cyclonedx-npm as a non-blocking substitute.
+      # Unlike the prior `pnpm sbom --prod`, this scans node_modules and so includes dev
+      # dependencies. The SBOM is informational only, so the broader scope is acceptable.
       - name: Generate the dependency SBOM
         id: sbom
         continue-on-error: true

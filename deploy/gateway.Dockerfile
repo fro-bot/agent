@@ -3,8 +3,10 @@ FROM node:24.17.0-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d
 
 WORKDIR /workspace
 
-# Install Bun (matches packageManager: bun@1.3.14)
-RUN npm i -g bun@1.3.14
+ARG BUN_VERSION=1.3.14
+
+# Install Bun (matches packageManager: bun@${BUN_VERSION})
+RUN npm i -g bun@${BUN_VERSION}
 
 # Copy workspace root manifests first (layer-cache friendly)
 COPY package.json bun.lock tsconfig.base.json ./

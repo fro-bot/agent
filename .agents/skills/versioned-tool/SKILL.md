@@ -31,7 +31,7 @@ This project manages external CLI tools through a **single-source-of-truth versi
 2. Verify the installer imports that constant (not a duplicate string).
 3. For user-facing tools, verify `src/harness/config/inputs.ts` falls back to the constant.
 4. Update any docs that surface the pinned default.
-5. Run: `pnpm test src/services/setup/ && pnpm lint && pnpm build`.
+5. Run: `bun run test && bun run lint && bun run build`.
 
 ### Add a new external tool
 
@@ -143,7 +143,7 @@ Update only the docs that surface the changed version:
 #### 5. Rebuild dist/
 
 ```bash
-pnpm build  # runs tsc --noEmit && tsdown
+bun run build  # runs tsc --noEmit && tsdown
 ```
 
 `dist/` is committed and must stay in sync.
@@ -202,9 +202,9 @@ Do not copy installer structure blindly between tools. Copy the version-source p
 - [ ] `action.yaml` has no hardcoded default for the version input
 - [ ] Renovate customManager regex matches the constant pattern exactly
 - [ ] Renovate packageRule sets `semanticCommitType: 'build'`
-- [ ] `pnpm test src/services/setup/` passes
-- [ ] `pnpm lint` clean (0 errors)
-- [ ] `pnpm build` succeeds (`check-types` runs as part of build)
+- [ ] `bun run test` passes
+- [ ] `bun run lint` clean (0 errors)
+- [ ] `bun run build` succeeds (`check-types` runs as part of build)
 - [ ] `dist/` is regenerated and in sync
 - [ ] Docs that surface the pinned default are updated
 

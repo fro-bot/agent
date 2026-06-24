@@ -116,13 +116,13 @@ export function parseInputs(raw: Record<string, string>): Result<ActionInputs> {
 ## Build & Verification
 
 ```bash
-pnpm test          # All tests must pass
-pnpm lint          # No lint errors
-pnpm build         # Bundle to dist/ (includes type-check); dist/ is committed
+bun run test          # All tests must pass
+bun run lint          # No lint errors
+bun run build         # Bundle to dist/ (includes type-check); dist/ is committed
 ```
 
 - Never manually edit `dist/`; it is always overwritten by build
-- CI validates `dist/` is in sync — always run `pnpm build` after source changes
+- CI validates `dist/` is in sync — always run `bun run build` after source changes
 
 ## Security
 

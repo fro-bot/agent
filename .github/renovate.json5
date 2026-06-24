@@ -90,6 +90,46 @@
       depNameTemplate: '@fro.bot/systematic',
       datasourceTemplate: 'npm',
     },
+    {
+      // Tracks the Bun version ARG in deploy/gateway.Dockerfile.
+      // Keep in lockstep with the oven-sh/bun allowedVersions cap.
+      customType: 'regex',
+      managerFilePatterns: ['/deploy\\/gateway\\.Dockerfile/'],
+      matchStrings: ['ARG BUN_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
+    {
+      // Tracks the Bun version ARG in deploy/workspace.Dockerfile.
+      // Keep in lockstep with the oven-sh/bun allowedVersions cap.
+      customType: 'regex',
+      managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
+      matchStrings: ['ARG BUN_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
+    {
+      // Tracks the bun-version default in .github/actions/setup/action.yaml.
+      // This composite action default must stay in lockstep with HARNESS_BUN_VERSION.
+      customType: 'regex',
+      managerFilePatterns: ['/\\.github\\/actions\\/setup\\/action\\.yaml/'],
+      matchStrings: ['default: (?<currentValue>\\d+\\.\\d+\\.\\d+)'],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
+    {
+      // Tracks the packageManager field in package.json (bun@X.Y.Z).
+      // Must stay in lockstep with HARNESS_BUN_VERSION and the oven-sh/bun cap.
+      customType: 'regex',
+      managerFilePatterns: ['/package\\.json/'],
+      matchStrings: ['"packageManager": "bun@(?<currentValue>\\d+\\.\\d+\\.\\d+)"'],
+      depNameTemplate: 'oven-sh/bun',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^bun-v(?<version>.*)$',
+    },
   ],
   packageRules: [
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},

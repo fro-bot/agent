@@ -15,9 +15,9 @@
  *
  *   node --import tsx/esm src/bindings/backfill-deny-keys-cli.ts
  *
- * Or via the package script (if added):
+ * Or via bunx (from the repo root):
  *
- *   bun run --filter @fro-bot/gateway exec tsx src/bindings/backfill-deny-keys-cli.ts
+ *   bunx tsx src/bindings/backfill-deny-keys-cli.ts
  *
  * Required env vars (same as the gateway daemon):
  *   GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (or _FILE variants)

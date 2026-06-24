@@ -36,7 +36,7 @@ The harness ships as a main `@fro.bot/harness` package + per-platform packages:
 
 Each per-platform package contains only that platform's native binary. The main package's `bin` shim + `postinstall` resolver (`resolve-binary.ts` → `platform.ts`) select the host's binary by computed package name (`@fro.bot/harness-<os>-<arch>`) and verify it before exec; `OPENCODE_PATH` and a bare `opencode` on PATH are honored as fallbacks for local/unbuilt use.
 
-The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `pnpm-lock.yaml` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
+The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `bun.lock` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
 Harness builds target **linux and darwin only** (x64 + arm64); Windows is unsupported.
 
@@ -163,10 +163,10 @@ Drop a carried ref when: upstream stable release includes it; it stops applying 
 ## Build
 
 ```bash
-pnpm --filter @fro.bot/harness build       # type-check + bundle → dist/cli.mjs
-pnpm --filter @fro.bot/harness check-types # tsc --noEmit only
-pnpm --filter @fro.bot/harness test        # vitest
-pnpm --filter @fro.bot/harness lint        # eslint
+bun run --filter @fro.bot/harness build       # type-check + bundle → dist/cli.mjs
+bun run --filter @fro.bot/harness check-types # tsc --noEmit only
+bun run --filter @fro.bot/harness test        # vitest
+bun run --filter @fro.bot/harness lint        # eslint
 ```
 
 The build produces `dist/cli.mjs` — the `harness` bin entry point.

@@ -182,6 +182,97 @@ describe('collectProdClosureFromBunLock', () => {
     const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
     expect(closure.get('shared')?.version).toBe('2.0.0')
   })
+
+  it('exercises stripTrailingCommas — trailing commas in lockfile input are handled', () => {
+    // JSON.stringify never emits trailing commas, so this exercises the regex path
+    // that stripTrailingCommas must handle (bun.lock uses JSON5-style trailing commas).
+    const lockWithTrailingCommas = `{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "@test/workspace",
+      "dependencies": {
+        "chalk": "5.3.0",
+      },
+    },
+  },
+  "packages": {
+    "chalk": ["chalk@5.3.0", "", {}],
+  },
+}`
+    mockReadFileSync.mockReturnValue(lockWithTrailingCommas)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('chalk')).toBe(true)
+    expect(closure.get('chalk')?.version).toBe('5.3.0')
+  })
+
+  it('parses scoped packages correctly (@actions/core@3.0.1)', () => {
+    const lockContent = makeBunLock({'@actions/core': '3.0.1'}, {'@actions/core': ['@actions/core@3.0.1', '', {}]})
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('@actions/core')).toBe(true)
+    expect(closure.get('@actions/core')?.version).toBe('3.0.1')
+  })
+
+  it('silently skips a dependency not present in the packages map', () => {
+    // resolveDepKey returns null → should not crash, just skip
+    const lockContent = makeBunLock(
+      {pkgA: '1.0.0'},
+      {
+        pkgA: ['pkgA@1.0.0', '', {dependencies: {'ghost-dep': '^1.0.0'}}],
+        // 'ghost-dep' is intentionally absent from packages
+      },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('pkgA')).toBe(true)
+    expect(closure.has('ghost-dep')).toBe(false)
+  })
+
+  it('throws a clear error when lockfileVersion is missing or not 1 (FIX B)', () => {
+    const badLock = JSON.stringify({
+      lockfileVersion: 2,
+      workspaces: {'': {name: '@test/workspace', dependencies: {}}},
+      packages: {},
+    })
+    mockReadFileSync.mockReturnValue(badLock)
+    mockExistsSync.mockReturnValue(true)
+    expect(() => collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')).toThrow(
+      /unsupported bun\.lock format.*lockfileVersion 1/,
+    )
+  })
+
+  it('throws a clear error when lockfileVersion is absent (FIX B)', () => {
+    const badLock = JSON.stringify({
+      workspaces: {'': {name: '@test/workspace', dependencies: {}}},
+      packages: {},
+    })
+    mockReadFileSync.mockReturnValue(badLock)
+    mockExistsSync.mockReturnValue(true)
+    expect(() => collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')).toThrow(
+      /unsupported bun\.lock format/,
+    )
+  })
+
+  it('includes packages reachable only via peerDependencies (FIX G)', () => {
+    // peer-only-dep is not in dependencies or optionalDependencies of pkgA,
+    // only in peerDependencies — it must still be included in the closure.
+    const lockContent = makeBunLock(
+      {pkgA: '1.0.0'},
+      {
+        pkgA: ['pkgA@1.0.0', '', {peerDependencies: {'peer-only-dep': '^1.0.0'}}],
+        'peer-only-dep': ['peer-only-dep@1.0.0', '', {}],
+      },
+    )
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('pkgA')).toBe(true)
+    expect(closure.has('peer-only-dep')).toBe(true)
+  })
 })
 
 describe('collectThirdPartyNoticesBun', () => {
@@ -274,6 +365,62 @@ describe('collectThirdPartyNoticesBun', () => {
     await expect(collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')).rejects.toThrow(
       /failed to parse bun\.lock/,
     )
+  })
+
+  it('reads license type from old-style licenses ARRAY field when no LICENSE file exists', async () => {
+    // Tests the package.json fallback path with the legacy `licenses` array format
+    const lockContent = makeBunLock({oldstyle: '0.5.0'}, {oldstyle: ['oldstyle@0.5.0', '', {}]})
+
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return path.endsWith('bun.lock') || path.endsWith('/oldstyle') || path.endsWith('/oldstyle/package.json')
+    })
+
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      if (path.endsWith('/oldstyle/package.json'))
+        return JSON.stringify({name: 'oldstyle', version: '0.5.0', licenses: [{type: 'BSD-2-Clause', url: '...'}]})
+      return ''
+    })
+
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      // No LICENSE file — only package.json
+      if (String(p).endsWith('/oldstyle')) return ['package.json'] as unknown as ReturnType<typeof readdirSync>
+      return []
+    })
+
+    const result = await collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')
+    expect(result).toContain('oldstyle@0.5.0')
+    expect(result).toContain('BSD-2-Clause')
+  })
+
+  it('falls back to package.json license field when no LICENSE file exists', async () => {
+    // Tests the package.json-only fallback path (no LICENSE file in the package dir)
+    const lockContent = makeBunLock({minipkg: '1.0.0'}, {minipkg: ['minipkg@1.0.0', '', {}]})
+
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return path.endsWith('bun.lock') || path.endsWith('/minipkg') || path.endsWith('/minipkg/package.json')
+    })
+
+    mockReadFileSync.mockImplementation((p: unknown, _enc?: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      if (path.endsWith('/minipkg/package.json'))
+        return JSON.stringify({name: 'minipkg', version: '1.0.0', license: 'ISC'})
+      return ''
+    })
+
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      // No LICENSE file — only package.json
+      if (String(p).endsWith('/minipkg')) return ['package.json'] as unknown as ReturnType<typeof readdirSync>
+      return []
+    })
+
+    const result = await collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')
+    expect(result).toContain('minipkg@1.0.0')
+    expect(result).toContain('ISC')
   })
 })
 
