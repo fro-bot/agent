@@ -66,7 +66,7 @@ jobs:
               - added|modified: *config
               - added|modified: *dist-changed
               - added|modified: *src-changed
-              - scripts/** # Build changes to CI scripts trigger build+test (scripts tests run in Test job)
+              - scripts/** # Build changes to CI scripts trigger build+test (scripts/ tested via test:scripts in the Test job)
 
   lint:
     if: ${{ needs.setup.outputs.should-lint == 'true' }}
@@ -137,6 +137,8 @@ jobs:
         uses: ./.github/actions/setup
       - name: Run tests
         run: bun run test
+      - name: Run scripts/ tests
+        run: bun run test:scripts
 
   test-action:
     if: >-

@@ -27,12 +27,26 @@ ARG BUN_VERSION=1.3.14
 RUN npm i -g bun@${BUN_VERSION}
 
 # Workspace root manifests first (layer-cache friendly)
-COPY package.json bun.lock tsconfig.base.json ./
+COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
 
-# Only the workspace-agent package is needed (it has no @fro-bot/runtime dep)
+# Copy every workspace package manifest so `bun install --frozen-lockfile` can
+# validate the full workspace graph against bun.lock. Bun (unlike pnpm) checks
+# the complete manifest set even for a filtered install, so a missing manifest
+# reads as lockfile drift and fails the frozen install.
+COPY apps/action/package.json apps/action/package.json
+COPY apps/workspace-agent/package.json apps/workspace-agent/package.json
+COPY packages/runtime/package.json packages/runtime/package.json
+COPY packages/gateway/package.json packages/gateway/package.json
+COPY packages/harness/package.json packages/harness/package.json
+
+# Install the full workspace (including devDependencies). The build typechecks
+# test files (which import vitest) and runs tsc/tsdown, so the build toolchain
+# and dev dependencies must be present. A filtered install omits root
+# devDependencies and breaks the typecheck.
+RUN bun install --frozen-lockfile
+
+# Source for the package we actually build
 COPY apps/workspace-agent/ apps/workspace-agent/
-
-RUN bun install --frozen-lockfile --filter '@fro-bot/workspace-agent'
 
 RUN bun run --filter @fro-bot/workspace-agent build
 
