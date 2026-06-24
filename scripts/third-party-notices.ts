@@ -294,6 +294,10 @@ export function collectProdClosureFromBunLock(
   return result
 }
 
+// Compares X.Y.Z numeric parts only — prerelease/build metadata (e.g. "-rc.1", "+build")
+// is ignored, so "1.0.0-rc.1" sorts equal to "1.0.0". That is acceptable here because
+// license TEXT is version-independent; this comparator only picks which version LABEL to
+// display when the same package appears at multiple resolved versions.
 function compareVersions(a: string, b: string): number {
   const aParts = a.split('.').map(Number)
   const bParts = b.split('.').map(Number)

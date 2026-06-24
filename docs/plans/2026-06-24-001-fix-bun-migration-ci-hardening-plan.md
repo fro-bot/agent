@@ -62,7 +62,7 @@ The Bun migration adopted the **hoisted** linker (required to keep TypeScript's 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Phantom-dependency lint guard**
+- [x] **Unit 1: Phantom-dependency lint guard**
 
 **Goal:** Fail lint on an import of a package not declared in the importing package's `package.json` (or root), while allowing devDependencies in test/config/script files.
 
@@ -84,7 +84,7 @@ The Bun migration adopted the **hoisted** linker (required to keep TypeScript's 
 
 **Verification:** `bun run lint` exits 0 on the real tree; a probe undeclared import fails and a probe test-file devDep import passes.
 
-- [ ] **Unit 2: Bun install cache in CI**
+- [x] **Unit 2: Bun install cache in CI**
 
 **Goal:** Cache Bun's global install cache so repeat CI runs skip re-downloading the dependency graph.
 
@@ -104,7 +104,7 @@ The Bun migration adopted the **hoisted** linker (required to keep TypeScript's 
 
 **Verification:** `actionlint` clean; a CI run logs a Bun cache save, and a later run on the same `bun.lock` logs a cache hit.
 
-- [ ] **Unit 3: Bun-version segment in the tools-cache key**
+- [x] **Unit 3: Bun-version segment in the tools-cache key**
 
 **Goal:** Invalidate the action's aggregate tools-cache when the Bun version changes, so a stale Bun binary isn't restored.
 
@@ -127,7 +127,7 @@ The Bun migration adopted the **hoisted** linker (required to keep TypeScript's 
 
 **Verification:** Updated tests pass; `bun run check-types` clean; `dist/main.js` rebuilt and in sync.
 
-- [ ] **Unit 4: Notice-collector polish**
+- [x] **Unit 4: Notice-collector polish**
 
 **Goal:** Document the version comparator's metadata assumption and pin devDependency exclusion from the prod closure.
 

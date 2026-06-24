@@ -273,6 +273,64 @@ describe('collectProdClosureFromBunLock', () => {
     expect(closure.has('pkgA')).toBe(true)
     expect(closure.has('peer-only-dep')).toBe(true)
   })
+
+  it('excludes workspace devDependencies that are not reachable via any prod dep', () => {
+    // Seeds come from workspace `dependencies` only — a package listed solely in
+    // `devDependencies` must not appear in the prod closure.
+    const lockContent = JSON.stringify({
+      lockfileVersion: 1,
+      configVersion: 1,
+      workspaces: {
+        '': {
+          name: '@test/workspace',
+          dependencies: {chalk: '5.3.0'},
+          devDependencies: {vitest: '2.0.0'},
+        },
+      },
+      packages: {
+        chalk: ['chalk@5.3.0', '', {}],
+        vitest: ['vitest@2.0.0', '', {}],
+      },
+    })
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    // prod dep is included
+    expect(closure.has('chalk')).toBe(true)
+    expect(closure.get('chalk')?.version).toBe('5.3.0')
+    // devDep with no prod-reachable path is excluded
+    expect(closure.has('vitest')).toBe(false)
+  })
+
+  it('includes a package that is both a workspace devDependency and a transitive prod dep', () => {
+    // Prod reachability wins: if a package is listed in devDependencies but is also
+    // reachable transitively through a prod dependency's tree, it must be included.
+    // This pins the seeding contract: closure seeds from `dependencies` only, but
+    // BFS traversal still reaches packages that happen to also be devDeps.
+    const lockContent = JSON.stringify({
+      lockfileVersion: 1,
+      configVersion: 1,
+      workspaces: {
+        '': {
+          name: '@test/workspace',
+          dependencies: {chalk: '5.3.0'},
+          // shared-util is also a devDep, but chalk depends on it transitively
+          devDependencies: {'shared-util': '1.0.0'},
+        },
+      },
+      packages: {
+        chalk: ['chalk@5.3.0', '', {dependencies: {'shared-util': '^1.0.0'}}],
+        'shared-util': ['shared-util@1.0.0', '', {}],
+      },
+    })
+    mockReadFileSync.mockReturnValue(lockContent)
+    mockExistsSync.mockReturnValue(true)
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+    expect(closure.has('chalk')).toBe(true)
+    // shared-util is reachable via chalk → must be in the prod closure
+    expect(closure.has('shared-util')).toBe(true)
+    expect(closure.get('shared-util')?.version).toBe('1.0.0')
+  })
 })
 
 describe('collectThirdPartyNoticesBun', () => {
