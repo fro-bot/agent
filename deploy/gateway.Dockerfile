@@ -10,24 +10,33 @@ RUN apk add --no-cache curl unzip
 
 # Install Bun from the official oven-sh/bun GitHub release, verified against the
 # release SHASUMS256.txt fail-closed — matching the verified-binary posture used
-# for the OpenCode install (and CI's oven-sh/setup-bun), rather than pulling the
-# unverified `bun` npm wrapper. TARGETARCH is provided automatically by BuildKit;
-# x64 uses the AVX2-independent baseline+musl variant so the image runs on any
-# x86 host, arm64 uses the musl variant. Both are musl for Alpine.
+# for the OpenCode install in deploy/workspace.Dockerfile (and CI's
+# oven-sh/setup-bun), rather than pulling the unverified `bun` npm wrapper.
+# TARGETARCH is provided automatically by BuildKit; x64 uses the AVX2-independent
+# baseline+musl variant so the image runs on any x86 host, arm64 uses the musl
+# variant. Both are musl for Alpine.
 #
 # Any download failure, checksum-fetch failure, missing entry, or hash mismatch
 # aborts the build (no fallback, no retry-around-mismatch).
+#
+# NOTE: keep this block in sync with the same block in deploy/workspace.Dockerfile.
 ARG TARGETARCH
 RUN set -euo pipefail \
+    # Validate the version before URL interpolation (parity with the OpenCode block).
+    && case "${BUN_VERSION}" in \
+         *[!0-9A-Za-z._-]*) echo "BUN_VERSION contains disallowed characters: ${BUN_VERSION}" >&2; exit 1 ;; \
+         [0-9]*.[0-9]*.[0-9]*) : ;; \
+         *) echo "BUN_VERSION is not a semver-like version: ${BUN_VERSION}" >&2; exit 1 ;; \
+       esac \
     && case "${TARGETARCH}" in \
          amd64) bun_asset="bun-linux-x64-musl-baseline" ;; \
          arm64) bun_asset="bun-linux-aarch64-musl" ;; \
          *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
        esac \
     && bun_base="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}" \
-    && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/${bun_asset}.zip" "${bun_base}/${bun_asset}.zip" \
-    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/SHASUMS256.txt "${bun_base}/SHASUMS256.txt" \
-    && expected_hash="$(awk -v f="${bun_asset}.zip" '$2 == f {print $1}' /tmp/SHASUMS256.txt)" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${bun_asset}.zip" "${bun_base}/${bun_asset}.zip" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHASUMS256.txt "${bun_base}/SHASUMS256.txt" \
+    && expected_hash="$(awk -v f="${bun_asset}.zip" '$2 == f || $2 == "./" f {print $1}' /tmp/SHASUMS256.txt)" \
     && if [ -z "${expected_hash}" ]; then \
          echo "SHASUMS256.txt has no entry for ${bun_asset}.zip" >&2; exit 1; \
        fi \
@@ -78,10 +87,15 @@ RUN bun run --filter @fro-bot/gateway build
 # final image does not carry the dev toolchain (vitest, tsdown, eslint, …). The
 # full install above is required for the build typecheck (which imports vitest).
 # Bun's --production does NOT prune an already-populated node_modules, so the
-# workspace node_modules are removed first for a clean production-only install.
-# --ignore-scripts skips the root simple-git-hooks postinstall (a devDependency
-# that would otherwise fail under --production). The runtime stage copies this
-# trimmed tree.
+# workspace node_modules are removed first for a clean production-only install
+# (the rm globs cover the current flat apps/* + packages/* workspace layout).
+# --ignore-scripts is required: bun still runs the ROOT postinstall under
+# --production (workspace mode), and that script invokes simple-git-hooks — a
+# devDependency that is absent under --production, so it would fail with exit
+# 127. The flag is a blanket suppression of all lifecycle scripts; that is safe
+# today because no production dependency declares a postinstall, but a future
+# prod dep that needs one would be silently skipped (caught only by the smoke
+# tests booting the image). The runtime stage copies this trimmed tree.
 RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
