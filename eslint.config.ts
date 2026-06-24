@@ -66,6 +66,9 @@ export default defineConfig(
       'import-x/no-extraneous-dependencies': [
         'error',
         {
+          // Keep this list in sync with the workspace packages in
+          // package.json#workspaces. A missing entry produces false-positive
+          // extraneous-dependency errors for that package's imports.
           packageDir: [
             import.meta.dirname,
             `${import.meta.dirname}/apps/action`,
@@ -86,7 +89,6 @@ export default defineConfig(
             'scripts/**',
             'packages/harness/scripts/**',
           ],
-          optionalDependencies: false,
           peerDependencies: true,
         },
       ],
