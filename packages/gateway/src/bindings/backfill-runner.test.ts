@@ -462,6 +462,27 @@ describe('makeWriteBinding', () => {
     expect(errorResult.error.message).toContain('conditionalPut')
   })
 
+  it('conditionalPut is called with an EMPTY condition object — unconditional overwrite, no ifMatch/ifNoneMatch', async () => {
+    // #given — a mock adapter and a known binding
+    const mockConditionalPut = vi.fn().mockResolvedValue({success: true, data: {etag: 'etag-unconditional'}})
+    const mockAdapter = makeMockWriteAdapter(mockConditionalPut)
+    const binding = makeTestBinding({databaseId: 77777, nodeId: 'R_kgDOUNCOND'})
+
+    // #when — invoke the real makeWriteBinding factory
+    const {makeWriteBinding} = await import('./backfill-runner.js')
+    const writeBinding = makeWriteBinding(mockAdapter, TEST_STORE_CONFIG, 'discord-gateway')
+    await writeBinding(binding)
+
+    // #then — conditionalPut was called exactly once
+    expect(mockConditionalPut).toHaveBeenCalledTimes(1)
+
+    // #and — the third argument (condition) is an empty object: no ifMatch, no ifNoneMatch
+    const [, , condition] = mockConditionalPut.mock.calls[0] as [string, string, Record<string, unknown>]
+    expect(condition).toEqual({})
+    expect(condition).not.toHaveProperty('ifMatch')
+    expect(condition).not.toHaveProperty('ifNoneMatch')
+  })
+
   it('uses the default identity (discord-gateway) in the key when identity is discord-gateway', async () => {
     // #given — default identity
     const mockConditionalPut = vi.fn().mockResolvedValue({success: true, data: {etag: 'etag-1'}})

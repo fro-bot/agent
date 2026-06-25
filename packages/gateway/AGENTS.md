@@ -293,4 +293,4 @@ bun run --filter @fro-bot/gateway test
 bun run --filter @fro-bot/gateway lint
 ```
 
-The build runs `tsc --noEmit` for type checking, then `tsdown` to bundle `src/main.ts` into `dist/main.js` (single ESM file). Production deployment runs that bundle inside the container image — see `deploy/gateway.Dockerfile`.
+The build runs `tsc --noEmit` for type checking, then `tsdown` to bundle `src/main.ts` into `dist/main.mjs` (single ESM file). Production deployment runs that bundle inside the container image — see `deploy/gateway.Dockerfile`.
