@@ -353,6 +353,66 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       })
     })
 
+    // ---------------------------------------------------------------------------
+    // Engine deps for launchWork — shared between Discord mentions and the web
+    // operator launch route so both paths use the same run-state/coordination
+    // instances and cannot diverge.
+    //
+    // botUserId is read lazily via a getter: client.user is set after login, but
+    // the operator server starts before login. On the web path botUserId is
+    // destructured by executeWorkOnHeldSlot but never consumed — the web path
+    // always supplies a promptBuilder that does not use it. On the Discord path
+    // the messageCreate handler spreads these deps and overrides botUserId with
+    // the concrete client.user.id value.
+    // ---------------------------------------------------------------------------
+    const runEngineDeps: import('./execute/run.js').RunMentionDeps = {
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      concurrency: concurrencyRegistry,
+      queue: channelQueue,
+      attachUrl: config.workspaceOpencodeUrl,
+      attachToken: config.workspaceOpencodeToken,
+      runTimeoutMs: config.runTimeoutMs,
+      // Lazy getter: client.user is non-null after login. Web-launched runs
+      // always supply a promptBuilder so botUserId is never read on that path.
+      get botUserId() {
+        return client.user?.id ?? ''
+      },
+      persona: config.persona,
+      logger,
+      approvalRegistry,
+      approvalMode: config.approvalMode,
+      statusMode: config.statusMode,
+      // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
+      // Placed inside run so it is called after the concurrency gate, not before.
+      readyz: async () => workspaceClient.readyz(),
+      // Ensure workspace checkout exists. Called after the concurrency gate so
+      // same-channel mention storms do not each mint GitHub App tokens before
+      // the busy/cap rejection fires. Adapts GatewayLogger (context-first) to
+      // the EnsureCloneDeps logger (message-first) inline.
+      ensureClone: async (owner: string, repo: string) =>
+        ensureWorkspaceClone({
+          owner,
+          repo,
+          appClient,
+          workspaceClient,
+          logger: {
+            info: (msg, meta) => logger.info(meta ?? {}, msg),
+            warn: (msg, meta) => logger.warn(meta ?? {}, msg),
+            error: (msg, meta) => logger.error(meta ?? {}, msg),
+          },
+        }),
+      // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
+      // The in-memory queue is lossy by design; dropping pending tasks on graceful
+      // shutdown matches that contract and is consistent with the messageCreate
+      // guard above that refuses new mentions once isShuttingDown() returns true.
+      isShuttingDown,
+      // Server-owned run index: populated at run creation for privileged route authz.
+      runIndex,
+      // Feeds the run-observation manager at each lifecycle transition.
+      runObserver: runObservationManager,
+    }
+
     // Track in-flight mention run promises so SIGTERM can await them before tearing down.
     const inFlightRuns = new Set<Promise<void>>()
 
@@ -363,51 +423,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // Stop accepting new mentions once shutdown has been requested.
       if (isShuttingDown()) return
 
+      // Reuse the program-scoped engine deps; override botUserId with the
+      // concrete value now that client.user is guaranteed non-null.
       const mentionDeps = {
         bindingsStore,
         triggerRoleId: config.triggerRoleId,
         run: {
-          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-          identity: config.identity,
-          concurrency: concurrencyRegistry,
-          queue: channelQueue,
-          attachUrl: config.workspaceOpencodeUrl,
-          attachToken: config.workspaceOpencodeToken,
-          runTimeoutMs: config.runTimeoutMs,
+          ...runEngineDeps,
           botUserId: client.user.id,
-          persona: config.persona,
-          logger,
-          approvalRegistry,
-          approvalMode: config.approvalMode,
-          statusMode: config.statusMode,
-          // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
-          // Placed inside run so it is called after the concurrency gate, not before.
-          readyz: async () => workspaceClient.readyz(),
-          // Ensure workspace checkout exists. Called after the concurrency gate so
-          // same-channel mention storms do not each mint GitHub App tokens before
-          // the busy/cap rejection fires. Adapts GatewayLogger (context-first) to
-          // the EnsureCloneDeps logger (message-first) inline.
-          ensureClone: async (owner: string, repo: string) =>
-            ensureWorkspaceClone({
-              owner,
-              repo,
-              appClient,
-              workspaceClient,
-              logger: {
-                info: (msg, meta) => logger.info(meta ?? {}, msg),
-                warn: (msg, meta) => logger.warn(meta ?? {}, msg),
-                error: (msg, meta) => logger.error(meta ?? {}, msg),
-              },
-            }),
-          // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
-          // The in-memory queue is lossy by design; dropping pending tasks on graceful
-          // shutdown matches that contract and is consistent with the messageCreate
-          // guard above that refuses new mentions once isShuttingDown() returns true.
-          isShuttingDown,
-          // Server-owned run index: populated at run creation for privileged route authz.
-          runIndex,
-          // Feeds the run-observation manager at each lifecycle transition.
-          runObserver: runObservationManager,
         },
         logger,
       }
@@ -515,6 +538,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           // GET /operator/repos mount on listBindings, so omitting it leaves that
           // route unmounted (404). bindingsLookup only covers the run-stream route.
           listBindings: bindingsStore.listBindings.bind(bindingsStore),
+          // getBindingByRepo gates the POST /operator/runs launch route mount.
+          // Mirrors the listBindings pattern: bind for `this` safety.
+          getBindingByRepo: bindingsStore.getBindingByRepo.bind(bindingsStore),
+          // launchWorkDeps gates the POST /operator/runs launch route mount.
+          // Uses the same program-scoped engine deps as the Discord mention path
+          // so web and Discord launches share run-state/coordination instances
+          // and the fail-closed approval gate is enforced on both paths.
+          launchWorkDeps: runEngineDeps,
           runObservationManager,
           runIndex,
         },

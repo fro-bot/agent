@@ -1331,3 +1331,252 @@ describe('button interaction handler (approval flow)', () => {
     await expect(fakeRegistry.disposeAll('gateway shutdown')).resolves.toBeUndefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Launch route wiring — POST /operator/runs must mount with production deps
+// ---------------------------------------------------------------------------
+//
+// These tests assert that the production OperatorServerDeps wired by
+// makeGatewayProgram include getBindingByRepo and launchWorkDeps, so that
+// buildOperatorApp registers POST /operator/runs. The existing server.test.ts
+// tests wire those deps manually (which is why they didn't catch this omission).
+// These tests prove the PRODUCTION wiring mounts the route.
+
+describe('launch route wiring — POST /operator/runs', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    // Re-stub what clearAllMocks reset
+    const {createApprovalRegistry} = await import('./approvals/registry.js')
+    vi.mocked(createApprovalRegistry).mockReturnValue({
+      register: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      pending: vi.fn().mockReturnValue([]),
+      hasPendingForScope: vi.fn().mockReturnValue(false),
+      describePendingForScope: vi.fn().mockReturnValue([]),
+      handleDecision: vi.fn().mockResolvedValue('ok'),
+      applySettlement: vi.fn().mockResolvedValue(undefined),
+      attachMessage: vi.fn(),
+      markMessagePostFailed: vi.fn(),
+      confirmReply: vi.fn(),
+      disposeRun: vi.fn(),
+      disposeAll: vi.fn().mockResolvedValue(undefined),
+    })
+  })
+
+  /**
+   * Helper: run the program with operatorWeb configured, capture the
+   * OperatorServerDeps passed to startOperatorServer, and return them.
+   */
+  // eslint-disable-next-line unicorn/consistent-function-scoping
+  async function captureOperatorServerDeps(): Promise<import('./web/server.js').OperatorServerDeps> {
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    return serverDeps
+  }
+
+  it('wires getBindingByRepo into the operator server deps', async () => {
+    // #given / #when
+    const serverDeps = await captureOperatorServerDeps()
+
+    // #then — getBindingByRepo must be wired so the launch route can mount
+    expect(serverDeps.getBindingByRepo).toBeDefined()
+    expect(typeof serverDeps.getBindingByRepo).toBe('function')
+  })
+
+  it('wires launchWorkDeps into the operator server deps', async () => {
+    // #given / #when
+    const serverDeps = await captureOperatorServerDeps()
+
+    // #then — launchWorkDeps must be wired so the launch route can mount
+    expect(serverDeps.launchWorkDeps).toBeDefined()
+    expect(typeof serverDeps.launchWorkDeps).toBe('object')
+  })
+
+  /**
+   * Extract unique logical routes from a Hono app, excluding the catch-all
+   * ALL /* middleware entry and deduplicating by method+path.
+   */
+  // eslint-disable-next-line unicorn/consistent-function-scoping
+  function extractRoutes(app: {routes: {method: string; path: string}[]}): {method: string; path: string}[] {
+    const seen = new Set<string>()
+    return app.routes
+      .map(route => ({method: route.method, path: route.path}))
+      .filter(route => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+  }
+
+  it('registers POST /operator/runs when production deps are fed to buildOperatorApp', async () => {
+    // #given — capture the production-shaped operator deps from the program
+    const serverDeps = await captureOperatorServerDeps()
+
+    // #when — feed those deps to buildOperatorApp with matching githubOAuth config
+    // (production deps include githubOAuth, so config must also include it)
+    const {buildOperatorApp} = await import('./web/server.js')
+    const app = buildOperatorApp(serverDeps, {
+      bindHost: '127.0.0.1',
+      bindPort: 0,
+      publicOrigin: 'https://operator.example.com',
+      githubOAuth: {
+        clientId: 'test-oauth-client-id',
+        clientSecret: 'test-oauth-client-secret',
+        publicOrigin: 'https://operator.example.com',
+        callbackPath: '/operator/auth/github/callback',
+        allowedReturnPaths: ['/operator'],
+        stateTtlMs: 600_000,
+        maxOutstandingAttemptsPerKey: 5,
+      },
+    })
+
+    // #then — POST /operator/runs is present (the launch route is mounted)
+    expect(extractRoutes(app)).toContainEqual({method: 'POST', path: '/operator/runs'})
+  })
+
+  it('omits POST /operator/runs when getBindingByRepo is dropped from production deps', async () => {
+    // #given — production deps with getBindingByRepo removed
+    // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
+    const serverDeps = await captureOperatorServerDeps()
+    const depsWithoutGetBindingByRepo = {...serverDeps, getBindingByRepo: undefined, githubOAuth: undefined}
+
+    // #when
+    const {buildOperatorApp} = await import('./web/server.js')
+    const app = buildOperatorApp(depsWithoutGetBindingByRepo, {
+      bindHost: '127.0.0.1',
+      bindPort: 0,
+      publicOrigin: 'https://operator.example.com',
+    })
+
+    // #then — launch route is absent when getBindingByRepo is missing
+    expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
+  })
+
+  it('omits POST /operator/runs when launchWorkDeps is dropped from production deps', async () => {
+    // #given — production deps with launchWorkDeps removed
+    // Drop githubOAuth from deps too so buildOperatorApp doesn't throw on partial OAuth config
+    const serverDeps = await captureOperatorServerDeps()
+    const depsWithoutLaunchWorkDeps = {...serverDeps, launchWorkDeps: undefined, githubOAuth: undefined}
+
+    // #when
+    const {buildOperatorApp} = await import('./web/server.js')
+    const app = buildOperatorApp(depsWithoutLaunchWorkDeps, {
+      bindHost: '127.0.0.1',
+      bindPort: 0,
+      publicOrigin: 'https://operator.example.com',
+    })
+
+    // #then — launch route is absent when launchWorkDeps is missing
+    expect(extractRoutes(app)).not.toContainEqual({method: 'POST', path: '/operator/runs'})
+  })
+
+  it('discord mention path still receives RunMentionDeps with the same engine deps shape', async () => {
+    // #given — run the program and capture the deps passed to handleMention
+    const capturedDeps = await runAndCaptureMentionDeps('approval-required')
+
+    // #then — the mention path still receives a full RunMentionDeps
+    // (the hoist did not change Discord behavior)
+    expect(capturedDeps.run).toBeDefined()
+    expect(typeof capturedDeps.run.coordinationConfig).toBe('object')
+    expect(typeof capturedDeps.run.concurrency).toBe('object')
+    expect(typeof capturedDeps.run.queue).toBe('object')
+    expect(typeof capturedDeps.run.logger).toBe('object')
+    expect(typeof capturedDeps.run.approvalRegistry).toBe('object')
+    expect(capturedDeps.run.approvalMode).toBe('approval-required')
+    expect(typeof capturedDeps.run.ensureClone).toBe('function')
+    expect(typeof capturedDeps.run.readyz).toBe('function')
+    expect(typeof capturedDeps.run.isShuttingDown).toBe('function')
+    expect(capturedDeps.run.runIndex).toBeDefined()
+    expect(capturedDeps.run.runObserver).toBeDefined()
+
+    // #and — botUserId is the concrete value from client.user.id (not the lazy getter's fallback)
+    expect(capturedDeps.run.botUserId).toBe('bot-user-id')
+  })
+
+  it('launchWorkDeps and Discord mention run deps share the same engine-deps instances (reference identity)', async () => {
+    // #given — run the program once, capturing both operator server deps and mention deps.
+    // Both paths must share the SAME runEngineDeps object so run-state/coordination
+    // instances are never accidentally duplicated by a future spread/copy refactor.
+    const {handleMention} = await import('./discord/mentions.js')
+    const handleMentionMock = vi.mocked(handleMention)
+
+    const botUserId = 'bot-user-id'
+    const fakeClient = {
+      ...makeFakeClient(),
+      user: {id: botUserId},
+    }
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeOperatorHandle = makeFakeServerHandle()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(fakeOperatorHandle)
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // Capture operator server deps
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+    const [operatorDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+
+    // Fire the messageCreate handler to capture mention deps
+    const onCalls = (fakeClient.on as ReturnType<typeof vi.fn>).mock.calls as [string, (msg: unknown) => void][]
+    const messageCreateHandler = onCalls.find(([event]) => event === 'messageCreate')?.[1]
+    if (messageCreateHandler === undefined) throw new Error('messageCreate handler not registered')
+
+    messageCreateHandler(makeFakeMentionMessage(botUserId))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(handleMentionMock).toHaveBeenCalledOnce()
+    const mentionDeps = handleMentionMock.mock.calls[0]?.[2] as import('./discord/mentions.js').MentionDeps
+    if (mentionDeps === undefined) throw new Error('handleMention was not called with deps')
+
+    // #then — launchWorkDeps IS the same object as the engine deps spread into mention run
+    // (reference identity on each shared instance proves no accidental copy was made)
+    const launchDeps = operatorDeps.launchWorkDeps
+    if (launchDeps === undefined) throw new Error('launchWorkDeps not wired')
+    const mentionRunDeps = mentionDeps.run
+
+    // These instances must be the exact same objects — not copies or re-creations.
+    expect(launchDeps.concurrency).toBe(mentionRunDeps.concurrency)
+    expect(launchDeps.queue).toBe(mentionRunDeps.queue)
+    expect(launchDeps.approvalRegistry).toBe(mentionRunDeps.approvalRegistry)
+    expect(launchDeps.runIndex).toBe(mentionRunDeps.runIndex)
+    expect(launchDeps.runObserver).toBe(mentionRunDeps.runObserver)
+  })
+})
