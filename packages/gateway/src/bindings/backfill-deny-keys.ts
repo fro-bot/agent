@@ -44,6 +44,12 @@ export interface BackfillDeps {
     readonly warn: (msg: string, meta?: Record<string, unknown>) => void
     readonly error: (msg: string, meta?: Record<string, unknown>) => void
   }
+  /**
+   * When true, resolve identities and count what would be written, but skip
+   * the actual writeBinding call. The returned counts are identical to a real
+   * run so the caller can preview the plan before committing.
+   */
+  readonly dryRun?: boolean
 }
 
 export interface BackfillResult {
@@ -71,7 +77,7 @@ export interface BackfillResult {
  * whole-backfill failure, not a per-binding one.
  */
 export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise<Result<BackfillResult, Error>> {
-  const {bindingsStore, getRepoIdentity, writeBinding, logger} = deps
+  const {bindingsStore, getRepoIdentity, writeBinding, logger, dryRun} = deps
 
   // #given — list all active bindings
   const listResult = await bindingsStore.listBindings()
@@ -112,7 +118,13 @@ export async function backfillActiveBindingDenyKeys(deps: BackfillDeps): Promise
     const {databaseId, nodeId} = identityResult.data
     const updatedBinding: RepoBinding = {...binding, databaseId, nodeId}
 
-    // #then — write the updated binding back
+    // #then — write the updated binding back (skipped in dry-run mode)
+    if (dryRun === true) {
+      logger.info('backfill: dry-run — would write deny keys', {owner, repo, databaseId})
+      updated++
+      continue
+    }
+
     const writeResult = await writeBinding(updatedBinding)
     if (writeResult.success === false) {
       logger.error('backfill: binding update write failed; binding stays keyless', {
