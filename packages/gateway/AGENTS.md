@@ -18,6 +18,44 @@ Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot
 
 **Backfill:** Active bindings created before deny-key capture was added are backfilled offline/admin via `src/bindings/backfill-deny-keys.ts` before the first operator consumer ships. Records still missing deny keys after backfill are omitted (fail closed) — never resolved via a surface-time query.
 
+The backfill ships inside the gateway bundle and runs as a one-off admin command against the deployed image — no Dockerfile change required. It is never invoked from a request handler, Discord command, or HTTP route.
+
+```sh
+# Preview: resolve identities, report the plan, write nothing
+node dist/main.mjs backfill-deny-keys --dry-run
+
+# Apply: write deny keys for all bindings that lack them
+node dist/main.mjs backfill-deny-keys
+```
+
+**Required env** (same as the gateway daemon):
+
+| Variable | `_FILE` variant | Notes |
+| --- | --- | --- |
+| `GITHUB_APP_ID` | `GITHUB_APP_ID_FILE` | GitHub App numeric ID |
+| `GITHUB_APP_PRIVATE_KEY` | `GITHUB_APP_PRIVATE_KEY_FILE` | PEM private key |
+| `S3_BUCKET` | `S3_BUCKET_FILE` | Object-store bucket name |
+| `AWS_REGION` | `AWS_REGION_FILE` | AWS region |
+| `AWS_ACCESS_KEY_ID` | `AWS_ACCESS_KEY_ID_FILE` | AWS credentials |
+| `AWS_SECRET_ACCESS_KEY` | `AWS_SECRET_ACCESS_KEY_FILE` | AWS credentials |
+
+**Optional env:**
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `S3_PREFIX` | `fro-bot-state` | Object-store key prefix |
+| `GATEWAY_IDENTITY` | `discord-gateway` | Namespace for bindings in the store |
+
+**Exit codes:**
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Clean run — all bindings updated or already-keyed (skipped) |
+| `1` | Config or setup failure — cannot proceed (check logs for the missing var or adapter error) |
+| `2` | Partial failure — some bindings failed to resolve or write; inspect logs, re-run to retry |
+
+The command is idempotent: bindings that already carry a `databaseId` are skipped.
+
 **Stale-redaction window:** A repo redacted in `repos.yaml` after ingest may surface until the next denylist refresh (bounded by TTL + grace window). Long-lived operator streams re-check on each request. This is a documented accepted risk.
 
 **No-oracle:** Redacted repo owner/name are never stored, logged, or returned anywhere in the gate. Only deny keys (`databaseId` / `nodeId`) are retained from redacted entries. Error messages on denial paths are repo-identity-free.

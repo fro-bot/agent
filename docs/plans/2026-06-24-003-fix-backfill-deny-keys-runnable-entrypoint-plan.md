@@ -128,7 +128,7 @@ not-runnable condition by inspection and recommended the argv-subcommand approac
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `--dry-run` to the backfill function**
+- [x] **Unit 1: Add `--dry-run` to the backfill function**
 
 **Goal:** `backfillActiveBindingDenyKeys` can resolve and count without writing.
 
@@ -166,7 +166,7 @@ file.
 **Verification:** dry-run paths call `getRepoIdentity` but never `writeBinding`;
 counts match the equivalent real run.
 
-- [ ] **Unit 2: Extract a daemon-free backfill runner and fix the adapter arity**
+- [x] **Unit 2: Extract a daemon-free backfill runner and fix the adapter arity**
 
 **Goal:** One shared builder constructs the adapter/store/App-client/`writeBinding`
 with the correct `createS3Adapter(config, logger)` arity; the CLI becomes a thin
@@ -205,68 +205,118 @@ CLI env-read + status-code-exit shape.
 **Verification:** `createS3Adapter` is called with `(config, logger)`; no
 dynamic-import branch remains; CLI test still passes via the runner.
 
-- [ ] **Unit 3: Wire the argv subcommand into `main.ts`**
+- [x] **Unit 3: Split `main.ts` into an unconditional entrypoint + testable dispatch**
 
 **Goal:** `node dist/main.mjs backfill-deny-keys [--dry-run]` runs the backfill and
-exits; no subcommand runs the gateway unchanged.
+exits; no subcommand runs the gateway unchanged — WITHOUT a fragile entry guard.
 
 **Requirements:** R1, R2, R5
 
 **Dependencies:** Unit 2
 
 **Files:**
-- Modify: `packages/gateway/src/main.ts`
-- Test: `packages/gateway/src/main.test.ts`
+- Modify: `packages/gateway/src/main.ts` (becomes a tiny unconditional entrypoint)
+- Create: `packages/gateway/src/main-dispatch.ts` (testable dispatch logic)
+- Modify/Move: `packages/gateway/src/main.test.ts` → tests target `main-dispatch.ts`
 
-**Approach:**
-- At the top of `main.ts`, before the Effect program runs, branch on
-  `process.argv[2]`. If `=== 'backfill-deny-keys'`, parse `--dry-run` from the
-  remaining argv, call `runDenyKeyBackfill({dryRun})`, and `process.exit` with the
-  runner's status code. Otherwise fall through to the existing gateway program
-  untouched.
-- Keep the branch minimal and synchronous-to-dispatch; the runner owns async work
-  and its own logging.
+**Approach (Oracle-reviewed):**
+- The original `main.ts` ran `Effect.runPromise(program)` UNCONDITIONALLY at top
+  level (no entry guard) — and that is the production guarantee we must preserve.
+  Adding an `import.meta.url === \`file://${process.argv[1]}\`` guard introduces a
+  catastrophic risk: if it ever evaluates false in the bundled `dist/main.mjs`, the
+  gateway silently never starts. Unit tests calling dispatch directly would not
+  catch it.
+- Instead, SPLIT:
+  - `main-dispatch.ts` exports `dispatchArgv()` (the `program` Effect + the argv
+    branch: `backfill-deny-keys` → parse `--dry-run` → `runDenyKeyBackfill` →
+    `process.exit(code)`; else `Effect.runPromise(program).catch(...)`). NO
+    import-time execution — safe to unit-test.
+  - `main.ts` becomes: `import {dispatchArgv} from './main-dispatch.js'` then a bare
+    top-level `void dispatchArgv()`. No `import.meta.url` guard. Entrypoint files are
+    allowed import-time side effects.
+- Update tests to import `main-dispatch.js` (not `main.js`). The old
+  no-import-time-side-effects test on `main.ts` is replaced by testing the dispatch
+  module directly.
 
-**Patterns to follow:** existing `main.test.ts` startup-order / no-side-effect-on-
-import tests.
+**Patterns to follow:** Oracle recommendation; keep `program` construction
+identical to current `main.ts`.
 
 **Test scenarios:**
-- Happy path: argv `['node','main','backfill-deny-keys']` dispatches the runner
-  (mocked) and does not start the gateway program.
-- Happy path: `--dry-run` is parsed and passed through as `dryRun: true`.
-- Happy path (regression): no subcommand → gateway program path is taken, backfill
-  runner not called.
-- Edge case: unknown subcommand → falls through to gateway (or explicit error —
-  decide and test one behavior).
+- Happy path: argv `['node','main','backfill-deny-keys']` → `dispatchArgv` calls the
+  runner (mocked) with `dryRun: false`, gateway program NOT started, exits with
+  runner code.
+- Happy path: `--dry-run` parsed → runner called with `dryRun: true`.
+- Regression: no subcommand → gateway program path taken, runner NOT called.
+- Edge case: unknown subcommand → falls through to gateway (runner not called).
 
-**Verification:** with the subcommand, the gateway program never starts and the
-process exits with the runner's code; without it, behavior is byte-identical to
-today.
+**Verification:** with the subcommand the gateway program never starts and exits
+with the runner's code; without it behavior matches today's unconditional start; no
+`import.meta.url` guard remains.
 
-- [ ] **Unit 4: Rebuild gateway bundle + docs runbook**
+- [x] **Unit 4: Make the gateway tsdown build hermetic (config-relative entry)**
 
-**Goal:** the shipped `dist/main.mjs` contains the subcommand; operators have a
-documented runbook.
+**Goal:** building the gateway from a full-monorepo checkout resolves the GATEWAY's
+`src/main.ts`, not the root action's `src/main.ts` — so the bundle is correct and
+locally verifiable.
 
-**Requirements:** R1, R6
+**Requirements:** R1 (the shipped bundle must contain the gateway + subcommand)
 
 **Dependencies:** Unit 3
 
 **Files:**
-- Modify: `packages/gateway/dist/main.mjs` (regenerated)
+- Modify: `packages/gateway/tsdown.config.ts`
+- Modify: `packages/gateway/package.json` (build script entry, if it hardcodes
+  `src/main.ts`)
+
+**Background:** `packages/gateway/tsconfig.json` has `rootDir: "../../"`, and the
+build runs `tsdown src/main.ts`. From a full monorepo, the bare relative
+`src/main.ts` can resolve the ROOT `src/main.ts` (the GitHub Action entry) instead
+of the gateway's — the same non-hermetic fragility #847 fixed for `workspace-agent`.
+Production Docker is unaffected (it copies only `packages/{runtime,gateway}/`), but
+local builds bundle the wrong entry, blocking verification.
+
+**Approach (Oracle-reviewed):** mirror the workspace-agent fix — compute the config
+dirname via `fileURLToPath(import.meta.url)` and use an ABSOLUTE entry
+`path.join(dirname, 'src/main.ts')` in `tsdown.config.ts`; align the `package.json`
+build script to the config (drop the hardcoded relative `src/main.ts` arg if
+present). Optionally add a bundle symbol guard asserting a gateway-only symbol
+(e.g. `dispatchArgv`/`makeGatewayProgram`) is present (defer if it adds churn).
+- DO NOT change gateway `tsconfig.json` `rootDir` to `"src"` here — Oracle flagged
+  it may trip TS rootDir/project-reference errors because gateway includes runtime
+  source; file that as a separate issue.
+
+**Test scenarios:** none (build config). Verification is the build output.
+
+**Verification:** a full-monorepo `bun run --filter @fro-bot/gateway build` produces
+a `dist/main.mjs` whose bundle contains gateway symbols (`makeGatewayProgram`,
+`dispatchArgv`) and NOT the action's `Starting Fro Bot Agent`; running
+`node packages/gateway/dist/main.mjs` attempts gateway startup, and
+`node packages/gateway/dist/main.mjs backfill-deny-keys --dry-run` dispatches the
+backfill runner.
+
+- [x] **Unit 5: Docs runbook**
+
+**Goal:** operators have a documented runbook for the backfill command.
+
+**Requirements:** R6
+
+**Dependencies:** Unit 3
+
+**Files:**
 - Modify: `docs/plans/2026-06-19-002-feat-gateway-redaction-gate-plan.md`
 - Modify: `packages/gateway/AGENTS.md`
 
 **Approach:**
-- Rebuild the gateway bundle so the argv path is present in `dist/main.mjs`.
 - Document the concrete command (`node dist/main.mjs backfill-deny-keys --dry-run`
-  first, then without `--dry-run`) and the required env vars in the redaction-gate
-  plan's backfill section and `AGENTS.md`.
+  first, then without `--dry-run`) and required env vars in the redaction-gate
+  plan's backfill section and `AGENTS.md`. NOTE: the gateway `dist/` is gitignored
+  and built in the image — there is NO committed bundle to keep in sync (the
+  original Unit 4 "rebuild + commit dist" was incorrect and is removed).
 
-**Test scenarios:** Test expectation: none — build artifact + docs only.
+**Test scenarios:** none — docs only.
 
-**Verification:** gateway build is in sync (no drift); the runbook names the exact
-command and env vars.
+**Verification:** the runbook names the exact command and env vars; no claim that a
+committed bundle must be rebuilt.
 
 ## System-Wide Impact
 
