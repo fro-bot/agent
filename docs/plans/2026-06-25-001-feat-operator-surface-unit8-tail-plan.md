@@ -140,57 +140,102 @@ operator gate is closed:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Image-level operator-route registration smoke (R3)**
+- [x] **Unit 1: Operator-route registration smoke via shared deps helper + diagnostic subcommand (R3)**
 
-**Goal:** The `Gateway Image Smoke Test` boots the built image with operator env and
-proves the operator routes register and respond (mounted, not 404) in the shipped
-image.
+**Goal:** Prove the operator routes register in the shipped image using the SAME
+deps-construction production wires — catching the #1001 route-unmount class (a route
+gated on a runtime dep that `program.ts` forgets to pass) at the image level.
 
 **Requirements:** R3
 
-**Dependencies:** None (extends the existing job)
+**Dependencies:** None
+
+**Background (why HTTP-probing fails):** the operator HTTP server only starts in
+`program.ts` AFTER `runProviderSelfTest` (fails with fake S3 creds) and
+`registerSlashCommands` (fails with a fake Discord token), so it never binds in CI
+without real backends. A static bundle/symbol check can't catch #1001 either (the
+bug is a runtime deps-gating omission, not a missing symbol). The fix: evaluate
+route registration with production's real deps construction, without starting the
+server. `buildOperatorApp(deps, config): Hono` (`server.ts:336`) builds the app
+without binding a port; its mount gates are deps-presence checks (e.g.
+`GET /operator/repos` mounts only if `deps.listBindings !== undefined`,
+`server.ts:647`). So a missing dep → the route is absent from `app.routes` → assertion
+fails. This is the exact #1001 signal.
 
 **Files:**
-- Modify: `.github/workflows/ci.yaml` (add a smoke step to the `Gateway Image Smoke
-  Test` job)
+- Modify: `packages/gateway/src/program.ts` (extract the operator deps/config
+  construction at lines ~461-535 into an exported `buildOperatorServerInputs(...)`
+  helper; production calls it so the smoke and prod share one wiring path)
+- Modify: `packages/gateway/src/main-dispatch.ts` (add an `operator-route-smoke`
+  subcommand alongside the existing `backfill-deny-keys` dispatch)
+- Create: `packages/gateway/src/web/operator-route-smoke.ts` (the diagnostic: build
+  the operator inputs via the shared helper with realistic stub-but-present
+  instances, call `buildOperatorApp`, assert the expected route inventory, exit 0/1)
+- Test: `packages/gateway/src/web/operator-route-smoke.test.ts`,
+  `packages/gateway/src/main-dispatch.test.ts` (extend), and a
+  `buildOperatorServerInputs` test
+- Modify: `.github/workflows/ci.yaml` (replace the config-acceptance step with one
+  that runs `node dist/main.mjs operator-route-smoke` in the built image)
 
 **Approach:**
-- After the existing "announce opt-out boots past config" step, add a step that runs
-  the image detached (`docker run -d --name operator-smoke -p <hostport>:<operatorport>`)
-  with the core fake secrets (mirror the #738 block) PLUS the `GATEWAY_OPERATOR_*`
-  env needed to enable `operatorWeb`: bind host `0.0.0.0`, a bind port, a public
-  origin, fake OAuth client id/secret, and a fake CSRF secret.
-- Wait for the operator server to listen (bounded retry: `nc -z`/`curl` loop on the
-  operator port, capped with a clear timeout-fail).
-- `curl` from the host and assert the registration signals:
-  - `/operator/health` → `200` (operator server up).
-  - `/operator` → `302` (redirect to OAuth start — surface mounted).
-  - `/operator/repos` (no auth) → mounted auth response (e.g. `401`), explicitly
-    **not** `404` (the #1001 regression signal).
-- Always `docker logs operator-smoke` on failure and `docker rm -f` in cleanup so
-  the step is debuggable and leaves no container. Add `timeout-minutes` to the step.
-- Keep the existing two smoke steps unchanged.
+- **Extract the shared helper.** Pull the `OperatorServerDeps` + `OperatorServerConfig`
+  object construction (currently inline at `program.ts:499-535`, including the
+  load-bearing `listBindings` wiring) into an exported `buildOperatorServerInputs(...)`
+  that takes the program-scoped instances (logger, denylistCache, bindingsStore,
+  runObservationManager, runIndex, sessionStore, githubOAuthDeps, operatorWeb config,
+  etc.) and returns `{deps, config}`. Production's `startOperatorServer(...)` call
+  passes the helper's output unchanged — behavior-identical. This is the seam that
+  makes the smoke catch #1001: if a future edit drops a dep from the helper, BOTH
+  production and the smoke lose it.
+- **Diagnostic module.** `runOperatorRouteSmoke()` builds realistic-but-offline stub
+  instances for the program-scoped deps (no real S3/Discord/network — the route
+  mount gates only check presence/shape, not liveness), calls
+  `buildOperatorServerInputs(...)` then `buildOperatorApp(deps, config)`, reads
+  `app.routes`, and asserts the expected operator route set is present:
+  `GET /operator/health`, `GET /operator/repos`, `GET /operator/runs/:runId/stream`,
+  `GET /operator/runs/:runId/approvals`, `POST /operator/runs/:runId/.../decision`,
+  `POST /operator/runs`, plus the OAuth/session routes. Missing any → non-zero exit
+  with a clear message naming the absent route. Returns an exit code; the subcommand
+  `process.exit`s with it (mirror the backfill runner's exit-code pattern).
+- **Subcommand.** Add `operator-route-smoke` to `main-dispatch.ts`'s argv dispatch
+  (same shape as `backfill-deny-keys`), with `--help`. Update the bundle symbol
+  guard if needed (it asserts `dispatchArgv`).
+- **CI step.** Replace the implemented config-acceptance step in the `Gateway Image
+  Smoke Test` job with: `docker run --rm fro-bot-gateway:smoke operator-route-smoke`
+  and assert exit 0 + an expected success marker. No env/creds needed (the smoke
+  doesn't boot the gateway). Add `timeout-minutes`. Keep the two existing smoke steps.
 
-**Patterns to follow:** the existing #738 smoke step (`set +e` / capture output /
-status checks / `grep` assertions) in the same job; the readiness-wait + host-curl
-shape used elsewhere in CI for container probes.
+**Execution note:** test-first for the diagnostic and the helper extraction — write
+the route-inventory assertion and a "missing-dep ⇒ route absent ⇒ failure" test
+before/alongside the extraction, so the #1001-class guard is proven non-vacuous.
+
+**Patterns to follow:** the `backfill-deny-keys` subcommand + `parseBackfillArgs` +
+exit-code shape in `main-dispatch.ts`/`backfill-runner.ts` (just shipped in #1023);
+`buildOperatorApp` in `server.ts`; the existing `server.test.ts` registration test
+(the in-process analog).
 
 **Test scenarios:**
-- Happy path: image booted with operator env → `/operator/health` 200, `/operator`
-  302, `/operator/repos` non-404 auth response → step passes.
-- Regression guard (the reason this exists): if the operator routes do not mount
-  (e.g. a future deps-wiring regression like #1001), `/operator/repos` returns 404 →
-  the assertion fails the step. (Validated during implementation by temporarily
-  asserting the inverse, or by reasoning from the #1001 case; do not ship the
-  inverse assertion.)
-- Edge case: operator server never binds within the timeout → bounded wait fails
-  with a clear message + `docker logs`, not a hang.
+- Happy path: with all operator deps present, the diagnostic asserts the full
+  operator route set is in `app.routes` and exits 0.
+- Regression guard (the reason this exists): drop `listBindings` from the deps the
+  helper produces (simulating #1001) → `GET /operator/repos` is absent from
+  `app.routes` → diagnostic exits non-zero naming the missing route. Prove this is
+  non-vacuous.
+- Edge case: each gated route (run-stream, approvals) absent when its dep is missing
+  → diagnostic fails, naming it.
+- Subcommand dispatch: `operator-route-smoke` argv → runs the diagnostic, exits with
+  its code; `--help` → usage, exit 0; no subcommand → gateway path unaffected.
+- Helper parity: `buildOperatorServerInputs` returns deps that, fed to
+  `buildOperatorApp`, mount the same route set production does (the helper extraction
+  is behavior-preserving).
 
-**Verification:** the `Gateway Image Smoke Test` job has a new green step that boots
-the operator surface and asserts the routes are mounted; a simulated unmount would
-fail it; no leaked container; the step has a bounded timeout.
+**Verification:** `node dist/main.mjs operator-route-smoke` in the built image exits
+0 and reports the operator routes present; a simulated missing-dep makes it fail
+naming the route; production startup is behavior-identical (the helper output equals
+the previous inline object); the CI step is green and bounded; the two existing smoke
+steps are unchanged.
 
-- [ ] **Unit 2: Consolidated Operator Web Surface runbook in deploy/README (R2)**
+- [x] **Unit 2: Consolidated Operator Web Surface runbook in deploy/README (R2)**
 
 **Goal:** `deploy/README.md` has one operator-facing "Operator Web Surface" section
 that ties together the route table, the enabling env, and the pattern docs.
