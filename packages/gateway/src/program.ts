@@ -128,7 +128,12 @@ export interface BuildOperatorServerInputs {
    */
   readonly runObservationManager?: NonNullable<OperatorServerDeps['runObservationManager']> | undefined
   readonly runIndex: NonNullable<OperatorServerDeps['runIndex']>
-  readonly approvalRegistry: NonNullable<OperatorServerDeps['approvalRegistry']>
+  /**
+   * Approval registry for the approval routes.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes the approval routes to be absent from app.routes.
+   */
+  readonly approvalRegistry?: NonNullable<OperatorServerDeps['approvalRegistry']>
   /**
    * Engine dependencies for the launch route's launchWork call.
    * Required for POST /operator/runs to be registered — the route gate checks
@@ -136,7 +141,7 @@ export interface BuildOperatorServerInputs {
    * Optional only for the offline diagnostic which may pass undefined to simulate
    * a missing dep and verify the launch route is absent.
    */
-  readonly launchWorkDeps: NonNullable<OperatorServerDeps['launchWorkDeps']> | undefined
+  readonly launchWorkDeps?: NonNullable<OperatorServerDeps['launchWorkDeps']>
   readonly operatorWebConfig: {
     readonly bindHost: string
     readonly bindPort: number

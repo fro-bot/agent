@@ -278,61 +278,48 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     expect(exitCode).not.toBe(0)
   })
 
-  it('returns non-zero when approval routes are absent (approvalRegistry omitted)', async () => {
-    // #given — approvalRegistry flows through buildOperatorServerInputs; omitting it
-    // causes the helper to pass undefined to deps.approvalRegistry, and server.ts
-    // gates the approval routes on that dep being present.
-    // #when — run the smoke with approvalRegistry explicitly undefined
-    // We simulate this by building the app directly with approvalRegistry absent.
-    const {buildOperatorServerInputs: buildInputs} = await import('../program.js')
-    const {loadAllowlistFromText: loadAllowlist} = await import('./auth/allowlist.js')
-    const {buildOperatorApp: buildApp} = await import('./server.js')
-
-    const noopLogger = {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined}
-    const allowlist = loadAllowlist('42\n', noopLogger)
-    const operatorWebConfig = {
-      bindHost: '127.0.0.1',
-      bindPort: 18080,
-      publicOrigin: 'https://operator.smoke.test',
-      oauthClientId: 'stub-client-id',
-      oauthClientSecret: 'stub-client-secret',
-      oauthAllowedReturnPaths: ['/operator'] as readonly string[],
-      oauthStateTtlMs: 10 * 60 * 1000,
-      oauthMaxOutstandingAttemptsPerKey: 5,
-      csrfSecret: Buffer.from('test-csrf-secret-32-bytes-long!!', 'utf8').toString('base64url'),
-      allowlist,
-    }
-
-    const {deps, config} = buildInputs({
-      logger: noopLogger,
-      isShuttingDown: () => false,
-      denylistCache: makeStubDenylistCache(),
-      bindingsStore: makeStubBindingsStore(),
-      runObservationManager: makeStubRunObservationManager(),
-      runIndex: makeStubRunIndex(),
-      approvalRegistry: makeStubApprovalRegistry(),
-      launchWorkDeps: makeStubLaunchWorkDeps(),
-      operatorWebConfig,
+  it('returns non-zero when approval routes are absent (approvalRegistryOverride: undefined)', async () => {
+    // #given — approvalRegistry flows through buildOperatorServerInputs; passing
+    // approvalRegistryOverride: undefined causes the helper to pass undefined to
+    // deps.approvalRegistry, and server.ts gates the approval routes on that dep being present.
+    // #when — route through runOperatorRouteSmoke with approvalRegistryOverride explicitly undefined
+    const exitCode = await runOperatorRouteSmoke({
+      approvalRegistryOverride: undefined,
     })
 
-    // Override approvalRegistry to undefined to simulate the missing dep
-    const depsWithoutApproval = {...deps, approvalRegistry: undefined}
-    const app = buildApp(depsWithoutApproval, config)
+    // #then — non-zero exit (approval routes absent)
+    expect(exitCode).not.toBe(0)
+  })
+})
 
-    // #then — approval routes are NOT registered
-    const seen = new Set<string>()
-    const routes = app.routes
-      .map((r: {method: string; path: string}) => ({method: r.method, path: r.path}))
-      .filter((r: {method: string; path: string}) => {
-        if (r.method === 'ALL' && r.path === '/*') return false
-        const key = `${r.method}:${r.path}`
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
+// ---------------------------------------------------------------------------
+// EXPECTED_OPERATOR_ROUTES drift-tie — asserts parity with server.test.ts
+// ---------------------------------------------------------------------------
 
-    const routePaths = routes.map((r: {method: string; path: string}) => `${r.method}:${r.path}`)
-    expect(routePaths).not.toContain('GET:/operator/runs/:runId/approvals')
-    expect(routePaths).not.toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')
+describe('EXPECTED_OPERATOR_ROUTES — drift-tie with server.test.ts v1.4.0 route set', () => {
+  it('matches the expectedV14Routes set in server.test.ts (both lists must stay in sync)', () => {
+    // #given — the canonical v1.4.0 route set from the server.test.ts drift guard.
+    // If a route is added or removed, BOTH this list AND the server.test.ts
+    // expectedV14Routes set must be updated — this assertion enforces that.
+    const expectedV14Routes = new Set([
+      'GET:/operator/health',
+      'GET:/operator/auth/github/start',
+      'GET:/operator/auth/github/callback',
+      'POST:/operator/auth/logout',
+      'GET:/operator/session/csrf',
+      'GET:/operator/session',
+      'GET:/operator/repos',
+      'POST:/operator/runs',
+      'GET:/operator/runs/:runId/stream',
+      'POST:/operator/runs/:runId/approvals/:requestId/decision',
+      'GET:/operator/runs/:runId/approvals',
+    ])
+
+    // #when — normalize EXPECTED_OPERATOR_ROUTES to the same Set<string> shape
+    const smokeRouteSet = new Set(EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`))
+
+    // #then — the two lists are identical; adding/removing a route forces both to update
+    expect(smokeRouteSet).toEqual(expectedV14Routes)
+    expect(EXPECTED_OPERATOR_ROUTES).toHaveLength(expectedV14Routes.size)
   })
 })

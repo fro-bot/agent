@@ -137,6 +137,13 @@ export interface OperatorRouteSmokeOptions {
    */
   readonly launchWorkDepsOverride?: Parameters<typeof buildOperatorServerInputs>[0]['launchWorkDeps'] | undefined
   /**
+   * Override the approvalRegistry passed to buildOperatorServerInputs.
+   * Pass undefined to simulate a missing approval registry (approval routes absent).
+   * Because approvalRegistry is optional in BuildOperatorServerInputs, passing
+   * undefined here flows through the helper and causes the approval routes to be absent.
+   */
+  readonly approvalRegistryOverride?: Parameters<typeof buildOperatorServerInputs>[0]['approvalRegistry']
+  /**
    * Whether to suppress log output. Defaults to false (logs to stdout).
    */
   readonly silent?: boolean
@@ -207,6 +214,13 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const hasLaunchWorkDepsOverride = options !== undefined && 'launchWorkDepsOverride' in options
   const launchWorkDeps = hasLaunchWorkDepsOverride ? options.launchWorkDepsOverride : makeStubLaunchWorkDeps()
 
+  // Resolve approvalRegistry — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, the approval routes will not register
+  // because buildOperatorServerInputs passes it through to deps.approvalRegistry,
+  // and server.ts gates the approval routes on that dep being present.
+  const hasApprovalRegistryOverride = options !== undefined && 'approvalRegistryOverride' in options
+  const approvalRegistry = hasApprovalRegistryOverride ? options.approvalRegistryOverride : makeStubApprovalRegistry()
+
   // Build the operator server inputs via the shared production helper.
   // This is the seam that makes the diagnostic catch wiring gaps: if a dep is
   // dropped from buildOperatorServerInputs, both production and this diagnostic
@@ -222,7 +236,10 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     bindingsStore,
     runObservationManager,
     runIndex: makeStubRunIndex(),
-    approvalRegistry: makeStubApprovalRegistry(),
+    // approvalRegistry flows through the helper so the route gate in server.ts
+    // sees the same value as production. When undefined (regression test), the
+    // helper passes undefined to deps.approvalRegistry and the approval routes are absent.
+    approvalRegistry,
     // launchWorkDeps flows through the helper so the route gate in server.ts
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.launchWorkDeps and POST /operator/runs is absent.
