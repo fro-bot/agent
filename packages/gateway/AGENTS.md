@@ -20,13 +20,20 @@ Gateway operator surfaces honor the `metadata/repos.yaml` denylist from `fro-bot
 
 The backfill ships inside the gateway bundle and runs as a one-off admin command against the deployed image — no Dockerfile change required. It is never invoked from a request handler, Discord command, or HTTP route.
 
-```sh
-# Preview: resolve identities, report the plan, write nothing
-node dist/main.mjs backfill-deny-keys --dry-run
+**The bare command is a safe preview — it writes nothing.** Pass `--apply` to perform real writes.
 
-# Apply: write deny keys for all bindings that lack them
+```sh
+# Preview (default, no flag): resolve identities, report the plan, write nothing
 node dist/main.mjs backfill-deny-keys
+
+# Apply: write deny keys for all bindings that lack them (requires --apply)
+node dist/main.mjs backfill-deny-keys --apply
+
+# Help: print usage and exit
+node dist/main.mjs backfill-deny-keys --help
 ```
+
+**Maintenance window:** Run the `--apply` pass during a maintenance window or when no binding mutations are in flight. The backfill only targets legacy keyless bindings (those without a `databaseId`), which normal gateway operation will not concurrently modify. However, the write is an unconditional overwrite (no etag/CAS) using the binding snapshot from `listBindings()`. If the gateway concurrently mutates the same binding between the list and the write (e.g. an `add-project` flow), the backfill will silently revert that change. Scheduling the `--apply` pass when the gateway is idle eliminates this window.
 
 **Required env** (same as the gateway daemon):
 

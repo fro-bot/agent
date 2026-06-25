@@ -2,7 +2,7 @@ import process from 'node:process'
 
 import {Effect} from 'effect'
 
-import {runDenyKeyBackfill} from './bindings/backfill-runner.js'
+import {parseBackfillArgs, runDenyKeyBackfill, USAGE} from './bindings/backfill-runner.js'
 import {loadGatewayConfig} from './config.js'
 import {createAnnounceServer} from './http/server.js'
 import {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} from './program.js'
@@ -42,17 +42,33 @@ const program = Effect.gen(function* () {
 // Argv dispatch
 //
 // Branches on process.argv[2]:
-//   'backfill-deny-keys' → run the deny-key backfill and exit with its code
+//   'backfill-deny-keys' → parse flags, run the deny-key backfill, exit with its code
 //   anything else        → fall through to the gateway Effect program (today's behavior)
+//
+// Flag semantics for backfill-deny-keys:
+//   (no flag)   → dry-run / preview (SAFE DEFAULT — no writes)
+//   --apply     → real run (writes to the live S3 bindings store)
+//   --help / -h → print usage, exit 0
+//   unknown     → print error + usage, exit 1 (strict validation)
 // ---------------------------------------------------------------------------
 
 export async function dispatchArgv(): Promise<void> {
   const subcommand = process.argv[2]
 
   if (subcommand === 'backfill-deny-keys') {
-    const dryRun = process.argv.slice(3).includes('--dry-run')
-    const exitCode = await runDenyKeyBackfill({dryRun})
-    process.exit(exitCode)
+    const parsed = parseBackfillArgs(process.argv.slice(3))
+
+    if ('error' in parsed) {
+      console.error(`backfill-deny-keys: ${parsed.error}\n\n${USAGE}`)
+      process.exit(1)
+    } else if (parsed.mode === 'help') {
+      process.stdout.write(`${USAGE}\n`)
+      process.exit(0)
+    } else {
+      const dryRun = parsed.mode !== 'apply'
+      const exitCode = await runDenyKeyBackfill({dryRun})
+      process.exit(exitCode)
+    }
   } else {
     // No subcommand (or unrecognized subcommand) — start the gateway program.
     // Config may not have loaded, so instantiate the logger at a fixed 'error'

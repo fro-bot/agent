@@ -34,6 +34,76 @@ import {backfillActiveBindingDenyKeys} from './backfill-deny-keys.js'
 import {createBindingsStore} from './store.js'
 
 // ---------------------------------------------------------------------------
+// Usage / help
+// ---------------------------------------------------------------------------
+
+export const USAGE = `
+Usage: node dist/main.mjs backfill-deny-keys [--apply] [--help|-h]
+
+Backfill deny keys (databaseId + nodeId) for active bindings that lack them.
+
+By default this command runs in PREVIEW mode — it resolves identities and
+reports what would be written, but makes NO changes to the store.
+Pass --apply to perform the actual writes.
+
+Options:
+  --apply     Write deny keys to the live S3 bindings store (real run).
+              Omit this flag to preview without writing (safe default).
+  --help, -h  Print this usage message and exit.
+
+Required env vars (with optional _FILE variants for secrets):
+  GITHUB_APP_ID              GitHub App numeric ID
+  GITHUB_APP_PRIVATE_KEY     PEM private key (or GITHUB_APP_PRIVATE_KEY_FILE)
+  S3_BUCKET                  Object-store bucket name
+  AWS_REGION                 AWS region
+  AWS_ACCESS_KEY_ID          AWS credentials
+  AWS_SECRET_ACCESS_KEY      AWS credentials (or AWS_SECRET_ACCESS_KEY_FILE)
+
+Optional env vars:
+  S3_PREFIX          Object-store key prefix (default: fro-bot-state)
+  GATEWAY_IDENTITY   Namespace for bindings in the store (default: discord-gateway)
+
+Exit codes:
+  0  Clean run — all bindings updated or already-keyed (skipped)
+  1  Config/setup failure or bad flag — cannot proceed (check logs)
+  2  Partial failure — some bindings failed; inspect logs and re-run to retry
+`.trim()
+
+// ---------------------------------------------------------------------------
+// Arg parsing
+// ---------------------------------------------------------------------------
+
+/** Parsed result from parseBackfillArgs. */
+export type BackfillArgMode = {readonly mode: 'help' | 'apply' | 'dry-run'} | {readonly error: string}
+
+const KNOWN_FLAGS = new Set(['--apply', '--help', '-h'])
+
+/**
+ * Parse the argv slice for the backfill-deny-keys subcommand.
+ *
+ * Pure function — no process.exit, no side effects. Testable in isolation.
+ *
+ * @param args - The remaining argv after the subcommand name (process.argv.slice(3))
+ */
+export function parseBackfillArgs(args: readonly string[]): BackfillArgMode {
+  for (const arg of args) {
+    if (!KNOWN_FLAGS.has(arg)) {
+      return {error: `Unknown flag: ${arg}`}
+    }
+  }
+
+  if (args.includes('--help') || args.includes('-h')) {
+    return {mode: 'help'}
+  }
+
+  if (args.includes('--apply')) {
+    return {mode: 'apply'}
+  }
+
+  return {mode: 'dry-run'}
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -107,6 +177,50 @@ function makeBackfillLogger(logger: Logger): {
     info: (msg, meta) => logger.info(msg, meta),
     warn: (msg, meta) => logger.warning(msg, meta),
     error: (msg, meta) => logger.error(msg, meta),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// writeBinding factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the writeBinding closure for the backfill runner.
+ *
+ * Extracted as a named factory so it can be tested directly without mocking
+ * backfillActiveBindingDenyKeys.
+ *
+ * Performs an unconditional overwrite via conditionalPut with no condition
+ * (no ifNoneMatch / ifMatch). Admin-only — never wired into a request handler.
+ */
+export function makeWriteBinding(
+  adapter: ObjectStoreAdapter,
+  storeConfig: ObjectStoreConfig,
+  identity: string,
+): (binding: RepoBinding) => Promise<Result<void, Error>> {
+  return async (binding: RepoBinding): Promise<Result<void, Error>> => {
+    const keyResult = buildObjectStoreKey(
+      storeConfig,
+      identity,
+      `${binding.owner}/${binding.repo}`,
+      'bindings',
+      'repo.json',
+    )
+    if (keyResult.success === false) {
+      return err(keyResult.error)
+    }
+
+    if (adapter.conditionalPut == null) {
+      return err(new Error('S3 adapter does not support conditionalPut — cannot write binding'))
+    }
+
+    // Unconditional put: no ifNoneMatch or ifMatch condition.
+    const putResult = await adapter.conditionalPut(keyResult.data, JSON.stringify(binding), {})
+    if (putResult.success === false) {
+      return err(putResult.error)
+    }
+
+    return ok(undefined)
   }
 }
 
@@ -188,30 +302,7 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
 
   // 5. Build writeBinding: unconditional overwrite via conditionalPut with no condition.
   //    Admin-only — not wired into any request handler.
-  const writeBinding = async (binding: RepoBinding): Promise<Result<void, Error>> => {
-    const keyResult = buildObjectStoreKey(
-      storeConfig,
-      identity,
-      `${binding.owner}/${binding.repo}`,
-      'bindings',
-      'repo.json',
-    )
-    if (keyResult.success === false) {
-      return err(keyResult.error)
-    }
-
-    if (adapter.conditionalPut == null) {
-      return err(new Error('S3 adapter does not support conditionalPut — cannot write binding'))
-    }
-
-    // Unconditional put: no ifNoneMatch or ifMatch condition.
-    const putResult = await adapter.conditionalPut(keyResult.data, JSON.stringify(binding), {})
-    if (putResult.success === false) {
-      return err(putResult.error)
-    }
-
-    return ok(undefined)
-  }
+  const writeBinding = makeWriteBinding(adapter, storeConfig, identity)
 
   // 6. Run the backfill
   const backfillLogger = makeBackfillLogger(logger)
