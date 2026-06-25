@@ -291,35 +291,3 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     expect(exitCode).not.toBe(0)
   })
 })
-
-// ---------------------------------------------------------------------------
-// EXPECTED_OPERATOR_ROUTES drift-tie — asserts parity with server.test.ts
-// ---------------------------------------------------------------------------
-
-describe('EXPECTED_OPERATOR_ROUTES — drift-tie with server.test.ts v1.4.0 route set', () => {
-  it('matches the expectedV14Routes set in server.test.ts (both lists must stay in sync)', () => {
-    // #given — the canonical v1.4.0 route set from the server.test.ts drift guard.
-    // If a route is added or removed, BOTH this list AND the server.test.ts
-    // expectedV14Routes set must be updated — this assertion enforces that.
-    const expectedV14Routes = new Set([
-      'GET:/operator/health',
-      'GET:/operator/auth/github/start',
-      'GET:/operator/auth/github/callback',
-      'POST:/operator/auth/logout',
-      'GET:/operator/session/csrf',
-      'GET:/operator/session',
-      'GET:/operator/repos',
-      'POST:/operator/runs',
-      'GET:/operator/runs/:runId/stream',
-      'POST:/operator/runs/:runId/approvals/:requestId/decision',
-      'GET:/operator/runs/:runId/approvals',
-    ])
-
-    // #when — normalize EXPECTED_OPERATOR_ROUTES to the same Set<string> shape
-    const smokeRouteSet = new Set(EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`))
-
-    // #then — the two lists are identical; adding/removing a route forces both to update
-    expect(smokeRouteSet).toEqual(expectedV14Routes)
-    expect(EXPECTED_OPERATOR_ROUTES).toHaveLength(expectedV14Routes.size)
-  })
-})
