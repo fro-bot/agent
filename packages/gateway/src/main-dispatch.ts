@@ -59,7 +59,7 @@ const program = Effect.gen(function* () {
 //   unknown     → print error + usage, exit 1 (strict validation)
 // ---------------------------------------------------------------------------
 
-const OPERATOR_ROUTE_SMOKE_USAGE = `
+export const OPERATOR_ROUTE_SMOKE_USAGE = `
 Usage: node dist/main.mjs operator-route-smoke [--help|-h]
 
 Offline operator-route registration diagnostic.
@@ -82,7 +82,7 @@ Exit codes:
 
 const OPERATOR_ROUTE_SMOKE_KNOWN_FLAGS = new Set(['--help', '-h'])
 
-function parseOperatorRouteSmokeArgs(
+export function parseOperatorRouteSmokeArgs(
   args: readonly string[],
 ): {readonly mode: 'help' | 'run'} | {readonly error: string} {
   for (const arg of args) {

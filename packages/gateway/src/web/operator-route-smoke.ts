@@ -37,7 +37,7 @@ import {buildOperatorApp} from './server.js'
 // registrations and the v1.4.0 drift-guard test in server.test.ts.
 // ---------------------------------------------------------------------------
 
-const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readonly path: string}[] = [
+export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readonly path: string}[] = [
   {method: 'GET', path: '/operator/health'},
   {method: 'GET', path: '/operator/auth/github/start'},
   {method: 'GET', path: '/operator/auth/github/callback'},
@@ -124,10 +124,18 @@ export interface OperatorRouteSmokeOptions {
   /**
    * Override the runObservationManager passed to buildOperatorServerInputs.
    * Pass undefined to simulate a missing run-observation manager (run-stream absent).
+   * Because runObservationManager is optional in BuildOperatorServerInputs, passing
+   * undefined here flows through the helper and causes the run-stream route to be absent.
    */
   readonly runObservationManagerOverride?:
     | Parameters<typeof buildOperatorServerInputs>[0]['runObservationManager']
     | undefined
+  /**
+   * Override the launchWorkDeps passed to buildOperatorServerInputs.
+   * Used in regression-guard tests to simulate a missing launch dep (POST /operator/runs absent).
+   * When omitted, the default stub is used.
+   */
+  readonly launchWorkDepsOverride?: Parameters<typeof buildOperatorServerInputs>[0]['launchWorkDeps'] | undefined
   /**
    * Whether to suppress log output. Defaults to false (logs to stdout).
    */
@@ -184,41 +192,43 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const bindingsStore = options?.bindingsStoreOverride ?? makeStubBindingsStore()
 
   // Resolve the runObservationManager — use the override if provided.
-  // When the override is explicitly undefined, the run-stream route will not register.
+  // When the override is explicitly undefined, the run-stream route will not register
+  // because buildOperatorServerInputs passes it through to deps.runObservationManager,
+  // and server.ts gates GET /operator/runs/:runId/stream on that dep being present.
   const hasRunObservationManagerOverride = options !== undefined && 'runObservationManagerOverride' in options
   const runObservationManager = hasRunObservationManagerOverride
     ? options.runObservationManagerOverride
     : makeStubRunObservationManager()
 
+  // Resolve launchWorkDeps — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, POST /operator/runs will not register
+  // because buildOperatorServerInputs passes it through to deps.launchWorkDeps,
+  // and server.ts gates POST /operator/runs on that dep being present.
+  const hasLaunchWorkDepsOverride = options !== undefined && 'launchWorkDepsOverride' in options
+  const launchWorkDeps = hasLaunchWorkDepsOverride ? options.launchWorkDepsOverride : makeStubLaunchWorkDeps()
+
   // Build the operator server inputs via the shared production helper.
   // This is the seam that makes the diagnostic catch wiring gaps: if a dep is
   // dropped from buildOperatorServerInputs, both production and this diagnostic
   // lose it, so the route assertion below fails.
-  const {deps: baseDeps, config} = buildOperatorServerInputs({
+  //
+  // getBindingByRepo and launchWorkDeps flow through the helper (not injected
+  // after) — so if a future edit drops either from the helper output, the route
+  // assertion below catches it and the diagnostic exits non-zero.
+  const {deps, config} = buildOperatorServerInputs({
     logger: noopLogger,
     isShuttingDown: () => false,
     denylistCache: makeStubDenylistCache(),
     bindingsStore,
-    runObservationManager: runObservationManager ?? makeStubRunObservationManager(),
+    runObservationManager,
     runIndex: makeStubRunIndex(),
     approvalRegistry: makeStubApprovalRegistry(),
+    // launchWorkDeps flows through the helper so the route gate in server.ts
+    // sees the same value as production. When undefined (regression test), the
+    // helper passes undefined to deps.launchWorkDeps and POST /operator/runs is absent.
+    launchWorkDeps,
     operatorWebConfig,
   })
-
-  // Augment deps with the launch route deps (getBindingByRepo + launchWorkDeps)
-  // so POST /operator/runs is also registered. These are not part of
-  // buildOperatorServerInputs because they are not program-scoped instances
-  // in the same way — they are derived from the bindings store.
-  const deps = {
-    ...baseDeps,
-    getBindingByRepo: bindingsStore.getBindingByRepo,
-    launchWorkDeps: makeStubLaunchWorkDeps(),
-    // When runObservationManager is explicitly overridden to undefined, remove it
-    // from deps so the run-stream route gate fails (simulating a missing dep).
-    ...(hasRunObservationManagerOverride && runObservationManager === undefined
-      ? {runObservationManager: undefined}
-      : {}),
-  }
 
   // Build the app without binding a port.
   const app = buildOperatorApp(deps, config)
@@ -236,6 +246,13 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     })
 
   const registeredSet = new Set(registeredRoutes.map((r: {method: string; path: string}) => `${r.method}:${r.path}`))
+
+  // Guard against an accidentally-emptied expected-routes list — an empty list
+  // would pass vacuously (zero missing routes) and provide no assurance.
+  if (EXPECTED_OPERATOR_ROUTES.length === 0) {
+    log('operator-route-smoke: FAIL — EXPECTED_OPERATOR_ROUTES is empty (no routes to assert)')
+    return 1
+  }
 
   // Assert the expected route inventory.
   const missingRoutes = EXPECTED_OPERATOR_ROUTES.filter(r => registeredSet.has(`${r.method}:${r.path}`) === false)

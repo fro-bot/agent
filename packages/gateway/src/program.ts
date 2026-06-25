@@ -121,9 +121,22 @@ export interface BuildOperatorServerInputs {
       {readonly success: true; readonly data: RepoBinding[]} | {readonly success: false; readonly error: Error}
     >
   }
-  readonly runObservationManager: NonNullable<OperatorServerDeps['runObservationManager']>
+  /**
+   * Run-observation manager for the run-stream route.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes GET /operator/runs/:runId/stream to be absent from app.routes.
+   */
+  readonly runObservationManager?: NonNullable<OperatorServerDeps['runObservationManager']> | undefined
   readonly runIndex: NonNullable<OperatorServerDeps['runIndex']>
   readonly approvalRegistry: NonNullable<OperatorServerDeps['approvalRegistry']>
+  /**
+   * Engine dependencies for the launch route's launchWork call.
+   * Required for POST /operator/runs to be registered — the route gate checks
+   * deps.launchWorkDeps !== undefined. Pass runEngineDeps from the program scope.
+   * Optional only for the offline diagnostic which may pass undefined to simulate
+   * a missing dep and verify the launch route is absent.
+   */
+  readonly launchWorkDeps: NonNullable<OperatorServerDeps['launchWorkDeps']> | undefined
   readonly operatorWebConfig: {
     readonly bindHost: string
     readonly bindPort: number
@@ -166,6 +179,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runObservationManager,
     runIndex,
     approvalRegistry,
+    launchWorkDeps,
     operatorWebConfig,
   } = inputs
 
@@ -225,6 +239,12 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     // GET /operator/repos mount on listBindings, so omitting it leaves that
     // route unmounted. bindingsLookup only covers the run-stream route.
     listBindings: bindingsStore.listBindings === undefined ? undefined : bindingsStore.listBindings.bind(bindingsStore),
+    // getBindingByRepo: server.ts gates POST /operator/runs on this dep being present.
+    // Bound to the store so the method's `this` context is preserved.
+    getBindingByRepo: bindingsStore.getBindingByRepo.bind(bindingsStore),
+    // launchWorkDeps: server.ts gates POST /operator/runs on this dep being present.
+    // Shared with the Discord mention path so both use the same run-state instances.
+    launchWorkDeps,
     runObservationManager,
     runIndex,
     approvalRegistry,
@@ -640,6 +660,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         runObservationManager,
         runIndex,
         approvalRegistry,
+        launchWorkDeps: runEngineDeps,
         operatorWebConfig: config.operatorWeb,
       })
 

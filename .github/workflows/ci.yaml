@@ -364,16 +364,22 @@ jobs:
           # app via buildOperatorServerInputs → buildOperatorApp with realistic-but-offline
           # stubs, reads app.routes, and asserts the expected route inventory is present.
           # No port is bound, no network is required, no credentials are needed.
-          output="$(docker run --rm fro-bot-gateway:smoke node dist/main.mjs operator-route-smoke 2>&1)"
+          set +e
+          output="$(timeout 60s docker run --rm fro-bot-gateway:smoke node dist/main.mjs operator-route-smoke 2>&1)"
           status=$?
+          set -e
           echo "--- docker run output ---"
           echo "$output"
           echo "--- exit status: $status ---"
+          if [ "$status" -eq 124 ]; then
+            echo "REGRESSION: operator-route-smoke timed out"
+            exit 1
+          fi
           if [ "$status" -ne 0 ]; then
             echo "REGRESSION: operator-route-smoke exited $status — one or more operator routes are not registered in the shipped image"
             exit 1
           fi
-          if ! echo "$output" | grep -q "operator-route-smoke: all"; then
+          if ! echo "$output" | grep -qE '^operator-route-smoke: all [0-9]+ operator routes registered$'; then
             echo "REGRESSION: operator-route-smoke did not print the expected success marker"
             exit 1
           fi

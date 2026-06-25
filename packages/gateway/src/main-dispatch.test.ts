@@ -524,6 +524,42 @@ describe('main-dispatch.ts argv dispatch', () => {
 })
 
 // ---------------------------------------------------------------------------
+// parseOperatorRouteSmokeArgs — pure unit tests (no process.exit)
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorRouteSmokeArgs — pure arg parsing', () => {
+  it('no args → run mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs([])
+    expect(result).toEqual({mode: 'run'})
+  })
+
+  it('--help → help mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--help'])
+    expect(result).toEqual({mode: 'help'})
+  })
+
+  it('-h → help mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['-h'])
+    expect(result).toEqual({mode: 'help'})
+  })
+
+  it('unknown flag → error with flag name', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--bogus'])
+    expect(result).toEqual({error: 'Unknown flag: --bogus'})
+  })
+
+  it('unknown flag among known flags → error (first unknown wins)', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--help', '--bogus'])
+    expect(result).toEqual({error: 'Unknown flag: --bogus'})
+  })
+})
+
+// ---------------------------------------------------------------------------
 // parseBackfillArgs — pure unit tests (no process.exit)
 // ---------------------------------------------------------------------------
 
