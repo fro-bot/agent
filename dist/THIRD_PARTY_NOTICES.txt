@@ -1761,7 +1761,7 @@ Apache-2.0
    limitations under the License.
 
 
-@aws-sdk/client-s3@3.1071.0
+@aws-sdk/client-s3@3.1073.0
 Apache-2.0
                                 Apache License
                            Version 2.0, January 2004
@@ -12315,7 +12315,7 @@ eastasianwidth@0.2.0
 MIT
 MIT
 
-effect@3.21.3
+effect@3.21.4
 MIT
 MIT License
 
