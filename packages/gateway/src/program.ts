@@ -359,10 +359,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     // instances and cannot diverge.
     //
     // botUserId is read lazily via a getter: client.user is set after login, but
-    // the operator server starts before login. For web-launched runs the
-    // promptBuilder override means botUserId is never consulted; for Discord
-    // mentions the messageCreate handler spreads these deps and overrides
-    // botUserId with the concrete client.user.id value.
+    // the operator server starts before login. On the web path botUserId is
+    // destructured by executeWorkOnHeldSlot but never consumed — the web path
+    // always supplies a promptBuilder that does not use it. On the Discord path
+    // the messageCreate handler spreads these deps and overrides botUserId with
+    // the concrete client.user.id value.
     // ---------------------------------------------------------------------------
     const runEngineDeps: import('./execute/run.js').RunMentionDeps = {
       coordinationConfig: makeCoordinationConfig(s3Adapter, config),
