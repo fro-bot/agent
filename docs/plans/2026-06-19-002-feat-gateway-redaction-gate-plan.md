@@ -149,7 +149,7 @@ The metadata source of truth lives in `fro-bot/.github@data` (`metadata/repos.ya
   - Thread the captured `{databaseId, nodeId}` into the binding write. Capture the immutable numeric `id` so a later rename/transfer (which preserves the id) still matches the denylist (canonical-identity decision).
 
   **Approach (backfill, Fork 3):**
-  - A controlled, offline/admin backfill (`backfill-deny-keys.ts`) enumerates ACTIVE bindings lacking deny keys and resolves each via the same narrow repo-identity accessor, writing the keys back. This runs OUTSIDE the operator surface (admin-invoked, not a per-request path), so it is not a denylist-before-query violation. It must run before the first operator consumer (4b) ships so the gate is not functionally empty for existing installs.
+  - A controlled, offline/admin backfill (`backfill-deny-keys.ts`) enumerates ACTIVE bindings lacking deny keys and resolves each via the same narrow repo-identity accessor, writing the keys back. This runs OUTSIDE the operator surface (admin-invoked, not a per-request path), so it is not a denylist-before-query violation. It must run before the first operator consumer (4b) ships so the gate is not functionally empty for existing installs. The shipped command (inside the gateway bundle): `node dist/main.mjs backfill-deny-keys --dry-run` (preview) then `node dist/main.mjs backfill-deny-keys` (apply). Authoritative runbook in `packages/gateway/AGENTS.md`.
 
   **Execution note:** capture-at-ingest is the security-load-bearing seam — test that no NEW GitHub call is added at run-creation/surface time (the ids come from the binding). The backfill is the only place an `owner/repo → id` query happens for existing records, and it is admin/offline.
 

@@ -323,6 +323,184 @@ describe('backfillActiveBindingDenyKeys', () => {
   })
 
   // -------------------------------------------------------------------------
+  // Dry-run mode: resolves identities and counts without writing
+  // -------------------------------------------------------------------------
+
+  it('dry-run: one keyless binding → updated=1, writeBinding never called', async () => {
+    // #given — one binding with no deny keys, dryRun=true
+    const binding = makeBinding()
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 42, nodeId: 'node-dry'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+      dryRun: true,
+    })
+
+    // #then — identity was resolved
+    expect(getRepoIdentity).toHaveBeenCalledWith('testowner', 'testrepo')
+    // #and — no write occurred
+    expect(writeBinding).not.toHaveBeenCalled()
+    // #and — counts match what a real run would report
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.total).toBe(1)
+    expect(result.data.updated).toBe(1)
+    expect(result.data.skipped).toBe(0)
+    expect(result.data.failed).toBe(0)
+  })
+
+  it('dry-run: mixed bindings (one keyed, one keyless) → skipped=1, updated=1, zero writes', async () => {
+    // #given — one binding with keys, one without; dryRun=true
+    const keyedBinding = makeBinding({databaseId: 99, nodeId: 'existing-node'})
+    const keylessBinding = makeBinding({owner: 'org', repo: 'fresh'})
+    const listBindings = vi.fn().mockResolvedValue(ok([keyedBinding, keylessBinding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 77, nodeId: 'node-fresh'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+      dryRun: true,
+    })
+
+    // #then — no writes at all
+    expect(writeBinding).not.toHaveBeenCalled()
+    // #and — identity resolved only for the keyless binding
+    expect(getRepoIdentity).toHaveBeenCalledTimes(1)
+    expect(getRepoIdentity).toHaveBeenCalledWith('org', 'fresh')
+    // #and — counts
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.total).toBe(2)
+    expect(result.data.updated).toBe(1)
+    expect(result.data.skipped).toBe(1)
+    expect(result.data.failed).toBe(0)
+  })
+
+  it('dry-run: getRepoIdentity fails for keyless binding → failed=1, zero writes', async () => {
+    // #given — one keyless binding, identity resolution fails; dryRun=true
+    const binding = makeBinding()
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity(new Error('API timeout'))
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+      dryRun: true,
+    })
+
+    // #then — identity was attempted
+    expect(getRepoIdentity).toHaveBeenCalledWith('testowner', 'testrepo')
+    // #and — no write occurred
+    expect(writeBinding).not.toHaveBeenCalled()
+    // #and — failure counted
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.total).toBe(1)
+    expect(result.data.updated).toBe(0)
+    expect(result.data.skipped).toBe(0)
+    expect(result.data.failed).toBe(1)
+  })
+
+  it('dry-run: zero keyless bindings → no getRepoIdentity, no writeBinding calls', async () => {
+    // #given — all bindings already have keys; dryRun=true
+    const binding = makeBinding({databaseId: 1, nodeId: 'node-1'})
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity()
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+      dryRun: true,
+    })
+
+    // #then — nothing resolved, nothing written
+    expect(getRepoIdentity).not.toHaveBeenCalled()
+    expect(writeBinding).not.toHaveBeenCalled()
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.total).toBe(1)
+    expect(result.data.updated).toBe(0)
+    expect(result.data.skipped).toBe(1)
+    expect(result.data.failed).toBe(0)
+  })
+
+  it('regression: dryRun absent → writeBinding IS called (existing behavior preserved)', async () => {
+    // #given — one keyless binding, no dryRun flag
+    const binding = makeBinding()
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 55, nodeId: 'node-reg'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when — no dryRun property at all
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+    })
+
+    // #then — write occurred
+    expect(writeBinding).toHaveBeenCalledTimes(1)
+    expect(writeBinding).toHaveBeenCalledWith(expect.objectContaining({databaseId: 55, nodeId: 'node-reg'}))
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.updated).toBe(1)
+  })
+
+  it('regression: dryRun=false → writeBinding IS called (explicit false is same as absent)', async () => {
+    // #given — one keyless binding, dryRun explicitly false
+    const binding = makeBinding()
+    const listBindings = vi.fn().mockResolvedValue(ok([binding]))
+    const store = makeBindingsStore({listBindings})
+    const getRepoIdentity = makeGetRepoIdentity({databaseId: 66, nodeId: 'node-false'})
+    const writeBinding = vi.fn().mockResolvedValue(ok(undefined))
+    const logger = makeLogger()
+
+    // #when
+    const result = await backfillActiveBindingDenyKeys({
+      bindingsStore: store,
+      getRepoIdentity,
+      writeBinding,
+      logger,
+      dryRun: false,
+    })
+
+    // #then — write occurred
+    expect(writeBinding).toHaveBeenCalledTimes(1)
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+    expect(result.data.updated).toBe(1)
+  })
+
+  // -------------------------------------------------------------------------
   // Security: not wired into any request path
   // -------------------------------------------------------------------------
 
