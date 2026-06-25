@@ -352,6 +352,38 @@ jobs:
             exit 1
           fi
           echo "OK: gateway booted PAST config load (announce disabled, #738 fixed) and reached the runtime self-test boundary"
+      - name: Smoke-test gateway image — operator route registration (offline diagnostic)
+        timeout-minutes: 8
+        run: |
+          # Proves the operator routes register in the shipped image using the same
+          # deps-construction path as production. Catches the class of bug where a
+          # route is silently unmounted because a required dep was not wired
+          # (e.g. listBindings omitted → GET /operator/repos absent → 404 in prod).
+          #
+          # The diagnostic (operator-route-smoke subcommand) builds the operator Hono
+          # app via buildOperatorServerInputs → buildOperatorApp with realistic-but-offline
+          # stubs, reads app.routes, and asserts the expected route inventory is present.
+          # No port is bound, no network is required, no credentials are needed.
+          set +e
+          output="$(timeout 60s docker run --rm fro-bot-gateway:smoke node dist/main.mjs operator-route-smoke 2>&1)"
+          status=$?
+          set -e
+          echo "--- docker run output ---"
+          echo "$output"
+          echo "--- exit status: $status ---"
+          if [ "$status" -eq 124 ]; then
+            echo "REGRESSION: operator-route-smoke timed out"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "REGRESSION: operator-route-smoke exited $status — one or more operator routes are not registered in the shipped image"
+            exit 1
+          fi
+          if ! echo "$output" | grep -qE '^operator-route-smoke: all [0-9]+ operator routes registered$'; then
+            echo "REGRESSION: operator-route-smoke did not print the expected success marker"
+            exit 1
+          fi
+          echo "OK: all operator routes registered in the shipped image"
 
   workspace-smoke:
     if: ${{ github.event_name == 'push' || needs.setup.outputs.should-build == 'true' }}

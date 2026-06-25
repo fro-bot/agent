@@ -6,6 +6,9 @@
  * - `backfill-deny-keys --apply` → dryRun: false (real write)
  * - `backfill-deny-keys --help` / `-h` → usage printed, exit 0, runner NOT called
  * - `backfill-deny-keys --bogus` (unknown flag) → error + usage, exit 1, runner NOT called
+ * - `operator-route-smoke` → runs the diagnostic, exits with its code
+ * - `operator-route-smoke --help` / `-h` → usage printed, exit 0, diagnostic NOT called
+ * - `operator-route-smoke --bogus` (unknown flag) → error + usage, exit 1, diagnostic NOT called
  * - No subcommand → gateway program path is taken (runner not called)
  * - Unknown subcommand → falls through to gateway program (runner not called)
  * - No import-time side effects (gateway program does not start on import)
@@ -83,6 +86,20 @@ vi.mock('./web/server.js', () => ({
 }))
 
 // ---------------------------------------------------------------------------
+// Mock the operator-route-smoke diagnostic so we never build a real Hono app
+// ---------------------------------------------------------------------------
+
+const mockRunOperatorRouteSmoke = vi.fn()
+
+vi.mock('./web/operator-route-smoke.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./web/operator-route-smoke.js')>()
+  return {
+    ...actual,
+    runOperatorRouteSmoke: mockRunOperatorRouteSmoke,
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -122,6 +139,8 @@ describe('main-dispatch.ts argv dispatch', () => {
 
     // Default: gateway program resolves cleanly
     mockEffectRunPromise.mockResolvedValue(undefined)
+    // Default: diagnostic returns success
+    mockRunOperatorRouteSmoke.mockResolvedValue(0)
   })
 
   afterEach(() => {
@@ -331,6 +350,125 @@ describe('main-dispatch.ts argv dispatch', () => {
   })
 
   // -------------------------------------------------------------------------
+  // operator-route-smoke subcommand — runs diagnostic, exits with its code
+  // -------------------------------------------------------------------------
+
+  it('operator-route-smoke: runs the diagnostic and exits with its code (0 = success)', async () => {
+    // #given — argv simulates `node dist/main.mjs operator-route-smoke`
+    const {restore} = withArgv(['node', 'main.js', 'operator-route-smoke'])
+    mockRunOperatorRouteSmoke.mockResolvedValue(0)
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — diagnostic called
+      expect(mockRunOperatorRouteSmoke).toHaveBeenCalledOnce()
+
+      // #and — process.exit called with the diagnostic's code
+      expect(exitSpy).toHaveBeenCalledWith(0)
+
+      // #and — gateway program was NOT started
+      expect(mockEffectRunPromise).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  it('operator-route-smoke: exits with code 1 when diagnostic returns 1 (routes absent)', async () => {
+    // #given — diagnostic returns failure
+    const {restore} = withArgv(['node', 'main.js', 'operator-route-smoke'])
+    mockRunOperatorRouteSmoke.mockResolvedValue(1)
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — process.exit called with 1
+      expect(exitSpy).toHaveBeenCalledWith(1)
+      expect(mockEffectRunPromise).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  it('operator-route-smoke --help: prints usage to stdout and exits 0 without calling diagnostic', async () => {
+    // #given — argv simulates `node dist/main.mjs operator-route-smoke --help`
+    const {restore} = withArgv(['node', 'main.js', 'operator-route-smoke', '--help'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — usage printed to stdout
+      expect(stdoutSpy).toHaveBeenCalledOnce()
+
+      // #and — exit 0
+      expect(exitSpy).toHaveBeenCalledWith(0)
+
+      // #and — diagnostic NOT called
+      expect(mockRunOperatorRouteSmoke).not.toHaveBeenCalled()
+
+      // #and — gateway program NOT started
+      expect(mockEffectRunPromise).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  it('operator-route-smoke -h: prints usage to stdout and exits 0 without calling diagnostic', async () => {
+    // #given — argv simulates `node dist/main.mjs operator-route-smoke -h`
+    const {restore} = withArgv(['node', 'main.js', 'operator-route-smoke', '-h'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — usage printed to stdout
+      expect(stdoutSpy).toHaveBeenCalledOnce()
+
+      // #and — exit 0
+      expect(exitSpy).toHaveBeenCalledWith(0)
+
+      // #and — diagnostic NOT called
+      expect(mockRunOperatorRouteSmoke).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  it('operator-route-smoke --bogus (unknown flag): prints error + usage, exits 1, diagnostic NOT called', async () => {
+    // #given — argv simulates `node dist/main.mjs operator-route-smoke --bogus`
+    const {restore} = withArgv(['node', 'main.js', 'operator-route-smoke', '--bogus'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — error printed to stderr naming the bad flag
+      expect(consoleErrorSpy).toHaveBeenCalledOnce()
+      const errorMsg = (consoleErrorSpy.mock.calls[0] as string[])[0]
+      expect(errorMsg).toContain('--bogus')
+
+      // #and — exit 1
+      expect(exitSpy).toHaveBeenCalledWith(1)
+
+      // #and — diagnostic NOT called
+      expect(mockRunOperatorRouteSmoke).not.toHaveBeenCalled()
+
+      // #and — gateway program NOT started
+      expect(mockEffectRunPromise).not.toHaveBeenCalled()
+    } finally {
+      restore()
+    }
+  })
+
+  // -------------------------------------------------------------------------
   // No subcommand → gateway program path (regression)
   // -------------------------------------------------------------------------
 
@@ -382,6 +520,42 @@ describe('main-dispatch.ts argv dispatch', () => {
     } finally {
       restore()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseOperatorRouteSmokeArgs — pure unit tests (no process.exit)
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorRouteSmokeArgs — pure arg parsing', () => {
+  it('no args → run mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs([])
+    expect(result).toEqual({mode: 'run'})
+  })
+
+  it('--help → help mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--help'])
+    expect(result).toEqual({mode: 'help'})
+  })
+
+  it('-h → help mode', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['-h'])
+    expect(result).toEqual({mode: 'help'})
+  })
+
+  it('unknown flag → error with flag name', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--bogus'])
+    expect(result).toEqual({error: 'Unknown flag: --bogus'})
+  })
+
+  it('unknown flag among known flags → error (first unknown wins)', async () => {
+    const {parseOperatorRouteSmokeArgs} = await import('./main-dispatch.js')
+    const result = parseOperatorRouteSmokeArgs(['--help', '--bogus'])
+    expect(result).toEqual({error: 'Unknown flag: --bogus'})
   })
 })
 
