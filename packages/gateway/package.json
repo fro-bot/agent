@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/main.ts",
   "scripts": {
-    "build": "bunx tsc -p tsconfig.json --noEmit && bunx tsdown src/main.ts --format esm --out-dir dist",
+    "build": "bunx tsc -p tsconfig.json --noEmit && bunx tsdown",
     "check-types": "bunx tsc -p tsconfig.json --noEmit",
     "fix": "bunx eslint --fix src",
     "lint": "bunx eslint src",
