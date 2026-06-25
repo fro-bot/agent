@@ -324,15 +324,45 @@ Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gate
 
 ### Operator runbook
 
+The operator web surface is a browser-facing authenticated API that lets human operators launch runs, list bound repos, stream run status and output, and submit tool-approval decisions — all behind GitHub OAuth and a numeric-user-ID allowlist. It is separate from the Discord surface and the GitHub App used for repository access.
+
+**Enabling the surface** requires all three bind/origin vars to be set together (partial config fails closed):
+
+| Variable | Purpose |
+| --- | --- |
+| `GATEWAY_OPERATOR_BIND_HOST` | Gateway-net IP the operator listener binds to (literal IP, not hostname; not `0.0.0.0`, loopback, or sandbox-net) |
+| `GATEWAY_OPERATOR_BIND_PORT` | Port for the operator listener |
+| `GATEWAY_OPERATOR_PUBLIC_ORIGIN` | Public `https://` origin exposed by the infra reverse proxy (e.g. `https://operator.example.com`) |
+| `GATEWAY_OPERATOR_GITHUB_CLIENT_ID` / `_FILE` | GitHub OAuth App client ID |
+| `GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET` / `_FILE` | GitHub OAuth App client secret |
+| `GATEWAY_OPERATOR_CSRF_SECRET` / `_FILE` | CSRF signing key — 256-bit CSPRNG entropy, base64url-encoded, no padding |
+| `GATEWAY_OPERATOR_ALLOWLIST` / `GATEWAY_OPERATOR_ALLOWLIST_FILE` | Newline-separated numeric GitHub user IDs permitted to log in |
+| `GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS` | Optional comma-separated list of allowed post-auth redirect paths (default: `/operator`) |
+
+For secret provisioning details see [Required secrets](#required-secrets) above.
+
 Follow these steps in order to deploy and operate the web surface:
 
 1. **Deploy the gateway image** — see [One-Time Setup](#one-time-setup) and [Starting the Stack](#starting-the-stack) for the Docker Compose setup and image build.
-2. **Set `GATEWAY_OPERATOR_PUBLIC_ORIGIN` and OAuth env** — see [Operator OAuth (Web Surface)](#operator-oauth-web-surface) for the required environment variables and secrets.
-3. **Register the GitHub OAuth app callback URL** — the callback path is `/operator/auth/github/callback` on your public origin; see the OAuth App setup instructions in [Operator OAuth (Web Surface)](#operator-oauth-web-surface).
-4. **Configure the operator allowlist** — add one numeric GitHub user ID per line to `deploy/secrets/gateway-operator-allowlist`; see the allowlist note in [Operator OAuth (Web Surface)](#operator-oauth-web-surface).
-5. **Verify** — confirm `GET /operator/health` returns `{ok:true}`, complete an OAuth login via `/operator/auth/github/start`, then exercise the [Operator API surface](#operator-api-surface) above.
+2. **Set the enabling env** — configure the `GATEWAY_OPERATOR_*` vars above (bind host/port/origin, OAuth credentials, CSRF secret, allowlist). See [Required secrets](#required-secrets) for the secret file commands.
+3. **Register the GitHub OAuth app callback URL** — the callback path is `/operator/auth/github/callback` on your public origin; see [OAuth callback URL](#oauth-callback-url) above.
+4. **Configure the operator allowlist** — add one numeric GitHub user ID per line to `deploy/secrets/gateway-operator-allowlist`; see the allowlist note in [Required secrets](#required-secrets).
+5. **Backfill deny keys for pre-gate bindings** — repos bound before deny-key capture was added will not appear in `GET /operator/repos` until their deny keys are populated. Run the backfill admin command (documented in [`packages/gateway/AGENTS.md`](../packages/gateway/AGENTS.md#redaction-gate)):
+   ```sh
+   # Preview (writes nothing):
+   node dist/main.mjs backfill-deny-keys
+   # Apply:
+   node dist/main.mjs backfill-deny-keys --apply
+   ```
+6. **Verify** — confirm `GET /operator/health` returns `{ok:true}`, complete an OAuth login via `/operator/auth/github/start`, then exercise the [Operator API surface](#operator-api-surface) above (added in #996).
 
-The route table and env table are the single source of truth — this runbook links to them rather than restating them.
+**Design rationale and patterns** — the following solution docs cover the operator surface architecture:
+
+- [`gateway-control-surface-spine-2026-06-15.md`](../docs/solutions/best-practices/gateway-control-surface-spine-2026-06-15.md) — overall operator surface spine: route registration, browser guard, session/CSRF architecture.
+- [`web-operator-launch-surface-2026-06-20.md`](../docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md) — launch endpoint design: fire-and-return, idempotency, per-operator rate limiting.
+- [`authenticated-sse-run-observation-2026-06-20.md`](../docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md) — SSE run-observation stream: auth, repo-scoped read authz, continuous delivery.
+- [`sse-output-streaming-terminal-drain-2026-06-21.md`](../docs/solutions/best-practices/sse-output-streaming-terminal-drain-2026-06-21.md) — SSE output streaming and terminal drain patterns.
+- [`signed-webhook-ingress-hardening-2026-05-29.md`](../docs/solutions/best-practices/signed-webhook-ingress-hardening-2026-05-29.md) — HMAC-signed ingress hardening (the announce surface that shares the gateway's HTTP layer).
 
 ## Workspace Port Model
 

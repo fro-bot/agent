@@ -30,6 +30,7 @@ import {loadAllowlistFromText} from './auth/allowlist.js'
 import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './auth/session.js'
+import {EXPECTED_OPERATOR_ROUTES} from './operator-route-smoke.js'
 import {isPrivilegedRoute, isPublicCrossSiteRoute, isPublicRoute} from './operator-route.js'
 import {buildOperatorApp, createOperatorServer} from './server.js'
 
@@ -1784,22 +1785,11 @@ describe('buildOperatorApp — v1.4.0 full route-registration smoke (drift guard
     const routes = extractRoutes(app)
 
     // #then — exact v1.4.0 set (order-independent)
-    // If this assertion fails, a route was added or removed. Update BOTH this test
-    // AND the deploy/README "Operator API surface" table to keep them in sync.
+    // If this assertion fails, a route was added or removed. Update EXPECTED_OPERATOR_ROUTES
+    // in operator-route-smoke.ts (the single canonical source) AND the deploy/README
+    // "Operator API surface" table to keep them in sync.
     const routeSet = new Set(routes.map(r => `${r.method}:${r.path}`))
-    const expectedV14Routes = new Set([
-      'GET:/operator/health',
-      'GET:/operator/auth/github/start',
-      'GET:/operator/auth/github/callback',
-      'POST:/operator/auth/logout',
-      'GET:/operator/session/csrf',
-      'GET:/operator/session',
-      'GET:/operator/repos',
-      'POST:/operator/runs',
-      'GET:/operator/runs/:runId/stream',
-      'POST:/operator/runs/:runId/approvals/:requestId/decision',
-      'GET:/operator/runs/:runId/approvals',
-    ])
+    const expectedV14Routes = new Set(EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`))
 
     expect(routeSet).toEqual(expectedV14Routes)
     expect(routes).toHaveLength(expectedV14Routes.size)

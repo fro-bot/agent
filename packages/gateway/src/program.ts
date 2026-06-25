@@ -1,6 +1,7 @@
 import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {Context} from 'hono'
+import type {RepoBinding} from './bindings/types.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
@@ -8,6 +9,7 @@ import type {RunTask} from './execute/run.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
+import type {OperatorAllowlist} from './web/auth/allowlist.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
 import {
   createS3Adapter,
@@ -101,6 +103,174 @@ export function makeDiscordClientFromConfig(
   logger: GatewayLogger,
 ): ReturnType<typeof createDiscordClient> {
   return createDiscordClient({intents: config.privilegedIntents, logger})
+}
+
+// ---------------------------------------------------------------------------
+// Operator server inputs helper — exported so the offline diagnostic can share
+// the same deps-construction path as production.
+// ---------------------------------------------------------------------------
+
+/** Program-scoped instances passed into buildOperatorServerInputs. */
+export interface BuildOperatorServerInputs {
+  readonly logger: OperatorServerDeps['logger']
+  readonly isShuttingDown: () => boolean
+  readonly denylistCache: NonNullable<OperatorServerDeps['denylistCache']>
+  readonly bindingsStore: {
+    readonly getBindingByRepo: NonNullable<OperatorServerDeps['getBindingByRepo']>
+    readonly listBindings?: () => Promise<
+      {readonly success: true; readonly data: RepoBinding[]} | {readonly success: false; readonly error: Error}
+    >
+  }
+  /**
+   * Run-observation manager for the run-stream route.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes GET /operator/runs/:runId/stream to be absent from app.routes.
+   */
+  readonly runObservationManager?: NonNullable<OperatorServerDeps['runObservationManager']> | undefined
+  readonly runIndex: NonNullable<OperatorServerDeps['runIndex']>
+  /**
+   * Approval registry for the approval routes.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes the approval routes to be absent from app.routes.
+   */
+  readonly approvalRegistry?: NonNullable<OperatorServerDeps['approvalRegistry']>
+  /**
+   * Engine dependencies for the launch route's launchWork call.
+   * Required for POST /operator/runs to be registered — the route gate checks
+   * deps.launchWorkDeps !== undefined. Pass runEngineDeps from the program scope.
+   * Optional only for the offline diagnostic which may pass undefined to simulate
+   * a missing dep and verify the launch route is absent.
+   */
+  readonly launchWorkDeps?: NonNullable<OperatorServerDeps['launchWorkDeps']>
+  readonly operatorWebConfig: {
+    readonly bindHost: string
+    readonly bindPort: number
+    readonly publicOrigin: string
+    readonly oauthClientId: string
+    readonly oauthClientSecret: string
+    readonly oauthAllowedReturnPaths: readonly string[]
+    readonly oauthStateTtlMs: number
+    readonly oauthMaxOutstandingAttemptsPerKey: number
+    readonly csrfSecret: string
+    readonly allowlist: OperatorAllowlist
+  }
+}
+
+/**
+ * Build the OperatorServerDeps and OperatorServerConfig objects from
+ * program-scoped instances.
+ *
+ * Constructs operator-local pieces (rate limiter, session store, OAuth deps,
+ * getSourceKey) internally. The caller passes already-constructed program-scoped
+ * instances (denylistCache, bindingsStore, runObservationManager, runIndex,
+ * approvalRegistry) in.
+ *
+ * Production's deps.startOperatorServer(...) call passes the helper's output
+ * unchanged — behavior-identical to the previous inline construction.
+ *
+ * Exported for the offline route-registration diagnostic which calls this helper
+ * with realistic-but-offline stubs to assert the route inventory without binding
+ * a port.
+ */
+export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
+  readonly deps: OperatorServerDeps
+  readonly config: OperatorServerConfig
+} {
+  const {
+    logger,
+    isShuttingDown: isShuttingDownFn,
+    denylistCache,
+    bindingsStore,
+    runObservationManager,
+    runIndex,
+    approvalRegistry,
+    launchWorkDeps,
+    operatorWebConfig,
+  } = inputs
+
+  // Build the source key extractor for OAuth outstanding-attempt counting.
+  // Must use the TCP socket address (not caller-spoofable headers).
+  // getConnInfo may throw in environments without a real socket; fall back to 'unknown'.
+  const getSourceKey = (c: Context): string => {
+    try {
+      return getConnInfo(c).remote.address ?? 'unknown'
+    } catch {
+      return 'unknown'
+    }
+  }
+
+  // Build the shared rate limiter for the operator surface.
+  // Passed to both buildGitHubOAuthDeps and OperatorServerDeps so OAuth routes
+  // participate in the same per-socket budget as the health route.
+  const operatorRateLimiter = createRateLimiter({limit: 20, windowMs: 60_000})
+
+  // Build the shared in-memory session store for the operator surface.
+  // Gateway restart is global logout — acceptable for v1.
+  const sessionStore = createInMemorySessionStore()
+  const sessionDeps = {
+    logger,
+    auditLogger: logger,
+    clock: () => Date.now(),
+  }
+
+  // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
+  // Pass the session store so successful callbacks mint a fresh session.
+  // Pass the allowlist so non-allowlisted users are denied before session creation.
+  const githubOAuthDeps = buildGitHubOAuthDeps(
+    logger,
+    logger,
+    getSourceKey,
+    operatorRateLimiter,
+    sessionStore,
+    sessionDeps,
+    operatorWebConfig.allowlist,
+  )
+
+  const deps: OperatorServerDeps = {
+    logger,
+    isShuttingDown: isShuttingDownFn,
+    rateLimiter: operatorRateLimiter,
+    githubOAuth: githubOAuthDeps,
+    sessionStore,
+    sessionDeps,
+    allowlist: operatorWebConfig.allowlist,
+    csrfSecret: operatorWebConfig.csrfSecret,
+    auditLogger: logger,
+    // Wire the existing program-scoped instances so the run-stream route
+    // can reach them without creating second copies.
+    denylistCache,
+    bindingsLookup: bindingsStore,
+    // listBindings is a distinct dep from bindingsLookup: server.ts gates the
+    // GET /operator/repos mount on listBindings, so omitting it leaves that
+    // route unmounted. bindingsLookup only covers the run-stream route.
+    listBindings: bindingsStore.listBindings === undefined ? undefined : bindingsStore.listBindings.bind(bindingsStore),
+    // getBindingByRepo: server.ts gates POST /operator/runs on this dep being present.
+    // Bound to the store so the method's `this` context is preserved.
+    getBindingByRepo: bindingsStore.getBindingByRepo.bind(bindingsStore),
+    // launchWorkDeps: server.ts gates POST /operator/runs on this dep being present.
+    // Shared with the Discord mention path so both use the same run-state instances.
+    launchWorkDeps,
+    runObservationManager,
+    runIndex,
+    approvalRegistry,
+  }
+
+  const config: OperatorServerConfig = {
+    bindHost: operatorWebConfig.bindHost,
+    bindPort: operatorWebConfig.bindPort,
+    publicOrigin: operatorWebConfig.publicOrigin,
+    githubOAuth: {
+      clientId: operatorWebConfig.oauthClientId,
+      clientSecret: operatorWebConfig.oauthClientSecret,
+      publicOrigin: operatorWebConfig.publicOrigin,
+      callbackPath: '/operator/auth/github/callback',
+      allowedReturnPaths: operatorWebConfig.oauthAllowedReturnPaths,
+      stateTtlMs: operatorWebConfig.oauthStateTtlMs,
+      maxOutstandingAttemptsPerKey: operatorWebConfig.oauthMaxOutstandingAttemptsPerKey,
+    },
+  }
+
+  return {deps, config}
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +523,66 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       })
     })
 
+    // ---------------------------------------------------------------------------
+    // Engine deps for launchWork — shared between Discord mentions and the web
+    // operator launch route so both paths use the same run-state/coordination
+    // instances and cannot diverge.
+    //
+    // botUserId is read lazily via a getter: client.user is set after login, but
+    // the operator server starts before login. On the web path botUserId is
+    // destructured by executeWorkOnHeldSlot but never consumed — the web path
+    // always supplies a promptBuilder that does not use it. On the Discord path
+    // the messageCreate handler spreads these deps and overrides botUserId with
+    // the concrete client.user.id value.
+    // ---------------------------------------------------------------------------
+    const runEngineDeps: import('./execute/run.js').RunMentionDeps = {
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      concurrency: concurrencyRegistry,
+      queue: channelQueue,
+      attachUrl: config.workspaceOpencodeUrl,
+      attachToken: config.workspaceOpencodeToken,
+      runTimeoutMs: config.runTimeoutMs,
+      // Lazy getter: client.user is non-null after login. Web-launched runs
+      // always supply a promptBuilder so botUserId is never read on that path.
+      get botUserId() {
+        return client.user?.id ?? ''
+      },
+      persona: config.persona,
+      logger,
+      approvalRegistry,
+      approvalMode: config.approvalMode,
+      statusMode: config.statusMode,
+      // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
+      // Placed inside run so it is called after the concurrency gate, not before.
+      readyz: async () => workspaceClient.readyz(),
+      // Ensure workspace checkout exists. Called after the concurrency gate so
+      // same-channel mention storms do not each mint GitHub App tokens before
+      // the busy/cap rejection fires. Adapts GatewayLogger (context-first) to
+      // the EnsureCloneDeps logger (message-first) inline.
+      ensureClone: async (owner: string, repo: string) =>
+        ensureWorkspaceClone({
+          owner,
+          repo,
+          appClient,
+          workspaceClient,
+          logger: {
+            info: (msg, meta) => logger.info(meta ?? {}, msg),
+            warn: (msg, meta) => logger.warn(meta ?? {}, msg),
+            error: (msg, meta) => logger.error(meta ?? {}, msg),
+          },
+        }),
+      // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
+      // The in-memory queue is lossy by design; dropping pending tasks on graceful
+      // shutdown matches that contract and is consistent with the messageCreate
+      // guard above that refuses new mentions once isShuttingDown() returns true.
+      isShuttingDown,
+      // Server-owned run index: populated at run creation for privileged route authz.
+      runIndex,
+      // Feeds the run-observation manager at each lifecycle transition.
+      runObserver: runObservationManager,
+    }
+
     // Track in-flight mention run promises so SIGTERM can await them before tearing down.
     const inFlightRuns = new Set<Promise<void>>()
 
@@ -363,51 +593,14 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // Stop accepting new mentions once shutdown has been requested.
       if (isShuttingDown()) return
 
+      // Reuse the program-scoped engine deps; override botUserId with the
+      // concrete value now that client.user is guaranteed non-null.
       const mentionDeps = {
         bindingsStore,
         triggerRoleId: config.triggerRoleId,
         run: {
-          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-          identity: config.identity,
-          concurrency: concurrencyRegistry,
-          queue: channelQueue,
-          attachUrl: config.workspaceOpencodeUrl,
-          attachToken: config.workspaceOpencodeToken,
-          runTimeoutMs: config.runTimeoutMs,
+          ...runEngineDeps,
           botUserId: client.user.id,
-          persona: config.persona,
-          logger,
-          approvalRegistry,
-          approvalMode: config.approvalMode,
-          statusMode: config.statusMode,
-          // Workspace readiness gate — uses the same :9100 base as the clone endpoint.
-          // Placed inside run so it is called after the concurrency gate, not before.
-          readyz: async () => workspaceClient.readyz(),
-          // Ensure workspace checkout exists. Called after the concurrency gate so
-          // same-channel mention storms do not each mint GitHub App tokens before
-          // the busy/cap rejection fires. Adapts GatewayLogger (context-first) to
-          // the EnsureCloneDeps logger (message-first) inline.
-          ensureClone: async (owner: string, repo: string) =>
-            ensureWorkspaceClone({
-              owner,
-              repo,
-              appClient,
-              workspaceClient,
-              logger: {
-                info: (msg, meta) => logger.info(meta ?? {}, msg),
-                warn: (msg, meta) => logger.warn(meta ?? {}, msg),
-                error: (msg, meta) => logger.error(meta ?? {}, msg),
-              },
-            }),
-          // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
-          // The in-memory queue is lossy by design; dropping pending tasks on graceful
-          // shutdown matches that contract and is consistent with the messageCreate
-          // guard above that refuses new mentions once isShuttingDown() returns true.
-          isShuttingDown,
-          // Server-owned run index: populated at run creation for privileged route authz.
-          runIndex,
-          // Feeds the run-observation manager at each lifecycle transition.
-          runObserver: runObservationManager,
         },
         logger,
       }
@@ -458,81 +651,25 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
-      // Build the source key extractor for OAuth outstanding-attempt counting.
-      // Must use the TCP socket address (not caller-spoofable headers).
-      // getConnInfo may throw in environments without a real socket; fall back to 'unknown'.
-      const getSourceKey = (c: Context): string => {
-        try {
-          return getConnInfo(c).remote.address ?? 'unknown'
-        } catch {
-          return 'unknown'
-        }
-      }
-
-      // Build the shared rate limiter for the operator surface.
-      // Passed to both buildGitHubOAuthDeps and OperatorServerDeps so OAuth routes
-      // participate in the same per-socket budget as the health route.
-      const operatorRateLimiter = createRateLimiter({limit: 20, windowMs: 60_000})
-
-      // Build the shared in-memory session store for the operator surface.
-      // Gateway restart is global logout — acceptable for v1.
-      const sessionStore = createInMemorySessionStore()
-      const sessionDeps = {
+      // Build the operator server deps and config via the shared helper.
+      // The helper constructs operator-local pieces (rate limiter, session store,
+      // OAuth deps, getSourceKey) and wires the program-scoped instances.
+      // Using the helper here ensures production and the offline diagnostic share
+      // the same wiring path — a future edit that drops a dep from the helper
+      // will be caught by the diagnostic before it reaches production.
+      const operatorInputs = buildOperatorServerInputs({
         logger,
-        auditLogger: logger,
-        clock: () => Date.now(),
-      }
+        isShuttingDown,
+        denylistCache,
+        bindingsStore,
+        runObservationManager,
+        runIndex,
+        approvalRegistry,
+        launchWorkDeps: runEngineDeps,
+        operatorWebConfig: config.operatorWeb,
+      })
 
-      // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
-      // Pass the session store so successful callbacks mint a fresh session.
-      // Pass the allowlist so non-allowlisted users are denied before session creation.
-      const githubOAuthDeps = buildGitHubOAuthDeps(
-        logger,
-        logger,
-        getSourceKey,
-        operatorRateLimiter,
-        sessionStore,
-        sessionDeps,
-        config.operatorWeb.allowlist,
-      )
-
-      operatorServerHandle = deps.startOperatorServer(
-        {
-          logger,
-          isShuttingDown,
-          rateLimiter: operatorRateLimiter,
-          githubOAuth: githubOAuthDeps,
-          sessionStore,
-          sessionDeps,
-          allowlist: config.operatorWeb.allowlist,
-          csrfSecret: config.operatorWeb.csrfSecret,
-          auditLogger: logger,
-          // Wire the existing program-scoped instances so the run-stream route
-          // can reach them without creating second copies.
-          denylistCache,
-          bindingsLookup: bindingsStore,
-          // listBindings is a distinct dep from bindingsLookup: server.ts gates the
-          // GET /operator/repos mount on listBindings, so omitting it leaves that
-          // route unmounted (404). bindingsLookup only covers the run-stream route.
-          listBindings: bindingsStore.listBindings.bind(bindingsStore),
-          runObservationManager,
-          runIndex,
-        },
-        {
-          bindHost: config.operatorWeb.bindHost,
-          bindPort: config.operatorWeb.bindPort,
-          publicOrigin: config.operatorWeb.publicOrigin,
-          githubOAuth: {
-            clientId: config.operatorWeb.oauthClientId,
-            clientSecret: config.operatorWeb.oauthClientSecret,
-            publicOrigin: config.operatorWeb.publicOrigin,
-            callbackPath: '/operator/auth/github/callback',
-            allowedReturnPaths: config.operatorWeb.oauthAllowedReturnPaths,
-            stateTtlMs: config.operatorWeb.oauthStateTtlMs,
-            maxOutstandingAttemptsPerKey: config.operatorWeb.oauthMaxOutstandingAttemptsPerKey,
-          },
-        },
-      )
+      operatorServerHandle = deps.startOperatorServer(operatorInputs.deps, operatorInputs.config)
       logger.info(
         {bindHost: config.operatorWeb.bindHost, bindPort: config.operatorWeb.bindPort},
         'operator web endpoint enabled — HTTP server started',
