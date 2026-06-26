@@ -70,8 +70,12 @@ export interface OperatorRunStatus {
  *
  * 'blocked' and 'waiting_for_approval' are NOT in this map — they are
  * endpoint-layer overlays, not derivable from RunPhase alone.
+ *
+ * Exported so sibling projectors (e.g. run-summary.ts) can reuse the mapping
+ * without re-declaring it. Consumers outside this package should import from
+ * the contract barrel.
  */
-const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
+export const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
   PENDING: 'queued',
   ACKNOWLEDGED: 'running',
   EXECUTING: 'running',
