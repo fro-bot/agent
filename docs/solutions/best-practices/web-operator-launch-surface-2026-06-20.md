@@ -1,6 +1,7 @@
 ---
 title: 'Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route'
 date: 2026-06-20
+last_updated: 2026-06-26
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -19,6 +20,8 @@ tags:
   - write-route
   - transport-agnostic
   - denylist
+  - dedup
+  - fanout
   - no-oracle
   - idempotency
 ---
@@ -115,15 +118,22 @@ const onPending = request.createApprovalOnPending === undefined
 
 The `?? default` (or `=== undefined ? default : ...`) selection is the single point where the other transport's behavior is preserved. Skipping the empty-string guard is exactly how an "additive" change silently regresses.
 
-### 5. Scoped enumeration: denylist-filter, then per-repo authz, hard cap, closed DTO
+### 5. Scoped enumeration: denylist-filter, dedup, hard cap, per-repo authz, closed DTO
 
-A repo list must not let an allowed operator enumerate unrelated repositories. The working set is built in strict order: `listBindings` → `filterDeniedRecords` (denylist-first, before any authz call) → hard cap → per-binding `checkRepoAuthz`, keeping only repos the operator actually accesses. Denied/unauthorized repos are silently omitted (not differentiated). The projection is closed by construction — it copies only the display-safe fields, never spreads the binding — so a future internal binding field cannot leak.
+A repo list must not let an allowed operator enumerate unrelated repositories, and duplicate channel bindings must not crowd distinct repos out of the cap. The working set is built in strict order: `listBindings` → `filterDeniedRecords` (denylist-first, before any authz call) → dedup by `owner/repo` → hard cap → per-repo `checkRepoAuthz`, keeping only repos the operator actually accesses. Denied/unauthorized repos are silently omitted (not differentiated). The projection is closed by construction — it copies only the display-safe fields, never spreads the binding — so a future internal binding field cannot leak.
 
 ```ts
 const result = await deps.listBindings()
 if (result.success === false) return c.json({error: 'unavailable'}, 503)
 const allowed = filterDeniedRecords(result.data, bindingToRepoKey, deps.isRepoDenied)
-const capped = allowed.slice(0, MAX_REPOS_PER_LISTING)
+const seenRepos = new Set<string>()
+const unique = allowed.filter(binding => {
+  const key = `${binding.owner}/${binding.repo}`
+  if (seenRepos.has(key)) return false
+  seenRepos.add(key)
+  return true
+})
+const capped = unique.slice(0, MAX_REPOS_PER_LISTING)
 const authorized = []
 for (const b of capped) {
   const r = await checkRepoAuthz(githubUserId, b.owner, b.repo, token, deps.repoAuthzDeps)
@@ -131,6 +141,8 @@ for (const b of capped) {
 }
 return c.json(authorized.map(toRepoSummary), 200) // toRepoSummary copies {owner, repo, channelName?} only
 ```
+
+The dedup step must run before the cap, not after. Bindings are keyed by channel, so the same repo can appear multiple times; if those duplicates consume cap slots, the route returns fewer distinct repos than intended and hides later unique repos from the operator. Distinct `owner/repo` pairs beyond the cap are silently truncated.
 
 Rate-limit the list **per operator** (not per socket, not per repo): the per-request authz fan-out is up to one GitHub call per bound repo, so an unlimited list route is an OAuth-budget self-DoS.
 
@@ -170,7 +182,7 @@ The auto-deny transport (rule 3) and the fire-and-return runId ownership (rule 1
 - Adding any non-Discord transport (web, CLI, API) that drives `launchWork`: own the runId, register before firing, never await, supply the three seams (or inherit Discord defaults — not what a new transport wants).
 - Any write route where redaction must run before an external authz call and pre-acceptance denials must be indistinguishable.
 - A surface with no human approval channel: auto-deny tool approvals rather than fall through to a transport that holds the lock.
-- Scoped per-operator enumeration: reuse the `listBindings → filterDeniedRecords → per-repo authz → closed DTO` sequence and rate-limit per operator.
+- Scoped per-operator enumeration: reuse the `listBindings → filterDeniedRecords → dedup by owner/repo → hard cap → per-repo authz → closed DTO` sequence and rate-limit per operator.
 - Any new denylist check: route through `bindingToRepoKey` rather than re-extracting the fields.
 
 ## Examples
@@ -198,4 +210,5 @@ if (body === null || typeof body !== 'object' || Array.isArray(body)) return c.j
 - [centralize-s3-key-identity-construction-2026-06-09.md](centralize-s3-key-identity-construction-2026-06-09.md) — `bindingToRepoKey` is a third key family under the same one-owner-one-builder discipline.
 - [atomic-serial-channel-queue-handoff-2026-06-09.md](atomic-serial-channel-queue-handoff-2026-06-09.md) — the launch surface threads `launchWork` with a synthetic per-operator/per-repo `channelId`; the FIFO + cap + shutdown discipline is respected by reuse, not extended.
 - [dependency-gated-route-registration-guard-2026-06-25.md](dependency-gated-route-registration-guard-2026-06-25.md) — the registration regression guard for this surface: `POST /operator/runs` was silently 404 in production because its deps weren't wired at the construction site. The offline route-inventory smoke (sharing the production wiring helper) is what catches that class.
-- Shipped via PR #968 under issue #907; the redaction-before-authz invariant is anchored by #950 and the operator-auth authority by #951. Run lifecycle admission moved into `launchWork` (queued/failed runs observable, two-phase idempotency) as a follow-up. Remaining deferred work: #965 (stream web-launched run output to the operator).
+- PR #1038 — extended the scoped-enumeration rule to both `GET /operator/repos` and `GET /operator/runs`: denylist first, dedup duplicate `owner/repo` bindings before the authz fan-out cap, then authz. This closed the bug where duplicate bindings consumed cap slots and crowded out distinct repos.
+- Shipped via PR #968 under issue #907; the redaction-before-authz invariant is anchored by #950 and the operator-auth authority by #951. Run lifecycle admission moved into `launchWork` (queued/failed runs observable, two-phase idempotency) as a follow-up. Remaining deferred work: #1036 (operator run-index scale follow-ups).
