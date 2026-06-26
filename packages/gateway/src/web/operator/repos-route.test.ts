@@ -7,8 +7,9 @@
  *   3. Resolve OAuth token via session store
  *   4. listBindings() — all bound repos
  *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   7. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+ *   6. Dedup by owner/repo, then cap before the authz fan-out
+ *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
+ *   8. Map to RepoSummary[]; return 200
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
@@ -325,6 +326,25 @@ describe('GET /operator/repos — error paths', () => {
     expect(Array.isArray(body)).toBe(false)
   })
 
+  it('returns coarse 503 when listBindings throws (not just success:false)', async () => {
+    // #given — listBindings rejects (unexpected throw, not a Result failure)
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => {
+        throw new Error('unexpected network crash')
+      }),
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — coarse 503; body is not an array
+    expect(res.status).toBe(503)
+    const body = (await res.json()) as {error?: string}
+    expect(typeof body.error).toBe('string')
+    expect(Array.isArray(body)).toBe(false)
+  })
+
   it('logs the store error without including the token', async () => {
     // #given listBindings fails
     const warnSpy = vi.fn()
@@ -362,6 +382,44 @@ describe('GET /operator/repos — error paths', () => {
     expect(res.status).not.toBe(200)
     const body = (await res.json()) as {error?: string}
     expect(typeof body.error).toBe('string')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Degraded path — authz throws for one repo, succeeds for the other
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/repos — checkRepoAuthz throws (degraded path)', () => {
+  it('silently omits a repo when checkRepoAuthz throws — other repos still returned', async () => {
+    // #given — 2 bindings; checkRepoAuthz throws for broken-authz, succeeds for good-repo
+    const bindings = [makeBinding('acme', 'broken-authz'), makeBinding('acme', 'good-repo')]
+
+    // authzFetch throws for broken-authz, returns 200 for good-repo
+    const authzFetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url)
+      if (urlStr.includes('broken-authz')) {
+        throw new Error('GitHub API timeout')
+      }
+      return new Response('{}', {status: 200})
+    }) as typeof globalThis.fetch
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/good-repo']), {fetch: authzFetch}),
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — 200 (not 500); broken-authz omitted; good-repo present
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {repo: string}[]
+    // Response is an array (not an error object)
+    expect(Array.isArray(body)).toBe(true)
+    const repos = body.map(r => r.repo)
+    expect(repos).toContain('good-repo')
+    expect(repos).not.toContain('broken-authz')
   })
 })
 
@@ -468,6 +526,77 @@ describe('GET /operator/repos — contract', () => {
 
     // #then
     expect(res.headers.get('cache-control')).toBe('no-store, private')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix — dedup bindings by owner/repo BEFORE the authz fan-out cap
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/repos — dedup before authz cap', () => {
+  it('reaches the 101st unique repo when two earlier bindings share the same owner/repo', async () => {
+    // #given — 101 bindings: 2 share acme/shared (different channelIds), 98 distinct repos,
+    // plus acme/last-unique. After dedup: 100 distinct repos, all within the cap of 100.
+    // Without dedup-before-cap, last-unique (index 100) would be dropped by the cap.
+
+    const sharedBindingA = makeBinding('acme', 'shared', {channelId: 'chan-shared-A'})
+    const sharedBindingB = makeBinding('acme', 'shared', {channelId: 'chan-shared-B'})
+    // 98 distinct repos (indices 2..99 in the original list)
+    const distinctBindings = Array.from({length: 98}, (_, i) =>
+      makeBinding('acme', `repo-${i + 2}`, {channelId: `chan-repo-${i + 2}`}),
+    )
+    const lastUniqueBinding = makeBinding('acme', 'last-unique', {channelId: 'chan-last-unique'})
+
+    const bindings = [sharedBindingA, sharedBindingB, ...distinctBindings, lastUniqueBinding]
+
+    // All repos are authorized
+    const authorizedRepos = new Set<string>([
+      'acme/shared',
+      ...distinctBindings.map(b => `${b.owner}/${b.repo}`),
+      'acme/last-unique',
+    ])
+
+    // Track which repos authz was called for
+    const authzFetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url)
+      const match = /\/repos\/([^/]+)\/([^/]+)$/.exec(urlStr)
+      if (match !== null) {
+        const key = `${match[1]}/${match[2]}`
+        const status = authorizedRepos.has(key) ? 200 : 404
+        return new Response('{}', {status})
+      }
+      return new Response('{}', {status: 404})
+    }) as typeof globalThis.fetch
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos, {fetch: authzFetch}),
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — status 200
+    expect(res.status).toBe(200)
+
+    // authz was called for acme/last-unique (dedup-before-cap allows it through)
+    const authzCalls = (authzFetch as ReturnType<typeof vi.fn>).mock.calls as [string | URL | Request][]
+    const calledUrls = authzCalls.map(([url]) => String(url))
+    expect(calledUrls.some(u => u.includes('last-unique'))).toBe(true)
+
+    // response includes last-unique
+    const body = (await res.json()) as {owner: string; repo: string}[]
+    const repoNames = body.map(r => r.repo)
+    expect(repoNames).toContain('last-unique')
+
+    // acme/shared appears exactly once in the response
+    const sharedEntries = body.filter(r => r.owner === 'acme' && r.repo === 'shared')
+    expect(sharedEntries).toHaveLength(1)
+
+    // acme/shared was authz-checked exactly once
+    const sharedAuthzCalls = calledUrls.filter(u => u.endsWith('/repos/acme/shared'))
+    expect(sharedAuthzCalls).toHaveLength(1)
   })
 })
 

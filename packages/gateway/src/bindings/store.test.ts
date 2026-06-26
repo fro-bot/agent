@@ -36,6 +36,7 @@ function makeAdapter(overrides: Partial<Required<ObjectStoreAdapter>> = {}): Req
     conditionalPut: vi.fn(async () => ok({etag: 'etag-primary'})),
     conditionalDelete: vi.fn(async () => ok(undefined)),
     getObject: vi.fn(async () => ok({data: JSON.stringify(makeBinding()), etag: 'etag-primary'})),
+    listWithMetadata: vi.fn(async () => ok([])),
     ...overrides,
   }
 }

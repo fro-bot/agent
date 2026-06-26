@@ -1,6 +1,7 @@
 ---
 title: 'Guard dep-gated routes with a shared wiring seam and an offline route-inventory smoke'
 date: 2026-06-25
+last_updated: 2026-06-26
 category: best-practices
 module: gateway
 problem_type: best_practice
@@ -32,6 +33,7 @@ mounts each route behind a runtime **dependency-presence gate**:
 
 - `GET /operator/repos` mounts only if `deps.listBindings !== undefined`
 - `POST /operator/runs` mounts only if `deps.getBindingByRepo !== undefined && deps.launchWorkDeps !== undefined`
+- `GET /operator/runs` mounts only if `deps.runIndex !== undefined && deps.listBindings !== undefined`
 - `POST /operator/runs/:runId/approvals/:requestId/decision` and
   `GET /operator/runs/:runId/approvals` mount only if `deps.approvalRegistry !== undefined`
 
@@ -133,9 +135,9 @@ Skip it when the wiring is trivial (one file, one path, no optional fields) or w
 small enough to construct in-test with all real deps and bind to `127.0.0.1:0`.
 
 **Maintenance rule:** the route inventory is a load-bearing claim about the surface. When a new route
-lands (e.g. `GET /operator/runs` from #1027), add it to `EXPECTED_OPERATOR_ROUTES` in the same PR.
-Forgetting to update the constant when adding a route silently lets the new route skip the guard's
-coverage — a fresh instance of the same bug class.
+lands, add it to `EXPECTED_OPERATOR_ROUTES` in the same PR. `GET /operator/runs` is now part of that
+canonical inventory. Forgetting to update the constant when adding a route silently lets the new route
+skip the guard's coverage — a fresh instance of the same bug class.
 
 ## Examples
 
@@ -203,6 +205,7 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'GET',  path: '/operator/session'},
   {method: 'GET',  path: '/operator/repos'},
   {method: 'POST', path: '/operator/runs'},
+  {method: 'GET',  path: '/operator/runs'},
   {method: 'GET',  path: '/operator/runs/:runId/stream'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'GET',  path: '/operator/runs/:runId/approvals'},
@@ -294,8 +297,9 @@ it('registers the full operator route set when all deps are provided', () => {
 - [gateway-docker-runtime-resolution-crash-loop](../build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md)
   — the sibling "build-time invariant + CI self-check against the BUILT image" pattern, applied to
   module resolution rather than route registration.
-- [web-operator-launch-surface](./web-operator-launch-surface-2026-06-20.md) — the launch feature whose
-  `POST /operator/runs` is in `EXPECTED_OPERATOR_ROUTES`; this guard is its registration regression test.
+- [web-operator-launch-surface](./web-operator-launch-surface-2026-06-20.md) — the operator listing and launch
+  surface whose `GET /operator/repos`, `GET /operator/runs`, and `POST /operator/runs` routes are in
+  `EXPECTED_OPERATOR_ROUTES`; this guard is their registration regression test.
 - [gateway-control-surface-spine](./gateway-control-surface-spine-2026-06-15.md) — the spine that defines
   the operator transports; this guard asserts those routes are actually mounted.
 - [authenticated-sse-run-observation](./authenticated-sse-run-observation-2026-06-20.md) — the SSE route
