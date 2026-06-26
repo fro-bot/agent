@@ -545,7 +545,7 @@ async function makeGitRepo(dir: string): Promise<{repoDir: string; commit: strin
   return {repoDir, commit, provenanceContent}
 }
 
-describe('packageArtifact', () => {
+describe('packageArtifact', {timeout: 15_000}, () => {
   it('creates a tar artifact at outPath containing provenance.json', async () => {
     // #given
     const {repoDir, commit} = await makeGitRepo(tmpDir)

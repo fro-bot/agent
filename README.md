@@ -373,7 +373,7 @@ concurrency:
 | `omo-slim-preset` | No | `openai` | OMO Slim preset to install. One of `openai`, `opencode-go`. Only applies when `enable-omo-slim: true`. |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | Execution timeout in milliseconds (0 = no limit) |
-| `opencode-version` | No | `1.2.24` | OpenCode CLI version for installation |
+| `opencode-version` | No | Source-pinned harness build | OpenCode CLI version for installation |
 | `systematic-version` | No | `2.1.0` | Systematic plugin version for OpenCode |
 | `session-retention` | No | `50` | Number of sessions to retain before pruning |
 | `s3-backup` | No | `false` | Enable S3-compatible object storage as canonical backend |
