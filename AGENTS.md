@@ -229,5 +229,5 @@ bun run dist:check-hidden-unicode    # Verify dist/ has no raw hidden Unicode (l
 Read-only dependency source repositories are available under
 `.slim/clonedeps/repos/` for inspection. Do not edit these clones.
 
-- `.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/` — `anomalyco/opencode` at `v1.17.9`; OpenCode server source. Read `src/session/{prompt,message,message-v2,processor}.ts` to understand how `message.part.updated` bus events transition through the tool-part lifecycle (pending → running → completed) the Fro Bot harness consumes.
-- `.slim/clonedeps/repos/anomalyco__opencode/packages/sdk/js/` — `@opencode-ai/sdk` at `v1.17.9`; thin HTTP + SSE client over the server. Useful for confirming event shapes pass through unchanged and for verifying our `processEventStream` consumer matches the SSE subscription contract.
+- `.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/` — `anomalyco/opencode` at `v1.17.11`; OpenCode server source. Read `src/session/{prompt,message,message-v2,processor}.ts` to understand how `message.part.updated` bus events transition through the tool-part lifecycle (pending → running → completed) the Fro Bot harness consumes.
+- `.slim/clonedeps/repos/anomalyco__opencode/packages/sdk/js/` — `@opencode-ai/sdk` at `v1.17.11`; thin HTTP + SSE client over the server. Useful for confirming event shapes pass through unchanged and for verifying our `processEventStream` consumer matches the SSE subscription contract.
