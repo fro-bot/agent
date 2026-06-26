@@ -532,4 +532,170 @@ describe('createS3Adapter', () => {
       credentials: {accessKeyId: 'AKIA...', secretAccessKey: 'wJal...'},
     })
   })
+
+  // ── listWithMetadata ──────────────────────────────────────────────────────
+
+  describe('listWithMetadata', () => {
+    it('returns key+lastModified pairs from a single-page response', async () => {
+      // #given
+      const now = new Date('2026-06-25T10:00:00.000Z')
+      const later = new Date('2026-06-25T11:00:00.000Z')
+      sendMock.mockResolvedValueOnce({
+        Contents: [
+          {Key: 'prefix/run-a.json', LastModified: now},
+          {Key: 'prefix/run-b.json', LastModified: later},
+        ],
+        IsTruncated: false,
+      })
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : undefined).toEqual([
+        {key: 'prefix/run-a.json', lastModified: now},
+        {key: 'prefix/run-b.json', lastModified: later},
+      ])
+    })
+
+    it('paginates across continuation tokens like list()', async () => {
+      // #given — two pages
+      const t1 = new Date('2026-06-25T09:00:00.000Z')
+      const t2 = new Date('2026-06-25T10:00:00.000Z')
+      sendMock
+        .mockResolvedValueOnce({
+          Contents: [{Key: 'prefix/run-a.json', LastModified: t1}],
+          IsTruncated: true,
+          NextContinuationToken: 'page-2',
+        })
+        .mockResolvedValueOnce({
+          Contents: [{Key: 'prefix/run-b.json', LastModified: t2}],
+          IsTruncated: false,
+        })
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then — both pages merged
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : undefined).toEqual([
+        {key: 'prefix/run-a.json', lastModified: t1},
+        {key: 'prefix/run-b.json', lastModified: t2},
+      ])
+      expect(sendMock).toHaveBeenCalledTimes(2)
+      expect(getCommandInput(1)).toMatchObject({ContinuationToken: 'page-2'})
+    })
+
+    it('skips entries missing Key', async () => {
+      // #given — one entry has no Key
+      const t = new Date('2026-06-25T10:00:00.000Z')
+      sendMock.mockResolvedValueOnce({
+        Contents: [
+          {LastModified: t}, // no Key
+          {Key: 'prefix/run-b.json', LastModified: t},
+        ],
+        IsTruncated: false,
+      })
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then — only the entry with both Key and LastModified is returned
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : undefined).toEqual([{key: 'prefix/run-b.json', lastModified: t}])
+    })
+
+    it('skips entries missing LastModified', async () => {
+      // #given — one entry has no LastModified
+      const t = new Date('2026-06-25T10:00:00.000Z')
+      sendMock.mockResolvedValueOnce({
+        Contents: [
+          {Key: 'prefix/run-a.json'}, // no LastModified
+          {Key: 'prefix/run-b.json', LastModified: t},
+        ],
+        IsTruncated: false,
+      })
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then — only the entry with both Key and LastModified is returned
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : undefined).toEqual([{key: 'prefix/run-b.json', lastModified: t}])
+    })
+
+    it('returns err when S3 throws', async () => {
+      // #given
+      sendMock.mockRejectedValue(
+        Object.assign(new Error('access denied'), {
+          Code: 'AccessDenied',
+          $metadata: {httpStatusCode: 403},
+          name: 'S3ServiceException',
+        }),
+      )
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+    })
+
+    it('returns an empty array when Contents is empty', async () => {
+      // #given
+      sendMock.mockResolvedValueOnce({Contents: [], IsTruncated: false})
+      const logger = createLogger()
+      const adapter = createS3Adapter(baseConfig, logger)
+      const listWithMetadata = adapter.listWithMetadata
+
+      if (listWithMetadata == null) {
+        throw new Error('Expected listWithMetadata to be defined on S3 adapter')
+      }
+
+      // #when
+      const result = await listWithMetadata('prefix/')
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : undefined).toEqual([])
+    })
+  })
 })

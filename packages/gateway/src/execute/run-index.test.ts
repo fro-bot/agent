@@ -959,4 +959,275 @@ describe('createRunIndex', () => {
       expect(Object.keys(ctx)).not.toContain('repo')
     })
   })
+
+  // ── listRunsForRepo ───────────────────────────────────────────────────────
+
+  describe('listRunsForRepo', () => {
+    it('returns all runs for a repo via the injected findRunsForRepo', async () => {
+      // #given
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-b', 'acme/widget')]
+      const runsByRepo = new Map([['acme/widget', runs]])
+      const deps = makeDeps(runsByRepo)
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo: async (repo: string) => runsByRepo.get(repo) ?? [],
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-b']))
+    })
+
+    it('returns empty array when repo has no runs', async () => {
+      // #given
+      const runsByRepo = new Map<string, RunState[]>([['acme/widget', []]])
+      const deps = makeDeps(runsByRepo)
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo: async (repo: string) => runsByRepo.get(repo) ?? [],
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then
+      expect(result).toEqual([])
+    })
+
+    it('does not touch the accelerator or negative cache', async () => {
+      // #given — register a run in the accelerator, then call listRunsForRepo
+      const runs = [makeRunState('run-a', 'acme/widget')]
+      const runsByRepo = new Map([['acme/widget', runs]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo,
+      })
+
+      // Register a run in the accelerator
+      index.register('run-a', {repo: 'acme/widget', surface: 'discord', startedAt: new Date().toISOString()})
+
+      // #when — listRunsForRepo should use findRunsForRepo, not the accelerator
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — returns runs from the scan
+      expect(result).toHaveLength(1)
+      // A subsequent lookup for the registered run still hits the accelerator (not affected)
+      const lookupResult = await index.lookup('run-a')
+      expect(lookupResult).toEqual({repo: 'acme/widget', surface: 'discord'})
+      // findRunsForRepo was called for listRunsForRepo (not for the accelerator lookup)
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+
+    it('uses listWithMetadata cap when the adapter provides it — only newest MAX_RUNS_PER_REPO keys are read', async () => {
+      // #given — build a store adapter with listWithMetadata returning 210 entries
+      // (more than MAX_RUNS_PER_REPO = 200), with varied lastModified dates.
+      // We want to assert that only the 200 newest are passed to getObject.
+      const totalEntries = 210
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      // Entry i has lastModified = baseTime + i*1000 (so entry 209 is newest)
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      // The newest 200 are entries 10..209 (indices 10 to 209 inclusive)
+      const newestKeys = new Set(metadataEntries.slice(10).map(e => e.key))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path with listWithMetadata
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — exactly 200 getObject calls (the cap)
+      expect(getObjectMock).toHaveBeenCalledTimes(200)
+
+      // All called keys must be from the newest 200
+      const calledKeys = getObjectMock.mock.calls.map(call => String(call[0]))
+      for (const key of calledKeys) {
+        expect(newestKeys.has(key)).toBe(true)
+      }
+
+      // The 10 oldest entries (run-000 through run-009) must NOT have been read
+      for (let i = 0; i < 10; i++) {
+        const oldKey = `prefix/run-${String(i).padStart(3, '0')}.json`
+        expect(calledKeys).not.toContain(oldKey)
+      }
+
+      // Result has 200 runs
+      expect(result).toHaveLength(200)
+    })
+
+    it('falls back to unbounded list() when listWithMetadata is absent', async () => {
+      // #given — adapter without listWithMetadata; list() returns 3 keys
+      const runs = [
+        makeRunState('run-a', 'acme/widget'),
+        makeRunState('run-b', 'acme/widget'),
+        makeRunState('run-c', 'acme/widget'),
+      ]
+
+      const getObjectMock = vi.fn(async (key: string) => {
+        const idx = ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+          // No listWithMetadata — adapter without the method
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — all 3 runs returned via the unbounded list() path
+      expect(result).toHaveLength(3)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-b', 'run-c']))
+      // getObject was called 3 times (one per key from list())
+      expect(getObjectMock).toHaveBeenCalledTimes(3)
+    })
+
+    it('skips a key when getObject fails — does not abort the scan', async () => {
+      // #given — 3 keys; the second getObject call fails
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-c', 'acme/widget')]
+      let callCount = 0
+      const getObjectMock = vi.fn(async (key: string) => {
+        callCount++
+        if (callCount === 2) {
+          return {success: false as const, error: new Error('S3 error')}
+        }
+        const idx = ['prefix/run-a.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — 2 runs returned (the failed key is skipped, not fatal)
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-c']))
+    })
+
+    it('injectable findRunsForRepo takes precedence over the production scan', async () => {
+      // #given — adapter has listWithMetadata, but findRunsForRepo is injected
+      const injectedRuns = [makeRunState('run-injected', 'acme/widget')]
+      const listWithMetadataMock = vi.fn()
+      const getObjectMock = vi.fn()
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn(),
+          getObject: getObjectMock,
+          listWithMetadata: listWithMetadataMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        findRunsForRepo: async () => injectedRuns,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — injected function used; production scan (listWithMetadata/getObject) not called
+      expect(result).toEqual(injectedRuns)
+      expect(listWithMetadataMock).not.toHaveBeenCalled()
+      expect(getObjectMock).not.toHaveBeenCalled()
+    })
+  })
 })

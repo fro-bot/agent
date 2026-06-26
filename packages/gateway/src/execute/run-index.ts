@@ -83,6 +83,15 @@ export interface RunIndex {
    * no-session). The typed re-auth result shape is designed with the 4b consumer.
    */
   lookup: (runId: string) => Promise<RunLocation | undefined>
+
+  /**
+   * Return all run-states for a single repo, bounded to the newest
+   * MAX_RUNS_PER_REPO entries when the store adapter supports metadata listing.
+   *
+   * Does NOT touch the accelerator or negative cache — this is a read scan,
+   * not a runId resolution. A failing key is skipped (not fatal).
+   */
+  listRunsForRepo: (repo: string) => Promise<readonly RunState[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +123,13 @@ const NEGATIVE_CACHE_TTL_MS = 60_000
  * Oldest entry is evicted when the cap is reached (same pattern as the accelerator).
  */
 const NEGATIVE_CACHE_CAP = 200
+
+/**
+ * Per-repo read cap for listRunsForRepo when the store adapter provides listWithMetadata.
+ * Bounds the number of getObject calls per repo to the newest K objects by LastModified.
+ * Large enough to comfortably hold the global newest-100 across the per-repo set.
+ */
+const MAX_RUNS_PER_REPO = 200
 
 export interface RunIndexDeps {
   readonly bindingsStore: BindingsStore
@@ -410,5 +426,87 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
     return fallbackLookup(runId)
   }
 
-  return {register, lookup}
+  // ---------------------------------------------------------------------------
+  // listRunsForRepo
+  // ---------------------------------------------------------------------------
+
+  async function fetchRunsForKeys(
+    keys: readonly string[],
+    getObject: NonNullable<typeof coordinationConfig.storeAdapter.getObject>,
+  ): Promise<RunState[]> {
+    const runs: RunState[] = []
+    for (const key of keys) {
+      const fetched = await getObject(key)
+      if (fetched.success === false) {
+        logger.debug({key, err: fetched.error.message}, 'run-index: getObject failed in listRunsForRepo — skipping key')
+        continue
+      }
+      const parsed = parseRunState(fetched.data.data)
+      if (parsed.success === false) {
+        logger.debug(
+          {key, err: parsed.error.message},
+          'run-index: parseRunState failed in listRunsForRepo — skipping key',
+        )
+        continue
+      }
+      runs.push(parsed.data)
+    }
+    return runs
+  }
+
+  async function listRunsForRepo(repo: string): Promise<readonly RunState[]> {
+    // Injectable override takes precedence (used in tests; production uses the store adapter).
+    if (deps.findRunsForRepo !== undefined) {
+      return deps.findRunsForRepo(repo)
+    }
+
+    const prefixResult = getRunPrefix(coordinationConfig, identity, repo)
+    if (prefixResult.success === false) {
+      logger.warn(
+        {repo, err: prefixResult.error.message},
+        'run-index: getRunPrefix failed in listRunsForRepo — returning empty',
+      )
+      return []
+    }
+
+    const prefix = prefixResult.data
+
+    if (coordinationConfig.storeAdapter.getObject == null) {
+      logger.warn({repo}, 'run-index: store adapter does not support getObject in listRunsForRepo — returning empty')
+      return []
+    }
+
+    const getObject = coordinationConfig.storeAdapter.getObject.bind(coordinationConfig.storeAdapter)
+
+    // When the adapter provides listWithMetadata, sort by lastModified desc and cap to newest K.
+    if (coordinationConfig.storeAdapter.listWithMetadata !== undefined) {
+      const listed = await coordinationConfig.storeAdapter.listWithMetadata(prefix)
+      if (listed.success === false) {
+        logger.warn(
+          {repo, err: listed.error.message},
+          'run-index: listWithMetadata failed in listRunsForRepo — returning empty',
+        )
+        return []
+      }
+
+      // Sort newest-first, take the cap.
+      const sorted = listed.data.slice().sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
+      const capped = sorted.slice(0, MAX_RUNS_PER_REPO)
+      return fetchRunsForKeys(
+        capped.map(e => e.key),
+        getObject,
+      )
+    }
+
+    // Fallback: unbounded list() path (adapters without listWithMetadata).
+    const listed = await coordinationConfig.storeAdapter.list(prefix)
+    if (listed.success === false) {
+      logger.warn({repo, err: listed.error.message}, 'run-index: list failed in listRunsForRepo — returning empty')
+      return []
+    }
+
+    return fetchRunsForKeys(listed.data, getObject)
+  }
+
+  return {register, lookup, listRunsForRepo}
 }

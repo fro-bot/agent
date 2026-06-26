@@ -15,6 +15,10 @@ export interface ObjectStoreAdapter {
   ) => Promise<Result<{etag: string}, Error>>
   readonly conditionalDelete?: (key: string, options: {ifMatch: string}) => Promise<Result<void, Error>>
   readonly getObject?: (key: string) => Promise<Result<{data: string; etag: string}, Error>>
+  /** Returns keys with their S3 LastModified timestamps for recency-bounded scans. */
+  readonly listWithMetadata?: (
+    prefix: string,
+  ) => Promise<Result<readonly {readonly key: string; readonly lastModified: Date}[], Error>>
 }
 
 export interface ValidationError extends Error {
