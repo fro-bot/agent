@@ -127,7 +127,12 @@ export interface BuildOperatorServerInputs {
    * which causes GET /operator/runs/:runId/stream to be absent from app.routes.
    */
   readonly runObservationManager?: NonNullable<OperatorServerDeps['runObservationManager']> | undefined
-  readonly runIndex: NonNullable<OperatorServerDeps['runIndex']>
+  /**
+   * Run index for runId → {repo, surface} resolution.
+   * Required in production. Optional here so the offline diagnostic can pass
+   * undefined to simulate a missing dep and verify GET /operator/runs is absent.
+   */
+  readonly runIndex?: NonNullable<OperatorServerDeps['runIndex']> | undefined
   /**
    * Approval registry for the approval routes.
    * Optional — omit (or pass undefined) to simulate a missing dep in tests,

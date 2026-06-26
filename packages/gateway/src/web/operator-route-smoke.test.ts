@@ -63,6 +63,7 @@ function makeStubRunIndex() {
   return {
     register: () => undefined,
     lookup: async () => undefined,
+    listRunsForRepo: async () => [] as const,
   }
 }
 
@@ -288,6 +289,19 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     })
 
     // #then — non-zero exit (approval routes absent)
+    expect(exitCode).not.toBe(0)
+  })
+
+  it('returns non-zero when GET /operator/runs is absent (runIndexOverride: undefined)', async () => {
+    // #given — runIndex flows through buildOperatorServerInputs; passing
+    // runIndexOverride: undefined causes the helper to pass undefined to
+    // deps.runIndex, and server.ts gates GET /operator/runs on that dep being present.
+    // #when
+    const exitCode = await runOperatorRouteSmoke({
+      runIndexOverride: undefined,
+    })
+
+    // #then — non-zero exit (GET /operator/runs absent)
     expect(exitCode).not.toBe(0)
   })
 })

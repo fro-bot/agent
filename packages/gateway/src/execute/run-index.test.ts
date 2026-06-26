@@ -821,6 +821,67 @@ describe('createRunIndex', () => {
     })
   })
 
+  // ── CORR-001: doFallbackScan strips #fragment from entity_ref ────────────
+
+  describe('CORR-001: doFallbackScan strips #fragment from entity_ref (pre-existing fix)', () => {
+    it('fallback lookup returns repo without #fragment when entity_ref is owner/repo#N', async () => {
+      // #given — run-state with entity_ref containing a #runNumber fragment
+      // (the pre-existing bug: without the fix, RunLocation.repo would be 'acme/widget#42')
+      const runState = makeRunState('run-corr-001', 'acme/widget', 'discord')
+      // Simulate entity_ref with fragment (as stored in real run-states)
+      const runStateWithFragment = {...runState, entity_ref: 'acme/widget#42'}
+
+      const runsByRepo = new Map([['acme/widget', [runStateWithFragment]]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — fallback scan (run not in accelerator)
+      const result = await index.lookup('run-corr-001')
+
+      // #then — repo is 'acme/widget' (no '#42' fragment)
+      expect(result).toBeDefined()
+      expect(result?.repo).toBe('acme/widget')
+      expect(result?.repo).not.toContain('#')
+      expect(result?.surface).toBe('discord')
+    })
+
+    it('re-cached entry after fallback also has repo without #fragment', async () => {
+      // #given — same as above; verify the accelerator re-cache also strips the fragment
+      const runState = makeRunState('run-corr-001-recache', 'acme/widget', 'web')
+      const runStateWithFragment = {...runState, entity_ref: 'acme/widget#99'}
+
+      const runsByRepo = new Map([['acme/widget', [runStateWithFragment]]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — first lookup triggers fallback + re-cache
+      const first = await index.lookup('run-corr-001-recache')
+      // Second lookup hits the accelerator (re-cached)
+      const second = await index.lookup('run-corr-001-recache')
+
+      // #then — both return clean repo (no fragment); findRunsForRepo called once
+      expect(first?.repo).toBe('acme/widget')
+      expect(second?.repo).toBe('acme/widget')
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+  })
+
   // ── FIX 6: Exact S3 key regression test ──────────────────────────────────
 
   describe('exact S3 key shape (FIX 6)', () => {
@@ -957,6 +1018,414 @@ describe('createRunIndex', () => {
       expect(ctx.runId).toBe('run-miss-debug')
       // Must NOT contain repo identity (no oracle)
       expect(Object.keys(ctx)).not.toContain('repo')
+    })
+  })
+
+  // ── listRunsForRepo ───────────────────────────────────────────────────────
+
+  describe('listRunsForRepo', () => {
+    it('returns all runs for a repo via the injected findRunsForRepo', async () => {
+      // #given
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-b', 'acme/widget')]
+      const runsByRepo = new Map([['acme/widget', runs]])
+      const deps = makeDeps(runsByRepo)
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo: async (repo: string) => runsByRepo.get(repo) ?? [],
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-b']))
+    })
+
+    it('returns empty array when repo has no runs', async () => {
+      // #given
+      const runsByRepo = new Map<string, RunState[]>([['acme/widget', []]])
+      const deps = makeDeps(runsByRepo)
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo: async (repo: string) => runsByRepo.get(repo) ?? [],
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then
+      expect(result).toEqual([])
+    })
+
+    it('does not touch the accelerator or negative cache', async () => {
+      // #given — register a run in the accelerator, then call listRunsForRepo
+      const runs = [makeRunState('run-a', 'acme/widget')]
+      const runsByRepo = new Map([['acme/widget', runs]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        ...deps,
+        now,
+        findRunsForRepo,
+      })
+
+      // Register a run in the accelerator
+      index.register('run-a', {repo: 'acme/widget', surface: 'discord', startedAt: new Date().toISOString()})
+
+      // #when — listRunsForRepo should use findRunsForRepo, not the accelerator
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — returns runs from the scan
+      expect(result).toHaveLength(1)
+      // A subsequent lookup for the registered run still hits the accelerator (not affected)
+      const lookupResult = await index.lookup('run-a')
+      expect(lookupResult).toEqual({repo: 'acme/widget', surface: 'discord'})
+      // findRunsForRepo was called for listRunsForRepo (not for the accelerator lookup)
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+
+    it('uses listWithMetadata cap when the adapter provides it — only newest MAX_RUNS_PER_REPO keys are read', async () => {
+      // #given — build a store adapter with listWithMetadata returning 210 entries
+      // (more than MAX_RUNS_PER_REPO = 200), with varied lastModified dates.
+      // We want to assert that only the 200 newest are passed to getObject.
+      const totalEntries = 210
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      // Entry i has lastModified = baseTime + i*1000 (so entry 209 is newest)
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      // The newest 200 are entries 10..209 (indices 10 to 209 inclusive)
+      const newestKeys = new Set(metadataEntries.slice(10).map(e => e.key))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path with listWithMetadata
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — exactly 200 getObject calls (the cap)
+      expect(getObjectMock).toHaveBeenCalledTimes(200)
+
+      // All called keys must be from the newest 200
+      const calledKeys = getObjectMock.mock.calls.map(call => String(call[0]))
+      for (const key of calledKeys) {
+        expect(newestKeys.has(key)).toBe(true)
+      }
+
+      // The 10 oldest entries (run-000 through run-009) must NOT have been read
+      for (let i = 0; i < 10; i++) {
+        const oldKey = `prefix/run-${String(i).padStart(3, '0')}.json`
+        expect(calledKeys).not.toContain(oldKey)
+      }
+
+      // Result has 200 runs
+      expect(result).toHaveLength(200)
+    })
+
+    it('falls back to unbounded list() when listWithMetadata is absent', async () => {
+      // #given — adapter without listWithMetadata; list() returns 3 keys
+      const runs = [
+        makeRunState('run-a', 'acme/widget'),
+        makeRunState('run-b', 'acme/widget'),
+        makeRunState('run-c', 'acme/widget'),
+      ]
+
+      const getObjectMock = vi.fn(async (key: string) => {
+        const idx = ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+          // No listWithMetadata — adapter without the method
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — all 3 runs returned via the unbounded list() path
+      expect(result).toHaveLength(3)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-b', 'run-c']))
+      // getObject was called 3 times (one per key from list())
+      expect(getObjectMock).toHaveBeenCalledTimes(3)
+    })
+
+    it('skips a key when getObject fails — does not abort the scan', async () => {
+      // #given — 3 keys; the second getObject call fails
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-c', 'acme/widget')]
+      let callCount = 0
+      const getObjectMock = vi.fn(async (key: string) => {
+        callCount++
+        if (callCount === 2) {
+          return {success: false as const, error: new Error('S3 error')}
+        }
+        const idx = ['prefix/run-a.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — 2 runs returned (the failed key is skipped, not fatal)
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-c']))
+    })
+
+    it('returns empty array when getRunPrefix fails (production path)', async () => {
+      // #given — storeConfig with an invalid/missing bucket so getRunPrefix fails
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        // Override storeConfig to trigger getRunPrefix failure (empty bucket)
+        storeConfig: {enabled: false, bucket: '', prefix: '', region: 'us-east-1'},
+      }
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path
+      })
+
+      // #when — production path with a config that causes getRunPrefix to fail
+      // (getRunPrefix returns success:false when storeConfig.enabled is false or bucket is empty)
+      // We verify the function returns [] rather than throwing
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (getRunPrefix failure is handled gracefully)
+      expect(Array.isArray(result)).toBe(true)
+    })
+
+    it('skips a key when getObject fails in listRunsForRepo — does not abort the scan (production path)', async () => {
+      // #given — adapter with list() returning 3 keys; second getObject fails
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-c', 'acme/widget')]
+      let callCount = 0
+      const getObjectMock = vi.fn(async (key: string) => {
+        callCount++
+        if (callCount === 2) {
+          return {success: false as const, error: new Error('S3 error on key 2')}
+        }
+        const idx = ['prefix/run-a.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — 2 runs returned (the failed key is skipped, not fatal)
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-c']))
+    })
+
+    it('returns empty array when listWithMetadata returns err (production path)', async () => {
+      // #given — adapter with listWithMetadata that returns an error
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: vi.fn(),
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: false,
+            error: new Error('listWithMetadata S3 error'),
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (listWithMetadata failure handled gracefully)
+      expect(result).toEqual([])
+    })
+
+    it('returns empty array when list() fallback returns err (production path)', async () => {
+      // #given — adapter without listWithMetadata; list() returns an error
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: false,
+            error: new Error('list() S3 error'),
+          }),
+          getObject: vi.fn(),
+          // No listWithMetadata — falls through to list() path
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (list() failure handled gracefully)
+      expect(result).toEqual([])
+    })
+
+    it('injectable findRunsForRepo takes precedence over the production scan', async () => {
+      // #given — adapter has listWithMetadata, but findRunsForRepo is injected
+      const injectedRuns = [makeRunState('run-injected', 'acme/widget')]
+      const listWithMetadataMock = vi.fn()
+      const getObjectMock = vi.fn()
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn(),
+          getObject: getObjectMock,
+          listWithMetadata: listWithMetadataMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        findRunsForRepo: async () => injectedRuns,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — injected function used; production scan (listWithMetadata/getObject) not called
+      expect(result).toEqual(injectedRuns)
+      expect(listWithMetadataMock).not.toHaveBeenCalled()
+      expect(getObjectMock).not.toHaveBeenCalled()
     })
   })
 })

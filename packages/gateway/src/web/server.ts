@@ -52,6 +52,7 @@ import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
 import {buildPendingApprovalsRoute} from './operator/pending-approvals-route.js'
 import {buildReposRoute} from './operator/repos-route.js'
+import {buildRunsRoute} from './operator/runs-route.js'
 import {
   badRequestResponse,
   notFoundResponse,
@@ -166,7 +167,7 @@ export interface OperatorServerDeps {
    * launchWork (via launchWorkDeps.runIndex). Optional — omit in tests
    * that don't exercise the run-stream route.
    */
-  readonly runIndex?: Pick<RunIndex, 'lookup' | 'register'>
+  readonly runIndex?: Pick<RunIndex, 'lookup' | 'register' | 'listRunsForRepo'>
   /**
    * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
    * When absent, a fresh in-memory cache is created per buildOperatorApp call.
@@ -328,6 +329,7 @@ function validateForwardedHeaders(
  *   - GET /operator/session/csrf: when browser guard deps are set
  *   - GET /operator/session: when browser guard deps are set
  *   - GET /operator/repos: when browser guard + sessionStore + denylistCache + listBindings are set
+ *   - GET /operator/runs: when browser guard + sessionStore + denylistCache + listBindings + runIndex are set
  *   - POST /operator/runs: when browser guard + sessionStore + denylistCache + getBindingByRepo + launchWorkDeps are set
  *   - GET /operator/runs/:runId/stream: when browser guard + sessionStore + denylistCache + bindingsLookup + runObservationManager + runIndex are set
  *   - POST /operator/runs/:runId/approvals/:requestId/decision: when browser guard + sessionStore + denylistCache + bindingsLookup + runIndex + approvalRegistry are set
@@ -662,6 +664,54 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         logger: deps.logger,
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Run-index listing endpoint ─────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND listBindings,
+  // denylistCache, sessionStore, and runIndex are provided.
+  // Route: GET /operator/runs — privileged (requires session + allowlist).
+  // Returns a bounded, repo-scoped, newest-first list of run summaries for all
+  // repositories the operator is authorized to access.
+  //
+  // Gate ordering:
+  //   1. Guard (browser/session/allowlist) — installed above
+  //   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
+  //   3. Session token resolution
+  //   4. listBindings() — enumerate all bound repos
+  //   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
+  //   6. checkRepoAuthz() per surviving binding — keep only authorized repos
+  //   7. listRunsForRepo() per authorized binding — enumerate run-states
+  //   8. toRunSummary() projection — drop null (entity_ref mismatch) + warn
+  //   9. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+  //  10. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.listBindings !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined &&
+    deps.runIndex !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildRunsRoute(app, {
+      sessionStore: deps.sessionStore,
+      listBindings: deps.listBindings,
+      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      listRunsForRepo: deps.runIndex.listRunsForRepo.bind(deps.runIndex),
       logger: deps.logger,
       now: clock,
     })
