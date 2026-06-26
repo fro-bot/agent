@@ -172,7 +172,7 @@ activity." The triage on #1027 is effectively the spec; this plan implements it.
 
 ## Implementation Units
 
-- [ ] **Unit 1: `listWithMetadata` adapter method + `RunIndex.listRunsForRepo` capped scanner**
+- [x] **Unit 1: `listWithMetadata` adapter method + `RunIndex.listRunsForRepo` capped scanner**
 
 **Goal:** Expose the existing single-repo run-state scan as a public `RunIndex` method,
 bounded to the newest K objects per repo via a new optional metadata-listing adapter method.
@@ -223,7 +223,7 @@ bounded to the newest K objects per repo via a new optional metadata-listing ada
 adapter supports metadata listing; a failing key is isolated; accelerator/negative-cache
 untouched; the existing `list()` path and its consumers are unchanged.
 
-- [ ] **Unit 2: `RunSummary` contract type + projector + version bump**
+- [x] **Unit 2: `RunSummary` contract type + projector + version bump**
 
 **Goal:** Add the additive `RunSummary` DTO + a pure closed projector, and bump the contract
 version.
@@ -267,7 +267,7 @@ fail-closed `?? 'failed'`; `toOperatorRunStatus` returning `null` to signal omis
   binding for `ownerA/repoA` → returns `null` (omitted), warn-logged.
 - Unrecognized phase (corrupt data) → `status: 'failed'` (fail-closed, no undefined).
 
-- [ ] **Unit 3: `runs-route.ts` → `GET /operator/runs` (TDD)**
+- [x] **Unit 3: `runs-route.ts` → `GET /operator/runs` (TDD)**
 
 **Goal:** The route itself, mirroring `repos-route.ts` gate ordering exactly.
 
@@ -328,7 +328,7 @@ the bound); if a future high-binding deployment needs one, returning a partial s
 - Contract: `Cache-Control: no-store, private` header set.
 - Edge case: 401 when no guard installed (bare Hono app).
 
-- [ ] **Unit 4: Wire into `server.ts` + route-registration proof + docs**
+- [x] **Unit 4: Wire into `server.ts` + route-registration proof + docs**
 
 **Goal:** Register the route, prove it mounts (the #1001 class), update docs.
 

@@ -63,6 +63,7 @@ function makeStubRunIndex() {
   return {
     register: () => undefined,
     lookup: async () => undefined,
+    listRunsForRepo: async () => [] as const,
   }
 }
 

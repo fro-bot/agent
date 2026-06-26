@@ -34,7 +34,7 @@ import {buildOperatorApp} from './server.js'
 //
 // These are the exact method+path strings Hono records for the full operator
 // route set when all deps are present. Verified against server.ts route
-// registrations and the v1.4.0 drift-guard test in server.test.ts.
+// registrations and the v1.5.0 drift-guard test in server.test.ts.
 // ---------------------------------------------------------------------------
 
 export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readonly path: string}[] = [
@@ -45,6 +45,7 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'GET', path: '/operator/session/csrf'},
   {method: 'GET', path: '/operator/session'},
   {method: 'GET', path: '/operator/repos'},
+  {method: 'GET', path: '/operator/runs'},
   {method: 'POST', path: '/operator/runs'},
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
@@ -95,6 +96,7 @@ function makeStubRunIndex() {
   return {
     register: () => undefined,
     lookup: async () => undefined,
+    listRunsForRepo: async () => [] as const,
   }
 }
 
