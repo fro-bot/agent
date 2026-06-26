@@ -313,12 +313,13 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/session/csrf` | Session | Get a signed CSRF token for mutating requests |
 | `GET` | `/operator/session` | Session | Get current session info (operatorId, login, expiresAt) |
 | `GET` | `/operator/repos` | Session | Scoped, denylist-filtered list of bound repos the operator may launch against |
+| `GET` | `/operator/runs` | Session | Session-gated, repo-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100 |
 | `POST` | `/operator/runs` | Session + CSRF | Launch a run against a bound repo (returns 202 `{runId}`) |
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
 
-Operator contract: v1.4.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
+Operator contract: v1.5.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
 

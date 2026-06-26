@@ -36,6 +36,7 @@ function createStoreAdapter(overrides: Partial<Required<ObjectStoreAdapter>> = {
     conditionalPut: vi.fn(async () => ok({etag: 'etag-1'})),
     conditionalDelete: vi.fn(async () => ok(undefined)),
     getObject: vi.fn(async () => ok({data: '{}', etag: 'etag-1'})),
+    listWithMetadata: vi.fn(async () => ok([])),
     ...overrides,
   }
 }

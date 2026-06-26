@@ -1717,6 +1717,7 @@ function makeStubRunIndex(): NonNullable<OperatorServerDeps['runIndex']> {
   return {
     register: () => undefined,
     lookup: async () => undefined,
+    listRunsForRepo: async () => [],
   }
 }
 
@@ -1772,8 +1773,8 @@ function extractRoutes(app: import('hono').Hono): {method: string; path: string}
     })
 }
 
-describe('buildOperatorApp — v1.4.0 full route-registration smoke (drift guard)', () => {
-  it('registers exactly the expected v1.4.0 operator route set when all privileged deps are present', () => {
+describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard)', () => {
+  it('registers exactly the expected v1.5.0 operator route set when all privileged deps are present', () => {
     // #given — all privileged deps present
     const sessionStore = createInMemorySessionStore()
     const app = buildOperatorApp(
@@ -1784,15 +1785,15 @@ describe('buildOperatorApp — v1.4.0 full route-registration smoke (drift guard
     // #when — extract registered routes
     const routes = extractRoutes(app)
 
-    // #then — exact v1.4.0 set (order-independent)
+    // #then — exact v1.5.0 set (order-independent)
     // If this assertion fails, a route was added or removed. Update EXPECTED_OPERATOR_ROUTES
     // in operator-route-smoke.ts (the single canonical source) AND the deploy/README
     // "Operator API surface" table to keep them in sync.
     const routeSet = new Set(routes.map(r => `${r.method}:${r.path}`))
-    const expectedV14Routes = new Set(EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`))
+    const expectedV15Routes = new Set(EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`))
 
-    expect(routeSet).toEqual(expectedV14Routes)
-    expect(routes).toHaveLength(expectedV14Routes.size)
+    expect(routeSet).toEqual(expectedV15Routes)
+    expect(routes).toHaveLength(expectedV15Routes.size)
   })
 
   it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {
@@ -1822,6 +1823,7 @@ describe('buildOperatorApp — v1.4.0 full route-registration smoke (drift guard
 
     // #then — run/approval routes are NOT registered (conditional gating is real)
     expect(routePaths).not.toContain('GET:/operator/repos')
+    expect(routePaths).not.toContain('GET:/operator/runs')
     expect(routePaths).not.toContain('POST:/operator/runs')
     expect(routePaths).not.toContain('GET:/operator/runs/:runId/stream')
     expect(routePaths).not.toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')

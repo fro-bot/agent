@@ -295,5 +295,48 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
         return err(logS3Error(logger, 'getObject', error))
       }
     },
+    listWithMetadata: async prefix => {
+      logger.debug('Listing object store keys with metadata', {prefix})
+
+      try {
+        const entries: {readonly key: string; readonly lastModified: Date}[] = []
+        let continuationToken: string | undefined
+        let iterations = 0
+
+        do {
+          if (iterations >= S3_LIST_MAX_ITERATIONS) {
+            logger.warning('Object store listWithMetadata hit iteration cap, truncating result', {
+              prefix,
+              maxIterations: S3_LIST_MAX_ITERATIONS,
+              entriesReturned: entries.length,
+            })
+            break
+          }
+          iterations++
+
+          const response = await client.send(
+            new ListObjectsV2Command({
+              Bucket: config.bucket,
+              ContinuationToken: continuationToken,
+              ExpectedBucketOwner: config.expectedBucketOwner,
+              Prefix: prefix,
+            }),
+          )
+
+          for (const object of response.Contents ?? []) {
+            if (object.Key != null && object.LastModified != null) {
+              entries.push({key: object.Key, lastModified: object.LastModified})
+            }
+          }
+
+          continuationToken = response.IsTruncated === true ? response.NextContinuationToken : undefined
+        } while (continuationToken != null)
+
+        logger.info('Listed object store keys with metadata', {count: entries.length, prefix})
+        return ok(entries)
+      } catch (error) {
+        return err(logS3Error(logger, 'listWithMetadata', error))
+      }
+    },
   }
 }
