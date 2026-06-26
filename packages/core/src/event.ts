@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, PubSub, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt } from "drizzle-orm"
@@ -10,6 +10,16 @@ import { Location } from "./location"
 import { LayerNode } from "./effect/layer-node"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { SqlError } from "effect/unstable/sql/SqlError"
+
+const sqliteLockRetrySchedule = Schedule.exponential("40 millis").pipe(Schedule.jittered, Schedule.take(8))
+
+// NOTE: gate on the reason tag, not error.isRetryable. In effect@4.0.0-beta.66 the
+// SqlError isRetryable flags are inverted (LockTimeoutError=false, ConstraintError=true),
+// so isRetryable would crash on locks and retry FK violations forever. Revisit on effect bump.
+export function isLockTimeoutSqlError(error: unknown) {
+  return error instanceof SqlError && error.reason._tag === "LockTimeoutError"
+}
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -80,6 +90,7 @@ export interface Interface {
   ) => Effect.Effect<string | undefined>
   readonly remove: (aggregateID: string) => Effect.Effect<void>
   readonly claim: (aggregateID: string, ownerID: string) => Effect.Effect<void>
+  readonly beforeCommit: (guard: (event: Payload) => Effect.Effect<void>) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Event") {}
@@ -100,6 +111,7 @@ export const layerWith = (options?: LayerOptions) =>
       const projectors = new Map<string, Subscriber[]>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
+      const commitGuards = new Array<(event: Payload) => Effect.Effect<void>>()
       const { db } = yield* Database.Service
 
       const getOrCreate = (definition: Definition) =>
@@ -236,8 +248,12 @@ export const layerWith = (options?: LayerOptions) =>
                             )
                           const committed = {
                             ...event,
+                            seq,
                             durable: { aggregateID, seq, version: durable.version },
                           } as Payload
+                          for (const guard of commitGuards) {
+                            yield* guard(event)
+                          }
                           for (const projector of list) {
                             yield* projector(committed)
                           }
@@ -271,7 +287,21 @@ export const layerWith = (options?: LayerOptions) =>
                         }),
                       { behavior: "immediate" },
                     )
-                    .pipe(Effect.orDie)
+                    .pipe(
+                      Effect.retry({
+                        while: isLockTimeoutSqlError,
+                        schedule: sqliteLockRetrySchedule,
+                      }),
+                      Effect.tapError((error) =>
+                        Effect.logError("durable event commit failed", {
+                          eventID: event.id,
+                          eventType: event.type,
+                          aggregateID,
+                          error,
+                        }),
+                      ),
+                      Effect.orDie,
+                    )
                   if (committed) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
@@ -553,6 +583,11 @@ export const layerWith = (options?: LayerOptions) =>
           projectors.set(definition.type, list)
         })
 
+      const beforeCommit = (guard: (event: Payload) => Effect.Effect<void>): Effect.Effect<void> =>
+        Effect.sync(() => {
+          commitGuards.push(guard)
+        })
+
       return Service.of({
         publish,
         subscribe,
@@ -564,6 +599,7 @@ export const layerWith = (options?: LayerOptions) =>
         replayAll,
         remove,
         claim,
+        beforeCommit,
       })
     }),
   )
