@@ -11,15 +11,16 @@
  *   3. Resolve OAuth token via session store
  *   4. listBindings() — enumerate all bound repos
  *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   7. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+ *   6. Dedup by owner/repo, then cap before the authz fan-out
+ *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
+ *   8. Map to RepoSummary[]; return 200
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
  *   - Unauthorized repos are silently omitted (no oracle).
  *   - Store errors return a coarse error; no partial list leaks.
  *   - Response carries no deny-keys, workspacePath, channelId, or internal IDs.
- *   - Result is capped at MAX_REPOS_PER_LISTING (no pagination machinery).
+ *   - Result is capped at MAX_REPOS_PER_LISTING distinct owner/repo pairs (no pagination machinery).
  *   - Token is never logged.
  *   - Rate limit is operator-keyed (not socket-keyed) to prevent OAuth-budget
  *     self-DoS from the per-repo authz fan-out (up to 100 GitHub calls per request).
@@ -43,13 +44,14 @@ import {rateLimitedResponse} from '../safe-response.js'
 // ---------------------------------------------------------------------------
 
 /**
- * Hard cap on the number of repos returned per listing.
+ * Hard cap on the number of distinct owner/repo pairs returned per listing.
  *
  * Authz checks are per-repo and the authz cache coalesces concurrent misses,
  * so N bindings is acceptable for small-to-medium deployments. The cap prevents
  * unbounded authz fan-out for unusually large binding sets. No pagination is
- * provided — the cap is the contract. Bindings beyond the cap are silently
- * truncated (first MAX_REPOS_PER_LISTING bindings after denylist filtering).
+ * provided — the cap is the contract. Distinct repos beyond the cap are silently
+ * truncated (first MAX_REPOS_PER_LISTING distinct owner/repo pairs after denylist
+ * filtering and dedup).
  */
 export const MAX_REPOS_PER_LISTING = 100
 
@@ -180,11 +182,23 @@ export function buildReposRoute(app: Hono, deps: ReposRouteDeps): void {
     // Extract deny keys from each binding; null/null means no usable key (fail closed).
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
 
-    // Apply the hard cap BEFORE authz fan-out to bound the number of GitHub calls.
-    // Bindings beyond the cap are silently truncated (first MAX_REPOS_PER_LISTING).
-    const capped = allowed.slice(0, MAX_REPOS_PER_LISTING)
+    // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
+    // repo would otherwise consume cap slots and crowd out distinct repos.
+    const seenBeforeCap = new Set<string>()
+    const dedupedAllowed = allowed.filter(b => {
+      const key = `${b.owner}/${b.repo}`
+      if (seenBeforeCap.has(key)) {
+        return false
+      }
+      seenBeforeCap.add(key)
+      return true
+    })
 
-    // ── Gate 6: Per-repo authz — keep only repos the operator can access ──────
+    // Cap AFTER dedup to bound the number of GitHub authz calls.
+    // Distinct repos beyond the cap are silently truncated (first MAX_REPOS_PER_LISTING).
+    const capped = dedupedAllowed.slice(0, MAX_REPOS_PER_LISTING)
+
+    // ── Gate 7: Per-repo authz — keep only repos the operator can access ──────
     // checkRepoAuthz is called per binding. A denial silently omits the repo.
     // Per-repo authz failures are NOT errors — they are silent omissions (R19).
     const authorized: RepoBinding[] = []

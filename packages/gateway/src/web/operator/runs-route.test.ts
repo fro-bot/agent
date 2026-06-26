@@ -7,9 +7,10 @@
  *   3. Resolve OAuth token via session store
  *   4. listBindings() — all bound repos
  *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   7. For each authorized binding: listRunsForRepo() → project via toRunSummary()
- *   8. Flatten, sort newest-first, cap at MAX_RUNS_PER_LISTING; return 200 {runs:[]}
+ *   6. Dedup by owner/repo, then cap before the authz fan-out
+ *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
+ *   8. For each authorized binding: listRunsForRepo() → project via toRunSummary()
+ *   9. Flatten, sort newest-first, cap at MAX_RUNS_PER_LISTING; return 200 {runs:[]}
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
@@ -776,6 +777,74 @@ describe('GET /operator/runs — entity_ref not logged on mismatch (Fix 2)', () 
 })
 
 // ---------------------------------------------------------------------------
+// Dedup bindings by owner/repo BEFORE the authz fan-out cap
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — dedup before authz cap', () => {
+  it('reaches the 101st unique repo when two earlier bindings share the same owner/repo', async () => {
+    // #given — 101 bindings: 2 share acme/shared (different channelIds), 98 distinct repos,
+    // plus acme/last-unique. After dedup: 100 distinct repos, all within the cap of 100.
+    // Without dedup-before-cap, last-unique (index 100) would be dropped by the cap.
+
+    const sharedBindingA = makeBinding('acme', 'shared', {channelId: 'chan-shared-A'})
+    const sharedBindingB = makeBinding('acme', 'shared', {channelId: 'chan-shared-B'})
+    // 98 distinct repos (indices 2..99 in the original list)
+    const distinctBindings = Array.from({length: 98}, (_, i) =>
+      makeBinding('acme', `repo-${i + 2}`, {channelId: `chan-repo-${i + 2}`}),
+    )
+    const lastUniqueBinding = makeBinding('acme', 'last-unique', {channelId: 'chan-last-unique'})
+
+    const bindings = [sharedBindingA, sharedBindingB, ...distinctBindings, lastUniqueBinding]
+
+    // All repos are authorized
+    const authorizedRepos = new Set<string>([
+      'acme/shared',
+      ...distinctBindings.map(b => `${b.owner}/${b.repo}`),
+      'acme/last-unique',
+    ])
+
+    // Track which repos authz was called for
+    const authzFetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url)
+      const match = /\/repos\/([^/]+)\/([^/]+)$/.exec(urlStr)
+      if (match !== null) {
+        const key = `${match[1]}/${match[2]}`
+        const status = authorizedRepos.has(key) ? 200 : 404
+        return new Response('{}', {status})
+      }
+      return new Response('{}', {status: 404})
+    }) as typeof globalThis.fetch
+
+    const listRunsForRepo = vi.fn(async (_repo: string) => [])
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos, {fetch: authzFetch}),
+      listRunsForRepo,
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — authz was called for acme/last-unique (dedup-before-cap allows it through)
+    expect(res.status).toBe(200)
+
+    const authzCalls = (authzFetch as ReturnType<typeof vi.fn>).mock.calls as [string | URL | Request][]
+    const calledUrls = authzCalls.map(([url]) => String(url))
+    expect(calledUrls.some(u => u.includes('last-unique'))).toBe(true)
+
+    // listRunsForRepo was also called for acme/last-unique (it passed authz)
+    const listCalls = listRunsForRepo.mock.calls as [string][]
+    expect(listCalls.some(([repo]) => repo === 'acme/last-unique')).toBe(true)
+
+    // acme/shared was only authz-checked once (dedup collapsed the two bindings)
+    const sharedAuthzCalls = calledUrls.filter(u => u.includes('/acme/shared'))
+    expect(sharedAuthzCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Fix 5 — additional error paths and authz fan-out cap
 // ---------------------------------------------------------------------------
 
@@ -854,9 +923,10 @@ describe('GET /operator/runs — authz fan-out cap (Fix 5)', () => {
     // #when
     await app.fetch(new Request('http://localhost/operator/runs'))
 
-    // #then — authzFetch called at most 100 times (cap enforced before authz fan-out)
+    // #then — authzFetch called exactly 100 times (all first 100 bindings reach authz;
+    // the remaining 10 are silently truncated by the cap before the fan-out).
     // Each checkRepoAuthz call makes one fetch call to the GitHub API.
     const callCount = (authzFetch as ReturnType<typeof vi.fn>).mock.calls.length
-    expect(callCount).toBeLessThanOrEqual(100)
+    expect(callCount).toBe(100)
   })
 })

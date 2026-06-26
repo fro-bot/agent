@@ -11,11 +11,12 @@
  *   3. Resolve OAuth token via session store
  *   4. listBindings() — enumerate all bound repos
  *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   7. listRunsForRepo() per authorized binding — enumerate run-states
- *   8. toRunSummary() projection — drop null (entity_ref mismatch) + warn
- *   9. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
- *  10. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+ *   6. Dedup by owner/repo, then cap before the authz fan-out
+ *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
+ *   8. listRunsForRepo() per authorized binding — enumerate run-states
+ *   9. toRunSummary() projection — drop null (entity_ref mismatch) + warn
+ *  10. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+ *  11. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
@@ -59,8 +60,8 @@ export const MAX_RUNS_PER_LISTING = 100
 /**
  * Authz fan-out cap: maximum number of bindings that proceed to checkRepoAuthz.
  *
- * Mirrors the repos-route cap. Bindings beyond this are silently truncated
- * (first MAX_REPOS_AUTHZ_FANOUT bindings after denylist filtering).
+ * Bindings beyond this are silently truncated (first MAX_REPOS_AUTHZ_FANOUT
+ * distinct owner/repo pairs after denylist filtering).
  */
 const MAX_REPOS_AUTHZ_FANOUT = 100
 
@@ -199,11 +200,22 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
     // Their run-states are never read — tighter than "scan all then filter."
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
 
-    // Apply the authz fan-out cap BEFORE authz to bound the number of GitHub calls.
-    // Bindings beyond the cap are silently truncated (first MAX_REPOS_AUTHZ_FANOUT).
-    const capped = allowed.slice(0, MAX_REPOS_AUTHZ_FANOUT)
+    // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
+    // repo would otherwise consume cap slots and crowd out distinct repos.
+    const seenBeforeCap = new Set<string>()
+    const dedupedAllowed = allowed.filter(b => {
+      const key = `${b.owner}/${b.repo}`
+      if (seenBeforeCap.has(key)) {
+        return false
+      }
+      seenBeforeCap.add(key)
+      return true
+    })
 
-    // ── Gate 6: Per-repo authz — keep only repos the operator can access ──────
+    // Cap AFTER dedup to bound GitHub API calls; excess distinct repos are silently truncated.
+    const capped = dedupedAllowed.slice(0, MAX_REPOS_AUTHZ_FANOUT)
+
+    // ── Gate 7: Per-repo authz — keep only repos the operator can access ──────
     // checkRepoAuthz is called per binding. A denial silently omits the repo.
     // Per-repo authz failures are NOT errors — they are silent omissions (no oracle).
     const authorized: RepoBinding[] = []
