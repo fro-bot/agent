@@ -70,6 +70,21 @@ describe('drift guard: harness-release.yaml bun-version literals', () => {
       ).toBe(HARNESS_BUN_VERSION)
     }
   })
+
+  it('installs workspace dependencies before building the harness package', async () => {
+    // #given — harness build imports root tsconfig/tooling, so release CI must install the workspace, not just the package.
+    const thisDir = path.dirname(fileURLToPath(import.meta.url))
+    const repoRoot = path.resolve(thisDir, '..', '..', '..')
+    const workflowPath = path.join(repoRoot, '.github', 'workflows', 'harness-release.yaml')
+
+    // #when
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs')
+    const content = realFs.readFileSync(workflowPath, 'utf8')
+
+    // #then
+    expect(content).toContain('run: bun install --frozen-lockfile')
+    expect(content).not.toContain('run: bun install --filter @fro.bot/harness --frozen-lockfile')
+  })
 })
 
 // ---------------------------------------------------------------------------
