@@ -146,6 +146,13 @@ export interface OperatorRouteSmokeOptions {
    */
   readonly approvalRegistryOverride?: Parameters<typeof buildOperatorServerInputs>[0]['approvalRegistry']
   /**
+   * Override the runIndex passed to buildOperatorServerInputs.
+   * Pass undefined to simulate a missing run index (GET /operator/runs absent).
+   * Because runIndex is optional in BuildOperatorServerInputs, passing undefined here
+   * flows through the helper and causes the runs listing route to be absent.
+   */
+  readonly runIndexOverride?: Parameters<typeof buildOperatorServerInputs>[0]['runIndex'] | undefined
+  /**
    * Whether to suppress log output. Defaults to false (logs to stdout).
    */
   readonly silent?: boolean
@@ -223,6 +230,13 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const hasApprovalRegistryOverride = options !== undefined && 'approvalRegistryOverride' in options
   const approvalRegistry = hasApprovalRegistryOverride ? options.approvalRegistryOverride : makeStubApprovalRegistry()
 
+  // Resolve runIndex — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, GET /operator/runs will not register
+  // because buildOperatorServerInputs passes it through to deps.runIndex,
+  // and server.ts gates GET /operator/runs on that dep being present.
+  const hasRunIndexOverride = options !== undefined && 'runIndexOverride' in options
+  const runIndex = hasRunIndexOverride ? options.runIndexOverride : makeStubRunIndex()
+
   // Build the operator server inputs via the shared production helper.
   // This is the seam that makes the diagnostic catch wiring gaps: if a dep is
   // dropped from buildOperatorServerInputs, both production and this diagnostic
@@ -237,7 +251,7 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     denylistCache: makeStubDenylistCache(),
     bindingsStore,
     runObservationManager,
-    runIndex: makeStubRunIndex(),
+    runIndex,
     // approvalRegistry flows through the helper so the route gate in server.ts
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.approvalRegistry and the approval routes are absent.

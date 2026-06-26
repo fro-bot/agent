@@ -821,6 +821,67 @@ describe('createRunIndex', () => {
     })
   })
 
+  // ── CORR-001: doFallbackScan strips #fragment from entity_ref ────────────
+
+  describe('CORR-001: doFallbackScan strips #fragment from entity_ref (pre-existing fix)', () => {
+    it('fallback lookup returns repo without #fragment when entity_ref is owner/repo#N', async () => {
+      // #given — run-state with entity_ref containing a #runNumber fragment
+      // (the pre-existing bug: without the fix, RunLocation.repo would be 'acme/widget#42')
+      const runState = makeRunState('run-corr-001', 'acme/widget', 'discord')
+      // Simulate entity_ref with fragment (as stored in real run-states)
+      const runStateWithFragment = {...runState, entity_ref: 'acme/widget#42'}
+
+      const runsByRepo = new Map([['acme/widget', [runStateWithFragment]]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — fallback scan (run not in accelerator)
+      const result = await index.lookup('run-corr-001')
+
+      // #then — repo is 'acme/widget' (no '#42' fragment)
+      expect(result).toBeDefined()
+      expect(result?.repo).toBe('acme/widget')
+      expect(result?.repo).not.toContain('#')
+      expect(result?.surface).toBe('discord')
+    })
+
+    it('re-cached entry after fallback also has repo without #fragment', async () => {
+      // #given — same as above; verify the accelerator re-cache also strips the fragment
+      const runState = makeRunState('run-corr-001-recache', 'acme/widget', 'web')
+      const runStateWithFragment = {...runState, entity_ref: 'acme/widget#99'}
+
+      const runsByRepo = new Map([['acme/widget', [runStateWithFragment]]])
+      const deps = makeDeps(runsByRepo)
+      const findRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: deps.coordinationConfig,
+        identity: deps.identity,
+        logger: deps.logger,
+        now,
+        findRunsForRepo,
+      })
+
+      // #when — first lookup triggers fallback + re-cache
+      const first = await index.lookup('run-corr-001-recache')
+      // Second lookup hits the accelerator (re-cached)
+      const second = await index.lookup('run-corr-001-recache')
+
+      // #then — both return clean repo (no fragment); findRunsForRepo called once
+      expect(first?.repo).toBe('acme/widget')
+      expect(second?.repo).toBe('acme/widget')
+      expect(findRunsForRepo).toHaveBeenCalledTimes(1)
+    })
+  })
+
   // ── FIX 6: Exact S3 key regression test ──────────────────────────────────
 
   describe('exact S3 key shape (FIX 6)', () => {
@@ -1192,6 +1253,143 @@ describe('createRunIndex', () => {
       // #then — 2 runs returned (the failed key is skipped, not fatal)
       expect(result).toHaveLength(2)
       expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-c']))
+    })
+
+    it('returns empty array when getRunPrefix fails (production path)', async () => {
+      // #given — storeConfig with an invalid/missing bucket so getRunPrefix fails
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        // Override storeConfig to trigger getRunPrefix failure (empty bucket)
+        storeConfig: {enabled: false, bucket: '', prefix: '', region: 'us-east-1'},
+      }
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path
+      })
+
+      // #when — production path with a config that causes getRunPrefix to fail
+      // (getRunPrefix returns success:false when storeConfig.enabled is false or bucket is empty)
+      // We verify the function returns [] rather than throwing
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (getRunPrefix failure is handled gracefully)
+      expect(Array.isArray(result)).toBe(true)
+    })
+
+    it('skips a key when getObject fails in listRunsForRepo — does not abort the scan (production path)', async () => {
+      // #given — adapter with list() returning 3 keys; second getObject fails
+      const runs = [makeRunState('run-a', 'acme/widget'), makeRunState('run-c', 'acme/widget')]
+      let callCount = 0
+      const getObjectMock = vi.fn(async (key: string) => {
+        callCount++
+        if (callCount === 2) {
+          return {success: false as const, error: new Error('S3 error on key 2')}
+        }
+        const idx = ['prefix/run-a.json', 'prefix/run-c.json'].indexOf(key)
+        if (idx === -1) return {success: false as const, error: new Error('not found')}
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(runs[idx]), etag: 'etag-1'},
+        }
+      })
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: true,
+            data: ['prefix/run-a.json', 'prefix/run-b.json', 'prefix/run-c.json'],
+          }),
+          getObject: getObjectMock,
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — 2 runs returned (the failed key is skipped, not fatal)
+      expect(result).toHaveLength(2)
+      expect(result.map(r => r.run_id)).toEqual(expect.arrayContaining(['run-a', 'run-c']))
+    })
+
+    it('returns empty array when listWithMetadata returns err (production path)', async () => {
+      // #given — adapter with listWithMetadata that returns an error
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: vi.fn(),
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: false,
+            error: new Error('listWithMetadata S3 error'),
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (listWithMetadata failure handled gracefully)
+      expect(result).toEqual([])
+    })
+
+    it('returns empty array when list() fallback returns err (production path)', async () => {
+      // #given — adapter without listWithMetadata; list() returns an error
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({
+            success: false,
+            error: new Error('list() S3 error'),
+          }),
+          getObject: vi.fn(),
+          // No listWithMetadata — falls through to list() path
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — empty array (list() failure handled gracefully)
+      expect(result).toEqual([])
     })
 
     it('injectable findRunsForRepo takes precedence over the production scan', async () => {

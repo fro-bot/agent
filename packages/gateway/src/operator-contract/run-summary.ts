@@ -18,9 +18,22 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorWebStatus} from './run-status.js'
 
 import {PHASE_TO_WEB_STATUS} from './run-status.js'
+
+/**
+ * The 5-value status set producible by toRunSummary via PHASE_TO_WEB_STATUS.
+ *
+ * 'blocked' and 'waiting_for_approval' are endpoint-layer overlays derived from
+ * queue/registry state — they are NEVER produced by toRunSummary (which maps
+ * RunPhase only). The ?? 'failed' fallback also produces 'failed', which is in
+ * this set.
+ *
+ * Derived from PHASE_TO_WEB_STATUS values:
+ *   PENDING → 'queued', ACKNOWLEDGED → 'running', EXECUTING → 'running',
+ *   COMPLETED → 'succeeded', FAILED → 'failed', CANCELLED → 'cancelled'
+ */
+export type RunSummaryStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
 /**
  * Operator-safe projection of a run's summary.
@@ -35,7 +48,7 @@ import {PHASE_TO_WEB_STATUS} from './run-status.js'
 export interface RunSummary {
   readonly runId: string
   readonly repo: string
-  readonly status: OperatorWebStatus
+  readonly status: RunSummaryStatus
   readonly createdAt: string
   readonly updatedAt?: string
 }
@@ -99,12 +112,15 @@ export function toRunSummary(
     return null
   }
 
-  // Determine the web status from the run phase.
+  // Determine the summary status from the run phase.
   // Fail-closed: an unrecognized phase (data corruption / version skew) surfaces
   // as 'failed', not as undefined — a missing status key would silently drop the
   // field from JSON output.
-  const status: OperatorWebStatus =
-    (PHASE_TO_WEB_STATUS as Record<string, OperatorWebStatus>)[runState.phase] ?? 'failed'
+  // PHASE_TO_WEB_STATUS values are all in RunSummaryStatus (queued/running/succeeded/
+  // failed/cancelled); 'blocked'/'waiting_for_approval' are never in the map.
+  // The ?? 'failed' fallback is also in RunSummaryStatus. Direct indexing typechecks
+  // because runState.phase is RunPhase and PHASE_TO_WEB_STATUS is Record<RunPhase, ...>.
+  const status: RunSummaryStatus = (PHASE_TO_WEB_STATUS[runState.phase] ?? 'failed') as RunSummaryStatus
 
   // Determine whether updatedAt should be included.
   // Omit when last_heartbeat is empty or not a parseable ISO date string.

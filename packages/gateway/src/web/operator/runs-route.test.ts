@@ -696,3 +696,167 @@ describe('GET /operator/runs — auth context guard', () => {
     expect(res.status).toBe(401)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Fix 1 — dedup repos before run enumeration
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — dedup repos (Fix 1)', () => {
+  it('calls listRunsForRepo exactly once when two bindings share the same owner/repo', async () => {
+    // #given — two bindings with the SAME owner/repo but different channelIds
+    const bindingA = makeBinding('acme', 'shared-repo', {channelId: 'chan-001'})
+    const bindingB = makeBinding('acme', 'shared-repo', {channelId: 'chan-002'})
+    const authorizedRepos = new Set(['acme/shared-repo'])
+    const run = makeRunState('acme', 'shared-repo', 'run-shared-1', '2024-01-01T00:00:00Z')
+    const runsByRepo = new Map<string, RunState[]>([['acme/shared-repo', [run]]])
+    const listRunsForRepo = vi.fn(async (repo: string) => runsByRepo.get(repo) ?? [])
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: [bindingA, bindingB]})),
+      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
+      listRunsForRepo,
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — listRunsForRepo called exactly once (dedup by owner/repo)
+    expect(res.status).toBe(200)
+    expect(listRunsForRepo).toHaveBeenCalledTimes(1)
+    expect(listRunsForRepo).toHaveBeenCalledWith('acme/shared-repo')
+
+    // Runs appear exactly once (no duplicates)
+    const body = (await res.json()) as {runs: {runId: string}[]}
+    const runIds = body.runs.map(r => r.runId)
+    expect(runIds.filter(id => id === 'run-shared-1')).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix 2 — entity_ref not logged on corruption warn path
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — entity_ref not logged on mismatch (Fix 2)', () => {
+  it('warn-log for entity_ref mismatch does not include entityRef field', async () => {
+    // #given — a run scanned under acme/alpha but entity_ref points to acme/other
+    const bindings = [makeBinding('acme', 'alpha')]
+    const authorizedRepos = new Set(['acme/alpha'])
+    const mismatchedRun = makeRunState('acme', 'alpha', 'run-mismatch-1', '2024-01-01T00:00:00Z', {
+      entity_ref: 'acme/other#1',
+    })
+    const runsByRepo = new Map<string, RunState[]>([['acme/alpha', [mismatchedRun]]])
+    const warnSpy = vi.fn()
+    const deps = makeBaseDeps(
+      {
+        listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+        repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
+        logger: {debug: vi.fn(), info: vi.fn(), warn: warnSpy, error: vi.fn()},
+      },
+      runsByRepo,
+    )
+    const app = buildTestApp(deps)
+
+    // #when
+    await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — warn was called for the mismatch but entityRef is NOT in the context
+    const mismatchCall = warnSpy.mock.calls.find(
+      (call: unknown[]) => typeof call[1] === 'string' && call[1].includes('mismatch'),
+    )
+    expect(mismatchCall).toBeDefined()
+    const ctx = mismatchCall?.[0] as Record<string, unknown>
+    expect('entityRef' in ctx).toBe(false)
+    expect('entity_ref' in ctx).toBe(false)
+    // Safe fields are still present
+    expect(ctx).toHaveProperty('repo')
+    expect(ctx).toHaveProperty('runId')
+    expect(ctx).toHaveProperty('githubUserId')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix 5 — additional error paths and authz fan-out cap
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — checkRepoAuthz throws (Fix 5)', () => {
+  it('silently omits a repo when checkRepoAuthz throws — other repos still returned', async () => {
+    // #given — 2 bindings; checkRepoAuthz throws for one, succeeds for the other
+    const bindings = [makeBinding('acme', 'broken-authz'), makeBinding('acme', 'good-repo')]
+    const run = makeRunState('acme', 'good-repo', 'run-good-1', '2024-01-01T00:00:00Z')
+    const runsByRepo = new Map<string, RunState[]>([['acme/good-repo', [run]]])
+
+    // authzFetch throws for broken-authz, returns 200 for good-repo
+    const authzFetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url)
+      if (urlStr.includes('broken-authz')) {
+        throw new Error('GitHub API timeout')
+      }
+      return new Response('{}', {status: 200})
+    }) as typeof globalThis.fetch
+
+    const deps = makeBaseDeps(
+      {
+        listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+        repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/good-repo']), {fetch: authzFetch}),
+      },
+      runsByRepo,
+    )
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — 200 (not 500); broken-authz omitted; good-repo's run present
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {runs: {runId: string}[]}
+    const runIds = body.runs.map(r => r.runId)
+    expect(runIds).toContain('run-good-1')
+    expect(runIds.some(id => id.includes('broken'))).toBe(false)
+  })
+})
+
+describe('GET /operator/runs — listBindings throws (Fix 5)', () => {
+  it('returns coarse 503 when listBindings throws (not just success:false)', async () => {
+    // #given — listBindings rejects (unexpected throw, not a Result failure)
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => {
+        throw new Error('unexpected network crash')
+      }),
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — coarse 503; body is not an array
+    expect(res.status).toBe(503)
+    const body = (await res.json()) as {error?: string; runs?: unknown}
+    expect(typeof body.error).toBe('string')
+    expect(Array.isArray(body)).toBe(false)
+    expect('runs' in body).toBe(false)
+  })
+})
+
+describe('GET /operator/runs — authz fan-out cap (Fix 5)', () => {
+  it('only first 100 non-denied bindings reach checkRepoAuthz (documents truncation)', async () => {
+    // #given — 110 distinct bindings (all non-denied); cap is MAX_REPOS_AUTHZ_FANOUT = 100
+    const count = 110
+    const bindings = Array.from({length: count}, (_, i) => makeBinding('acme', `repo-${i}`))
+    const authzFetch = vi.fn(async () => new Response('{}', {status: 200})) as typeof globalThis.fetch
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      repoAuthzDeps: makeRepoAuthzDeps(new Set(bindings.map(b => `${b.owner}/${b.repo}`)), {fetch: authzFetch}),
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — authzFetch called at most 100 times (cap enforced before authz fan-out)
+    // Each checkRepoAuthz call makes one fetch call to the GitHub API.
+    const callCount = (authzFetch as ReturnType<typeof vi.fn>).mock.calls.length
+    expect(callCount).toBeLessThanOrEqual(100)
+  })
+})

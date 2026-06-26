@@ -226,10 +226,21 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
     // ── Enumerate runs for each authorized binding ────────────────────────────
     // Run-states are read ONLY for authorized, non-denied repos. A per-repo scan
     // error is isolated (skip that repo, continue) — never a 500.
+    //
+    // Dedup by owner/repo before scanning: bindings are keyed by channelId, so two
+    // Discord channels can share the same owner/repo. Scanning the same repo twice
+    // would produce duplicate runs and double the S3 cost. Keep the first binding
+    // per unique owner/repo (they project identically — repo comes from owner/repo).
     const allSummaries: RunSummary[] = []
+    const scannedRepos = new Set<string>()
 
     for (const binding of authorized) {
       const repo = `${binding.owner}/${binding.repo}`
+      if (scannedRepos.has(repo)) {
+        continue
+      }
+      scannedRepos.add(repo)
+
       let runs: readonly RunState[]
       try {
         runs = await deps.listRunsForRepo(repo)
@@ -244,10 +255,7 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       for (const runState of runs) {
         const summary = toRunSummary(runState, binding)
         if (summary === null) {
-          deps.logger.warn(
-            {githubUserId, repo, runId: runState.run_id, entityRef: runState.entity_ref},
-            'runs: toRunSummary returned null — entity_ref mismatch, omitting run',
-          )
+          deps.logger.warn({githubUserId, repo, runId: runState.run_id}, 'runs: run omitted — entity_ref mismatch')
           continue
         }
         allSummaries.push(summary)
