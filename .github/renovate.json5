@@ -135,17 +135,19 @@
     {
       // bfra-me/renovate-action sets RENOVATE_BINARY_SOURCE=install, so
       // Renovate's built-in artifact update path calls `install-tool bun <ver>`
-      // (containerbase) to obtain Bun before regenerating bun.lock. That call
-      // fails in the self-hosted action environment, causing the
-      // `renovate/artifacts` synthetic status to fail on every branch.
-      // This affects both the `bun` manager (direct lockfile updates) and the
-      // `npm` manager (package.json dep updates that also touch bun.lock).
-      // Skip Renovate's built-in artifact update for both; the `postUpgradeTasks`
-      // `bun install` below regenerates bun.lock using the runner's pre-installed
-      // Bun, so the lockfile still stays current. Remove if the runner switches
-      // to binarySource=global or containerbase gains a working bun installer.
+      // before regenerating bun.lock. That fails in this environment; the
+      // postUpgradeTasks `bun install` below regenerates bun.lock instead.
       matchManagers: ['bun', 'npm'],
       skipArtifactsUpdate: true,
+    },
+    {
+      // @types/node must not be grouped with Docker/custom-manager Node surfaces:
+      // skipArtifactsUpdate only suppresses artifact regeneration when every
+      // upgrade in the group carries the flag, so mixed-manager Node groups still
+      // hit the failing bun installer path.
+      matchManagers: ['npm'],
+      matchPackageNames: ['@types/node'],
+      groupName: null,
     },
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
     {matchDatasources: ['docker'], semanticCommitType: 'build'},
