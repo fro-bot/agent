@@ -13,8 +13,7 @@ linker = "hoisted"
 # Mirrors the prior pnpm minimumReleaseAge policy. Seconds (3 days).
 minimumReleaseAge = 259200
 
-# The age gate now applies to all packages. Add per-version exclusions here only
-# when deliberately fast-tracking a specific release (e.g. a critical security fix
-# that has not yet cleared the 3-day window). Remove the exclusion once the version
-# is past the gate.
-minimumReleaseAgeExcludes = []
+# Temporarily fast-track the deliberate OpenCode 1.17.11 SDK bump before the
+# 3-day age gate clears. Bun exclusions are package-scoped, so keep Renovate's
+# OpenCode cap tight and remove this after 2026-06-28T12:09Z.
+minimumReleaseAgeExcludes = ["@opencode-ai/sdk"]

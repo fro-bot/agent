@@ -1,21 +1,21 @@
 {
   "version": "1.0.0",
-  "updatedAt": "2026-06-11T00:00:00.000Z",
+  "updatedAt": "2026-06-26T00:00:00.000Z",
   "dependencies": [
     {
       "name": "opencode (server)",
-      "resolvedVersion": "1.17.6",
+      "resolvedVersion": "1.17.11",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v1.17.6",
+      "ref": "v1.17.11",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
       "packagePath": "packages/opencode",
       "reason": "OpenCode server source — owns session/prompt machinery and publishes message.part.updated bus events."
     },
     {
       "name": "@opencode-ai/sdk",
-      "resolvedVersion": "1.17.6",
+      "resolvedVersion": "1.17.11",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v1.17.6",
+      "ref": "v1.17.11",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
       "packagePath": "packages/sdk/js",
       "reason": "OpenCode SDK source for inspecting SSE subscription contract."

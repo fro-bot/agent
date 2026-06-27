@@ -1,15 +1,15 @@
 /**
- * Live integration probe for OpenCode 1.17.9 SDK streaming path.
+ * Live integration probe for OpenCode 1.17.11 SDK streaming path.
  *
  * Gate: OPENCODE_LIVE_PROBE=1 (skipped in normal CI)
  *
  * Proves the real harness consumer path (createOpencode → event.subscribe →
  * promptAsync → runPromptAttempt) works end-to-end against a stock isolated
- * 1.17.9 server. The prompt is sent directly via promptAsync (not through the
+ * 1.17.11 server. The prompt is sent directly via promptAsync (not through the
  * arming/startPrompt path); runPromptAttempt handles stream processing and the
  * poll/v2-wait completion signal.
  *
- * Run: OPENCODE_LIVE_PROBE=1 bunx vitest run src/features/agent/live-probe-1.17.9.test.ts
+ * Run: OPENCODE_LIVE_PROBE=1 bunx vitest run src/features/agent/live-probe-1.17.11.test.ts
  */
 import type {Event} from '@opencode-ai/sdk'
 import * as childProcess from 'node:child_process'
@@ -77,12 +77,12 @@ function createIsolatedEnv(suffix: string): IsolatedEnv {
   const binDir = path.join(home, 'bin')
   fs.mkdirSync(binDir, {recursive: true})
 
-  // Create a wrapper script that calls `bun x opencode-ai@1.17.9`
+  // Create a wrapper script that calls `bun x opencode-ai@1.17.11`
   const opencodeBin = path.join(binDir, 'opencode')
   fs.writeFileSync(
     opencodeBin,
     `#!/bin/sh
-exec "${BUN_BIN}" x opencode-ai@1.17.9 "$@"
+exec "${BUN_BIN}" x opencode-ai@1.17.11 "$@"
 `,
     {mode: 0o755},
   )
@@ -133,7 +133,7 @@ function cleanupIsolatedEnv(env: IsolatedEnv): void {
 // because createIsolatedEnv mutates global process.env (HOME, PATH, XDG_*) and restores
 // it in a finally block. Running concurrently with the normal suite (Vitest parallel
 // file execution) would cause env bleed into sibling test files.
-describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.9 live integration probe', {timeout: PROBE_TIMEOUT_MS}, () => {
+describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.11 live integration probe', {timeout: PROBE_TIMEOUT_MS}, () => {
   const logger = createLogger({component: 'probe'})
 
   it('streams tool execution and final text via real harness consumer path', {timeout: PROBE_TIMEOUT_MS}, async () => {
@@ -149,11 +149,11 @@ describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.9 live integration probe', {timeo
         .execSync(`"${env.opencodeBin}" --version`, {encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']})
         .trim()
       console.log('[probe] opencode binary version:', versionOutput)
-      expect(versionOutput).toContain('1.17.9')
+      expect(versionOutput).toContain('1.17.11')
       console.log('[probe] Isolated HOME:', env.home)
 
       // -----------------------------------------------------------------------
-      // Start an isolated stock 1.17.9 server
+      // Start an isolated stock 1.17.11 server
       //
       // Config:
       //   - permission.bash = "allow" → auto-allow bash tool (no interactive gate)
@@ -385,7 +385,7 @@ describe.skipIf(!PROBE_ENABLED)('OpenCode 1.17.9 live integration probe', {timeo
 
       // The key assertion: the harness signature `wait({sessionID}, options?)` is valid
       // (TypeScript would have caught a shape mismatch at compile time)
-      console.log('[probe:v2-wait] ✓ v2.session.wait({sessionID}, options?) signature is valid in 1.17.9')
+      console.log('[probe:v2-wait] ✓ v2.session.wait({sessionID}, options?) signature is valid in 1.17.11')
     } finally {
       abortController.abort()
       opencode?.server.close()
