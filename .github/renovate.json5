@@ -1,19 +1,6 @@
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: ['github>fro-bot/.github'],
-  // Renovate 43.234.0 (pinned by the runner action) regressed productLinks
-  // handling, so the stability-days / merge-confidence status checks build a
-  // scheme-relative target_url that GitHub rejects with a 422 whose `errors`
-  // body is a string. Renovate's error handler assumes `errors` is an array and
-  // crashes (`errors?.find is not a function`), aborting the entire run — no
-  // Dependency Dashboard update, no branches processed. Suppressing these two
-  // status-check names skips the broken POST while leaving the minimumReleaseAge
-  // policy (below) fully in effect. Remove once the runner advances past the fix
-  // (Renovate >= 43.234.1).
-  statusCheckNames: {
-    minimumReleaseAge: null,
-    mergeConfidence: null,
-  },
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
   // ignorePaths excludes it from dependency extraction only — it does NOT
   // suppress the hidden-Unicode safety scan, which runs on these files
