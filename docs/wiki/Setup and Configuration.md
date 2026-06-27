@@ -80,7 +80,7 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 | oMo          | `DEFAULT_OMO_VERSION`        | Oh My OpenAgent workflow framework       |
 | Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows |
 
-These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `systematic-version`). The pinned defaults are updated via Renovate-managed PRs.
+These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs; the OpenCode harness default is advanced by the harness release sync PR after a harness build exists.
 
 The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (for example `1.17.6+harness.13169873`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
