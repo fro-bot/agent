@@ -133,16 +133,18 @@
   ],
   packageRules: [
     {
-      // The Renovate runner image (bfra-me/renovate-action) curl-installs Bun
-      // globally as root and runs Renovate as a non-root user, so the bun
-      // manager's lockfile regeneration (`install-tool bun <ver>` →
-      // updateArtifacts) fails EACCES writing the root-owned containerbase tool
-      // dir — failing the `renovate/artifacts` check on every branch, for any
-      // version. Skip Renovate's bun artifact update; the `postUpgradeTasks`
-      // `bun install` below regenerates bun.lock on the runner's installed Bun,
-      // so the lockfile still stays current. Dependency update PRs are
-      // unaffected. Remove if the runner switches to binarySource=global.
-      matchManagers: ['bun'],
+      // bfra-me/renovate-action sets RENOVATE_BINARY_SOURCE=install, so
+      // Renovate's built-in artifact update path calls `install-tool bun <ver>`
+      // (containerbase) to obtain Bun before regenerating bun.lock. That call
+      // fails in the self-hosted action environment, causing the
+      // `renovate/artifacts` synthetic status to fail on every branch.
+      // This affects both the `bun` manager (direct lockfile updates) and the
+      // `npm` manager (package.json dep updates that also touch bun.lock).
+      // Skip Renovate's built-in artifact update for both; the `postUpgradeTasks`
+      // `bun install` below regenerates bun.lock using the runner's pre-installed
+      // Bun, so the lockfile still stays current. Remove if the runner switches
+      // to binarySource=global or containerbase gains a working bun installer.
+      matchManagers: ['bun', 'npm'],
       skipArtifactsUpdate: true,
     },
     {matchFileNames: ['.github/workflows/**'], semanticCommitType: 'ci'},
