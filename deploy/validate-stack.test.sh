@@ -4657,6 +4657,67 @@ echo "  OP-12 output (stderr+stdout combined):"
 echo "${OP12_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# LOCKSTEP-1 — Negative/Positive: egress-smoke.sh must not hardcode the
+#              mitmproxy image; it must derive it from deploy/compose.yaml.
+#
+# Regression guard for PR #1021 (mitmproxy 11.1.3 → v12 Renovate bump):
+# egress-smoke.sh previously hardcoded the mitmproxy image/pin, so a
+# Renovate bump to compose.yaml would leave the smoke running the OLD image
+# and never exercise the new version before approval.
+#
+# This test proves the lockstep invariant statically (no Docker required):
+#
+#   (a) NEGATIVE: egress-smoke.sh must NOT contain a hardcoded
+#       "mitmproxy/mitmproxy:" image literal in its heredoc.  If it does,
+#       the smoke can silently drift from compose.yaml.
+#
+#   (b) POSITIVE: the mitmproxy image extracted from deploy/compose.yaml
+#       must appear in egress-smoke.sh as a variable reference
+#       (${MITMPROXY_IMAGE}), proving the script reads the canonical source.
+#
+#   (c) POSITIVE: the image extracted from deploy/compose.yaml must be
+#       non-empty (sanity check that the extraction itself works).
+#
+# Run from repo root:
+#   bash deploy/validate-stack.test.sh
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- LOCKSTEP-1: egress-smoke.sh must derive mitmproxy image from compose.yaml ---"
+
+EGRESS_SMOKE_FILE="deploy/egress-smoke.sh"
+COMPOSE_FILE_LOCKSTEP="deploy/compose.yaml"
+
+# (a) egress-smoke.sh must NOT contain a hardcoded mitmproxy/mitmproxy: image literal
+#     as a YAML value (i.e., a line starting with optional whitespace then "image: mitmproxy/mitmproxy:").
+#     We match only lines where "image:" is a YAML key (leading spaces allowed), not grep arguments
+#     or comments that happen to contain the string.
+if grep -qE '^[[:space:]]+image: mitmproxy/mitmproxy:' "${EGRESS_SMOKE_FILE}"; then
+  fail "LOCKSTEP-1(a): ${EGRESS_SMOKE_FILE} contains a hardcoded YAML 'image: mitmproxy/mitmproxy:' value — it must derive the image from ${COMPOSE_FILE_LOCKSTEP} via \${MITMPROXY_IMAGE}"
+else
+  pass "LOCKSTEP-1(a): ${EGRESS_SMOKE_FILE} does not hardcode a YAML 'image: mitmproxy/mitmproxy:' value — image is derived dynamically"
+fi
+
+# (b) egress-smoke.sh must reference ${MITMPROXY_IMAGE} in the heredoc.
+if grep -q 'image: \${MITMPROXY_IMAGE}' "${EGRESS_SMOKE_FILE}"; then
+  pass "LOCKSTEP-1(b): ${EGRESS_SMOKE_FILE} uses \${MITMPROXY_IMAGE} variable in the smoke compose heredoc"
+else
+  fail "LOCKSTEP-1(b): ${EGRESS_SMOKE_FILE} does not reference \${MITMPROXY_IMAGE} in the smoke compose heredoc — lockstep wiring is missing"
+fi
+
+# (c) The mitmproxy image in compose.yaml must be non-empty (extraction sanity check).
+COMPOSE_MITM_IMAGE="$(grep 'image: mitmproxy/mitmproxy:' "${COMPOSE_FILE_LOCKSTEP}" | head -1 | sed 's/.*image: //' | tr -d '[:space:]')"
+if [[ -n "${COMPOSE_MITM_IMAGE}" ]]; then
+  pass "LOCKSTEP-1(c): mitmproxy image extracted from ${COMPOSE_FILE_LOCKSTEP}: ${COMPOSE_MITM_IMAGE}"
+else
+  fail "LOCKSTEP-1(c): could not extract mitmproxy image from ${COMPOSE_FILE_LOCKSTEP} — check the image: line format"
+fi
+
+echo ""
+echo "  LOCKSTEP-1 context:"
+echo "    compose.yaml image : ${COMPOSE_MITM_IMAGE:-<not found>}"
+echo "    egress-smoke.sh    : $(grep 'image:.*mitmproxy' "${EGRESS_SMOKE_FILE}" | head -1 | sed 's/^[[:space:]]*//' || echo '<no mitmproxy image line>')"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
