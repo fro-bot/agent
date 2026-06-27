@@ -37,6 +37,20 @@ SMOKE_DIR="$(mktemp -d)"
 PASS=0
 FAIL=0
 
+# ---------------------------------------------------------------------------
+# Derive the mitmproxy image from deploy/compose.yaml so the smoke always
+# exercises the same image pin that the production stack uses.  This keeps
+# egress-smoke.sh in lockstep with compose.yaml automatically — a Renovate
+# bump to compose.yaml is immediately picked up here without a separate edit.
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MITMPROXY_IMAGE="$(grep '^[[:space:]]*image: mitmproxy/mitmproxy:' "${SCRIPT_DIR}/compose.yaml" | head -1 | sed 's/.*image: //' | tr -d '[:space:]')"
+if [[ -z "${MITMPROXY_IMAGE}" ]]; then
+  echo "ERROR: could not extract mitmproxy image from ${SCRIPT_DIR}/compose.yaml" >&2
+  exit 1
+fi
+echo "--- mitmproxy image (from compose.yaml): ${MITMPROXY_IMAGE} ---"
+
 cleanup() {
   echo "--- cleaning up compose project ${COMPOSE_PROJECT} ---"
   docker compose -p "${COMPOSE_PROJECT}" -f "${SMOKE_DIR}/compose.yaml" down -v --remove-orphans 2>/dev/null || true
@@ -71,7 +85,7 @@ name: ${COMPOSE_PROJECT}
 
 services:
   mitmproxy:
-    image: mitmproxy/mitmproxy:11.1.3@sha256:e0deb0df7edf9f909053f274a067cd1cacb90f5c17d74459e1693179c0b98d8f
+    image: ${MITMPROXY_IMAGE}
     command: >
       mitmdump
       -s /scripts/allowlist.py
