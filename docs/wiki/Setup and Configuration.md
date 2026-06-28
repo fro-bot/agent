@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-14"
-updated-by: "7065ca0"
+last-updated: "2026-06-28"
+updated-by: "schedule-d7190410-28335678121"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -27,9 +27,9 @@ The setup module (`src/services/setup/`) bootstraps the CI environment before ag
 
 ## Installation Sequence
 
-The `runSetup()` orchestrator follows a **mode-gated** sequence based on the `enable-omo` input. When oMo is disabled (the default), the setup path is minimal — OpenCode only. When `enable-omo: true`, Bun and oMo are installed alongside OpenCode.
+The `runSetup()` orchestrator follows a **mode-gated** sequence. When no orchestration plugin is requested (the default), the setup path is minimal — OpenCode only. When `enable-omo: true`, Bun and oMo are installed alongside OpenCode. A third mutually-exclusive mode, `enable-omo-slim: true`, installs Bun and [OMO Slim](https://github.com/alvinunreal/oh-my-opencode-slim) instead and pins `orchestrator` as the default agent; requesting both oMo and OMO Slim fails fast. The two plugin-enabled modes share the same "enabled" cache partition and bootstrap shape, so the description below contrasts the default OpenCode-only path against the plugin-enabled path.
 
-### Disabled Mode (Default, `enable-omo: false`)
+### Default Mode (no orchestration plugin)
 
 1. **Parse credentials** — Validates `auth-json` input early to fail fast on bad credentials. The input is a JSON object mapping LLM provider names to their auth configs (e.g., `{"anthropic": {"apiKey": "..."}}`).
 
@@ -47,46 +47,48 @@ The `runSetup()` orchestrator follows a **mode-gated** sequence based on the `en
 
 8. **Configure authentication** — Sets up `gh` CLI auth, configures Git identity as `{bot}[bot]` for audit trails, and writes the ephemeral `auth.json` with `0o600` permissions.
 
-### Enabled Mode (`enable-omo: true`)
+### Plugin-Enabled Mode (`enable-omo` or `enable-omo-slim`)
 
-When oMo is enabled, the setup path adds Bun installation and oMo setup after the OpenCode CLI install:
+When a plugin orchestrator is enabled, the setup path adds Bun installation and plugin setup after the OpenCode CLI install:
 
-1. Steps 1–4 match disabled mode (credentials, versions, cache restore, OpenCode install).
+1. Steps 1–4 match the default mode (credentials, versions, cache restore, OpenCode install).
 
-2. **Install Bun runtime** — Required for running the oMo installer via `bunx`. If Bun installation fails, oMo is skipped but execution continues.
+2. **Install Bun runtime** — Required for running the oMo / OMO Slim installer via `bunx`. If Bun installation fails, the plugin is skipped but execution continues.
 
 3. **Disable oMo telemetry** — Sets `OMO_SEND_ANONYMOUS_TELEMETRY=0` and `OMO_DISABLE_POSTHOG=1` before any oMo code runs, including the installer itself.
 
 4. **Write optional configs** — If `systematic-config` is provided, writes it before the installer runs.
 
-5. **Install oMo** — Runs the oMo installer via Bun. This is treated as a graceful-fail operation: if it fails, the agent runs without oMo agent workflows. The installer error is captured but doesn't abort the run.
+5. **Install the plugin** — Runs the oMo or OMO Slim installer via Bun. This is treated as a graceful-fail operation: if it fails, the agent runs without the plugin's agent workflows. The installer error is captured but doesn't abort the run. OMO Slim additionally validates its preset (`openai` or `opencode-go`) against an allowlist before installing.
 
-6. **Build CI config** — Assembles `OPENCODE_CONFIG_CONTENT`. Does not pin `default_agent` — oMo-managed config selects Sisyphus as the default when `agent` is unset.
+6. **Build CI config** — Assembles `OPENCODE_CONFIG_CONTENT`. For oMo it does not pin `default_agent` — oMo-managed config selects Sisyphus as the default when `agent` is unset; for OMO Slim it pins `default_agent` to `"orchestrator"`.
 
-7. **Merge configs** — Merges CI config on top of any existing `opencode.json` (which the oMo installer may have created). Plugin arrays are deduplicated. `oh-my-openagent` plugin entries from the oMo installer are preserved.
+7. **Merge configs** — Merges CI config on top of any existing `opencode.json` (which the installer may have created). Plugin arrays are deduplicated. The active plugin's entries (`oh-my-openagent` or `oh-my-opencode-slim`) are preserved.
 
-8. **Save tools cache** — The enabled-mode cache includes Bun and `~/.config/opencode` paths.
+8. **Save tools cache** — The enabled-mode cache includes Bun, the Bun package cache, and `~/.config/opencode` paths.
 
-9. **Configure authentication** — Same as disabled mode.
+9. **Configure authentication** — Same as the default mode.
 
 ## Pinned Versions
 
 Default versions are defined in `packages/runtime/src/shared/constants.ts` (shared across surfaces) and `src/shared/constants.ts` (action-specific overrides):
 
-| Tool         | Constant                     | Purpose                                  |
-| ------------ | ---------------------------- | ---------------------------------------- |
-| OpenCode CLI | `DEFAULT_OPENCODE_VERSION`   | The AI coding agent platform             |
-| Bun          | `DEFAULT_BUN_VERSION`        | JavaScript runtime for oMo installer     |
-| oMo          | `DEFAULT_OMO_VERSION`        | Oh My OpenAgent workflow framework       |
-| Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows |
+| Tool         | Constant                     | Purpose                                          |
+| ------------ | ---------------------------- | ------------------------------------------------ |
+| OpenCode CLI | `DEFAULT_OPENCODE_VERSION`   | The AI coding agent platform                     |
+| Bun          | `DEFAULT_BUN_VERSION`        | JavaScript runtime and workspace package manager |
+| oMo          | `DEFAULT_OMO_VERSION`        | Oh My OpenAgent workflow framework               |
+| Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows         |
 
 These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs; the OpenCode harness default is advanced by the harness release sync PR after a harness build exists.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (for example `1.17.6+harness.13169873`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
+
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.11+harness.bf0e9bed`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.6`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.6+harness.13169873`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.11`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.11+harness.bf0e9bed`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include SQLite-reliability fixes that landed with the 1.17.9 upgrade. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 
@@ -107,26 +109,28 @@ The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in 
 
 The final config is the result of merging:
 
-- In disabled mode: CI config (with `default_agent: "build"`) + user-provided `opencode-config` input. Existing local `opencode.json` files are ignored to prevent stale oMo config from leaking in.
-- In enabled mode: CI config (without `default_agent` pin) + existing `opencode.json` (from oMo installer) + user-provided `opencode-config` input.
+- In default mode: CI config (with `default_agent: "build"`) + user-provided `opencode-config` input. Existing local `opencode.json` files are ignored to prevent a stale orchestration config from leaking in.
+- In plugin-enabled mode: CI config (with `default_agent` pinned to `"orchestrator"` for OMO Slim, or left unpinned so oMo selects Sisyphus) + existing `opencode.json` (from the installer) + user-provided `opencode-config` input.
 
-User values win on conflicts. In disabled mode, `oh-my-openagent` plugin entries in user config are stripped with a warning.
+User values win on conflicts. In default mode, `oh-my-openagent` and `oh-my-opencode-slim` plugin entries in user config are stripped with a warning.
 
 ## Tools Cache
 
-The setup module maintains its own cache (separate from the session cache) for installed binaries. The key is **mode-partitioned**: disabled mode excludes oMo version and restricts cached paths to OpenCode tooling only, preventing stale oMo config from being restored.
+The setup module maintains its own cache (separate from the session cache) for installed binaries. The key is **mode-partitioned**: disabled mode omits the oMo version and restricts cached paths to OpenCode tooling only, preventing stale oMo config from being restored, while enabled mode additionally caches the Bun binary, the Bun package cache, and the oMo config directory.
 
 Disabled-mode key:
 
 ```text
-opencode-tools-disabled-{opencodeVersion}-{systematicVersion}-{os}
+opencode-tools-{os}-disabled-oc-{opencodeVersion}-sys-{systematicVersion}-bun-{bunVersion}
 ```
 
 Enabled-mode key:
 
 ```text
-opencode-tools-enabled-{opencodeVersion}-{omoVersion}-{systematicVersion}-{os}
+opencode-tools-{os}-enabled-oc-{opencodeVersion}-omo-{omoVersion}-sys-{systematicVersion}-bun-{bunVersion}
 ```
+
+The Bun version is part of both keys even in disabled mode. The project's own tooling runs on Bun, so a Bun bump must invalidate the aggregate tools cache to avoid restoring a stale runtime; baking the Bun version into the key makes that automatic.
 
 On a cache hit, the module verifies the binary is actually present in the tool cache before trusting it — cache hits where the binary is missing fall through to a fresh install. The lookup uses the tool-cache-safe form of the version (see [Harness Builds](#harness-builds)), so a harness build never reuses a stock binary's cache entry. This cache typically saves 10-20 seconds per run.
 
@@ -148,6 +152,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). When set to `auto`, the resolver in `src/features/agent/output-mode.ts` scans the prompt text for branch/PR-related phrases (e.g., "pull request", "create a pr", "git push") and selects `branch-pr` if any match, otherwise `working-dir`. This heuristic is frozen — new phrases require a code change. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the design rationale.
 - `agent` selects the OpenCode agent. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent.
 - `enable-omo` enables Oh My OpenAgent (default: `false`). When `true`, oMo installs and configures Sisyphus as the default agent.
+- `enable-omo-slim` enables OMO Slim (default: `false`), mutually exclusive with `enable-omo`. When `true`, OMO Slim installs with the chosen `omo-slim-preset` (`openai` or `opencode-go`, default `openai`) and pins `orchestrator` as the default agent.
 - `model` overrides the LLM model in `provider/model` format.
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
 - `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation rejects SSRF-vulnerable endpoints (metadata services, private IPs) and enforces HTTPS unless explicitly overridden.
