@@ -201,6 +201,15 @@ services:
       - gateway-net
       - sandbox-net
     restart: unless-stopped
+    # Container hardening (#1053). The gateway binds the operator listener on an
+    # unprivileged port (4000) and its healthcheck uses `nc -z` (TCP connect, not
+    # a raw socket), so it needs no added capabilities — drop the full set. Root
+    # filesystem read-only and non-root user are deferred (the runtime writes a
+    # readiness flag to /var/run/fro-bot; that needs a tmpfs/write-path audit first).
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     logging:
       driver: json-file
       options:

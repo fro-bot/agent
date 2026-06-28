@@ -4657,6 +4657,71 @@ echo "  OP-12 output (stderr+stdout combined):"
 echo "${OP12_OUTPUT}" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------
+# TEST 68 — Positive regression: real deploy/compose.yaml gateway service must
+#           declare cap_drop: [ALL] and security_opt: [no-new-privileges:true]
+#           (#1053 container hardening).
+#
+# This test asserts directly against the real compose.yaml so that removing
+# either hardening key from the gateway service causes an immediate test
+# failure.  It does NOT use validate-stack.sh (which does not check cap_drop/
+# security_opt on the gateway); instead it inspects the raw YAML file with
+# grep, matching the exact indented forms that Compose requires.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- TEST 68: gateway service in real compose.yaml declares cap_drop: [ALL] and security_opt: [no-new-privileges:true] (#1053) ---"
+
+REAL_COMPOSE_FILE="deploy/compose.yaml"
+
+# #given the real compose.yaml exists
+# #when we inspect the GATEWAY service block (not the whole file) for cap_drop
+# and security_opt. Extract only the gateway service block — from the `  gateway:`
+# line up to the next top-level `  <service>:` line — so the assertions cannot
+# false-pass on keys that belong to another service (workspace/mitmproxy).
+GW_BLOCK="$(awk '
+  /^  gateway:[[:space:]]*$/ { in_block = 1; next }
+  in_block && /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { in_block = 0 }
+  in_block { print }
+' "${REAL_COMPOSE_FILE}")"
+
+# cap_drop: - ALL  (4-space indent for key, 6-space for list item)
+GW_CAP_DROP_EXIT=0
+grep -q "^    cap_drop:" <<<"${GW_BLOCK}" || GW_CAP_DROP_EXIT=$?
+GW_CAP_DROP_ALL_EXIT=0
+grep -q "^      - ALL" <<<"${GW_BLOCK}" || GW_CAP_DROP_ALL_EXIT=$?
+
+# security_opt: - no-new-privileges:true  (4-space indent for key, 6-space for list item)
+GW_SECOPT_EXIT=0
+grep -q "^    security_opt:" <<<"${GW_BLOCK}" || GW_SECOPT_EXIT=$?
+GW_SECOPT_NNP_EXIT=0
+grep -q "^      - no-new-privileges:true" <<<"${GW_BLOCK}" || GW_SECOPT_NNP_EXIT=$?
+
+# #then both hardening keys must be present in the gateway service
+
+if [[ "${GW_CAP_DROP_EXIT}" -eq 0 ]]; then
+  pass "TEST 68: real compose.yaml gateway service declares 'cap_drop:'"
+else
+  fail "TEST 68: real compose.yaml gateway service is MISSING 'cap_drop:' — add cap_drop: [ALL] (#1053)"
+fi
+
+if [[ "${GW_CAP_DROP_ALL_EXIT}" -eq 0 ]]; then
+  pass "TEST 68: real compose.yaml gateway service declares 'cap_drop: - ALL'"
+else
+  fail "TEST 68: real compose.yaml gateway service is MISSING '- ALL' under cap_drop — add cap_drop: [ALL] (#1053)"
+fi
+
+if [[ "${GW_SECOPT_EXIT}" -eq 0 ]]; then
+  pass "TEST 68: real compose.yaml gateway service declares 'security_opt:'"
+else
+  fail "TEST 68: real compose.yaml gateway service is MISSING 'security_opt:' — add security_opt: [no-new-privileges:true] (#1053)"
+fi
+
+if [[ "${GW_SECOPT_NNP_EXIT}" -eq 0 ]]; then
+  pass "TEST 68: real compose.yaml gateway service declares 'security_opt: - no-new-privileges:true'"
+else
+  fail "TEST 68: real compose.yaml gateway service is MISSING '- no-new-privileges:true' under security_opt — add security_opt: [no-new-privileges:true] (#1053)"
+fi
+
+# ---------------------------------------------------------------------------
 # LOCKSTEP-1 — Negative/Positive: egress-smoke.sh must not hardcode the
 #              mitmproxy image; it must derive it from deploy/compose.yaml.
 #
