@@ -722,10 +722,10 @@ describe('GET /operator/runs — dedup repos (Fix 1)', () => {
     // #when
     const res = await app.fetch(new Request('http://localhost/operator/runs'))
 
-    // #then — listRunsForRepo called exactly once (dedup by owner/repo)
+    // #then — listRunsForRepo called exactly once (dedup by owner/repo), with the per-repo limit
     expect(res.status).toBe(200)
     expect(listRunsForRepo).toHaveBeenCalledTimes(1)
-    expect(listRunsForRepo).toHaveBeenCalledWith('acme/shared-repo')
+    expect(listRunsForRepo).toHaveBeenCalledWith('acme/shared-repo', MAX_RUNS_PER_LISTING)
 
     // Runs appear exactly once (no duplicates)
     const body = (await res.json()) as {runs: {runId: string}[]}
@@ -928,5 +928,57 @@ describe('GET /operator/runs — authz fan-out cap (Fix 5)', () => {
     // Each checkRepoAuthz call makes one fetch call to the GitHub API.
     const callCount = (authzFetch as ReturnType<typeof vi.fn>).mock.calls.length
     expect(callCount).toBe(100)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Read-amplification fix — per-repo limit passed to listRunsForRepo
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — per-repo limit (read-amplification fix)', () => {
+  it('invokes listRunsForRepo with MAX_RUNS_PER_LISTING as the second argument', async () => {
+    // #given — 1 authorized binding; spy on listRunsForRepo to capture call args
+    const binding = makeBinding('acme', 'widget')
+    const authorizedRepos = new Set(['acme/widget'])
+    const run = makeRunState('acme', 'widget', 'run-widget-1', '2024-01-01T00:00:00Z')
+    const listRunsForRepo = vi.fn(async (_repo: string, _limit?: number) => [run])
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: [binding]})),
+      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
+      listRunsForRepo,
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — 200 response and listRunsForRepo was called with MAX_RUNS_PER_LISTING as limit
+    expect(res.status).toBe(200)
+    expect(listRunsForRepo).toHaveBeenCalledTimes(1)
+    expect(listRunsForRepo).toHaveBeenCalledWith('acme/widget', MAX_RUNS_PER_LISTING)
+  })
+
+  it('passes MAX_RUNS_PER_LISTING to every authorized repo scan (multiple repos)', async () => {
+    // #given — 3 authorized bindings; spy captures all call args
+    const bindings = [makeBinding('acme', 'alpha'), makeBinding('acme', 'beta'), makeBinding('acme', 'gamma')]
+    const authorizedRepos = new Set(['acme/alpha', 'acme/beta', 'acme/gamma'])
+    const listRunsForRepo = vi.fn(async (_repo: string, _limit?: number) => [])
+
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
+      listRunsForRepo,
+    })
+    const app = buildTestApp(deps)
+
+    // #when
+    await app.fetch(new Request('http://localhost/operator/runs'))
+
+    // #then — called once per repo, each with MAX_RUNS_PER_LISTING as the limit
+    expect(listRunsForRepo).toHaveBeenCalledTimes(3)
+    for (const call of listRunsForRepo.mock.calls as [string, number][]) {
+      expect(call[1]).toBe(MAX_RUNS_PER_LISTING)
+    }
   })
 })

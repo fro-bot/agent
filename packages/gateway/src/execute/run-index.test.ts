@@ -1427,5 +1427,244 @@ describe('createRunIndex', () => {
       expect(listWithMetadataMock).not.toHaveBeenCalled()
       expect(getObjectMock).not.toHaveBeenCalled()
     })
+
+    // ── limit parameter (read-amplification fix) ─────────────────────────────
+
+    it('explicit limit smaller than available objects caps getObject calls to that limit (newest by lastModified)', async () => {
+      // #given — 30 entries in listWithMetadata; we pass limit=10
+      const totalEntries = 30
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      // Entry i has lastModified = baseTime + i*1000 (entry 29 is newest)
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      // The newest 10 are entries 20..29 (indices 20 to 29 inclusive)
+      const newestKeys = new Set(metadataEntries.slice(20).map(e => e.key))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        // No findRunsForRepo injection — use the production path with listWithMetadata
+      })
+
+      // #when — pass limit=10 (smaller than 30 available and smaller than MAX_RUNS_PER_REPO)
+      const result = await index.listRunsForRepo('acme/widget', 10)
+
+      // #then — exactly 10 getObject calls (the explicit limit)
+      expect(getObjectMock).toHaveBeenCalledTimes(10)
+
+      // All called keys must be from the newest 10
+      const calledKeys = getObjectMock.mock.calls.map(call => String(call[0]))
+      for (const key of calledKeys) {
+        expect(newestKeys.has(key)).toBe(true)
+      }
+
+      // The 20 oldest entries must NOT have been read
+      for (let i = 0; i < 20; i++) {
+        const oldKey = `prefix/run-${String(i).padStart(3, '0')}.json`
+        expect(calledKeys).not.toContain(oldKey)
+      }
+
+      // Result has exactly 10 runs
+      expect(result).toHaveLength(10)
+    })
+
+    it('explicit limit larger than MAX_RUNS_PER_REPO is clamped to MAX_RUNS_PER_REPO', async () => {
+      // #given — 210 entries; we pass limit=999 (above MAX_RUNS_PER_REPO=200)
+      const totalEntries = 210
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when — pass limit=999 (above the hard ceiling of 200)
+      const result = await index.listRunsForRepo('acme/widget', 999)
+
+      // #then — clamped to MAX_RUNS_PER_REPO=200; exactly 200 getObject calls
+      expect(getObjectMock).toHaveBeenCalledTimes(200)
+      expect(result).toHaveLength(200)
+    })
+
+    it('omitting limit still caps at MAX_RUNS_PER_REPO (backward-compatible default)', async () => {
+      // #given — 210 entries; no limit argument
+      const totalEntries = 210
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when — no limit argument (omitted)
+      const result = await index.listRunsForRepo('acme/widget')
+
+      // #then — defaults to MAX_RUNS_PER_REPO=200
+      expect(getObjectMock).toHaveBeenCalledTimes(200)
+      expect(result).toHaveLength(200)
+    })
+
+    it('non-positive limit (0) falls back to MAX_RUNS_PER_REPO rather than reading nothing', async () => {
+      // #given — 210 entries; we pass limit=0, which must NOT zero out the read
+      const totalEntries = 210
+      const baseTime = new Date('2026-06-01T00:00:00.000Z').getTime()
+
+      const metadataEntries = Array.from({length: totalEntries}, (_, i) => ({
+        key: `prefix/run-${String(i).padStart(3, '0')}.json`,
+        lastModified: new Date(baseTime + i * 1000),
+      }))
+
+      const getObjectMock = vi.fn(async (key: string) => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify(makeRunState(key, 'acme/widget')),
+          etag: 'etag-1',
+        },
+      }))
+
+      const coordinationConfig: CoordinationConfig = {
+        ...makeCoordinationConfig(),
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn().mockResolvedValue({success: true, data: []}),
+          getObject: getObjectMock,
+          listWithMetadata: vi.fn().mockResolvedValue({
+            success: true,
+            data: metadataEntries,
+          }),
+        },
+      }
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig,
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+      })
+
+      // #when — limit=0 (rejected by the `> 0` guard)
+      const result = await index.listRunsForRepo('acme/widget', 0)
+
+      // #then — falls back to MAX_RUNS_PER_REPO=200, not an empty read
+      expect(getObjectMock).toHaveBeenCalledTimes(200)
+      expect(result).toHaveLength(200)
+    })
+
+    it('findRunsForRepo override path ignores the limit and returns fixtures verbatim', async () => {
+      // #given — findRunsForRepo injected with 5 runs; limit=2 passed
+      const injectedRuns = Array.from({length: 5}, (_, i) => makeRunState(`run-${i}`, 'acme/widget'))
+
+      const deps = makeDeps()
+      const index = createRunIndex({
+        bindingsStore: deps.bindingsStore,
+        coordinationConfig: makeCoordinationConfig(),
+        identity: 'gateway',
+        logger: deps.logger,
+        now,
+        findRunsForRepo: async () => injectedRuns,
+      })
+
+      // #when — pass limit=2 (smaller than the 5 injected runs)
+      const result = await index.listRunsForRepo('acme/widget', 2)
+
+      // #then — all 5 runs returned verbatim (override path is not limited)
+      expect(result).toHaveLength(5)
+      expect(result).toEqual(injectedRuns)
+    })
   })
 })

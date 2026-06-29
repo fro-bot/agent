@@ -91,7 +91,7 @@ export interface RunIndex {
    * Does NOT touch the accelerator or negative cache — this is a read scan,
    * not a runId resolution. A failing key is skipped (not fatal).
    */
-  listRunsForRepo: (repo: string) => Promise<readonly RunState[]>
+  listRunsForRepo: (repo: string, limit?: number) => Promise<readonly RunState[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +459,7 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
     return runs
   }
 
-  async function listRunsForRepo(repo: string): Promise<readonly RunState[]> {
+  async function listRunsForRepo(repo: string, limit?: number): Promise<readonly RunState[]> {
     // Injectable override takes precedence (used in tests; production uses the store adapter).
     if (deps.findRunsForRepo !== undefined) {
       return deps.findRunsForRepo(repo)
@@ -494,9 +494,17 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
         return []
       }
 
-      // Sort newest-first, take the cap.
+      // Sort newest-first, take the effective cap.
+      // The caller may pass a limit to tighten the cap (e.g. MAX_RUNS_PER_LISTING when the
+      // final result never returns more than that). The limit can only tighten, never raise,
+      // the hard MAX_RUNS_PER_REPO ceiling. A non-positive, non-integer, or absent limit
+      // falls back to the ceiling.
+      const effectiveCap =
+        limit !== undefined && Number.isInteger(limit) && limit > 0
+          ? Math.min(limit, MAX_RUNS_PER_REPO)
+          : MAX_RUNS_PER_REPO
       const sorted = listed.data.slice().sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
-      const capped = sorted.slice(0, MAX_RUNS_PER_REPO)
+      const capped = sorted.slice(0, effectiveCap)
       return fetchRunsForKeys(
         capped.map(e => e.key),
         getObject,
