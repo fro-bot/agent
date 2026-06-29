@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-21"
-updated-by: "aaaf91d"
+last-updated: "2026-06-28"
+updated-by: "schedule-d7190410-28335678121"
 sources:
   - packages/runtime/src/session/storage.ts
   - packages/runtime/src/session/search.ts
@@ -64,7 +64,7 @@ GitHub Actions cache has a 10 GB limit per repository and entries expire after 7
 
 The implementation lives in `packages/runtime/src/object-store/` and consists of five modules:
 
-- **`s3-adapter.ts`** — Creates an `ObjectStoreAdapter` wrapping `@aws-sdk/client-s3`. Handles upload (PutObject), download (GetObject with streaming pipeline), and list (ListObjectsV2 with pagination). All S3 error messages are sanitized to strip credentials before logging. The client retries up to 3 times and caps list pagination at 100 iterations.
+- **`s3-adapter.ts`** — Creates an `ObjectStoreAdapter` wrapping `@aws-sdk/client-s3`. Handles upload (PutObject), download (GetObject with streaming pipeline), and list (ListObjectsV2 with pagination). A companion `listWithMetadata` operation returns each key alongside its S3 `LastModified` timestamp, which lets callers scan an object prefix by recency rather than reading every record — the gateway's operator run-index reads runs this way to surface only recent activity (see [[Operator Web Control Surface]]). All S3 error messages are sanitized to strip credentials before logging. The client retries up to 3 times and caps list pagination at 100 iterations, the same cap the metadata variant applies.
 
 - **`content-sync.ts`** — Orchestrates bidirectional sync of three content types. `syncSessionsToStore` uploads the SQLite database files (`opencode.db`, `.db-wal`, `.db-shm`) to S3. `syncSessionsFromStore` downloads them back, with path traversal validation on every key. `syncArtifactsToStore` uploads the OpenCode log directory tree. `syncMetadataToStore` writes a JSON metadata blob (token usage, timing, session IDs, costs) to S3 via a secure temp file.
 
@@ -72,7 +72,7 @@ The implementation lives in `packages/runtime/src/object-store/` and consists of
 
 - **`validation.ts`** — Endpoint validation (HTTPS enforcement, SSRF protection against link-local/loopback/private IPs, metadata service blocking for `169.254.169.254` and `fd00:ec2::254`), prefix validation, key component sanitization, and download path traversal checks.
 
-- **`types.ts`** — Defines `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`).
+- **`types.ts`** — Defines the `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`). The interface keeps the core upload/download/list operations required and exposes the conditional (ETag-guarded) and recency-aware operations — `conditionalPut`, `conditionalDelete`, `getObject`, and `listWithMetadata` — as optional, so backends that do not need them are not forced to implement them.
 
 ### How It Integrates
 
