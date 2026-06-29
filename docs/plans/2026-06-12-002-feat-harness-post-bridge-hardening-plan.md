@@ -1,9 +1,11 @@
 ---
 title: "feat: Harness post-bridge hardening (#775)"
 type: feat
-status: active
+status: done
 date: 2026-06-12
 ---
+
+> **Status: done.** R2 (error redaction), R3 (doctor version form), R4 (per-ref provenance), and R5 (clean-snapshot tests) shipped in #873. R1 (config-based merge-agent sandbox) was dropped after review as unworkable and off the production path. #775 is closed; the production merge-agent credential-isolation concern is tracked separately in #1060.
 
 # feat: Harness post-bridge hardening (#775)
 
