@@ -27,9 +27,6 @@
 # step before checkout and pass it the same way. This is useful when the
 # repository already uses a GitHub App for other workflows.
 #
-# workflow_dispatch is the exception: it uses the built-in GITHUB_TOKEN
-# because the caller typed a manual prompt — no @mention identity needed.
-#
 # ── PERMISSIONS ─────────────────────────────────────────────────────────────
 # The workflow-level `permissions` block sets a read-only baseline. The
 # job-level block grants `contents: write` which is needed when the agent
@@ -349,7 +346,7 @@ jobs:
       (
         github.event.pull_request == null ||
         (
-          !github.event.pull_request.head.repo.fork &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
           !endsWith(github.event.pull_request.user.login || '', '[bot]')
         )
       ) && (
@@ -379,22 +376,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # Check out PR code when:
-          # 1. Issue comment on PR: refs/pull/{number}/head
-          # 2. Direct PR event: pull_request.head.sha
-          # 3. Other events: default to workflow ref
-          ref: >-
-            ${{
-              (github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number))
-              || github.event.pull_request.head.sha
-              || ''
-            }}
-          token: >-
-            ${{
-              github.event_name == 'workflow_dispatch'
-              && secrets.GITHUB_TOKEN
-              || secrets.FRO_BOT_PAT
-            }}
+          persist-credentials: false
+          token: ${{ secrets.FRO_BOT_PAT }}
 
       # CUSTOMIZE: Add project-specific setup steps here (e.g. install deps).
 
@@ -410,11 +393,6 @@ jobs:
               || ''
             }}
         with:
-          github-token: >-
-            ${{
-              github.event_name == 'workflow_dispatch'
-              && secrets.GITHUB_TOKEN
-              || secrets.FRO_BOT_PAT
-            }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: ${{ env.PROMPT }}

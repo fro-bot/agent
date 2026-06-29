@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-06-21"
-updated-by: "aaaf91d"
+last-updated: "2026-06-28"
+updated-by: "schedule-d7190410-28335678121"
 sources:
   - src/main.ts
   - src/post.ts
@@ -88,7 +88,7 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **HTTP** (`http/`) — The signed announce webhook server. Handles control-plane presence messages with HMAC signature verification (`hmac.ts`), replay protection (`replay-cache.ts`), rate limiting (`rate-limit.ts`), and schema validation (`announce-schema.ts`).
 
-**Web** (`web/`, `operator-contract/`) — The authenticated operator web control surface: a browser-facing Hono server that lets a signed-in human launch and observe agent runs over HTTP and Server-Sent Events. It owns GitHub OAuth, server-side sessions, a numeric-user-ID allowlist, per-repo authorization, CSRF protection, and the SSE observation pipeline, all speaking a frozen operator contract. This is a second entry point into the same execution engine the Discord mention handler uses. See [[Operator Web Control Surface]].
+**Web** (`web/`, `operator-contract/`) — The authenticated operator web control surface: a browser-facing Hono server that lets a signed-in human launch, observe, and approve tool use within agent runs over HTTP and Server-Sent Events. It owns GitHub OAuth, server-side sessions, a numeric-user-ID allowlist, per-repo authorization, CSRF protection, the SSE observation pipeline, and a web tool-approval flow that drives the same approval registry as Discord — all speaking a frozen operator contract. Routes are mounted through a dependency-gated registration seam whose inventory is verified by an offline smoke check, so a missing dependency surfaces as a build failure rather than a silently absent endpoint. This is a second entry point into the same execution engine the Discord mention handler uses. See [[Operator Web Control Surface]].
 
 **Workspace API** (`workspace-api/`) — Client for calling the workspace-agent's clone and OpenCode-proxy endpoints (`client.ts`, `types.ts`).
 

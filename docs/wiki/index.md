@@ -1,6 +1,6 @@
 ---
 type: index
-last-updated: "2026-06-21"
+last-updated: "2026-06-28"
 summary: "Navigable entry point for the Fro Bot Agent project wiki"
 ---
 
@@ -26,7 +26,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | [Session Persistence](Session%20Persistence.md) | subsystem | How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
 | [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credential management, cache strategy, and oMo opt-in |
-| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface that lets operators launch and observe gateway agent runs over HTTP and SSE |
+| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface that lets operators launch, observe, and approve gateway agent runs over HTTP and SSE |
 
 ### Conventions
 

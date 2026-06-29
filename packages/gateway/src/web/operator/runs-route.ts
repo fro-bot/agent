@@ -119,7 +119,7 @@ export interface RunsRouteDeps {
    * the route will not compile without this field. Injected via RunIndex.listRunsForRepo
    * in production; injected as a Map-backed stub in tests.
    */
-  readonly listRunsForRepo: (repo: string) => Promise<readonly RunState[]>
+  readonly listRunsForRepo: (repo: string, limit?: number) => Promise<readonly RunState[]>
   /**
    * Optional injectable per-minute rate limiter (operator-keyed).
    * When absent, a fresh limiter is created with RUNS_RATE_LIMIT_PER_MIN.
@@ -243,6 +243,15 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
     // Discord channels can share the same owner/repo. Scanning the same repo twice
     // would produce duplicate runs and double the S3 cost. Keep the first binding
     // per unique owner/repo (they project identically — repo comes from owner/repo).
+    //
+    // Each repo is read with at most MAX_RUNS_PER_LISTING candidates to bound read
+    // amplification: the final result never returns more than MAX_RUNS_PER_LISTING
+    // summaries, so a full per-repo scan costs S3 reads that the global cap discards.
+    // This is an approximation: the per-repo cap selects newest-by-lastModified while
+    // the final listing sorts by createdAt, so a run whose createdAt would rank in the
+    // global top-N but whose lastModified ranks below its repo's cap can be missed. The
+    // prior 200-cap had the same property; tightening to MAX_RUNS_PER_LISTING widens it
+    // slightly in exchange for halving worst-case reads — acceptable for this listing.
     const allSummaries: RunSummary[] = []
     const scannedRepos = new Set<string>()
 
@@ -255,7 +264,7 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
 
       let runs: readonly RunState[]
       try {
-        runs = await deps.listRunsForRepo(repo)
+        runs = await deps.listRunsForRepo(repo, MAX_RUNS_PER_LISTING)
       } catch (error: unknown) {
         deps.logger.warn({githubUserId, repo, error}, 'runs: listRunsForRepo threw — skipping repo')
         continue
