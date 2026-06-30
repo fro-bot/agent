@@ -548,6 +548,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       attachUrl: config.workspaceOpencodeUrl,
       attachToken: config.workspaceOpencodeToken,
       runTimeoutMs: config.runTimeoutMs,
+      runInactivityTimeoutMs: config.runInactivityTimeoutMs,
       // Lazy getter: client.user is non-null after login. Web-launched runs
       // always supply a promptBuilder so botUserId is never read on that path.
       get botUserId() {

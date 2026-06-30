@@ -1,0 +1,74 @@
+{
+  "reviewer": "adversarial",
+  "findings": [
+    {
+      "title": "Config: inactivity timeout can silently exceed the hard run ceiling — dead config",
+      "severity": "low",
+      "confidence": 0.9,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "packages/gateway/src/config.ts",
+      "line": 513,
+      "suggested_fix": "Add cross-validation after line 528: `if (runInactivityTimeoutMs > runTimeoutMs) { console.warn(...) }`.",
+      "evidence": [
+        "GATEWAY_RUN_INACTIVITY_TIMEOUT_MS and GATEWAY_RUN_TIMEOUT_MS are validated independently as positive integers (config.ts:504-511, 513-528) with no cross-validation.",
+        "When inactivity > run timeout, the hard ceiling (AbortSignal.timeout) always fires first (run-core.ts:304-306). The inactivity timer at config.ts:513-528 with exceeded timeout is armed (run-core.ts:293-297) but never reaches its delay.",
+        "The hard ceiling signal is an independent source in AbortSignal.any (run-core.ts:304-307) -- never cleared, reset, or modified by any inactivity logic. run.ts:489 creates AbortSignal.timeout(remainingBudgetMs) once and never touches it again.",
+        "The inactivity-timeout kind exists in the error repertoire (run-core.ts:42, run.ts:673, run.ts:750-754) but never appears in logs when config is misaligned."
+      ]
+    },
+    {
+      "title": "AbortSignal.any composite signal retains listeners after normal completion — bounded memory retention",
+      "severity": "low",
+      "confidence": 0.85,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "packages/gateway/src/execute/run-core.ts",
+      "line": 304,
+      "suggested_fix": "In the session.idle handler (line 607-608), add `inactivityController?.abort()` after `clearInactivity()` to trigger AbortSignal.any's spec-mandated cleanup of source listeners.",
+      "evidence": [
+        "AbortSignal.any([signal, inactivityController.signal]) at run-core.ts:304-306 registers internal abort listeners on both source signals. Per spec, these listeners are only removed when the composite is aborted (one source fires).",
+        "When runCore completes via session.idle (line 601-608), clearInactivity() clears the timer but never aborts inactivityController. Neither source signal fires during normal completion.",
+        "The caller's AbortSignal.timeout(remainingBudgetMs) (run.ts:489) holds a strong reference to the composite's listener via addEventListener closure, keeping the composite and inactivityController alive.",
+        "Retention duration: until AbortSignal.timeout fires -- up to remainingBudgetMs (max 30 min after run completed). Objects retained: AbortController, composite AbortSignal, closure chains. Verified trace: run.ts:489 -> run-core.ts:304-307 -> run-core.ts:281-301.",
+        "No functional correctness issue -- no code path reads these objects after return. Minor GC pressure under high run concurrency."
+      ]
+    },
+    {
+      "title": "void iterator.return?.() leaves theoretical unhandledRejection path — latent process crash",
+      "severity": "medium",
+      "confidence": 0.5,
+      "autofix_class": "manual",
+      "owner": "downstream-resolver",
+      "file": "packages/gateway/src/execute/run-core.ts",
+      "line": 701,
+      "suggested_fix": "Change `void iterator.return?.()` to `void iterator.return?.()?.catch(() => {})` at line 701. One extra token eliminates the entire crash class.",
+      "evidence": [
+        "Change at run-core.ts:701: from `await iterator.return?.()` to `void iterator.return?.()`, with comment 'Do NOT await -- the inner iterator may be a never-resolving generator.' (lines 695-699). No .catch() on the discarded promise.",
+        "Current SSE iterator (serverSentEvents.gen.ts) has synchronous finally cleanup -- won't reject. But stream param is typed AsyncIterable<unknown> (line 653) -- any iterable qualifies.",
+        "If iterator.return?.() returns a rejected promise: no .catch() handler -> Node emits unhandledRejection. Gateway has zero process.on('unhandledRejection') handlers (confirmed by source search). Node 24 default --unhandled-rejection=throw terminates the process.",
+        "Fix is zero-cost defense-in-depth: the .catch(() => {}) handles both the hang case (still doesn't await) and the rejection case (swallows)."
+      ]
+    }
+  ],
+  "residual_risks": [
+    {
+      "risk": "Gateway has no unhandledRejection handler — any unhandled rejection from any code path crashes the process in Node 24 (default --unhandled-rejection=throw). Not scoped to this change, but the void-change increases the risk surface.",
+      "mitigation": "Add `process.on('unhandledRejection', (reason) => { logger.error({err: String(reason)}, 'Unhandled rejection') })` at gateway entry point."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "gap": "No test for makeAbortableStream's finally block with a rejecting iterator.return(). The void-change contract is uncovered.",
+      "suggested_test": "Create a mock AsyncIterable whose iterator.return() returns a rejected promise. Verify makeAbortableStream exits without throwing or crashing."
+    },
+    {
+      "gap": "No test for simultaneous inactivity + hard ceiling abort. The prioritization logic at run-core.ts:623-631 (inactivity-timeout kind checked before timeout kind) has no coverage.",
+      "suggested_test": "Provide both a pre-aborted signal and a pre-armed inactivity controller. Verify error kind is 'inactivity-timeout'."
+    },
+    {
+      "gap": "No config test for inactivityTimeoutMs > runTimeoutMs cross-validation.",
+      "suggested_test": "Set GATEWAY_RUN_INACTIVITY_TIMEOUT_MS > GATEWAY_RUN_TIMEOUT_MS. Verify warning or behavior."
+    }
+  ]
+}

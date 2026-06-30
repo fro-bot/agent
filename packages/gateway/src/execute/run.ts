@@ -39,6 +39,12 @@ export interface RunMentionDeps {
   /** Wall-clock milliseconds before an in-progress run is timed out. */
   readonly runTimeoutMs: number
   /**
+   * Milliseconds of inactivity (no text delta or tool completion) before a run is aborted.
+   * Resets on every text delta, tool completion, and permission.replied event.
+   * Pauses while waiting on a human approval.
+   */
+  readonly runInactivityTimeoutMs: number
+  /**
    * Discord user ID of the bot. Used to strip leading mention tokens from
    * the message before building the agent prompt, so a bare `@bot` mention
    * does not silently dispatch a no-op run.
@@ -239,6 +245,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     attachUrl,
     attachToken,
     runTimeoutMs,
+    runInactivityTimeoutMs,
     botUserId,
     persona,
     logger,
@@ -586,6 +593,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           logger,
           coordinator,
           approvalMode,
+          inactivityTimeoutMs: runInactivityTimeoutMs,
           onActivity: (summary: string) => {
             statusSink.noteActivity(summary)
           },
@@ -662,6 +670,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       const isCoreError = execError instanceof RunCoreError
       const isTimeout = isCoreError && execError.kind === 'timeout'
+      const isInactivityTimeout = isCoreError && execError.kind === 'inactivity-timeout'
       const isStreamEnded = isCoreError && execError.kind === 'stream-ended'
       const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
       const isEmptyPrompt = execError instanceof EmptyPromptError
@@ -731,19 +740,24 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       // Coarse user message — no internal detail
       const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
+      const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
       const hasVisibleOutput = replySink.hasVisibleOutput() === true
       const userMessage =
         isTimeout === true
           ? hasVisibleOutput === true
             ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
             : `The task reached the ${timeoutDuration} time limit. Please try again.`
-          : isReachability === true
-            ? 'The workspace is not reachable right now. Please try again later.'
-            : isEmptyPrompt === true
-              ? 'Nothing to do — please include a task in your message.'
-              : isStreamEnded === true
-                ? 'The task stream closed unexpectedly. Please try again.'
-                : 'The task failed. Please try again.'
+          : isInactivityTimeout === true
+            ? hasVisibleOutput === true
+              ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+              : `The task stopped producing output for ${inactivityDuration}. Please try again.`
+            : isReachability === true
+              ? 'The workspace is not reachable right now. Please try again later.'
+              : isEmptyPrompt === true
+                ? 'Nothing to do — please include a task in your message.'
+                : isStreamEnded === true
+                  ? 'The task stream closed unexpectedly. Please try again.'
+                  : 'The task failed. Please try again.'
 
       // ── Status controller failure transition ──────────────────────────────────────────────────
       // resolveToFailure returns:
