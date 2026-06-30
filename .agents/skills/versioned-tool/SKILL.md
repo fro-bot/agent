@@ -137,7 +137,6 @@ Update only the docs that surface the changed version:
 
 - `README.md` — if it shows the pinned default in the input table
 - `action.yaml` — input descriptions for user-facing tools
-- `FEATURES.md` — if the feature checklist mentions the version
 - `AGENTS.md` / `src/services/setup/AGENTS.md` — only if architectural pattern changed
 
 #### 5. Rebuild dist/

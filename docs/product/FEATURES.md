@@ -6,6 +6,8 @@
 
 ---
 
+> **Historical planning document.** Archived 2026-06-30. For current project state see README.md, ARCHITECTURE.md, and STRUCTURE.md.
+
 ## Table of Contents
 
 - [Product Overview](#product-overview)
