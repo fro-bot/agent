@@ -150,6 +150,7 @@ function makeLaunchWorkDeps(): RunMentionDeps {
     attachUrl: 'http://localhost:3000',
     attachToken: 'attach-token',
     runTimeoutMs: 10 * 60 * 1000,
+    runInactivityTimeoutMs: 300_000,
     botUserId: 'bot-123',
     persona: null,
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
