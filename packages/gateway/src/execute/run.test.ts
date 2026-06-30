@@ -423,6 +423,7 @@ function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
     attachUrl: 'http://workspace:9200',
     attachToken: 'secret-bearer-token',
     runTimeoutMs: overrides.runTimeoutMs ?? 600000,
+    runInactivityTimeoutMs: overrides.runInactivityTimeoutMs ?? 300_000,
     botUserId: overrides.botUserId ?? 'bot-123',
     persona: overrides.persona ?? null,
     logger: overrides.logger ?? {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
