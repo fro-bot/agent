@@ -65,6 +65,8 @@ beforeEach(() => {
     'WORKSPACE_OPENCODE_TOKEN_FILE',
     'GATEWAY_TRIGGER_ROLE_ID',
     'GATEWAY_MAX_CONCURRENT_RUNS',
+    'GATEWAY_RUN_TIMEOUT_MS',
+    'GATEWAY_RUN_INACTIVITY_TIMEOUT_MS',
     'GATEWAY_APPROVAL_MODE',
     'GATEWAY_APPROVAL_MODE_FILE',
     'GATEWAY_STATUS_MODE',
@@ -2476,5 +2478,193 @@ describe('loadGatewayConfig — CSRF secret strict base64url validation', () => 
 
     // #then
     expect(config.operatorWeb?.csrfSecret).toBe(minSecret)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GATEWAY_RUN_TIMEOUT_MS and GATEWAY_RUN_INACTIVITY_TIMEOUT_MS
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — GATEWAY_RUN_TIMEOUT_MS', () => {
+  it('happy path: unset → runTimeoutMs defaults to 1800000 (30 minutes)', () => {
+    // #given — GATEWAY_RUN_TIMEOUT_MS not set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — default is 30 minutes (1800000 ms)
+    expect(config.runTimeoutMs).toBe(1_800_000)
+  })
+
+  it('happy path: GATEWAY_RUN_TIMEOUT_MS=600000 → runTimeoutMs is 600000', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '600000'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.runTimeoutMs).toBe(600_000)
+  })
+
+  it('happy path: GATEWAY_RUN_TIMEOUT_MS=1 → accepted (minimum positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '1'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.runTimeoutMs).toBe(1)
+  })
+
+  it('error path: GATEWAY_RUN_TIMEOUT_MS=0 → throws (zero is not a positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_TIMEOUT_MS value: "0"')
+  })
+
+  it('error path: GATEWAY_RUN_TIMEOUT_MS=banana → throws with clear error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = 'banana'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_TIMEOUT_MS value: "banana"')
+  })
+
+  it('error path: GATEWAY_RUN_TIMEOUT_MS=-1 → throws (negative is not a positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '-1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_TIMEOUT_MS value: "-1"')
+  })
+})
+
+describe('loadGatewayConfig — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS', () => {
+  it('happy path: unset → runInactivityTimeoutMs defaults to 300000 (5 minutes)', () => {
+    // #given — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS not set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — default is 5 minutes (300000 ms)
+    expect(config.runInactivityTimeoutMs).toBe(300_000)
+  })
+
+  it('happy path: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS=60000 → runInactivityTimeoutMs is 60000', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '60000'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.runInactivityTimeoutMs).toBe(60_000)
+  })
+
+  it('happy path: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS=1 → accepted (minimum positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '1'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.runInactivityTimeoutMs).toBe(1)
+  })
+
+  it('error path: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS=0 → throws (zero is not a positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_INACTIVITY_TIMEOUT_MS value: "0"')
+  })
+
+  it('error path: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS=banana → throws with clear error', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = 'banana'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_INACTIVITY_TIMEOUT_MS value: "banana"')
+  })
+
+  it('error path: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS=-1 → throws (negative is not a positive integer)', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '-1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Invalid GATEWAY_RUN_INACTIVITY_TIMEOUT_MS value: "-1"')
+  })
+
+  it('soft warning: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS >= GATEWAY_RUN_TIMEOUT_MS emits a console.warn (does not throw)', () => {
+    // #given — inactivity timeout equals the hard ceiling (dead config, but valid)
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '60000'
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '60000'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when — must NOT throw
+    let config: GatewayConfig | undefined
+    expect(() => {
+      config = loadGatewayConfig()
+    }).not.toThrow()
+
+    // #then — warning emitted, config still valid
+    expect(config?.runInactivityTimeoutMs).toBe(60_000)
+    expect(warnSpy).toHaveBeenCalledOnce()
+    const warnArg = warnSpy.mock.calls[0]?.[0] as string
+    expect(warnArg).toContain('inactivity timer can never fire')
+
+    warnSpy.mockRestore()
+  })
+
+  it('soft warning: GATEWAY_RUN_INACTIVITY_TIMEOUT_MS > GATEWAY_RUN_TIMEOUT_MS also warns', () => {
+    // #given — inactivity timeout exceeds the hard ceiling
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '60000'
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '120000'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when
+    expect(() => loadGatewayConfig()).not.toThrow()
+
+    // #then — warning emitted
+    expect(warnSpy).toHaveBeenCalledOnce()
+    warnSpy.mockRestore()
+  })
+
+  it('no warning when GATEWAY_RUN_INACTIVITY_TIMEOUT_MS < GATEWAY_RUN_TIMEOUT_MS (normal config)', () => {
+    // #given — inactivity timeout is less than the hard ceiling (correct config)
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '1800000'
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '300000'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when
+    loadGatewayConfig()
+
+    // #then — no inactivity warning (there may be other console.warn calls from persona etc.)
+    const inactivityWarns = warnSpy.mock.calls.filter(
+      call => typeof call[0] === 'string' && call[0].includes('inactivity timer can never fire'),
+    )
+    expect(inactivityWarns).toHaveLength(0)
+
+    warnSpy.mockRestore()
   })
 })

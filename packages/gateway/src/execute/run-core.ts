@@ -39,6 +39,7 @@ export type RunCoreErrorKind =
   | 'session-error' // OpenCode `session.error` event received
   | 'prompt-error' // `promptAsync` returned an error
   | 'timeout' // run exceeded the configured wall-clock timeout
+  | 'inactivity-timeout' // run exceeded the inactivity timeout (no text/tool progress)
   | 'stream-ended' // event stream closed before session.idle was received
   | 'missing-coordinator' // approval-required mode but no coordinator provided (fail-closed)
 
@@ -136,6 +137,15 @@ export interface RunCoreParams {
    * No-op when absent.
    */
   readonly onBusy?: (busy: boolean) => void
+  /**
+   * Optional inactivity timeout in milliseconds.
+   * When set, the run is aborted with `kind: 'inactivity-timeout'` if no text delta or
+   * tool completion is received within this window. The timer resets on every text delta,
+   * tool completion, and permission.replied event. It is paused (cleared) on
+   * permission.asked and re-armed on permission.replied.
+   * When absent, no inactivity timeout is applied.
+   */
+  readonly inactivityTimeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +244,19 @@ function appendToolSummary(
 // ---------------------------------------------------------------------------
 
 export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
-  const {handle, directory, promptText, sink, signal, logger, coordinator, approvalMode, onActivity, onBusy} = params
+  const {
+    handle,
+    directory,
+    promptText,
+    sink,
+    signal,
+    logger,
+    coordinator,
+    approvalMode,
+    onActivity,
+    onBusy,
+    inactivityTimeoutMs,
+  } = params
   const {client} = handle
 
   // ── 0. Mode/coordinator pre-flight ────────────────────────────────────────
@@ -249,10 +271,42 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     )
   }
 
-  // ── 0b. Pre-flight abort check ─────────────────────────────────────────────
+  // ── 0b. Inactivity controller setup ───────────────────────────────────────
+  // When inactivityTimeoutMs is set, arm an AbortController that fires after the
+  // configured window of silence. The controller is reset on every text delta,
+  // tool completion, and permission.replied event. It is cleared (paused) on
+  // permission.asked and re-armed on permission.replied.
+  // The combined signal merges the wall-clock timeout signal with the inactivity signal
+  // so either can abort the event loop.
+  let inactivityController: AbortController | null = null
+  let inactivityTimer: ReturnType<typeof setTimeout> | null = null
+
+  function clearInactivity(): void {
+    if (inactivityTimer !== null) {
+      clearTimeout(inactivityTimer)
+      inactivityTimer = null
+    }
+  }
+
+  function resetInactivity(): void {
+    if (inactivityController === null || inactivityTimeoutMs === undefined) return
+    clearInactivity()
+    inactivityTimer = setTimeout(() => {
+      inactivityController?.abort()
+    }, inactivityTimeoutMs)
+  }
+
+  if (inactivityTimeoutMs !== undefined && inactivityTimeoutMs > 0) {
+    inactivityController = new AbortController()
+  }
+
+  // combinedSignal: aborts when either the wall-clock signal or the inactivity signal fires.
+  const combinedSignal = inactivityController === null ? signal : AbortSignal.any([signal, inactivityController.signal])
+
+  // ── 0c. Pre-flight abort check ─────────────────────────────────────────────
   // Check before any external call so an already-expired signal (e.g. AbortSignal.timeout
   // that fired during setup) is caught immediately rather than after a blocking SDK call.
-  if (signal.aborted) {
+  if (combinedSignal.aborted) {
     logger.warn({}, 'run-core: signal already aborted before session creation')
     throw new RunCoreError('timeout', 'Run timed out: signal was already aborted before session creation')
   }
@@ -264,7 +318,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // Discord approval UI handles permission asks via the coordinator.
     const sessionResponse = await client.session.create({
       query: {directory},
-      signal,
+      signal: combinedSignal,
     })
     if (sessionResponse.error != null) {
       const errMsg = String(sessionResponse.error)
@@ -287,7 +341,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // ── 1b. Post-create abort check ────────────────────────────────────────────
-  if (signal.aborted) {
+  if (combinedSignal.aborted) {
+    clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after session creation')
     throw new RunCoreError('timeout', 'Run timed out: signal aborted after session creation')
   }
@@ -297,7 +352,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // before the SSE listener exists.
   let eventStream: AsyncIterable<unknown>
   try {
-    const eventsResult = await client.event.subscribe({query: {directory}, signal})
+    const eventsResult = await client.event.subscribe({query: {directory}, signal: combinedSignal})
     eventStream = eventsResult.stream as AsyncIterable<unknown>
     logger.info({sessionId, directory}, 'run-core: event stream subscribed')
   } catch (error) {
@@ -307,7 +362,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // ── 2b. Post-subscribe abort check ────────────────────────────────────────
-  if (signal.aborted) {
+  if (combinedSignal.aborted) {
+    clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after event subscribe')
     throw new RunCoreError('timeout', 'Run timed out: signal aborted after event subscribe')
   }
@@ -318,7 +374,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       path: {id: sessionId},
       body: {parts: [{type: 'text', text: promptText}]},
       query: {directory},
-      signal,
+      signal: combinedSignal,
     })
     if (promptResponse.error != null) {
       const errMsg = String(promptResponse.error)
@@ -332,6 +388,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     logger.info({sessionId, directory}, 'run-core: prompt sent')
     // Signal busy: work has started — drive typing indicator in the status controller.
     onBusy?.(true)
+    // Arm inactivity timer; the agent should produce output within the window.
+    resetInactivity()
   } catch (error) {
     if (error instanceof RunCoreError) throw error
     const message = error instanceof Error ? error.message : String(error)
@@ -340,7 +398,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // ── 3b. Post-prompt abort check ────────────────────────────────────────────
-  if (signal.aborted) {
+  if (combinedSignal.aborted) {
+    clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after prompt send')
     throw new RunCoreError('timeout', 'Run timed out: signal aborted after prompt send')
   }
@@ -360,189 +419,215 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
   // the loop exits promptly even when the SSE server is silent.
-  const abortableStream = makeAbortableStream(eventStream, signal)
+  const abortableStream = makeAbortableStream(eventStream, combinedSignal)
 
-  for await (const rawEvent of abortableStream) {
-    // Check abort at the top of each iteration so we exit as soon as the signal
-    // fires, even if the stream itself keeps yielding events.
-    if (signal.aborted) break
+  try {
+    for await (const rawEvent of abortableStream) {
+      // Check abort at the top of each iteration so we exit as soon as the signal
+      // fires, even if the stream itself keeps yielding events.
+      if (combinedSignal.aborted) break
 
-    const eventType = getEventKind(rawEvent)
-    const eventPayload = getEventPayload(rawEvent)
+      const eventType = getEventKind(rawEvent)
+      const eventPayload = getEventPayload(rawEvent)
 
-    if (eventType === 'message.part.delta') {
-      // New SDK shape: streaming text delta events.
-      // delta may be {type:'text', text:string} or a plain string when field === 'text'.
-      // Reasoning suppression: skip any delta whose partID is a known reasoning part.
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        const deltaPartId = getStringProperty(eventPayload, 'partID')
-        if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
-          // This delta belongs to a reasoning part — suppress it entirely.
-        } else {
-          const delta = getObjectProperty(eventPayload, 'delta')
-          const deltaType = getStringProperty(delta, 'type')
-          const deltaText = getStringProperty(delta, 'text')
-          if (deltaType === 'text' && deltaText != null) {
+      if (eventType === 'message.part.delta') {
+        // New SDK shape: streaming text delta events.
+        // delta may be {type:'text', text:string} or a plain string when field === 'text'.
+        // Reasoning suppression: skip any delta whose partID is a known reasoning part.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const deltaPartId = getStringProperty(eventPayload, 'partID')
+          if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
+            // This delta belongs to a reasoning part — suppress it entirely.
+          } else {
+            const delta = getObjectProperty(eventPayload, 'delta')
+            const deltaType = getStringProperty(delta, 'type')
+            const deltaText = getStringProperty(delta, 'text')
+            if (deltaType === 'text' && deltaText != null) {
+              sink.append(deltaText)
+              resetInactivity()
+            } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
+              sink.append(delta)
+              resetInactivity()
+            }
+          }
+        }
+      } else if (eventType === 'session.next.text.delta') {
+        // Sync/session.next shape: delta is a plain string or {type:'text', text:string}.
+        // No partID on this legacy path — reasoning suppression does not apply here.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const deltaRaw = getObjectProperty(eventPayload, 'delta')
+          const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
+          if (deltaText != null) {
             sink.append(deltaText)
-          } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
-            sink.append(delta)
+            resetInactivity()
           }
         }
-      }
-    } else if (eventType === 'session.next.text.delta') {
-      // Sync/session.next shape: delta is a plain string or {type:'text', text:string}.
-      // No partID on this legacy path — reasoning suppression does not apply here.
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        const deltaRaw = getObjectProperty(eventPayload, 'delta')
-        const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
-        if (deltaText != null) sink.append(deltaText)
-      }
-    } else if (eventType === 'message.part.updated') {
-      // Tool lifecycle on the V1 session layer arrives via message.part.updated
-      // (partType:'tool', state.status:'completed'). The V2 session.next.tool.*
-      // events are handled separately below — both families can reach the /event
-      // stream, so both branches are live.
-      const part = getObjectProperty(eventPayload, 'part')
-      const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
-      if (eventSessionID === sessionId) {
-        const partType = getStringProperty(part, 'type')
-        if (partType === 'reasoning') {
-          // Reasoning suppression: register this part's ID so its deltas are suppressed
-          // at the message.part.delta site. Render nothing for reasoning parts.
-          const reasoningId = getStringProperty(part, 'id')
-          if (reasoningId !== null) {
-            reasoningPartIds.add(reasoningId)
-          }
-        } else if (partType === 'tool') {
-          // ONLY handle tool parts — text parts are streamed via message.part.delta.
-          const toolState = getObjectProperty(part, 'state')
-          const status = getStringProperty(toolState, 'status')
-          if (status === 'completed' || status === 'error') {
-            const tool = getStringProperty(part, 'tool') ?? ''
-            const stateInput = getObjectProperty(toolState, 'input')
-            const stateTitle = getStringProperty(toolState, 'title')
-            logger.debug({tool, status}, 'run-core: tool completed (message.part.updated)')
-            appendToolSummary(
-              {
-                tool,
-                state: {
-                  input:
-                    stateInput != null && typeof stateInput === 'object'
-                      ? (stateInput as Record<string, unknown>)
-                      : undefined,
-                  title: stateTitle ?? undefined,
-                  status: status === 'error' ? 'error' : 'completed',
+      } else if (eventType === 'message.part.updated') {
+        // Tool lifecycle on the V1 session layer arrives via message.part.updated
+        // (partType:'tool', state.status:'completed'). The V2 session.next.tool.*
+        // events are handled separately below — both families can reach the /event
+        // stream, so both branches are live.
+        const part = getObjectProperty(eventPayload, 'part')
+        const eventSessionID = getSessionID(eventPayload) ?? getSessionID(part)
+        if (eventSessionID === sessionId) {
+          const partType = getStringProperty(part, 'type')
+          if (partType === 'reasoning') {
+            // Reasoning suppression: register this part's ID so its deltas are suppressed
+            // at the message.part.delta site. Render nothing for reasoning parts.
+            const reasoningId = getStringProperty(part, 'id')
+            if (reasoningId !== null) {
+              reasoningPartIds.add(reasoningId)
+            }
+          } else if (partType === 'tool') {
+            // ONLY handle tool parts — text parts are streamed via message.part.delta.
+            const toolState = getObjectProperty(part, 'state')
+            const status = getStringProperty(toolState, 'status')
+            if (status === 'completed' || status === 'error') {
+              const tool = getStringProperty(part, 'tool') ?? ''
+              const stateInput = getObjectProperty(toolState, 'input')
+              const stateTitle = getStringProperty(toolState, 'title')
+              logger.debug({tool, status}, 'run-core: tool completed (message.part.updated)')
+              appendToolSummary(
+                {
+                  tool,
+                  state: {
+                    input:
+                      stateInput != null && typeof stateInput === 'object'
+                        ? (stateInput as Record<string, unknown>)
+                        : undefined,
+                    title: stateTitle ?? undefined,
+                    status: status === 'error' ? 'error' : 'completed',
+                  },
                 },
-              },
-              sink,
-              logger,
-              onActivity,
-            )
+                sink,
+                logger,
+                onActivity,
+              )
+              resetInactivity()
+            }
           }
         }
-      }
-    } else if (eventType === 'session.next.tool.called') {
-      // V2 sync tool lifecycle: cache call info for correlation with success event.
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        const callID = getStringProperty(eventPayload, 'callID')
-        const tool = getStringProperty(eventPayload, 'tool')
-        const input = getObjectProperty(eventPayload, 'input')
-        if (callID != null && tool != null) {
-          pendingToolCalls.set(callID, {tool, input})
-          logger.debug({callID, tool}, 'run-core: tool called')
+      } else if (eventType === 'session.next.tool.called') {
+        // V2 sync tool lifecycle: cache call info for correlation with success event.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const callID = getStringProperty(eventPayload, 'callID')
+          const tool = getStringProperty(eventPayload, 'tool')
+          const input = getObjectProperty(eventPayload, 'input')
+          if (callID != null && tool != null) {
+            pendingToolCalls.set(callID, {tool, input})
+            logger.debug({callID, tool}, 'run-core: tool called')
+          }
         }
-      }
-    } else if (eventType === 'session.next.tool.success') {
-      // V2 sync tool lifecycle: resolve title and surface progress line to Discord.
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        const callID = getStringProperty(eventPayload, 'callID')
-        if (callID !== null) {
-          const callInfo = pendingToolCalls.get(callID)
-          if (callInfo !== undefined) {
-            pendingToolCalls.delete(callID)
-            const {tool, input} = callInfo
-            // Title resolution: structured.title → input.title → bash command → tool name.
-            const structured = getObjectProperty(eventPayload, 'structured')
-            const structuredTitle = getStringProperty(structured, 'title')
-            const inputTitle = getStringProperty(input, 'title')
-            const title = structuredTitle ?? inputTitle ?? undefined
-            logger.debug({callID, tool}, 'run-core: tool success')
-            appendToolSummary(
-              {
-                tool,
-                state: {
-                  input: input != null && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
-                  title,
-                  status: 'completed',
+      } else if (eventType === 'session.next.tool.success') {
+        // V2 sync tool lifecycle: resolve title and surface progress line to Discord.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const callID = getStringProperty(eventPayload, 'callID')
+          if (callID !== null) {
+            const callInfo = pendingToolCalls.get(callID)
+            if (callInfo !== undefined) {
+              pendingToolCalls.delete(callID)
+              const {tool, input} = callInfo
+              // Title resolution: structured.title → input.title → bash command → tool name.
+              const structured = getObjectProperty(eventPayload, 'structured')
+              const structuredTitle = getStringProperty(structured, 'title')
+              const inputTitle = getStringProperty(input, 'title')
+              const title = structuredTitle ?? inputTitle ?? undefined
+              logger.debug({callID, tool}, 'run-core: tool success')
+              appendToolSummary(
+                {
+                  tool,
+                  state: {
+                    input: input != null && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
+                    title,
+                    status: 'completed',
+                  },
                 },
-              },
-              sink,
-              logger,
-              onActivity,
-            )
+                sink,
+                logger,
+                onActivity,
+              )
+              resetInactivity()
+            }
           }
         }
-      }
-    } else if (eventType === 'permission.asked') {
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        // approval-required mode: route to coordinator.
+      } else if (eventType === 'permission.asked') {
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          // approval-required mode: route to coordinator.
+          // Coordinator is guaranteed non-null here (pre-flight check above).
+          const req = parsePermissionRequest(eventPayload)
+          if (req === null) {
+            logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
+          } else {
+            // Pause typing while waiting on a human approval — the run is blocked,
+            // not actively working. Typing would falsely imply active work.
+            onBusy?.(false)
+            // Pause the inactivity timer while waiting for human approval.
+            clearInactivity()
+            // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
+            // eslint-disable-next-line no-void
+            void coordinator.onPermissionAsked(req)
+            logger.info({requestID: req.requestID}, 'run-core: permission.asked forwarded to coordinator')
+          }
+        }
+      } else if (eventType === 'permission.replied') {
+        // Authoritative settlement — route to coordinator.
         // Coordinator is guaranteed non-null here (pre-flight check above).
-        const req = parsePermissionRequest(eventPayload)
-        if (req === null) {
-          logger.warn({eventType}, 'run-core: permission.asked payload malformed — skipping')
-        } else {
-          // Pause typing while waiting on a human approval — the run is blocked,
-          // not actively working. Typing would falsely imply active work.
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          const ev = parsePermissionReply(eventPayload)
+          if (ev === null) {
+            logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
+          } else {
+            // Approval resolved — resume typing if the run continues.
+            onBusy?.(true)
+            resetInactivity() // Re-arm inactivity now that the run is unblocked.
+            coordinator.onPermissionReplied(ev)
+            logger.info(
+              {requestID: ev.requestID, reply: ev.reply},
+              'run-core: permission.replied forwarded to coordinator',
+            )
+          }
+        }
+      } else if (eventType === 'session.idle') {
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === sessionId) {
+          logger.info({sessionId}, 'run-core: session.idle received — stream complete')
+          // Signal not-busy: work is done.
           onBusy?.(false)
-          // Fire-and-continue: do NOT await — awaiting would starve the SSE drain.
-          // eslint-disable-next-line no-void
-          void coordinator.onPermissionAsked(req)
-          logger.info({requestID: req.requestID}, 'run-core: permission.asked forwarded to coordinator')
+          clearInactivity()
+          return
         }
-      }
-    } else if (eventType === 'permission.replied') {
-      // Authoritative settlement — route to coordinator.
-      // Coordinator is guaranteed non-null here (pre-flight check above).
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        const ev = parsePermissionReply(eventPayload)
-        if (ev === null) {
-          logger.warn({eventType}, 'run-core: permission.replied payload malformed — skipping')
-        } else {
-          // Approval resolved — resume typing if the run continues.
-          onBusy?.(true)
-          coordinator.onPermissionReplied(ev)
-          logger.info(
-            {requestID: ev.requestID, reply: ev.reply},
-            'run-core: permission.replied forwarded to coordinator',
-          )
+      } else if (eventType === 'session.error') {
+        const eventSessionID = getEventSessionID(rawEvent)
+        if (eventSessionID === null || eventSessionID === sessionId) {
+          const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
+          logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
+          clearInactivity()
+          throw new RunCoreError('session-error', `Session error: ${errorDetail}`)
         }
-      }
-    } else if (eventType === 'session.idle') {
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === sessionId) {
-        logger.info({sessionId}, 'run-core: session.idle received — stream complete')
-        // Signal not-busy: work is done.
-        onBusy?.(false)
-        return
-      }
-    } else if (eventType === 'session.error') {
-      const eventSessionID = getEventSessionID(rawEvent)
-      if (eventSessionID === null || eventSessionID === sessionId) {
-        const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
-        logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
-        throw new RunCoreError('session-error', `Session error: ${errorDetail}`)
       }
     }
+  } finally {
+    // Ensure the inactivity timer is always cleared on loop exit (normal, break, or throw).
+    // The explicit clearInactivity() calls on the session.idle and session.error paths are
+    // kept as defensive double-clears — clearTimeout on an already-cleared handle is a no-op.
+    clearInactivity()
   }
 
-  // Stream exhausted. Distinguish timeout (signal aborted) from premature close.
-  if (signal.aborted) {
+  // Stream exhausted (loop exited normally or via break). Distinguish timeout from premature close.
+  // NOTE: this block runs AFTER the finally above, so clearInactivity() has already fired.
+  if (combinedSignal.aborted) {
+    // Inactivity is the tighter bound (always < hard ceiling), so on the rare both-aborted
+    // tick we attribute to inactivity-timeout deliberately.
+    if (inactivityController !== null && inactivityController.signal.aborted) {
+      logger.warn({sessionId}, 'run-core: stream ended due to inactivity timeout')
+      throw new RunCoreError('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
+    }
     logger.warn({sessionId}, 'run-core: stream ended due to timeout signal')
     throw new RunCoreError('timeout', 'Run timed out: event stream aborted by timeout signal')
   }
@@ -609,8 +694,10 @@ async function* makeAbortableStream(stream: AsyncIterable<unknown>, signal: Abor
       yield result.value
     }
   } finally {
-    // Best-effort: return the underlying iterator if it supports it.
-    await iterator.return?.()
+    // Fire-and-forget: the iterator may never resolve return(); awaiting it would hang.
+    // .catch avoids an unhandled rejection if return() rejects (Node 24 crashes on those).
+    // eslint-disable-next-line no-void
+    void iterator.return?.()?.catch(() => {})
   }
 }
 

@@ -56,6 +56,12 @@ export interface GatewayConfig {
   /** Maximum wall-clock milliseconds a single run may take before being aborted. */
   readonly runTimeoutMs: number
   /**
+   * Maximum milliseconds of inactivity (no text delta or tool completion) before a run is
+   * aborted. Resets on every text delta, tool completion, and permission reply.
+   * Pauses while waiting on a human approval (permission.asked → permission.replied).
+   */
+  readonly runInactivityTimeoutMs: number
+  /**
    * Approval mode for tool permission requests during mention runs.
    * - `approval-required` (default): routes permission asks to Discord approval UI.
    *
@@ -495,13 +501,41 @@ export function loadGatewayConfig(): GatewayConfig {
     throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
   }
 
-  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? '600000'
+  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? '1800000'
   if (/^[1-9]\d*$/.test(rawRunTimeout) === false) {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }
   const runTimeoutMs = Number.parseInt(rawRunTimeout, 10)
   if (Number.isFinite(runTimeoutMs) === false || Number.isInteger(runTimeoutMs) === false || runTimeoutMs < 1) {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
+  }
+
+  const rawRunInactivityTimeout = readOptionalSecret('GATEWAY_RUN_INACTIVITY_TIMEOUT_MS') ?? '300000'
+  if (/^[1-9]\d*$/.test(rawRunInactivityTimeout) === false) {
+    throw new Error(
+      `Invalid GATEWAY_RUN_INACTIVITY_TIMEOUT_MS value: "${rawRunInactivityTimeout}" (must be a positive integer)`,
+    )
+  }
+  const runInactivityTimeoutMs = Number.parseInt(rawRunInactivityTimeout, 10)
+  if (
+    Number.isFinite(runInactivityTimeoutMs) === false ||
+    Number.isInteger(runInactivityTimeoutMs) === false ||
+    runInactivityTimeoutMs < 1
+  ) {
+    throw new Error(
+      `Invalid GATEWAY_RUN_INACTIVITY_TIMEOUT_MS value: "${rawRunInactivityTimeout}" (must be a positive integer)`,
+    )
+  }
+
+  // Soft warning: if inactivity >= hard ceiling, the inactivity timer can never fire.
+  // Valid config, but effectively dead — the hard ceiling always wins first.
+  if (runInactivityTimeoutMs >= runTimeoutMs) {
+    console.warn(
+      JSON.stringify({
+        level: 'warn',
+        msg: `GATEWAY_RUN_INACTIVITY_TIMEOUT_MS (${runInactivityTimeoutMs}ms) is >= GATEWAY_RUN_TIMEOUT_MS (${runTimeoutMs}ms) — the inactivity timer can never fire because the hard ceiling fires first. Set GATEWAY_RUN_INACTIVITY_TIMEOUT_MS to a value less than GATEWAY_RUN_TIMEOUT_MS.`,
+      }),
+    )
   }
 
   // Persona — optional multi-line markdown file (e.g. fro-bot-persona.md).
@@ -849,6 +883,7 @@ export function loadGatewayConfig(): GatewayConfig {
     triggerRoleId,
     maxConcurrentRuns,
     runTimeoutMs,
+    runInactivityTimeoutMs,
     ...(announce === undefined ? {} : {announce}),
     ...(operatorWeb === undefined ? {} : {operatorWeb}),
   }

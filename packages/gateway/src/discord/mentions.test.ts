@@ -134,6 +134,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
     attachUrl: 'http://workspace:9200',
     attachToken: 'secret-token',
     runTimeoutMs: 600_000,
+    runInactivityTimeoutMs: 300_000,
     botUserId: 'bot-user-id',
     logger: {
       debug: vi.fn(),

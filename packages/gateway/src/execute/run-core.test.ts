@@ -13,7 +13,7 @@ import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 
@@ -54,6 +54,17 @@ async function* makeEventStream(events: readonly object[]): AsyncGenerator<objec
   for (const event of events) {
     yield event
   }
+}
+
+/**
+ * Async generator that yields one initial event then hangs forever.
+ * Used by inactivity-timeout tests that need a stream that never completes.
+ */
+async function* hangingStreamAfterFirst(firstEvent: object): AsyncGenerator<object> {
+  yield firstEvent
+  await new Promise<void>(() => {
+    /* never resolves */
+  })
 }
 
 /** Standard "session created" response. */
@@ -2116,6 +2127,356 @@ describe('runOpenCodeCore', () => {
 
       // #when / #then — must not throw
       await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Inactivity timeout
+  // ---------------------------------------------------------------------------
+
+  describe('inactivity timeout', () => {
+    it('resolves normally when session.idle arrives before inactivity timeout fires', async () => {
+      // #given — inactivityTimeoutMs set but session.idle arrives quickly
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([partDeltaObjectEvent('Hello'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 60_000, // 60 s — won't fire in test
+      }
+
+      // #when / #then — resolves without throwing
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    it('throws RunCoreError with kind "inactivity-timeout" when no activity arrives within the window', async () => {
+      // #given — silent stream; inactivity timer fires before any event
+      // Use a very short inactivity timeout (10ms) — will fire almost immediately after prompt send
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              // Yield nothing — simulate a completely silent stream
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 10, // fires almost immediately
+      }
+
+      // #when / #then — inactivity-timeout kind thrown
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('inactivity-timeout')
+    }, 10_000)
+
+    it('inactivity timer resets on text delta — does not fire when output is flowing', async () => {
+      // #given — text deltas arrive steadily; inactivity timer resets each time
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partDeltaObjectEvent('chunk 1'),
+            partDeltaObjectEvent('chunk 2'),
+            partDeltaObjectEvent('chunk 3'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 60_000, // long enough not to fire during test
+      }
+
+      // #when / #then — resolves normally (timer never fires)
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    it('inactivity timer is cleared on session.idle — no dangling timer after completion', async () => {
+      // #given — normal run that completes via session.idle
+      const handle = makeHandle()
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 60_000,
+      }
+
+      // #when — run completes normally
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then — no dangling timer (verified by test completing without hanging)
+      // If the timer were not cleared, the test runner would hang waiting for it.
+    })
+
+    it('inactivity timer is paused on permission.asked and re-armed on permission.replied', async () => {
+      // #given — permission.asked then permission.replied then session.idle
+      // With a very short inactivity timeout, the timer would fire during the approval wait
+      // if it were not paused. Since it IS paused, the run completes normally.
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            permissionAskedEvent('req-inact-1'),
+            permissionRepliedEvent('req-inact-1', 'once'),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 1, // very short — would fire during approval wait if not paused
+      }
+
+      // #when / #then — resolves normally because timer is paused during approval wait
+      // (permission.asked clears the timer; permission.replied re-arms it; session.idle clears it)
+      // Note: this test is timing-sensitive but works because the event stream is synchronous
+      // in tests — all events are processed before any real timer fires.
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    it('inactivity timeout does not fire when inactivityTimeoutMs is absent', async () => {
+      // #given — no inactivityTimeoutMs; silent stream that never yields
+      // Without inactivity timeout, the run would hang forever on a silent stream.
+      // We use a pre-aborted wall-clock signal to terminate it.
+      const controller = new AbortController()
+      const handle = makeHandle({
+        promptAsync: async () => {
+          controller.abort()
+          return promptAsyncOk()
+        },
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+      const params = {
+        ...buildParams(handle),
+        signal: controller.signal,
+        coordinator: makeCoordinator(),
+        // No inactivityTimeoutMs
+      }
+
+      // #when / #then — timeout kind (wall-clock), NOT inactivity-timeout
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+    })
+
+    it('inactivity-timeout kind is distinct from timeout kind', async () => {
+      // #given — inactivity fires (not wall-clock timeout)
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 10, // fires almost immediately
+      }
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — kind is 'inactivity-timeout', not 'timeout'
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('inactivity-timeout')
+      expect((err as RunCoreError).kind).not.toBe('timeout')
+    }, 10_000)
+
+    it('inactivity timer resets on tool completion (message.part.updated)', async () => {
+      // #given — tool completion resets the inactivity timer; session.idle arrives after
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'x.ts', newString: 'a', oldString: 'b'}}),
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {
+        ...buildParams(handle),
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 60_000, // long enough not to fire during test
+      }
+
+      // #when / #then — resolves normally (tool completion reset the timer)
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    // -------------------------------------------------------------------------
+    // Fake-timer tests — verify time-advancing boundary behavior
+    // -------------------------------------------------------------------------
+
+    describe('fake-timer boundary tests', () => {
+      afterEach(() => {
+        vi.useRealTimers()
+      })
+
+      it('(a) continuous output does not abort: resets prevent inactivity-timeout over time', async () => {
+        // #given — fake timers; inactivity window of 5000ms
+        vi.useFakeTimers()
+        const WINDOW = 5_000
+
+        // Build a controlled async generator that yields events on demand
+        const eventQueue: object[] = []
+        let resolveNext: (() => void) | null = null
+
+        async function* controlledStream(): AsyncGenerator<object> {
+          while (true) {
+            if (eventQueue.length > 0) {
+              const next = eventQueue.shift()
+              if (next === undefined) break
+              yield next
+            } else {
+              await new Promise<void>(resolve => {
+                resolveNext = resolve
+              })
+            }
+          }
+        }
+
+        const emitNext = (event: object) => {
+          eventQueue.push(event)
+          if (resolveNext !== null) {
+            const r = resolveNext
+            resolveNext = null
+            r()
+          }
+        }
+        const streamDone = () => {
+          // Signal end by emitting session.idle
+          emitNext(sessionIdleEvent('sess-123'))
+        }
+
+        const handle = makeHandle({
+          subscribe: async () => Promise.resolve({stream: controlledStream()}),
+        })
+        const params = {
+          ...buildParams(handle),
+          coordinator: makeCoordinator(),
+          inactivityTimeoutMs: WINDOW,
+        }
+
+        // Start the run (don't await yet)
+        const runPromise = runOpenCodeCore(params)
+
+        // Emit first delta, advance time to just under the window, emit another, repeat
+        emitNext(partDeltaObjectEvent('chunk 1'))
+        await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+        emitNext(partDeltaObjectEvent('chunk 2'))
+        await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+        emitNext(partDeltaObjectEvent('chunk 3'))
+        await vi.advanceTimersByTimeAsync(WINDOW - 1000)
+
+        // Now complete the run — session.idle
+        streamDone()
+
+        // #then — resolves successfully (no inactivity-timeout)
+        await expect(runPromise).resolves.toBeUndefined()
+      })
+
+      it('(b) inactivity fires after the window with no further events', async () => {
+        // #given — fake timers; inactivity window of 5000ms
+        vi.useFakeTimers()
+        const WINDOW = 5_000
+
+        // Stream that yields one delta immediately, then hangs forever
+        const handle = makeHandle({
+          subscribe: async () =>
+            Promise.resolve({stream: hangingStreamAfterFirst(partDeltaObjectEvent('initial chunk'))}),
+        })
+        const params = {
+          ...buildParams(handle),
+          coordinator: makeCoordinator(),
+          inactivityTimeoutMs: WINDOW,
+        }
+
+        // Attach .catch() immediately so the rejection is handled before timers fire
+        let capturedError: unknown
+        const runPromise = runOpenCodeCore(params).catch((error: unknown) => {
+          capturedError = error
+        })
+
+        // Let the run start and process the first delta (resets the timer), then advance past the window
+        await vi.advanceTimersByTimeAsync(WINDOW + 1000)
+        await runPromise
+
+        // #then — inactivity-timeout thrown
+        expect(capturedError).toBeInstanceOf(RunCoreError)
+        expect((capturedError as RunCoreError).kind).toBe('inactivity-timeout')
+      })
+
+      it('(c) approval pause survives a long wait: timer cleared during approval, re-armed after', async () => {
+        // #given — fake timers; inactivity window of 5000ms
+        vi.useFakeTimers()
+        const WINDOW = 5_000
+
+        // Stream: permission.asked, then (after a long wait) permission.replied, then session.idle
+        let emitReply!: () => void
+        async function* controlledStream(): AsyncGenerator<object> {
+          yield permissionAskedEvent('req-pause-1')
+          // Simulate a long human approval wait — longer than the inactivity window
+          await new Promise<void>(resolve => {
+            emitReply = resolve
+          })
+          yield permissionRepliedEvent('req-pause-1', 'once')
+          yield sessionIdleEvent('sess-123')
+        }
+
+        const handle = makeHandle({
+          subscribe: async () => Promise.resolve({stream: controlledStream()}),
+        })
+        const params = {
+          ...buildParams(handle),
+          coordinator: makeCoordinator(),
+          inactivityTimeoutMs: WINDOW,
+        }
+
+        const runPromise = runOpenCodeCore(params)
+
+        // Advance past the inactivity window — timer should be cleared (paused) during approval
+        await vi.advanceTimersByTimeAsync(WINDOW + 60_000)
+
+        // Now the human approves
+        emitReply()
+
+        // #then — resolves successfully (no inactivity-timeout, because timer was paused)
+        await expect(runPromise).resolves.toBeUndefined()
+      })
+
+      it('no dangling timer after successful run (vi.getTimerCount() === 0)', async () => {
+        // #given — fake timers; normal run with inactivity timer set
+        vi.useFakeTimers()
+
+        const handle = makeHandle({
+          subscribe: async () => subscribeOk([partDeltaObjectEvent('Hello'), sessionIdleEvent('sess-123')]),
+        })
+        const params = {
+          ...buildParams(handle),
+          coordinator: makeCoordinator(),
+          inactivityTimeoutMs: 60_000,
+        }
+
+        // #when — run completes normally
+        await runOpenCodeCore(params)
+
+        // #then — no dangling timers remain
+        expect(vi.getTimerCount()).toBe(0)
+      })
     })
   })
 })

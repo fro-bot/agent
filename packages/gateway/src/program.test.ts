@@ -168,6 +168,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     triggerRoleId: null,
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
+    runInactivityTimeoutMs: 300_000,
     approvalMode: 'approval-required',
     statusMode: 'live-status',
     persona: null,
