@@ -13,7 +13,7 @@ Read these files before implementing anything:
   - _Testing Standards_ (TDD workflow, SDK mocking, BDD comments)
   - _Anti-Patterns (Forbidden)_ (comprehensive list of what NOT to do)
 - **RFCs/** — Check relevant RFCs for feature-specific architecture decisions
-- **PRD.md / FEATURES.md** — Check for requirements on new features
+- **docs/product/PRD.md / docs/product/FEATURES.md** — Historical product requirements (archived; check for background only)
 
 Documentation hierarchy: PRD > RFCs > FEATURES.md > RULES.md > AGENTS.md
 

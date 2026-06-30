@@ -641,4 +641,4 @@ describe("installAgentPlugin", () => {
 
 - [RFC-010: Delegated Work Library](./RFC-010-Delegated-Work.md) - Library implementation (completed)
 - [OpenCode Plugins Documentation](https://opencode.ai/docs/plugins/) - Plugin API reference
-- [PRD Section A.5](../PRD.md) - Delegated work requirements
+- [PRD Section A.5](../docs/product/PRD.md) - Delegated work requirements
