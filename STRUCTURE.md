@@ -1,6 +1,6 @@
 # Structure
 
-This document maps the repository's directory layout and explains where code lives. For system design, invariants, and data flows see [`ARCHITECTURE.md`](ARCHITECTURE.md) (forthcoming). For agent-operational knowledge — commands, conventions, and the full code map — see [`AGENTS.md`](AGENTS.md).
+This document maps the repository's directory layout and explains where code lives. For system design, invariants, and data flows see [`ARCHITECTURE.md`](ARCHITECTURE.md). For agent-operational knowledge — commands, conventions, and the full code map — see [`AGENTS.md`](AGENTS.md).
 
 ## Directory Layout
 
