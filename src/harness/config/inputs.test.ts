@@ -297,7 +297,50 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(true)
       expect(mocks.setSecret).toHaveBeenCalledWith('AKIA_TEST_VALUE')
       expect(mocks.setSecret).toHaveBeenCalledWith('secret-test-value')
-      expect(mocks.setSecret).toHaveBeenCalledTimes(2)
+      // 3 calls: AWS access key + AWS secret key + auth-json (masked as of Unit 1's env scrub)
+      expect(mocks.setSecret).toHaveBeenCalledTimes(3)
+    })
+
+    it('scrubs INPUT_AUTH-JSON from process.env after parsing while preserving the returned value', () => {
+      // @actions/core reads auth-json from INPUT_AUTH-JSON (hyphen preserved; only spaces→_)
+      const rawAuthJson = '{"anthropic":{"type":"api","key":"sk-ant-test"}}'
+      vi.stubEnv('INPUT_AUTH-JSON', rawAuthJson)
+      mockInputs({'auth-json': rawAuthJson})
+
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.authJson).toBe(rawAuthJson)
+      expect(process.env['INPUT_AUTH-JSON']).toBeUndefined()
+    })
+
+    it('registers auth-json as a masked secret', () => {
+      const rawAuthJson = '{"anthropic":{"type":"api","key":"sk-ant-test"}}'
+      mockInputs({'auth-json': rawAuthJson})
+
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(mocks.setSecret).toHaveBeenCalledWith(rawAuthJson)
+      expect(mocks.setSecret).toHaveBeenCalledTimes(1)
+    })
+
+    it('excludes auth-json from a simulated child-process env snapshot after scrubbing', () => {
+      const rawAuthJson = '{"anthropic":{"type":"api","key":"sk-ant-test"}}'
+      vi.stubEnv('INPUT_AUTH-JSON', rawAuthJson)
+      mockInputs({'auth-json': rawAuthJson})
+
+      const result = parseActionInputs()
+
+      // #when: simulate the SDK's child-process spawn env construction
+      const childEnv = {...process.env}
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(childEnv['INPUT_AUTH-JSON']).toBeUndefined()
+      expect(Object.values(childEnv)).not.toContain(rawAuthJson)
     })
 
     it('forces storeConfig.enabled to false for fork pull requests', () => {
@@ -344,6 +387,19 @@ describe('parseActionInputs', () => {
 
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('auth-json')
+    })
+
+    it('does not throw scrubbing INPUT_AUTH-JSON when the env var was never set', () => {
+      // #given: valid auth-json input but no INPUT_AUTH-JSON env var present to delete
+      expect(process.env['INPUT_AUTH-JSON']).toBeUndefined()
+      mockInputs({})
+
+      // #when
+      const result = parseActionInputs()
+
+      // #then: delete on a non-existent property is a no-op and does not throw
+      expect(result.success).toBe(true)
+      expect(process.env['INPUT_AUTH-JSON']).toBeUndefined()
     })
 
     it('returns error for invalid auth-json (not valid JSON)', () => {
