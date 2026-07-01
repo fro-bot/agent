@@ -72,6 +72,7 @@ For architecture (the four-layer rule, committed `dist/`, NormalizedEvent, dual 
 - **SDK-based execution**: Uses `@opencode-ai/sdk` for server lifecycle + event streaming
 - **Bundled Systematic plugin**: Setup injects `@fro.bot/systematic@<version>` into CI OpenCode config by default
 - **Persistent memory**: Sessions survive across CI runs via GitHub Actions cache
+- **Documented solutions**: `docs/solutions/` holds solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`) — searchable when implementing or debugging in a documented area
 - **Pre-push hook**: Runs lint + build (the lint step includes the dist hidden-Unicode check)
 - **Release-notes narration**: After a release publishes, a `@semantic-release/exec` `successCmd` (`scripts/release/dispatch-release-notes.ts`) dispatches `fro-bot.yaml` on `main` to rewrite the GitHub Release body into a `## What's new` narrative. The model is operator-configurable via the `RELEASE_NOTES_MODEL` repository variable (must be a cliproxy-served id, e.g. `anthropic/claude-haiku-4-5-20251001`); narration is skipped with a warning if the variable is unset. Dispatch auth is `FRO_BOT_PAT` (`RELEASE_NOTES_DISPATCH_TOKEN`), not the read-only App token. It is idempotent (skips when the body already carries `<!-- fro-bot-narration-v1 -->`) and fail-soft: narrative-quality failures warn and never block the release, while security-relevant anomalies (off-target release edits, auth failures) fail the step.
 
