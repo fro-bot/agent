@@ -228,6 +228,10 @@ Agent prompts are assembled from named XML-tagged sections with an explicit auth
 
 > See also: [Prompt Architecture](docs/wiki/Prompt%20Architecture.md)
 
+### Two-Layer Session Management
+
+Session persistence spans two distinct layers that are easy to conflate. The **agent-side** layer is a set of in-session tools the model calls _during_ a run — `session_search` and `session_read`, injected into the prompt (`packages/runtime/src/agent/prompt.ts`) so the agent can recall relevant prior work before re-investigating. The **action-side** layer is a set of TypeScript utilities the harness runs _around_ execution — `listSessions`, `searchSessions`, `pruneSessions`, and `writeSessionSummary` (`packages/runtime/src/session/`) — invoked by the finalize and cleanup phases to persist, summarize, and prune session state across CI runs. The agent never calls the action-side utilities directly, and the harness never invokes the agent-side tools; they meet only through the persisted session store.
+
 ### OIDC Trusted Publishing
 
 The harness release workflow publishes to npm via OIDC (no long-lived npm token). `id-token: write` is scoped to the `publish` job only; `integrate` and `build` jobs run with `contents: read` and no `id-token`. Each of the five packages (`@fro.bot/harness` + four per-platform packages) requires a one-time trusted-publisher configuration on npmjs.com before OIDC publishes can succeed.

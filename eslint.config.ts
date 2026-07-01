@@ -12,7 +12,6 @@ export default defineConfig(
       'docs/product/',
       'RFCs/',
       'RFCS.md',
-      'RULES.md',
       'dist/**',
       'docs/brainstorms/',
       'docs/ideation/',

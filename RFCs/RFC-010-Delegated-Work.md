@@ -803,7 +803,7 @@ RFC-010 was implemented as a **library-only** solution. The delegated work funct
 
 3. **Idempotent operations**: Branch creation returns existing ref if already exists (no error).
 
-4. **Function-based architecture**: Per RULES.md - no classes, pure exported functions with dependency injection.
+4. **Function-based architecture**: Per AGENTS.md - no classes, pure exported functions with dependency injection.
 
 ### Deferred Work
 
