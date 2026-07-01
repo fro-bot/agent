@@ -91,8 +91,7 @@ export interface IntegrationAdapters {
 // ---------------------------------------------------------------------------
 
 export type IntegrationResult =
-  | {readonly ok: true; readonly manifest: ProvenanceManifest}
-  | {readonly ok: false; readonly error: string}
+  {readonly ok: true; readonly manifest: ProvenanceManifest} | {readonly ok: false; readonly error: string}
 
 // ---------------------------------------------------------------------------
 // Provenance manifest I/O (single source of truth)
