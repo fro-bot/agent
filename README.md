@@ -75,9 +75,9 @@ jobs:
 
 Comment `@fro-bot` on any issue or pull request. The agent acknowledges with a reaction, restores its memory, runs the task, and posts a single response with a run summary.
 
-> [!TIP] The snippet above wires a single trigger. For the complete workflow — every supported trigger, conditional token selection, scheduled tasks, and PR reviews — copy [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml). To have an agent set it up for you, point it at that file:
->
-> > Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+> [!TIP] The snippet above wires a single trigger. For the complete workflow — every supported trigger, conditional token selection, scheduled tasks, and PR reviews — copy [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml). To have an agent set it up for you, point it at that file with the prompt below.
+
+> Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
 
 > [!NOTE] `@fro-bot` mention triggers require a token whose login matches the mention. `GITHUB_TOKEN` posts as `@github-actions`, so responding to `@fro-bot` needs a PAT or GitHub App token.
 
