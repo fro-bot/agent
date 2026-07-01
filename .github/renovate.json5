@@ -185,7 +185,7 @@
       // patch releases, so moves past the validated release must be deliberate and
       // reviewed. Raise after validating a newer release.
       matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
-      allowedVersions: '<=1.17.11',
+      allowedVersions: '<=1.17.13',
     },
     {
       // Cap Bun at 1.3.14. The build gate requires an exact match with upstream
