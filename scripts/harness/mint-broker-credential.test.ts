@@ -369,6 +369,26 @@ describe('main — error paths (fail closed)', () => {
     expect(mocks.setOutput).not.toHaveBeenCalled()
   })
 
+  it('exits non-zero and emits nothing when the response body read fails or hangs', async () => {
+    // #given: a 2xx response whose body read rejects (e.g. the shared AbortSignal
+    // aborts a slow/hung body) — must be caught and fail closed, not escape.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => {
+        throw new Error('The operation was aborted due to timeout')
+      },
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    // #when
+    await main()
+
+    // #then
+    expect(process.exitCode).toBe(1)
+    expect(mocks.setOutput).not.toHaveBeenCalled()
+  })
+
   it('exits non-zero and emits nothing for a one-valid-one-invalid-provider payload (all-or-nothing)', async () => {
     // #given
     const fetchMock = vi.fn().mockResolvedValue(

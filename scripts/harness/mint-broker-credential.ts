@@ -115,6 +115,11 @@ export async function main(): Promise<void> {
     core.setSecret(oidcToken)
 
     const brokerUrl = resolveBrokerUrl(process.env)
+    // One AbortSignal bounds the ENTIRE exchange. A signal passed to fetch also
+    // aborts an in-progress response body read, so the response.text() below is
+    // covered by the same timeout, not just the initial POST — a slow/hung body
+    // cannot exceed the bound.
+    const signal = AbortSignal.timeout(MINT_TIMEOUT_MS)
     let response: Response
     try {
       response = await fetch(`${brokerUrl}/v1/mint`, {
@@ -123,10 +128,10 @@ export async function main(): Promise<void> {
           Authorization: `Bearer ${oidcToken}`,
           'Content-Type': 'application/json',
         },
-        // Single attempt, bounded — no retry loop. The OIDC token is
-        // single-use per jti; a retry either fails replay protection or
-        // risks minting a duplicate credential.
-        signal: AbortSignal.timeout(MINT_TIMEOUT_MS),
+        // Single attempt — no retry loop. The OIDC token is single-use per jti;
+        // a retry either fails replay protection or risks minting a duplicate
+        // credential.
+        signal,
       })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
@@ -137,7 +142,13 @@ export async function main(): Promise<void> {
       throw new Error(`broker returned HTTP ${response.status}`)
     }
 
-    const raw = await response.text()
+    let raw: string
+    try {
+      raw = await response.text()
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new Error(`broker response read failed: ${message}`)
+    }
     const result = validateBrokerResponse(raw)
     if (!result.ok) {
       throw new Error(`broker response rejected: ${result.reason}`)
