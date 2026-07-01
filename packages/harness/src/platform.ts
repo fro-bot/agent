@@ -33,8 +33,7 @@ export interface PlatformInfo {
  * ok: false → platform is not in the supported matrix; error contains a human-readable message.
  */
 export type PlatformResult =
-  | {readonly ok: true; readonly info: PlatformInfo}
-  | {readonly ok: false; readonly error: string}
+  {readonly ok: true; readonly info: PlatformInfo} | {readonly ok: false; readonly error: string}
 
 /**
  * Returns the platform result for the given os/arch pair.

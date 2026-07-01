@@ -223,6 +223,12 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       return err(new Error('auth-json is required but was not provided'))
     }
     validateJsonString(authJson, 'auth-json')
+    core.setSecret(authJson)
+    // @actions/core maps input names to env vars via name.replace(/ /g, '_').toUpperCase() —
+    // spaces become underscores but hyphens are preserved, so `auth-json` reads from
+    // `INPUT_AUTH-JSON` (not `INPUT_AUTH_JSON`). Delete the correct key so the raw secret is
+    // not inherited by the OpenCode server child (spawned with `{ ...process.env }`).
+    delete process.env['INPUT_AUTH-JSON']
 
     // Optional string inputs (null if empty)
     const promptRaw = core.getInput('prompt').trim()

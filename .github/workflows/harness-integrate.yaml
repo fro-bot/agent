@@ -1,0 +1,88 @@
+---
+# ONE-JOB SECURITY INVARIANT
+# ---------------------------------------------------------------------------
+# This workflow MUST have exactly one job.
+#
+# The broker's allowlist pins `job_workflow_ref` to
+# `fro-bot/agent/.github/workflows/harness-integrate.yaml@refs/heads/main`.
+# That pin authorizes ANY job in THIS file to mint a credential — it does not
+# distinguish between jobs. A second job would silently inherit the same
+# minting authority without a corresponding allowlist review.
+#
+# Any change that adds a job to this file is security-critical and must be
+# reviewed as such. Keep `id-token: write` scoped to the single `integrate`
+# job below; do not add other jobs.
+# ---------------------------------------------------------------------------
+name: harness-integrate
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Model override for the merge agent (e.g. anthropic/claude-sonnet-4-6). Falls back to vars.HARNESS_MODEL when omitted.
+        type: string
+        required: false
+      prompt:
+        description: The rendered integration prompt to run.
+        type: string
+        required: false
+    secrets:
+      FRO_BOT_PAT:
+        description: PAT used for checkout and as the action's github-token. Required.
+        required: true
+      OPENCODE_CONFIG:
+        description: JSON merged into the OpenCode config (OPENCODE_CONFIG_CONTENT). Optional.
+        required: false
+      OMO_PROVIDERS:
+        description: Comma-separated oMo providers passed through to the merge (enable-omo is true on this path). Optional.
+        required: false
+      # NO AUTH_JSON. NO secrets: inherit. The durable model credential must
+      # never reach this workflow — see docs/plans/2026-07-01-001-feat-harness-merge-credential-broker-plan.md.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Single job: id-token: write is required to request the OIDC token minted
+  # against the credential broker. contents: read is required for checkout.
+  # Everything else is omitted (denied by default). See the ONE-JOB SECURITY
+  # INVARIANT comment at the top of this file before adding anything here.
+  # ---------------------------------------------------------------------------
+  integrate:
+    name: integrate
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.FRO_BOT_PAT }}
+
+      - name: Setup Node.js and Bun
+        uses: ./.github/actions/setup
+
+      - name: Mint broker credential
+        id: mint
+        run: node --experimental-strip-types scripts/harness/mint-broker-credential.ts
+
+      # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
+      - name: Run Fro Bot
+        uses: ./
+        with:
+          auth-json: ${{ steps.mint.outputs.auth-json }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
+          model: ${{ inputs.model || vars.HARNESS_MODEL }}
+          prompt: ${{ inputs.prompt }}
+          response-mode: none
+          output-mode: working-dir
+          # Preserve the current integrate behavior: the merge runs with oMo
+          # enabled (the correlation-id-gated disable in fro-bot.yaml applies
+          # only to release-notes narration, not this path).
+          enable-omo: true
+          omo-providers: ${{ secrets.OMO_PROVIDERS }}
+          opencode-config: ${{ secrets.OPENCODE_CONFIG }}
+          timeout: '0'

@@ -8,7 +8,7 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/fro-bot/agent/ci.yaml?style=for-the-badge&label=Build&labelColor=0D0216&color=00BCD4)](https://github.com/fro-bot/agent/actions) [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/fro-bot/agent/badge?style=for-the-badge&labelColor=0D0216&color=E91E63)](https://securityscorecards.dev/viewer/?uri=github.com/fro-bot/agent) [![License](https://img.shields.io/badge/License-MIT-FFC107?style=for-the-badge&labelColor=0D0216&color=FFC107)](LICENSE)
 
-[Overview](#overview) · [Quick Start](#quick-start) · [Usage](#usage) · [Configuration](#configuration) · [Development](#development)
+[Overview](#overview) · [Getting Started](#getting-started) · [Usage](#usage) · [Configuration](#configuration) · [Development](#development)
 
 </div>
 
@@ -16,42 +16,24 @@
 
 ## Overview
 
-Fro Bot Agent is a GitHub Action that brings AI automation to your repository using [OpenCode](https://opencode.ai/). It optionally supports [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) for extended provider and agent workflows when `enable-omo: true` is set. It can respond to issues, review pull requests, participate in discussions, and execute scheduled tasks—all while **remembering previous interactions**.
+Fro Bot Agent is a GitHub Action that runs an [OpenCode](https://opencode.ai/) agent in response to repository events — issues, pull requests, comments, reviews, and scheduled runs — and **remembers previous interactions across workflow runs**.
 
-### Why Fro Bot?
-
-Traditional CI-based AI agents are stateless: they process each request independently, with no memory of past work. This leads to repeated investigations, redundant API calls, and wasted compute time.
-
-**Fro Bot solves this with persistent sessions.** The agent's memory is preserved across workflow runs using GitHub Actions cache (with optional S3 backup), enabling it to:
-
-- **Build institutional knowledge** of your codebase over time
-- **Reference prior investigations** to avoid duplicate work
-- **Learn from past decisions** and maintain consistency
-- **Resume interrupted work** without starting over
+Traditional CI-based AI agents are stateless: each run starts from scratch, repeating investigations and burning tokens. Fro Bot persists its session state across runs (GitHub Actions cache, with optional S3 backup), so it builds context over time, references prior work instead of redoing it, and resumes interrupted tasks.
 
 ### Key Features
 
-- **🔄 Persistent Memory** — Session state survives workflow runs via cache
-- **🤖 Multiple Triggers** — Responds to comments, PRs, issues, reviews, and scheduled events
-- **⚡ Auto-Setup** — Zero-config installation of OpenCode on first run (oMo is opt-in)
-- **👀 User Feedback** — Visual acknowledgment with reactions and labels
-- **🔐 Security-First** — Enforces permission gating and credential hygiene
-- **📊 Observability** — Detailed run summaries with metrics and error tracking
-- **☁️ S3 Backup** — Optional write-through backup prevents cache eviction data loss
+- **Persistent memory** — session state survives workflow runs via cache, with optional S3 write-through backup that outlives cache eviction.
+- **Multiple triggers** — responds to comments, issues, pull requests, review threads, and scheduled or manually dispatched runs.
+- **Auto-setup** — installs OpenCode on first run; no manual toolchain setup.
+- **Security-first** — author-association gating, credential hygiene, and fork-PR protection are enforced, not optional.
+- **Observability** — every run writes a summary with metrics and error context.
+- **Extensible orchestration** — opt in to [Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent) or [OMO Slim](https://github.com/alvinunreal/oh-my-opencode-slim) when you need extended provider and agent workflows.
 
-## Quick Start
+## Getting Started
 
-### What You Need
+### 1. Configure credentials
 
-- A GitHub repository where you have admin access
-- An [OpenCode](https://opencode.ai/) account with API credentials
-- Basic familiarity with GitHub Actions
-
-### Step 1: Configure Secrets
-
-Add the following secret to your repository (Settings → Secrets and variables → Actions):
-
-**`OPENCODE_AUTH_JSON`** — Your LLM provider credentials in JSON format:
+Add an `OPENCODE_AUTH_JSON` secret (Settings → Secrets and variables → Actions) mapping your LLM providers to credentials:
 
 ```json
 {
@@ -60,9 +42,11 @@ Add the following secret to your repository (Settings → Secrets and variables 
 }
 ```
 
-### Step 2: Create Workflow File
+Any provider OpenCode supports works here — see the [OpenCode docs](https://opencode.ai/docs/).
 
-Create `.github/workflows/fro-bot.yaml` in your repository:
+### 2. Add the workflow
+
+Create `.github/workflows/fro-bot.yaml`:
 
 ```yaml
 name: Fro Bot Agent
@@ -81,363 +65,66 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: fro-bot/agent@v0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
 ```
 
-### Step 3: Mention the Agent
+### 3. Mention the agent
 
-Comment `@fro-bot` on any issue or pull request. The agent will:
-
-1. Add a 👀 reaction to acknowledge your request
-2. Restore its memory from previous runs
-3. Execute the requested task using OpenCode
-4. Post a response with a run summary
-
-> [!NOTE]
->
-> On first run, the action automatically installs OpenCode — no manual setup required! If you need oMo agent workflows with Sisyphus or other oMo-provided agents, set `enable-omo: true` in your workflow.
+Comment `@fro-bot` on any issue or pull request. The agent acknowledges with a reaction, restores its memory, runs the task, and posts a single response with a run summary.
 
 > [!TIP]
 >
-> **Full workflow reference** — The Quick Start above covers a single trigger. For the complete workflow with all supported triggers, conditional token selection, scheduled tasks, and PR reviews, see [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
+> The snippet above wires a single trigger. For the complete workflow — every supported trigger, conditional token selection, scheduled tasks, and PR reviews — copy [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml). To have an agent set it up for you, point it at that file with the prompt below.
+
+```txt
+Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+```
+
+> [!NOTE]
 >
-> **AI-assisted setup** — To have an AI agent set up the workflow for your repository, point it at the example file and tell it to follow the instructions in the header:
->
-> > Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+> `@fro-bot` mention triggers require a token whose login matches the mention. `GITHUB_TOKEN` posts as `@github-actions`, so responding to `@fro-bot` needs a PAT or GitHub App token.
 
 ## How It Works
 
-Fro Bot uses a multi-phase execution model to provide stateful AI assistance:
+Each run moves through a multi-phase pipeline: restore cached session state, discover relevant prior sessions, acknowledge the request, execute the OpenCode agent with full history, publish exactly one comment or review, then persist and prune session state back to the cache (and S3, if configured). Session state is cached under a branch-scoped key so branches stay isolated while continuity is preserved within a feature branch.
 
-```mermaid
-graph TB
-%% Brand Colors: Void=#0D0216, Purple=#1A0B2E, Cyan=#00BCD4, Magenta=#E91E63, Amber=#FFC107
-%% Nodes
-A[Trigger Event] --> B[Restore Cache]
-B --> C[Load Session History]
-C --> D[Acknowledge Request]
-D --> E[Execute Agent]
-E --> F[Post Response]
-F --> G[Save Session State]
-G --> H[Update Cache]
-
-%% Styles
-classDef default fill:#1A0B2E,stroke:#3D2A5F,stroke-width:1px,color:#FFFFFF
-classDef start fill:#1A0B2E,stroke:#00BCD4,stroke-width:2px,color:#00BCD4
-classDef action fill:#2D1B4E,stroke:#E91E63,stroke-width:2px,color:#FFFFFF
-classDef endNode fill:#1A0B2E,stroke:#FFC107,stroke-width:2px,color:#FFC107
-
-%% Apply Styles
-class A start
-class E action
-class H endNode
-
-%% Link Styles (explicit indexes for broad Mermaid compatibility)
-linkStyle 0 stroke:#3D2A5F,stroke-width:2px
-linkStyle 1 stroke:#3D2A5F,stroke-width:2px
-linkStyle 2 stroke:#3D2A5F,stroke-width:2px
-linkStyle 3 stroke:#3D2A5F,stroke-width:2px
-linkStyle 4 stroke:#3D2A5F,stroke-width:2px
-linkStyle 5 stroke:#3D2A5F,stroke-width:2px
-linkStyle 6 stroke:#3D2A5F,stroke-width:2px
-```
-
-### Execution Phases
-
-1. **Cache Restore** — Previous session state loaded from GitHub Actions cache (or S3 if configured)
-2. **Session Discovery** — Agent searches prior sessions for relevant context
-3. **Request Acknowledgment** — Visual feedback via reactions and labels
-4. **Agent Execution** — OpenCode runs with full access to conversation history
-5. **Response Publishing** — Results posted as comments or PR reviews
-6. **State Persistence** — Updated session data saved back to cache
-7. **Session Pruning** — Old sessions removed per retention policy
-
-### Cache Strategy
-
-Sessions are cached using a branch-scoped key:
-
-```text
-opencode-storage-{repo}-{branch}-{os}
-```
-
-This approach:
-
-- **Isolates branches** to prevent cache poisoning
-- **Preserves context** within feature branches
-- **Enables continuity** when working on long-running tasks
-
-> [!WARNING] GitHub Actions cache has a 10GB limit per repository and entries expire after 7 days of inactivity. For mission-critical persistence, enable S3 backup.
+For the full execution model, invariants, and the three data flows, see **[ARCHITECTURE.md](ARCHITECTURE.md)** or the [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md) deep dive.
 
 ## Usage
 
-### Comment Triggers
+### Triggers
 
-The agent responds when mentioned in comments on issues, pull requests, or PR review threads:
+The agent supports seven event types:
+
+- **`issue_comment`** / **`pull_request_review_comment`** / **`discussion_comment`** — respond to `@fro-bot` mentions in comments and review or discussion threads.
+- **`issues`** — auto-triage on open; respond to `@fro-bot` on edit.
+- **`pull_request`** — AI code review on open, sync, reopen, ready-for-review, and review-requested (an AI review, not CI).
+- **`schedule`** / **`workflow_dispatch`** — run a supplied `prompt` on a cron schedule or manual dispatch.
+
+Comment and issue triggers are gated by author association — only `OWNER`, `MEMBER`, and `COLLABORATOR` are processed. Bot accounts are ignored to prevent loops, and fork pull requests are skipped. The full guard expressions, per-trigger behavior, and minimum permissions live in [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
+
+### Comment examples
 
 ```markdown
 @fro-bot Can you investigate why the CI tests are failing?
 ```
 
 ```markdown
-@fro-bot Please review this PR and suggest improvements
-```
-
-```markdown
 @fro-bot What did we decide about error handling in the last discussion?
 ```
 
-### Supported Events
+### Scheduled maintenance
 
-| Event | Trigger | Default Behavior |
-| --- | --- | --- |
-| `issue_comment` | `@fro-bot` mention | Respond to comment |
-| `issues` (opened/edited) | `@fro-bot` in issue body | Triage issue and propose next steps |
-| `pull_request` | PR opened/synced/reopened/ready_for_review/review_requested | Review code for quality and potential bugs |
-| `pull_request_review_comment` | `@fro-bot` in review thread | Respond to specific code review comment |
-| `workflow_dispatch` | Manual workflow trigger | Execute custom prompt (required input) |
-| `schedule` | Cron schedule | Execute periodic task (requires prompt config) |
-
-### Access Control
-
-For security, the agent only responds to trusted users:
-
-- **Repository owners**
-- **Organization members**
-- **External collaborators**
-
-Bot accounts and first-time contributors from forks are automatically skipped to prevent abuse.
-
-## Event Trigger Reference
-
-The action supports seven event types. Use this section to wire triggers correctly and understand prompt, permissions, and concurrency expectations.
-
-| Event | Actions | @mention required | Prompt source | Minimum permissions | Concurrency key |
-| --- | --- | --- | --- | --- | --- |
-| `issue_comment` | `created` | Yes | Comment body | `contents: read`, `issues: write`, `pull-requests: write` | `issue.number` or `run_id` |
-| `pull_request_review_comment` | `created` | Yes | Comment body | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
-| `discussion_comment` | `created` | Yes | Comment body | `contents: read`, `discussions: write` | `discussion.number` or `run_id` |
-| `issues` | `opened`, `edited` | No (opened), Yes (edited) | Built-in directives | `contents: read`, `issues: write` | `issue.number` or `run_id` |
-| `pull_request` | `opened`, `synchronize`, `reopened`, `ready_for_review`, `review_requested` | No | `prompt` input (review prompt) | `contents: read`, `pull-requests: write` | `pull_request.number` or `run_id` |
-| `schedule` | Cron | No | `prompt` input (schedule prompt) | `contents: read`, `issues: write` | `run_id` |
-| `workflow_dispatch` | Manual | No | `prompt` input (required) | Varies by task | `run_id` |
-
-### Trigger Details
-
-<details>
-<summary><strong>issue_comment</strong> — comment mentions in issues and PRs</summary>
-
-- **Behavior:** Responds to comments with `@fro-bot`.
-- **Skip conditions:** Bot comments, missing mention, or author association not in `OWNER`, `MEMBER`, `COLLABORATOR`.
-- **Guard example:**
-  ```yaml
-  if: >-
-    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) && github.event_name == 'issue_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
-  ```
-
-</details>
-
-<details>
-<summary><strong>pull_request_review_comment</strong> — review thread mentions</summary>
-
-- **Behavior:** Responds to `@fro-bot` mentions inside PR review threads.
-- **Skip conditions:** Same gating as `issue_comment` (mention + association + bot check).
-- **Guard example:**
-  ```yaml
-  if: >-
-    (github.event.pull_request == null || !github.event.pull_request.head.repo.fork) && github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
-  ```
-
-</details>
-
-<details>
-<summary><strong>discussion_comment</strong> — discussion mentions</summary>
-
-- **Behavior:** Responds to `@fro-bot` mentions in discussion threads (if Discussions are enabled).
-- **Skip conditions:** Missing mention, bot comments, or untrusted author association.
-- **Guard example:**
-  ```yaml
-  if: >-
-    github.event_name == 'discussion_comment' && contains(github.event.comment.body || '', '@fro-bot') && (github.event.comment.user.login || '') != 'fro-bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
-  ```
-
-</details>
-
-<details>
-<summary><strong>issues</strong> — issue opened/edited</summary>
-
-- **Behavior:** Auto-triage on `opened`. `edited` requires a mention.
-- **Skip conditions:** Locked issues, bot authors, or untrusted author association.
-- **Guard example:**
-  ```yaml
-  if: github.event_name == 'issues'
-  ```
-
-</details>
-
-<details>
-<summary><strong>pull_request</strong> — AI code review (not CI)</summary>
-
-- **Behavior:** Runs an AI review on `opened`, `synchronize`, `reopened`, `ready_for_review`, and `review_requested`.
-- **Reviewer-assignment gating:** For `review_requested` and `ready_for_review`, processing continues only when the configured bot login is requested as reviewer (or when `bot-login` is not set).
-- **Team requests:** `review_requested` events targeting teams are normalized and exposed in context, but current gating only auto-triggers for explicit reviewer logins, not team membership expansion.
-- **Skip conditions:** Draft PRs and fork PRs. For `opened`/`synchronize`/`reopened`/`ready_for_review`, untrusted author association is skipped. For `review_requested`, processing is gated by requester bot-check and explicit bot reviewer assignment.
-- **Guard example:**
-  ```yaml
-  if: >-
-    github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
-  ```
-
-</details>
-
-<details>
-<summary><strong>schedule</strong> — periodic maintenance</summary>
-
-- **Behavior:** Executes a scheduled prompt (must be provided via `prompt` input).
-- **Skip conditions:** Missing prompt (the action exits cleanly).
-- **Guard example:**
-  ```yaml
-  if: github.event_name == 'schedule'
-  ```
-
-</details>
-
-<details>
-<summary><strong>workflow_dispatch</strong> — manual prompt execution</summary>
-
-- **Behavior:** Runs the user-supplied prompt.
-- **Skip conditions:** Missing prompt input when marked `required: true`.
-- **Guard example:**
-  ```yaml
-  if: github.event_name == 'workflow_dispatch'
-  ```
-
-</details>
-
-### Permissions Guide
-
-Use the minimum permissions needed for the triggers you enable.
-
-```yaml
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
-  discussions: write
-```
-
-- `discussion_comment` requires `discussions: write`.
-- `issues` and `schedule` need `issues: write` to create or comment on issues.
-- `pull_request` reviews require `pull-requests: write`.
-
-### Concurrency Strategy
-
-Use a single concurrency group that scopes to the relevant issue/PR/discussion and falls back to the run ID for schedule/dispatch.
-
-```yaml
-concurrency:
-  group: >-
-    fro-bot-${{
-      github.event.issue.number ||
-      github.event.pull_request.number ||
-      github.event.discussion.number ||
-      github.run_id
-    }}
-
-
-  cancel-in-progress: false
-```
-
-### Security Model
-
-- **Association gating:** The router only processes events from `OWNER`, `MEMBER`, and `COLLABORATOR` users.
-- **Bot protection:** Bot comments are ignored to avoid loops.
-- **Fork protection:** `pull_request` runs are skipped for forks; comment triggers are still gated by association.
-- **Mention identity:** Mention-based triggers require a token whose login matches the `@` mention users type. Using `GITHUB_TOKEN` means the mention would be `@github-actions`, so `@fro-bot` requires a PAT or GitHub App token.
-
-## Configuration
-
-### Action Inputs
-
-| Input | Required | Default | Description |
-| --- | --- | --- | --- |
-| `github-token` | Yes | — | GitHub token with write permissions |
-| `auth-json` | Yes | — | JSON object mapping LLM providers to credentials |
-| `prompt` | No | — | Custom prompt for the agent |
-| `agent` | No | — | Agent to use. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent. |
-| `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support. When `true`, installs Bun and oMo, and oMo configures Sisyphus as the default agent. |
-| `enable-omo-slim` | No | `false` | Enable [OMO Slim](https://github.com/alvinunreal/oh-my-opencode-slim) orchestration. Mutually exclusive with `enable-omo`. When `true`, installs Bun and OMO Slim and pins `orchestrator` as the default agent. |
-| `omo-slim-preset` | No | `openai` | OMO Slim preset to install. One of `openai`, `opencode-go`. Only applies when `enable-omo-slim: true`. |
-| `model` | No | — | Model override in `provider/model` format |
-| `timeout` | No | `1800000` | Execution timeout in milliseconds (0 = no limit) |
-| `opencode-version` | No | Source-pinned harness build | OpenCode CLI version for installation |
-| `systematic-version` | No | `2.1.0` | Systematic plugin version for OpenCode |
-| `session-retention` | No | `50` | Number of sessions to retain before pruning |
-| `s3-backup` | No | `false` | Enable S3-compatible object storage as canonical backend |
-| `s3-bucket` | No | — | Bucket name (required if `s3-backup` is true) |
-| `aws-region` | No | — | Region for the bucket (e.g. `us-east-1`, `auto` for R2) |
-| `s3-endpoint` | No | — | Custom endpoint URL for non-AWS providers (R2, B2, MinIO) |
-| `s3-prefix` | No | `fro-bot-state` | Prefix for all object keys |
-| `s3-expected-bucket-owner` | No | — | AWS account ID for bucket ownership pinning |
-| `s3-allow-insecure-endpoint` | No | `false` | Allow HTTP endpoints (local MinIO dev only) |
-| `s3-sse-encryption` | No | auto | `aws:kms` or `AES256` (auto-picked by endpoint) |
-| `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS |
-| `skip-cache` | No | `false` | Skip cache restore (useful for debugging) |
-| `systematic-config` | No | — | Custom Systematic configuration JSON (deep-merged) |
-| `opencode-config` | No | — | Custom OpenCode configuration JSON (deep-merged) |
-
-> [!IMPORTANT] **Migration: oMo default change.** Previous versions of this action shipped with Oh My OpenAgent enabled by default. As of this release, oMo is opt-in. If your workflow relies on oMo-provided agents (such as Sisyphus), set `enable-omo: true`. When oMo is disabled (the default):
->
-> - `default_agent` in the generated OpenCode config is forced to `"build"`.
-> - `oh-my-openagent` entries are stripped from both `plugin` and legacy `plugins` in any user-provided `opencode-config` (a warning names rewritten fields).
-> - Both behaviors are bypassed when `enable-omo: true` — oMo manages its own config and agent selection.
-
-> [!NOTE] **OMO Slim** is an alternative orchestration plugin to oMo and cannot run alongside it — enabling both `enable-omo` and `enable-omo-slim` fails fast. When `enable-omo-slim: true`, the action installs OMO Slim with the chosen `omo-slim-preset`, registers the `oh-my-opencode-slim` plugin, and pins `default_agent` to `"orchestrator"`. The gateway environment variable for OMO Slim presets in workspace containers is deferred until the workspace image runs OpenCode.
-
-### Action Outputs
-
-| Output         | Description                                       |
-| -------------- | ------------------------------------------------- |
-| `session-id`   | OpenCode session ID used for this run             |
-| `cache-status` | Cache restore status (`hit`, `miss`, `corrupted`) |
-| `duration`     | Run duration in seconds                           |
-
-### Secrets Configuration
-
-#### Required
-
-**`OPENCODE_AUTH_JSON`** — LLM provider credentials in JSON format:
-
-```json
-{
-  "anthropic": {"apiKey": "sk-ant-..."},
-  "openai": {"apiKey": "sk-..."}
-}
-```
-
-Supports any provider supported by OpenCode. See [OpenCode documentation](https://opencode.ai/docs/) for the complete list.
-
-#### Optional (for S3 backup)
-
-- `AWS_ACCESS_KEY_ID` — IAM user access key
-- `AWS_SECRET_ACCESS_KEY` — IAM user secret key
-
-The IAM user needs `s3:PutObject` and `s3:GetObject` permissions for the configured bucket.
-
-## Advanced Examples
-
-### Scheduled Maintenance Tasks
-
-Run the agent daily to maintain a rolling maintenance report:
+Run the agent on a schedule to maintain a rolling report:
 
 ```yaml
 name: Daily Maintenance Report
 on:
   schedule:
-    - cron: "30 15 * * *" # Daily at 15:30 UTC (8:30 AM Arizona)
+    - cron: "30 15 * * *"
 
 jobs:
   maintenance:
@@ -447,68 +134,77 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: fro-bot/agent@v0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           prompt: |
             Perform daily repository maintenance and update a SINGLE rolling
-            issue titled "Daily Maintenance Report". Search for an existing
-            issue with this exact title; create it if none exists.
-            Append a dated "## YYYY-MM-DD (UTC)" section with:
-            - Summary metrics (new issues, open PRs, stale items)
-            - Stale issues (>30 days) and PRs (>7 days)
-            - Unassigned bugs and recommended actions
-            Do NOT comment on individual issues/PRs. Update ONE issue only.
+            issue titled "Daily Maintenance Report". Append a dated section with
+            summary metrics, stale issues and PRs, and recommended actions.
 ```
 
-> [!TIP]
->
-> The example above uses a read-only maintenance report. For an **autohealing** variant that actively fixes failing PRs, patches vulnerabilities, and upgrades dependencies, see the "Schedule Prompt Alternatives" section in [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml).
+## Configuration
 
-### Manual Workflow with Custom Prompt
+Provide inputs via the `with:` block. Only `github-token` and `auth-json` are required; everything else is optional. [`action.yaml`](action.yaml) is the authoritative, always-current source.
 
-Allow team members to manually trigger the agent with custom instructions:
+A few inputs most workflows touch:
 
-```yaml
-name: Manual Agent Task
-on:
-  workflow_dispatch:
-    inputs:
-      prompt:
-        description: What should the agent do?
-        required: true
-        type: string
+- **`prompt`** — custom prompt; required for `schedule` and `workflow_dispatch`.
+- **`agent`** / **`model`** — override the agent (a primary agent, not a subagent) or the model (`provider/model`).
+- **`timeout`** — execution timeout in milliseconds. Default `1800000` (30 minutes); `0` disables it.
+- **`response-mode`** — `github` (default) posts exactly one comment or review; `none` suppresses all GitHub writes and uses the run log as the response surface.
+- **`enable-omo`** / **`enable-omo-slim`** — opt into extended orchestration (mutually exclusive).
 
-jobs:
-  custom-task:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
+<details>
+<summary><strong>All inputs</strong></summary>
 
-      - uses: fro-bot/agent@v0
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-          prompt: ${{ inputs.prompt }}
-```
+| Input | Required | Default | Description |
+| --- | --- | --- | --- |
+| `github-token` | Yes | — | GitHub token (App installation token or PAT) with write permissions |
+| `auth-json` | Yes | — | JSON object mapping provider IDs to auth configs |
+| `prompt` | No | — | Custom prompt for the agent |
+| `output-mode` | No | `auto` | Requested delivery mode for `schedule`/`workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`) |
+| `session-retention` | No | `50` | Number of sessions to retain before pruning |
+| `s3-backup` | No | `false` | Enable S3 write-through backup |
+| `s3-bucket` | No | — | S3 bucket for backup (required if `s3-backup` is true) |
+| `aws-region` | No | — | AWS region for the S3 bucket (`auto` for R2) |
+| `s3-endpoint` | No | — | Custom S3-compatible endpoint URL (R2, B2, MinIO) |
+| `s3-prefix` | No | `fro-bot-state` | Prefix for all S3 keys |
+| `s3-expected-bucket-owner` | No | — | AWS account ID of the expected bucket owner |
+| `s3-allow-insecure-endpoint` | No | `false` | Allow HTTP (non-HTTPS) endpoints; local MinIO dev only |
+| `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS |
+| `s3-sse-encryption` | No | Endpoint-dependent | `aws:kms` (AWS S3) or `AES256` (custom endpoints) |
+| `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
+| `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support |
+| `enable-omo-slim` | No | `false` | Enable OMO Slim orchestration (mutually exclusive with `enable-omo`) |
+| `model` | No | — | Model override in `provider/model` format |
+| `timeout` | No | `1800000` | Execution timeout in milliseconds (`0` = no timeout) |
+| `opencode-version` | No | Source-pinned | OpenCode CLI version to install |
+| `omo-version` | No | Source-pinned | oMo version to install |
+| `systematic-version` | No | Source-pinned | Systematic plugin version to register |
+| `skip-cache` | No | `false` | Skip session cache restore |
+| `omo-providers` | No | — | Comma-separated oMo providers to enable |
+| `omo-slim-preset` | No | `openai` | OMO Slim preset (`openai`, `opencode-go`); only when `enable-omo-slim` is true |
+| `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
+| `systematic-config` | No | — | JSON deep-merged into the Systematic plugin config |
+| `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |
+| `response-mode` | No | `github` | `github` posts one comment/review; `none` suppresses all GitHub writes |
 
-### Durable Object Storage
+**Outputs**
 
-Enable S3-compatible object storage as the canonical persistence backend. GitHub Actions cache acts as a hot accelerator; S3 is the source of truth and survives cache eviction.
+| Output                 | Description                                                   |
+| ---------------------- | ------------------------------------------------------------- |
+| `session-id`           | OpenCode session ID used for this run                         |
+| `resolved-output-mode` | Resolved delivery mode (`working-dir`, `branch-pr`, or empty) |
+| `cache-status`         | Cache restore status (`hit`, `miss`, `corrupted`)             |
+| `duration`             | Run duration in seconds                                       |
 
-When enabled:
+</details>
 
-1. Sessions, prompt artifacts, and run metadata are written to both cache and S3 on save
-2. Restore tries GitHub cache first (faster), falls back to S3 on miss/corruption
-3. S3 failures are logged but never fail the run
+### Durable object storage (S3)
 
-#### AWS S3
+Set `s3-backup: true` to use S3-compatible storage as the canonical backend. The Actions cache stays a hot accelerator; S3 is the source of truth and survives cache eviction. Restore tries cache first and falls back to S3 on miss or corruption; S3 failures are logged but never fail the run.
 
 ```yaml
 - uses: fro-bot/agent@v0
@@ -518,182 +214,47 @@ When enabled:
     s3-backup: true
     s3-bucket: my-agent-sessions
     aws-region: us-east-1
-    s3-expected-bucket-owner: "123456789012"  # Your AWS account ID
+    s3-expected-bucket-owner: "123456789012"
   env:
     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
 
-#### Cloudflare R2
+For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket`. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
 
-```yaml
-- uses: fro-bot/agent@v0
-  with:
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-    s3-backup: true
-    s3-bucket: my-agent-sessions
-    aws-region: auto
-    s3-endpoint: https://<account-id>.r2.cloudflarestorage.com
-    s3-sse-encryption: AES256  # R2 does not support aws:kms
-  env:
-    AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-    AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-```
+## Repository Structure
 
-#### Backblaze B2
-
-```yaml
-- uses: fro-bot/agent@v0
-  with:
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-    s3-backup: true
-    s3-bucket: my-agent-sessions
-    aws-region: us-west-004
-    s3-endpoint: https://s3.us-west-004.backblazeb2.com
-    s3-sse-encryption: AES256
-  env:
-    AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-    AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-```
-
-#### MinIO (local development only)
-
-```yaml
-- uses: fro-bot/agent@v0
-  with:
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
-    s3-backup: true
-    s3-bucket: agent-dev
-    aws-region: us-east-1
-    s3-endpoint: http://localhost:9000
-    s3-allow-insecure-endpoint: "true"  # Required for non-HTTPS endpoints
-    s3-sse-encryption: AES256
-  env:
-    AWS_ACCESS_KEY_ID: minioadmin
-    AWS_SECRET_ACCESS_KEY: minioadmin
-```
-
-#### Security Defaults
-
-- **SSE-KMS** for AWS S3 (auto-selected when no custom endpoint); **AES256** for custom endpoints (R2/B2/MinIO)
-- **HTTPS required** unless `s3-allow-insecure-endpoint: true` is explicitly set
-- **SSRF protection**: link-local, loopback, and private IP endpoints are rejected by default
-- **Path traversal protection** on downloads — malicious S3 keys cannot escape the local storage directory
-- **Fork-PR writes are disabled** — prevents attacker-controlled prompts from writing to the canonical store
-- **Credentials** must come from env vars or IAM roles; never from action inputs
-- **IAM policy** requires `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` (with prefix condition); no `s3:DeleteObject` needed
-
-> [!TIP]
->
-> Durable object storage is recommended for production deployments where losing agent memory would significantly impact operations. The GitHub Actions cache remains a hot accelerator, so there is no latency penalty on cache hits.
-
-## Troubleshooting
-
-### Agent Not Responding
-
-- **Check permissions**: Verify your workflow has `contents`, `issues`, and `pull-requests` write permissions
-- **Verify secrets**: Ensure `OPENCODE_AUTH_JSON` is properly formatted JSON
-- **Check trigger condition**: For comment triggers, ensure `@fro-bot` appears in the comment
-- **Review access control**: Only repo owners, org members, and collaborators can trigger the agent
-
-### Cache Issues
-
-If sessions aren't persisting between runs:
-
-1. Check GitHub Actions cache size (Settings → Actions → Cache)
-2. Enable S3 backup for more reliable persistence
-3. Verify `skip-cache` isn't set to `true`
-4. Review run logs for cache corruption warnings
-
-### Timeout Errors
-
-If the agent times out before completing:
-
-- Increase `timeout` value (default is 30 minutes)
-- Check for infinite loops or stuck operations in logs
-- Consider breaking large tasks into smaller steps
+The repository is a Bun monorepo: the Action's logic lives in the layered root `src/`, alongside the gateway, harness, and runtime packages. See **[STRUCTURE.md](STRUCTURE.md)** for the directory layout, key file locations, and where to add new code.
 
 ## Development
 
-### Prerequisites
-
-- Node.js 24 (see `.node-version`)
-- Bun 1.3.14+ (see `package.json` `packageManager`)
-
-### Setup
+For the full contributor workflow — setup, the command surface, testing standards, commit conventions, and the git hooks — see **[CONTRIBUTING.md](CONTRIBUTING.md)**. A quick glance:
 
 ```bash
-# Install dependencies
-bun install
-
-# Run tests
-bun run test
-
-# Build action
-bun run build
-
-# Lint code
-bun run lint
+bun install       # Install dependencies
+bun run test      # Run the test suites
+bun run build     # Type-check + bundle to committed dist/
+bun run lint      # Lint (includes the committed-dist/ check)
 ```
 
-### Project Structure
+- **Node.js 24** (see `.node-version`) and **Bun** (see `package.json` `packageManager`).
+- Tests are Vitest, colocated as `*.test.ts`. Run one with `bunx vitest run packages/runtime/src/agent/prompt.test.ts`.
 
-```text
-├── src/
-│   ├── main.ts              # Main action entry point
-│   ├── post.ts              # Post-action cache save hook
-│   └── lib/
-│       ├── agent/           # OpenCode execution & prompts
-│       ├── attachments/     # File attachment processing
-│       ├── cache.ts         # GitHub Actions cache operations
-│       ├── comments/        # GitHub comment API interactions
-│       ├── github/          # GitHub API client & context
-│       ├── observability/   # Metrics & run summaries
-│       ├── reviews/         # PR review logic
-│       ├── session/         # Session management & search
-│       ├── setup/           # OpenCode/oMo installation
-│       └── triggers/        # Event routing & filtering
-├── dist/                    # Bundled output (committed)
-├── RFCs/                    # Architecture decision records
-└── action.yaml              # Action definition
-```
+## Documentation
 
-### Testing
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — system design, invariants, the three execution flows, and cross-cutting concerns.
+- **[STRUCTURE.md](STRUCTURE.md)** — directory layout, key file locations, and where to add new code.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — setup, the command surface, testing standards, and commit conventions.
+- **[SECURITY.md](SECURITY.md)** — vulnerability reporting and the security posture.
+- **[AGENTS.md](AGENTS.md)** — conventions, anti-patterns, and commands in one operational page.
+- **[docs/wiki/](docs/wiki/index.md)** — deep dives on the architecture, execution lifecycle, prompt design, operator surface, and [troubleshooting](docs/wiki/Troubleshooting.md).
 
-The project uses Vitest with comprehensive test coverage:
+## Resources
 
-```bash
-# Run all tests
-bun run test
-
-# Run specific test file
-bunx vitest run src/lib/agent/prompt.test.ts
-
-# Watch mode (for development)
-bunx vitest --watch
-```
-
-### Contributing
-
-This project follows test-driven development (TDD):
-
-1. Write failing test first
-2. Implement minimal code to pass
-3. Refactor while keeping tests green
-4. Never commit without running `bun run build` (dist/ must stay in sync)
-
-See `AGENTS.md` for detailed development guidelines and architecture overview.
-
-## References
-
-- [OpenCode Documentation](https://opencode.ai/docs/) — Official OpenCode platform docs
-- [Oh My OpenAgent (oMo)](https://github.com/code-yeongyu/oh-my-openagent) — Agent workflow framework
-- [GitHub Actions Documentation](https://docs.github.com/en/actions) — GitHub Actions reference
-- [Action Source Code](https://github.com/fro-bot/agent) — View the implementation
+- [OpenCode Documentation](https://opencode.ai/docs/) — the OpenCode platform.
+- [Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent) — extended agent workflows.
+- [GitHub Actions Documentation](https://docs.github.com/en/actions) — Actions reference.
 
 ## License
 
-[MIT](LICENSE) © Fro Bot
+[MIT](LICENSE) © Marcus R. Brown
