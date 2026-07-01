@@ -200,6 +200,9 @@ jobs:
     name: integrate (LLM merge via Fro Bot)
     needs: prepare-integrate
     if: ${{ needs.prepare-integrate.outputs.has_refs == 'true' }}
+    permissions:
+      id-token: write
+      contents: read
     uses: ./.github/workflows/harness-integrate.yaml
     secrets:
       FRO_BOT_PAT: ${{ secrets.FRO_BOT_PAT }}
