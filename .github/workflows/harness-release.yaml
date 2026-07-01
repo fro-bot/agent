@@ -189,8 +189,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Integrate job — calls fro-bot.yaml as a reusable workflow.
-  # Fro Bot installs opencode, provisions auth, and runs the LLM merge.
+  # Integrate job — calls harness-integrate.yaml as a reusable workflow.
+  # harness-integrate.yaml mints a short-lived credential from the OIDC
+  # credential broker (no secrets: inherit, no AUTH_JSON) and runs the LLM
+  # merge on it via the Fro Bot action.
   # vars.HARNESS_MODEL must be set to anthropic/claude-sonnet-4-6 in repo vars.
   # Skipped when the carry set is empty (has_refs == 'false').
   # ---------------------------------------------------------------------------
@@ -198,12 +200,14 @@ jobs:
     name: integrate (LLM merge via Fro Bot)
     needs: prepare-integrate
     if: ${{ needs.prepare-integrate.outputs.has_refs == 'true' }}
-    uses: ./.github/workflows/fro-bot.yaml
-    secrets: inherit
+    uses: ./.github/workflows/harness-integrate.yaml
+    secrets:
+      FRO_BOT_PAT: ${{ secrets.FRO_BOT_PAT }}
+      OPENCODE_CONFIG: ${{ secrets.OPENCODE_CONFIG }}
+      OMO_PROVIDERS: ${{ secrets.OMO_PROVIDERS }}
     with:
       model: ${{ vars.HARNESS_MODEL }}
       prompt: ${{ needs.prepare-integrate.outputs.rendered_prompt }}
-      response-mode: none
 
   # ---------------------------------------------------------------------------
   # Per-platform build matrix
