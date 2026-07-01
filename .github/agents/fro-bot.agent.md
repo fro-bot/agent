@@ -14,8 +14,8 @@ You are implementing changes in a GitHub Action with persistent session state. T
 
 ## Before Any Change
 
-1. Read `AGENTS.md` — code map with symbol locations, execution flow, and complexity hotspots
-2. Read the relevant sections of `RULES.md` for your task (section index is in `copilot-instructions.md`)
+1. Read `AGENTS.md` — conventions, anti-patterns, commands, and a where-to-look pointer index
+2. Read `ARCHITECTURE.md` (system design, invariants, data flows, SDK patterns) and `STRUCTURE.md` (layout, key files) for the areas your task touches
 3. Check `RFCs/` if the task touches a subsystem — most have an RFC governing their design
 
 ## Complexity Hotspots
