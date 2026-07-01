@@ -4,18 +4,14 @@
 
 Read these files before implementing anything:
 
-- **AGENTS.md** — Code map, execution flow, complexity hotspots, and project commands
-- **RULES.md** — Focus on these sections:
-  - _Code Style & Conventions_ (module system, booleans, function style)
-  - _Architecture Patterns_ (adapters, dependency injection, NormalizedEvent)
-  - _SDK Execution Patterns_ (server lifecycle, sessions, events)
-  - _Security Requirements_ (credential handling, log redaction, authorization)
-  - _Testing Standards_ (TDD workflow, SDK mocking, BDD comments)
-  - _Anti-Patterns (Forbidden)_ (comprehensive list of what NOT to do)
+- **AGENTS.md** — Conventions, anti-patterns, commands, and a where-to-look pointer index
+- **ARCHITECTURE.md** — System design, invariants, the three data flows, SDK execution patterns, cross-cutting concerns (credential handling, log redaction, authorization)
+- **STRUCTURE.md** — Directory layout, key file locations, where to add new code
+- **CONTRIBUTING.md** — Setup, command surface, testing standards, commit conventions
 - **RFCs/** — Check relevant RFCs for feature-specific architecture decisions
-- **PRD.md / FEATURES.md** — Check for requirements on new features
+- **docs/product/PRD.md / docs/product/FEATURES.md** — Historical product requirements (archived; check for background only)
 
-Documentation hierarchy: PRD > RFCs > FEATURES.md > RULES.md > AGENTS.md
+Documentation hierarchy: PRD > RFCs > ARCHITECTURE.md / STRUCTURE.md > AGENTS.md
 
 ## Critical Patterns (AI Failure Modes)
 

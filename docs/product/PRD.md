@@ -14,6 +14,8 @@
 
 ---
 
+> **Historical planning document.** Archived 2026-06-30. For current project state see README.md, ARCHITECTURE.md, and STRUCTURE.md.
+
 ## Source of Truth & Conflict Resolution
 
 **Documentation Hierarchy** (highest to lowest priority):
