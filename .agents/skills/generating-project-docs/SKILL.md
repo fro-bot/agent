@@ -54,7 +54,7 @@ There are **three distinct execution flows**, not one request/response: the Acti
 
 ### README.md
 
-Order: centered `<picture>` dark/light header → flat-square badges → ` · `-separated nav → overview → getting started → repository structure (point at `STRUCTURE.md`) → automation → development (point at `CONTRIBUTING.md`) → architecture link (`ARCHITECTURE.md`) → resources (incl. `docs/wiki/` deep dives). Avoid tables in README. Badges use `style=flat-square`.
+Order: centered `<picture>` dark/light header → badges → ` · `-separated nav → overview → getting started → repository structure (point at `STRUCTURE.md`) → automation → development (point at `CONTRIBUTING.md`) → architecture link (`ARCHITECTURE.md`) → resources (incl. `docs/wiki/` deep dives). Avoid tables in README. Badges use the repo's established style (`style=for-the-badge`).
 
 ### ARCHITECTURE.md
 

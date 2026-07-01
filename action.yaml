@@ -96,6 +96,7 @@ inputs:
       OMO Slim preset to install (single name). Values: openai, opencode-go.
       Only applies when enable-omo-slim is true. Default: openai.
     required: false
+    default: openai
   opencode-config:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).

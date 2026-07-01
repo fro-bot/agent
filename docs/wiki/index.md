@@ -34,6 +34,12 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | --- | --- | --- |
 | [Conventions and Patterns](Conventions%20and%20Patterns.md) | convention | Coding conventions, architectural patterns, and anti-patterns enforced across the project |
 
+### Guides
+
+| Page | Type | Summary |
+| --- | --- | --- |
+| [Troubleshooting](Troubleshooting.md) | guide | Diagnosing common Action failures — no response, cache persistence, and timeouts |
+
 ## About This Wiki
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
