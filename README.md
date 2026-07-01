@@ -79,7 +79,9 @@ Comment `@fro-bot` on any issue or pull request. The agent acknowledges with a r
 >
 > The snippet above wires a single trigger. For the complete workflow — every supported trigger, conditional token selection, scheduled tasks, and PR reviews — copy [`docs/examples/fro-bot.yaml`](docs/examples/fro-bot.yaml). To have an agent set it up for you, point it at that file with the prompt below.
 
-> Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+```txt
+Fetch `https://raw.githubusercontent.com/fro-bot/agent/refs/heads/main/docs/examples/fro-bot.yaml` and follow the instructions at the top of the file to set up the Fro Bot agent workflow for this repository.
+```
 
 > [!NOTE]
 >
