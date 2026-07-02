@@ -200,7 +200,7 @@ harness-release.yaml (workflow_dispatch)
   │     → build-platform.ts --source-tree <tree> --integration-commit <sha>
   │     → emit: integration_commit
   │
-  └─→ publish job (gated by npm-publish environment + required reviewers)
+  └─→ publish job (all-or-nothing; requires build + release-binaries success)
         OIDC trusted publishing (id-token: write, publish job only)
         → npm publish @fro.bot/harness + 4 per-platform packages
         → GitHub Release (OpenCode-shaped assets + SHA256SUMS)
