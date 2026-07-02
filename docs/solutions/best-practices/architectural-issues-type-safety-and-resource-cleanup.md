@@ -374,7 +374,7 @@ All fixes verified with:
 
 ## Related Documentation
 
-- [Fro Bot Agent SQLite Session Support Plan](../plans/2026-02-15-feat-opencode-sqlite-session-support-plan.md)
+- [Fro Bot Agent SQLite Session Support Plan](../../plans/2026-02-15-feat-opencode-sqlite-session-support-plan.md)
 - [Build Errors: Tool Binary Caching on Ephemeral Runners](../performance-issues/tool-binary-caching-ephemeral-runners.md)
 
 ## Related Issues

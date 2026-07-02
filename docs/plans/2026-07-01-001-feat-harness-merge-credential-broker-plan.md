@@ -277,7 +277,7 @@ Until these are set the broker fails closed (mint 403s). The env-hygiene deliver
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-07-01-harness-merge-credential-broker-requirements.md](docs/brainstorms/2026-07-01-harness-merge-credential-broker-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-07-01-harness-merge-credential-broker-requirements.md](../brainstorms/2026-07-01-harness-merge-credential-broker-requirements.md)
 - Related code: `src/harness/config/inputs.ts`, `src/services/setup/auth-json.ts`, `.github/workflows/harness-release.yaml`, `.github/workflows/fro-bot.yaml`
 - Related issue: #1060
 - Cross-repo: `marcusrbrown/infra#725` (egress containment, deferred)

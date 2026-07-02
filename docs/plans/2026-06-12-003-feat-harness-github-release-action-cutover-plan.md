@@ -250,6 +250,6 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md](docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md](../brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md)
 - Related code: `src/services/setup/opencode.ts`, `.github/workflows/harness-release.yaml`, `packages/harness/scripts/build-platform.ts`, `packages/harness/src/provenance.ts`
 - External: npm/cli #1479, npm #6379, SemVer §10 (build metadata stripping)
