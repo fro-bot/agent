@@ -1,7 +1,7 @@
 {
   "release_repo": "anomalyco/opencode",
   "source_repo": "https://github.com/anomalyco/opencode.git",
-  "base_version": "1.17.11",
+  "base_version": "1.17.13",
   "integrationRefs": [
     "https://github.com/anomalyco/opencode/pull/19961",
     "https://github.com/anomalyco/opencode/pull/31859",
