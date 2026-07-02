@@ -137,3 +137,4 @@ macOS Docker Desktop silently turns a **single-file** `/tmp` bind mount into a d
 - `docs/solutions/best-practices/gateway-opencode-mention-loop-best-practices-2026-05-30.md` — the runtime attach/SSE side this deploy-time provisioning unblocks.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — the config-declared plugin injection pattern; this doc adds the hardened-overlay rules (autoupdate pin, strings-only plugin union) for when operator config is merged over the baked config.
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — the image build-and-boot smoke discipline this change extends.
+- `docs/solutions/workflow-issues/isolate-ci-credential-via-oidc-broker-2026-07-01.md` — the sibling `auth-json` surface: this doc is the workspace-container consumer side; that one is the harness-CI producer side that mints an OIDC-brokered short-lived credential.

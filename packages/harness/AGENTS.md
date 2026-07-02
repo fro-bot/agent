@@ -119,7 +119,7 @@ gh workflow run harness-release.yaml \
   --field base_version=<configured-base-release>
 ```
 
-The publish job is additionally gated by the `npm-publish` GitHub environment (required reviewers).
+The publish job has no environment/reviewer gate — a non-dry-run dispatch publishes on green builds. Use `--field dry_run=true` to exercise the pipeline without publishing.
 
 ## Publishing
 
