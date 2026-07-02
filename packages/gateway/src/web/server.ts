@@ -40,6 +40,7 @@ import {getConnInfo} from '@hono/node-server/conninfo'
 import {Hono} from 'hono'
 import {bodyLimit} from 'hono/body-limit'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {OPERATOR_CONTRACT_VERSION} from '../operator-contract/index.js'
 import {buildCsrfRoute} from './auth/csrf-route.js'
 import {applyBrowserGuard} from './auth/csrf.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
@@ -56,7 +57,6 @@ import {buildRunsRoute} from './operator/runs-route.js'
 import {
   badRequestResponse,
   notFoundResponse,
-  okResponse,
   payloadTooLargeResponse,
   rateLimitedResponse,
   unavailableResponse,
@@ -448,7 +448,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       deps.logger.warn({}, 'operator request rate limited (unauthenticated)')
       return rateLimitedResponse(c)
     }
-    return okResponse(c)
+    return c.json({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
   })
 
   // ── GitHub OAuth routes ────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
  *   - Error path: partial config fails closed during startup.
  *   - Security: unauthenticated floods hit socket-keyed rate limits and bounded body handling.
  *   - Shutdown: closing the Gateway closes the operator server without hanging active handles.
- *   - Health route: GET /operator/health returns 200 {ok:true}.
+ *   - Health route: GET /operator/health returns 200 {ok:true, contractVersion}.
  *   - Rate limiter: limit enforcement, window reset, key isolation.
  *   - Forwarded headers: no headers, only host, only proto, proto=http, host with port, comma-separated.
  *   - Drain gate: returns 503 before body-limit (drain fires first).
@@ -26,6 +26,7 @@ import {createServer} from 'node:http'
 
 import {describe, expect, it, vi} from 'vitest'
 import {createRateLimiter} from '../http/rate-limit.js'
+import {OPERATOR_CONTRACT_VERSION} from '../operator-contract/index.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
 import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
@@ -248,7 +249,7 @@ describe('buildOperatorApp — partial OAuth config programming error', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/health — happy path', () => {
-  it('returns 200 {ok:true} when the listener is running', async () => {
+  it('returns 200 {ok:true, contractVersion} when the listener is running', async () => {
     // #given
     const port = await findFreePort()
     const server = createOperatorServer(makeStubDeps(), makeStubConfig({bindPort: port}))
@@ -260,7 +261,7 @@ describe('GET /operator/health — happy path', () => {
 
       // #then
       expect(res.status).toBe(200)
-      expect(body).toEqual({ok: true})
+      expect(body).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
     } finally {
       await closeServer(server)
     }
@@ -450,7 +451,7 @@ describe('operator server — trusted origin enforcement', () => {
 
       // #then — accepted (health route is not privileged)
       expect(res.status).toBe(200)
-      expect(body).toEqual({ok: true})
+      expect(body).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
     }
