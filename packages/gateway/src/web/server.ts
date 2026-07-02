@@ -421,7 +421,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
    * GET /operator/health
    *
    * Unauthenticated health check for the operator listener.
-   * Returns 200 {ok:true} when the listener is running and not draining.
+   * Returns 200 {ok:true, contractVersion} when the listener is running and not
+   * draining. contractVersion is emit-only (never read/negotiated over the wire).
    * (Drain gate above returns 503 before this handler is reached.)
    *
    * Registered as a public route via registerPublicRoute — explicitly unauthenticated.
