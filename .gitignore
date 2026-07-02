@@ -97,9 +97,6 @@ Thumbs.db
 # Worktrees
 .worktrees/
 
-# Workflow docs
-docs/brainstorms/
-
 # eslint-typegen (https://github.com/antfu/eslint-typegen)
 eslint-typegen.d.ts
 
