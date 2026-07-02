@@ -54,7 +54,7 @@ Confirmed live on Fronomenal Discord against gateway v0.46.3: full add-project p
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — bake tool binaries into the image; do not runtime-install in the hot path.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — bake tool binaries into the image; do not runtime-install in the hot path.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — the `@fro.bot/systematic` plugin is declared via OpenCode config, not a separate install step. Reuse this pattern for the workspace OpenCode config.
 - OpenCode version pin (project memory): `DEFAULT_OPENCODE_VERSION = 1.14.41`; 1.14.42+ regresses the SSE stream. The workspace must pin the same version.
 

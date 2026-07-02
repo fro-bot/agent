@@ -1,7 +1,7 @@
 ---
 title: Signed webhook ingress hardening
 date: 2026-05-29
-category: docs/solutions/best-practices/
+category: best-practices
 module: packages/gateway/src/http
 problem_type: best_practice
 component: authentication

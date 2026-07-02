@@ -5,6 +5,7 @@ category: build-errors
 module: packages/gateway
 problem_type: build_error
 component: tooling
+severity: high
 symptoms:
   - Gateway Docker image crash-loops on boot
   - ERR_MODULE_NOT_FOUND for @fro-bot/runtime resolving to src/index.ts

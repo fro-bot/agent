@@ -1,7 +1,7 @@
 ---
 title: Couple the review verdict to the GitHub review event so PR reviews satisfy branch protection
 date: 2026-06-01
-category: docs/solutions/workflow-issues
+category: workflow-issues
 module: pr-review-prompt-contract
 problem_type: workflow_issue
 component: assistant

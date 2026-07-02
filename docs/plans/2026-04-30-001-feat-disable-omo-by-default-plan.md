@@ -81,7 +81,7 @@ Disabled-mode hardening:
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md`: tools caches are best-effort, versioned, and separate from session caches. Cache misses are not failures.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md`: tools caches are best-effort, versioned, and separate from session caches. Cache misses are not failures.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`: versioned tool inputs must be threaded through `action.yaml`, parser types, setup types, config generation, tests, and `dist/`.
 - `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md`: implicit runtime behavior should become explicit action-level contract when it affects callers.
 - Runtime extraction moved canonical agent logic into `packages/runtime/src/agent/`; update runtime first and keep action-side wrappers aligned.
@@ -344,7 +344,7 @@ Disabled-mode hardening:
 **Patterns to follow:**
 
 - Existing key builder and restore-key tests in `src/services/setup/tools-cache.test.ts`.
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` guidance that tool cache misses are not failures.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` guidance that tool cache misses are not failures.
 
 **Test scenarios:**
 
@@ -485,6 +485,6 @@ Disabled-mode hardening:
 - Related code: `src/services/setup/ci-config.ts`
 - Related code: `src/services/setup/tools-cache.ts`
 - Related code: `.github/workflows/fro-bot.yaml`
-- Institutional learning: `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md`
+- Institutional learning: `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md`
 - Institutional learning: `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`
 - Institutional learning: `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md`

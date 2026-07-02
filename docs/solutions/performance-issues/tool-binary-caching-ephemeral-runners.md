@@ -1,10 +1,11 @@
 ---
 title: Tool Cache Separation - Persistent Binary Caching Across Ephemeral GitHub Actions Runners
-problem_type: performance-issues
-component: GitHub Actions Setup - Cache Layer
 date: 2026-02-15
+category: performance-issues
+module: src/services/setup
+problem_type: performance_issue
+component: tooling
 severity: medium
-status: solved
 tags:
   - caching
   - ci-optimization

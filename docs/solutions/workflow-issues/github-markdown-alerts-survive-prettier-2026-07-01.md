@@ -1,7 +1,7 @@
 ---
 title: GitHub Markdown alerts need a blank quote separator to survive prettier
 date: 2026-07-01
-category: docs/solutions/workflow-issues
+category: workflow-issues
 module: documentation
 problem_type: workflow_issue
 component: documentation

@@ -56,7 +56,7 @@ Aligned with the parent Gateway v1 plan:
 
 ### Institutional Learnings
 
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — for the multi-step orchestration: model each step explicitly, ensure compensation runs even when later steps fail. Direct precedent for the partial-failure recovery in this unit.
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — for the multi-step orchestration: model each step explicitly, ensure compensation runs even when later steps fail. Direct precedent for the partial-failure recovery in this unit.
 - `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md` — make execution contracts explicit on public input surfaces, resolve centrally, surface state observably. Applied here as the explicit `AddProjectPhase` enum + progress-message updates rather than heuristic state.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — sub-app conventions: single source of truth for version/config, explicit wiring, no dead installer layer. Applied to `apps/workspace-agent/` package layout.
 
@@ -596,4 +596,4 @@ Persistent setup-state (resume-on-crash) is deferred to Unit 6 or later. Documen
 - **Sub-app conventions:** `packages/gateway/{package.json,tsconfig.json,tsdown.config.ts}`
 - **Compose sandbox-net:** `deploy/compose.yaml`
 - **Workspace placeholder:** `deploy/workspace.Dockerfile`
-- **Institutional learnings:** `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md`, `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md`, `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`
+- **Institutional learnings:** `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`, `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md`, `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`

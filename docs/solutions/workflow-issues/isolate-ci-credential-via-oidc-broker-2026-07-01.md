@@ -1,7 +1,7 @@
 ---
 title: Isolate a CI credential from an autonomous agent via an OIDC broker
 date: 2026-07-01
-category: docs/solutions/workflow-issues
+category: workflow-issues
 module: harness/release pipeline
 problem_type: workflow_issue
 component: tooling
