@@ -74,7 +74,7 @@ Repeat for each package:
 4. `@fro.bot/harness-darwin-x64`
 5. `@fro.bot/harness-darwin-arm64`
 
-> **Note on environment**: The publish job in `harness-release.yaml` uses `environment: npm-publish` (a maintainer-gated GitHub environment). Leave the trusted publisher environment field blank on npm — the OIDC token is issued by GitHub regardless of which environment the job runs in; the environment gate is enforced on the GitHub side.
+> **Note on environment**: Leave the trusted publisher environment field blank on npm. The publish job runs without a GitHub `environment:` (the former `npm-publish` environment gate was removed once the npm trusted-publisher bindings were confirmed blank — see the 2026-06-12 cutover plan), so the OIDC `sub` claim carries no environment segment.
 
 ---
 
@@ -89,7 +89,7 @@ gh workflow run harness-release.yaml \
   --field dry_run=true
 ```
 
-This triggers the `integrate` job (which produces the merged source artifact), then the full build matrix across all four platforms (linux/x64, linux/arm64, darwin/x64, darwin/arm64), runs `verify-binary.ts` on each output, assembles the per-platform packages, and then **skips the npm publish step** (`dry_run=true`). The publish job is also gated by the `npm-publish` GitHub environment (required reviewers), so even without `dry_run=true`, a human must approve before anything reaches npm.
+This triggers the `integrate` job (which produces the merged source artifact), then the full build matrix across all four platforms (linux/x64, linux/arm64, darwin/x64, darwin/arm64), runs `verify-binary.ts` on each output, assembles the per-platform packages, and then **skips the npm publish step** (`dry_run=true`). There is no environment/reviewer gate on the publish job — `dry_run=true` is what keeps a validation run away from npm, so don't omit it casually.
 
 Watch the run:
 
@@ -123,9 +123,9 @@ When `harness-release.yaml` is dispatched, the workflow runs in two stages:
 
 2. **`build` matrix** — each platform job downloads the `integration-tree` artifact, verifies its digest against the declared value, extracts the merged source tree, and builds the native binary from that tree using `build-platform.ts --source-tree <extracted>`. No upstream clone happens in the build matrix; all four platforms build from the same frozen merged source snapshot.
 
-The `publish` job runs after the matrix and is gated by the `npm-publish` GitHub environment (required reviewers). It obtains an OIDC token and publishes to npm with automatic provenance — no npm token.
+The `publish` job runs after the matrix; it requires the build matrix and GitHub Release jobs to succeed (there is no environment/reviewer gate). It obtains an OIDC token and publishes to npm with automatic provenance — no npm token.
 
-Merged refs come exclusively from the `harness.config.json` carry-policy allowlist. No arbitrary ref can be injected at dispatch time. The `provenance.json` included in the artifact records the exact upstream inputs (base tag + each ref + resolved SHA) and should be reviewed before approving the publish gate.
+Merged refs come exclusively from the `harness.config.json` carry-policy allowlist. No arbitrary ref can be injected at dispatch time. The `provenance.json` included in the artifact records the exact upstream inputs (base tag + each ref + resolved SHA) and should be reviewed before dispatching a non-dry-run release.
 
 ### Dry run (no publish credentials needed)
 
