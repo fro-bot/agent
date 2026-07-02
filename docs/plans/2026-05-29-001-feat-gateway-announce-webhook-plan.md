@@ -70,7 +70,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 ### Institutional Learnings
 
 - `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md` — **never log request/response bodies that can carry secrets; enforce with a captured-logger test across all error paths.** Directly governs R9. Also: test the real bootstrap/dispatch path, not just the handler.
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — **shutdown belongs in `finally` with its own guarded try/catch so teardown can't be masked by a business-logic error.** Governs R12 server lifecycle.
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — **shutdown belongs in `finally` with its own guarded try/catch so teardown can't be masked by a business-logic error.** Governs R12 server lifecycle.
 - No existing repo learnings for HMAC / canonical JSON / Effect Schema / Hono DoS hardening — fresh territory; document the pattern after implementation (`ce:compound` candidate).
 
 ### External References
@@ -411,5 +411,5 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 - **Origin issue:** https://github.com/fro-bot/agent/issues/671 (body + Fro Bot triage comment)
 - Related code: `packages/gateway/src/program.ts`, `config.ts`, `shutdown.ts`, `discord/commands/add-project.ts`; `apps/workspace-agent/src/server.ts`
-- Institutional learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md`
+- Institutional learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`
 - External: RFC 8785 (JCS), RFC 2104 (HMAC), Stripe/GitHub webhook signing docs, OWASP REST Security Cheat Sheet, Effect 3.21 Schema docs, Hono 4.12 docs

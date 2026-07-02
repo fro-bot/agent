@@ -86,7 +86,7 @@ Carries the origin brainstorm's full-harness requirements, with R4 corrected to 
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — OpenCode binary must be cached under a dedicated tools-cache key; `latest` is a non-determinism trap → the harness binary follows the same cache discipline; bumps are pinned.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — OpenCode binary must be cached under a dedicated tools-cache key; `latest` is a non-determinism trap → the harness binary follows the same cache discipline; bumps are pinned.
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — ship compiled artifacts, not source-resolved entries → harness CLI ships built `dist/`; the per-platform packages ship native binaries.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — pinned-version-constant + Renovate regex idiom → the base-release pin reuses it.
 

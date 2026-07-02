@@ -1,6 +1,7 @@
 ---
 module: "harness/release pipeline"
 date: 2026-06-14
+category: best-practices
 problem_type: best_practice
 component: tooling
 severity: medium
@@ -114,5 +115,5 @@ The four layers reinforce each other: the fail-closed download (§5) assumes the
 - `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md` — direct predecessor on version-source drift. Its "Renovate tracks the consumed source" rule still holds generally, but the workspace `OPENCODE_VERSION` pin specifically moved *off* Renovate (build-metadata `+harness.<sha>` tags can't be ordered) onto the release-job coupled bump described in §4.
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — sibling image-only packaging gap; same "verify by inspection, not host-checkout execution" pattern.
 - `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — the workspace Dockerfile surface these changes modify.
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — verify the tools cache key includes the full `+harness.<sha>` literal so two harness builds of the same base don't collide.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — verify the tools cache key includes the full `+harness.<sha>` literal so two harness builds of the same base don't collide.
 - PRs #887 (musl build/publish), #889 (workspace repoint + coupled bump), #874 (harness GitHub Release + boolean-gate fix).

@@ -127,7 +127,7 @@ Workspace-agent (extend — `apps/workspace-agent/src/`):
 - `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md` —
   **test the real dispatch path**: handler-only unit tests masked a bootstrap-wiring gap that shipped
   green. Unit 4/5 here must assert the real `messageCreate → execution` wiring, not just the handler.
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — guaranteed,
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — guaranteed,
   backend-agnostic cleanup; don't assume session ordering. Bears on lock/run-state release in `finally`.
 - `docs/solutions/best-practices/signed-webhook-ingress-hardening-2026-05-29.md` — reserve side effects
   before awaiting; fail-closed ordering. Bears on lock-before-execute ordering.
@@ -667,4 +667,4 @@ startup; document the MVP behavior and limitations.
 - Brainstorm: [docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md](docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md) (Cluster B extraction, Cluster C sandbox)
 - Reuse: `packages/runtime/src/agent/{execution,retry,streaming,session-poll,server}.ts`, `packages/runtime/src/coordination/{lock,run-state,heartbeat}.ts`
 - Extend: `packages/gateway/src/discord/mentions.ts`, `packages/gateway/src/bindings/store.ts`, `packages/gateway/src/program.ts`, `apps/workspace-agent/src/server.ts`
-- Learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md`
+- Learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`

@@ -2,6 +2,7 @@
 title: "Auxiliary v-Prefixed Tags Poison semantic-release Version Computation"
 module: "release-pipeline"
 date: 2026-06-14
+category: workflow-issues
 problem_type: workflow_issue
 component: tooling
 severity: high

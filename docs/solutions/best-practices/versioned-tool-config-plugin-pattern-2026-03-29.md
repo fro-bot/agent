@@ -1,11 +1,13 @@
 ---
 title: "Adding a Config-Declared Plugin to the Versioned Tool Pattern"
 date: 2026-03-29
+category: best-practices
+module: src/services/setup
 problem_type: best_practice
 component: tooling
+severity: medium
 root_cause: missing_tooling
 resolution_type: tooling_addition
-severity: medium
 tags:
   - versioning
   - plugin
@@ -13,7 +15,6 @@ tags:
   - systematic
   - setup
   - renovate
-category: best_practice
 ---
 
 # Adding a Config-Declared Plugin to the Versioned Tool Pattern
@@ -163,7 +164,7 @@ When changing what goes into `OPENCODE_CONFIG_CONTENT`, grep `setup.test.ts` for
 
 ## Related Documentation
 
-- [Tool Binary Caching on Ephemeral Runners](../build-errors/tool-binary-caching-ephemeral-runners.md) — Covers the tools cache layer, oMo version pinning, and the input→type→constant flow pattern that Systematic also follows
+- [Tool Binary Caching on Ephemeral Runners](../performance-issues/tool-binary-caching-ephemeral-runners.md) — Covers the tools cache layer, oMo version pinning, and the input→type→constant flow pattern that Systematic also follows
 - [Versioned Tool Skill](/.agents/skills/versioned-tool/SKILL.md) — The canonical reference for this pattern
 - [PR #409](https://github.com/fro-bot/agent/pull/409) — Implementation PR
 

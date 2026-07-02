@@ -46,7 +46,7 @@ Adjacent docs (different angle, not duplicates):
   orchestration side (members.fetch auth, partial-failure recovery, IAT handling).
 - `signed-webhook-ingress-hardening-2026-05-29.md` — the inbound webhook trust boundary
   (fail-closed auth, never-log-secret, no auth oracle).
-- `../code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — the
+- `./architectural-issues-type-safety-and-resource-cleanup.md` — the
   finally-guaranteed cleanup discipline this doc's dual-finally sharpens.
 
 ## Context

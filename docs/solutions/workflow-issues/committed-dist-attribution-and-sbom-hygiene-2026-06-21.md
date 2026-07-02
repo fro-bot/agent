@@ -1,10 +1,12 @@
 ---
 title: 'Committed-bundle attribution and SBOM hygiene'
 date: 2026-06-21
-last_updated: 2026-06-24
+category: workflow-issues
+module: scripts/
 problem_type: workflow_issue
 component: tooling
 severity: medium
+last_updated: 2026-06-24
 applies_when:
   - 'A GitHub Action (or any tool) commits its bundled dist/ directory and redistributes third-party dependencies'
   - 'A generated license-notice file is perpetually untracked or oscillates in and out of the tree'
@@ -142,7 +144,7 @@ Any project that commits a bundled or vendored `dist/` and redistributes third-p
 - [cross-libc-build-and-release-safety](../best-practices/cross-libc-build-and-release-safety-2026-06-14.md) — the project's fail-closed canon ("abort on anomaly, no fallback"); Rule 3 applies it to license generation.
 - [versioned-tool-config-plugin-pattern](../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md) — Renovate customManager / config-source-of-truth discipline behind Rule 5.
 - [gateway-docker-runtime-resolution-crash-loop](../build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md) — the sibling "build-time invariant in the bundler + CI self-check" pattern; the dist-diff-gate-as-proof here is the same discipline.
-- [tool-binary-caching-ephemeral-runners](../build-errors/tool-binary-caching-ephemeral-runners.md) — the dist/ rebuild-verification convention this builds on.
+- [tool-binary-caching-ephemeral-runners](../performance-issues/tool-binary-caching-ephemeral-runners.md) — the dist/ rebuild-verification convention this builds on.
 - [durable-dist-hidden-unicode-fix](durable-dist-hidden-unicode-fix-2026-06-22.md) — the durability fix for the hidden-Unicode scan Rule 5 alludes to: escape `dist/` in `build` so the scanner is irrelevant, not load-bearing.
 - [build-pipeline-fallible-preflight-and-finally-cleanup](build-pipeline-fallible-preflight-and-finally-cleanup-2026-06-22.md) — the lifecycle placement of Rule 3's fail-closed collection: run it as a preflight *before* the bundler mutates `dist/`, not inside a late hook the bundler may skip.
 - [Migrating a pnpm workspace to Bun](migrate-pnpm-to-bun-monorepo-2026-06-24.md) — the pnpm→Bun migration that replaced the `pnpm sbom` / `pnpm licenses list` primitives referenced in Rule 6 and Rule 5 with Bun-native equivalents.

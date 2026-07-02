@@ -124,7 +124,7 @@ Four compounding defects make the mention loop fail on cold boot:
   ownership-checked lock release; don't let EOF/timeout masquerade as success.
 - `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — "server is up"
   is **not** readiness; treat **absent config fail-soft, malformed config fail-fast** (directly informs R8).
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — use **nested `finally`** for
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — use **nested `finally`** for
   shutdown/cleanup; don't assume SDK ordering. The anti-footgun for a supervisor that must always reap children.
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — host-checkout tests lie;
   the existing `Workspace Image Smoke Test` is the real boot proof for supervisor/readiness changes.
@@ -506,5 +506,5 @@ at the top of `opencode-server.ts`.
   `packages/gateway/src/{discord/mentions,execute/run,execute/run-core,workspace-api/client,workspace-api/types,config}.ts`
 - Learnings: `docs/solutions/best-practices/gateway-opencode-mention-loop-best-practices-2026-05-30.md`,
   `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md`,
-  `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md`,
+  `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`,
   `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md`
