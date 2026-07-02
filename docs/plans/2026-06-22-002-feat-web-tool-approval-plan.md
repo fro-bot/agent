@@ -1,10 +1,12 @@
 ---
 title: 'feat: web tool-approval flow (gateway operator surface)'
 type: feat
-status: active
+status: done
 date: 2026-06-22
 origin: docs/brainstorms/2026-06-22-web-tool-approval-requirements.md
 ---
+
+> **Status: done.** All 6 units shipped: command/filepath surfaced on `PermissionRequest`, the SSE `ApprovalFrame` + `observeApproval` (operator-contract bump), write-level repo authz + audit enum, the web approval transport replacing auto-deny, the decision route, and the `GET` pending-approvals reconciliation endpoint — all verified on `main` (`packages/gateway/src/web/operator/web-approval.ts`, `packages/gateway/src/operator-contract/approval-frame.ts`).
 
 # Web Tool Approval Flow (Gateway Operator Surface)
 

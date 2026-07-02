@@ -1,10 +1,12 @@
 ---
 title: "fix: Close egress-relay bypass in the compose topology guard (#814) + live egress smoke (#745)"
 type: fix
-status: active
+status: done
 date: 2026-06-14
 deepened: 2026-06-14
 ---
+
+> **Status: done.** All 4 units shipped: the global non-internal-attachment allowlist + drift check replacing Invariant 5, guard tests, the gateway TCB-exception docs + ingress pinning test, and the live workspace egress smoke — verified on `main` (`deploy/validate-stack.sh`, `deploy/egress-smoke.sh`, PR #901).
 
 # Close the egress-relay bypass in the topology guard (#814) + live egress smoke (#745)
 
@@ -79,7 +81,7 @@ Decision basis: Option B from issue #814, chosen after threat-model analysis con
 
 ## Implementation Units
 
-- [ ] **Unit 1: Replace Invariant 5 with a global non-internal-attachment allowlist + drift check**
+- [x] **Unit 1: Replace Invariant 5 with a global non-internal-attachment allowlist + drift check**
 
 **Goal:** The guard fails any non-allowlisted service on any non-internal network, and any unknown non-internal network declaration.
 
@@ -121,7 +123,7 @@ for net in sorted(non_internal_nets - {"egress-net", "gateway-net"}):
 
 **Verification:** running the guard against current `deploy/compose.yaml` exits 0; against each malicious fixture exits non-zero with the precise failing pair/network.
 
-- [ ] **Unit 2: Guard tests for the global invariant**
+- [x] **Unit 2: Guard tests for the global invariant**
 
 **Goal:** Lock the new invariant + drift check behavior with regression tests.
 
@@ -140,7 +142,7 @@ for net in sorted(non_internal_nets - {"egress-net", "gateway-net"}):
 
 **Verification:** the test suite passes; removing the Unit 1 fix makes the shadow-egress test fail (the test actually guards the bug); the multi-file override case runs through `docker compose config` (or is explicitly skipped, not silently raw-YAML'd).
 
-- [ ] **Unit 3: Document the gateway TCB exception + correct topology comments + pin the gateway ingress surface**
+- [x] **Unit 3: Document the gateway TCB exception + correct topology comments + pin the gateway ingress surface**
 
 **Goal:** Make the deliberate weaker-than-strict posture explicit and auditable; remove false "only mitmproxy reaches the internet" statements; back the TCB assumption with a pinning test so it can't silently erode.
 
@@ -162,7 +164,7 @@ for net in sorted(non_internal_nets - {"egress-net", "gateway-net"}):
 
 **Verification:** no remaining comment claims "only mitmproxy" reaches the internet; the gateway exception + constraint is stated in compose, guard header, and README; the gateway ingress pin passes for the current surface and would fail on an unreviewed new route.
 
-- [ ] **Unit 4: Live workspace egress smoke (#745)**
+- [x] **Unit 4: Live workspace egress smoke (#745)**
 
 **Goal:** Prove at runtime that the workspace's only internet path is mitmproxy.
 

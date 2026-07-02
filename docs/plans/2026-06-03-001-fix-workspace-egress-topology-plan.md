@@ -1,9 +1,11 @@
 ---
 title: "fix: Workspace egress topology + configurable OpenCode proxy allowlist"
 type: fix
-status: active
+status: done
 date: 2026-06-03
 ---
+
+> **Status: done.** All 5 units shipped: the dedicated `egress-net` (`deploy/compose.yaml`), `WORKSPACE_EGRESS_HOSTS` + shared validation, DNS-rebinding defense (`_resolve_has_disallowed_ip` in `deploy/mitmproxy/allowlist.py`), the CI compose-topology + allowlist test guard, and operator-facing docs — verified on `main` (PR #747).
 
 # fix: Workspace egress topology + configurable OpenCode proxy allowlist
 
@@ -106,7 +108,7 @@ Implementer must confirm no additional host is reached at runtime before calling
 
 ## Implementation Units
 
-- [ ] **Unit 1: Egress topology — dedicated `egress-net` for mitmproxy's upstream leg**
+- [x] **Unit 1: Egress topology — dedicated `egress-net` for mitmproxy's upstream leg**
 
 **Goal:** mitmproxy can resolve and reach the internet while the workspace retains zero direct egress and `sandbox-net` stays `internal: true`.
 
@@ -136,7 +138,7 @@ Implementer must confirm no additional host is reached at runtime before calling
 - `docker compose -f deploy/compose.yaml config` is valid and shows the new network on mitmproxy only.
 - Containment invariants above hold.
 
-- [ ] **Unit 2: `WORKSPACE_EGRESS_HOSTS` env var + shared validation helper in `allowlist.py`**
+- [x] **Unit 2: `WORKSPACE_EGRESS_HOSTS` env var + shared validation helper in `allowlist.py`**
 
 **Goal:** A deployment can allowlist additional exact egress hosts (e.g. a self-hosted OpenCode proxy) via `WORKSPACE_EGRESS_HOSTS`, with identical security validation to `OBJECT_STORE_HOSTS`, implemented once.
 
@@ -172,7 +174,7 @@ Implementer must confirm no additional host is reached at runtime before calling
 **Verification:**
 - `pytest deploy/mitmproxy/test_allowlist.py` (or `python3 deploy/mitmproxy/test_allowlist.py`) is green, including the new and existing cases.
 
-- [ ] **Unit 3: DNS-rebinding defense — resolved-IP validation at enforcement time**
+- [x] **Unit 3: DNS-rebinding defense — resolved-IP validation at enforcement time**
 
 **Goal:** An operator-supplied allowlist host that resolves to a private/loopback/link-local/reserved IP is rejected at connect time, closing the DNS-rebinding gap for `OBJECT_STORE_HOSTS` and `WORKSPACE_EGRESS_HOSTS`.
 
@@ -206,7 +208,7 @@ Implementer must confirm no additional host is reached at runtime before calling
 **Verification:**
 - `python3 deploy/mitmproxy/test_allowlist.py` green including the new resolved-IP cases; the shared range helper backs both literal and resolved checks.
 
-- [ ] **Unit 4: CI regression guard — compose-topology invariant + run allowlist tests**
+- [x] **Unit 4: CI regression guard — compose-topology invariant + run allowlist tests**
 
 **Goal:** This defect class fails CI: a static assertion on the compose network topology, and the existing `test_allowlist.py` runs on deploy-touching changes.
 
@@ -237,7 +239,7 @@ Implementer must confirm no additional host is reached at runtime before calling
 **Verification:**
 - The `workspace-smoke` (or appropriate deploy) CI job runs the allowlist tests and the topology assertion and is green on the PR; both gates are present in `.github/workflows/ci.yaml`.
 
-- [ ] **Unit 5: Operator-facing docs — env var, topology, provider-proxy example**
+- [x] **Unit 5: Operator-facing docs — env var, topology, provider-proxy example**
 
 **Goal:** Deployers can discover and correctly use `WORKSPACE_EGRESS_HOSTS`, and the corrected egress topology is reflected in docs.
 

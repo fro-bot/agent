@@ -1,10 +1,12 @@
 ---
 title: 'fix: workspace-agent OpenCode supervisor readiness + gateway readiness gate'
 type: fix
-status: active
+status: done
 date: 2026-06-03
 deepened: 2026-06-03
 ---
+
+> **Status: done.** All 6 units shipped: per-probe readiness timeout, `WORKSPACE_OPENCODE_READY_TIMEOUT_MS`, workspace-agent `/readyz`, gateway readiness gate before mention dispatch, bounded respawn/backoff, and process-group reaping — verified on `main` (`apps/workspace-agent/src/opencode-server.ts`, PR #755/#767).
 
 # fix: workspace-agent OpenCode supervisor readiness + gateway readiness gate
 
@@ -219,7 +221,7 @@ handleMention: thread guard → mention guard → auth → binding lookup
 
 ### Phase 1 — PR 1: deployment unblock (supervisor startup readiness)
 
-- [ ] **Unit 1: Per-probe readiness timeout in `defaultPollReady`**
+- [x] **Unit 1: Per-probe readiness timeout in `defaultPollReady`**
 
 **Goal:** A hung readiness connect can no longer stall the supervisor in `starting` forever.
 
@@ -254,7 +256,7 @@ handleMention: thread guard → mention guard → auth → binding lookup
 **Verification:** the stuck-probe test fails before the change and passes after; no test relies on fake timers; SIGTERM
 assertion on total-timeout still holds.
 
-- [ ] **Unit 2: Configurable readiness timeout via `WORKSPACE_OPENCODE_READY_TIMEOUT_MS`**
+- [x] **Unit 2: Configurable readiness timeout via `WORKSPACE_OPENCODE_READY_TIMEOUT_MS`**
 
 **Goal:** Operators can raise the readiness timeout; the default becomes a realistic 60s cold-boot value.
 
@@ -297,7 +299,7 @@ boot; `deploy/README.md` documents the variable.
 
 ### Phase 2 — PR 2: readiness contract + gateway gate
 
-- [ ] **Unit 3: workspace-agent `/readyz` endpoint**
+- [x] **Unit 3: workspace-agent `/readyz` endpoint**
 
 **Goal:** Expose OpenCode liveness as a dedicated readiness signal without regressing clone-only liveness.
 
@@ -330,7 +332,7 @@ boot; `deploy/README.md` documents the variable.
 
 **Verification:** `/readyz` flips with OpenCode status while `/healthz` stays 200.
 
-- [ ] **Unit 4: Gateway readiness gate before mention dispatch**
+- [x] **Unit 4: Gateway readiness gate before mention dispatch**
 
 **Goal:** The gateway refuses to route a mention run to a not-ready workspace, replying with a coarse message instead
 of creating a thread/lock/run-state.
@@ -378,7 +380,7 @@ message; with ready, dispatch proceeds unchanged.
 
 ### Phase 3 — PR 3: supervisor robustness (respawn + process-group reaping)
 
-- [ ] **Unit 5: Retry/respawn with bounded backoff + state machine**
+- [x] **Unit 5: Retry/respawn with bounded backoff + state machine**
 
 **Goal:** A transient startup failure no longer permanently disables the mention loop.
 
@@ -424,7 +426,7 @@ discipline from the resource-cleanup learning.
 **Verification:** induced transient failure recovers without container recreation; exhausted retries land in `degraded`
 and `/readyz` returns non-200.
 
-- [ ] **Unit 6: Process-group reaping on timeout/respawn**
+- [x] **Unit 6: Process-group reaping on timeout/respawn**
 
 **Goal:** No orphaned OpenCode child survives a timeout/respawn to confuse later `:54321` probes.
 

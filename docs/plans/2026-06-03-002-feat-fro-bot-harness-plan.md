@@ -1,10 +1,12 @@
 ---
 title: "feat: @fro.bot/harness — orw-embedded patched OpenCode (LLM-merge integration, default setup)"
 type: feat
-status: active
+status: superseded
 date: 2026-06-03
 origin: docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md
 ---
+
+> **Status: superseded.** The `@fro.bot/harness` package, integration engine, per-platform build/publish, and action cutover all shipped through the follow-on cycle plans (`2026-06-10-002`, `2026-06-12-001`, `2026-06-12-003`, `2026-06-13-001` action-pin-flip). Unit 5 (scheduled deliberate-bump pipeline) was never built — harness bumps remain manual/reviewed via the cycle-plan pattern, not a scheduled CI job.
 
 # feat: @fro.bot/harness — orw-embedded patched OpenCode
 

@@ -1,9 +1,11 @@
 ---
 title: 'feat: harness release carry fingerprint, notes, and non-latest'
 type: feat
-status: active
+status: done
 date: 2026-06-21
 ---
+
+> **Status: done.** Both units shipped: the carried refs squashed into one fingerprint commit (`packages/harness/prompt.txt` `git reset --soft` + single commit), and the carry list plumbed to the release job/notes in `harness-release.yaml` — verified on `main` (PR #982).
 
 # Harness release carry fingerprint, notes, and non-latest
 

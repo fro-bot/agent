@@ -1,10 +1,12 @@
 ---
 title: 'fix: Move run lifecycle admission into launchWork so queued/failed runs are observable'
 type: fix
-status: active
+status: done
 date: 2026-06-20
 deepened: 2026-06-20
 ---
+
+> **Status: done.** All 6 units shipped: the early-FAILED runtime transition table, `launchWork` admission ownership, `executeWorkOnHeldSlot` run-adoption, two-phase idempotency in the web launch route, shutdown queue-drop + recovery-sweep terminalization, and the operator read-surface verification — all verified on `main` (`packages/gateway/src/execute/run.ts`).
 
 # Move run lifecycle admission into launchWork so queued/failed runs are observable
 

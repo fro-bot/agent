@@ -1,9 +1,11 @@
 ---
 title: "feat: Gateway daily_digest presence event"
 type: feat
-status: active
+status: done
 date: 2026-06-07
 ---
+
+> **Status: done.** Both units shipped: the `daily_digest` schema variant (`packages/gateway/src/http/announce-schema.ts`) and its embed rendering (`packages/gateway/src/http/templates.ts`) — verified on `main`.
 
 # Gateway daily_digest presence event
 

@@ -1,11 +1,13 @@
 ---
 title: 'feat: Gateway control surface spine — Phase A (transport-agnostic execution + approval extraction)'
 type: feat
-status: active
+status: done
 date: 2026-06-15
 deepened: 2026-06-15
 origin: docs/brainstorms/2026-06-15-gateway-control-surface-spine-requirements.md
 ---
+
+> **Status: done.** All 5 units shipped: characterization tests, `LaunchWorkRequest`/`StatusSink`/`ReplySink`, `launchWork` extracted from `startRun`, `runMention` as a thin Discord adapter, and the transport-neutral approval coordinator seam — verified on `main` (`packages/gateway/src/execute/launch-types.ts`, PR #920).
 
 # Gateway control surface spine — Phase A (transport-agnostic execution + approval extraction)
 
@@ -150,7 +152,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
 ## Implementation Units
 
-- [ ] **Unit 0: Characterization tests pinning current Discord behavior (mandatory)**
+- [x] **Unit 0: Characterization tests pinning current Discord behavior (mandatory)**
 
   **Goal:** Lock the current `runMention → startRun` and approval behaviors with tests that pass before AND after the refactor — the zero-regression gate. This is not optional; the engine has many edge behaviors (queue/cap, thread creation, live-status vs typing-only, reactions, approval waiting/timeout, empty-prompt) that a seam extraction can silently break.
 
@@ -170,7 +172,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Verification:** the new characterization tests pass on current `main` before any refactor; they remain the regression gate through Units 2–4.
 
-- [ ] **Unit 1: Define transport-neutral types — `LaunchWorkRequest`, `StatusSink`, `ReplySink`**
+- [x] **Unit 1: Define transport-neutral types — `LaunchWorkRequest`, `StatusSink`, `ReplySink`**
 
   **Goal:** Establish the typed interface contract that the engine will accept and the Discord adapter will implement. No runtime behavior changes in this unit.
 
@@ -196,7 +198,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; the new types file exports `LaunchWorkRequest`, `StatusSink`, `ReplySink`; no `any` or `@ts-ignore`; the Discord `Message`-derived implementations in Unit 3 satisfy the interfaces structurally.
 
-- [ ] **Unit 2: Extract `launchWork` core from `startRun`**
+- [x] **Unit 2: Extract `launchWork` core from `startRun`**
 
   **Goal:** Move the execution engine to accept `LaunchWorkRequest` + sinks instead of `RunTask.message`. `startRun` is updated to bridge `RunTask` → `LaunchWorkRequest` (or `RunTask` carries `LaunchWorkRequest` directly). The engine runs against a fake/in-memory sink with no Discord dependency.
 
@@ -226,7 +228,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; `pnpm --filter @fro-bot/gateway test` passes (existing `run.test.ts` + new `launchWork` tests); `launchWork` is exported and accepts `LaunchWorkRequest` + in-memory sinks; no Discord import in `launchWork`'s own logic.
 
-- [ ] **Unit 3: Make `runMention` a thin Discord adapter**
+- [x] **Unit 3: Make `runMention` a thin Discord adapter**
 
   **Goal:** `runMention` maps a Discord `Message` → `LaunchWorkRequest`, constructs Discord `StatusSink`/`ReplySink` implementations over the existing live-status/typing message flow, and calls `launchWork`. Zero change to the Discord user experience.
 
@@ -257,7 +259,7 @@ A future web caller (Phase B) will call `launchWork` directly with its own `Stat
 
   **Verification:** `pnpm --filter @fro-bot/gateway check-types` clean; `pnpm --filter @fro-bot/gateway test` passes; `runMention` no longer passes a `Message` into `launchWork`/`startRun`; the Discord sink implementations satisfy `StatusSink`/`ReplySink` structurally; characterization tests pass.
 
-- [ ] **Unit 4: Generalize the approval coordinator seam**
+- [x] **Unit 4: Generalize the approval coordinator seam**
 
   **Goal:** Generalize the approval coordinator's transport callbacks (`onPending`, `onReplied`, `onDispose`) so a non-Discord transport can render+register an approval, settle a decision, and fail-close teardown via the same registry. The Discord embed+button flow becomes one set of implementations. The registry and fail-closed settlement are unchanged. A decision from a non-Discord source settles via the same gate.
 

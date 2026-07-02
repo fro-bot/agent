@@ -1,10 +1,12 @@
 ---
 title: 'feat: GET /operator/runs run-index route'
 type: feat
-status: active
+status: done
 date: 2026-06-25
 deepened: 2026-06-25
 ---
+
+> **Status: done.** All 4 units shipped: `RunIndex.listRunsForRepo` + `listWithMetadata` adapter, `RunSummary` contract + projector, `GET /operator/runs` route (`packages/gateway/src/web/operator/runs-route.ts`), and server wiring — all verified on `main`.
 
 # feat: GET /operator/runs run-index route
 

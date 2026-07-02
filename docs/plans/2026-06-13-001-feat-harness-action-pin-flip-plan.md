@@ -1,10 +1,12 @@
 ---
 title: "feat: Flip the action default to the harness OpenCode binary"
 type: feat
-status: active
+status: done
 date: 2026-06-13
 deepened: 2026-06-13
 ---
+
+> **Status: done.** All 6 units shipped (PR #884) — `FALLBACK_VERSION`/`DEFAULT_OPENCODE_VERSION` decoupled, build-metadata-safe version compare, harness-aware tool-cache identity, retargeted Renovate manager, `sync-default-version` self-update job, and dist rebuild — verified on `main`.
 
 # feat: Flip the action default to the harness OpenCode binary
 
@@ -79,7 +81,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 ## Implementation Units
 
-- [ ] **Unit 1: Decouple FALLBACK_VERSION and introduce the harness default**
+- [x] **Unit 1: Decouple FALLBACK_VERSION and introduce the harness default**
 
 **Goal:** Make `FALLBACK_VERSION` an explicit stock constant and flip `DEFAULT_OPENCODE_VERSION` to the harness form, without the two aliasing.
 
@@ -104,7 +106,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** the existing fallback-is-semver test passes; default is the harness form.
 
-- [ ] **Unit 1b: Make compareVersions/isSqliteBackend build-metadata-safe**
+- [x] **Unit 1b: Make compareVersions/isSqliteBackend build-metadata-safe**
 
 **Goal:** Prevent the harness `+harness.<sha>` suffix from breaking OpenCode version comparison, which gates SQLite cache persistence.
 
@@ -129,7 +131,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** `isSqliteBackend` returns true for the harness default; SQLite cache paths are included; stock behavior unchanged.
 
-- [ ] **Unit 2: Tool-cache identity for harness versions**
+- [x] **Unit 2: Tool-cache identity for harness versions**
 
 **Goal:** Prevent harness/stock collision in `@actions/tool-cache` by using a `-harness` cache identity.
 
@@ -156,7 +158,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** all `toolCache.find`/`cacheDir` calls receive the `-harness` identity for harness versions; download/checksum/logs keep the raw `+harness` version.
 
-- [ ] **Unit 3: Retarget the existing Renovate manager to FALLBACK_VERSION**
+- [x] **Unit 3: Retarget the existing Renovate manager to FALLBACK_VERSION**
 
 **Goal:** Keep stock base tracking alive by pointing the existing customManager at `FALLBACK_VERSION`.
 
@@ -174,7 +176,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** the manager regex matches the new `FALLBACK_VERSION` literal.
 
-- [ ] **Unit 4: Self-update DEFAULT_OPENCODE_VERSION on successful harness release**
+- [x] **Unit 4: Self-update DEFAULT_OPENCODE_VERSION on successful harness release**
 
 **Goal:** Make the harness-release workflow open a PR that bumps `DEFAULT_OPENCODE_VERSION` (+ rebuilt `dist/`) when a publish succeeds, so future harness releases flow into the action default automatically — replacing any Renovate involvement for the harness version (Renovate cannot order `+harness.<sha>` tags).
 
@@ -198,7 +200,7 @@ Flipping the default is not a single constant change. Two latent issues (surface
 
 **Verification:** `actionlint` clean; the new step is gated on publish success + non-dry-run; opens a PR rather than pushing to main; rebuilds dist in the PR.
 
-- [ ] **Unit 5: Stale comments, dist rebuild, and config validation**
+- [x] **Unit 5: Stale comments, dist rebuild, and config validation**
 
 **Goal:** Clean up stale comments, rebuild `dist/`, and validate config.
 

@@ -1,10 +1,12 @@
 ---
 title: "fix: Gateway approval waits for unattended tool permissions"
 type: fix
-status: active
+status: done
 date: 2026-06-05
 deepened: 2026-06-05
 ---
+
+> **Status: done.** All 4 units shipped: the approval-mode config guard (`GATEWAY_APPROVAL_MODE` in `packages/gateway/src/config.ts`), the coordinator-required core boundary, approval wait/timeout UX, and unsafe-fix regression guards — verified on `main`.
 
 # fix: Gateway approval waits for unattended tool permissions
 

@@ -1,11 +1,13 @@
 ---
 title: "feat: Stream web-launched run output to the operator"
 type: feat
-status: active
+status: done
 date: 2026-06-20
 origin: docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md
 issue: 965
 ---
+
+> **Status: done.** All 6 units shipped: the `OperatorOutputFrame` contract type + version bump, the manager `output` frame + `observeOutput` + terminal-output cache, the run-stream route `output` SSE mapping, the web `ReplySink` wired to push output, engine-side ordering, and the docs refresh — all verified on `main` (`packages/gateway/src/operator-contract/output.ts`, `packages/gateway/src/web/sse/manager.ts`). Closes #965.
 
 # feat: Stream web-launched run output to the operator
 

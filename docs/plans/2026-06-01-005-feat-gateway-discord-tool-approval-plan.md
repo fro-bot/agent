@@ -1,10 +1,12 @@
 ---
 title: "feat: Gateway Discord tool-approval (S5) — probe-first"
 type: feat
-status: active
+status: done
 date: 2026-06-01
 origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 ---
+
+> **Status: done.** All 4 units shipped: the runtime permission-round-trip probe (PASSED 2026-06-01), the permission coordinator + run-core integration (`packages/gateway/src/approvals/coordinator.ts`), the Discord approval embed/buttons (`packages/gateway/src/discord/approvals.ts`), and integration tests + deploy docs — verified on `main`.
 
 # feat: Gateway Discord tool-approval (S5) — probe-first
 
@@ -175,7 +177,7 @@ Unit 1 probe confirms the full round-trip at 1.14.41?
 **Verification:**
 - A documented finding: "full round-trip {confirmed | partially confirmed | failed}; `permission.asked` over SSE = {yes | no}; `GET /permission` lists pending = {yes | no}; `POST /permission/{requestID}/reply` unblocks = {yes | no}; `requestID = properties.id` = {confirmed | contradicted}; reject cascade = {confirmed | contradicted}; `session.idle` interleaving = {…}; create-subscribe-prompt ordering = {…}." The decision gate is resolved and the chosen branch is recorded.
 
-- [ ] **Unit 2: Permission coordinator + run-core integration**
+- [x] **Unit 2: Permission coordinator + run-core integration**
 
 **Goal:** Add a permission coordinator with an explicit seam (`onPermissionAsked` / `onPermissionReplied`) and an in-memory registry keyed by `requestID`. run-core consumes both `permission.asked` (register pending + signal the coordinator) and `permission.replied` (authoritative settle — reconcile sibling embeds on reject cascade). The coordinator owns the blocking wait; run-core stays transport-focused.
 
@@ -209,7 +211,7 @@ Unit 1 probe confirms the full round-trip at 1.14.41?
 
 **Verification:** run-core emits structured pending-permission signals on `permission.asked`, processes `permission.replied` as the authoritative settle, and continues to handle all existing event types unchanged.
 
-- [ ] **Unit 3: Discord approval embed/buttons + live auth + channel binding + pause/resume**
+- [x] **Unit 3: Discord approval embed/buttons + live auth + channel binding + pause/resume**
 
 **Goal:** When the coordinator signals a pending permission, post a Discord approval embed with Approve/Deny buttons (`custom_id = approve:<requestID>` / `deny:<requestID>`); the run pauses on the coordinator promise. Handle button clicks: verify channel binding, authorize the clicker (live fetch), POST the decision to OpenCode's reply endpoint (with workspace routing), and settle the coordinator registry entry. Single authoritative sub-deadline and single-winner settle guard govern the entire flow.
 
@@ -254,7 +256,7 @@ Unit 1 probe confirms the full round-trip at 1.14.41?
 
 **Verification:** a permission-requiring run posts an approval prompt, blocks, and resumes or fail-closes deterministically; the concurrency slot is released within the sub-deadline bound; N-concurrent requests do not interfere; shutdown drains cleanly.
 
-- [ ] **Unit 4: Integration/failure tests + deploy docs**
+- [x] **Unit 4: Integration/failure tests + deploy docs**
 
 **Goal:** End-to-end failure-mode tests covering the scenarios that unit mocks cannot prove, plus deploy documentation: the workspace `permission: ask` config knob (the deploy-time switch that activates S5) and `AGENTS.md` permission posture.
 
