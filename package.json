@@ -23,11 +23,12 @@
     "bootstrap": "bun install",
     "build": "bun run --filter @fro-bot/runtime build && bun run --filter @fro-bot/action build && bun run --filter @fro.bot/harness build && bun run dist:escape-hidden-unicode",
     "check-types": "bun run --filter @fro-bot/runtime check-types && bun run --filter @fro-bot/action check-types && bun run --filter @fro.bot/harness check-types",
+    "check:md-links": "node --experimental-strip-types scripts/check-md-links.ts",
     "dist:check-hidden-unicode": "node --experimental-strip-types scripts/check-dist-hidden-unicode.ts",
     "dist:escape-hidden-unicode": "node --experimental-strip-types scripts/escape-dist-hidden-unicode.ts",
     "fix": "bun run --filter @fro-bot/runtime fix && bun run --filter @fro-bot/action fix && bun run --filter @fro.bot/harness fix",
     "postinstall": "simple-git-hooks",
-    "lint": "bun run --filter @fro-bot/runtime lint && bun run --filter @fro-bot/action lint && bun run --filter @fro.bot/harness lint && bun run dist:check-hidden-unicode",
+    "lint": "bun run --filter @fro-bot/runtime lint && bun run --filter @fro-bot/action lint && bun run --filter @fro.bot/harness lint && bun run dist:check-hidden-unicode && bun run check:md-links",
     "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test",
     "test:scripts": "vitest run scripts/"
   },

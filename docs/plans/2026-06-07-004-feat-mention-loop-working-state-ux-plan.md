@@ -237,6 +237,6 @@ Phase 2 of the production-ready `@Fro Bot` Discord mention loop. Phase 1 (clean 
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md](docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md) — Phase 2 (working-state UX), OQ1/OQ2, interaction states.
+- **Origin document:** [docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md](../brainstorms/2026-06-07-mention-loop-production-ready-requirements.md) — Phase 2 (working-state UX), OQ1/OQ2, interaction states.
 - Related code: `packages/gateway/src/discord/streaming.ts`, `packages/gateway/src/execute/run.ts`, `packages/gateway/src/execute/run-core.ts`, `packages/gateway/src/config.ts`, `packages/gateway/src/execute/format-part.ts`.
 - Phase 1 (shipped): #831 (rendering + persona), #837 (NBC follow-ups), #833 (lock-leak fix).

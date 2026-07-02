@@ -280,6 +280,6 @@ Late subscriber connects after terminal:
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md](docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md](../brainstorms/2026-06-20-stream-web-run-output-requirements.md)
 - Related: `docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md` (the 10-rule checklist), `docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md` (names #965 as deferred), `docs/solutions/best-practices/gateway-control-surface-spine-2026-06-15.md` (sinks-over-transport), `docs/solutions/best-practices/atomic-serial-channel-queue-handoff-2026-06-09.md` (FIFO/ordering).
 - Issue: #965 (advances #907).

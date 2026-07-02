@@ -322,7 +322,7 @@ Unit 1 probe confirms the full round-trip at 1.14.41?
 
 ## Sources & References
 
-- **Origin document:** [docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md](docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md) (Unit 6 deferred items; approval design sketch at lines 183, 200, 284-286, 764, 769)
+- **Origin document:** [docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md](./2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md) (Unit 6 deferred items; approval design sketch at lines 183, 200, 284-286, 764, 769)
 - Spike findings: project memory ID 4365 (S5 remote-attach feasibility at 1.14.41)
 - Oracle architecture review + Librarian source research: project memory ID 4366 (session 2026-06-01) — BusEvent classification confirmed, `requestID = properties.id` confirmed, `permission.replied` authoritative signal confirmed, reject cascade confirmed, no server-side timeout confirmed, `GET /permission` reconciliation endpoint confirmed
 - SDK refs: installed `@opencode-ai/sdk@1.14.41` — `PermissionList` (`GET /permission`), `postPermissionRequestIdReply` (`POST /permission/{requestID}/reply`), `permission.asked` / `permission.replied` event shapes

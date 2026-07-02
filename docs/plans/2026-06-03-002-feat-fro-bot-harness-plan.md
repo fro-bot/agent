@@ -318,7 +318,7 @@ The pipeline is the asset; the patch list stays boring. Target **1–3 carried r
 
 ## Sources & References
 
-- **Origin:** [docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md](docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md) (full-harness spec; R4 corrected here to LLM-merge per orw)
+- **Origin:** [docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md](../brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md) (full-harness spec; R4 corrected here to LLM-merge per orw)
 - Integration method: `cortexkit/orw` (`src/index.ts`, `prompt.txt`, `package.json`) — embedded as the harness engine
 - Build/publish model: `anomalyco/opencode` `packages/opencode/script/build.ts`, `script/publish.ts`, `.github/workflows/publish.yml`
 - Cut-over seam: `src/services/setup/opencode.ts`, `src/services/setup/setup.ts`, `src/features/agent/server.ts`, `src/services/setup/tools-cache.ts`

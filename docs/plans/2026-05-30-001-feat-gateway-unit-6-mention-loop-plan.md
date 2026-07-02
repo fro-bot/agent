@@ -663,8 +663,8 @@ startup; document the MVP behavior and limitations.
 
 ## Sources & References
 
-- **Origin document:** [docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md](docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md) (Unit 6, lines 745-817)
-- Brainstorm: [docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md](docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md) (Cluster B extraction, Cluster C sandbox)
+- **Origin document:** [docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md](./2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md) (Unit 6, lines 745-817)
+- Brainstorm: [docs/brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md](../brainstorms/2026-04-17-fro-bot-gateway-discord-requirements.md) (Cluster B extraction, Cluster C sandbox)
 - Reuse: `packages/runtime/src/agent/{execution,retry,streaming,session-poll,server}.ts`, `packages/runtime/src/coordination/{lock,run-state,heartbeat}.ts`
 - Extend: `packages/gateway/src/discord/mentions.ts`, `packages/gateway/src/bindings/store.ts`, `packages/gateway/src/program.ts`, `apps/workspace-agent/src/server.ts`
 - Learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`

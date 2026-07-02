@@ -322,6 +322,6 @@ operator decides (write-authz)                                             [Unit
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-22-web-tool-approval-requirements.md](docs/brainstorms/2026-06-22-web-tool-approval-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-22-web-tool-approval-requirements.md](../brainstorms/2026-06-22-web-tool-approval-requirements.md)
 - Related code: `packages/gateway/src/approvals/{registry,coordinator,discord-transport}.ts`, `packages/gateway/src/web/operator/{web-approval,launch-route}.ts`, `packages/gateway/src/web/sse/{manager,run-stream-route,projection}.ts`, `packages/gateway/src/web/auth/repo-authz.ts`, `packages/gateway/src/operator-contract/{approval,version}.ts`, `packages/gateway/src/web/{audit,server}.ts`.
 - Institutional learnings: gateway-control-surface-spine, web-operator-launch-surface, authenticated-sse-run-observation, sse-output-streaming-terminal-drain, effect-failure-channel-discipline, atomic-serial-channel-queue-handoff (all under docs/solutions/best-practices/).

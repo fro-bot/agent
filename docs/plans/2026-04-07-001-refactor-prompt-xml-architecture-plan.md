@@ -360,7 +360,7 @@ parts.push(wrapXml('agent_context', buildAgentContextSection(...)))
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-04-07-prompt-xml-architecture-requirements.md](docs/brainstorms/2026-04-07-prompt-xml-architecture-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-04-07-prompt-xml-architecture-requirements.md](../brainstorms/2026-04-07-prompt-xml-architecture-requirements.md)
 - **Oracle analysis:** Session consultation on Claude-optimal prompting structure (this session)
 - **Anthropic guidance:** XML tags for mixed-content prompts, long-context ordering (data first, query last)
 - Related code: `src/features/agent/prompt.ts`, `src/features/agent/prompt.test.ts`
