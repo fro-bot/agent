@@ -88,7 +88,7 @@ The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.1
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.11`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.11+harness.bf0e9bed`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include SQLite-reliability fixes that landed with the 1.17.9 upgrade. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.13`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.11+harness.bf0e9bed`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include SQLite-reliability fixes that landed with the 1.17.9 upgrade. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 
