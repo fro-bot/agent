@@ -1,9 +1,11 @@
 ---
 title: "fix: Reject remaining egress-escalation compose keys in the topology guard (#908)"
 type: fix
-status: active
+status: done
 date: 2026-06-14
 ---
+
+> **Status: done.** All 7 units shipped: `cap_add: ALL`, `device_cgroup_rules`, `pid_mode: host`, IP-forwarding `sysctls`, confinement-disabling `security_opt`, guard tests, and docs — verified on `main` (`deploy/validate-stack.sh`, PR #911).
 
 # Reject remaining egress-escalation compose keys in the topology guard (#908)
 
@@ -93,7 +95,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add cap_add: ALL to the banned capability set**
+- [x] **Unit 1: Add cap_add: ALL to the banned capability set**
 
 **Goal:** `cap_add: ALL` / `CAP_ALL` is rejected by the existing capability invariant.
 
@@ -112,7 +114,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** a service with `cap_add: [ALL]` or `[CAP_ALL]` fails; real compose passes.
 
-- [ ] **Unit 2: Reject device_cgroup_rules that grant devices**
+- [x] **Unit 2: Reject device_cgroup_rules that grant devices**
 
 **Goal:** The guard fails any service declaring a `device_cgroup_rules` allow rule.
 
@@ -131,7 +133,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** a service with `device_cgroup_rules: ["c 10:200 rwm"]` fails; real compose passes.
 
-- [ ] **Unit 3: Reject pid_mode: host**
+- [x] **Unit 3: Reject pid_mode: host**
 
 **Goal:** The guard fails any service declaring `pid_mode: host`.
 
@@ -150,7 +152,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** `pid_mode: host` fails; `pid_mode: "service:foo"` passes; real compose passes.
 
-- [ ] **Unit 4: Reject IP-forwarding sysctls**
+- [x] **Unit 4: Reject IP-forwarding sysctls**
 
 **Goal:** The guard fails any service enabling IP forwarding via `sysctls`.
 
@@ -169,7 +171,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** `sysctls: {net.ipv4.ip_forward: 1}` fails; a benign sysctl (or forwarding=0) passes; real compose passes.
 
-- [ ] **Unit 5: Reject confinement-disabling security_opt**
+- [x] **Unit 5: Reject confinement-disabling security_opt**
 
 **Goal:** The guard fails any service that disables seccomp or AppArmor confinement.
 
@@ -188,7 +190,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** `security_opt: ["seccomp:unconfined"]` fails; `["no-new-privileges:true"]` passes; real compose passes.
 
-- [ ] **Unit 6: Guard tests for all five vectors**
+- [x] **Unit 6: Guard tests for all five vectors**
 
 **Goal:** Lock each rejection + benign/positive controls with regression tests.
 
@@ -217,7 +219,7 @@ These are not regressions introduced by #899; they are pre-existing vectors defe
 
 **Verification:** suite passes; removing each Unit 1-5 check makes its fixture pass (teeth); benign/positive controls pass; pre-existing PyYAML-absent failures unchanged.
 
-- [ ] **Unit 7: Document the additional rejected keys**
+- [x] **Unit 7: Document the additional rejected keys**
 
 **Goal:** Operators understand the full set of forbidden egress-weakening keys.
 

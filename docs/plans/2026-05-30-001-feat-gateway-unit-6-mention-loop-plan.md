@@ -1,11 +1,13 @@
 ---
 title: "feat: Gateway Unit 6 MVP — @fro-bot mention → OpenCode interaction loop (remote attach)"
 type: feat
-status: active
+status: done
 date: 2026-05-30
 origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 deepened: 2026-05-30
 ---
+
+> **Status: done.** All 6 units shipped: the Unit 0 remote-attach spike (verdict GO, `docs/plans/2026-05-30-001-unit-0-spike-findings.md`), the workspace-agent OpenCode SDK server lifecycle, the gateway remote-attach client + execution orchestrator, the Discord streaming sink, mention → execution wiring with run-state lifecycle + lock, and startup stale-run recovery — verified on `main` (`packages/gateway/src/execute/recovery.ts`, PR #705). The deferred UX/approval/queue layers (reactions, working-message heartbeat, approvals, per-thread queue, extra slash commands) shipped separately in the follow-up plans this reconciliation also marks done.
 
 # Gateway Unit 6 MVP — `@fro-bot` Mention → OpenCode Interaction Loop
 
@@ -288,7 +290,7 @@ EXECUTING by a crash is transitioned FAILED, its lock released, and (best-effort
 
 ## Implementation Units
 
-- [ ] **Unit 0: Spike — prove remote-attach streaming (de-risk the topology)**
+- [x] **Unit 0: Spike — prove remote-attach streaming (de-risk the topology)**
 
 **Goal:** Empirically confirm that `createOpencodeClient({baseURL})` against a *remote* OpenCode server
 can run the full prompt → SSE stream → `session.idle` flow (not just `v2.session.wait()`), with tool
@@ -335,7 +337,7 @@ until the topology is confirmed. The output is a go/no-go finding, not shippable
 - A written go/no-go note: remote streaming works (proceed to Unit 1) or does not (escalate, re-plan
   to Option B). Capture the exact event kinds observed.
 
-- [ ] **Unit 1: Workspace-agent — OpenCode SDK server lifecycle**
+- [x] **Unit 1: Workspace-agent — OpenCode SDK server lifecycle**
 
 **Goal:** The workspace container runs an OpenCode SDK server at boot, bound to `/workspace/repos`,
 reachable on the internal `sandbox-net`. `GET /healthz` reflects server readiness so the gateway can
@@ -386,7 +388,7 @@ gate on it.
 - Tests pass; manual: container boots, `/healthz` flips to `ready`, the OpenCode port answers from a
   peer container on `sandbox-net` but not from the host.
 
-- [ ] **Unit 2: Gateway remote-attach client + execution orchestrator**
+- [x] **Unit 2: Gateway remote-attach client + execution orchestrator**
 
 **Goal:** A gateway-side module that attaches to the remote OpenCode server, creates a session, sends
 a prompt against the repo `directory`, and drives it to completion using the reused runtime
@@ -450,7 +452,7 @@ makes the gateway close the remote server would break every subsequent mention.
 - Tests pass; the execute core resolves text from a fake remote stream and never closes the injected
   handle.
 
-- [ ] **Unit 3: Discord streaming sink**
+- [x] **Unit 3: Discord streaming sink**
 
 **Goal:** Consume the execution event stream and render the agent's text into the Discord thread —
 incremental where sensible, with a `.md` attachment fallback for long output and `@everyone` stripped.
@@ -489,7 +491,7 @@ incremental where sensible, with a `.md` attachment fallback for long output and
 **Verification:**
 - Tests pass; manual: a short prompt renders inline in the thread; a long prompt yields a `.md` file.
 
-- [ ] **Unit 4: Mention → execution wiring + run-state lifecycle + lock**
+- [x] **Unit 4: Mention → execution wiring + run-state lifecycle + lock**
 
 **Goal:** Replace the `pong` stub. On a real `@fro-bot` mention in a bound channel, run the full
 orchestration: resolve binding → thread → lock → run-state lifecycle → execute (Unit 2) → stream
@@ -566,7 +568,7 @@ handler-only tests.
 - Tests pass; live smoke: `@fro-bot explain <file>` in a bound channel → thread → text response →
   COMPLETED; S3 shows run-state + a released lock.
 
-- [ ] **Unit 5: Startup stale-run recovery + integration + docs**
+- [x] **Unit 5: Startup stale-run recovery + integration + docs**
 
 **Goal:** On gateway boot, recover runs a prior crash left mid-flight; wire the recovery into program
 startup; document the MVP behavior and limitations.

@@ -1,9 +1,11 @@
 ---
 title: "fix: Decouple license collection from the dist-escape build lifecycle"
 type: fix
-status: active
+status: done
 date: 2026-06-22
 ---
+
+> **Status: done.** All 4 units shipped: license-notice generation extracted to `scripts/third-party-notices.ts`, the `scripts/build-action-dist.ts` preflight→bundle→escape→writeNotice wrapper (escape runs in `finally`), the throwing license logic removed from the tsdown `writeBundle` hook, and the renovate.json5 comment fixed — verified on `main`.
 
 # fix: Decouple license collection from the dist-escape build lifecycle
 
@@ -76,7 +78,7 @@ Because the throw happens in a late, post-mutation hook and shares the plugin ar
 
 ## Implementation Units
 
-- [ ] **Unit 1: Extract license-notice generation into a shared, testable module**
+- [x] **Unit 1: Extract license-notice generation into a shared, testable module**
 
 **Goal:** Move the fallible license collection (`getProjectLicenses` + `getPnpmLicensesJson` + `formatThirdPartyNotices`) out of the tsdown `writeBundle` hook into a standalone module that produces the notice content (string) without writing to `dist/`.
 
@@ -102,7 +104,7 @@ Because the throw happens in a late, post-mutation hook and shares the plugin ar
 
 **Verification:** The notice-generation logic is importable and unit-tested; `tsdown.config.ts` no longer performs fallible license collection inside `writeBundle`.
 
-- [ ] **Unit 2: Add a build wrapper that preflights notices, bundles, and escapes in finally**
+- [x] **Unit 2: Add a build wrapper that preflights notices, bundles, and escapes in finally**
 
 **Goal:** Introduce a build-orchestration helper that runs the license preflight (fail-closed, before tsdown), then the tsdown action build, then the hidden-unicode escape in a `finally` that preserves the bundle's exit code, then writes the notice atomically on success.
 
@@ -131,7 +133,7 @@ Because the throw happens in a late, post-mutation hook and shares the plugin ar
 
 **Verification:** On success, `dist/` is byte-identical to current main and the notice is present; on a simulated license failure, the build exits non-zero without dropping the committed notice; on a simulated bundle failure, the escape has still run and the exit code is non-zero.
 
-- [ ] **Unit 3: Remove the throwing license logic from the tsdown writeBundle hook**
+- [x] **Unit 3: Remove the throwing license logic from the tsdown writeBundle hook**
 
 **Goal:** Ensure `tsdown.config.ts` no longer aborts the bundle from inside `writeBundle` due to license collection — the escape plugin and version-invariant plugin must not be blocked by a license failure.
 
@@ -151,7 +153,7 @@ Because the throw happens in a late, post-mutation hook and shares the plugin ar
 
 **Verification:** A simulated license failure no longer aborts the tsdown build; the escape plugin still runs in the normal build.
 
-- [ ] **Unit 4: Fix the stale renovate.json5 comment**
+- [x] **Unit 4: Fix the stale renovate.json5 comment**
 
 **Goal:** Correct the `.github/renovate.json5` comment that claims `ignorePaths` skips the hidden-unicode detector — it does not, and the claim actively misleads about this exact bug.
 

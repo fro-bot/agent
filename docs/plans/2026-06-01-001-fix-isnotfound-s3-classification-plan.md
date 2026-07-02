@@ -1,9 +1,11 @@
 ---
 title: 'fix: isNotFound() misclassifies S3 NoSuchKey as fatal'
 type: fix
-status: active
+status: done
 date: 2026-06-01
 ---
+
+> **Status: done.** Both units shipped: structured S3 error classification preserved through the object-store adapter (`packages/runtime/src/object-store/s3-adapter.ts`), and regression tests — verified on `main`.
 
 # fix: isNotFound() misclassifies S3 NoSuchKey as fatal
 

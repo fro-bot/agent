@@ -1,10 +1,12 @@
 ---
 title: "feat: Provision OpenCode model/auth into the workspace executor for the mention loop"
 type: feat
-status: active
+status: done
 date: 2026-06-01
 reviewed: 2026-06-01
 ---
+
+> **Status: done.** All 4 units shipped: file-based entrypoint auth provisioning, `WORKSPACE_OPENCODE_MODEL`/`WORKSPACE_OPENCODE_CONFIG` overlay with no baked default, compose wiring, and smoke/docs — verified on `main` (`deploy/compose.yaml:242-251`, PR #728).
 
 # feat: Workspace OpenCode model/auth provisioning
 
@@ -116,7 +118,7 @@ The workspace container clones and may execute untrusted repository code in the 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Entrypoint auth provisioning (file-based)**
+- [x] **Unit 1: Entrypoint auth provisioning (file-based)**
 
 **Goal:** The entrypoint writes a validated `auth.json` to OpenCode's data path from a mounted secret, so the server authenticates — without baking the secret or exposing it via env.
 
@@ -143,7 +145,7 @@ The workspace container clones and may execute untrusted repository code in the 
 **Verification:**
 - With a valid secret, `$XDG_DATA_HOME/opencode/auth.json` exists `0600` with the blob; with a malformed/empty-provider blob, the container exits with a clear error; with no secret, it boots and the clone path works; the secret never appears in logs.
 
-- [ ] **Unit 2: Model + provider-config overlay (entrypoint), no baked default**
+- [x] **Unit 2: Model + provider-config overlay (entrypoint), no baked default**
 
 **Goal:** The workspace OpenCode server's model and provider config are supplied at deploy time, mirroring the action's `model` + `opencode-config`.
 
@@ -168,7 +170,7 @@ The workspace container clones and may execute untrusted repository code in the 
 **Verification:**
 - With the cliproxyapi-shaped env, the effective `opencode.json` carries the overlaid model + provider `baseURL` + the Systematic plugin; with neither env, no `model` field and the plugin remains; malformed JSON exits non-zero.
 
-- [ ] **Unit 3: Compose wiring**
+- [x] **Unit 3: Compose wiring**
 
 **Goal:** Wire the auth secret into the `workspace` service, preserving secret/network conventions.
 
@@ -193,7 +195,7 @@ The workspace container clones and may execute untrusted repository code in the 
 **Verification:**
 - `docker compose -f deploy/compose.yaml config` parses; the workspace mounts the auth secret; no host ports added.
 
-- [ ] **Unit 4: Smoke extension + docs**
+- [x] **Unit 4: Smoke extension + docs**
 
 **Goal:** Guard the config shape in CI and document the new secret + the model for operators, stating precisely what CI does and does not prove.
 

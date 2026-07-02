@@ -1,10 +1,12 @@
 ---
 title: 'fix: deploy contract hardening for external IaC consumers'
 type: fix
-status: active
+status: done
 date: 2026-05-18
 deepened: 2026-05-18
 ---
+
+> **Status: done.** All 3 units shipped: explicit S3 `credentials:` plumbing, compose AWS credential mounts + log rotation + secret-path guard, and the gateway readiness healthcheck + docs — verified on `main` (`packages/runtime/src/object-store/s3-adapter.ts:99-111`, `deploy/compose.yaml`, PR #649).
 
 # fix: deploy contract hardening for external IaC consumers
 
@@ -104,7 +106,7 @@ The two stale claims in the original handoff brief (`DISCORD_GUILD_ID` plumbing 
 
 ## Implementation Units
 
-- [ ] **Unit 1: AWS credential plumbing (config + adapter + tests)**
+- [x] **Unit 1: AWS credential plumbing (config + adapter + tests)**
 
 **Goal:** Read optional AWS credentials from secret files in `loadGatewayConfig`, pass them through `ObjectStoreConfig`, and inject them into the `S3Client` constructor when both are present.
 
@@ -156,7 +158,7 @@ The two stale claims in the original handoff brief (`DISCORD_GUILD_ID` plumbing 
 - `pnpm check-types` clean across the workspace.
 - `pnpm lint` clean.
 
-- [ ] **Unit 2: Compose AWS credential mounts + log rotation + secret-path guard**
+- [x] **Unit 2: Compose AWS credential mounts + log rotation + secret-path guard**
 
 **Goal:** Wire the new AWS credential `*_FILE` env vars + bind-mounts in `deploy/compose.yaml`. Add bounded `logging:` to gateway, workspace, and mitmproxy. Add the `isFile()` guard to `readOptionalSecret` so directory-as-secret-path fails with a clear error.
 
@@ -194,7 +196,7 @@ The two stale claims in the original handoff brief (`DISCORD_GUILD_ID` plumbing 
 - `pnpm --filter @fro-bot/gateway test` passes new directory-guard test.
 - `docker compose -f deploy/compose.yaml config --quiet` exits 0 after running `touch deploy/secrets/aws-{access-key-id,secret-access-key}`.
 
-- [ ] **Unit 3: Gateway readiness healthcheck + docs**
+- [x] **Unit 3: Gateway readiness healthcheck + docs**
 
 **Goal:** Replace the no-op Dockerfile healthcheck with a real readiness check backed by a `/tmp/gateway-ready` flag file touched by the Discord `ready` handler. Remove the compose healthcheck override (the Dockerfile's becomes authoritative). Update `deploy/README.md` to reflect AWS credentials + the readiness behavior.
 

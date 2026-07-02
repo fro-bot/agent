@@ -1,9 +1,11 @@
 ---
 title: "fix: Reject host-namespace-sharing compose keys in the topology guard (#910)"
 type: fix
-status: active
+status: done
 date: 2026-06-14
 ---
+
+> **Status: done.** All 3 units shipped: `ipc: host` rejection + `SYS_PTRACE` added to the banned capability set, guard tests, and docs — verified on `main` (`deploy/validate-stack.sh`, PR #914).
 
 # Reject host-namespace-sharing compose keys in the topology guard (#910)
 
@@ -68,7 +70,7 @@ Different threat class from the egress work (lateral-movement / cross-container,
 
 ## Implementation Units
 
-- [ ] **Unit 1: Reject ipc: host and add SYS_PTRACE to the banned caps**
+- [x] **Unit 1: Reject ipc: host and add SYS_PTRACE to the banned caps**
 
 **Goal:** The guard fails any service declaring `ipc: host` or `cap_add: SYS_PTRACE`.
 
@@ -90,7 +92,7 @@ Different threat class from the egress work (lateral-movement / cross-container,
 
 **Verification:** `ipc: host` fails; `cap_add: [SYS_PTRACE]` fails; `ipc: "service:foo"` passes; real `deploy/compose.yaml` passes.
 
-- [ ] **Unit 2: Guard tests**
+- [x] **Unit 2: Guard tests**
 
 **Goal:** Lock the two rejections + positive controls.
 
@@ -112,7 +114,7 @@ Different threat class from the egress work (lateral-movement / cross-container,
 
 **Verification:** suite passes; removing the Unit 1 checks makes the fixtures pass (teeth); positive controls pass; pre-existing PyYAML-absent failures unchanged.
 
-- [ ] **Unit 3: Document the additional rejected keys**
+- [x] **Unit 3: Document the additional rejected keys**
 
 **Goal:** Operators understand `ipc: host` and `SYS_PTRACE` are forbidden.
 

@@ -1,12 +1,14 @@
 ---
 title: "feat: Gateway v1 Unit 5 — channel-repo binding + /fro-bot add-project"
 type: feat
-status: active
+status: done
 date: 2026-05-23
 origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 parent_unit: Unit 5 of the Gateway v1 plan
 deepened: 2026-05-24 (coherence + feasibility + security review applied)
 ---
+
+> **Status: done.** All 4 PRs shipped: the bindings store, GitHub App auth, `apps/workspace-agent` scaffold, and `/fro-bot add-project` — verified on `main` (PR #672/#673/#674/#676).
 
 # feat: Gateway v1 Unit 5 — channel-repo binding + /fro-bot add-project
 
@@ -190,7 +192,7 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 
 ## Implementation Units
 
-- [ ] **PR A: Channel-repo bindings store**
+- [x] **PR A: Channel-repo bindings store**
 
 **Goal:** A typed, S3-backed store for repo bindings using the two-key shape from the Binding Storage Model section above. Primary record per repo + channel-to-repo index. Read, list, create-only-write (via `IfNoneMatch: '*'`). No Discord, no GitHub — pure storage layer.
 
@@ -239,7 +241,7 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 
 ---
 
-- [ ] **PR B: GitHub App authentication for the gateway**
+- [x] **PR B: GitHub App authentication for the gateway**
 
 **Goal:** Octokit-backed App client with auto-discovered `installation_id`. No Discord wiring, no slash command — just the authenticated client that PR D will use.
 
@@ -291,7 +293,7 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 
 ---
 
-- [ ] **PR C: apps/workspace-agent scaffold + Hono HTTP service**
+- [x] **PR C: apps/workspace-agent scaffold + Hono HTTP service**
 
 **Goal:** New `apps/workspace-agent/` sub-app: Hono server on port 9100, `/clone` route handler, packaged + built + wired into `workspace.Dockerfile` to replace `sleep infinity`. Nothing in the gateway calls it yet — that's PR D.
 
@@ -353,7 +355,7 @@ deploy/compose.yaml                          (PR B — GitHub App secret mounts)
 
 ---
 
-- [ ] **PR D: workspace-api client + Discord channel management + /add-project slash command**
+- [x] **PR D: workspace-api client + Discord channel management + /add-project slash command**
 
 **Goal:** Ship the slash command. Wire together PR A (bindings) + PR B (auth) + the workspace-api HTTP client. Operator runs `/fro-bot add-project url:<git-url>` and gets a Discord channel bound to a freshly cloned repo. Setup thread shows phase progression. End-to-end `/add-project` works after this lands.
 

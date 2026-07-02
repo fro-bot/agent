@@ -1,11 +1,13 @@
 ---
 title: 'feat: LLM-narrated release notes for the multi-part release flow'
 type: feat
-status: active
+status: done
 date: 2026-06-07
 deepened: 2026-06-07
 origin: docs/brainstorms/2026-06-07-release-notes-narrative-requirements.md
 ---
+
+> **Status: done.** All 5 units shipped: `scripts/release/release-notes.ts` (pure narration logic), `scripts/release/dispatch-release-notes.ts` (CLI entry), the Vitest test port, `successCmd` wired in `.releaserc.yaml` + `fro-bot.yaml` inputs, and AGENTS.md documentation — verified on `main` and operating in production (the `RELEASE_NOTES_MODEL` operator-configurable variable per AGENTS.md).
 
 # LLM-narrated release notes
 
@@ -155,7 +157,7 @@ PR merge → `auto-release.yaml`) and its TypeScript-scripts convention
 
 ## Implementation Units
 
-- [ ] **Unit 1: Pure narration logic module**
+- [x] **Unit 1: Pure narration logic module**
 
 **Goal:** Tag validation, prompt construction, run selection, and outcome classification as pure
 functions.
@@ -213,7 +215,7 @@ direct unit testing).
 **Verification:** All classification branches and selection cases covered; `release-notes.test.ts`
 passes under Vitest.
 
-- [ ] **Unit 2: CLI entry (dispatch + poll + watch)**
+- [x] **Unit 2: CLI entry (dispatch + poll + watch)**
 
 **Goal:** Thin executable that wires the pure logic to `gh`.
 
@@ -252,7 +254,7 @@ subprocess test is explicitly out of scope given the pure-logic-first decision.)
 scripts/release/dispatch-release-notes.ts vX.Y.Z` runs the full flow; invalid tag exits 1 before
 any dispatch; a simulated `gh workflow run` failure exits 0 with a warning.
 
-- [ ] **Unit 3: Test port to Vitest**
+- [x] **Unit 3: Test port to Vitest**
 
 **Goal:** Port the 19 structural scenarios as direct unit tests of Unit 1's pure functions.
 
@@ -281,7 +283,7 @@ Unit 1.
 **Verification:** `pnpm test` (or the runtime-scoped vitest invocation) runs and passes the new
 file in CI; coverage spans all D4 branches.
 
-- [ ] **Unit 4: Wire successCmd + fro-bot.yaml inputs (correlation-id, model)**
+- [x] **Unit 4: Wire successCmd + fro-bot.yaml inputs (correlation-id, model)**
 
 **Goal:** Integrate into the release flow and add the dispatch inputs.
 
@@ -322,7 +324,7 @@ and the real release.
 `RELEASE_NOTES_DISPATCH_TOKEN` is set on the semantic-release step; `fro-bot.yaml` accepts
 `-f correlation-id=` and `-f model=` on dispatch (workflow lints clean).
 
-- [ ] **Unit 5: Documentation**
+- [x] **Unit 5: Documentation**
 
 **Goal:** Make the narration step and its contract discoverable.
 

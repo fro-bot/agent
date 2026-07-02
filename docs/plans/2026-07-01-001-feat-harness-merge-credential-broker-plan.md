@@ -1,11 +1,13 @@
 ---
 title: "feat: Harness merge credential broker — consuming side"
 type: feat
-status: active
+status: done
 date: 2026-07-01
 deepened: 2026-07-01
 origin: docs/brainstorms/2026-07-01-harness-merge-credential-broker-requirements.md
 ---
+
+> **Status: done.** All 4 units shipped: `INPUT_AUTH_JSON` scrubbed from the harness process env (#1080), the testable broker-mint script (#1081), the `harness-integrate.yaml` reusable workflow (#1081/#1082), and the `harness-release.yaml` integrate job rewired onto broker-minted credentials (#1082) — merged and live end-to-end verified 2026-07-02 (broker mint + authenticated merge on harness-release run 28565737720). Residual: egress containment tracked in marcusrbrown/infra#725; R7 revocation is TTL/sweeper-only by design.
 
 # feat: Harness merge credential broker — consuming side
 
@@ -117,7 +119,7 @@ harness-release.yaml (integrate job)
 
 ## Implementation Units
 
-- [ ] **Unit 1: Scrub `INPUT_AUTH_JSON` from the harness process env**
+- [x] **Unit 1: Scrub `INPUT_AUTH_JSON` from the harness process env**
 
 **Goal:** Remove the durable `auth-json` secret from `process.env` after it is read and mask it, so it is not env-dumpable and not inherited by the OpenCode child.
 
@@ -146,7 +148,7 @@ harness-release.yaml (integrate job)
 
 **Verification:** `parseActionInputs` returns the same `authJson` value as before; `process.env.INPUT_AUTH_JSON` is gone after the call; `setSecret` masks it; existing 89 input-parsing tests still pass.
 
-- [ ] **Unit 2: Testable broker-mint script**
+- [x] **Unit 2: Testable broker-mint script**
 
 **Goal:** A self-contained, unit-tested module that mints the OIDC token, exchanges it at the broker, validates the response, emits the minted `auth.json` masked, and fails closed.
 
@@ -185,7 +187,7 @@ harness-release.yaml (integrate job)
 
 **Verification:** `bun run test:scripts` passes; the `Test Scripts Load` job accepts the file; every failure branch emits no credential; the OIDC token is masked before the first outbound call.
 
-- [ ] **Unit 3: `harness-integrate.yaml` reusable workflow**
+- [x] **Unit 3: `harness-integrate.yaml` reusable workflow**
 
 **Goal:** A dedicated reusable workflow that runs the merge on a broker-minted credential, with `id-token: write` scoped to it and no `AUTH_JSON`.
 
@@ -215,7 +217,7 @@ harness-release.yaml (integrate job)
 - The workflow parses (no YAML error); `id-token: write` is present only on this one job; `AUTH_JSON`/`secrets: inherit`/`continue-on-error` appear nowhere.
 - **Pre-allowlist fail-closed smoke test** (before the infra allowlist is un-placeholdered): dispatch the integrate path against the live broker and assert the run (1) reaches the mint step, (2) `core.getIDToken` returns a token (proves `id-token: write` propagates through `workflow_call`), (3) the placeholder allowlist returns 403 → the mint script exits non-zero, (4) no credential is emitted and the job fails (does not silently continue). A 403 here is success — it proves the OIDC plumbing, broker reachability, and fail-closed path independent of the infra allowlist.
 
-- [ ] **Unit 4: Rewire the `harness-release.yaml` integrate job**
+- [x] **Unit 4: Rewire the `harness-release.yaml` integrate job**
 
 **Goal:** Point the release integrate path at `harness-integrate.yaml` and stop inheriting the durable secret.
 

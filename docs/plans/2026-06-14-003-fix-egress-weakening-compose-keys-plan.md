@@ -1,9 +1,11 @@
 ---
 title: "fix: Reject egress-weakening compose keys in the topology guard (#899)"
 type: fix
-status: active
+status: done
 date: 2026-06-14
 ---
+
+> **Status: done.** All 3 units shipped: the `extra_hosts`/`cap_add`/`/dev/net/tun` rejections (Invariants 1c-1f), guard tests, and docs — verified on `main` (`deploy/validate-stack.sh`, PR #909).
 
 # Reject egress-weakening compose keys in the topology guard (#899)
 
@@ -80,7 +82,7 @@ The inconsistency (the most obvious bypass banned, adjacent ones open) is the ga
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add egress-weakening compose-key rejections to the guard**
+- [x] **Unit 1: Add egress-weakening compose-key rejections to the guard**
 
 **Goal:** The guard fails closed on `extra_hosts` host-gateway, `cap_add` NET_ADMIN/NET_RAW, and `/dev/net/tun` device mappings, on any service.
 
@@ -105,7 +107,7 @@ The inconsistency (the most obvious bypass banned, adjacent ones open) is the ga
 
 **Verification:** running the guard against current `deploy/compose.yaml` exits 0; against each malicious fixture exits non-zero naming the service + key.
 
-- [ ] **Unit 2: Guard tests for the new rejections**
+- [x] **Unit 2: Guard tests for the new rejections**
 
 **Goal:** Lock the three rejections + the real-stack-passes behavior with regression tests.
 
@@ -130,7 +132,7 @@ The inconsistency (the most obvious bypass banned, adjacent ones open) is the ga
 
 **Verification:** the suite passes; removing the Unit 1 checks makes the malicious fixtures pass (proving the tests guard the bug); benign `extra_hosts` is not falsely rejected.
 
-- [ ] **Unit 3: Document the additional rejected keys**
+- [x] **Unit 3: Document the additional rejected keys**
 
 **Goal:** Operators understand which compose keys the guard forbids and why.
 

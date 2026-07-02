@@ -1,9 +1,11 @@
 ---
 title: "feat: Operator web surface Unit 8 tail — image-level route smoke + deploy runbook"
 type: feat
-status: active
+status: done
 date: 2026-06-25
 ---
+
+> **Status: done.** Both units shipped: the image-level operator route-registration smoke (PR #1031) and the consolidated Operator Web Surface runbook in `deploy/README.md` (PR #996).
 
 # Operator web surface Unit 8 tail — image-level route smoke + deploy runbook
 

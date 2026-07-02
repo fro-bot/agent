@@ -1,11 +1,13 @@
 ---
 title: "feat: Cut the workspace executor over to the harness OpenCode binary"
 type: feat
-status: active
+status: done
 date: 2026-06-13
 deepened: 2026-06-13
 origin: docs/brainstorms/2026-06-13-workspace-harness-cutover-requirements.md
 ---
+
+> **Status: done.** All 5 units shipped: the harness release publishes musl/baseline Linux assets, the release workflow checksums them, `deploy/workspace.Dockerfile` repoints to the harness release with SHA256SUMS verification, dry-run validation, and the workspace smoke test — verified on `main` (PR #887/#889).
 
 # feat: Cut the workspace executor over to the harness OpenCode binary
 
@@ -87,7 +89,7 @@ The workspace is Alpine-based and needs **musl** OpenCode binaries (`opencode-li
 
 ## Implementation Units
 
-- [ ] **Unit 1: Harness build emits musl/baseline Linux targets**
+- [x] **Unit 1: Harness build emits musl/baseline Linux targets**
 
 **Goal:** Make the harness Linux build produce `linux-x64-baseline-musl` and `linux-arm64-musl` binaries via an ephemeral `build.ts` target-selector patch + target-aware wrapper.
 
@@ -114,7 +116,7 @@ The workspace is Alpine-based and needs **musl** OpenCode binaries (`opencode-li
 
 **Verification:** a dry-run (Unit 4) produces musl/baseline binaries whose libc is verified musl and `--version` reports the harness version.
 
-- [ ] **Unit 2: Release workflow publishes + checksums the new assets**
+- [x] **Unit 2: Release workflow publishes + checksums the new assets**
 
 **Goal:** Expand Release Binaries asset handling from 4 to 6 so the musl/baseline assets are packaged, checksummed, and uploaded.
 
@@ -135,7 +137,7 @@ The workspace is Alpine-based and needs **musl** OpenCode binaries (`opencode-li
 
 **Verification:** dry-run release contains all 6 assets and `SHA256SUMS` lists the 2 new ones.
 
-- [ ] **Unit 3: Workspace Dockerfile repoint + checksum verification**
+- [x] **Unit 3: Workspace Dockerfile repoint + checksum verification**
 
 **Goal:** Point the workspace OpenCode bake at the harness release with fail-closed checksum verification and the harness version.
 
@@ -159,7 +161,7 @@ The workspace is Alpine-based and needs **musl** OpenCode binaries (`opencode-li
 
 **Verification:** the image builds, downloads the musl harness asset from `fro-bot/agent`, verifies the checksum, and boots; a tampered/missing checksum aborts the build.
 
-- [ ] **Unit 4: Dry-run validation (CI cost + asset correctness)**
+- [x] **Unit 4: Dry-run validation (CI cost + asset correctness)**
 
 **Goal:** Prove end-to-end via a real harness-release dry-run before any publish, and measure the added CI cost.
 
@@ -177,7 +179,7 @@ The workspace is Alpine-based and needs **musl** OpenCode binaries (`opencode-li
 
 **Verification:** dry-run succeeds, all 6 assets present + checksummed, musl confirmed via `file`/`ldd`, CI cost recorded against the abort threshold.
 
-- [ ] **Unit 5: Workspace smoke test (functional, beyond --version) + negative path**
+- [x] **Unit 5: Workspace smoke test (functional, beyond --version) + negative path**
 
 **Goal:** Prove the musl harness binary boots on Alpine and runs a real execution path, plus the fail-closed negative path.
 

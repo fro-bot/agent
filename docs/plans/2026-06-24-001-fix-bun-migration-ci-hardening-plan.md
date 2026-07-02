@@ -1,9 +1,11 @@
 ---
 title: 'fix: Bun migration CI hardening — phantom-dep guard, bun cache, tools-cache version segment'
 type: fix
-status: active
+status: done
 date: 2026-06-24
 ---
+
+> **Status: done.** All 4 units shipped: the phantom-dependency ESLint guard (`eslint.config.ts` — "phantom-dependency guard"), Bun install cache in CI, Bun-version segment in the tools-cache key, and notice-collector polish — all verified on `main` (PR #1006).
 
 # Bun migration CI hardening
 

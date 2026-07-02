@@ -1,10 +1,12 @@
 ---
 title: "feat: generating-project-docs skill + living-docs reconciliation"
 type: feat
-status: active
+status: done
 date: 2026-06-30
 origin: docs/brainstorms/2026-06-30-generating-project-docs-skill-requirements.md
 ---
+
+> **Status: done.** All 5 units shipped: PRD/FEATURES archived to `docs/product/` (#1071), the `generating-project-docs` skill authored (#1073), `ARCHITECTURE.md`/`STRUCTURE.md` generated and `AGENTS.md` slimmed (#1075), `CONTRIBUTING.md`/`SECURITY.md` added and `RULES.md` retired (#1076), and `README.md` refreshed as the canonical entry point (#1077) — all merged.
 
 # feat: generating-project-docs skill + living-docs reconciliation
 
@@ -126,7 +128,7 @@ Phase 3 (first generation run — uses the skill)
 
 ## Implementation Units
 
-- [ ] **Unit 1: Archive PRD.md and FEATURES.md to docs/product/**
+- [x] **Unit 1: Archive PRD.md and FEATURES.md to docs/product/**
 
 **Goal:** Move the two stale planning docs out of the repo root with a historical note, and repair every inbound reference and ignore-list entry so nothing dead-links.
 
@@ -152,7 +154,7 @@ Phase 3 (first generation run — uses the skill)
 
 **Verification:** No dead links to the old paths from `README.md`, `.github/`, or `.agents/`; `bun run lint` clean; `git grep -n "FEATURES.md\|PRD.md"` shows only intended targets.
 
-- [ ] **Unit 2: Author the generating-project-docs skill**
+- [x] **Unit 2: Author the generating-project-docs skill**
 
 **Goal:** Create `.agents/skills/generating-project-docs/SKILL.md` defining the living-doc set, per-document structures, style rules, first-run-vs-re-run generation flow, argument surface, and a verification checklist — adapted to this repo's monorepo shape.
 
@@ -178,7 +180,7 @@ Phase 3 (first generation run — uses the skill)
 
 **Verification:** The skill defines all five living docs with concrete structures, the bootstrap-vs-diff distinction, the argument surface, and a verification checklist; `.agents/skills/` lint exclusion means no lint gate, but the file parses as valid markdown + YAML frontmatter; a reviewer can follow it to produce each doc without inventing structure.
 
-- [ ] **Unit 3: Generate ARCHITECTURE.md and STRUCTURE.md; slim AGENTS.md**
+- [x] **Unit 3: Generate ARCHITECTURE.md and STRUCTURE.md; slim AGENTS.md**
 
 **Goal:** Run the skill to author the two canonical structural docs from `AGENTS.md`'s extracted content + live-repo facts, then slim `AGENTS.md` to its operational remainder with references to the new docs.
 
@@ -206,7 +208,7 @@ Phase 3 (first generation run — uses the skill)
 
 **Verification:** ARCHITECTURE.md + STRUCTURE.md exist with the defined structures and resolve all references; AGENTS.md is reduced to operational content + pointers and retains every convention/anti-pattern/command; no duplicate architecture/structure content across AGENTS.md and the new docs (one home per fact).
 
-- [ ] **Unit 4: Generate CONTRIBUTING.md (fold RULES.md) and SECURITY.md; retire RULES.md**
+- [x] **Unit 4: Generate CONTRIBUTING.md (fold RULES.md) and SECURITY.md; retire RULES.md**
 
 **Goal:** Partition `RULES.md` (1239 lines) by section into a written triage map, then author `CONTRIBUTING.md` from its contributor-facing buckets and `SECURITY.md` from scratch, then retire `RULES.md` and repair its remaining inbound references and ignore-lists. The partition is the load-bearing first step — produce it explicitly before authoring, not as an implicit byproduct.
 
@@ -240,7 +242,7 @@ Phase 3 (first generation run — uses the skill)
 
 **Verification:** CONTRIBUTING.md + SECURITY.md exist and resolve references; RULES.md is gone with no dead inbound links; `bun run lint` clean; the contributor content survived the fold without duplicating ARCHITECTURE/STRUCTURE.
 
-- [ ] **Unit 5: Refresh README.md as the canonical entry point**
+- [x] **Unit 5: Refresh README.md as the canonical entry point**
 
 **Goal:** Apply a bounded structural update to `README.md` — refresh stale body from live facts, add the picture header, flat-square badges, and `·` nav, and wire in the net-new navigation nodes (links to ARCHITECTURE/STRUCTURE/CONTRIBUTING/SECURITY and the wiki). Preserve the existing banner/TOC shape where still accurate; the doc graph changed, so this is a topology update, not a no-op diff.
 
