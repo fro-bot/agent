@@ -1,11 +1,13 @@
 ---
 title: "feat: Gateway announce webhook (POST /v1/announce) for control-plane presence messages"
 type: feat
-status: active
+status: done
 date: 2026-05-29
 origin: https://github.com/fro-bot/agent/issues/671
 deepened: 2026-05-29
 ---
+
+> **Status: done.** All 8 units shipped: the Hono dependency, config, HMAC verification, the announce payload schema, the presence-posting helper, embed templates, the HTTP server + route handler, and program-lifecycle wiring — verified on `main` (PR #697).
 
 # feat: Gateway announce webhook (POST /v1/announce)
 
@@ -70,7 +72,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 ### Institutional Learnings
 
 - `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md` — **never log request/response bodies that can carry secrets; enforce with a captured-logger test across all error paths.** Directly governs R9. Also: test the real bootstrap/dispatch path, not just the handler.
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — **shutdown belongs in `finally` with its own guarded try/catch so teardown can't be masked by a business-logic error.** Governs R12 server lifecycle.
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — **shutdown belongs in `finally` with its own guarded try/catch so teardown can't be masked by a business-logic error.** Governs R12 server lifecycle.
 - No existing repo learnings for HMAC / canonical JSON / Effect Schema / Hono DoS hardening — fresh territory; document the pattern after implementation (`ce:compound` candidate).
 
 ### External References
@@ -138,7 +140,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 ## Implementation Units
 
-- [ ] **Unit 0: Add Hono dependency to the gateway package**
+- [x] **Unit 0: Add Hono dependency to the gateway package**
 
 **Goal:** Make `hono` + `@hono/node-server` available to `packages/gateway` so Unit 6 can compile. They currently exist only in `apps/workspace-agent/package.json`, NOT in the gateway.
 
@@ -158,7 +160,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** `hono` resolves in the gateway package; `pnpm install` leaves a clean lockfile; no version divergence from workspace-agent.
 
-- [ ] **Unit 1: Config — webhook secret, presence channel, HTTP port**
+- [x] **Unit 1: Config — webhook secret, presence channel, HTTP port**
 
 **Goal:** Thread the three new config values through `GatewayConfig` and `loadGatewayConfig()`.
 
@@ -186,7 +188,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** `loadGatewayConfig()` returns the new fields; missing required secrets fail fast; invalid port rejected.
 
-- [ ] **Unit 2: HMAC verification + timestamp binding (pure utility)**
+- [x] **Unit 2: HMAC verification + timestamp binding (pure utility)**
 
 **Goal:** A pure, well-tested module that verifies an HMAC-SHA256 signature over `timestamp + "." + rawBody` and enforces the replay window.
 
@@ -218,7 +220,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** every tampering and skew case rejects; only an exact match within window passes; no input shape throws.
 
-- [ ] **Unit 3: Announce payload schema (Effect Schema)**
+- [x] **Unit 3: Announce payload schema (Effect Schema)**
 
 **Goal:** Validate the decoded JSON into a typed `AnnouncePayload`, rejecting unknown event types.
 
@@ -255,7 +257,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** valid payloads decode; every malformed shape returns Left with a content-free reason.
 
-- [ ] **Unit 4: Presence channel posting helper**
+- [x] **Unit 4: Presence channel posting helper**
 
 **Goal:** Resolve the presence channel by ID and post an embed via the existing discord.js client.
 
@@ -282,7 +284,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** posts to the configured channel; all failure modes return typed errors, never throw, never log content.
 
-- [ ] **Unit 5: Embed templates registry**
+- [x] **Unit 5: Embed templates registry**
 
 **Goal:** Map `event_type` → embed (accent color + in-character text), honoring `rendered_text` override.
 
@@ -308,7 +310,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** correct color + copy per type; `rendered_text` override wins.
 
-- [ ] **Unit 6: HTTP server + announce route handler**
+- [x] **Unit 6: HTTP server + announce route handler**
 
 **Goal:** The Hono server and the `POST /v1/announce` handler that composes size-cap → HMAC → timestamp cross-check → decode → render → post, with the rate limiter and structured logging.
 
@@ -345,7 +347,7 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 **Verification:** every status-code branch behaves per spec; auth failures are indistinguishable to the caller; no secret/body leakage in logs; oversized bodies rejected before hashing.
 
-- [ ] **Unit 7: Wire server into program lifecycle + shutdown drain**
+- [x] **Unit 7: Wire server into program lifecycle + shutdown drain**
 
 **Goal:** Start the announce server in `makeGatewayProgram` and close it in the shutdown drain.
 
@@ -411,5 +413,5 @@ See origin: https://github.com/fro-bot/agent/issues/671 (issue body + Fro Bot tr
 
 - **Origin issue:** https://github.com/fro-bot/agent/issues/671 (body + Fro Bot triage comment)
 - Related code: `packages/gateway/src/program.ts`, `config.ts`, `shutdown.ts`, `discord/commands/add-project.ts`; `apps/workspace-agent/src/server.ts`
-- Institutional learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md`
+- Institutional learnings: `docs/solutions/best-practices/discord-slash-command-orchestration-patterns-2026-05-27.md`, `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md`
 - External: RFC 8785 (JCS), RFC 2104 (HMAC), Stripe/GitHub webhook signing docs, OWASP REST Security Cheat Sheet, Effect 3.21 Schema docs, Hono 4.12 docs

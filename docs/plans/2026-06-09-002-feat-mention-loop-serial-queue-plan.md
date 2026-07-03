@@ -229,6 +229,6 @@ Two serialization layers exist and only one changes: the **per-channel concurren
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md](docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md) (Phase 3 / SC5)
+- **Origin document:** [docs/brainstorms/2026-06-07-mention-loop-production-ready-requirements.md](../brainstorms/2026-06-07-mention-loop-production-ready-requirements.md) (Phase 3 / SC5)
 - Related code: `packages/gateway/src/execute/concurrency.ts`, `packages/gateway/src/execute/run.ts`, `packages/gateway/src/discord/mentions.ts`, `packages/gateway/src/discord/commands/fro-bot.ts`, `packages/gateway/src/program.ts`
 - Related learnings: `docs/solutions/best-practices/gateway-opencode-mention-loop-best-practices-*.md`

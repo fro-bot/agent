@@ -1,10 +1,12 @@
 ---
 title: "refactor: Migrate the workspace from pnpm to Bun"
 type: refactor
-status: active
+status: done
 date: 2026-06-23
 origin: docs/brainstorms/2026-06-23-pnpm-to-bun-migration-requirements.md
 ---
+
+> **Status: done.** All 10 units shipped: the workspace runs on Bun (`bun.lock`, `bunfig.toml` on `main`, no `pnpm-lock.yaml`/`pnpm-workspace.yaml`), with CI, Dockerfiles, and the notice collector migrated — verified on `main` (PR #1002, follow-up hardening in `2026-06-24-001`/`2026-06-24-002`).
 
 # refactor: Migrate the workspace from pnpm to Bun
 
@@ -64,7 +66,7 @@ The repo runs two package managers: pnpm for the workspace and Bun 1.3.14 for th
 - `docs/solutions/workflow-issues/durable-dist-hidden-unicode-fix-2026-06-22.md`: the hidden-Unicode escape must stay the final `build` step and remain an allowlisted `run` script name (Renovate string-matches `postUpgradeTasks`).
 - `docs/solutions/workflow-issues/committed-dist-attribution-and-sbom-hygiene-2026-06-21.md`: `THIRD_PARTY_NOTICES.txt` must stay byte-identical; the dist-diff gate is the proof; SBOM stays a non-blocking artifact.
 - `docs/solutions/workflow-issues/build-pipeline-fallible-preflight-and-finally-cleanup-2026-06-22.md`: preserve preflight→mutator→finally slot ordering in `build-action-dist.ts`; fail-closed is policy not place (no env-conditional behavior).
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md`: Bun-as-runtime was deleted Feb 2026 as dead code; if Bun returns as an install surface, add a `bun{version}` cache-key segment (grow the key, never rename).
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md`: Bun-as-runtime was deleted Feb 2026 as dead code; if Bun returns as an install surface, add a `bun{version}` cache-key segment (grow the key, never rename).
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md`: the `gateway-smoke` CI job is the canary for monorepo resolution differences (pnpm store vs Bun hoisted) — re-verify under Bun.
 - `.agents/skills/versioned-tool/SKILL.md` already pins `DEFAULT_BUN_VERSION` in `src/shared/constants.ts` (Renovate `github-releases` on `oven-sh/bun`, `extractVersionTemplate: "^bun-v(?<version>.*)$"`). Any new workspace Bun pin follows this row; coupled multi-file bumps need the dual-source idempotency guard (`cross-libc-build-and-release-safety-2026-06-14.md`).
 
@@ -114,7 +116,7 @@ Migration phases and their gate relationship:
 
 ### Phase 1 — Spike (branch, no committed switch)
 
-- [ ] **Unit 1: Install + full workspace gate under Bun**
+- [x] **Unit 1: Install + full workspace gate under Bun**
 
 **Goal:** Prove `bun install` + build/test/lint/check-types succeed across all packages on a throwaway branch, with config relocated in-branch only.
 
@@ -140,7 +142,7 @@ Migration phases and their gate relationship:
 
 **Verification:** A captured gate transcript shows install + all four scripts' outcomes; any failure is recorded as a named blocker with its cause.
 
-- [ ] **Unit 2: Build-order and `--filter` parity**
+- [x] **Unit 2: Build-order and `--filter` parity**
 
 **Goal:** Confirm `bun --filter` reproduces per-package execution and the runtime → action/gateway/harness build order, including the `...` transitive syntax used by Dockerfiles and gateway-smoke.
 
@@ -160,7 +162,7 @@ Migration phases and their gate relationship:
 
 **Verification:** Build order and filter syntax confirmed (or a documented substitute), recorded in the decision artifact.
 
-- [ ] **Unit 3: tsdown + vitest under Bun**
+- [x] **Unit 3: tsdown + vitest under Bun**
 
 **Goal:** Validate the bundler and test runner work against Bun's install layout.
 
@@ -179,7 +181,7 @@ Migration phases and their gate relationship:
 
 **Verification:** tsdown + vitest pass under Bun with no resolution regressions; gateway build proves monorepo linking.
 
-- [ ] **Unit 4: THIRD_PARTY_NOTICES byte-diff**
+- [x] **Unit 4: THIRD_PARTY_NOTICES byte-diff**
 
 **Goal:** Prove the committed-dist attribution stays accurate under Bun's npm/arborist resolver path.
 
@@ -199,7 +201,7 @@ Migration phases and their gate relationship:
 
 **Verification:** A notices diff with zero unexplained differences; the attribution guarantee holds under Bun.
 
-- [ ] **Unit 5: Linker decision + spike decision artifact**
+- [x] **Unit 5: Linker decision + spike decision artifact**
 
 **Goal:** Choose isolated vs hoisted on evidence and record the consolidated go/no-go.
 
@@ -220,7 +222,7 @@ Migration phases and their gate relationship:
 
 ### Phase 2 — Cutover (spike GO confirmed; notice collector proven)
 
-- [ ] **Unit 6a: Bun-native notice collector (replaces generate-license-file)**
+- [x] **Unit 6a: Bun-native notice collector (replaces generate-license-file)**
 
 **Goal:** Replace the `generate-license-file` + `pnpm licenses list` path with a `bun.lock`-based collector that reproduces the committed `THIRD_PARTY_NOTICES.txt` package set. Proven in the sub-spike; this unit finalizes and reviews it.
 
@@ -241,7 +243,7 @@ Migration phases and their gate relationship:
 
 **Verification:** `bunx vitest run scripts/third-party-notices.test.ts` passes; name-level diff vs committed file shows zero missing committed packages.
 
-- [ ] **Unit 6: Config relocation + lockfile**
+- [x] **Unit 6: Config relocation + lockfile**
 
 **Goal:** Land the committed config: `package.json` workspaces/trustedDependencies/overrides, `bunfig.toml`, `bun.lock`, delete `pnpm-workspace.yaml`, move `minimumReleaseAgeExclude` to `renovate.json5`.
 
@@ -262,7 +264,7 @@ Migration phases and their gate relationship:
 
 **Verification:** Clean frozen install; `pnpm-workspace.yaml`/`pnpm-lock.yaml` gone; overrides enforced.
 
-- [ ] **Unit 7: Scripts rewrite (root + per-package)**
+- [x] **Unit 7: Scripts rewrite (root + per-package)**
 
 **Goal:** Rewrite all `pnpm` script invocations to Bun, preserving the build-ordering chain, the dist hidden-Unicode escape tail, and the `simple-git-hooks`/`lint-staged` config.
 
@@ -290,7 +292,7 @@ Migration phases and their gate relationship:
 
 **Verification:** All scripts run under Bun; `dist/` regenerates deterministically with notices + escape; hooks work.
 
-- [ ] **Unit 8: CI rewire (composite action + 6 workflows + dist regen)**
+- [x] **Unit 8: CI rewire (composite action + 6 workflows + dist regen)**
 
 **Goal:** Swap the shared composite action and all workflow pnpm references to Bun; commit the regenerated `dist/`.
 
@@ -316,7 +318,7 @@ Migration phases and their gate relationship:
 
 **Verification:** All CI jobs green under Bun; dist-diff gate passes; the action runs from the Bun-built bundle.
 
-- [ ] **Unit 9: Dockerfiles + Renovate manager + final gate**
+- [x] **Unit 9: Dockerfiles + Renovate manager + final gate**
 
 **Goal:** Update the deploy images and switch Renovate to the Bun manager; final end-to-end verification.
 

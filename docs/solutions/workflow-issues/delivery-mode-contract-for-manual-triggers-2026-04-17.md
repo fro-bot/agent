@@ -1,7 +1,7 @@
 ---
 title: "Delivery-mode contract for manual workflow triggers"
 date: 2026-04-17
-category: workflow_issue
+category: workflow-issues
 module: src/features/agent
 problem_type: workflow_issue
 component: assistant

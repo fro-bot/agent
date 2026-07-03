@@ -1,10 +1,12 @@
 ---
 title: Build pipelines — fallible work is a preflight, cleanup is a finally
 date: 2026-06-22
-last_updated: 2026-06-24
+category: workflow-issues
+module: packages/harness
 problem_type: workflow_issue
 component: tooling
 severity: low
+last_updated: 2026-06-24
 applies_when:
   - "A generated artifact is committed to the repo and gated by a CI dist-diff / rebuild check"
   - "A fallible step produces content for that artifact and a destructive mutator (bundler/compiler/codegen) rewrites it"

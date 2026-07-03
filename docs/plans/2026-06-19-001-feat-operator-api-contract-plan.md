@@ -1,11 +1,13 @@
 ---
 title: "feat: Own and freeze the canonical operator API contract (S1 surface)"
 type: feat
-status: active
+status: done
 date: 2026-06-19
 deepened: 2026-06-19
 origin: https://github.com/fro-bot/agent/issues/949 (Fro Bot triage comment as requirements)
 ---
+
+> **Status: done.** All 6 units shipped as `packages/gateway/src/operator-contract/` (`version.ts`, `identity.ts`, `run-status.ts`, `approval.ts`, `responses.ts`/`parse.ts`, `redaction.ts`) — verified on `main` (PR #952).
 
 # Own and freeze the canonical operator API contract (S1 surface)
 
@@ -119,7 +121,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
 ## Implementation Units
 
-- [ ] **Unit 1: Contract version + module skeleton**
+- [x] **Unit 1: Contract version + module skeleton**
 
   **Goal:** Establish the module home, the pinned contract version, and the public barrel.
 
@@ -145,7 +147,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
   **Verification:** the version constant is pinned by test and exported from the barrel; type-check and lint clean.
 
-- [ ] **Unit 2: Canonical operator identity**
+- [x] **Unit 2: Canonical operator identity**
 
   **Goal:** Define one `OperatorIdentity` as the sole definer and collapse the duplicated identity sites onto it.
 
@@ -178,7 +180,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
   **Verification:** one structural definer of the operator identity; dependent sites reference it; all existing approval/launch tests pass.
 
-- [ ] **Unit 3: Run-status projection + lifecycle re-export**
+- [x] **Unit 3: Run-status projection + lifecycle re-export**
 
   **Goal:** Expose an operator-safe `OperatorRunStatus` projection and make the contract the operator-facing surface for `RunPhase`/`Surface`.
 
@@ -208,7 +210,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
   **Verification:** `OperatorRunStatus` excludes internal fields by construction, omits denylisted repos, and is covered by projection tests; field names match the Phase B table; `RunPhase`/`Surface` are re-exported from the barrel.
 
-- [ ] **Unit 4: Approval-decision contract + `PermissionReply` ownership**
+- [x] **Unit 4: Approval-decision contract + `PermissionReply` ownership**
 
   **Goal:** Make the contract the sole definer of `PermissionReply` and canonicalize the operator-facing decision-state set with an explicit mapping.
 
@@ -240,7 +242,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
   **Verification:** `PermissionReply` has one definer with a working re-export; the 5-variant mapping is correct and exhaustive; `DecisionInput` is exported and the no-`decidedBy` structural test passes; coordinator tests pass unchanged.
 
-- [ ] **Unit 5: Named operator response types + validators**
+- [x] **Unit 5: Named operator response types + validators**
 
   **Goal:** Publish named types for the already-shipped operator HTTP responses and provide Effect-free runtime validators.
 
@@ -269,7 +271,7 @@ The gateway is gaining an inbound operator control surface (S1/S2, umbrella #907
 
   **Verification:** named response types exported; validators return `Result` with no-oracle errors proven across all error paths; the session-info route uses the contract type; existing route tests pass.
 
-- [ ] **Unit 6: Redaction + authorization obligation clauses**
+- [x] **Unit 6: Redaction + authorization obligation clauses**
 
   **Goal:** Embed the #950 redaction obligation and the authorization obligation as normative contract clauses bound to the contract version.
 

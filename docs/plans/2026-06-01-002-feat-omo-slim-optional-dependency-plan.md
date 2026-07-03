@@ -1,10 +1,12 @@
 ---
 title: 'feat: OMO Slim as an optional dependency'
 type: feat
-status: active
+status: done
 date: 2026-06-01
 origin: docs/brainstorms/2026-06-01-omo-slim-optional-dependency-requirements.md
 ---
+
+> **Status: done.** All 6 units shipped: `DEFAULT_OMO_SLIM_VERSION` (`packages/runtime/src/shared/constants.ts`), `enable-omo-slim`/`omo-slim-preset` action inputs, the installer, CI config assembly, tests, and docs — verified on `main` (`action.yaml`, PR #722). R13-R15 (gateway passthrough) remain explicitly deferred per the plan's own scope.
 
 # feat: OMO Slim as an optional dependency
 
@@ -88,7 +90,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 ## Implementation Units
 
-- [ ] **Unit 1: Version constant + Renovate tracking**
+- [x] **Unit 1: Version constant + Renovate tracking**
 
 **Goal:** Single-source-of-truth pinned Slim version with Renovate updates.
 
@@ -113,7 +115,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 **Verification:** `grep` finds no duplicate `1.1.1` literal elsewhere; Renovate regex matches the constant; `pnpm build` clean.
 
-- [ ] **Unit 2: Action inputs, parsing, mutual exclusivity, warnings**
+- [x] **Unit 2: Action inputs, parsing, mutual exclusivity, warnings**
 
 **Goal:** Expose `enable-omo-slim` / `omo-slim-preset` / `omo-slim-version`; parse into `ActionInputs`; enforce mutual exclusion with `enable-omo`; warn on disabled-mode usage.
 
@@ -144,7 +146,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 **Verification:** inputs.test.ts green; mutual-exclusion + warnings covered.
 
-- [ ] **Unit 3: Slim installer**
+- [x] **Unit 3: Slim installer**
 
 **Goal:** Install Slim via Bun at the resolved version with the selected preset; report status.
 
@@ -175,7 +177,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 **Verification:** installer + setup tests green; command/preset asserted against the mocked adapter.
 
-- [ ] **Unit 4: CI config assembly (orchestrator default, mode-authoritative plugins, guards)**
+- [x] **Unit 4: CI config assembly (orchestrator default, mode-authoritative plugins, guards)**
 
 **Goal:** When Slim is enabled, register the Slim plugin and pin `default_agent: 'orchestrator'`; rebuild the plugin array mode-authoritatively; refuse a both-plugins config; verify orchestrator presence; set the Slim permission posture.
 
@@ -205,7 +207,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 **Verification:** ci-config + setup tests green; cache-restore flip scenario covered.
 
-- [ ] **Unit 5: Tests + CI introspection**
+- [x] **Unit 5: Tests + CI introspection**
 
 **Goal:** Round out coverage and add disabled/enabled Slim introspection to the Test GitHub Action job.
 
@@ -226,7 +228,7 @@ Implements R1-R12, R16-R20 from the origin requirements doc. R13-R15 (gateway pa
 
 **Verification:** full suite green; `pnpm build` clean; `dist/` in sync; a Test GitHub Action run shows the slim introspection passing.
 
-- [ ] **Unit 6: Documentation**
+- [x] **Unit 6: Documentation**
 
 **Goal:** Surface the new inputs and the pinned default.
 

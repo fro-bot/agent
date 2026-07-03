@@ -1,10 +1,12 @@
 ---
 title: 'feat: web tool-approval flow (gateway operator surface)'
 type: feat
-status: active
+status: done
 date: 2026-06-22
 origin: docs/brainstorms/2026-06-22-web-tool-approval-requirements.md
 ---
+
+> **Status: done.** All 6 units shipped: command/filepath surfaced on `PermissionRequest`, the SSE `ApprovalFrame` + `observeApproval` (operator-contract bump), write-level repo authz + audit enum, the web approval transport replacing auto-deny, the decision route, and the `GET` pending-approvals reconciliation endpoint — all verified on `main` (`packages/gateway/src/web/operator/web-approval.ts`, `packages/gateway/src/operator-contract/approval-frame.ts`).
 
 # Web Tool Approval Flow (Gateway Operator Surface)
 
@@ -322,6 +324,6 @@ operator decides (write-authz)                                             [Unit
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-22-web-tool-approval-requirements.md](docs/brainstorms/2026-06-22-web-tool-approval-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-22-web-tool-approval-requirements.md](../brainstorms/2026-06-22-web-tool-approval-requirements.md)
 - Related code: `packages/gateway/src/approvals/{registry,coordinator,discord-transport}.ts`, `packages/gateway/src/web/operator/{web-approval,launch-route}.ts`, `packages/gateway/src/web/sse/{manager,run-stream-route,projection}.ts`, `packages/gateway/src/web/auth/repo-authz.ts`, `packages/gateway/src/operator-contract/{approval,version}.ts`, `packages/gateway/src/web/{audit,server}.ts`.
 - Institutional learnings: gateway-control-surface-spine, web-operator-launch-surface, authenticated-sse-run-observation, sse-output-streaming-terminal-drain, effect-failure-channel-discipline, atomic-serial-channel-queue-handoff (all under docs/solutions/best-practices/).

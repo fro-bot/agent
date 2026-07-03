@@ -1,11 +1,13 @@
 ---
 title: 'feat: Gateway web launch adapter (Unit 5)'
 type: feat
-status: active
+status: done
 date: 2026-06-20
 origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan.md
 deepened: 2026-06-20
 ---
+
+> **Status: done.** Both units shipped: the scoped operator repo-list route (`GET /operator/repos`) and the web sinks + launch route (`POST /operator/runs`) — verified on `main` (`packages/gateway/src/web/operator/launch-route.ts`).
 
 # Gateway web launch adapter (Unit 5)
 

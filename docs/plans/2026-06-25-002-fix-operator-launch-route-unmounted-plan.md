@@ -1,9 +1,11 @@
 ---
 title: "fix: Operator launch route (POST /operator/runs) unmounted in production"
 type: fix
-status: active
+status: done
 date: 2026-06-25
 ---
+
+> **Status: done.** `getBindingByRepo` and `launchWorkDeps` are wired into `OperatorServerDeps` in `packages/gateway/src/program.ts` — the route mounts in production, verified on `main`.
 
 # Operator launch route (POST /operator/runs) unmounted in production
 
@@ -126,7 +128,7 @@ runtime dep is not wired).
 
 ## Implementation Units
 
-- [ ] **Unit 1: Wire getBindingByRepo + launchWorkDeps into the operator server deps**
+- [x] **Unit 1: Wire getBindingByRepo + launchWorkDeps into the operator server deps**
 
 **Goal:** `POST /operator/runs` registers in the running gateway; the launch route
 receives the same engine deps the Discord mention path uses.

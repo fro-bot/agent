@@ -1,11 +1,13 @@
 ---
 title: "feat: Harness GitHub Release + action cutover (C1)"
 type: feat
-status: active
+status: done
 date: 2026-06-12
 deepened: 2026-06-12
 origin: docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md
 ---
+
+> **Status: done.** All 5 units shipped: harness version computation + npm prerelease versioning, the `release-binaries` job creating GitHub Releases with `SHA256SUMS`, the action's download-source swap + harness-aware `getLatestVersion()`, stock fallback + integrity verification, and the npm-publish environment/docs cleanup — verified on `main` (`src/services/setup/opencode.ts`, `.github/workflows/harness-release.yaml`).
 
 # feat: Harness GitHub Release + action cutover (C1)
 
@@ -96,7 +98,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 ## Implementation Units
 
-- [ ] **Unit 1: Compute harness version strings + fix npm prerelease versioning**
+- [x] **Unit 1: Compute harness version strings + fix npm prerelease versioning**
 
 **Goal:** Publish npm as the prerelease `<base>-harness.<short8>` across all 5 packages with the `latest` dist-tag set to it; expose the GitHub tag form `v<base>+harness.<short8>` for the release job.
 
@@ -123,7 +125,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 **Verification:** a dry-run publish names all 5 packages `1.17.3-harness.<sha>`; `latest` would resolve to it; harness tests pass.
 
-- [ ] **Unit 2: `release-binaries` job — package OpenCode-shaped assets + create the GitHub Release**
+- [x] **Unit 2: `release-binaries` job — package OpenCode-shaped assets + create the GitHub Release**
 
 **Goal:** A new isolated job that downloads the 4 build artifacts, repackages them into stock-shaped assets, verifies integrity, and creates the GitHub Release — all-or-nothing.
 
@@ -152,7 +154,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 **Verification:** dry-run produces 4 correctly-named, correctly-shaped assets + checksums; a simulated missing/4th asset fails the job; a real release lists all 4 + checksums.
 
-- [ ] **Unit 3: Action download source swap + `getLatestVersion()` harness-awareness**
+- [x] **Unit 3: Action download source swap + `getLatestVersion()` harness-awareness**
 
 **Goal:** The action downloads the harness binary from `fro-bot/agent` releases at `v<base>+harness.<short8>` and never misroutes a harness pin to stock latest.
 
@@ -179,7 +181,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 **Verification:** action tests pass; a manual/CI run downloads the real harness binary and `opencode --version` reports `1.17.3+harness.<sha>`.
 
-- [ ] **Unit 4: Stock fallback + download integrity verification in the action**
+- [x] **Unit 4: Stock fallback + download integrity verification in the action**
 
 **Goal:** A bad/missing harness release does not break runs (falls back to stock), and the downloaded binary is integrity-checked before execution.
 
@@ -202,7 +204,7 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 **Verification:** action tests cover fallback + integrity; injected bad-release path falls back cleanly.
 
-- [ ] **Unit 5: npm-publish environment removal (gated) + Windows/posture docs**
+- [x] **Unit 5: npm-publish environment removal (gated) + Windows/posture docs**
 
 **Goal:** Remove the redundant `environment: npm-publish` only if the npm trusted-publisher binding allows it; document harness as linux/darwin-only.
 
@@ -250,6 +252,6 @@ The action runs **stock** OpenCode from `anomalyco/opencode` releases. The patch
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md](docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md](../brainstorms/2026-06-12-harness-github-release-and-action-cutover-requirements.md)
 - Related code: `src/services/setup/opencode.ts`, `.github/workflows/harness-release.yaml`, `packages/harness/scripts/build-platform.ts`, `packages/harness/src/provenance.ts`
 - External: npm/cli #1479, npm #6379, SemVer §10 (build metadata stripping)

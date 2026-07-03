@@ -1,10 +1,12 @@
 ---
 title: "Duplicate Version Sources Cause Silently-Missed Bumps"
 date: 2026-06-12
-last_updated: 2026-06-14
+category: workflow-issues
+module: packages/harness
 problem_type: workflow_issue
 component: tooling
 severity: medium
+last_updated: 2026-06-14
 applies_when:
   - "A version or config value is declared in more than one file"
   - "Renovate or a custom manager bumps a version literal"
@@ -18,7 +20,6 @@ tags:
   - workflow
   - harness
   - opencode
-category: workflow-issues
 ---
 
 # Duplicate Version Sources Cause Silently-Missed Bumps

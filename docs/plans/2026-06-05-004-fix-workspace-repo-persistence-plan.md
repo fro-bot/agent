@@ -1,10 +1,12 @@
 ---
 title: "fix: Persist and rehydrate workspace repos"
 type: fix
-status: active
+status: done
 date: 2026-06-05
 origin: https://github.com/fro-bot/agent/issues/791
 ---
+
+> **Status: done.** All 4 units shipped: the `workspace-repos` named volume in `deploy/compose.yaml`, the gateway ensure-clone helper, rehydration before mention execution, and the already-bound recovery UX — verified on `main`.
 
 # fix: Persist and rehydrate workspace repos
 

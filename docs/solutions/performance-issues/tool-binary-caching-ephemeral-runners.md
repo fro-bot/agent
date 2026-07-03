@@ -1,10 +1,11 @@
 ---
 title: Tool Cache Separation - Persistent Binary Caching Across Ephemeral GitHub Actions Runners
-problem_type: performance-issues
-component: GitHub Actions Setup - Cache Layer
 date: 2026-02-15
+category: performance-issues
+module: src/services/setup
+problem_type: performance_issue
+component: tooling
 severity: medium
-status: solved
 tags:
   - caching
   - ci-optimization
@@ -244,10 +245,10 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
 ## Related Documentation
 
 ### RFC References
-- **[RFC-002: Cache Infrastructure](../../RFCs/RFC-002-Cache-Infrastructure.md)** - Core cache persistence for OpenCode storage, foundational for session durable memory across CI runs
-- **[RFC-017: Post-Action Cache Hook](../../RFCs/RFC-017-Post-Action-Cache-Hook.md)** - Reliable cache persistence via GitHub Actions `post:` lifecycle hook, handles timeout/cancellation/failure scenarios
-- **[RFC-011: Setup Action & Environment Bootstrap](../../RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md)** - DEPRECATED (auto-setup integrated into main action), but documents setup orchestration including tool installation
-- **[RFC-019: S3 Storage Backend](../../RFCs/RFC-019-S3-Storage-Backend.md)** - S3 write-through backup for cross-runner persistence, serves as fallback when GitHub Actions cache evicts
+- **[RFC-002: Cache Infrastructure](../../../RFCs/RFC-002-Cache-Infrastructure.md)** - Core cache persistence for OpenCode storage, foundational for session durable memory across CI runs
+- **[RFC-017: Post-Action Cache Hook](../../../RFCs/RFC-017-Post-Action-Cache-Hook.md)** - Reliable cache persistence via GitHub Actions `post:` lifecycle hook, handles timeout/cancellation/failure scenarios
+- **[RFC-011: Setup Action & Environment Bootstrap](../../../RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md)** - DEPRECATED (auto-setup integrated into main action), but documents setup orchestration including tool installation
+- **[RFC-019: S3 Storage Backend](../../../RFCs/RFC-019-S3-Storage-Backend.md)** - S3 write-through backup for cross-runner persistence, serves as fallback when GitHub Actions cache evicts
 
 ### Related Code Modules
 

@@ -1,9 +1,11 @@
 ---
 title: fix: Improve Discord timeout messaging after partial output
 type: fix
-status: active
+status: done
 date: 2026-06-06
 ---
+
+> **Status: done.** All 3 units shipped: sink visible-output state exposure, timeout copy branching on visibility state, and the deferred-scope documentation — verified on `main` (`packages/gateway/src/discord/streaming.ts` `hasVisibleOutput`).
 
 # fix: Improve Discord timeout messaging after partial output
 

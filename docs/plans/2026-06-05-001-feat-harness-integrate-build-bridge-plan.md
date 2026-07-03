@@ -61,7 +61,7 @@ A real (patched) harness release is currently impossible to run end-to-end: the 
 
 - `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md` — make the workflow contract explicit and surface resolved values as job outputs rather than letting the model choose delivery shape. Applies to the integrate job emitting the integration commit SHA as a declared output.
 - `docs/solutions/best-practices/gateway-opencode-mention-loop-best-practices-2026-05-30.md` + `workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — non-interactive `opencode run`, file-based auth, never log token/body. Applies to R5.
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — producer-does-setup-once, consumers-reuse mindset; informs the integrate→matrix artifact handoff contract.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — producer-does-setup-once, consumers-reuse mindset; informs the integrate→matrix artifact handoff contract.
 
 ## Key Technical Decisions
 

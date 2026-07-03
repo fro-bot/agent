@@ -1,9 +1,11 @@
 ---
 title: "fix: ship a runnable deny-key backfill entrypoint with --dry-run"
 type: fix
-status: active
+status: done
 date: 2026-06-24
 ---
+
+> **Status: done.** All 5 units shipped: `--dry-run` on the backfill function, the daemon-free `backfill-runner.ts`, the `main-dispatch.ts` unconditional entrypoint + testable dispatch, the hermetic gateway tsdown build, and the docs runbook — all verified on `main` (`packages/gateway/src/bindings/backfill-runner.ts`, `packages/gateway/src/main-dispatch.ts`).
 
 # fix: ship a runnable deny-key backfill entrypoint with --dry-run
 

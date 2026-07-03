@@ -1,9 +1,11 @@
 ---
 title: 'fix: harden Bun install in deploy Dockerfiles (verified binary) and trim runtime image'
 type: fix
-status: active
+status: done
 date: 2026-06-24
 ---
+
+> **Status: done.** All 4 units shipped: verified Bun binary install in `deploy/gateway.Dockerfile` and `deploy/workspace.Dockerfile` (checksum against `SHASUMS256.txt`, fail-closed), production-only runtime `node_modules`, and docs reconciliation — all verified on `main` (PR #1008).
 
 # Harden Bun install in deploy Dockerfiles + trim runtime image
 

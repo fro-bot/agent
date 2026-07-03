@@ -632,7 +632,7 @@ Embed the logical key only in writeback summaries and search for it via `searchS
 
 ### Origin
 
-- **Brainstorm document:** [docs/brainstorms/2026-03-22-agent-cohesion-session-context-brainstorm.md](docs/brainstorms/2026-03-22-agent-cohesion-session-context-brainstorm.md) — Key decisions carried forward: (1) optimize for stable continuity over fuzzy retrieval, (2) deterministic logical keys as first-class concept, (3) observability ships alongside continuity
+- **Brainstorm document:** [docs/brainstorms/2026-03-22-agent-cohesion-session-context-brainstorm.md](../brainstorms/2026-03-22-agent-cohesion-session-context-brainstorm.md) — Key decisions carried forward: (1) optimize for stable continuity over fuzzy retrieval, (2) deterministic logical keys as first-class concept, (3) observability ships alongside continuity
 
 ### Internal References
 

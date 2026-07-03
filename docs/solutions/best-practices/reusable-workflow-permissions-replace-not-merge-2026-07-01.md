@@ -1,7 +1,7 @@
 ---
 title: Reusable-workflow permissions replace, not merge — the id-token startup trap
 date: 2026-07-01
-category: docs/solutions/best-practices
+category: best-practices
 module: ci-orchestration
 problem_type: best_practice
 component: tooling

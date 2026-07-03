@@ -1,7 +1,7 @@
 ---
 title: Isolate a CI credential from an autonomous agent via an OIDC broker
 date: 2026-07-01
-category: docs/solutions/workflow-issues
+category: workflow-issues
 module: harness/release pipeline
 problem_type: workflow_issue
 component: tooling
@@ -66,7 +66,15 @@ The paths that still use the durable key should scrub it from `process.env` afte
 
 The durable model key is the highest-value secret on the runner. Removing it entirely (broker path) shrinks the credential's value and lifetime; a stolen minted token is cliproxy-scoped and expires. The two halves are load-bearing together: dropping `secrets: inherit` without the broker leaves the merge with no credential; minting without dropping `secrets: inherit` leaves the durable key inherited into the called workflow's env, making the isolation fake.
 
-**Diagnostic — 401 vs 403 from the broker:** `401` = unauthenticated (bad/missing token). `403` = authenticated but the allowlist claim match failed — the OIDC token passed issuer/signature/audience/expiry, so the fix is on the broker's allowlist config (the pinned `repository_id` / `repository_owner_id` / `job_workflow_ref`), not the workflow. This distinction localizes a mint failure to the correct repo in seconds.
+**Diagnostic — failure taxonomy (each code localizes the fix to a different place):**
+
+| Signal | Meaning | Fix lives in |
+| --- | --- | --- |
+| `401` at **mint** | Unauthenticated — bad/missing OIDC token | The workflow (`id-token: write`, audience) |
+| `403` at **mint** | Authenticated but allowlist claim match failed — the token passed issuer/signature/audience/expiry | The broker's allowlist config (pinned `repository_id` / `repository_owner_id` / `job_workflow_ref`) |
+| `401` **mid-run** from the credential consumer (e.g. `cliproxy … Invalid API key`, `isRetryable: false`) after the mint succeeded and calls worked | The minted credential was invalidated after issue — in practice: **the broker was redeployed while the run was in flight** | Operations — re-run the job; don't redeploy the broker while a consuming run is active |
+
+The mid-run case was hit live (2026-07-02): mint succeeded at 04:37:10Z, the merge made ~90s of authenticated model calls, then every call returned `401 Invalid API key` — the broker had been redeployed mid-run, invalidating the in-flight minted key. The agent failed closed (exit 1, no partial push) and a re-run of the same job succeeded on a fresh mint. Corollary: treat broker redeploys as draining operations — check for active integrate runs first.
 
 ## When to Apply
 

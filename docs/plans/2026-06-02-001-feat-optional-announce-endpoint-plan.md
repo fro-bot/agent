@@ -1,9 +1,11 @@
 ---
 title: "feat: Make gateway announce/presence endpoint opt-in"
 type: feat
-status: active
+status: done
 date: 2026-06-02
 ---
+
+> **Status: done.** All 3 units shipped: `GATEWAY_WEBHOOK_SECRET`/`GATEWAY_PRESENCE_CHANNEL_ID` are optional with both-or-neither validation, announce server startup gated on opt-in, and compose/docs/CI updated — verified on `main` (`packages/gateway/src/config.ts:562-573`).
 
 # feat: Make gateway announce/presence endpoint opt-in
 
@@ -82,7 +84,7 @@ The maintainer decision (per triage) is to make the endpoint **optional** rather
 
 ## Implementation Units
 
-- [ ] **Unit 1: Make announce secrets optional with both-or-neither validation (`config.ts`)**
+- [x] **Unit 1: Make announce secrets optional with both-or-neither validation (`config.ts`)**
 
 **Goal:** `loadGatewayConfig()` no longer throws when both announce secrets are absent; models them as an optional `announce` object with pair-validation.
 
@@ -115,7 +117,7 @@ The maintainer decision (per triage) is to make the endpoint **optional** rather
 
 ---
 
-- [ ] **Unit 2: Gate announce server startup on opt-in (`program.ts`)**
+- [x] **Unit 2: Gate announce server startup on opt-in (`program.ts`)**
 
 **Goal:** The announce HTTP server starts only when `config.announce` is present; when absent, the gateway boots with no HTTP server and shutdown handles the undefined handle.
 
@@ -147,7 +149,7 @@ The maintainer decision (per triage) is to make the endpoint **optional** rather
 
 ---
 
-- [ ] **Unit 3: Compose + docs + CI no-secrets boot smoke (`deploy/`, `ci.yaml`)**
+- [x] **Unit 3: Compose + docs + CI no-secrets boot smoke (`deploy/`, `ci.yaml`)**
 
 **Goal:** The shipped compose boots without announce secrets (closing #738); enabling announce is a documented opt-in; CI proves the no-secrets image boot.
 

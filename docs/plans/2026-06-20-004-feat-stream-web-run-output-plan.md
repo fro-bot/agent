@@ -1,11 +1,13 @@
 ---
 title: "feat: Stream web-launched run output to the operator"
 type: feat
-status: active
+status: done
 date: 2026-06-20
 origin: docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md
 issue: 965
 ---
+
+> **Status: done.** All 6 units shipped: the `OperatorOutputFrame` contract type + version bump, the manager `output` frame + `observeOutput` + terminal-output cache, the run-stream route `output` SSE mapping, the web `ReplySink` wired to push output, engine-side ordering, and the docs refresh — all verified on `main` (`packages/gateway/src/operator-contract/output.ts`, `packages/gateway/src/web/sse/manager.ts`). Closes #965.
 
 # feat: Stream web-launched run output to the operator
 
@@ -280,6 +282,6 @@ Late subscriber connects after terminal:
 
 ## Sources & References
 
-- **Origin document:** [docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md](docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md)
+- **Origin document:** [docs/brainstorms/2026-06-20-stream-web-run-output-requirements.md](../brainstorms/2026-06-20-stream-web-run-output-requirements.md)
 - Related: `docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md` (the 10-rule checklist), `docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md` (names #965 as deferred), `docs/solutions/best-practices/gateway-control-surface-spine-2026-06-15.md` (sinks-over-transport), `docs/solutions/best-practices/atomic-serial-channel-queue-handoff-2026-06-09.md` (FIFO/ordering).
 - Issue: #965 (advances #907).

@@ -227,5 +227,5 @@ Pair this with a `tryCreate` that distinguishes **name-taken** (advance to next 
 
 ## Related
 
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — adjacent: deterministic recovery and `finally`-style cleanup orchestration (different subsystem, same discipline of making partial-failure paths explicit)
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — adjacent: deterministic recovery and `finally`-style cleanup orchestration (different subsystem, same discipline of making partial-failure paths explicit)
 - GitHub issue #646 — Gateway intent-posture flip (privileged intents opt-in), the posture that makes the `appPermissions` trap (learning #1) reachable

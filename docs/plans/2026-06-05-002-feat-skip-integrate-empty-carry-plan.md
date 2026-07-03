@@ -1,9 +1,11 @@
 ---
 title: "feat: Skip integrate job for empty carry set + tune merge prompt for Sonnet 4.6"
 type: feat
-status: active
+status: done
 date: 2026-06-05
 ---
+
+> **Status: done.** All 5 units shipped: `has_refs` emitted from `prepare-integrate` and gating the `integrate` job, `build`'s dual-source clone, `publish` tolerating a skipped integrate, and the restructured merge prompt (`packages/harness/prompt.txt`) — verified on `main` (`.github/workflows/harness-release.yaml`, PR #788).
 
 # feat: Skip integrate job for empty carry set + tune merge prompt for Sonnet 4.6
 
@@ -112,7 +114,7 @@ publish (consumes needs.build.outputs.integration_commit; provenance = same SHA)
 
 ## Implementation Units
 
-- [ ] **Unit 1: Emit `has_refs` from `prepare-integrate`**
+- [x] **Unit 1: Emit `has_refs` from `prepare-integrate`**
 
 **Goal:** Make the empty/non-empty carry decision an explicit job output.
 
@@ -134,7 +136,7 @@ publish (consumes needs.build.outputs.integration_commit; provenance = same SHA)
 **Verification:**
 - actionlint clean; a dry-run logs `has_refs=false` for the current empty config.
 
-- [ ] **Unit 2: Gate the `integrate` job on `has_refs`**
+- [x] **Unit 2: Gate the `integrate` job on `has_refs`**
 
 **Goal:** Skip the agent run when there are no patches.
 
@@ -154,7 +156,7 @@ publish (consumes needs.build.outputs.integration_commit; provenance = same SHA)
 **Verification:**
 - Empty-carry dry-run shows `integrate` skipped; build still proceeds.
 
-- [ ] **Unit 3: `build` dual-source (fetch ref OR clone stock tag)**
+- [x] **Unit 3: `build` dual-source (fetch ref OR clone stock tag)**
 
 **Goal:** Make `build` produce the correct `integration_commit` in both paths and run even when `integrate` is skipped.
 
@@ -178,7 +180,7 @@ publish (consumes needs.build.outputs.integration_commit; provenance = same SHA)
 **Verification:**
 - Empty-carry dry-run: build clones the stock tag, resolves the tag SHA, builds all 4 platforms reporting `<base>+harness.<sha>`, emits `integration_commit` = tag SHA.
 
-- [ ] **Unit 4: `publish` tolerates skipped `integrate`**
+- [x] **Unit 4: `publish` tolerates skipped `integrate`**
 
 **Goal:** Ensure publish runs in the empty-carry path and records the correct commit.
 
@@ -199,7 +201,7 @@ publish (consumes needs.build.outputs.integration_commit; provenance = same SHA)
 **Verification:**
 - Empty-carry dry-run: publish job runs (skip-guards/dry-run as configured), provenance manifest has `integrationRefs: []` + tag SHA.
 
-- [ ] **Unit 5: Restructure the merge prompt for Sonnet 4.6**
+- [x] **Unit 5: Restructure the merge prompt for Sonnet 4.6**
 
 **Goal:** Make the (now merge-only) prompt a deterministic runbook; remove empty-carry conditionals.
 
