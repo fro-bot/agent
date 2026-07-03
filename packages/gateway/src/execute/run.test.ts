@@ -15,6 +15,7 @@ import * as discordApprovalsModule from '../discord/approvals.js'
 import * as reactionsModule from '../discord/reactions.js'
 import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
+import {abortRegistry} from './abort-registry.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core.js'
@@ -6868,5 +6869,345 @@ describe('early-abort gates terminalize to FAILED', () => {
 
     // #and — execution happened
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Operator cancel — abort-registry integration (Unit 1)
+// ---------------------------------------------------------------------------
+
+const CANCEL_RUN_ID = 'cancel-run-id-1'
+
+/**
+ * Simulate `runOpenCodeCore` observing the cancel signal fire and throwing
+ * the same way the real implementation would once its combined signal aborts:
+ * a `RunCoreError('timeout', ...)` (run-core does not add a distinct
+ * 'cancelled' kind — classification happens in run.ts via registry probe).
+ */
+function mockRunOpenCodeCoreAbortedBy(viaRegistryAbort: () => void) {
+  mockRunOpenCodeCore.mockImplementation(async () => {
+    viaRegistryAbort()
+    throw new runCoreModule.RunCoreError('timeout', 'run-core: signal aborted')
+  })
+}
+
+describe('operator cancel — abort-registry integration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // The registry is a module-level singleton shared with run.ts (mirrors
+    // inFlightRuns). Clear any leaked entries between tests.
+    abortRegistry.delete(CANCEL_RUN_ID)
+  })
+
+  it('registered run aborted via registry settles CANCELLED (not FAILED), notifies SSE observer, releases lock+slot, deletes registry entry', async () => {
+    // #given — happy-path runtime mocks, but runOpenCodeCore aborts the run's own
+    // registry entry mid-flight (simulating an operator cancel firing during execution)
+    const {launchWork} = await import('./run.js')
+    const ackState = buildMockRunState({phase: 'ACKNOWLEDGED', run_id: CANCEL_RUN_ID})
+    const execState = buildMockRunState({phase: 'EXECUTING', run_id: CANCEL_RUN_ID})
+    const cancelledState = buildMockRunState({phase: 'CANCELLED', run_id: CANCEL_RUN_ID})
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'ack-etag', state: ackState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'exec-etag', state: execState}})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'cancelled-etag', state: cancelledState}})
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: cancelledState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(CANCEL_RUN_ID, 'operator cancel')
+    })
+
+    const observeFn = vi.fn().mockResolvedValue(undefined)
+    const releaseFn = vi.fn()
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = CANCEL_RUN_ID
+    const deps = makeDeps({
+      runObserver: {observe: observeFn},
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — settled CANCELLED, not FAILED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+    expect(transitionPhases).not.toContain('FAILED')
+
+    // #and — SSE observer notified with the CANCELLED state
+    const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
+    expect(observedPhases).toContain('CANCELLED')
+
+    // #and — lock released using the heartbeat-stop lockEtag
+    expect(mockRuntime.releaseLock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'lock-etag-after-heartbeat',
+      expect.anything(),
+    )
+
+    // #and — concurrency slot released
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+
+    // #and — no user-facing failure reply was sent to the thread
+    const sends = request._replySink._sends
+    expect(sends.some(s => s.content.toLowerCase().includes('failed'))).toBe(false)
+
+    // #and — registry entry deleted (a later abort() is now a no-op)
+    expect(abortRegistry.has(CANCEL_RUN_ID)).toBe(false)
+  })
+
+  it('timeout-vs-cancel race: classification uses registry probe, not composite abort reason', async () => {
+    // #given — a pure ceiling-timeout failure where the registry entry exists but was
+    // never aborted. The run must still land FAILED with timeout messaging.
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock timeout'))
+
+    const request = makeInMemoryRequest()
+    const TIMEOUT_RUN_ID = 'timeout-run-id-1'
+    ;(request as {runId?: string}).runId = TIMEOUT_RUN_ID
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — settled FAILED (registry was never aborted for this runId)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('FAILED')
+    expect(transitionPhases).not.toContain('CANCELLED')
+
+    // #and — the coarse timeout message was sent (existing FAILED-path messaging)
+    const sends = request._replySink._sends
+    expect(sends.some(s => s.content.includes('time limit'))).toBe(true)
+
+    abortRegistry.delete(TIMEOUT_RUN_ID)
+  })
+
+  it('timeout-vs-cancel race: a cancel-flagged abort lands CANCELLED even with a timeout-kind RunCoreError', async () => {
+    // #given — the registry entry IS aborted (operator cancel won the race), even though
+    // run-core still surfaces a 'timeout' kind (it has no distinct 'cancelled' kind).
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const RACE_RUN_ID = 'race-run-id-1'
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      abortRegistry.abort(RACE_RUN_ID, 'operator cancel wins the race')
+      throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
+    })
+
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = RACE_RUN_ID
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — settled CANCELLED despite the 'timeout' RunCoreError kind
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+    expect(transitionPhases).not.toContain('FAILED')
+
+    abortRegistry.delete(RACE_RUN_ID)
+  })
+
+  it('lock-release failure on the cancelled path — cleanup continues, no throw', async () => {
+    // #given — cancelled run whose lock release fails
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    mockRuntime.releaseLock.mockResolvedValue({success: false as const, error: new Error('release failed')})
+
+    const LOCK_FAIL_RUN_ID = 'lock-fail-run-id-1'
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      abortRegistry.abort(LOCK_FAIL_RUN_ID, 'operator cancel')
+      throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
+    })
+
+    const releaseFn = vi.fn()
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = LOCK_FAIL_RUN_ID
+    const deps = makeDeps({
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when — must not throw despite the lock-release failure
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the run still settled CANCELLED and the concurrency slot was still released
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+    expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+
+    abortRegistry.delete(LOCK_FAIL_RUN_ID)
+  })
+
+  it('#1055 class: stream never settles after abort — run promise still resolves bounded, no unhandled rejection', async () => {
+    // #given — runOpenCodeCore that hangs unless it observes the abort, then rejects
+    // (mirrors run-core's makeAbortableStream: the abort signal races the hung iterator
+    // rather than waiting on it forever).
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const NEVER_SETTLE_RUN_ID = 'never-settle-run-id-1'
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      abortRegistry.abort(NEVER_SETTLE_RUN_ID, 'operator cancel')
+      // Simulate run-core's abort-aware race resolving promptly instead of hanging
+      // on a stream that never emits again.
+      throw new runCoreModule.RunCoreError('timeout', 'aborted while stream was hung')
+    })
+
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = NEVER_SETTLE_RUN_ID
+    const deps = makeDeps()
+
+    // #when — the run promise must resolve (not hang, not reject) within this test's
+    // normal timeout budget
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — settled CANCELLED
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+
+    abortRegistry.delete(NEVER_SETTLE_RUN_ID)
+  })
+
+  it('partial output flushed before cancel remains flushed after CANCELLED settles', async () => {
+    // #given — a reply sink that has visible/appended output before the abort fires
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const PARTIAL_OUTPUT_RUN_ID = 'partial-output-run-id-1'
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      abortRegistry.abort(PARTIAL_OUTPUT_RUN_ID, 'operator cancel')
+      throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
+    })
+
+    const replySink = makeInMemoryReplySink()
+    replySink.append('partial output streamed before cancel')
+    const request = makeInMemoryRequest({replySink})
+    ;(request as {runId?: string}).runId = PARTIAL_OUTPUT_RUN_ID
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — flush was called on the cancel path (partial output preserved)
+    expect(replySink.flush).toHaveBeenCalled()
+    expect(replySink.buffered()).toBe('partial output streamed before cancel')
+
+    abortRegistry.delete(PARTIAL_OUTPUT_RUN_ID)
+  })
+
+  it('abort for an unknown/already-completed runId is a registry no-op — no signal fired, run unaffected', async () => {
+    // #given — a happy-path run whose registry entry is untouched; abort a DIFFERENT,
+    // never-registered runId concurrently
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    const HAPPY_RUN_ID = 'happy-run-id-1'
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = HAPPY_RUN_ID
+    const deps = makeDeps()
+
+    // #when — abort an unrelated, unregistered runId; then run the happy-path task
+    const noopResult = abortRegistry.abort('never-registered-run-id')
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — the unrelated abort was a no-op
+    expect(noopResult).toBe(false)
+    // #and — the happy-path run completed normally (COMPLETED, not CANCELLED)
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('COMPLETED')
+    expect(transitionPhases).not.toContain('CANCELLED')
+
+    abortRegistry.delete(HAPPY_RUN_ID)
+  })
+
+  it('cancel-wins-adoption race: PENDING→ACKNOWLEDGED 412s, re-read shows CANCELLED → no failAdmittedRun noise, no user-facing reply, clean exit', async () => {
+    // #given — the ACK transition fails (etag mismatch), and a re-read of the run-state
+    // shows CANCELLED (an operator cancel committed PENDING→CANCELLED first)
+    const {launchWork} = await import('./run.js')
+    const releaseFn = vi.fn()
+
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    // ACK transition 412s.
+    mockRuntime.transitionRun.mockResolvedValueOnce({
+      success: false as const,
+      error: new Error('412 precondition failed'),
+    })
+
+    const cancelledRunState = buildMockRunState({phase: 'CANCELLED'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(cancelledRunState), etag: 'cancelled-etag'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({
+      coordinationConfig,
+      concurrency: {
+        tryAcquire: vi.fn().mockReturnValue('ok'),
+        release: releaseFn,
+        activeCount: vi.fn().mockReturnValue(1),
+        max: 3,
+      },
+    })
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — failAdmittedRun (a second FAILED transitionRun call) was never attempted
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).not.toContain('FAILED')
+
+    // #and — no user-facing "could not start" reply was sent
+    const sends = request._replySink._sends
+    expect(sends.some(s => s.content.includes('Could not start'))).toBe(false)
+
+    // #and — lock released, execution never attempted, clean exit
+    expect(mockRuntime.releaseLock).toHaveBeenCalled()
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 })

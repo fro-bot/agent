@@ -12,7 +12,15 @@ import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, St
 import type {ChannelQueue} from './queue.js'
 import type {RunIndex} from './run-index.js'
 
-import {acquireLock, createHeartbeatController, createRun, releaseLock, transitionRun} from '@fro-bot/runtime'
+import {
+  acquireLock,
+  createHeartbeatController,
+  createRun,
+  getRunKey,
+  parseRunState,
+  releaseLock,
+  transitionRun,
+} from '@fro-bot/runtime'
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
@@ -20,6 +28,7 @@ import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {abortRegistry} from './abort-registry.js'
 import {attachOpencode} from './opencode-attach.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
@@ -179,6 +188,53 @@ export function formatTimeoutDuration(ms: number): string {
 function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
   return {
     debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
+  }
+}
+
+/**
+ * Re-read the run-state's current phase.
+ *
+ * Used by the ACK/EXECUTING adoption-race graceful-loser path: when a
+ * `transitionRun` call 412s, this determines whether the run lost the race to
+ * an operator cancel (phase === 'CANCELLED') so the caller can skip
+ * `failAdmittedRun` (whose stale etag would 412 too, logging a misleading
+ * error) and exit cleanly instead. Returns `null` on any read/parse failure —
+ * callers fall back to the pre-existing failure-path behavior in that case.
+ */
+async function readCurrentRunPhase(
+  deps: RunMentionDeps,
+  repo: string,
+  runId: string,
+): Promise<RunState['phase'] | null> {
+  const {coordinationConfig, identity, logger} = deps
+  try {
+    const keyResult = getRunKey(coordinationConfig, identity, repo, runId)
+    if (keyResult.success === false) {
+      logger.warn({repo, runId, err: keyResult.error.message}, 'run: readCurrentRunPhase — could not build run key')
+      return null
+    }
+    const getObject = coordinationConfig.storeAdapter?.getObject
+    if (getObject == null) {
+      logger.warn({repo, runId}, 'run: readCurrentRunPhase — store adapter does not support getObject')
+      return null
+    }
+    const fetched = await getObject(keyResult.data)
+    if (fetched.success === false) {
+      logger.warn({repo, runId, err: fetched.error.message}, 'run: readCurrentRunPhase — getObject failed')
+      return null
+    }
+    const parsed = parseRunState(fetched.data.data)
+    if (parsed.success === false) {
+      logger.warn({repo, runId, err: parsed.error.message}, 'run: readCurrentRunPhase — parseRunState failed')
+      return null
+    }
+    return parsed.data.phase
+  } catch (error) {
+    logger.warn(
+      {repo, runId, err: error instanceof Error ? error.message : String(error)},
+      'run: readCurrentRunPhase threw — treating as not-CANCELLED',
+    )
+    return null
   }
 }
 
@@ -419,6 +475,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       {threadId},
     )
     if (ackResult.success === false) {
+      // ── Graceful loser: cancel-wins-adoption race ──────────────────────────────────
+      // The etag mismatch may mean an operator cancel committed PENDING → CANCELLED
+      // before this ACK transition. Re-read to distinguish that from a genuine failure:
+      // a stale-etag failAdmittedRun call would 412 anyway and log a misleading error.
+      const currentPhase = await readCurrentRunPhase(deps, repo, runId)
+      if (currentPhase === 'CANCELLED') {
+        logger.info({repo, runId}, 'run: ACK lost the adoption race to an operator cancel — exiting cleanly')
+        await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+        return
+      }
+
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
       // Gate 5 (ACK fail): run is still PENDING; terminalize to FAILED using adoptionEtag.
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
@@ -453,12 +520,38 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         coordLogger,
       )
       if (execResult.success === false) {
+        // ── Graceful loser: cancel-wins-adoption race (ACKNOWLEDGED → EXECUTING) ──────
+        // Same rendezvous as the ACK case above: an operator cancel may have committed
+        // ACKNOWLEDGED → CANCELLED before this transition. Re-read before treating the
+        // etag mismatch as a genuine failure.
+        const currentPhase = await readCurrentRunPhase(deps, repo, runId)
+        if (currentPhase === 'CANCELLED') {
+          logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
+          // Registration happens only after EXECUTING succeeds (below), so there is no
+          // abort-registry entry to delete here — the outer finally's unconditional
+          // delete() is still a safe no-op for this runId.
+          if (heartbeatStopped === false) {
+            await heartbeat.stop().catch(() => {
+              /* best-effort */
+            })
+            heartbeatStopped = true
+          }
+          return
+        }
         throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
       }
       runEtag = execResult.data.etag
 
       // Push the EXECUTING state to the observation pipeline (best-effort, fire-and-forget).
       notifyObserverBestEffort(deps, execResult.data.state)
+
+      // ── Operator-cancel registration ──────────────────────────────────────────
+      // Registered only after EXECUTING commits — the pre-ACK/pre-EXECUTING window is
+      // covered by the run-state conditional-write rendezvous (see the ACK/EXECUTING
+      // etag-mismatch handling above and Unit 2's orchestrator), not by this registry.
+      // Always deleted in the outer finally below, regardless of settlement outcome.
+      // The returned signal is composed into effectiveSignal at the timeout seam below.
+      const cancelSignal = abortRegistry.register(runId)
 
       // ── Working reaction — best-effort, fire-and-forget ───────────────────────────────────────────────────────────────────
       statusSink.setReaction('working')
@@ -489,6 +582,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       const elapsedMs = Date.now() - runStartMs
       const remainingBudgetMs = Math.max(0, runTimeoutMs - elapsedMs)
       const timeoutSignal = AbortSignal.timeout(remainingBudgetMs)
+
+      // ── Cancel signal composition ───────────────────────────────────────────────
+      // The run's effective signal is any-of(ceiling timeout, operator cancel). No
+      // parallel abort mechanism: run-core's own internal AbortSignal.any (inactivity
+      // composition) nests cleanly on top of this — run-core's interface is unchanged.
+      const effectiveSignal = AbortSignal.any([timeoutSignal, cancelSignal])
 
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
       const approvalDeadlineMs = computeApprovalDeadlineMs(remainingBudgetMs)
@@ -591,7 +690,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           directory: bindingWithEnsuredPath.workspacePath,
           promptText,
           sink: replySink,
-          signal: timeoutSignal,
+          signal: effectiveSignal,
           logger,
           coordinator,
           approvalMode,
@@ -677,109 +776,186 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       const isReachability = isCoreError && (execError.kind === 'unreachable' || execError.kind === 'auth')
       const isEmptyPrompt = execError instanceof EmptyPromptError
 
+      // ── Cancel classification — registry probe, NOT composite abort-reason inspection ──
+      // AbortSignal.any([timeoutSignal, cancelSignal]) propagates whichever child fired
+      // first; reading the composite signal's `.reason` to decide "was this a cancel" is
+      // racy. The registry's own controller state is ground truth (see abort-registry.ts).
+      const wasCancelled = abortRegistry.isAborted(runId)
+
       logger.error(
         {
           repo,
           runId,
           kind: isCoreError ? execError.kind : 'unknown',
+          cancelled: wasCancelled,
           err: execError instanceof Error ? execError.message : String(execError),
         },
-        'run: execution failed',
+        wasCancelled === true ? 'run: execution aborted by operator cancel' : 'run: execution failed',
       )
 
-      // ── Failed reaction — best-effort, fire-and-forget ────────────────────────────────────────
-      // Replaces the working/awaiting reaction with the failed cue.
-      statusSink.setReaction('failed')
+      if (wasCancelled === true) {
+        // ── Operator-cancel settlement path ──────────────────────────────────────────
+        // Distinct from the generic FAILED path below: settles CANCELLED, suppresses the
+        // user-facing failure reply (Unit 2's thread notice is the communication), and
+        // still flushes partial output.
 
-      // Stop heartbeat (best-effort) if not already stopped
-      if (heartbeatStopped === false) {
-        const stopResult = await heartbeat.stop()
-        heartbeatStopped = true
-        if (stopResult.success === true) {
-          runEtag = stopResult.data.runEtag
-          lockEtag = stopResult.data.lockEtag
-        } else {
-          logger.warn(
-            {repo, runId, err: stopResult.error.message},
-            'run: heartbeat stop failed; using last known etags',
-          )
+        // Replaces the working/awaiting reaction with the failed cue — no distinct
+        // "cancelled" reaction exists yet; reusing 'failed' here is a UX nit, not a
+        // correctness issue (the thread notice, added in Unit 2, carries the real signal).
+        statusSink.setReaction('failed')
+
+        // heartbeat.stop() FIRST — its runEtag/lockEtag are the authoritative
+        // conditional-write etags. A stale etag on the subsequent transitionRun/releaseLock
+        // calls makes those conditional writes silently 412 (releaseLock) or fail the
+        // transition; a 412'd lock release TTL-orphans the lock rather than failing loudly.
+        // This ordering discipline mirrors the COMPLETED/FAILED paths above.
+        if (heartbeatStopped === false) {
+          const stopResult = await heartbeat.stop()
+          heartbeatStopped = true
+          if (stopResult.success === true) {
+            runEtag = stopResult.data.runEtag
+            lockEtag = stopResult.data.lockEtag
+          } else {
+            logger.warn(
+              {repo, runId, err: stopResult.error.message},
+              'run: heartbeat stop failed on cancel path; using last known etags',
+            )
+          }
         }
-      }
 
-      // Transition to FAILED (best-effort)
-      const failedResult = await transitionRun(
-        coordinationConfig,
-        identity,
-        repo,
-        runId,
-        'FAILED',
-        runEtag,
-        coordLogger,
-      )
-      // Capture the FAILED state now so we can notify AFTER the partial-output flush.
-      // The notify is deferred to guarantee the web sink's flush() → final output frame
-      // is pushed before observe(terminalState) fans the terminal status frame (which
-      // closes run subscribers). For Discord, the reorder is inert.
-      let failedStateForNotify: RunState | undefined
-      if (failedResult.success === false) {
-        logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
+        // Best-effort flush of partial output BEFORE the transition/observer notify —
+        // mirrors the existing failure-path ordering so the user's streamed output is
+        // never lost on cancel.
+        await replySink.flush().catch((flushError: unknown) => {
+          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in cancel path')
+        })
+
+        // Transition to CANCELLED (best-effort) with the fresh heartbeat-stop etag.
+        // Unit 2: `details.cancelledBy` attribution lands on this transition once the
+        // orchestrator threads actor context through the abort call.
+        const cancelledResult = await transitionRun(
+          coordinationConfig,
+          identity,
+          repo,
+          runId,
+          'CANCELLED',
+          runEtag,
+          coordLogger,
+        )
+        if (cancelledResult.success === false) {
+          logger.error({repo, runId, err: cancelledResult.error.message}, 'run: transitionRun CANCELLED failed')
+        } else {
+          notifyObserverBestEffort(deps, cancelledResult.data.state)
+        }
+
+        // Release lock with the heartbeat-stop lockEtag via the existing ownership-checked
+        // release path (outer finally, below) — no separate release call here; lockEtag
+        // was already updated above so the outer finally's releaseLock uses the fresh value.
+
+        // Suppress the user-facing failure reply for operator-initiated cancels — no
+        // "task failed" message to the thread. Unit 2 posts the cancellation notice.
+        // Log instead so the suppression is observable in gateway logs.
+        logger.info({repo, runId}, 'run: cancelled — suppressing user-facing failure reply')
       } else {
-        failedStateForNotify = failedResult.data.state
-      }
+        // ── Failed reaction — best-effort, fire-and-forget ────────────────────────────────────────
+        // Replaces the working/awaiting reaction with the failed cue.
+        statusSink.setReaction('failed')
 
-      // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
-      // Wrapped in its own try/catch so a flush failure does not mask the original error.
-      await replySink.flush().catch((flushError: unknown) => {
-        logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
-      })
+        // Stop heartbeat (best-effort) if not already stopped
+        if (heartbeatStopped === false) {
+          const stopResult = await heartbeat.stop()
+          heartbeatStopped = true
+          if (stopResult.success === true) {
+            runEtag = stopResult.data.runEtag
+            lockEtag = stopResult.data.lockEtag
+          } else {
+            logger.warn(
+              {repo, runId, err: stopResult.error.message},
+              'run: heartbeat stop failed; using last known etags',
+            )
+          }
+        }
 
-      // Push the FAILED state to the observation pipeline AFTER the partial-output flush.
-      // This guarantees the web sink's final output frame is delivered before the terminal
-      // status frame (which closes run subscribers). Best-effort, fire-and-forget.
-      if (failedStateForNotify !== undefined) {
-        notifyObserverBestEffort(deps, failedStateForNotify)
-      }
+        // Transition to FAILED (best-effort)
+        const failedResult = await transitionRun(
+          coordinationConfig,
+          identity,
+          repo,
+          runId,
+          'FAILED',
+          runEtag,
+          coordLogger,
+        )
+        // Capture the FAILED state now so we can notify AFTER the partial-output flush.
+        // The notify is deferred to guarantee the web sink's flush() → final output frame
+        // is pushed before observe(terminalState) fans the terminal status frame (which
+        // closes run subscribers). For Discord, the reorder is inert.
+        let failedStateForNotify: RunState | undefined
+        if (failedResult.success === false) {
+          logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED failed')
+        } else {
+          failedStateForNotify = failedResult.data.state
+        }
 
-      // Coarse user message — no internal detail
-      const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
-      const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
-      const hasVisibleOutput = replySink.hasVisibleOutput() === true
-      const userMessage =
-        isTimeout === true
-          ? hasVisibleOutput === true
-            ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
-            : `The task reached the ${timeoutDuration} time limit. Please try again.`
-          : isInactivityTimeout === true
+        // Flush partial output (best-effort) so the user sees whatever streamed before the failure.
+        // Wrapped in its own try/catch so a flush failure does not mask the original error.
+        await replySink.flush().catch((flushError: unknown) => {
+          logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
+        })
+
+        // Push the FAILED state to the observation pipeline AFTER the partial-output flush.
+        // This guarantees the web sink's final output frame is delivered before the terminal
+        // status frame (which closes run subscribers). Best-effort, fire-and-forget.
+        if (failedStateForNotify !== undefined) {
+          notifyObserverBestEffort(deps, failedStateForNotify)
+        }
+
+        // Coarse user message — no internal detail
+        const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
+        const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
+        const hasVisibleOutput = replySink.hasVisibleOutput() === true
+        const userMessage =
+          isTimeout === true
             ? hasVisibleOutput === true
-              ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
-              : `The task stopped producing output for ${inactivityDuration}. Please try again.`
-            : isReachability === true
-              ? 'The workspace is not reachable right now. Please try again later.'
-              : isEmptyPrompt === true
-                ? 'Nothing to do — please include a task in your message.'
-                : isStreamEnded === true
-                  ? 'The task stream closed unexpectedly. Please try again.'
-                  : 'The task failed. Please try again.'
+              ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+              : `The task reached the ${timeoutDuration} time limit. Please try again.`
+            : isInactivityTimeout === true
+              ? hasVisibleOutput === true
+                ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+                : `The task stopped producing output for ${inactivityDuration}. Please try again.`
+              : isReachability === true
+                ? 'The workspace is not reachable right now. Please try again later.'
+                : isEmptyPrompt === true
+                  ? 'Nothing to do — please include a task in your message.'
+                  : isStreamEnded === true
+                    ? 'The task stream closed unexpectedly. Please try again.'
+                    : 'The task failed. Please try again.'
 
-      // ── Status controller failure transition ──────────────────────────────────────────────────
-      // resolveToFailure returns:
-      //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
-      //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
-      // Never both — single owner for the failure message.
-      const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
-        logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
-        return {transition: 'delegated' as const}
-      })
-      if (failureResult.transition === 'delegated') {
-        const failureSendResult = await replySink.send('thread', {content: userMessage})
-        if (failureSendResult !== undefined) {
-          const result = failureSendResult as {success?: boolean; error?: {message: string}}
-          if (result.success === false && result.error !== undefined) {
-            logger.warn({repo, runId, err: result.error.message}, 'run: failed to send error reply to thread')
+        // ── Status controller failure transition ──────────────────────────────────────────────────
+        // resolveToFailure returns:
+        //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
+        //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
+        // Never both — single owner for the failure message.
+        const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
+          logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
+          return {transition: 'delegated' as const}
+        })
+        if (failureResult.transition === 'delegated') {
+          const failureSendResult = await replySink.send('thread', {content: userMessage})
+          if (failureSendResult !== undefined) {
+            const result = failureSendResult as {success?: boolean; error?: {message: string}}
+            if (result.success === false && result.error !== undefined) {
+              logger.warn({repo, runId, err: result.error.message}, 'run: failed to send error reply to thread')
+            }
           }
         }
       }
     } finally {
+      // Delete the abort-registry entry unconditionally — the run is settling one way or
+      // another (COMPLETED/FAILED/CANCELLED). Prevents leaking registry entries; a stray
+      // abort() call after this point becomes the documented unknown-runId no-op.
+      abortRegistry.delete(runId)
+
       // Stop heartbeat if not yet stopped (defensive — should not normally happen)
       if (heartbeatStopped === false) {
         await heartbeat.stop().catch(() => {
