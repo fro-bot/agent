@@ -212,6 +212,7 @@ function makeDefaultQueue(): ChannelQueue<RunTask> {
     pendingCount: vi.fn().mockReturnValue(0),
     takeNext: vi.fn().mockReturnValue(undefined),
     clear: vi.fn().mockReturnValue(0),
+    removeBy: vi.fn().mockReturnValue(undefined),
   }
 }
 

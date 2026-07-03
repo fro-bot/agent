@@ -831,8 +831,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         })
 
         // Transition to CANCELLED (best-effort) with the fresh heartbeat-stop etag.
-        // Unit 2: `details.cancelledBy` attribution lands on this transition once the
-        // orchestrator threads actor context through the abort call.
+        // Attribution: the abort-registry entry may carry `cancelledBy` metadata,
+        // written by `cancelRun` (Unit 2) alongside its `abort()` call. This is the
+        // single writer of the CANCELLED transition, so reading it back here (rather
+        // than a follow-up write from the orchestrator) keeps attribution atomic with
+        // the phase write and avoids a second etag round-trip.
+        const cancelledByMetadata = abortRegistry.getMetadata(runId)
+        const cancelledOptions =
+          cancelledByMetadata === undefined ? undefined : {detailsPatch: {cancelledBy: cancelledByMetadata}}
         const cancelledResult = await transitionRun(
           coordinationConfig,
           identity,
@@ -841,6 +847,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           'CANCELLED',
           runEtag,
           coordLogger,
+          cancelledOptions,
         )
         if (cancelledResult.success === false) {
           logger.error({repo, runId, err: cancelledResult.error.message}, 'run: transitionRun CANCELLED failed')

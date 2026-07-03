@@ -48,6 +48,22 @@ export interface ChannelQueue<T> {
    * Does not affect the in-flight run (which holds the concurrency slot, not the queue).
    */
   readonly clear: (channelId: string) => number
+  /**
+   * Remove the FIRST pending task for the channel matching `predicate`
+   * (head/middle/tail — the whole array is searched) and return it.
+   *
+   * Returns `undefined` when no pending task matches (unknown channel, empty
+   * channel, or no match) — including the race where `takeNext` already
+   * consumed the target task before this call runs.
+   *
+   * Preserves FIFO order for the remaining tasks. Removing the last remaining
+   * task cleans up the channel's entry (mirrors `takeNext`'s empty-array cleanup)
+   * so `pendingCount` stays accurate.
+   *
+   * Generic predicate (rather than a `removeByRunId`-specific method) so this
+   * primitive is reusable for any `T` shape without a `runId` type constraint.
+   */
+  readonly removeBy: (channelId: string, predicate: (task: T) => boolean) => T | undefined
 }
 
 /**
@@ -94,6 +110,20 @@ export function createChannelQueue<T>(maxDepth: number = DEFAULT_MAX_QUEUE_DEPTH
       const count = existing.length
       queues.delete(channelId)
       return count
+    },
+
+    removeBy: (channelId: string, predicate: (task: T) => boolean): T | undefined => {
+      const existing = queues.get(channelId)
+      if (existing === undefined || existing.length === 0) return undefined
+      const index = existing.findIndex(predicate)
+      if (index === -1) return undefined
+      const [removed] = existing.splice(index, 1)
+      // Clean up the entry when the array is drained so pendingCount stays accurate
+      // and we don't accumulate stale empty arrays — mirrors takeNext's cleanup.
+      if (existing.length === 0) {
+        queues.delete(channelId)
+      }
+      return removed
     },
   }
 }

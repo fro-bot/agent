@@ -250,6 +250,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
         takeNext: vi.fn(() => undefined),
         pendingCount: vi.fn(() => 0),
         clear: vi.fn(() => 0),
+        removeBy: vi.fn(() => undefined),
       },
       attachUrl: 'http://localhost:3000',
       attachToken: 'stub-token',

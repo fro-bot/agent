@@ -32,6 +32,7 @@ function makeQueue(clearReturnValue = 0): ChannelQueue<RunTask> {
     pendingCount: vi.fn().mockReturnValue(0),
     takeNext: vi.fn().mockReturnValue(undefined),
     clear: vi.fn().mockReturnValue(clearReturnValue),
+    removeBy: vi.fn().mockReturnValue(undefined),
   }
 }
 
@@ -434,6 +435,7 @@ describe('/fro-bot clear-queue — infra-failure path', () => {
       clear: vi.fn().mockImplementation(() => {
         throw infraError
       }),
+      removeBy: vi.fn().mockReturnValue(undefined),
     }
     const deps = makeDeps({queue})
     const cmd = createFroBotCommand(deps)
