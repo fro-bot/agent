@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
@@ -10,12 +10,22 @@ import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { SqlError } from "effect/unstable/sql/SqlError"
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
 export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
+
+const sqliteLockRetrySchedule = Schedule.exponential("40 millis").pipe(Schedule.jittered, Schedule.take(8))
+
+// NOTE: gate on the reason tag, not error.isRetryable. In effect@4.0.0-beta.66 the
+// SqlError isRetryable flags are inverted (LockTimeoutError=false, ConstraintError=true),
+// so isRetryable would crash on locks and retry FK violations forever. Revisit on effect bump.
+export function isLockTimeoutSqlError(error: unknown) {
+  return error instanceof SqlError && error.reason._tag === "LockTimeoutError"
+}
 export type Unsubscribe = Effect.Effect<void>
 
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
@@ -350,7 +360,21 @@ export const layerWith = (options?: LayerOptions) =>
                         }),
                       { behavior: "immediate" },
                     )
-                    .pipe(Effect.orDie)
+                    .pipe(
+                      Effect.retry({
+                        while: isLockTimeoutSqlError,
+                        schedule: sqliteLockRetrySchedule,
+                      }),
+                      Effect.tapError((error) =>
+                        Effect.logError("durable event commit failed", {
+                          eventID: event.id,
+                          eventType: event.type,
+                          aggregateID,
+                          error,
+                        }),
+                      ),
+                      Effect.orDie,
+                    )
                   if (committed) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
