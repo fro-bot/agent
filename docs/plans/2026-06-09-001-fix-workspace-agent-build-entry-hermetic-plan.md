@@ -1,9 +1,11 @@
 ---
 title: "fix: Make workspace-agent build entry hermetic"
 type: fix
-status: active
+status: done
 date: 2026-06-09
 ---
+
+> **Status: done.** All 3 units shipped: hermetic entry + scoped rootDir (`apps/workspace-agent/tsdown.config.ts`), the post-build symbol guard, and the CI repo-root build regression step — verified on `main` (PR #849).
 
 # fix: Make workspace-agent build entry hermetic
 

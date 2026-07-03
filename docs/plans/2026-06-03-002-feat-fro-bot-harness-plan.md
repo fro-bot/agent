@@ -1,10 +1,12 @@
 ---
 title: "feat: @fro.bot/harness — orw-embedded patched OpenCode (LLM-merge integration, default setup)"
 type: feat
-status: active
+status: superseded
 date: 2026-06-03
 origin: docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md
 ---
+
+> **Status: superseded.** The `@fro.bot/harness` package, integration engine, per-platform build/publish, and action cutover all shipped through the follow-on cycle plans (`2026-06-10-002`, `2026-06-12-001`, `2026-06-12-003`, `2026-06-13-001` action-pin-flip). Unit 5 (scheduled deliberate-bump pipeline) was never built — harness bumps remain manual/reviewed via the cycle-plan pattern, not a scheduled CI job.
 
 # feat: @fro.bot/harness — orw-embedded patched OpenCode
 
@@ -86,7 +88,7 @@ Carries the origin brainstorm's full-harness requirements, with R4 corrected to 
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — OpenCode binary must be cached under a dedicated tools-cache key; `latest` is a non-determinism trap → the harness binary follows the same cache discipline; bumps are pinned.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — OpenCode binary must be cached under a dedicated tools-cache key; `latest` is a non-determinism trap → the harness binary follows the same cache discipline; bumps are pinned.
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — ship compiled artifacts, not source-resolved entries → harness CLI ships built `dist/`; the per-platform packages ship native binaries.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — pinned-version-constant + Renovate regex idiom → the base-release pin reuses it.
 
@@ -318,7 +320,7 @@ The pipeline is the asset; the patch list stays boring. Target **1–3 carried r
 
 ## Sources & References
 
-- **Origin:** [docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md](docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md) (full-harness spec; R4 corrected here to LLM-merge per orw)
+- **Origin:** [docs/brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md](../brainstorms/2026-06-02-fro-bot-harness-patched-opencode-requirements.md) (full-harness spec; R4 corrected here to LLM-merge per orw)
 - Integration method: `cortexkit/orw` (`src/index.ts`, `prompt.txt`, `package.json`) — embedded as the harness engine
 - Build/publish model: `anomalyco/opencode` `packages/opencode/script/build.ts`, `script/publish.ts`, `.github/workflows/publish.yml`
 - Cut-over seam: `src/services/setup/opencode.ts`, `src/services/setup/setup.ts`, `src/features/agent/server.ts`, `src/services/setup/tools-cache.ts`

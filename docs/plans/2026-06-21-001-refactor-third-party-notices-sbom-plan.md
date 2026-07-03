@@ -1,9 +1,11 @@
 ---
 title: 'refactor: deterministic committed third-party notices + CI SBOM'
 type: refactor
-status: active
+status: done
 date: 2026-06-21
 ---
+
+> **Status: done.** All 4 units shipped: deterministic fail-closed notice generation + rename, the CI dist-diff carve-out removed, the CI CycloneDX SBOM artifact, and the renamed notice + docs committed — verified on `main` (`scripts/third-party-notices.ts`, PR #978).
 
 # Deterministic committed third-party notices + CI SBOM
 

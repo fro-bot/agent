@@ -1,10 +1,12 @@
 ---
 title: Escape committed dist/ artifacts independently of the bundler lifecycle
 date: 2026-06-22
-last_updated: 2026-06-24
+category: workflow-issues
+module: scripts/
 problem_type: workflow_issue
 component: tooling
 severity: low
+last_updated: 2026-06-24
 applies_when:
   - "A committed generated artifact (dist/, build/, codegen) must satisfy an external scanner that runs on the same files"
   - "The bundler's writeBundle hook is the only stage that escapes a known character set in the bundle"

@@ -1,10 +1,12 @@
 ---
 title: 'fix: Move run lifecycle admission into launchWork so queued/failed runs are observable'
 type: fix
-status: active
+status: done
 date: 2026-06-20
 deepened: 2026-06-20
 ---
+
+> **Status: done.** All 6 units shipped: the early-FAILED runtime transition table, `launchWork` admission ownership, `executeWorkOnHeldSlot` run-adoption, two-phase idempotency in the web launch route, shutdown queue-drop + recovery-sweep terminalization, and the operator read-surface verification — all verified on `main` (`packages/gateway/src/execute/run.ts`).
 
 # Move run lifecycle admission into launchWork so queued/failed runs are observable
 
@@ -65,7 +67,7 @@ This moves run **admission** (creating the initial `PENDING` `RunState`) into `l
 - `docs/solutions/best-practices/atomic-serial-channel-queue-handoff-2026-06-09.md` — FIFO/cap/shutdown contract admission must preserve. **Corollary (R5):** dropped-queue `PENDING` records must be terminalized to `FAILED` on shutdown, not orphaned holding a slot.
 - `docs/solutions/best-practices/gateway-opencode-mention-loop-best-practices-2026-05-30.md` — the recovery sweep terminalizes stale `EXECUTING` to `FAILED`; **must extend to `PENDING` (R6)**. Also the `IfMatch` lock-release precedent is the model for testing the `ifNoneMatch:'*'` create.
 - `docs/solutions/best-practices/centralize-s3-key-identity-construction-2026-06-09.md` — **test discipline:** pin the S3 key AND the conditional-write header (`IfNoneMatch: '*'`), not just that `createRun` was called.
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — **dual-finally:** every early-abort gate path that can throw after admission but before a terminal transition must terminalize to `FAILED` in a `finally`-guarded structure so a throw can't orphan a `PENDING`.
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — **dual-finally:** every early-abort gate path that can throw after admission but before a terminal transition must terminalize to `FAILED` in a `finally`-guarded structure so a throw can't orphan a `PENDING`.
 - `docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md` — the route/idempotency surface this extends (don't redesign rules 1/4/6, extend them). **This doc becomes stale when #966 lands** (see Documentation Notes).
 - `docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md` — the read surface; verify the status overlay guard allows `PENDING` (non-terminal, should display).
 

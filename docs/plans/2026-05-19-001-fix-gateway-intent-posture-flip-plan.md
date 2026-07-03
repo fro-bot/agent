@@ -1,10 +1,12 @@
 ---
 title: 'fix: Gateway intent-posture flip — privileged intents become opt-in'
 type: fix
-status: active
+status: done
 date: 2026-05-19
 origin: https://github.com/fro-bot/agent/issues/646
 ---
+
+> **Status: done.** All 3 units shipped: `DEFAULT_INTENTS` flipped to `[Guilds, GuildMessages]`, `DISCORD_PRIVILEGED_INTENTS` config knob, and tests/docs — verified on `main` (`packages/gateway/src/discord/client.ts:10`, PR #651).
 
 # Gateway intent-posture flip — privileged intents become opt-in
 
@@ -113,7 +115,7 @@ This plan flips the baseline to the non-privileged set (`Guilds`, `GuildMessages
 
 ## Implementation Units
 
-- [ ] **Unit 1: Flip `DEFAULT_INTENTS` to non-privileged baseline**
+- [x] **Unit 1: Flip `DEFAULT_INTENTS` to non-privileged baseline**
 
 **Goal:** Change `DEFAULT_INTENTS` in `packages/gateway/src/discord/client.ts` to contain only `Guilds` and `GuildMessages`. The merge logic in `createDiscordClient` is unchanged.
 
@@ -143,7 +145,7 @@ This plan flips the baseline to the non-privileged set (`Guilds`, `GuildMessages
 
 ---
 
-- [ ] **Unit 2: Add `DISCORD_PRIVILEGED_INTENTS` config knob in `loadGatewayConfig`**
+- [x] **Unit 2: Add `DISCORD_PRIVILEGED_INTENTS` config knob in `loadGatewayConfig`**
 
 **Goal:** Parse `DISCORD_PRIVILEGED_INTENTS` from env (via `readOptionalSecret`), validate against the two-value allowlist, and expose as `privilegedIntents: GatewayIntentBits[]` on `GatewayConfig`. Wire it into `main.ts` so it flows into `createDiscordClient` as the `intents` override.
 
@@ -201,7 +203,7 @@ This plan flips the baseline to the non-privileged set (`Guilds`, `GuildMessages
 
 ---
 
-- [ ] **Unit 3: Client-level tests + test-isolation guard + AGENTS.md docs**
+- [x] **Unit 3: Client-level tests + test-isolation guard + AGENTS.md docs**
 
 **Goal:** Add the client-level test scenarios from R4, install the test-isolation guard in `client.test.ts`, and document the `DISCORD_PRIVILEGED_INTENTS` knob in `packages/gateway/AGENTS.md`.
 

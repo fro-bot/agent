@@ -1,10 +1,12 @@
 ---
 title: "feat: Workspace executor image — make /fro-bot add-project and the mention loop work end-to-end"
 type: feat
-status: active
+status: done
 date: 2026-06-01
 origin: docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md
 ---
+
+> **Status: done.** All 5 units shipped: `deploy/workspace.Dockerfile`, the CA-trust entrypoint, compose wiring, the `workspace-smoke` CI job, and deploy docs — verified on `main` (PR #725).
 
 # feat: Workspace executor image
 
@@ -54,7 +56,7 @@ Confirmed live on Fronomenal Discord against gateway v0.46.3: full add-project p
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — bake tool binaries into the image; do not runtime-install in the hot path.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — bake tool binaries into the image; do not runtime-install in the hot path.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — the `@fro.bot/systematic` plugin is declared via OpenCode config, not a separate install step. Reuse this pattern for the workspace OpenCode config.
 - OpenCode version pin (project memory): `DEFAULT_OPENCODE_VERSION = 1.14.41`; 1.14.42+ regresses the SSE stream. The workspace must pin the same version.
 
@@ -129,7 +131,7 @@ Egress clients inside workspace → mitmproxy:8080 (HTTPS_PROXY) → allowlist
 
 ## Implementation Units
 
-- [ ] **Unit 1: Workspace executor Dockerfile**
+- [x] **Unit 1: Workspace executor Dockerfile**
 
 **Goal:** Replace the placeholder with a multi-stage Alpine image that builds `apps/workspace-agent` and bakes OpenCode 1.14.41 (musl) + the system packages the clone/OpenCode paths need.
 
@@ -156,7 +158,7 @@ Egress clients inside workspace → mitmproxy:8080 (HTTPS_PROXY) → allowlist
 **Verification:**
 - `docker build -f deploy/workspace.Dockerfile .` succeeds; `opencode --version` inside the image prints `1.14.41`; `git --version` resolves; `node dist/main.mjs` is the launch target.
 
-- [ ] **Unit 2: CA-trust entrypoint script**
+- [x] **Unit 2: CA-trust entrypoint script**
 
 **Goal:** Make outbound TLS through mitmproxy work for git/opencode (system CA bundle) before the supervisor starts.
 
@@ -182,7 +184,7 @@ Egress clients inside workspace → mitmproxy:8080 (HTTPS_PROXY) → allowlist
 **Verification:**
 - In a composed stack, `docker exec workspace git clone https://github.com/octocat/Hello-World /tmp/t` succeeds (no `SSL certificate problem`); the smoke job (no CA mounted) still reaches `:9100` listening.
 
-- [ ] **Unit 3: Compose wiring for the real workspace**
+- [x] **Unit 3: Compose wiring for the real workspace**
 
 **Goal:** Wire the workspace service to the real image with CA trust and a health gate, preserving the sandbox port model.
 
@@ -208,7 +210,7 @@ Egress clients inside workspace → mitmproxy:8080 (HTTPS_PROXY) → allowlist
 **Verification:**
 - `docker compose -f deploy/compose.yaml config` parses; workspace builds from the real Dockerfile; no host ports published; CA volume mounted at the dedicated path.
 
-- [ ] **Unit 4: `workspace-smoke` CI job**
+- [x] **Unit 4: `workspace-smoke` CI job**
 
 **Goal:** Prove the image builds and the clone path boots independently of OpenCode, guarding against module-resolution and missing-binary regressions.
 
@@ -238,7 +240,7 @@ Egress clients inside workspace → mitmproxy:8080 (HTTPS_PROXY) → allowlist
 **Verification:**
 - The job runs on this PR (the `deploy/**` + `ci.yaml` changes trigger it), builds the image, and passes the assertions.
 
-- [ ] **Unit 5: Deploy docs**
+- [x] **Unit 5: Deploy docs**
 
 **Goal:** Document that the workspace is now a real executor: the OpenCode token requirement, the `OBJECT_STORE_HOSTS` allowlist relationship, and the CA-trust behavior.
 

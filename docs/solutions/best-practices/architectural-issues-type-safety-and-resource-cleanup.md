@@ -1,37 +1,20 @@
 ---
 title: "OpenCode SDK Session Backend: Architectural Issues in Type Safety and Resource Cleanup"
-date: "2026-02-16"
-category: "code-quality"
-severity: "high"
-status: "resolved"
-affected_components:
-  - "session/storage.ts"
-  - "session/prune.ts"
-  - "main.ts (cleanup orchestration)"
-  - "SDK session backend integration"
-related_patterns:
-  - "hardcoded backend coupling"
-  - "dependency injection violation"
-  - "resource cleanup ordering"
-  - "non-deterministic behavior"
-  - "unsafe type casts"
-keywords:
-  - "pruneSessions"
-  - "SessionBackend"
-  - "server shutdown"
-  - "latest session selection"
-  - "type safety"
-  - "resource cleanup"
-  - "finally blocks"
-  - "determinism"
-related_issues:
-  - "PR #198 (OpenCode SQLite session support)"
-discovery_context: "code review feedback (Fro Bot + Codex agent)"
-reviewer_agents:
-  - "Fro Bot (primary backend coupling issue)"
-  - "Codex agent (architectural critique: cleanup ordering, determinism, type safety)"
-root_cause: "Multiple architectural quality issues: (1) pruneSessions() hardcoded JsonBackend instead of accepting injected SessionBackend, (2) server shutdown in try block could be skipped if cleanup throws, (3) non-deterministic SDK session ordering, (4) unnecessary unsafe type casts"
-impact: "SQLite backend cannot properly prune sessions; server processes leak on cleanup failure; non-reproducible CI behavior; type safety gaps hide runtime errors"
+date: 2026-02-16
+category: best-practices
+module: packages/runtime/src/session
+problem_type: best_practice
+component: assistant
+severity: high
+tags:
+  - prune-sessions
+  - session-backend
+  - server-shutdown
+  - latest-session-selection
+  - type-safety
+  - resource-cleanup
+  - finally-blocks
+  - determinism
 ---
 
 # OpenCode SDK Session Backend: Architectural Issues in Type Safety and Resource Cleanup
@@ -391,8 +374,8 @@ All fixes verified with:
 
 ## Related Documentation
 
-- [Fro Bot Agent SQLite Session Support Plan](../plans/2026-02-15-feat-opencode-sqlite-session-support-plan.md)
-- [Build Errors: Tool Binary Caching on Ephemeral Runners](../solutions/build-errors/tool-binary-caching-ephemeral-runners.md)
+- [Fro Bot Agent SQLite Session Support Plan](../../plans/2026-02-15-feat-opencode-sqlite-session-support-plan.md)
+- [Build Errors: Tool Binary Caching on Ephemeral Runners](../performance-issues/tool-binary-caching-ephemeral-runners.md)
 
 ## Related Issues
 

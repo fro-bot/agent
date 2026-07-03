@@ -1,9 +1,11 @@
 ---
 title: 'fix: thread directory to session.create so mention-loop events arrive'
 type: fix
-status: active
+status: done
 date: 2026-06-04
 ---
+
+> **Status: done.** `client.session.create()` threads `{query: {directory}}` matching `event.subscribe`/`promptAsync` — verified on `main` (`packages/gateway/src/execute/run-core.ts:319`).
 
 # fix: thread directory to session.create so mention-loop events arrive
 
@@ -103,7 +105,7 @@ threading" describe block tests `promptAsync` only), which is why the bug shippe
 
 ## Implementation Units
 
-- [ ] **Unit 1: Thread directory to session.create + regression test + comment**
+- [x] **Unit 1: Thread directory to session.create + regression test + comment**
 
 **Goal:** The mention run's session is rooted at the repo directory so the subdir-filtered event subscription receives
 its `message.part.delta` / `session.idle`, and the gateway posts the reply.

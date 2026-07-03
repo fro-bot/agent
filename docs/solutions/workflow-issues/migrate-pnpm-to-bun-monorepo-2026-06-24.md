@@ -1,6 +1,8 @@
 ---
 title: 'Migrating a pnpm workspace to Bun: diagnostics, spike-then-cutover, and the semantics that bite'
 date: 2026-06-24
+category: workflow-issues
+module: workspace tooling
 problem_type: workflow_issue
 component: tooling
 severity: high

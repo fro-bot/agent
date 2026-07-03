@@ -1,7 +1,7 @@
 ---
 title: Release-notes narration — model routing and fail-soft guards
 date: 2026-06-07
-category: docs/solutions/best-practices/
+category: best-practices
 module: release-notes
 problem_type: best_practice
 component: development_workflow

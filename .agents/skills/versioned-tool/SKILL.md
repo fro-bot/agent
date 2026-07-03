@@ -7,7 +7,7 @@ description: Use when adding or updating external CLI tools managed by pinned ve
 
 ## Overview
 
-This project manages external CLI tools through a **single-source-of-truth version constant** pattern. Every tool's default version lives in `src/shared/constants.ts`, with Renovate automation tracking updates via `.github/renovate.json5`.
+This project manages external CLI tools through a **single-source-of-truth version constant** pattern. Every tool's default version lives in `packages/runtime/src/shared/constants.ts` (the root `src/shared/constants.ts` is a re-export barrel with no version literals — edits go in the runtime package), with Renovate automation tracking updates via `.github/renovate.json5`.
 
 **Current tools:**
 
@@ -27,11 +27,12 @@ This project manages external CLI tools through a **single-source-of-truth versi
 
 ### Bump an existing tool version
 
-1. Update `DEFAULT_<TOOL>_VERSION` in `src/shared/constants.ts`.
+1. Update `DEFAULT_<TOOL>_VERSION` in `packages/runtime/src/shared/constants.ts`.
 2. Verify the installer imports that constant (not a duplicate string).
 3. For user-facing tools, verify `src/harness/config/inputs.ts` falls back to the constant.
 4. Update any docs that surface the pinned default.
-5. Run: `bun run test && bun run lint && bun run build`.
+5. If the bump pulls an npm package published within the last 3 days (e.g. `@opencode-ai/sdk` on a same-day OpenCode bump), `bun install` refuses it under `bunfig.toml`'s `minimumReleaseAge` — add a temporary `minimumReleaseAgeExcludes = ["<pkg>"]` and file a removal reminder for when the window clears (precedent: PRs #1066, #1084).
+6. Run: `bun run test && bun run lint && bun run build`.
 
 ### Add a new external tool
 
@@ -77,26 +78,20 @@ All tools share the same version-source and Renovate tracking. User-facing tools
 
 #### 1. Define the Constant
 
-All default versions live in `src/shared/constants.ts`:
+All default versions live in `packages/runtime/src/shared/constants.ts` (re-exported through the root barrel `src/shared/constants.ts`):
 
 ```typescript
-export const DEFAULT_OPENCODE_VERSION = "1.2.24"
 export const DEFAULT_BUN_VERSION = "1.3.9"
 export const DEFAULT_OMO_VERSION = "3.11.2"
 ```
 
-Rules: semver string, no `v` prefix, named `DEFAULT_<TOOL>_VERSION`. This is the ONLY place the version literal appears.
+Rules: semver string, no `v` prefix, named `DEFAULT_<TOOL>_VERSION`. This is the ONLY place the version literal appears. (Exception: `DEFAULT_OPENCODE_VERSION` carries the harness build format `<base>+harness.<sha>` and is bumped by the release job, not by hand.)
 
 #### 2. Import from Installer
 
-Each installer imports the constant. If a fallback is needed, alias it:
+Each installer imports the constant. Never duplicate the same version string across files.
 
-```typescript
-import {DEFAULT_OPENCODE_VERSION} from "../../shared/constants.js"
-export const FALLBACK_VERSION = DEFAULT_OPENCODE_VERSION
-```
-
-Never duplicate the version string.
+**OpenCode is the exception, not the template:** `FALLBACK_VERSION` in `src/services/setup/opencode.ts` is an independent **stock** pin (e.g. `1.17.13`), deliberately NOT aliased from `DEFAULT_OPENCODE_VERSION` (the harness build, e.g. `1.17.13+harness.<sha>`). They are different artifacts on different update cadences, each with its own Renovate/release-job tracking — do not "deduplicate" them into an alias.
 
 #### 3. Add Renovate Tracking
 
@@ -188,7 +183,7 @@ Installers reuse the pinned version constant instead of hardcoding version liter
 
 Repo-specific behaviors today:
 
-- **OpenCode**: supports explicit `latest` resolution, falls back to `FALLBACK_VERSION` (aliased from `DEFAULT_OPENCODE_VERSION`)
+- **OpenCode**: supports explicit `latest` resolution, falls back to `FALLBACK_VERSION` (independent stock pin in `src/services/setup/opencode.ts` — deliberately not the harness-build `DEFAULT_OPENCODE_VERSION`)
 - **Bun**: installs from `DEFAULT_BUN_VERSION`, no user override
 - **oMo**: installs from `DEFAULT_OMO_VERSION`, but package/runtime identity differs
 
@@ -196,7 +191,7 @@ Do not copy installer structure blindly between tools. Copy the version-source p
 
 ## Verification Checklist
 
-- [ ] Constant updated in `src/shared/constants.ts`
+- [ ] Constant updated in `packages/runtime/src/shared/constants.ts`
 - [ ] No duplicate version literals elsewhere (grep for old version string)
 - [ ] `action.yaml` has no hardcoded default for the version input
 - [ ] Renovate customManager regex matches the constant pattern exactly
@@ -212,7 +207,7 @@ Do not copy installer structure blindly between tools. Copy the version-source p
 | Mistake | Why It's Wrong | Fix |
 | --- | --- | --- |
 | Hardcoding default in `action.yaml` | Creates two sources of truth; version drifts | Remove `default:` line, let `inputs.ts` fall back to constant |
-| Duplicating version string in installer | Stale fallback when constant updates | Import and alias: `export const FALLBACK = DEFAULT_X_VERSION` |
+| Duplicating version string in installer | Stale fallback when constant updates | Import the constant (exception: OpenCode's `FALLBACK_VERSION` is an independent stock pin — see §2) |
 | Wrong Renovate `extractVersionTemplate` | Renovate can't parse tag format | Check actual tag format: `v1.2.3` vs `bun-v1.2.3` |
 | Using `latest` as default | Non-reproducible builds, surprise breakage | Pin to known stable; let users opt in to `latest` explicitly |
 | Assuming package name == runtime identity | Config paths, version parsing, plugin names break | Verify install name, stdout output, and config file independently |

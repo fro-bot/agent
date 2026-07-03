@@ -1,6 +1,7 @@
 ---
 module: gateway control-surface spine
 date: 2026-06-15
+category: best-practices
 problem_type: architecture_pattern
 component: tooling
 severity: medium

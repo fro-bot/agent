@@ -145,8 +145,8 @@ This partition is **cleaner than the original plan stated**: the runtime is genu
 ### Institutional Learnings
 
 - `docs/solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md` — **highly relevant**. The six-layer delivery contract (harness_rules authority, Delivery Mode enum, soft-control framing) is the template for the Discord surface's delivery mode. Discord-initiated runs must emit a Delivery Mode preamble following the same pattern.
-- `docs/solutions/code-quality/architectural-issues-type-safety-and-resource-cleanup.md` — **critical for runtime extraction**. Session backend must be backend-agnostic. v1 treats the S3 object-store as the first-class canonical backend (matching the shipped PR #514 state), not the JSON vs SQLite framing the doc was written under. This doc will need refreshing after extraction lands.
-- `docs/solutions/build-errors/tool-binary-caching-ephemeral-runners.md` — informs the container image strategy. OpenCode/oMo binaries should be baked into the workspace image; session state goes to S3.
+- `docs/solutions/best-practices/architectural-issues-type-safety-and-resource-cleanup.md` — **critical for runtime extraction**. Session backend must be backend-agnostic. v1 treats the S3 object-store as the first-class canonical backend (matching the shipped PR #514 state), not the JSON vs SQLite framing the doc was written under. This doc will need refreshing after extraction lands.
+- `docs/solutions/performance-issues/tool-binary-caching-ephemeral-runners.md` — informs the container image strategy. OpenCode/oMo binaries should be baked into the workspace image; session state goes to S3.
 - `docs/solutions/best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md` — preserve the config-declared plugin pattern when the workspace container runs OpenCode. Systematic plugin injection uses the same config-declaration approach, not a separate install step.
 
 ### External References
