@@ -270,6 +270,24 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
 
 // DiscordAdapterBridge was removed — thread creation now lives in the adapter via threadFactory
 
+/**
+ * Classify an in-flight execution failure to the internal failure-kind string
+ * persisted on the FAILED run-state (`details.failureKind`).
+ *
+ * Returns the internal `RunCoreErrorKind` verbatim when `execError` is a
+ * `RunCoreError` (e.g. `'timeout'`, `'inactivity-timeout'`, `'unreachable'`) —
+ * the operator-contract projection (`toOperatorFailureKind`) owns mapping
+ * these internal kinds to the closed operator enum.
+ *
+ * Returns `undefined` for any non-`RunCoreError` failure (generic JS error,
+ * a stray `EmptyPromptError`, etc.) so `details.failureKind` is omitted
+ * rather than persisting a synthetic 'unknown' string — the projection
+ * already renders an absent field as no failure reason.
+ */
+function classifyOperatorFailureKind(execError: unknown): string | undefined {
+  return execError instanceof RunCoreError ? execError.kind : undefined
+}
+
 // ---------------------------------------------------------------------------
 // executeWorkOnHeldSlot — the private slot-holding execution pipeline
 // ---------------------------------------------------------------------------
@@ -858,6 +876,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // released by the outer finally is an inconsistent state until the next recovery
           // sweep. Attempt a best-effort FAILED terminalization with the same etag (FAILED
           // is a valid transition from EXECUTING) rather than leaving this to recovery alone.
+          // The error is already classified above (the cancel path itself was entered via
+          // execError) — carry it through so the rare fallback still surfaces a reason.
+          const fallbackFailureKind = classifyOperatorFailureKind(execError)
+          const fallbackOptions =
+            fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
           const failedFallbackResult = await transitionRun(
             coordinationConfig,
             identity,
@@ -866,6 +889,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             'FAILED',
             runEtag,
             coordLogger,
+            fallbackOptions,
           )
           if (failedFallbackResult.success === false) {
             logger.error(
@@ -908,7 +932,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           }
         }
 
-        // Transition to FAILED (best-effort)
+        // Transition to FAILED (best-effort), carrying the classified failure kind
+        // atomically with the phase write so the operator projections can read it back.
+        const inFlightFailureKind = classifyOperatorFailureKind(execError)
+        const inFlightFailedOptions =
+          inFlightFailureKind === undefined ? undefined : {detailsPatch: {failureKind: inFlightFailureKind}}
         const failedResult = await transitionRun(
           coordinationConfig,
           identity,
@@ -917,6 +945,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           'FAILED',
           runEtag,
           coordLogger,
+          inFlightFailedOptions,
         )
         // Capture the FAILED state now so we can notify AFTER the partial-output flush.
         // The notify is deferred to guarantee the web sink's flush() → final output frame

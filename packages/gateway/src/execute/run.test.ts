@@ -7421,3 +7421,240 @@ describe('operator cancel — abort-registry integration', () => {
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
   })
 })
+
+// ---------------------------------------------------------------------------
+// failureKind persistence on the FAILED transition (Unit 3)
+// ---------------------------------------------------------------------------
+
+describe('failureKind persistence on FAILED transitions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('inactivity-timeout failure: FAILED transitionRun called with detailsPatch.failureKind = internal kind', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('inactivity-timeout')
+  })
+
+  it('wall-clock timeout failure: detailsPatch.failureKind = internal "timeout" kind (projects to max-duration-timeout)', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('timeout')
+
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('max-duration-timeout')
+  })
+
+  it('reachability failure (unreachable/auth): persisted kind projects to workspace-unreachable', async () => {
+    // #given
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'network error'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('unreachable')
+
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unreachable')
+  })
+
+  it('generic/uncategorized failure: failureKind omitted from detailsPatch (no options object, or options without failureKind)', async () => {
+    // #given — a plain Error, not a RunCoreError
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call carries no detailsPatch.failureKind
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7]
+    expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+
+  it('regression: the CANCELLED path still writes cancelledBy and NOT failureKind', async () => {
+    // #given — a run whose registry entry is aborted mid-flight (operator cancel)
+    const {launchWork} = await import('./run.js')
+    const REGRESSION_CANCEL_RUN_ID = 'regression-cancel-run-id'
+    setupHappyPath()
+    const cancelledState = buildMockRunState({phase: 'CANCELLED', run_id: REGRESSION_CANCEL_RUN_ID})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED', run_id: REGRESSION_CANCEL_RUN_ID})},
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING', run_id: REGRESSION_CANCEL_RUN_ID})},
+      })
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'cancelled-etag', state: cancelledState}})
+
+    const cancelledByMetadata = {
+      githubUserId: 1,
+      login: 'someone',
+      sessionCorrelationId: 'sess-x',
+      cancelledAt: '2026-07-04T00:00:00.000Z',
+    }
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(REGRESSION_CANCEL_RUN_ID, 'operator cancel', cancelledByMetadata)
+    })
+
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = REGRESSION_CANCEL_RUN_ID
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — CANCELLED transition carries cancelledBy, not failureKind
+    const cancelledCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'CANCELLED')
+    const cancelledOptions = cancelledCall?.[7] as {detailsPatch: Record<string, unknown>} | undefined
+    expect(cancelledOptions?.detailsPatch.cancelledBy).toEqual(cancelledByMetadata)
+    expect(cancelledOptions?.detailsPatch.failureKind).toBeUndefined()
+
+    abortRegistry.delete(REGRESSION_CANCEL_RUN_ID)
+  })
+
+  it('fallback: CANCELLED transition returns success:false → FAILED fallback persists detailsPatch.failureKind', async () => {
+    // #given — the CANCELLED transitionRun call itself fails; the run falls back to FAILED
+    const {launchWork} = await import('./run.js')
+    const FALLBACK_RUN_ID = 'fallback-cancel-run-id'
+    setupHappyPath()
+    const failedFallbackState = buildMockRunState({phase: 'FAILED', run_id: FALLBACK_RUN_ID})
+    mockRuntime.transitionRun
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED', run_id: FALLBACK_RUN_ID})},
+      })
+      .mockResolvedValueOnce({
+        success: true as const,
+        data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING', run_id: FALLBACK_RUN_ID})},
+      })
+      .mockResolvedValueOnce({success: false as const, error: new Error('CANCELLED transition failed')})
+      .mockResolvedValueOnce({success: true as const, data: {etag: 'failed-etag', state: failedFallbackState}})
+
+    const {RunCoreError} = runCoreModule
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      abortRegistry.abort(FALLBACK_RUN_ID, 'operator cancel')
+      throw new RunCoreError('inactivity-timeout', 'no progress')
+    })
+
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = FALLBACK_RUN_ID
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — the CANCELLED call was attempted, then the FAILED fallback carries failureKind
+    const transitionCalls = mockRuntime.transitionRun.mock.calls
+    const cancelledCall = transitionCalls.find((c: unknown[]) => c[4] === 'CANCELLED')
+    expect(cancelledCall).toBeDefined()
+    const failedFallbackCall = transitionCalls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedFallbackOptions = failedFallbackCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedFallbackOptions?.detailsPatch.failureKind).toBe('inactivity-timeout')
+
+    abortRegistry.delete(FALLBACK_RUN_ID)
+  })
+
+  it('end-to-end (#1109 guard): a real transitionRun(FAILED, {detailsPatch:{failureKind}}) round-trip through the coordination store projects to the operator enum on both surfaces', async () => {
+    // #given — the REAL transitionRun (unmocked for this test) against a fake store adapter,
+    // driving a PENDING run through FAILED with detailsPatch.failureKind, then feeding the
+    // RETURNED state into both operator projections. This ties the write to the read through
+    // the real seam (not a hand-built run-state fake) per the #1109 write-path-trap guard.
+    const {transitionRun: realTransitionRun} =
+      await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+    const {toOperatorRunStatus} = await import('../operator-contract/run-status.js')
+    const {toRunSummary} = await import('../operator-contract/run-summary.js')
+
+    const initialState = buildMockRunState({phase: 'EXECUTING', run_id: 'e2e-run-1', entity_ref: 'acme/widget#1'})
+    let stored = JSON.stringify(initialState)
+    const storeAdapter = {
+      upload: vi.fn(),
+      download: vi.fn(),
+      list: vi.fn(),
+      conditionalPut: vi.fn(async (_key: unknown, data: string) => {
+        stored = data
+        return {success: true as const, data: {etag: 'etag-2'}}
+      }),
+      conditionalDelete: vi.fn(),
+      getObject: vi.fn(async () => ({success: true as const, data: {data: stored, etag: 'etag-1'}})),
+      listWithMetadata: vi.fn(),
+    }
+    const coordinationConfig = {
+      storeAdapter,
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+    const logger = {debug: vi.fn()}
+
+    // #when — the real seam: transitionRun with detailsPatch.failureKind
+    const result = await realTransitionRun(
+      coordinationConfig,
+      'discord-gateway',
+      'acme/widget',
+      'e2e-run-1',
+      'FAILED',
+      'etag-1',
+      logger,
+      {detailsPatch: {failureKind: 'inactivity-timeout'}},
+    )
+    expect(result.success).toBe(true)
+    if (result.success === false) return
+
+    // #then — the RETURNED run-state projects failureKind on both operator surfaces
+    const operatorStatus = toOperatorRunStatus(result.data.state, {
+      nowMs: Date.now(),
+      staleThresholdMs: 60_000,
+      repoKey: {databaseId: 123, nodeId: 'node-123'},
+      isRepoDenylisted: () => false,
+    })
+    expect(operatorStatus?.failureKind).toBe('inactivity-timeout')
+
+    const summary = toRunSummary(result.data.state, {owner: 'acme', repo: 'widget'})
+    expect(summary?.failureKind).toBe('inactivity-timeout')
+  })
+})
