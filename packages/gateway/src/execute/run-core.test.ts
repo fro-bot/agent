@@ -1040,6 +1040,43 @@ describe('runOpenCodeCore', () => {
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('timeout')
     })
+
+    it('event counters: hard-ceiling timeout signal carries counters when at least one event was processed', async () => {
+      // #given — no inactivityTimeoutMs (so only the outer wall-clock signal can abort), a
+      // stream that yields one activity event and then hangs, and an outer signal aborted
+      // via a real timer AFTER that first event has already been processed. This exercises
+      // the `combinedSignal.aborted && !inactivityController.signal.aborted` branch (here
+      // inactivityController is null entirely) that logs 'stream ended due to timeout signal'.
+      const controller = new AbortController()
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: hangingStreamAfterFirst(partDeltaObjectEvent('hi')),
+          }),
+      })
+      const params = {...buildParams(handle), signal: controller.signal, logger, coordinator: makeCoordinator()}
+      // Abort on a real timer tick — the first event (yielded synchronously by the async
+      // generator) is processed well before this fires, since the generator only blocks
+      // on its *second* `next()` call.
+      setTimeout(() => controller.abort(), 5)
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — timeout kind (not inactivity-timeout, since no inactivity controller exists)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          totalEvents: 1,
+          activityEvents: 1,
+          lastEventType: 'message.part.delta',
+        }),
+        'run-core: stream ended due to timeout signal',
+      )
+    })
   })
 
   describe('isAuthError classification', () => {
@@ -1824,6 +1861,7 @@ describe('runOpenCodeCore', () => {
 
     it('throws RunCoreError with kind "stream-ended" when stream closes after some events but before session.idle', async () => {
       // #given — stream yields some text deltas then closes without session.idle
+      const logger = makeLogger()
       const handle = makeHandle({
         subscribe: async () =>
           subscribeOk([
@@ -1831,12 +1869,21 @@ describe('runOpenCodeCore', () => {
             // No sessionIdleEvent — stream ends prematurely
           ]),
       })
-      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+      const params = {...buildParams(handle), logger, coordinator: makeCoordinator()}
 
       // #when / #then
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('stream-ended')
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          totalEvents: 1,
+          activityEvents: 1,
+          lastEventType: 'message.part.delta',
+        }),
+        'run-core: event stream closed before session.idle',
+      )
     })
 
     it('stream-ended error is NOT thrown when signal is aborted (timeout takes precedence)', async () => {
@@ -2237,6 +2284,140 @@ describe('runOpenCodeCore', () => {
       // Note: this test is timing-sensitive but works because the event stream is synchronous
       // in tests — all events are processed before any real timer fires.
       await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+    })
+
+    it('event counters: zero events on inactivity timeout signal the silent-workspace case', async () => {
+      // #given — a completely silent stream (no events at all) and a short inactivity window
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+      const params = {
+        ...buildParams(handle),
+        logger,
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 10,
+      }
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — inactivity-timeout thrown with totalEvents:0, activityEvents:0 (silent hang signature)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('inactivity-timeout')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({sessionId: 'sess-123', totalEvents: 0, activityEvents: 0}),
+        'run-core: stream ended due to inactivity timeout',
+      )
+    }, 10_000)
+
+    it('event counters: events arriving without activity signal the lost-event/routing-gap case', async () => {
+      // #given — events arrive (a foreign-session delta and an unrecognized event type) but
+      // none of them reset the inactivity timer, since none is a recognized same-session activity event.
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: (async function* () {
+              yield partDeltaObjectEvent('should be ignored', 'other-session')
+              yield {type: 'some.unrecognized.event', properties: {sessionID: 'sess-123'}}
+              await new Promise<void>(() => {
+                /* never resolves */
+              })
+            })(),
+          }),
+      })
+      const params = {
+        ...buildParams(handle),
+        logger,
+        coordinator: makeCoordinator(),
+        inactivityTimeoutMs: 10,
+      }
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — totalEvents > 0 but activityEvents stays 0; lastEventType reflects the last processed event
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('inactivity-timeout')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          activityEvents: 0,
+          lastEventType: 'some.unrecognized.event',
+        }),
+        'run-core: stream ended due to inactivity timeout',
+      )
+      const warnCall = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.find(
+        (call: unknown[]) => call[1] === 'run-core: stream ended due to inactivity timeout',
+      )
+      expect((warnCall?.[0] as {totalEvents: number}).totalEvents).toBeGreaterThan(0)
+    }, 10_000)
+
+    it('event counters: unrecognized event type logs at debug and increments totalEvents', async () => {
+      // #given — a stream with one unrecognized event type followed by session.idle
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            {type: 'some.unrecognized.event', properties: {sessionID: 'sess-123'}},
+            sessionIdleEvent('sess-123'),
+          ]),
+      })
+      const params = {
+        ...buildParams(handle),
+        logger,
+        coordinator: makeCoordinator(),
+      }
+
+      // #when
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then — debug log fired for the unrecognized event type
+      expect(logger.debug).toHaveBeenCalledWith(
+        {eventType: 'some.unrecognized.event', sessionId: 'sess-123'},
+        'run-core: unrecognized event type',
+      )
+      // session.idle log carries totalEvents > 0 (counts the unrecognized event + session.idle itself)
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({sessionId: 'sess-123', totalEvents: 2}),
+        'run-core: session.idle received — stream complete',
+      )
+    })
+
+    it('event counters: a normal run reaching session.idle after activity has totalEvents and activityEvents > 0', async () => {
+      // #given — a normal run with text delta activity before session.idle
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () => subscribeOk([partDeltaObjectEvent('Hello'), sessionIdleEvent('sess-123')]),
+      })
+      const params = {
+        ...buildParams(handle),
+        logger,
+        coordinator: makeCoordinator(),
+      }
+
+      // #when
+      await expect(runOpenCodeCore(params)).resolves.toBeUndefined()
+
+      // #then — healthy-baseline signature: both counters > 0
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({sessionId: 'sess-123'}),
+        'run-core: session.idle received — stream complete',
+      )
+      const idleCall = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+        (call: unknown[]) => call[1] === 'run-core: session.idle received — stream complete',
+      )
+      const ctx = idleCall?.[0] as {totalEvents: number; activityEvents: number}
+      expect(ctx.totalEvents).toBeGreaterThan(0)
+      expect(ctx.activityEvents).toBeGreaterThan(0)
     })
 
     it('inactivity timeout does not fire when inactivityTimeoutMs is absent', async () => {

@@ -40,6 +40,7 @@ function makeMockDeps(): FroBotDeps {
       pendingCount: vi.fn().mockReturnValue(0),
       takeNext: vi.fn().mockReturnValue(undefined),
       clear: vi.fn().mockReturnValue(0),
+      removeBy: vi.fn().mockReturnValue(undefined),
     },
     triggerRoleId: null,
     gatewayLogger: {

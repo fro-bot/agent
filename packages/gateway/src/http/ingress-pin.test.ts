@@ -123,6 +123,7 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'GET', path: '/operator/runs'},
   {method: 'POST', path: '/operator/runs'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
+  {method: 'POST', path: '/operator/runs/:runId/cancel'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
 ]
 
@@ -250,6 +251,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
         takeNext: vi.fn(() => undefined),
         pendingCount: vi.fn(() => 0),
         clear: vi.fn(() => 0),
+        removeBy: vi.fn(() => undefined),
       },
       attachUrl: 'http://localhost:3000',
       attachToken: 'stub-token',
@@ -277,6 +279,8 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
       ensureClone: vi.fn(async () => ({success: true as const, data: '/workspace'})),
       readyz: vi.fn(async () => ({success: true as const, data: {ready: true as const, opencode: 'ready' as const}})),
     },
+    // Provide cancelRunDeps so the cancel route is registered in the pinned inventory.
+    cancelRunDeps: {} as unknown as OperatorServerDeps['cancelRunDeps'],
   }
 }
 

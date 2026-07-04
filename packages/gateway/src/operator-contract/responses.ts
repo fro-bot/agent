@@ -10,6 +10,8 @@
  * - camelCase keys match the shipped JSON literals exactly.
  */
 
+import type {TerminalPhase} from '@fro-bot/runtime'
+
 /**
  * Canonical response shape for GET /operator/session.
  *
@@ -53,4 +55,21 @@ export interface OperatorOk {
  */
 export interface OperatorError {
   readonly error: string
+}
+
+/**
+ * Canonical success response shape for POST /operator/runs/:runId/cancel.
+ *
+ * Carries the resulting phase so the dashboard can render honestly whether the
+ * cancel actually transitioned the run ('CANCELLED') or the run was already
+ * terminal (the pre-existing terminal phase — an idempotent no-op, still a
+ * 200, never an error). `runId` echoes the path param for client convenience.
+ *
+ * Internal attribution (`details.cancelledBy`) and coordination fields
+ * (`thread_id`, etc.) are excluded by construction — they never appear here.
+ */
+export interface OperatorCancelResponse {
+  readonly ok: true
+  readonly runId: string
+  readonly phase: TerminalPhase
 }

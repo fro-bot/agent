@@ -103,6 +103,25 @@ export async function createRun(
   return conditionalPut.data(key.data, JSON.stringify(runState), {ifNoneMatch: '*'})
 }
 
+/**
+ * Extension point for fields that must be atomically merged into a run-state write
+ * alongside the phase transition. Sibling additions (e.g. detailsPatch) should be
+ * appended as additional optional fields on this bag rather than as new positional
+ * params on transitionRun.
+ */
+export interface TransitionRunOptions {
+  /** When provided and non-empty, atomically persists the live thread id alongside the phase write. Absent/empty leaves the existing thread_id untouched. */
+  readonly threadId?: string
+  /**
+   * Optional shallow patch merged into `details` alongside the phase change.
+   * Used by operator-attributed transitions (e.g. `details.cancelledBy`) so
+   * attribution lands atomically with the phase write instead of a separate
+   * follow-up write (which would need its own etag round-trip). Absent by
+   * default — existing callers are unaffected.
+   */
+  readonly detailsPatch?: Record<string, unknown>
+}
+
 export async function transitionRun(
   config: CoordinationConfig,
   identity: string,
@@ -111,6 +130,7 @@ export async function transitionRun(
   newPhase: RunPhase,
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  options?: TransitionRunOptions,
 ): Promise<Result<{etag: string; state: RunState}, Error>> {
   const key = getRunKey(config, identity, repo, runId)
   if (key.success === false) {
@@ -143,7 +163,16 @@ export async function transitionRun(
 
   // The caller-supplied etag is the single concurrency gate. S3's IfMatch enforces atomicity —
   // a 412 here means another writer modified the object since the caller's last fetch.
-  const nextState: RunState = {...parsedCurrent.data, phase: newPhase}
+  const threadId = options?.threadId
+  const detailsPatch = options?.detailsPatch
+  const mergedDetails =
+    detailsPatch === undefined ? undefined : {details: {...parsedCurrent.data.details, ...detailsPatch}}
+  const nextState: RunState = {
+    ...parsedCurrent.data,
+    phase: newPhase,
+    ...(threadId !== undefined && threadId !== '' ? {thread_id: threadId} : {}),
+    ...mergedDetails,
+  }
   logger.debug('Transitioning run-state', {
     key: key.data,
     from: parsedCurrent.data.phase,
