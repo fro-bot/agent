@@ -23,7 +23,15 @@ import type {CoordinationConfig} from '@fro-bot/runtime'
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
-import {findStaleRuns, getLockKey, getRunKey, releaseLock, transitionRun} from '@fro-bot/runtime'
+import {
+  findStaleRuns,
+  forceReleaseStaleLock,
+  getLockKey,
+  getRunKey,
+  parseRunState,
+  releaseLock,
+  transitionRun,
+} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -166,18 +174,126 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
     }
 
     const staleRuns = staleResult.data
-    if (staleRuns.length === 0) {
-      continue
+    if (staleRuns.length > 0) {
+      logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
+
+      for (const run of staleRuns) {
+        await recoverOneRun({run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger})
+      }
     }
 
-    logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
-
-    for (const run of staleRuns) {
-      await recoverOneRun({run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger})
-    }
+    // A crash between committing the CANCELLED transition and releasing the repo
+    // lock is invisible to findStaleRuns (its phase filter only matches
+    // EXECUTING/PENDING/ACKNOWLEDGED — CANCELLED is terminal and intentionally
+    // skipped there). Reconcile separately: if the repo's lock is still held by
+    // a run whose committed state is CANCELLED, release it. The run itself is
+    // already terminal and must NOT be re-transitioned.
+    await reconcileCancelledLock({repo, coordinationConfig, identity, coordLogger, logger})
   }
 
   logger.info({}, 'recovery: stale-run sweep complete')
+}
+
+// ---------------------------------------------------------------------------
+// Cancelled-run lock reconciliation
+// ---------------------------------------------------------------------------
+
+interface ReconcileCancelledLockOpts {
+  readonly repo: string
+  readonly coordinationConfig: CoordinationConfig
+  readonly identity: string
+  readonly coordLogger: {debug: (message: string, context?: Record<string, unknown>) => void}
+  readonly logger: GatewayLogger
+}
+
+/**
+ * Release a repo's lock when it is still held by a run whose committed
+ * run-state phase is CANCELLED.
+ *
+ * The run itself is terminal and is never re-transitioned — only the lock is
+ * reconciled. Release goes through `forceReleaseStaleLock`, which independently
+ * re-verifies both dead-run signals (lease + heartbeat staleness) and performs
+ * an `IfMatch`-conditional delete, so a newer run that re-acquired the lock
+ * after this one's lease expired is never clobbered.
+ *
+ * No-ops (logged at debug) when: no lock exists, the lock belongs to a
+ * different run_id, the owning run-state cannot be read, or the owning run's
+ * phase is not CANCELLED. Any error is logged and swallowed — one repo's
+ * failure must not block the rest of the startup sweep.
+ */
+async function reconcileCancelledLock(opts: ReconcileCancelledLockOpts): Promise<void> {
+  const {repo, coordinationConfig, identity, coordLogger, logger} = opts
+
+  const lockKeyResult = getLockKey(coordinationConfig, repo)
+  if (lockKeyResult.success === false) {
+    logger.warn(
+      {repo, err: lockKeyResult.error.message},
+      'recovery: could not build lock key — skipping cancelled-lock reconciliation',
+    )
+    return
+  }
+
+  const lockFetch = await fetchLockRecord(coordinationConfig, lockKeyResult.data, logger)
+  if (lockFetch === null || lockFetch.runId === null) {
+    // No lock, or lock content unreadable/lacks run_id — nothing to reconcile.
+    return
+  }
+
+  const runKeyResult = getRunKey(coordinationConfig, identity, repo, lockFetch.runId)
+  if (runKeyResult.success === false) {
+    logger.warn(
+      {repo, runId: lockFetch.runId, err: runKeyResult.error.message},
+      'recovery: could not build run key — skipping cancelled-lock reconciliation',
+    )
+    return
+  }
+
+  if (coordinationConfig.storeAdapter.getObject == null) {
+    logger.warn({repo}, 'recovery: store adapter does not support getObject — skipping cancelled-lock reconciliation')
+    return
+  }
+
+  const runResult = await coordinationConfig.storeAdapter.getObject(runKeyResult.data)
+  if (runResult.success === false) {
+    // Absent or unreadable run-state for the lock's run_id — not this reconciliation's
+    // concern (forceReleaseStaleLock's own dead-run check handles absence separately).
+    return
+  }
+
+  const parsedRun = parseRunState(runResult.data.data)
+  if (parsedRun.success === false || parsedRun.data.phase !== 'CANCELLED') {
+    // Only CANCELLED-held locks are in scope for this pass — live/other-terminal
+    // runs are left alone (EXECUTING is handled by the stale-run sweep above;
+    // COMPLETED/FAILED runs release their own lock before reaching that phase).
+    return
+  }
+
+  const releaseResult = await forceReleaseStaleLock(coordinationConfig, repo, identity, coordLogger)
+  if (releaseResult.success === false) {
+    logger.warn(
+      {repo, runId: lockFetch.runId, err: releaseResult.error.message},
+      'recovery: forceReleaseStaleLock errored while reconciling cancelled-run lock — continuing',
+    )
+    return
+  }
+
+  const outcome = releaseResult.data
+  if (outcome.outcome === 'released') {
+    logger.info(
+      {repo, runId: lockFetch.runId},
+      'recovery: released repo lock stranded by a crash between CANCELLED commit and lock release',
+    )
+  } else if (outcome.outcome === 'live-holder' || outcome.outcome === 'conflict') {
+    logger.info(
+      {repo, runId: lockFetch.runId, outcome: outcome.outcome},
+      'recovery: cancelled-lock reconciliation skipped release — lock is live or was re-acquired by a newer run',
+    )
+  } else {
+    logger.debug(
+      {repo, runId: lockFetch.runId, outcome: outcome.outcome},
+      'recovery: cancelled-lock reconciliation outcome',
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------

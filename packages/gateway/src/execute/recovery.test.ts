@@ -12,13 +12,19 @@ import {recoverStaleRuns} from './recovery.js'
 // Mock @fro-bot/runtime
 // ---------------------------------------------------------------------------
 
-vi.mock('@fro-bot/runtime', () => ({
-  getRunKey: vi.fn(),
-  getLockKey: vi.fn(),
-  findStaleRuns: vi.fn(),
-  transitionRun: vi.fn(),
-  releaseLock: vi.fn(),
-}))
+vi.mock('@fro-bot/runtime', async () => {
+  const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+  return {
+    getRunKey: vi.fn(),
+    getLockKey: vi.fn(),
+    findStaleRuns: vi.fn(),
+    transitionRun: vi.fn(),
+    releaseLock: vi.fn(),
+    forceReleaseStaleLock: vi.fn(),
+    // parseRunState is pure JSON-shape validation — use the real implementation.
+    parseRunState: actual.parseRunState,
+  }
+})
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors
@@ -29,6 +35,7 @@ const mockGetLockKey = vi.mocked(runtimeModule.getLockKey)
 const mockFindStaleRuns = vi.mocked(runtimeModule.findStaleRuns)
 const mockTransitionRun = vi.mocked(runtimeModule.transitionRun)
 const mockReleaseLock = vi.mocked(runtimeModule.releaseLock)
+const mockForceReleaseStaleLock = vi.mocked(runtimeModule.forceReleaseStaleLock)
 
 // ---------------------------------------------------------------------------
 // Test constants
@@ -116,6 +123,37 @@ function makeThread(): SinkThread {
   return {send: vi.fn().mockResolvedValue(undefined)}
 }
 
+function makeCancelledLockFixture(overrides: {lockRunId?: string} = {}): CoordinationConfig {
+  const runStateJson = JSON.stringify({
+    run_id: RUN_ID,
+    surface: 'discord',
+    thread_id: THREAD_ID,
+    entity_ref: REPO_SLUG,
+    phase: 'CANCELLED',
+    started_at: new Date().toISOString(),
+    last_heartbeat: new Date().toISOString(),
+    holder_id: 'discord-gateway',
+    details: {},
+  })
+
+  const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+    if (key === RUN_KEY) return {success: true, data: {data: runStateJson, etag: RUN_ETAG}}
+    if (key === LOCK_KEY) {
+      return {
+        success: true,
+        data: {data: JSON.stringify({run_id: overrides.lockRunId ?? RUN_ID}), etag: LOCK_ETAG},
+      }
+    }
+    return {success: false, error: new Error('not found')}
+  })
+
+  const base = makeCoordinationConfig()
+  return {
+    ...base,
+    storeAdapter: {...base.storeAdapter, getObject: getObjectFn},
+  }
+}
+
 function makeDeps(overrides: Partial<RecoverStaleRunsDeps> = {}): RecoverStaleRunsDeps {
   return {
     coordinationConfig: overrides.coordinationConfig ?? makeCoordinationConfig(),
@@ -165,6 +203,10 @@ beforeEach(() => {
     data: {etag: 'etag-run-2', state: makeStaleRun({phase: 'FAILED'})},
   })
   mockReleaseLock.mockResolvedValue({success: true, data: undefined})
+  mockForceReleaseStaleLock.mockResolvedValue({
+    success: true,
+    data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -499,6 +541,139 @@ describe('recoverStaleRuns', () => {
       )
       expect(mockReleaseLock).toHaveBeenCalledWith(expect.anything(), REPO_SLUG, LOCK_ETAG, expect.anything())
       expect(thread.send).toHaveBeenCalled()
+    })
+  })
+
+  describe('cancelled-run lock reconciliation', () => {
+    it('releases the lock via forceReleaseStaleLock when it is still held by a CANCELLED run', async () => {
+      // #given — no other stale runs; a CANCELLED run whose own lock is still live
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const coordinationConfig = makeCancelledLockFixture()
+      mockForceReleaseStaleLock.mockResolvedValue({
+        success: true,
+        data: {
+          outcome: 'released',
+          holderId: 'discord-gateway',
+          runId: RUN_ID,
+          lockAgeMs: 999_999,
+          heartbeatAgeMs: 999_999,
+        },
+      })
+      const logger = makeLogger()
+      const deps = makeDeps({coordinationConfig, logger})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — release goes through the dead-run-verified path, not a raw releaseLock
+      expect(mockForceReleaseStaleLock).toHaveBeenCalledWith(
+        coordinationConfig,
+        REPO_SLUG,
+        'discord-gateway',
+        expect.anything(),
+      )
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({repo: REPO_SLUG, runId: RUN_ID}),
+        expect.stringContaining('released repo lock stranded'),
+      )
+    })
+
+    it('leaves the lock untouched when it was re-acquired by a newer run (ownership mismatch)', async () => {
+      // #given — the lock's run_id no longer matches the CANCELLED run that originally held it
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const coordinationConfig = makeCancelledLockFixture({lockRunId: 'run-newer-999'})
+      const deps = makeDeps({coordinationConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — reconciliation reads run-state for the LOCK's run_id (run-newer-999), which is
+      // not the CANCELLED fixture (RUN_ID) — forceReleaseStaleLock must not even be attempted
+      expect(mockForceReleaseStaleLock).not.toHaveBeenCalled()
+    })
+
+    it('is a no-op when the CANCELLED run holds no lock', async () => {
+      // #given — CANCELLED run-state exists, but no lock object for the repo
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === LOCK_KEY) return {success: false, error: new Error('not found')}
+        return {success: false, error: new Error('not found')}
+      })
+      const base = makeCoordinationConfig()
+      const coordinationConfig = {...base, storeAdapter: {...base.storeAdapter, getObject: getObjectFn}}
+      const deps = makeDeps({coordinationConfig})
+
+      // #when
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockForceReleaseStaleLock).not.toHaveBeenCalled()
+    })
+
+    it('continues the sweep when forceReleaseStaleLock errors (fail-soft)', async () => {
+      // #given
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const coordinationConfig = makeCancelledLockFixture()
+      mockForceReleaseStaleLock.mockResolvedValue({success: false, error: new Error('conditional delete boom')})
+      const logger = makeLogger()
+      const deps = makeDeps({coordinationConfig, logger})
+
+      // #when — must not throw; startup sweep completes
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({repo: REPO_SLUG, runId: RUN_ID}),
+        expect.stringContaining('forceReleaseStaleLock errored'),
+      )
+    })
+
+    it('does not attempt reconciliation for a non-CANCELLED terminal run (FAILED) holding the lock', async () => {
+      // #given — a lock owned by a FAILED (not CANCELLED) run
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+      const runStateJson = JSON.stringify({
+        run_id: RUN_ID,
+        surface: 'discord',
+        thread_id: THREAD_ID,
+        entity_ref: REPO_SLUG,
+        phase: 'FAILED',
+        started_at: new Date().toISOString(),
+        last_heartbeat: new Date().toISOString(),
+        holder_id: 'discord-gateway',
+        details: {},
+      })
+      const getObjectFn = vi.fn().mockImplementation(async (key: string) => {
+        if (key === RUN_KEY) return {success: true, data: {data: runStateJson, etag: RUN_ETAG}}
+        if (key === LOCK_KEY) return {success: true, data: {data: JSON.stringify({run_id: RUN_ID}), etag: LOCK_ETAG}}
+        return {success: false, error: new Error('not found')}
+      })
+      const base = makeCoordinationConfig()
+      const coordinationConfig = {...base, storeAdapter: {...base.storeAdapter, getObject: getObjectFn}}
+      const deps = makeDeps({coordinationConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — only CANCELLED-held locks are reconciled by this pass
+      expect(mockForceReleaseStaleLock).not.toHaveBeenCalled()
+    })
+
+    it('does not disturb existing EXECUTING/PENDING/ACKNOWLEDGED recovery when a separate CANCELLED lock is also reconciled', async () => {
+      // #given — one stale EXECUTING run (existing path) plus a CANCELLED run's lock is NOT
+      // the one held (findStaleRuns path exercises the same repo scan already covered above);
+      // here we assert the two passes coexist without interference.
+      const staleExecuting = makeStaleRun({phase: 'EXECUTING'})
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleExecuting]})
+      const coordinationConfig = makeCoordinationConfig() // lock owned by RUN_ID, run-state is '{}' (not CANCELLED)
+      const deps = makeDeps({coordinationConfig})
+
+      // #when
+      await recoverStaleRuns(deps)
+
+      // #then — existing EXECUTING recovery still fires; cancelled-lock pass is a no-op (parse fails)
+      expect(mockTransitionRun).toHaveBeenCalled()
+      expect(mockReleaseLock).toHaveBeenCalled()
+      expect(mockForceReleaseStaleLock).not.toHaveBeenCalled()
     })
   })
 
