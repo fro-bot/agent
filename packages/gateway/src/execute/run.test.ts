@@ -7049,9 +7049,23 @@ describe('operator cancel — abort-registry integration', () => {
   })
 
   it('cancelled transition failure falls back to FAILED terminalization — run does not remain EXECUTING', async () => {
-    // #given — the CANCELLED transitionRun call fails; a subsequent FAILED transitionRun succeeds
+    // #given — the CANCELLED transitionRun call fails; a re-read shows the run still
+    // EXECUTING with a fresh etag; the FAILED fallback uses that fresh etag and succeeds
     const {launchWork} = await import('./run.js')
     const failedState = buildMockRunState({phase: 'FAILED', run_id: 'cancel-fallback-run-id'})
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-run-id'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(executingState), etag: 'fresh-etag-after-cancel-412'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
 
     mockRuntime.acquireLock.mockResolvedValue({
       success: true as const,
@@ -7094,7 +7108,7 @@ describe('operator cancel — abort-registry integration', () => {
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
     const request = makeInMemoryRequest()
     ;(request as {runId?: string}).runId = CANCEL_FALLBACK_RUN_ID
-    const deps = makeDeps({logger})
+    const deps = makeDeps({logger, coordinationConfig})
 
     // #when — must not throw
     await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
@@ -7106,6 +7120,12 @@ describe('operator cancel — abort-registry integration', () => {
     const observedPhases = transitionCalls.map((c: unknown[]) => c[4] as string)
     expect(observedPhases).toContain('CANCELLED')
     expect(observedPhases).toContain('FAILED')
+
+    // #and — the re-read happened, and the FAILED fallback used the FRESH etag from the
+    // re-read (not the stale runEtag the CANCELLED write was rejected with).
+    expect(getObjectMock).toHaveBeenCalled()
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    expect(failedCall?.[5]).toBe('fresh-etag-after-cancel-412')
 
     // #and — the run does not remain EXECUTING: the FAILED fallback call is the last
     // observed terminal-settlement attempt for this run, confirming it did not stay open.
@@ -7121,6 +7141,343 @@ describe('operator cancel — abort-registry integration', () => {
     abortRegistry.delete(CANCEL_FALLBACK_RUN_ID)
   })
 
+  for (const terminalPhase of ['COMPLETED', 'FAILED', 'CANCELLED'] as const) {
+    it(`cancelled transition failure + re-read shows run ALREADY TERMINAL (concurrent writer landed ${terminalPhase}) — no FAILED fallback attempted`, async () => {
+      // #given — the CANCELLED transitionRun call fails, but a re-read shows a concurrent
+      // writer already landed on a terminal phase — the FAILED fallback must be skipped
+      // (FAILED is not a valid transition from any terminal phase)
+      const {launchWork} = await import('./run.js')
+      const terminalState = buildMockRunState({
+        phase: terminalPhase,
+        run_id: `cancel-fallback-terminal-run-id-${terminalPhase}`,
+      })
+      const getObjectMock = vi.fn().mockResolvedValue({
+        success: true as const,
+        data: {data: JSON.stringify(terminalState), etag: 'terminal-etag'},
+      })
+      const coordinationConfig = {
+        storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      mockRuntime.transitionRun.mockImplementation(
+        async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+          if (phase === 'CANCELLED') {
+            return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+          }
+          // ACKNOWLEDGED / EXECUTING admission transitions
+          return {success: true as const, data: {etag: 'admit-etag', state: terminalState}}
+        },
+      )
+      const heartbeatStop = vi.fn().mockResolvedValue({
+        success: true,
+        data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: terminalState},
+      })
+      mockRuntime.createHeartbeatController.mockReturnValue({
+        start: vi.fn(),
+        stop: heartbeatStop,
+        isRunning: false,
+      })
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+      const TERMINAL_RUN_ID = `cancel-fallback-terminal-run-id-${terminalPhase}`
+      mockRunOpenCodeCoreAbortedBy(() => {
+        abortRegistry.abort(TERMINAL_RUN_ID, 'operator cancel')
+      })
+
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const request = makeInMemoryRequest()
+      ;(request as {runId?: string}).runId = TERMINAL_RUN_ID
+      const deps = makeDeps({logger, coordinationConfig})
+
+      // #when — must not throw
+      await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+      // #then — the FAILED fallback transitionRun was NEVER attempted
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).not.toContain('FAILED')
+
+      // #and — a log records the concurrent terminalization with the observed phase
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({runId: TERMINAL_RUN_ID, phase: terminalPhase}),
+        expect.stringContaining('already terminalized'),
+      )
+
+      abortRegistry.delete(TERMINAL_RUN_ID)
+    })
+  }
+
+  it('cancelled transition failure + re-read fails (read error) — no fallback write, warn logged, no throw', async () => {
+    // #given — the CANCELLED transitionRun call fails, and the subsequent re-read also
+    // fails (e.g. getObject error) — the fallback must be skipped fail-soft, no throw
+    const {launchWork} = await import('./run.js')
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-readfail-run-id'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: false as const,
+      error: new Error('getObject transient failure'),
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: executingState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const READFAIL_RUN_ID = 'cancel-fallback-readfail-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(READFAIL_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = READFAIL_RUN_ID
+    const deps = makeDeps({logger, coordinationConfig})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the FAILED fallback transitionRun was NEVER attempted
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).not.toContain('FAILED')
+
+    // #and — a warn log records the skipped fallback (fail-soft; recovery reconciles)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: READFAIL_RUN_ID}),
+      expect.stringContaining('skipping FAILED fallback'),
+    )
+
+    abortRegistry.delete(READFAIL_RUN_ID)
+  })
+
+  it('cancelled transition failure + re-read data is unparseable — no fallback write, warn logged, no throw', async () => {
+    // #given — the CANCELLED transitionRun call fails, and the subsequent re-read's stored
+    // data fails to parse (corrupt/malformed run state) — parseRunState failure inside
+    // readCurrentRunStateWithEtag must be treated as fail-soft and skip the fallback write
+    const {launchWork} = await import('./run.js')
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: '{not-valid-json', etag: 'corrupt-etag'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-parsefail-run-id'})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: executingState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const PARSEFAIL_RUN_ID = 'cancel-fallback-parsefail-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(PARSEFAIL_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = PARSEFAIL_RUN_ID
+    const deps = makeDeps({logger, coordinationConfig})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the FAILED fallback transitionRun was NEVER attempted
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).not.toContain('FAILED')
+
+    // #and — a warn log records the skipped fallback (fail-soft; recovery reconciles)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: PARSEFAIL_RUN_ID}),
+      expect.stringContaining('skipping FAILED fallback'),
+    )
+
+    abortRegistry.delete(PARSEFAIL_RUN_ID)
+  })
+
+  it('cancelled transition failure + no getObject adapter — re-read unsupported, no fallback write, warn logged, no throw', async () => {
+    // #given — the CANCELLED transitionRun call fails, and the store adapter does not
+    // support getObject at all — readCurrentRunStateWithEtag must return null without
+    // throwing and the fallback write must be skipped fail-soft
+    const {launchWork} = await import('./run.js')
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn()},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
+
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-noadapter-run-id'})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: executingState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const NOADAPTER_RUN_ID = 'cancel-fallback-noadapter-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(NOADAPTER_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = NOADAPTER_RUN_ID
+    const deps = makeDeps({logger, coordinationConfig})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the FAILED fallback transitionRun was NEVER attempted
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).not.toContain('FAILED')
+
+    // #and — a warn log records the skipped fallback (fail-soft; recovery reconciles)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: NOADAPTER_RUN_ID}),
+      expect.stringContaining('skipping FAILED fallback'),
+    )
+
+    abortRegistry.delete(NOADAPTER_RUN_ID)
+  })
+
+  it('happy cancel path (CANCELLED transition succeeds) — no re-read, no fallback attempted', async () => {
+    // #given — the CANCELLED transitionRun call succeeds outright
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const cancelledState = buildMockRunState({phase: 'CANCELLED', run_id: 'cancel-happy-run-id'})
+    const getObjectMock = vi.fn()
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+    } as unknown as CoordinationConfig
+
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: true as const, data: {etag: 'cancelled-etag', state: cancelledState}}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: cancelledState}}
+      },
+    )
+
+    const HAPPY_CANCEL_RUN_ID = 'cancel-happy-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(HAPPY_CANCEL_RUN_ID, 'operator cancel')
+    })
+
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = HAPPY_CANCEL_RUN_ID
+    const deps = makeDeps({coordinationConfig})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the CANCELLED transition succeeded; no re-read (getObject) was ever needed
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+    expect(transitionPhases).not.toContain('FAILED')
+    expect(getObjectMock).not.toHaveBeenCalled()
+
+    abortRegistry.delete(HAPPY_CANCEL_RUN_ID)
+  })
+
   it('cancelled→failed fallback reaches a terminal state without throwing (accepted notice-vs-settlement interleaving)', async () => {
     // #given — same CANCELLED-transition-fails/FAILED-fallback-succeeds setup as above.
     // ACCEPTED BEHAVIOR: cancelRun (execute/cancel.ts) posts the "cancelled" thread
@@ -7133,6 +7490,19 @@ describe('operator cancel — abort-registry integration', () => {
     // by cancel.test.ts's "abort delivered → notice posted" test.
     const {launchWork} = await import('./run.js')
     const failedState = buildMockRunState({phase: 'FAILED', run_id: 'cancel-fallback-pin-run-id'})
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: 'cancel-fallback-pin-run-id'})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(executingState), etag: 'fresh-etag-pin'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
 
     mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
     mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
@@ -7170,7 +7540,7 @@ describe('operator cancel — abort-registry integration', () => {
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
     const request = makeInMemoryRequest()
     ;(request as {runId?: string}).runId = PIN_RUN_ID
-    const deps = makeDeps({logger})
+    const deps = makeDeps({logger, coordinationConfig})
 
     // #when — the run must resolve (not throw, not hang) despite the CANCELLED
     // transition failing.
@@ -7561,6 +7931,19 @@ describe('failureKind persistence on FAILED transitions', () => {
     const FALLBACK_RUN_ID = 'fallback-cancel-run-id'
     setupHappyPath()
     const failedFallbackState = buildMockRunState({phase: 'FAILED', run_id: FALLBACK_RUN_ID})
+    const executingState = buildMockRunState({phase: 'EXECUTING', run_id: FALLBACK_RUN_ID})
+    const getObjectMock = vi.fn().mockResolvedValue({
+      success: true as const,
+      data: {data: JSON.stringify(executingState), etag: 'fresh-etag-failurekind'},
+    })
+    const coordinationConfig = {
+      storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+      storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    } as unknown as CoordinationConfig
     mockRuntime.transitionRun
       .mockResolvedValueOnce({
         success: true as const,
@@ -7581,7 +7964,7 @@ describe('failureKind persistence on FAILED transitions', () => {
 
     const request = makeInMemoryRequest()
     ;(request as {runId?: string}).runId = FALLBACK_RUN_ID
-    const deps = makeDeps()
+    const deps = makeDeps({coordinationConfig})
 
     // #when
     await awaitLaunchWorkRun(launchWork, request, deps)
