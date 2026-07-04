@@ -1730,6 +1730,13 @@ function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalReg
   }
 }
 
+/** Shared stub for cancelRunDeps — opaque sentinel for registration tests only. */
+function makeStubCancelRunDeps(): NonNullable<OperatorServerDeps['cancelRunDeps']> {
+  // Registration only checks `deps.cancelRunDeps !== undefined`; the actual
+  // shape is not inspected at construction time. Cast to satisfy the type.
+  return {} as unknown as NonNullable<OperatorServerDeps['cancelRunDeps']>
+}
+
 /** Shared stub for launchWorkDeps — opaque sentinel for registration tests only. */
 function makeStubLaunchWorkDeps(): NonNullable<OperatorServerDeps['launchWorkDeps']> {
   // Registration only checks `deps.launchWorkDeps !== undefined`; the actual
@@ -1756,6 +1763,7 @@ function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySe
     getBindingByRepo: async () => ({success: true, data: null}),
     launchWorkDeps: makeStubLaunchWorkDeps(),
     approvalRegistry: makeStubApprovalRegistry(),
+    cancelRunDeps: makeStubCancelRunDeps(),
     rateLimiter: {allow: () => true},
   })
 }
@@ -1829,6 +1837,7 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(routePaths).not.toContain('GET:/operator/runs/:runId/stream')
     expect(routePaths).not.toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')
     expect(routePaths).not.toContain('GET:/operator/runs/:runId/approvals')
+    expect(routePaths).not.toContain('POST:/operator/runs/:runId/cancel')
 
     // #and — health, auth, session routes ARE registered
     expect(routePaths).toContain('GET:/operator/health')

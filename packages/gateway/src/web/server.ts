@@ -24,6 +24,7 @@
 import type {ServerType} from '@hono/node-server'
 import type {ApprovalRegistry} from '../approvals/registry.js'
 import type {RepoBinding} from '../bindings/types.js'
+import type {CancelRunDeps} from '../execute/cancel.js'
 import type {RunIndex} from '../execute/run-index.js'
 import type {RunMentionDeps} from '../execute/run.js'
 import type {DenylistCache} from '../redaction/denylist.js'
@@ -48,6 +49,7 @@ import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {assertAllPrivilegedRoutesWrapped, registerPublicRoute, setOperatorRouteGuard} from './operator-route.js'
+import {buildCancelRoute} from './operator/cancel-route.js'
 import {buildDecisionRoute} from './operator/decision-route.js'
 import {createIdempotencyGuard} from './operator/idempotency.js'
 import {buildLaunchRoute} from './operator/launch-route.js'
@@ -213,6 +215,18 @@ export interface OperatorServerDeps {
    * When absent, neither route is registered (opt-in).
    */
   readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision' | 'describePendingForScope'>
+  /**
+   * Cancel-run engine dependencies (queue, abort registry, approvals, Discord
+   * client, coordination config/identity) for the cancel route's `cancelRun`
+   * orchestrator call.
+   *
+   * When present (alongside the browser guard, sessionStore, denylistCache,
+   * bindingsLookup, runIndex, approvalRegistry, and auditLogger), the following
+   * route is registered:
+   *   - POST /operator/runs/:runId/cancel (write-gated)
+   * When absent, the route is not registered (opt-in).
+   */
+  readonly cancelRunDeps?: CancelRunDeps
 }
 
 export interface OperatorServerConfig {
@@ -824,6 +838,61 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       registry: deps.approvalRegistry,
+      auditLogger: deps.auditLogger,
+      logger: deps.logger,
+      now: clock,
+    })
+  }
+
+  // ── Cancel route ───────────────────────────────────────────────────────────
+  //
+  // Registered only when the full browser guard is present AND the cancel-run
+  // engine deps, runIndex, denylistCache, bindingsLookup, and auditLogger are
+  // provided. Route: POST /operator/runs/:runId/cancel — privileged
+  //   (requires session + allowlist + CSRF; write-level repo authz).
+  //
+  // Gate ordering (mirrors the decision route):
+  //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
+  //   2. Session token resolution
+  //   3. RunIndex.lookup (server-owned runId → repo resolution)
+  //   4. Split owner/repo
+  //   5. Denylist check (before authz, no oracle)
+  //   6. checkRepoWriteAuthz (WRITE-level — not read)
+  //   7. Operator-keyed rate limit (AFTER authz)
+  //   8. Build CancelActorContext from session
+  //   9. cancelRun(params, deps) — transport-neutral orchestrator
+  //  10. Emit run.cancel.* audit record
+  //  11. Map CancelOutcome → JSON response
+  //
+  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // A gate throw degrades to the same denial, not a distinguishable 500.
+  if (
+    browserGuardDeps !== undefined &&
+    deps.sessionStore !== undefined &&
+    deps.denylistCache !== undefined &&
+    deps.bindingsLookup !== undefined &&
+    deps.runIndex !== undefined &&
+    deps.approvalRegistry !== undefined &&
+    deps.allowlist !== undefined &&
+    deps.auditLogger !== undefined &&
+    deps.cancelRunDeps !== undefined
+  ) {
+    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
+    buildCancelRoute(app, {
+      sessionStore: deps.sessionStore,
+      runIndex: deps.runIndex,
+      denylistCache: deps.denylistCache,
+      bindingsLookup: deps.bindingsLookup,
+      repoAuthzDeps: {
+        allowlist: deps.allowlist,
+        fetch: globalThis.fetch,
+        clock,
+        random: Math.random.bind(Math),
+        auditLogger: deps.auditLogger,
+        logger: deps.logger,
+        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
+      },
+      cancelRunDeps: deps.cancelRunDeps,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
       now: clock,
