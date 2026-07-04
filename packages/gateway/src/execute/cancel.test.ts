@@ -104,18 +104,6 @@ function makeApprovalRegistry(
   }
 }
 
-function makeDiscordClient(sendMock = vi.fn().mockResolvedValue(undefined)): CancelRunDeps['discordClient'] {
-  const channel = {
-    isTextBased: () => true,
-    send: sendMock,
-  }
-  return {
-    channels: {
-      fetch: vi.fn().mockResolvedValue(channel),
-    } as unknown as CancelRunDeps['discordClient']['channels'],
-  }
-}
-
 function makeDeps(overrides: Partial<CancelRunDeps> & {readonly runState: RunState}): CancelRunDeps {
   const {runState, ...rest} = overrides
   return {
@@ -125,7 +113,7 @@ function makeDeps(overrides: Partial<CancelRunDeps> & {readonly runState: RunSta
     queue: rest.queue ?? makeQueue(),
     abortRegistry: rest.abortRegistry ?? makeAbortRegistry(),
     approvalRegistry: rest.approvalRegistry ?? makeApprovalRegistry(),
-    discordClient: rest.discordClient ?? makeDiscordClient(),
+    postCancelNotice: rest.postCancelNotice ?? vi.fn().mockResolvedValue(undefined),
     runObserver: rest.runObserver,
     now: rest.now ?? (() => new Date('2026-07-03T12:00:00.000Z').getTime()),
   }
@@ -160,8 +148,8 @@ describe('cancelRun — already-terminal', () => {
     // #given — the run is already COMPLETED
     const runState = makeRunState({phase: 'COMPLETED'})
     const coordinationConfig = makeCoordinationConfig(runState)
-    const discordClient = makeDiscordClient()
-    const deps = makeDeps({runState, coordinationConfig, discordClient})
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, coordinationConfig, postCancelNotice})
 
     // #when
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
@@ -169,8 +157,7 @@ describe('cancelRun — already-terminal', () => {
     // #then — origin AE1: idempotent, no transition, no notice
     expect(result).toEqual({outcome: 'already-terminal', phase: 'COMPLETED'})
     expect(coordinationConfig.storeAdapter.conditionalPut).not.toHaveBeenCalled()
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- vi.fn() mock reference, not a real method
-    expect(discordClient.channels.fetch).not.toHaveBeenCalled()
+    expect(postCancelNotice).not.toHaveBeenCalled()
   })
 })
 
@@ -185,9 +172,8 @@ describe('cancelRun — queued', () => {
     const task = {runId: 'run-1'} as unknown as RunTask
     const queue = makeQueue({removeBy: vi.fn().mockReturnValue(task)})
     const observe = vi.fn().mockResolvedValue(undefined)
-    const sendMock = vi.fn().mockResolvedValue(undefined)
-    const discordClient = makeDiscordClient(sendMock)
-    const deps = makeDeps({runState, queue, runObserver: {observe}, discordClient})
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, queue, runObserver: {observe}, postCancelNotice})
 
     // #when
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
@@ -202,8 +188,7 @@ describe('cancelRun — queued', () => {
       login: 'octocat',
       sessionCorrelationId: 'sess-1',
     })
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
-    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({content: expect.stringContaining('cancelled')}))
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
   })
 
   it('does not touch an active run on the same channel (other queue entries untouched)', async () => {
@@ -247,9 +232,8 @@ describe('cancelRun — executing', () => {
       handleDecision,
     })
     const abortRegistry = makeAbortRegistry({has: vi.fn().mockReturnValue(true), abort})
-    const sendMock = vi.fn().mockResolvedValue(undefined)
-    const discordClient = makeDiscordClient(sendMock)
-    const deps = makeDeps({runState, approvalRegistry, abortRegistry, discordClient})
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, approvalRegistry, abortRegistry, postCancelNotice})
 
     // #when
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
@@ -270,7 +254,7 @@ describe('cancelRun — executing', () => {
     )
     // #and — settlement happens BEFORE the abort fires
     expect(callOrder).toEqual(['handleDecision', 'abort'])
-    expect(sendMock).toHaveBeenCalled()
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
   })
 
   it('asserts no direct registry-state mutation — only handleDecision is called for settlement', async () => {
@@ -420,41 +404,33 @@ describe('cancelRun — double-miss rendezvous', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancelRun — thread notice failure', () => {
-  it('cancellation still succeeds when the notice send fails', async () => {
-    // #given — channels.fetch throws
+  it('cancellation still succeeds when postCancelNotice rejects', async () => {
+    // #given — the injected notice callback rejects (belt-and-suspenders .catch in cancel.ts)
     const runState = makeRunState({phase: 'PENDING'})
     const task = {runId: 'run-1'} as unknown as RunTask
     const queue = makeQueue({removeBy: vi.fn().mockReturnValue(task)})
-    const discordClient: CancelRunDeps['discordClient'] = {
-      channels: {
-        fetch: vi.fn().mockRejectedValue(new Error('discord unreachable')),
-      } as unknown as CancelRunDeps['discordClient']['channels'],
-    }
+    const postCancelNotice = vi.fn().mockRejectedValue(new Error('discord unreachable'))
     const logger = makeLogger()
-    const deps = makeDeps({runState, queue, discordClient})
+    const deps = makeDeps({runState, queue, postCancelNotice})
 
     // #when
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger}, deps)
 
-    // #then — outcome unaffected; failure logged
+    // #then — outcome unaffected
     expect(result).toEqual({outcome: 'cancelled', wasQueued: true})
-    expect(logger.warn).toHaveBeenCalled()
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
   })
 
-  it('does not delay cancelRun return when channels.fetch never resolves', async () => {
-    // #given — channels.fetch returns a promise that never resolves
+  it('does not delay cancelRun return when postCancelNotice never resolves', async () => {
+    // #given — postCancelNotice returns a promise that never resolves
     const runState = makeRunState({phase: 'PENDING'})
     const task = {runId: 'run-1'} as unknown as RunTask
     const queue = makeQueue({removeBy: vi.fn().mockReturnValue(task)})
-    const discordClient: CancelRunDeps['discordClient'] = {
-      channels: {
-        fetch: vi.fn().mockReturnValue(new Promise(() => {})),
-      } as unknown as CancelRunDeps['discordClient']['channels'],
-    }
+    const postCancelNotice = vi.fn().mockReturnValue(new Promise(() => {}))
     const logger = makeLogger()
-    const deps = makeDeps({runState, queue, discordClient})
+    const deps = makeDeps({runState, queue, postCancelNotice})
 
-    // #when — cancelRun must resolve without waiting on the pending fetch
+    // #when — cancelRun must resolve without waiting on the pending notice
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger}, deps)
 
     // #then
@@ -471,8 +447,7 @@ describe('cancelRun — executing race: abort delivers to nothing', () => {
     // #given — the run left the registry between has() and abort() (settled naturally)
     const runState = makeRunState({phase: 'EXECUTING'})
     const abortRegistry = makeAbortRegistry({has: vi.fn().mockReturnValue(true), abort: vi.fn().mockReturnValue(false)})
-    const sendMock = vi.fn().mockResolvedValue(undefined)
-    const discordClient = makeDiscordClient(sendMock)
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
 
     // Coordination config whose re-read reflects the run having settled to COMPLETED.
     const coordinationConfig: CoordinationConfig = {
@@ -489,14 +464,14 @@ describe('cancelRun — executing race: abort delivers to nothing', () => {
       staleThresholdMs: 60_000,
       pendingStaleThresholdMs: 30 * 60_000,
     }
-    const deps = makeDeps({runState, coordinationConfig, abortRegistry, discordClient})
+    const deps = makeDeps({runState, coordinationConfig, abortRegistry, postCancelNotice})
 
     // #when
     const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
 
     // #then — accurate already-terminal outcome, no thread notice, no false 'cancelled'
     expect(result).toEqual({outcome: 'already-terminal', phase: 'COMPLETED'})
-    expect(sendMock).not.toHaveBeenCalled()
+    expect(postCancelNotice).not.toHaveBeenCalled()
   })
 })
 

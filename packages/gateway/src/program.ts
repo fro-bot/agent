@@ -23,6 +23,7 @@ import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
+import {createCancelNoticeDispatcher} from './discord/cancel-notice.js'
 import {createDiscordClient, withLogContext} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {editInteractionAsync} from './discord/io.js'
@@ -687,7 +688,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           queue: channelQueue,
           abortRegistry,
           approvalRegistry,
-          discordClient: client,
+          postCancelNotice: createCancelNoticeDispatcher(client, logger),
           runObserver: runObservationManager,
         },
         launchWorkDeps: runEngineDeps,

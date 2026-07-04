@@ -28,7 +28,6 @@
  */
 
 import type {CoordinationConfig, RunPhase, RunState} from '@fro-bot/runtime'
-import type {Client} from 'discord.js'
 import type {ApprovalActor, ApprovalRegistry} from '../approvals/registry.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {AbortRegistry, CancelledByMetadata} from './abort-registry.js'
@@ -37,7 +36,6 @@ import type {RunIndex} from './run-index.js'
 import type {RunTask} from './run.js'
 
 import {getRunKey, parseRunState, transitionRun} from '@fro-bot/runtime'
-import {sendMessage} from '../discord/io.js'
 import {toCoordLogger} from './run.js'
 
 // ---------------------------------------------------------------------------
@@ -83,7 +81,13 @@ export interface CancelRunDeps {
   readonly queue: ChannelQueue<RunTask>
   readonly abortRegistry: Pick<AbortRegistry, 'has' | 'abort'>
   readonly approvalRegistry: Pick<ApprovalRegistry, 'describePendingForScope' | 'handleDecision'>
-  readonly discordClient: Pick<Client, 'channels'>
+  /**
+   * Post the cancellation notice for a run to its origin surface. Transport-specific
+   * (Discord thread, etc.) — injected by the composition root so this orchestrator
+   * stays transport-neutral. Must be fail-soft: never throw. Called fire-and-forget.
+   * `threadId` is the run-state thread_id ('' when the run has no thread).
+   */
+  readonly postCancelNotice: (threadId: string, runId: string) => Promise<void>
   readonly runObserver?: {readonly observe: (runState: RunState) => Promise<void>}
   /** Wall-clock provider — injectable for deterministic tests. Defaults to `Date.now`. */
   readonly now?: () => number
@@ -104,8 +108,6 @@ export interface CancelRunDeps {
  * safely re-issue the cancel request.
  */
 const RENDEZVOUS_MAX_ATTEMPTS = 2
-
-const CANCELLED_NOTICE_TEXT = 'Run cancelled by operator.'
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -171,44 +173,6 @@ function notifyObserverBestEffort(deps: CancelRunDeps, state: RunState, logger: 
     })
   } catch (error: unknown) {
     logger.warn({err: String(error)}, 'cancelRun: runObserver.observe threw synchronously')
-  }
-}
-
-/**
- * Post the thread cancellation notice. Always fail-soft: never throws, and
- * failure is logged, not propagated — the cancellation outcome does not
- * depend on this succeeding. Skips (logs) when `thread_id` is absent.
- */
-async function postCancellationNotice(
-  deps: CancelRunDeps,
-  runId: string,
-  threadId: string,
-  logger: GatewayLogger,
-): Promise<void> {
-  if (threadId === '') {
-    logger.info({runId}, 'cancelRun: no thread_id on run-state — skipping cancellation notice')
-    return
-  }
-  try {
-    const channel = await deps.discordClient.channels.fetch(threadId)
-    if (channel === null || channel === undefined) {
-      logger.warn({runId, threadId}, 'cancelRun: thread channel not found — skipping cancellation notice')
-      return
-    }
-    if (channel.isTextBased() === false || 'send' in channel === false) {
-      logger.warn({runId, threadId}, 'cancelRun: resolved channel is not text-sendable — skipping cancellation notice')
-      return
-    }
-    const sendResult = await sendMessage(channel, {content: CANCELLED_NOTICE_TEXT}, logger)
-    if (sendResult.success === false) {
-      logger.warn({runId, threadId, err: sendResult.error.message}, 'cancelRun: cancellation notice send failed')
-    }
-  } catch (error: unknown) {
-    // sendMessage/io.ts never throws, but channels.fetch can — belt-and-suspenders.
-    logger.warn(
-      {runId, threadId, err: error instanceof Error ? error.message : String(error)},
-      'cancelRun: cancellation notice threw — continuing',
-    )
   }
 }
 
@@ -305,7 +269,7 @@ async function attemptRendezvousCancel(
     if (result.success === true) {
       notifyObserverBestEffort(deps, result.data.state, logger)
       // eslint-disable-next-line no-void
-      void postCancellationNotice(deps, runId, result.data.state.thread_id, logger).catch(() => {})
+      void deps.postCancelNotice(result.data.state.thread_id, runId).catch(() => {})
       return {outcome: 'cancelled', wasQueued: false}
     }
 
@@ -380,7 +344,7 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
       }
       notifyObserverBestEffort(deps, transitionResult.data.state, logger)
       // eslint-disable-next-line no-void
-      void postCancellationNotice(deps, runId, transitionResult.data.state.thread_id, logger).catch(() => {})
+      void deps.postCancelNotice(transitionResult.data.state.thread_id, runId).catch(() => {})
       return {outcome: 'cancelled', wasQueued: true}
     }
   }
@@ -418,7 +382,7 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
     }
 
     // eslint-disable-next-line no-void
-    void postCancellationNotice(deps, runId, initialRead.state.thread_id, logger).catch(() => {})
+    void deps.postCancelNotice(initialRead.state.thread_id, runId).catch(() => {})
     return {outcome: 'cancelled', wasQueued: false}
   }
 
