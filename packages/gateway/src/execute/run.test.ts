@@ -7658,3 +7658,109 @@ describe('failureKind persistence on FAILED transitions', () => {
     expect(summary?.failureKind).toBe('inactivity-timeout')
   })
 })
+
+// ---------------------------------------------------------------------------
+// failAdmittedRun failureKind threading (Unit 4) — pre-ACK gates
+// ---------------------------------------------------------------------------
+
+describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('workspace clone failure: FAILED transitionRun carries detailsPatch.failureKind = "unreachable"', async () => {
+    // #given — ensureClone fails before ACK
+    const {runMention} = await import('./run.js')
+    const ensureClone = makeEnsureCloneFn('failure')
+    const message = makeMessage()
+    const deps = makeDeps({ensureClone})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call persists the internal 'unreachable' kind
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('unreachable')
+
+    // #and — this projects to 'workspace-unreachable' via the operator mapping (Unit 1)
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unreachable')
+  })
+
+  it('readyz failure: FAILED transitionRun carries detailsPatch.failureKind = "unreachable"', async () => {
+    // #given — readyz reports not-ready before ACK
+    const {runMention} = await import('./run.js')
+    const readyz = makeReadyzFn('not-ready')
+    const message = makeMessage()
+    const deps = makeDeps({readyz})
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call persists the internal 'unreachable' kind
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch: {failureKind: unknown}} | undefined
+    expect(failedOptions?.detailsPatch.failureKind).toBe('unreachable')
+
+    const {toOperatorFailureKind} = await import('../operator-contract/run-status.js')
+    expect(toOperatorFailureKind(failedOptions?.detailsPatch.failureKind)).toBe('workspace-unreachable')
+  })
+
+  it('lock held: FAILED transitionRun omits detailsPatch.failureKind (contention, not a workspace-startup failure)', async () => {
+    // #given — lock is held by another gateway
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const message = makeMessage()
+    const deps = makeDeps()
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: false as const, etag: null, holder: {holder_id: 'other-gateway', etag: 'abc'} as unknown},
+    } as Awaited<ReturnType<typeof runtimeModule.acquireLock>>)
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — the FAILED transitionRun call carries no detailsPatch.failureKind
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
+    expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+
+  it('threadFactory throws: FAILED transitionRun omits detailsPatch.failureKind', async () => {
+    // #given — threadFactory (message.startThread) rejects before ACK
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const thread = makeThread()
+    const message = makeMessage(thread)
+    ;(message.startThread as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Discord thread creation failed'))
+    const deps = makeDeps()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
+    expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+
+  it('regression: omit call sites still call failAdmittedRun with the same signature (no behavior change)', async () => {
+    // #given — a plain Error from the core run (generic failure, not a pre-ACK gate)
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+
+    const deps = makeDeps()
+    const message = makeMessage()
+
+    // #when
+    await runMention(message, makeBinding(), deps)
+
+    // #then — FAILED transition still occurs with no failureKind (this failure is post-ACK, Unit 3's path)
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
+    expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+})

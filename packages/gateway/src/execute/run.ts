@@ -372,7 +372,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'run: workspace clone unavailable — aborting',
       )
       // Gate 1 failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
+      // 'unreachable' maps to 'workspace-unreachable' via the operator projection.
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag, 'unreachable')
       await request.replySink.send('source', {
         content: 'The workspace is not available right now. Please try again later.',
       })
@@ -399,7 +400,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     if (workspaceReady === false) {
       logger.warn({channelId, repo}, 'run: workspace not ready — aborting')
       // Gate 2 failure: terminalize the admitted run to FAILED before replying.
-      await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
+      // 'unreachable' maps to 'workspace-unreachable' via the operator projection.
+      await failAdmittedRun(deps, repo, runId, task.adoptionEtag, 'unreachable')
       await request.replySink.send('source', {
         content: 'The workspace is not reachable right now. Please try again later.',
       })
@@ -1369,11 +1371,31 @@ function notifyObserverBestEffort(deps: RunMentionDeps, state: RunState): void {
  * Uses the provided etag (the latest known etag for this run). Best-effort:
  * a failure to transition is logged but not propagated — the caller's error
  * takes precedence.
+ *
+ * `failureKind`, when provided, is persisted as `details.failureKind` on the
+ * FAILED transition — used by the workspace-startup gates (clone/readyz) so
+ * the operator projection can surface `workspace-unreachable`. Omitted for
+ * all other pre-ACK failure paths (contention, transport, admission races).
  */
-async function failAdmittedRun(deps: RunMentionDeps, repo: string, runId: string, currentEtag: string): Promise<void> {
+async function failAdmittedRun(
+  deps: RunMentionDeps,
+  repo: string,
+  runId: string,
+  currentEtag: string,
+  failureKind?: string,
+): Promise<void> {
   const {coordinationConfig, identity, logger} = deps
   const coordLogger = toCoordLogger(logger)
-  const failResult = await transitionRun(coordinationConfig, identity, repo, runId, 'FAILED', currentEtag, coordLogger)
+  const failResult = await transitionRun(
+    coordinationConfig,
+    identity,
+    repo,
+    runId,
+    'FAILED',
+    currentEtag,
+    coordLogger,
+    failureKind === undefined ? undefined : {detailsPatch: {failureKind}},
+  )
   if (failResult.success === false) {
     logger.error({repo, runId, err: failResult.error.message}, 'run: failAdmittedRun — transitionRun FAILED failed')
   } else {
