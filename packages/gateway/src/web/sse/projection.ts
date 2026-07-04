@@ -85,6 +85,9 @@ export async function projectRunObservation(
     status: overlaidStatus,
     startedAt: base.startedAt,
     stale: base.stale,
+    // Copy from the deny-gated bridge result (base), never from runState —
+    // preserves the deny-gate (a denied repo's base is null before any field).
+    ...(base.failureKind === undefined ? {} : {failureKind: base.failureKind}),
   }
 
   return result

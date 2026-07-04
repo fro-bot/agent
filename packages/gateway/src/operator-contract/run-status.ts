@@ -57,6 +57,7 @@ export interface OperatorRunStatus {
   readonly status: OperatorWebStatus
   readonly startedAt: string
   readonly stale: boolean
+  readonly failureKind?: OperatorFailureKind
 }
 
 /**
@@ -203,5 +204,11 @@ export const toOperatorRunStatus = (
     status: PHASE_TO_WEB_STATUS[runState.phase] ?? 'failed',
     startedAt: runState.started_at,
     stale,
+    // failureKind is populated ONLY for FAILED runs, mapped through the closed
+    // allowlist (never a raw passthrough). Read runState.details.failureKind
+    // solely within this branch — never elsewhere.
+    ...(runState.phase === 'FAILED' && toOperatorFailureKind(runState.details.failureKind) !== undefined
+      ? {failureKind: toOperatorFailureKind(runState.details.failureKind)}
+      : {}),
   }
 }

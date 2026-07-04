@@ -202,6 +202,34 @@ describe('toRunSummary — closed-DTO key set', () => {
     expect(keys).not.toContain('details')
   })
 
+  it('output has failureKind + exactly 6 keys for a FAILED run with details.failureKind', () => {
+    // #given a FAILED run with a classified failureKind and no valid heartbeat
+    const runState = makeRunState({phase: 'FAILED', last_heartbeat: '', details: {failureKind: 'session-error'}})
+
+    // #when projected
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then failureKind is present, updatedAt is absent
+    assert(result !== null, 'expected a non-null summary')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'repo', 'status', 'createdAt', 'failureKind']))
+    expect(result.failureKind).toBe('session-error')
+  })
+
+  it('output has no failureKind for a non-FAILED run even with details.failureKind set', () => {
+    // #given a non-FAILED run whose details happen to carry a failureKind value
+    const runState = makeRunState({phase: 'EXECUTING', last_heartbeat: '', details: {failureKind: 'session-error'}})
+
+    // #when projected
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then failureKind is absent — population is gated on FAILED phase
+    assert(result !== null, 'expected a non-null summary')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'repo', 'status', 'createdAt']))
+    expect(Object.prototype.hasOwnProperty.call(result, 'failureKind')).toBe(false)
+  })
+
   it('runSummary type does not carry entityRef, surface, phase, stale, or internal fields', () => {
     // #given the RunSummary type
     // #when inspected at the type level

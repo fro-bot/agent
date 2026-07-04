@@ -18,8 +18,9 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorFailureKind} from './run-status.js'
 
-import {PHASE_TO_WEB_STATUS} from './run-status.js'
+import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
 
 /**
  * The 5-value status set producible by toRunSummary via PHASE_TO_WEB_STATUS.
@@ -51,6 +52,7 @@ export interface RunSummary {
   readonly status: RunSummaryStatus
   readonly createdAt: string
   readonly updatedAt?: string
+  readonly failureKind?: OperatorFailureKind
 }
 
 /**
@@ -135,6 +137,12 @@ export function toRunSummary(
     status,
     createdAt: runState.started_at,
     ...(hasValidHeartbeat ? {updatedAt: runState.last_heartbeat} : {}),
+    // failureKind is populated ONLY for FAILED runs, mapped through the closed
+    // allowlist (never a raw passthrough). Read runState.details.failureKind
+    // solely within this branch — never elsewhere.
+    ...(runState.phase === 'FAILED' && toOperatorFailureKind(runState.details.failureKind) !== undefined
+      ? {failureKind: toOperatorFailureKind(runState.details.failureKind)}
+      : {}),
   }
 
   return summary

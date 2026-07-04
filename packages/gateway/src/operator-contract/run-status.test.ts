@@ -104,6 +104,76 @@ describe('toOperatorRunStatus — operator-safe fields', () => {
     expect(keys).not.toContain('details')
   })
 
+  it('(r5) exact key-set for a non-FAILED run — no failureKind, no sibling leak', () => {
+    // #given a non-FAILED run
+    const runState = makeRunState({phase: 'EXECUTING'})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then the output has exactly the 7 declared keys, no more, no less
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale']))
+  })
+
+  it('(r5/r7) exact key-set for a FAILED run with details.failureKind — field present+mapped', () => {
+    // #given a FAILED run with a classified failureKind in details
+    const runState = makeRunState({phase: 'FAILED', details: {failureKind: 'inactivity-timeout'}})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then failureKind is present and mapped, with exactly the 8 declared keys
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(
+      new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale', 'failureKind']),
+    )
+    expect(result.failureKind).toBe('inactivity-timeout')
+  })
+
+  it('(r5) exact key-set for a FAILED run with no details.failureKind — field omitted', () => {
+    // #given a FAILED run with no failureKind in details
+    const runState = makeRunState({phase: 'FAILED', details: {}})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then the output has exactly the 7 declared keys — no failureKind key at all
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale']))
+  })
+
+  it('(r4/r5) FAILED run whose details also carries rawOutput/workspacePath/internalUrl — only failureKind surfaces', () => {
+    // #given a FAILED run with sensitive sibling detail keys alongside failureKind
+    const runState = makeRunState({
+      phase: 'FAILED',
+      details: {
+        failureKind: 'stream-ended',
+        rawOutput: 'secret tool output',
+        workspacePath: '/home/runner/workspace/acme/widget',
+        internalUrl: 'http://internal.corp/api',
+      },
+    })
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then only failureKind surfaces — no sibling detail key leaks
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(
+      new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale', 'failureKind']),
+    )
+    expect(result.failureKind).toBe('stream-ended')
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain('rawOutput')
+    expect(serialized).not.toContain('workspacePath')
+    expect(serialized).not.toContain('internalUrl')
+  })
+
   it('(r5) OperatorRunStatus type cannot carry holder_id, thread_id, or details', () => {
     // #given the OperatorRunStatus type
     // #when inspected at the type level
