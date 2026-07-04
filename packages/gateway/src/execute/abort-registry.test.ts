@@ -58,6 +58,35 @@ describe('abort-registry', () => {
     expect(registry.isAborted(runId)).toBe(true)
   })
 
+  it('getMetadata returns stored CancelledByMetadata after abort with metadata; delete clears it', () => {
+    // #given a registered run
+    const registry = createAbortRegistry()
+    const runId = 'run-4'
+    registry.register(runId)
+    const metadata = {
+      githubUserId: 42,
+      login: 'octocat',
+      sessionCorrelationId: 'sess-1',
+      cancelledAt: '2026-07-03T00:00:00.000Z',
+    }
+
+    // #then no metadata before abort
+    expect(registry.getMetadata(runId)).toBeUndefined()
+
+    // #when aborting with metadata
+    const aborted = registry.abort(runId, 'operator cancel', metadata)
+
+    // #then metadata is retrievable
+    expect(aborted).toBe(true)
+    expect(registry.getMetadata(runId)).toEqual(metadata)
+
+    // #when deleting the entry
+    registry.delete(runId)
+
+    // #then metadata is cleared
+    expect(registry.getMetadata(runId)).toBeUndefined()
+  })
+
   it('delete on an unknown runId is a no-op', () => {
     // #given a fresh registry
     const registry = createAbortRegistry()

@@ -398,6 +398,80 @@ describe('recoverStaleRuns', () => {
       )
     })
 
+    it('continues to the next repo when recoverOneRun throws unexpectedly for a prior repo', async () => {
+      // #given — two repos, each with one stale EXECUTING run; repo A's recovery throws unexpectedly
+      const bindingA = {owner: 'acme', repo: 'widget', channelId: 'ch-1', workspacePath: '/w/widget'}
+      const bindingB = {owner: 'acme', repo: 'other', channelId: 'ch-2', workspacePath: '/w/other'}
+      const bindingsStore = makeBindingsStore({
+        listBindings: vi.fn().mockResolvedValue({success: true, data: [bindingA, bindingB]}),
+      })
+
+      const staleRun = makeStaleRun()
+      mockFindStaleRuns.mockResolvedValue({success: true, data: [staleRun]})
+
+      // getRunKey throws (unexpected, not a Result failure) only for repo A
+      mockGetRunKey.mockImplementation((_config, _identity, repo, runId) => {
+        if (repo === 'acme/widget') {
+          throw new Error('unexpected boom in repo A')
+        }
+        if (runId === RUN_ID) return okKey(RUN_KEY)
+        return errKey('unexpected run key')
+      })
+
+      const logger = makeLogger()
+      const deps = makeDeps({bindingsStore, logger})
+
+      // #when — must not throw
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then — repo B is still swept (its transitionRun/reconcile still ran)
+      expect(mockTransitionRun).toHaveBeenCalledWith(
+        expect.anything(),
+        'discord-gateway',
+        'acme/other',
+        RUN_ID,
+        'FAILED',
+        RUN_ETAG,
+        expect.anything(),
+      )
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({repo: 'acme/widget', err: 'unexpected boom in repo A'}),
+        expect.stringContaining('unexpected error recovering repo'),
+      )
+    })
+
+    it('continues to the next repo when reconcileCancelledLock throws unexpectedly for a prior repo', async () => {
+      // #given — two repos, no stale runs; repo A's cancelled-lock reconciliation throws unexpectedly
+      const bindingA = {owner: 'acme', repo: 'widget', channelId: 'ch-1', workspacePath: '/w/widget'}
+      const bindingB = {owner: 'acme', repo: 'other', channelId: 'ch-2', workspacePath: '/w/other'}
+      const bindingsStore = makeBindingsStore({
+        listBindings: vi.fn().mockResolvedValue({success: true, data: [bindingA, bindingB]}),
+      })
+
+      mockFindStaleRuns.mockResolvedValue({success: true, data: []})
+
+      // getLockKey throws (unexpected) only for repo A
+      mockGetLockKey.mockImplementation((_config, repo) => {
+        if (repo === 'acme/widget') {
+          throw new Error('unexpected boom reconciling repo A')
+        }
+        return okKey(LOCK_KEY)
+      })
+
+      const logger = makeLogger()
+      const deps = makeDeps({bindingsStore, logger})
+
+      // #when — must not throw
+      await expect(recoverStaleRuns(deps)).resolves.toBeUndefined()
+
+      // #then — repo B's reconciliation still attempted (getLockKey called for it)
+      expect(mockGetLockKey).toHaveBeenCalledWith(expect.anything(), 'acme/other')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({repo: 'acme/widget', err: 'unexpected boom reconciling repo A'}),
+        expect.stringContaining('unexpected error recovering repo'),
+      )
+    })
+
     it('logs an error and returns early when listBindings fails', async () => {
       // #given
       const bindingsStore = makeBindingsStore({

@@ -167,28 +167,37 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
   for (const binding of bindings) {
     const repo = `${binding.owner}/${binding.repo}`
 
-    const staleResult = await findStaleRuns(coordinationConfig, identity, repo, coordLogger)
-    if (staleResult.success === false) {
-      logger.warn({repo, err: staleResult.error.message}, 'recovery: findStaleRuns failed — skipping repo')
-      continue
-    }
-
-    const staleRuns = staleResult.data
-    if (staleRuns.length > 0) {
-      logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
-
-      for (const run of staleRuns) {
-        await recoverOneRun({run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger})
+    try {
+      const staleResult = await findStaleRuns(coordinationConfig, identity, repo, coordLogger)
+      if (staleResult.success === false) {
+        logger.warn({repo, err: staleResult.error.message}, 'recovery: findStaleRuns failed — skipping repo')
+        continue
       }
-    }
 
-    // A crash between committing the CANCELLED transition and releasing the repo
-    // lock is invisible to findStaleRuns (its phase filter only matches
-    // EXECUTING/PENDING/ACKNOWLEDGED — CANCELLED is terminal and intentionally
-    // skipped there). Reconcile separately: if the repo's lock is still held by
-    // a run whose committed state is CANCELLED, release it. The run itself is
-    // already terminal and must NOT be re-transitioned.
-    await reconcileCancelledLock({repo, coordinationConfig, identity, coordLogger, logger})
+      const staleRuns = staleResult.data
+      if (staleRuns.length > 0) {
+        logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
+
+        for (const run of staleRuns) {
+          await recoverOneRun({run, repo, coordinationConfig, identity, resolveThread, coordLogger, logger})
+        }
+      }
+
+      // A crash between committing the CANCELLED transition and releasing the repo
+      // lock is invisible to findStaleRuns (its phase filter only matches
+      // EXECUTING/PENDING/ACKNOWLEDGED — CANCELLED is terminal and intentionally
+      // skipped there). Reconcile separately: if the repo's lock is still held by
+      // a run whose committed state is CANCELLED, release it. The run itself is
+      // already terminal and must NOT be re-transitioned.
+      await reconcileCancelledLock({repo, coordinationConfig, identity, coordLogger, logger})
+    } catch (error: unknown) {
+      // Fail-soft per the module docstring: an unexpected throw from either helper
+      // must not abort recovery for the remaining repos.
+      logger.warn(
+        {repo, err: error instanceof Error ? error.message : String(error)},
+        'recovery: unexpected error recovering repo — continuing to next repo',
+      )
+    }
   }
 
   logger.info({}, 'recovery: stale-run sweep complete')

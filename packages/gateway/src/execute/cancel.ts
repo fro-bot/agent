@@ -31,13 +31,14 @@ import type {CoordinationConfig, RunPhase, RunState} from '@fro-bot/runtime'
 import type {Client} from 'discord.js'
 import type {ApprovalActor, ApprovalRegistry} from '../approvals/registry.js'
 import type {GatewayLogger} from '../discord/client.js'
-import type {AbortRegistry} from './abort-registry.js'
+import type {AbortRegistry, CancelledByMetadata} from './abort-registry.js'
 import type {ChannelQueue} from './queue.js'
 import type {RunIndex} from './run-index.js'
 import type {RunTask} from './run.js'
 
 import {getRunKey, parseRunState, transitionRun} from '@fro-bot/runtime'
 import {sendMessage} from '../discord/io.js'
+import {toCoordLogger} from './run.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -150,6 +151,16 @@ const TERMINAL_PHASES: ReadonlySet<RunPhase> = new Set(['COMPLETED', 'FAILED', '
 
 function isTerminalPhase(phase: RunPhase): boolean {
   return TERMINAL_PHASES.has(phase)
+}
+
+/** Build the `cancelledBy` attribution metadata attached to a CANCELLED transition. */
+function makeCancelledBy(actor: CancelActorContext, now?: () => number): CancelledByMetadata {
+  return {
+    githubUserId: actor.githubUserId,
+    login: actor.login,
+    sessionCorrelationId: actor.sessionCorrelationId,
+    cancelledAt: new Date(now?.() ?? Date.now()).toISOString(),
+  }
 }
 
 /** Fire-and-forget SSE observer notification — mirrors run.ts's notifyObserverBestEffort. */
@@ -273,7 +284,7 @@ async function attemptRendezvousCancel(
   logger: GatewayLogger,
 ): Promise<CancelOutcome> {
   const {coordinationConfig, identity} = deps
-  const coordLogger = {debug: (msg: string, ctx?: Record<string, unknown>) => logger.debug(ctx ?? {}, msg)}
+  const coordLogger = toCoordLogger(logger)
 
   let read = await readRunState(deps, repo, runId, logger)
   if (read === undefined) {
@@ -285,12 +296,7 @@ async function attemptRendezvousCancel(
       return {outcome: 'already-terminal', phase: read.state.phase}
     }
 
-    const cancelledBy = {
-      githubUserId: actor.githubUserId,
-      login: actor.login,
-      sessionCorrelationId: actor.sessionCorrelationId,
-      cancelledAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
-    }
+    const cancelledBy = makeCancelledBy(actor, deps.now)
 
     const result = await transitionRun(coordinationConfig, identity, repo, runId, 'CANCELLED', read.etag, coordLogger, {
       detailsPatch: {cancelledBy},
@@ -298,7 +304,8 @@ async function attemptRendezvousCancel(
 
     if (result.success === true) {
       notifyObserverBestEffort(deps, result.data.state, logger)
-      await postCancellationNotice(deps, runId, result.data.state.thread_id, logger)
+      // eslint-disable-next-line no-void
+      void postCancellationNotice(deps, runId, result.data.state.thread_id, logger).catch(() => {})
       return {outcome: 'cancelled', wasQueued: false}
     }
 
@@ -348,13 +355,8 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
   if (channelId !== '') {
     const removed = deps.queue.removeBy(channelId, task => task.runId === runId)
     if (removed !== undefined) {
-      const coordLogger = {debug: (msg: string, ctx?: Record<string, unknown>) => logger.debug(ctx ?? {}, msg)}
-      const cancelledBy = {
-        githubUserId: actor.githubUserId,
-        login: actor.login,
-        sessionCorrelationId: actor.sessionCorrelationId,
-        cancelledAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
-      }
+      const coordLogger = toCoordLogger(logger)
+      const cancelledBy = makeCancelledBy(actor, deps.now)
       const transitionResult = await transitionRun(
         deps.coordinationConfig,
         deps.identity,
@@ -377,7 +379,8 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
         return attemptRendezvousCancel(deps, repo, runId, actor, logger)
       }
       notifyObserverBestEffort(deps, transitionResult.data.state, logger)
-      await postCancellationNotice(deps, runId, transitionResult.data.state.thread_id, logger)
+      // eslint-disable-next-line no-void
+      void postCancellationNotice(deps, runId, transitionResult.data.state.thread_id, logger).catch(() => {})
       return {outcome: 'cancelled', wasQueued: true}
     }
   }
@@ -397,15 +400,25 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
     // a still-open approval against the cancel.
     await settlePendingApprovals(deps, initialRead.state, approvalActor, logger)
 
-    const cancelledBy = {
-      githubUserId: actor.githubUserId,
-      login: actor.login,
-      sessionCorrelationId: actor.sessionCorrelationId,
-      cancelledAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
-    }
-    deps.abortRegistry.abort(runId, 'operator cancel', cancelledBy)
+    const cancelledBy = makeCancelledBy(actor, deps.now)
+    const delivered = deps.abortRegistry.abort(runId, 'operator cancel', cancelledBy)
 
-    await postCancellationNotice(deps, runId, initialRead.state.thread_id, logger)
+    if (delivered === false) {
+      // The run left the registry between `has()` and `abort()` (run.ts's finally
+      // deletes the entry on settlement) — the abort signal reached nothing. Re-read
+      // run-state to report an accurate outcome instead of falsely claiming 'cancelled'.
+      const reread = await readRunState(deps, repo, runId, logger)
+      if (reread === undefined) {
+        return {outcome: 'not-found'}
+      }
+      if (isTerminalPhase(reread.state.phase)) {
+        return {outcome: 'already-terminal', phase: reread.state.phase}
+      }
+      return attemptRendezvousCancel(deps, repo, runId, actor, logger)
+    }
+
+    // eslint-disable-next-line no-void
+    void postCancellationNotice(deps, runId, initialRead.state.thread_id, logger).catch(() => {})
     return {outcome: 'cancelled', wasQueued: false}
   }
 

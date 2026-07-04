@@ -185,7 +185,9 @@ export function formatTimeoutDuration(ms: number): string {
 }
 
 /** Narrow logger adapter for runtime coordination functions. */
-function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
+export function toCoordLogger(logger: GatewayLogger): {
+  debug: (message: string, context?: Record<string, unknown>) => void
+} {
   return {
     debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
   }
@@ -851,6 +853,29 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         )
         if (cancelledResult.success === false) {
           logger.error({repo, runId, err: cancelledResult.error.message}, 'run: transitionRun CANCELLED failed')
+
+          // Fallback: leaving the run non-terminal (EXECUTING) with the lock about to be
+          // released by the outer finally is an inconsistent state until the next recovery
+          // sweep. Attempt a best-effort FAILED terminalization with the same etag (FAILED
+          // is a valid transition from EXECUTING) rather than leaving this to recovery alone.
+          const failedFallbackResult = await transitionRun(
+            coordinationConfig,
+            identity,
+            repo,
+            runId,
+            'FAILED',
+            runEtag,
+            coordLogger,
+          )
+          if (failedFallbackResult.success === false) {
+            logger.error(
+              {repo, runId, err: failedFallbackResult.error.message},
+              'run: FAILED fallback after CANCELLED transition failure also failed — leaving for recovery sweep',
+            )
+          } else {
+            logger.warn({repo, runId}, 'run: CANCELLED transition failed — fell back to FAILED terminalization')
+            notifyObserverBestEffort(deps, failedFallbackResult.data.state)
+          }
         } else {
           notifyObserverBestEffort(deps, cancelledResult.data.state)
         }

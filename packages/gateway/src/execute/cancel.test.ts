@@ -440,4 +440,120 @@ describe('cancelRun — thread notice failure', () => {
     expect(result).toEqual({outcome: 'cancelled', wasQueued: true})
     expect(logger.warn).toHaveBeenCalled()
   })
+
+  it('does not delay cancelRun return when channels.fetch never resolves', async () => {
+    // #given — channels.fetch returns a promise that never resolves
+    const runState = makeRunState({phase: 'PENDING'})
+    const task = {runId: 'run-1'} as unknown as RunTask
+    const queue = makeQueue({removeBy: vi.fn().mockReturnValue(task)})
+    const discordClient: CancelRunDeps['discordClient'] = {
+      channels: {
+        fetch: vi.fn().mockReturnValue(new Promise(() => {})),
+      } as unknown as CancelRunDeps['discordClient']['channels'],
+    }
+    const logger = makeLogger()
+    const deps = makeDeps({runState, queue, discordClient})
+
+    // #when — cancelRun must resolve without waiting on the pending fetch
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger}, deps)
+
+    // #then
+    expect(result).toEqual({outcome: 'cancelled', wasQueued: true})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// F2: executing-path race — abort() returns false (run already left the registry)
+// ---------------------------------------------------------------------------
+
+describe('cancelRun — executing race: abort delivers to nothing', () => {
+  it('abortRegistry.has→true but abort→false with a COMPLETED run-state → already-terminal, no false cancelled', async () => {
+    // #given — the run left the registry between has() and abort() (settled naturally)
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = makeAbortRegistry({has: vi.fn().mockReturnValue(true), abort: vi.fn().mockReturnValue(false)})
+    const sendMock = vi.fn().mockResolvedValue(undefined)
+    const discordClient = makeDiscordClient(sendMock)
+
+    // Coordination config whose re-read reflects the run having settled to COMPLETED.
+    const coordinationConfig: CoordinationConfig = {
+      storeAdapter: {
+        upload: vi.fn(async () => ok(undefined)),
+        download: vi.fn(async () => ok(undefined)),
+        getObject: vi.fn(async () => ok({data: JSON.stringify({...runState, phase: 'COMPLETED'}), etag: 'etag-2'})),
+        conditionalPut: vi.fn(async () => err(new Error('should not be called'))),
+        list: vi.fn(async () => ok([])),
+      },
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    }
+    const deps = makeDeps({runState, coordinationConfig, abortRegistry, discordClient})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then — accurate already-terminal outcome, no thread notice, no false 'cancelled'
+    expect(result).toEqual({outcome: 'already-terminal', phase: 'COMPLETED'})
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// readRunState failure modes → not-found
+// ---------------------------------------------------------------------------
+
+describe('cancelRun — readRunState failure modes', () => {
+  it('returns not-found when getObject fails', async () => {
+    // #given
+    const runState = makeRunState({phase: 'PENDING'})
+    const coordinationConfig: CoordinationConfig = {
+      storeAdapter: {
+        upload: vi.fn(async () => ok(undefined)),
+        download: vi.fn(async () => ok(undefined)),
+        getObject: vi.fn(async () => err(new Error('S3 unreachable'))),
+        conditionalPut: vi.fn(async () => err(new Error('should not be called'))),
+        list: vi.fn(async () => ok([])),
+      },
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    }
+    const deps = makeDeps({runState, coordinationConfig})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then
+    expect(result).toEqual({outcome: 'not-found'})
+  })
+
+  it('returns not-found when the stored run-state JSON is malformed', async () => {
+    // #given
+    const runState = makeRunState({phase: 'PENDING'})
+    const coordinationConfig: CoordinationConfig = {
+      storeAdapter: {
+        upload: vi.fn(async () => ok(undefined)),
+        download: vi.fn(async () => ok(undefined)),
+        getObject: vi.fn(async () => ok({data: 'not valid json {{{', etag: 'etag-1'})),
+        conditionalPut: vi.fn(async () => err(new Error('should not be called'))),
+        list: vi.fn(async () => ok([])),
+      },
+      storeConfig: {enabled: true, bucket: 'test-bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      lockTtlSeconds: 900,
+      heartbeatIntervalMs: 30_000,
+      staleThresholdMs: 60_000,
+      pendingStaleThresholdMs: 30 * 60_000,
+    }
+    const deps = makeDeps({runState, coordinationConfig})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then
+    expect(result).toEqual({outcome: 'not-found'})
+  })
 })

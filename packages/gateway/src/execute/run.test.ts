@@ -6933,8 +6933,14 @@ describe('operator cancel — abort-registry integration', () => {
     } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
+    const cancelledByMetadata = {
+      githubUserId: 42,
+      login: 'octocat',
+      sessionCorrelationId: 'sess-1',
+      cancelledAt: '2026-07-03T00:00:00.000Z',
+    }
     mockRunOpenCodeCoreAbortedBy(() => {
-      abortRegistry.abort(CANCEL_RUN_ID, 'operator cancel')
+      abortRegistry.abort(CANCEL_RUN_ID, 'operator cancel', cancelledByMetadata)
     })
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -6959,6 +6965,12 @@ describe('operator cancel — abort-registry integration', () => {
     expect(transitionPhases).toContain('CANCELLED')
     expect(transitionPhases).not.toContain('FAILED')
 
+    // #and — the CANCELLED transitionRun call carries the registry's cancelledBy attribution
+    // (the only end-to-end check of the getMetadata → transitionRun attribution seam)
+    const cancelledCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'CANCELLED')
+    const cancelledCallOptions = cancelledCall?.[7] as {detailsPatch: {cancelledBy: unknown}}
+    expect(cancelledCallOptions.detailsPatch.cancelledBy).toEqual(cancelledByMetadata)
+
     // #and — SSE observer notified with the CANCELLED state
     const observedPhases = observeFn.mock.calls.map((c: unknown[]) => (c[0] as {phase?: string}).phase)
     expect(observedPhases).toContain('CANCELLED')
@@ -6980,6 +6992,133 @@ describe('operator cancel — abort-registry integration', () => {
 
     // #and — registry entry deleted (a later abort() is now a no-op)
     expect(abortRegistry.has(CANCEL_RUN_ID)).toBe(false)
+  })
+
+  it('heartbeat.stop() failure on the cancel path — CANCELLED still settles using last-known etags, warning logged', async () => {
+    // #given — heartbeat.stop() fails on the cancel path
+    const {launchWork} = await import('./run.js')
+    const cancelledState = buildMockRunState({phase: 'CANCELLED', run_id: 'hb-fail-cancel-run-id'})
+    const stopError = new Error('heartbeat stop S3 error on cancel path')
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'cancelled-etag', state: cancelledState},
+    })
+    const heartbeatStop = vi.fn().mockResolvedValue({success: false, error: stopError})
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const HB_FAIL_CANCEL_RUN_ID = 'hb-fail-cancel-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(HB_FAIL_CANCEL_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = HB_FAIL_CANCEL_RUN_ID
+    const deps = makeDeps({logger})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — CANCELLED still settled despite the heartbeat-stop failure
+    const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+    expect(transitionPhases).toContain('CANCELLED')
+
+    // #and — warning logged for the heartbeat-stop failure on the cancel path
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({err: stopError.message}),
+      expect.stringContaining('heartbeat stop failed on cancel path'),
+    )
+
+    abortRegistry.delete(HB_FAIL_CANCEL_RUN_ID)
+  })
+
+  it('cancelled transition failure falls back to FAILED terminalization — run does not remain EXECUTING', async () => {
+    // #given — the CANCELLED transitionRun call fails; a subsequent FAILED transitionRun succeeds
+    const {launchWork} = await import('./run.js')
+    const failedState = buildMockRunState({phase: 'FAILED', run_id: 'cancel-fallback-run-id'})
+
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        if (phase === 'FAILED') {
+          return {success: true as const, data: {etag: 'failed-etag', state: failedState}}
+        }
+        // ACKNOWLEDGED / EXECUTING admission transitions
+        return {success: true as const, data: {etag: 'admit-etag', state: failedState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: failedState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const CANCEL_FALLBACK_RUN_ID = 'cancel-fallback-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(CANCEL_FALLBACK_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = CANCEL_FALLBACK_RUN_ID
+    const deps = makeDeps({logger})
+
+    // #when — must not throw
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — both a CANCELLED attempt (failed) and a FAILED fallback attempt (succeeded) observed
+    const transitionCalls = mockRuntime.transitionRun.mock.calls.filter(
+      (c: unknown[]) => c[4] === 'CANCELLED' || c[4] === 'FAILED',
+    )
+    const observedPhases = transitionCalls.map((c: unknown[]) => c[4] as string)
+    expect(observedPhases).toContain('CANCELLED')
+    expect(observedPhases).toContain('FAILED')
+
+    // #and — the run does not remain EXECUTING: the FAILED fallback call is the last
+    // observed terminal-settlement attempt for this run, confirming it did not stay open.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({runId: CANCEL_FALLBACK_RUN_ID}),
+      expect.stringContaining('transitionRun CANCELLED failed'),
+    )
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: CANCEL_FALLBACK_RUN_ID}),
+      expect.stringContaining('fell back to FAILED'),
+    )
+
+    abortRegistry.delete(CANCEL_FALLBACK_RUN_ID)
   })
 
   it('timeout-vs-cancel race: classification uses registry probe, not composite abort reason', async () => {
