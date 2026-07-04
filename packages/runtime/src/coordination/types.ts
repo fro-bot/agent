@@ -2,6 +2,14 @@ import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/types.
 
 export type RunPhase = 'PENDING' | 'ACKNOWLEDGED' | 'EXECUTING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
 
+/**
+ * The subset of `RunPhase` that is terminal (no further transitions possible).
+ * Shared by `cancelRun`'s already-terminal outcome and the operator cancel
+ * route's response DTO so both agree on one closed union instead of each
+ * hand-writing the same three literals.
+ */
+export type TerminalPhase = Extract<RunPhase, 'COMPLETED' | 'FAILED' | 'CANCELLED'>
+
 export type Surface = 'github' | 'discord' | 'web'
 
 export interface RunState {

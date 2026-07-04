@@ -36,6 +36,9 @@ export type LaunchRejectedReason = 'binding_not_found' | 'concurrency_cap' | 'au
 /** Safe reasons for approval rejection. */
 export type ApprovalRejectedReason = 'already_claimed' | 'not_found' | 'deadline_expired' | 'scope_mismatch' | 'unknown'
 
+/** Safe reasons for cancel-request rejection (pre-acceptance denial). */
+export type CancelRejectedReason = 'not_found' | 'authz_denied' | 'unknown'
+
 /** Safe reasons for bearer token rejection. */
 export type BearerRejectedReason = 'missing_token' | 'invalid_signature' | 'expired' | 'unknown'
 
@@ -141,6 +144,27 @@ export interface ApprovalRejectedEvent {
   readonly reason: ApprovalRejectedReason
 }
 
+/**
+ * Operator cancel request accepted and processed (regardless of outcome —
+ * 'cancelled' or the idempotent 'already-terminal' hit). The resulting phase
+ * is carried so the audit trail records what actually happened.
+ */
+export interface RunCancelRequestedEvent {
+  readonly kind: 'run.cancel.requested'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly runId: string
+  readonly phase: 'CANCELLED' | 'COMPLETED' | 'FAILED'
+}
+
+/** Operator cancel request denied at a pre-acceptance gate (no state change). */
+export interface RunCancelRejectedEvent {
+  readonly kind: 'run.cancel.rejected'
+  readonly correlationId: string
+  readonly githubUserId: number
+  readonly reason: CancelRejectedReason
+}
+
 /** Operator read a repo binding. */
 export interface BindingReadEvent {
   readonly kind: 'binding.read'
@@ -186,6 +210,8 @@ export type AuditEvent =
   | BindingReadEvent
   | BearerRejectedEvent
   | BrowserGuardRejectedEvent
+  | RunCancelRequestedEvent
+  | RunCancelRejectedEvent
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -256,6 +282,8 @@ const LOG_LEVEL: Record<Exclude<AuditEvent['kind'], 'approval.rejected'>, 'info'
   'binding.read': 'info',
   'bearer.rejected': 'warn',
   'browser.guard.rejected': 'warn',
+  'run.cancel.requested': 'info',
+  'run.cancel.rejected': 'warn',
 }
 
 /**
@@ -308,6 +336,9 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'approval.rejected':
       ctx.requestId = redactIfSensitive(event.requestId)
       break
+    case 'run.cancel.requested':
+      ctx.runId = redactIfSensitive(event.runId)
+      break
     case 'auth.start':
     case 'auth.callback.failure':
     case 'auth.logout':
@@ -316,6 +347,7 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'launch.rejected':
     case 'bearer.rejected':
     case 'browser.guard.rejected':
+    case 'run.cancel.rejected':
       // No additional caller-controlled string fields on these variants.
       break
     default:

@@ -50,6 +50,7 @@ export const EXPECTED_OPERATOR_ROUTES: readonly {readonly method: string; readon
   {method: 'GET', path: '/operator/runs/:runId/stream'},
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
+  {method: 'POST', path: '/operator/runs/:runId/cancel'},
 ]
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,12 @@ function makeStubApprovalRegistry() {
   }
 }
 
+function makeStubCancelRunDeps() {
+  // Registration only checks `deps.cancelRunDeps !== undefined`; the actual
+  // shape is not inspected at construction time.
+  return {} as NonNullable<Parameters<typeof buildOperatorApp>[0]['cancelRunDeps']>
+}
+
 function makeStubLaunchWorkDeps() {
   // Registration only checks `deps.launchWorkDeps !== undefined`; the actual
   // shape is not inspected at construction time.
@@ -130,8 +137,7 @@ export interface OperatorRouteSmokeOptions {
    * undefined here flows through the helper and causes the run-stream route to be absent.
    */
   readonly runObservationManagerOverride?:
-    | Parameters<typeof buildOperatorServerInputs>[0]['runObservationManager']
-    | undefined
+    Parameters<typeof buildOperatorServerInputs>[0]['runObservationManager'] | undefined
   /**
    * Override the launchWorkDeps passed to buildOperatorServerInputs.
    * Used in regression-guard tests to simulate a missing launch dep (POST /operator/runs absent).
@@ -152,6 +158,13 @@ export interface OperatorRouteSmokeOptions {
    * flows through the helper and causes the runs listing route to be absent.
    */
   readonly runIndexOverride?: Parameters<typeof buildOperatorServerInputs>[0]['runIndex'] | undefined
+  /**
+   * Override the cancelRunDeps passed to buildOperatorServerInputs.
+   * Pass undefined to simulate a missing cancel-run dep (cancel route absent).
+   * Because cancelRunDeps is optional in BuildOperatorServerInputs, passing
+   * undefined here flows through the helper and causes the cancel route to be absent.
+   */
+  readonly cancelRunDepsOverride?: Parameters<typeof buildOperatorServerInputs>[0]['cancelRunDeps'] | undefined
   /**
    * Whether to suppress log output. Defaults to false (logs to stdout).
    */
@@ -237,6 +250,13 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
   const hasRunIndexOverride = options !== undefined && 'runIndexOverride' in options
   const runIndex = hasRunIndexOverride ? options.runIndexOverride : makeStubRunIndex()
 
+  // Resolve cancelRunDeps — use the override if provided, else the default stub.
+  // When the override is explicitly undefined, POST /operator/runs/:runId/cancel
+  // will not register because buildOperatorServerInputs passes it through to
+  // deps.cancelRunDeps, and server.ts gates the cancel route on that dep being present.
+  const hasCancelRunDepsOverride = options !== undefined && 'cancelRunDepsOverride' in options
+  const cancelRunDeps = hasCancelRunDepsOverride ? options.cancelRunDepsOverride : makeStubCancelRunDeps()
+
   // Build the operator server inputs via the shared production helper.
   // This is the seam that makes the diagnostic catch wiring gaps: if a dep is
   // dropped from buildOperatorServerInputs, both production and this diagnostic
@@ -256,6 +276,10 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.approvalRegistry and the approval routes are absent.
     approvalRegistry,
+    // cancelRunDeps flows through the helper so the route gate in server.ts
+    // sees the same value as production. When undefined (regression test), the
+    // helper passes undefined to deps.cancelRunDeps and the cancel route is absent.
+    cancelRunDeps,
     // launchWorkDeps flows through the helper so the route gate in server.ts
     // sees the same value as production. When undefined (regression test), the
     // helper passes undefined to deps.launchWorkDeps and POST /operator/runs is absent.

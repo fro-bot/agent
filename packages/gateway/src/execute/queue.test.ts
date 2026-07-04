@@ -10,7 +10,7 @@ describe('createChannelQueue', () => {
   describe('happy path — FIFO enqueue and takeNext', () => {
     it('enqueues two tasks and returns them in FIFO order', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const task1 = {id: 'task-1'}
       const task2 = {id: 'task-2'}
 
@@ -27,7 +27,7 @@ describe('createChannelQueue', () => {
 
     it('pendingCount reflects depth and decrements on each takeNext', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const task1 = {id: 'task-1'}
       const task2 = {id: 'task-2'}
 
@@ -55,7 +55,7 @@ describe('createChannelQueue', () => {
   describe('edge cases — empty / unknown channel', () => {
     it('takeNext on an empty channel returns undefined', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
 
       // #when / #then
       expect(queue.takeNext('ch-unknown')).toBeUndefined()
@@ -63,7 +63,7 @@ describe('createChannelQueue', () => {
 
     it('takeNext on a channel that was drained returns undefined', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       queue.enqueue('ch-a', {id: 'task-1'})
       queue.takeNext('ch-a')
 
@@ -73,7 +73,7 @@ describe('createChannelQueue', () => {
 
     it('pendingCount on an unknown channel returns 0', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
 
       // #when / #then
       expect(queue.pendingCount('ch-unknown')).toBe(0)
@@ -81,7 +81,7 @@ describe('createChannelQueue', () => {
 
     it('clear on an empty / unknown channel returns 0', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
 
       // #when / #then
       expect(queue.clear('ch-unknown')).toBe(0)
@@ -89,7 +89,7 @@ describe('createChannelQueue', () => {
 
     it('clear on a drained channel returns 0', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       queue.enqueue('ch-a', {id: 'task-1'})
       queue.takeNext('ch-a')
 
@@ -101,7 +101,7 @@ describe('createChannelQueue', () => {
   describe('channel isolation', () => {
     it('enqueue on channel A does not affect pendingCount for channel B', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
 
       // #when
       queue.enqueue('ch-a', {id: 'task-1'})
@@ -113,7 +113,7 @@ describe('createChannelQueue', () => {
 
     it('takeNext on channel A does not affect channel B', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const taskA = {id: 'task-a'}
       const taskB = {id: 'task-b'}
       queue.enqueue('ch-a', taskA)
@@ -129,7 +129,7 @@ describe('createChannelQueue', () => {
 
     it('clear on channel A does not affect channel B', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const taskA = {id: 'task-a'}
       const taskB = {id: 'task-b'}
       queue.enqueue('ch-a', taskA)
@@ -213,10 +213,153 @@ describe('createChannelQueue', () => {
     })
   })
 
+  describe('removeBy', () => {
+    it('removes a task matching the predicate from the head', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      const task2 = {id: 'task-2'}
+      const task3 = {id: 'task-3'}
+      queue.enqueue('ch-a', task1)
+      queue.enqueue('ch-a', task2)
+      queue.enqueue('ch-a', task3)
+
+      // #when
+      const removed = queue.removeBy('ch-a', t => t.id === 'task-1')
+
+      // #then — removed the head; remaining order preserved
+      expect(removed).toBe(task1)
+      expect(queue.pendingCount('ch-a')).toBe(2)
+      expect(queue.takeNext('ch-a')).toBe(task2)
+      expect(queue.takeNext('ch-a')).toBe(task3)
+    })
+
+    it('removes a task matching the predicate from the middle, preserving order of the rest', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      const task2 = {id: 'task-2'}
+      const task3 = {id: 'task-3'}
+      queue.enqueue('ch-a', task1)
+      queue.enqueue('ch-a', task2)
+      queue.enqueue('ch-a', task3)
+
+      // #when
+      const removed = queue.removeBy('ch-a', t => t.id === 'task-2')
+
+      // #then
+      expect(removed).toBe(task2)
+      expect(queue.pendingCount('ch-a')).toBe(2)
+      expect(queue.takeNext('ch-a')).toBe(task1)
+      expect(queue.takeNext('ch-a')).toBe(task3)
+    })
+
+    it('removes a task matching the predicate from the tail', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      const task2 = {id: 'task-2'}
+      const task3 = {id: 'task-3'}
+      queue.enqueue('ch-a', task1)
+      queue.enqueue('ch-a', task2)
+      queue.enqueue('ch-a', task3)
+
+      // #when
+      const removed = queue.removeBy('ch-a', t => t.id === 'task-3')
+
+      // #then — removing the tail cleans up correctly and pendingCount is accurate
+      expect(removed).toBe(task3)
+      expect(queue.pendingCount('ch-a')).toBe(2)
+      expect(queue.takeNext('ch-a')).toBe(task1)
+      expect(queue.takeNext('ch-a')).toBe(task2)
+      expect(queue.takeNext('ch-a')).toBeUndefined()
+    })
+
+    it('returns undefined on a miss without disturbing the queue', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      queue.enqueue('ch-a', task1)
+
+      // #when
+      const removed = queue.removeBy('ch-a', t => t.id === 'nonexistent')
+
+      // #then
+      expect(removed).toBeUndefined()
+      expect(queue.pendingCount('ch-a')).toBe(1)
+      expect(queue.takeNext('ch-a')).toBe(task1)
+    })
+
+    it('returns undefined for an unknown channel', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+
+      // #when / #then
+      expect(queue.removeBy('ch-unknown', () => true)).toBeUndefined()
+    })
+
+    it('returns undefined for an already-drained channel', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      queue.enqueue('ch-a', {id: 'task-1'})
+      queue.takeNext('ch-a')
+
+      // #when / #then
+      expect(queue.removeBy('ch-a', () => true)).toBeUndefined()
+    })
+
+    it('removing the last remaining task cleans up the channel entry (pendingCount stays accurate)', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      queue.enqueue('ch-a', task1)
+
+      // #when
+      const removed = queue.removeBy('ch-a', t => t.id === 'task-1')
+
+      // #then
+      expect(removed).toBe(task1)
+      expect(queue.pendingCount('ch-a')).toBe(0)
+      // Re-enqueue to prove the channel entry was cleaned up, not left as a stale empty array.
+      expect(queue.enqueue('ch-a', {id: 'task-2'})).toBe('queued')
+    })
+
+    it('removeBy on channel A does not affect channel B', () => {
+      // #given
+      const queue = createChannelQueue<{id: string}>(5)
+      const taskA = {id: 'task-a'}
+      const taskB = {id: 'task-b'}
+      queue.enqueue('ch-a', taskA)
+      queue.enqueue('ch-b', taskB)
+
+      // #when
+      queue.removeBy('ch-a', t => t.id === 'task-a')
+
+      // #then
+      expect(queue.pendingCount('ch-b')).toBe(1)
+      expect(queue.takeNext('ch-b')).toBe(taskB)
+    })
+
+    it('race-adjacent: after takeNext consumes the target task, removeBy misses deterministically', () => {
+      // #given — simulates the dequeue-handoff window: takeNext already drained the task
+      // that a concurrent cancel is targeting by runId.
+      const queue = createChannelQueue<{id: string}>(5)
+      const task1 = {id: 'task-1'}
+      queue.enqueue('ch-a', task1)
+
+      // #when — takeNext wins the race first
+      const taken = queue.takeNext('ch-a')
+
+      // #then — the subsequent removeBy for the same task deterministically misses
+      expect(taken).toBe(task1)
+      expect(queue.removeBy('ch-a', t => t.id === 'task-1')).toBeUndefined()
+    })
+  })
+
   describe('atomicity and FIFO correctness', () => {
     it('two sequential takeNext calls never return the same task object', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const task1 = {id: 'task-1'}
       const task2 = {id: 'task-2'}
       queue.enqueue('ch-a', task1)
@@ -234,7 +377,7 @@ describe('createChannelQueue', () => {
 
     it('interleaved enqueue + takeNext preserves FIFO and loses no task', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const task1 = {id: 'task-1'}
       const task2 = {id: 'task-2'}
       const task3 = {id: 'task-3'}
@@ -257,7 +400,7 @@ describe('createChannelQueue', () => {
 
     it('clear after a takeNext drops only the remaining tasks', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       const task1 = {id: 'task-1'}
       const task2 = {id: 'task-2'}
       const task3 = {id: 'task-3'}
@@ -276,7 +419,7 @@ describe('createChannelQueue', () => {
 
     it('clear returns the exact count of dropped tasks', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       queue.enqueue('ch-a', {id: 'task-1'})
       queue.enqueue('ch-a', {id: 'task-2'})
       queue.enqueue('ch-a', {id: 'task-3'})
@@ -291,7 +434,7 @@ describe('createChannelQueue', () => {
 
     it('takeNext after clear returns undefined — no stale empty array', () => {
       // #given
-      const queue = createChannelQueue(5)
+      const queue = createChannelQueue<{id: string}>(5)
       queue.enqueue('ch-a', {id: 'task-1'})
       queue.clear('ch-a')
 

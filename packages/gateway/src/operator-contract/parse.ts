@@ -16,7 +16,13 @@
  */
 
 import type {Result} from '@fro-bot/runtime'
-import type {OperatorCsrfToken, OperatorError, OperatorOk, OperatorSessionInfo} from './responses.js'
+import type {
+  OperatorCancelResponse,
+  OperatorCsrfToken,
+  OperatorError,
+  OperatorOk,
+  OperatorSessionInfo,
+} from './responses.js'
 
 import {err, ok} from '@fro-bot/runtime'
 
@@ -133,6 +139,41 @@ function hasValidOperatorErrorShape(value: unknown): value is OperatorError {
 export function parseOperatorError(input: unknown): Result<OperatorError, Error> {
   if (hasValidOperatorErrorShape(input) === false) {
     return err(new Error('invalid operator error shape'))
+  }
+
+  return ok(input)
+}
+
+// ---------------------------------------------------------------------------
+// OperatorCancelResponse
+// ---------------------------------------------------------------------------
+
+const VALID_CANCEL_PHASES: ReadonlySet<string> = new Set(['CANCELLED', 'COMPLETED', 'FAILED'])
+
+function hasValidOperatorCancelResponseShape(value: unknown): value is OperatorCancelResponse {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return (
+    candidate.ok === true &&
+    typeof candidate.runId === 'string' &&
+    typeof candidate.phase === 'string' &&
+    VALID_CANCEL_PHASES.has(candidate.phase)
+  )
+}
+
+/**
+ * Parse an unknown value as OperatorCancelResponse.
+ *
+ * Returns ok(value) when the input has the required shape.
+ * Returns err(Error) with a FIXED reason string when validation fails —
+ * the error message never echoes any part of the input.
+ */
+export function parseOperatorCancelResponse(input: unknown): Result<OperatorCancelResponse, Error> {
+  if (hasValidOperatorCancelResponseShape(input) === false) {
+    return err(new Error('invalid operator cancel response shape'))
   }
 
   return ok(input)
