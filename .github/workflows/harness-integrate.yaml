@@ -64,10 +64,12 @@ jobs:
           allowed-endpoints: |
             api.github.com:443
             broker.fro.bot:443
+            bun.sh:443
             codeload.github.com:443
             cliproxy.fro.bot:443
             github.com:443
             models.dev:443
+            nodejs.org:443
             registry.npmjs.org:443
             *.actions.githubusercontent.com:443
             *.githubusercontent.com:443
