@@ -284,7 +284,7 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  * rather than persisting a synthetic 'unknown' string — the projection
  * already renders an absent field as no failure reason.
  */
-function classifyOperatorFailureKind(execError: unknown): string | undefined {
+function extractRunCoreKind(execError: unknown): string | undefined {
   return execError instanceof RunCoreError ? execError.kind : undefined
 }
 
@@ -878,9 +878,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // released by the outer finally is an inconsistent state until the next recovery
           // sweep. Attempt a best-effort FAILED terminalization with the same etag (FAILED
           // is a valid transition from EXECUTING) rather than leaving this to recovery alone.
-          // The error is already classified above (the cancel path itself was entered via
-          // execError) — carry it through so the rare fallback still surfaces a reason.
-          const fallbackFailureKind = classifyOperatorFailureKind(execError)
+          // The cancel path was entered via the wasCancelled registry check; execError is
+          // still the caught throw and is classified here for the rare CANCELLED→FAILED
+          // fallback (usually an AbortError → no RunCoreError.kind → failureKind omitted).
+          const fallbackFailureKind = extractRunCoreKind(execError)
           const fallbackOptions =
             fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
           const failedFallbackResult = await transitionRun(
@@ -936,7 +937,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         // Transition to FAILED (best-effort), carrying the classified failure kind
         // atomically with the phase write so the operator projections can read it back.
-        const inFlightFailureKind = classifyOperatorFailureKind(execError)
+        const inFlightFailureKind = extractRunCoreKind(execError)
         const inFlightFailedOptions =
           inFlightFailureKind === undefined ? undefined : {detailsPatch: {failureKind: inFlightFailureKind}}
         const failedResult = await transitionRun(

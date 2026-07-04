@@ -129,6 +129,11 @@ export function toRunSummary(
   const heartbeatMs = runState.last_heartbeat.length === 0 ? Number.NaN : Date.parse(runState.last_heartbeat)
   const hasValidHeartbeat = Number.isNaN(heartbeatMs) === false
 
+  // failureKind is populated ONLY for FAILED runs, mapped through the closed
+  // allowlist (never a raw passthrough). Read runState.details.failureKind
+  // solely within this branch — never elsewhere.
+  const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
+
   // Build the closed DTO — copy only declared safe fields, never spread runState.
   // repo comes from the binding (the authorization anchor), not entity_ref.
   const summary: RunSummary = {
@@ -137,12 +142,7 @@ export function toRunSummary(
     status,
     createdAt: runState.started_at,
     ...(hasValidHeartbeat ? {updatedAt: runState.last_heartbeat} : {}),
-    // failureKind is populated ONLY for FAILED runs, mapped through the closed
-    // allowlist (never a raw passthrough). Read runState.details.failureKind
-    // solely within this branch — never elsewhere.
-    ...(runState.phase === 'FAILED' && toOperatorFailureKind(runState.details.failureKind) !== undefined
-      ? {failureKind: toOperatorFailureKind(runState.details.failureKind)}
-      : {}),
+    ...(failureKind === undefined ? {} : {failureKind}),
   }
 
   return summary

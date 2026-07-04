@@ -29,6 +29,7 @@
  */
 
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
+import type {RunCoreErrorKind} from '../execute/run-core.js'
 
 export type {RunPhase, Surface} from '@fro-bot/runtime'
 
@@ -92,13 +93,16 @@ export type OperatorFailureKind =
 /**
  * Closed allowlist mapping RunCoreErrorKind (internal) → OperatorFailureKind (operator-safe).
  *
- * Deliberately a `Partial`-shaped Record via index access with `?? 'unknown'` in
- * toOperatorFailureKind — kinds with no entry here (e.g. 'missing-coordinator') fall
- * through to 'unknown' rather than being a type error, since the input is untyped `unknown`.
+ * `satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>` makes this
+ * exhaustive over the RunCoreErrorKind union at compile time — adding a new
+ * RunCoreErrorKind member in run-core.ts without adding an entry here is a compile
+ * error. `undefined` is an explicit, intentional "maps to 'unknown'" entry (e.g.
+ * 'missing-coordinator' has no operator-meaningful mapping), distinct from an
+ * omitted key (which `satisfies` would reject).
  *
  * Exported so sibling projectors can reuse the mapping without re-declaring it.
  */
-export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND: Record<string, OperatorFailureKind> = {
+export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
   timeout: 'max-duration-timeout',
   'inactivity-timeout': 'inactivity-timeout',
   'stream-ended': 'stream-ended',
@@ -106,8 +110,8 @@ export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND: Record<string, Operat
   auth: 'workspace-unreachable',
   'session-error': 'session-error',
   'prompt-error': 'session-error',
-  // 'missing-coordinator' has no entry — falls through to 'unknown' via the default.
-}
+  'missing-coordinator': undefined, // → 'unknown' at the projection (no operator-meaningful mapping)
+} satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
 
 /**
  * Maps a raw failure-kind value to the operator-safe OperatorFailureKind enum.
@@ -128,7 +132,13 @@ export function toOperatorFailureKind(failureKind: unknown): OperatorFailureKind
   }
 
   if (typeof failureKind === 'string') {
-    return RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND[failureKind] ?? 'unknown'
+    // Widening cast (not a suppression): `satisfies` narrows the object's key type to
+    // RunCoreErrorKind, but the lookup key here is an arbitrary runtime string (untyped
+    // `unknown` input) that may not be a RunCoreErrorKind member. Widen the lookup type
+    // to accept any string so the index access type-checks; the `?? 'unknown'` fallback
+    // below still handles unrecognized keys safely at runtime.
+    const lookup = RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND as Record<string, OperatorFailureKind | undefined>
+    return lookup[failureKind] ?? 'unknown'
   }
 
   return 'unknown'
@@ -193,6 +203,11 @@ export const toOperatorRunStatus = (
   const heartbeatMs = Date.parse(runState.last_heartbeat)
   const stale = Number.isNaN(heartbeatMs) || heartbeatMs <= opts.nowMs - opts.staleThresholdMs
 
+  // failureKind is populated ONLY for FAILED runs, mapped through the closed
+  // allowlist (never a raw passthrough). Read runState.details.failureKind
+  // solely within this branch — never elsewhere.
+  const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
+
   // #when projecting — map only operator-safe fields; internal fields are never read
   return {
     runId: runState.run_id,
@@ -204,11 +219,6 @@ export const toOperatorRunStatus = (
     status: PHASE_TO_WEB_STATUS[runState.phase] ?? 'failed',
     startedAt: runState.started_at,
     stale,
-    // failureKind is populated ONLY for FAILED runs, mapped through the closed
-    // allowlist (never a raw passthrough). Read runState.details.failureKind
-    // solely within this branch — never elsewhere.
-    ...(runState.phase === 'FAILED' && toOperatorFailureKind(runState.details.failureKind) !== undefined
-      ? {failureKind: toOperatorFailureKind(runState.details.failureKind)}
-      : {}),
+    ...(failureKind === undefined ? {} : {failureKind}),
   }
 }

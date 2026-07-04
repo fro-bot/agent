@@ -461,6 +461,51 @@ describe('toOperatorFailureKind — allowlist mapping', () => {
       expect(result).toBe('unknown')
     },
   )
+
+  it("(edge) empty string '' maps to 'unknown' (not undefined — present but unrecognized)", () => {
+    // #given an empty-string failure-kind value (distinct from absent/undefined)
+    // #when mapped
+    const result = toOperatorFailureKind('')
+
+    // #then it is treated as an unrecognized string and falls back to 'unknown'
+    expect(result).toBe('unknown')
+  })
+})
+
+describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCoreErrorKind', () => {
+  it('every RunCoreErrorKind member maps to a valid OperatorFailureKind via toOperatorFailureKind', () => {
+    // #given every member of the internal RunCoreErrorKind union
+    const allRunCoreErrorKinds = [
+      'unreachable',
+      'auth',
+      'session-error',
+      'prompt-error',
+      'timeout',
+      'inactivity-timeout',
+      'stream-ended',
+      'missing-coordinator',
+    ] as const
+
+    const validOperatorFailureKinds = new Set<OperatorFailureKind>([
+      'inactivity-timeout',
+      'max-duration-timeout',
+      'stream-ended',
+      'workspace-unreachable',
+      'session-error',
+      'unknown',
+    ])
+
+    for (const kind of allRunCoreErrorKinds) {
+      // #when mapped through the operator-safe gate
+      const result = toOperatorFailureKind(kind)
+
+      // #then it resolves to one of the six closed OperatorFailureKind values
+      // (including 'unknown' for kinds with no operator-meaningful mapping, e.g.
+      // 'missing-coordinator')
+      assert(result !== undefined, `expected ${kind} to map to a defined OperatorFailureKind`)
+      expect(validOperatorFailureKinds.has(result)).toBe(true)
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
