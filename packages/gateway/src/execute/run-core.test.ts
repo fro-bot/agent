@@ -1040,6 +1040,43 @@ describe('runOpenCodeCore', () => {
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('timeout')
     })
+
+    it('event counters: hard-ceiling timeout signal carries counters when at least one event was processed', async () => {
+      // #given — no inactivityTimeoutMs (so only the outer wall-clock signal can abort), a
+      // stream that yields one activity event and then hangs, and an outer signal aborted
+      // via a real timer AFTER that first event has already been processed. This exercises
+      // the `combinedSignal.aborted && !inactivityController.signal.aborted` branch (here
+      // inactivityController is null entirely) that logs 'stream ended due to timeout signal'.
+      const controller = new AbortController()
+      const logger = makeLogger()
+      const handle = makeHandle({
+        subscribe: async () =>
+          Promise.resolve({
+            stream: hangingStreamAfterFirst(partDeltaObjectEvent('hi')),
+          }),
+      })
+      const params = {...buildParams(handle), signal: controller.signal, logger, coordinator: makeCoordinator()}
+      // Abort on a real timer tick — the first event (yielded synchronously by the async
+      // generator) is processed well before this fires, since the generator only blocks
+      // on its *second* `next()` call.
+      setTimeout(() => controller.abort(), 5)
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then — timeout kind (not inactivity-timeout, since no inactivity controller exists)
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('timeout')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          totalEvents: 1,
+          activityEvents: 1,
+          lastEventType: 'message.part.delta',
+        }),
+        'run-core: stream ended due to timeout signal',
+      )
+    })
   })
 
   describe('isAuthError classification', () => {
@@ -1824,6 +1861,7 @@ describe('runOpenCodeCore', () => {
 
     it('throws RunCoreError with kind "stream-ended" when stream closes after some events but before session.idle', async () => {
       // #given — stream yields some text deltas then closes without session.idle
+      const logger = makeLogger()
       const handle = makeHandle({
         subscribe: async () =>
           subscribeOk([
@@ -1831,12 +1869,21 @@ describe('runOpenCodeCore', () => {
             // No sessionIdleEvent — stream ends prematurely
           ]),
       })
-      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+      const params = {...buildParams(handle), logger, coordinator: makeCoordinator()}
 
       // #when / #then
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('stream-ended')
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          totalEvents: 1,
+          activityEvents: 1,
+          lastEventType: 'message.part.delta',
+        }),
+        'run-core: event stream closed before session.idle',
+      )
     })
 
     it('stream-ended error is NOT thrown when signal is aborted (timeout takes precedence)', async () => {
