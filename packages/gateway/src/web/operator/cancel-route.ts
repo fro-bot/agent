@@ -250,21 +250,20 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
           return c.json({ok: true, runId, phase: 'CANCELLED'}, 200)
         }
         case 'already-terminal': {
-          // cancelRun's TERMINAL_PHASES set guarantees outcome.phase is one of
-          // CANCELLED/COMPLETED/FAILED here — narrow the wider RunPhase type
-          // to match OperatorCancelResponse's closed phase union.
-          const terminalPhase = outcome.phase as 'CANCELLED' | 'COMPLETED' | 'FAILED'
+          // outcome.phase is already TerminalPhase — CancelOutcome's already-terminal
+          // variant is typed as such (see execute/cancel.ts), so it matches
+          // OperatorCancelResponse's phase field with no narrowing needed.
           emitAudit(
             {
               kind: 'run.cancel.requested',
               correlationId: `cancel:${githubUserId}:${runId}`,
               githubUserId,
               runId,
-              phase: terminalPhase,
+              phase: outcome.phase,
             },
             deps.auditLogger,
           )
-          return c.json({ok: true, runId, phase: terminalPhase}, 200)
+          return c.json({ok: true, runId, phase: outcome.phase}, 200)
         }
         case 'not-found': {
           deps.logger.warn({githubUserId, runId, gate: 'cancelRun-not-found'}, 'cancel: denied')
@@ -285,8 +284,10 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
           // EXECUTING (a subsequent cancel hits the abort-registry path) or
           // reached a terminal state on its own. Return a coarse transient
           // 503 rather than a misleading success or a distinguishable error.
+          // The rendezvous window is short — bounded by ensureClone/readyz/
+          // threadFactory/lock — so a 2s Retry-After is a reasonable hint.
           deps.logger.warn({githubUserId, runId, gate: 'cancelRun-retry'}, 'cancel: transient — retry')
-          return unavailableResponse(c)
+          return unavailableResponse(c, 2)
         }
       }
     } catch (error: unknown) {

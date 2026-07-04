@@ -10,6 +10,8 @@
  * - camelCase keys match the shipped JSON literals exactly.
  */
 
+import type {TerminalPhase} from '@fro-bot/runtime'
+
 /**
  * Canonical response shape for GET /operator/session.
  *
@@ -69,5 +71,5 @@ export interface OperatorError {
 export interface OperatorCancelResponse {
   readonly ok: true
   readonly runId: string
-  readonly phase: 'CANCELLED' | 'COMPLETED' | 'FAILED'
+  readonly phase: TerminalPhase
 }

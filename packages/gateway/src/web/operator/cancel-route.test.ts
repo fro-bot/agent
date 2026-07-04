@@ -379,6 +379,7 @@ describe('POST cancel — CancelOutcome mapping', () => {
     expect(response.status).toBe(503)
     const body = (await response.json()) as {error: string}
     expect(body.error).toBe('unavailable')
+    expect(response.headers.get('Retry-After')).toBe('2')
   })
 })
 

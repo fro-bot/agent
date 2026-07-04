@@ -27,7 +27,7 @@
  * the cancellation outcome, only logs.
  */
 
-import type {CoordinationConfig, RunPhase, RunState} from '@fro-bot/runtime'
+import type {CoordinationConfig, RunPhase, RunState, TerminalPhase} from '@fro-bot/runtime'
 import type {ApprovalActor, ApprovalRegistry} from '../approvals/registry.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {AbortRegistry, CancelledByMetadata} from './abort-registry.js'
@@ -58,7 +58,7 @@ export interface CancelActorContext {
 
 export type CancelOutcome =
   | {readonly outcome: 'not-found'}
-  | {readonly outcome: 'already-terminal'; readonly phase: RunPhase}
+  | {readonly outcome: 'already-terminal'; readonly phase: TerminalPhase}
   | {readonly outcome: 'cancelled'; readonly wasQueued: boolean}
   /**
    * The bounded rendezvous retry (see `attemptRendezvousCancel`) was
@@ -151,7 +151,7 @@ async function readRunState(
 
 const TERMINAL_PHASES: ReadonlySet<RunPhase> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
 
-function isTerminalPhase(phase: RunPhase): boolean {
+function isTerminalPhase(phase: RunPhase): phase is TerminalPhase {
   return TERMINAL_PHASES.has(phase)
 }
 
@@ -381,6 +381,15 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
       return attemptRendezvousCancel(deps, repo, runId, actor, logger)
     }
 
+    // ACCEPTED: this notice fires as soon as abort() confirms delivery — it means
+    // "cancel requested and delivered to the run", not "settled as CANCELLED". The
+    // actual terminal transition happens asynchronously in run.ts's catch handler,
+    // which may rarely fall back to FAILED if the CANCELLED conditional write fails
+    // (see run.ts's cancel-path fallback). In that narrow window the thread can show
+    // "cancelled" while the run settles FAILED — state is always correct, only this
+    // best-effort message can be briefly stale. Do NOT make this conditional on the
+    // eventual terminal state: that would couple this fire-and-forget orchestrator to
+    // the async settlement and defeat the point of firing eagerly.
     // eslint-disable-next-line no-void
     void deps.postCancelNotice(initialRead.state.thread_id, runId).catch(() => {})
     return {outcome: 'cancelled', wasQueued: false}

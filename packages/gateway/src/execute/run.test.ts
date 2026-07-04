@@ -7121,6 +7121,76 @@ describe('operator cancel — abort-registry integration', () => {
     abortRegistry.delete(CANCEL_FALLBACK_RUN_ID)
   })
 
+  it('cancelled→failed fallback reaches a terminal state without throwing (accepted notice-vs-settlement interleaving)', async () => {
+    // #given — same CANCELLED-transition-fails/FAILED-fallback-succeeds setup as above.
+    // ACCEPTED BEHAVIOR: cancelRun (execute/cancel.ts) posts the "cancelled" thread
+    // notice fire-and-forget as soon as abort() confirms delivery — before this async
+    // settlement runs. In this rare fallback window the thread may show "cancelled"
+    // while the run actually settles FAILED. State is always correct; only the
+    // best-effort notice can be briefly stale. This test pins the FAILED-fallback
+    // side: the run must still reach a terminal state and must not throw or hang.
+    // The notice side (fire-and-forget post on abort delivery) is covered separately
+    // by cancel.test.ts's "abort delivered → notice posted" test.
+    const {launchWork} = await import('./run.js')
+    const failedState = buildMockRunState({phase: 'FAILED', run_id: 'cancel-fallback-pin-run-id'})
+
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED conditional write conflict')}
+        }
+        if (phase === 'FAILED') {
+          return {success: true as const, data: {etag: 'failed-etag', state: failedState}}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: failedState}}
+      },
+    )
+    const heartbeatStop = vi.fn().mockResolvedValue({
+      success: true,
+      data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: failedState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: heartbeatStop,
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+
+    const PIN_RUN_ID = 'cancel-fallback-pin-run-id'
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(PIN_RUN_ID, 'operator cancel')
+    })
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = PIN_RUN_ID
+    const deps = makeDeps({logger})
+
+    // #when — the run must resolve (not throw, not hang) despite the CANCELLED
+    // transition failing.
+    await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
+
+    // #then — the run reached a terminal state via the FAILED fallback.
+    const transitionCalls = mockRuntime.transitionRun.mock.calls.filter(
+      (c: unknown[]) => c[4] === 'CANCELLED' || c[4] === 'FAILED',
+    )
+    expect(transitionCalls.map((c: unknown[]) => c[4] as string)).toEqual(
+      expect.arrayContaining(['CANCELLED', 'FAILED']),
+    )
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: PIN_RUN_ID}),
+      expect.stringContaining('fell back to FAILED'),
+    )
+
+    abortRegistry.delete(PIN_RUN_ID)
+  })
+
   it('timeout-vs-cancel race: classification uses registry probe, not composite abort reason', async () => {
     // #given — a pure ceiling-timeout failure where the registry entry exists but was
     // never aborted. The run must still land FAILED with timeout messaging.
