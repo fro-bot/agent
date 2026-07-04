@@ -1,6 +1,7 @@
 ---
 title: Isolate a CI credential from an autonomous agent via an OIDC broker
 date: 2026-07-01
+last_updated: 2026-07-04
 category: workflow-issues
 module: harness/release pipeline
 problem_type: workflow_issue
@@ -62,6 +63,8 @@ A dedicated reusable workflow requests a GitHub OIDC token and exchanges it at a
 
 The paths that still use the durable key should scrub it from `process.env` after reading it, so it is not inherited by the agent's child process (which the OpenCode SDK spawns with `{ ...process.env }`). Note `@actions/core` maps input names replacing **spaces** only with underscores — `auth-json` reads from `INPUT_AUTH-JSON`, not `INPUT_AUTH_JSON` (PR #1080).
 
+**A scrub removes one copy, not the credential — enumerate every env copy before claiming isolation.** Scrubbing a single `INPUT_*` var is credential *hygiene*, not *isolation*, when the same secret value is exported again under a different name that the agent genuinely needs. The `github-token` case (#1107 / PR #1119) is the cautionary example: masking + `delete process.env['INPUT_GITHUB-TOKEN']` removes the input copy, but the same PAT is still exported as `GH_TOKEN` (`src/services/setup/setup.ts` `core.exportVariable`, `src/services/setup/gh-auth.ts` `process.env.GH_TOKEN = token`) — and the integrate agent *needs* `GH_TOKEN` to `git push` its result. So the scrub cannot isolate the token; it only shrinks the log/leak surface (`core.setSecret` masks by **value**, so it does cover all copies of the string in logs). When a prompt-injectable child genuinely needs the credential, the only real fix is credential **minimization** — give it a short-lived, narrowly-scoped, mint-per-run token so the durable one never reaches it — not a scrub. Before asserting "the agent can't read secret X," grep for X's value origin and every `core.exportVariable` / `process.env.X =` that re-creates it.
+
 ## Why This Matters
 
 The durable model key is the highest-value secret on the runner. Removing it entirely (broker path) shrinks the credential's value and lifetime; a stolen minted token is cliproxy-scoped and expires. The two halves are load-bearing together: dropping `secrets: inherit` without the broker leaves the merge with no credential; minting without dropping `secrets: inherit` leaves the durable key inherited into the called workflow's env, making the isolation fake.
@@ -89,6 +92,8 @@ Fail-closed verified in practice: a dry-run `harness-release` dispatch whose bro
 ## Related
 
 - `docs/solutions/best-practices/reusable-workflow-permissions-replace-not-merge-2026-07-01.md` — the permissions trap this work hit (a caller job needs `id-token: write` for the broker mint; getting the `permissions:` block wrong fails the run at startup).
+- `docs/solutions/workflow-issues/create-github-app-token-caller-mint-invalid-2026-07-04.md` — why you cannot mint a scoped App token in the caller and pass it into the reusable workflow (the intuitive alternative to broker-mint), and the valid alternatives.
+- `docs/solutions/best-practices/same-job-phase-split-not-a-security-boundary-2026-07-04.md` — why splitting the agent and the privileged push into sequential steps of one job does not isolate them (the reason broker-mint / credential minimization is the real fix, not intra-job ordering).
 - `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — the sibling `auth-json` surface (workspace container entrypoint). This doc is the harness-CI producer side; that doc is the container consumer side.
 - `docs/solutions/workflow-issues/build-pipeline-fallible-preflight-and-finally-cleanup-2026-06-22.md` — the preflight → mutator → finally lifecycle the mint script follows.
 - `docs/solutions/best-practices/release-notes-narration-routing-and-fail-soft-guards-2026-06-07.md` — the `scripts/`-as-testable-module precedent for the mint script.
