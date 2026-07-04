@@ -1915,8 +1915,7 @@ describe('runMention', () => {
 
       // Extract the onDeadlineSettled callback from the register call
       const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
-        | {onDeadlineSettled?: () => void | Promise<void>}
-        | undefined
+        {onDeadlineSettled?: () => void | Promise<void>} | undefined
       expect(registerCall?.onDeadlineSettled).toBeDefined()
 
       // #when — simulate deadline firing
@@ -2629,8 +2628,7 @@ describe('runMention', () => {
 
       // Extract the onDeadlineSettled callback from the register call
       const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
-        | {onDeadlineSettled?: () => void | Promise<void>}
-        | undefined
+        {onDeadlineSettled?: () => void | Promise<void>} | undefined
       expect(registerCall).toBeDefined()
       expect(registerCall?.onDeadlineSettled).toBeDefined()
 
@@ -2714,8 +2712,7 @@ describe('runMention', () => {
 
       // Extract the deadlineMs from the register call
       const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
-        | {deadlineMs?: number}
-        | undefined
+        {deadlineMs?: number} | undefined
       expect(registerCall).toBeDefined()
 
       // The deadline must equal computeApprovalDeadlineMs(runTimeoutMs - elapsedMs).
@@ -6544,6 +6541,46 @@ describe('early-abort gates terminalize to FAILED', () => {
 
     // #and — acquireLock NOT called
     expect(mockRuntime.acquireLock).not.toHaveBeenCalled()
+  })
+
+  // ── thread_id persistence at ACK (bug fix) ────────────────────────────────
+
+  it('persists the live thread_id to run-state at PENDING → ACKNOWLEDGED when threadFactory succeeds', async () => {
+    // #given — a discord run with a threadFactory that resolves a real thread id
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-thread'}})
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const threadFactory = vi.fn().mockResolvedValue({ok: true as const, threadId: 'live-thread-999'})
+    const requestWithFactory = {...request, threadFactory}
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, requestWithFactory, deps)
+
+    // #then — the ACKNOWLEDGED transitionRun call carries the live thread id in the options bag
+    const ackCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'ACKNOWLEDGED')
+    expect(ackCall).toBeDefined()
+    expect((ackCall as unknown[])[7]).toEqual({threadId: 'live-thread-999'})
+  })
+
+  it('leaves thread_id empty at ACK when there is no threadFactory (non-discord/no-thread path)', async () => {
+    // #given — a run with no threadFactory (e.g. in-memory/no-thread transport)
+    const {launchWork} = await import('./run.js')
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'adoption-etag-nothread'}})
+    setupHappyPath()
+
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then — the ACKNOWLEDGED transitionRun call passes {threadId: ''} (no-op in transitionRun)
+    const ackCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'ACKNOWLEDGED')
+    expect(ackCall).toBeDefined()
+    expect((ackCall as unknown[])[7]).toEqual({threadId: ''})
   })
 
   // ── Gate 4a: lock acquisition error ───────────────────────────────────────

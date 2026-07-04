@@ -404,9 +404,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // The run was already created (PENDING) by launchWork during admission.
     // Adopt it here by transitioning PENDING → ACKNOWLEDGED using the adoption etag.
     // This is the seam between admission (launchWork) and execution (here).
-    // The thread_id is updated via the transition so the run-state reflects the actual thread.
-    // NOTE: transitionRun does not update thread_id — the thread_id was set at createRun time
-    // with an empty string (pre-thread). This is acceptable — the thread_id is not load-bearing for run-state.
+    // thread_id IS now persisted at adoption: it's load-bearing for discord approval-scope
+    // resolution (projection.ts scopeIdFor) and recovery thread-notes (recovery.ts resolveThread).
+    // The thread_id was set at createRun time to an empty string (pre-thread); once threadFactory
+    // resolves a live thread id above, fold it into this same conditional write.
     const ackResult = await transitionRun(
       coordinationConfig,
       identity,
@@ -415,6 +416,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       'ACKNOWLEDGED',
       task.adoptionEtag,
       coordLogger,
+      {threadId},
     )
     if (ackResult.success === false) {
       logger.error({repo, runId, err: ackResult.error.message}, 'run: transitionRun ACKNOWLEDGED failed')
