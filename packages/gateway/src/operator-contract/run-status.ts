@@ -40,13 +40,7 @@ export type {RunPhase, Surface} from '@fro-bot/runtime'
  * RunPhase only). The snapshot endpoint layers them on top after projection.
  */
 export type OperatorWebStatus =
-  | 'queued'
-  | 'blocked'
-  | 'running'
-  | 'waiting_for_approval'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
+  'queued' | 'blocked' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled'
 
 /**
  * Operator-safe projection of a run's status.
@@ -82,6 +76,61 @@ export const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
   COMPLETED: 'succeeded',
   FAILED: 'failed',
   CANCELLED: 'cancelled',
+}
+
+/**
+ * The operator-facing failure-reason enum.
+ *
+ * A closed allowlist derived from RunCoreErrorKind (execute/run-core.ts) — the internal
+ * error-kind vocabulary. 'unknown' is the fallback for any internal kind with no mapping
+ * entry (defense-in-depth: unmapped/future/unrecognized kinds never leak past this gate).
+ */
+export type OperatorFailureKind =
+  'inactivity-timeout' | 'max-duration-timeout' | 'stream-ended' | 'workspace-unreachable' | 'session-error' | 'unknown'
+
+/**
+ * Closed allowlist mapping RunCoreErrorKind (internal) → OperatorFailureKind (operator-safe).
+ *
+ * Deliberately a `Partial`-shaped Record via index access with `?? 'unknown'` in
+ * toOperatorFailureKind — kinds with no entry here (e.g. 'missing-coordinator') fall
+ * through to 'unknown' rather than being a type error, since the input is untyped `unknown`.
+ *
+ * Exported so sibling projectors can reuse the mapping without re-declaring it.
+ */
+export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND: Record<string, OperatorFailureKind> = {
+  timeout: 'max-duration-timeout',
+  'inactivity-timeout': 'inactivity-timeout',
+  'stream-ended': 'stream-ended',
+  unreachable: 'workspace-unreachable',
+  auth: 'workspace-unreachable',
+  'session-error': 'session-error',
+  'prompt-error': 'session-error',
+  // 'missing-coordinator' has no entry — falls through to 'unknown' via the default.
+}
+
+/**
+ * Maps a raw failure-kind value to the operator-safe OperatorFailureKind enum.
+ *
+ * Structural defense-in-depth: this function's signature accepts only the single
+ * candidate VALUE, never a details/context object — it is impossible for this function
+ * to read any other property, because it never receives one.
+ *
+ * - `undefined` (field absent) → `undefined` (the operator field will be omitted).
+ * - Any recognized internal kind string → its mapped OperatorFailureKind.
+ * - Any other value (unrecognized string, object, number, null, boolean) → `'unknown'`.
+ *   This is a closed allowlist gate: nothing but the six known enum values can escape
+ *   this function, regardless of what raw value flows in.
+ */
+export function toOperatorFailureKind(failureKind: unknown): OperatorFailureKind | undefined {
+  if (failureKind === undefined) {
+    return undefined
+  }
+
+  if (typeof failureKind === 'string') {
+    return RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND[failureKind] ?? 'unknown'
+  }
+
+  return 'unknown'
 }
 
 /**

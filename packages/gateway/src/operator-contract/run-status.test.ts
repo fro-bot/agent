@@ -1,8 +1,8 @@
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus, OperatorWebStatus} from './run-status.js'
+import type {OperatorFailureKind, OperatorRunStatus, OperatorWebStatus} from './run-status.js'
 
 import {assert, describe, expect, expectTypeOf, it} from 'vitest'
-import {toOperatorRunStatus} from './run-status.js'
+import {toOperatorFailureKind, toOperatorRunStatus} from './run-status.js'
 
 // ---------------------------------------------------------------------------
 // Shared fixture helpers
@@ -329,6 +329,71 @@ describe('toOperatorRunStatus — unknown phase fallback (fail-closed)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// toOperatorFailureKind — internal→operator failure-kind mapping
+//
+// Structural note: toOperatorFailureKind(failureKind: unknown) takes only the single
+// candidate VALUE — never a details/context object — so it is structurally impossible
+// for this function to read any other key off a details dict.
+// ---------------------------------------------------------------------------
+
+describe('toOperatorFailureKind — allowlist mapping', () => {
+  const cases: [string, OperatorFailureKind][] = [
+    ['timeout', 'max-duration-timeout'],
+    ['inactivity-timeout', 'inactivity-timeout'],
+    ['stream-ended', 'stream-ended'],
+    ['unreachable', 'workspace-unreachable'],
+    ['auth', 'workspace-unreachable'],
+    ['session-error', 'session-error'],
+    ['prompt-error', 'session-error'],
+  ]
+
+  for (const [internalKind, expected] of cases) {
+    it(`maps internal kind '${internalKind}' → '${expected}'`, () => {
+      // #given an internal RunCoreErrorKind value
+      // #when mapped to the operator-safe enum
+      const result = toOperatorFailureKind(internalKind)
+
+      // #then it resolves to the expected OperatorFailureKind
+      expect(result).toBe(expected)
+    })
+  }
+
+  it('absent failureKind (undefined) maps to undefined (field omitted)', () => {
+    // #given no failure-kind value at all
+    // #when mapped
+    const result = toOperatorFailureKind(undefined)
+
+    // #then undefined — the operator field is omitted, not defaulted to 'unknown'
+    expect(result).toBeUndefined()
+  })
+
+  it.each(['lol-raw-error', 'missing-coordinator', 'DROP TABLE'])(
+    "(security) unrecognized string '%s' maps to 'unknown' (allowlist gate)",
+    unrecognizedKind => {
+      // #given a string that is not in the closed allowlist (including the internal
+      // 'missing-coordinator' kind, which is deliberately unmapped)
+      // #when mapped
+      const result = toOperatorFailureKind(unrecognizedKind)
+
+      // #then it falls back to 'unknown' — never coerced/passed through raw
+      expect(result).toBe('unknown')
+    },
+  )
+
+  it.each([{}, 42, null, true])(
+    "(security) non-string value %j maps to 'unknown' (never coerced to a raw value)",
+    nonStringValue => {
+      // #given a non-string candidate value (object, number, null, boolean)
+      // #when mapped
+      const result = toOperatorFailureKind(nonStringValue)
+
+      // #then it falls back to 'unknown'
+      expect(result).toBe('unknown')
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // Barrel re-export smoke test
 // ---------------------------------------------------------------------------
 
@@ -340,5 +405,14 @@ describe('barrel re-exports', () => {
     // #when the projection function is accessed
     // #then it is present and callable
     expect(typeof barrel.toOperatorRunStatus).toBe('function')
+  })
+
+  it('toOperatorFailureKind is re-exported from the contract barrel', async () => {
+    // #given the public barrel for the operator-contract module
+    const barrel = await import('./index.js')
+
+    // #when the failure-kind mapper is accessed
+    // #then it is present and callable
+    expect(typeof barrel.toOperatorFailureKind).toBe('function')
   })
 })
