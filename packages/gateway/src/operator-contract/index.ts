@@ -20,14 +20,33 @@ export type {DecisionInput, OperatorDecisionState, PermissionReply} from './appr
 export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'
 export type {OperatorOutputFrame} from './output.js'
-export {parseOperatorCsrfToken, parseOperatorError, parseOperatorOk, parseOperatorSessionInfo} from './parse.js'
+export {
+  parseOperatorCancelResponse,
+  parseOperatorCsrfToken,
+  parseOperatorError,
+  parseOperatorOk,
+  parseOperatorSessionInfo,
+} from './parse.js'
 export {assertRedactionApplied, AUTHORIZATION_OBLIGATION, REDACTION_OBLIGATION} from './redaction.js'
 export type {RedactionContext} from './redaction.js'
 export type {RepoSummary} from './repo-summary.js'
 export {toRepoSummary} from './repo-summary.js'
-export type {OperatorCsrfToken, OperatorError, OperatorOk, OperatorSessionInfo} from './responses.js'
-export type {OperatorRunStatus, OperatorWebStatus, RunPhase, RunStatusRepoKey, Surface} from './run-status.js'
-export {toOperatorRunStatus} from './run-status.js'
+export type {
+  OperatorCancelResponse,
+  OperatorCsrfToken,
+  OperatorError,
+  OperatorOk,
+  OperatorSessionInfo,
+} from './responses.js'
+export type {
+  OperatorFailureKind,
+  OperatorRunStatus,
+  OperatorWebStatus,
+  RunPhase,
+  RunStatusRepoKey,
+  Surface,
+} from './run-status.js'
+export {toOperatorFailureKind, toOperatorRunStatus} from './run-status.js'
 export type {RunSummary, RunSummaryStatus} from './run-summary.js'
 export {toRunSummary} from './run-summary.js'
 export {OPERATOR_CONTRACT_VERSION} from './version.js'

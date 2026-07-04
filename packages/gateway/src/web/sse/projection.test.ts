@@ -332,6 +332,34 @@ describe('projectRunObservation — closed DTO safety', () => {
     expect(resultKeys).toEqual(contractFields)
   })
 
+  it('carries failureKind through from the bridge result when present (FAILED)', async () => {
+    // #given a FAILED base status carrying a failureKind from the bridge
+    const runState = makeRunState({phase: 'FAILED'})
+    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed', failureKind: 'inactivity-timeout'})
+    const deps = makeDeps(baseStatus)
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then failureKind is copied through from base
+    expect(result).not.toBeNull()
+    expect(result?.failureKind).toBe('inactivity-timeout')
+  })
+
+  it('omits failureKind when absent from the bridge result (non-FAILED)', async () => {
+    // #given a non-FAILED base status with no failureKind
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const baseStatus = makeBaseStatus({phase: 'EXECUTING', status: 'running'})
+    const deps = makeDeps(baseStatus)
+
+    // #when projecting
+    const result = await projectRunObservation(runState, deps)
+
+    // #then failureKind is absent (not undefined-valued key, structurally omitted)
+    expect(result).not.toBeNull()
+    expect(Object.prototype.hasOwnProperty.call(result as object, 'failureKind')).toBe(false)
+  })
+
   it('does not spread runState — holder_id and thread_id are absent from output', async () => {
     // #given a run with holder_id and thread_id
     const runState = makeRunState({holder_id: 'holder-secret', thread_id: 'thread-secret'})

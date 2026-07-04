@@ -33,12 +33,10 @@ vi.mock('../../execute/run.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../../execute/run.js')>()
   return {
     ...actual,
-    launchWork: vi.fn(
-      async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
-        accepted: true,
-        runId: request.runId ?? 'mock-run-id',
-      }),
-    ),
+    launchWork: vi.fn(async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
+      accepted: true,
+      runId: request.runId ?? 'mock-run-id',
+    })),
   }
 })
 
@@ -49,12 +47,10 @@ const mockLaunchWork = vi.mocked(launchWork)
 beforeEach(() => {
   mockLaunchWork.mockClear()
   // Restore the default implementation (accepted:true, echoes request.runId).
-  mockLaunchWork.mockImplementation(
-    async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
-      accepted: true,
-      runId: request.runId ?? 'mock-run-id',
-    }),
-  )
+  mockLaunchWork.mockImplementation(async (request: {readonly runId?: string}): Promise<LaunchAdmission> => ({
+    accepted: true,
+    runId: request.runId ?? 'mock-run-id',
+  }))
 })
 
 // ---------------------------------------------------------------------------
@@ -146,6 +142,7 @@ function makeLaunchWorkDeps(): RunMentionDeps {
       takeNext: vi.fn(() => undefined),
       pendingCount: vi.fn(() => 0),
       clear: vi.fn(() => 0),
+      removeBy: vi.fn(() => undefined),
     },
     attachUrl: 'http://localhost:3000',
     attachToken: 'attach-token',

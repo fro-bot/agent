@@ -23,10 +23,12 @@ import {Effect} from 'effect'
 import {createApprovalRegistry} from './approvals/registry.js'
 import {createBindingsStore} from './bindings/store.js'
 import {parseApprovalCustomId} from './discord/approvals.js'
+import {createCancelNoticeDispatcher} from './discord/cancel-notice.js'
 import {createDiscordClient, withLogContext} from './discord/client.js'
 import {dispatchCommand, getCommandRegistry, registerSlashCommands} from './discord/commands/index.js'
 import {editInteractionAsync} from './discord/io.js'
 import {handleMention, userIsAuthorized} from './discord/mentions.js'
+import {abortRegistry} from './execute/abort-registry.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
@@ -140,6 +142,12 @@ export interface BuildOperatorServerInputs {
    */
   readonly approvalRegistry?: NonNullable<OperatorServerDeps['approvalRegistry']>
   /**
+   * Cancel-run engine dependencies for the cancel route's `cancelRun` orchestrator call.
+   * Optional — omit (or pass undefined) to simulate a missing dep in tests,
+   * which causes POST /operator/runs/:runId/cancel to be absent from app.routes.
+   */
+  readonly cancelRunDeps?: NonNullable<OperatorServerDeps['cancelRunDeps']>
+  /**
    * Engine dependencies for the launch route's launchWork call.
    * Required for POST /operator/runs to be registered — the route gate checks
    * deps.launchWorkDeps !== undefined. Pass runEngineDeps from the program scope.
@@ -189,6 +197,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runObservationManager,
     runIndex,
     approvalRegistry,
+    cancelRunDeps,
     launchWorkDeps,
     operatorWebConfig,
   } = inputs
@@ -258,6 +267,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runObservationManager,
     runIndex,
     approvalRegistry,
+    cancelRunDeps,
   }
 
   const config: OperatorServerConfig = {
@@ -671,6 +681,16 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         runObservationManager,
         runIndex,
         approvalRegistry,
+        cancelRunDeps: {
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+          identity: config.identity,
+          runIndex,
+          queue: channelQueue,
+          abortRegistry,
+          approvalRegistry,
+          postCancelNotice: createCancelNoticeDispatcher(client, logger),
+          runObserver: runObservationManager,
+        },
         launchWorkDeps: runEngineDeps,
         operatorWebConfig: config.operatorWeb,
       })

@@ -1,8 +1,8 @@
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus, OperatorWebStatus} from './run-status.js'
+import type {OperatorFailureKind, OperatorRunStatus, OperatorWebStatus} from './run-status.js'
 
 import {assert, describe, expect, expectTypeOf, it} from 'vitest'
-import {toOperatorRunStatus} from './run-status.js'
+import {toOperatorFailureKind, toOperatorRunStatus} from './run-status.js'
 
 // ---------------------------------------------------------------------------
 // Shared fixture helpers
@@ -102,6 +102,76 @@ describe('toOperatorRunStatus — operator-safe fields', () => {
     expect(keys).not.toContain('holder_id')
     expect(keys).not.toContain('thread_id')
     expect(keys).not.toContain('details')
+  })
+
+  it('(r5) exact key-set for a non-FAILED run — no failureKind, no sibling leak', () => {
+    // #given a non-FAILED run
+    const runState = makeRunState({phase: 'EXECUTING'})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then the output has exactly the 7 declared keys, no more, no less
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale']))
+  })
+
+  it('(r5/r7) exact key-set for a FAILED run with details.failureKind — field present+mapped', () => {
+    // #given a FAILED run with a classified failureKind in details
+    const runState = makeRunState({phase: 'FAILED', details: {failureKind: 'inactivity-timeout'}})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then failureKind is present and mapped, with exactly the 8 declared keys
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(
+      new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale', 'failureKind']),
+    )
+    expect(result.failureKind).toBe('inactivity-timeout')
+  })
+
+  it('(r5) exact key-set for a FAILED run with no details.failureKind — field omitted', () => {
+    // #given a FAILED run with no failureKind in details
+    const runState = makeRunState({phase: 'FAILED', details: {}})
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then the output has exactly the 7 declared keys — no failureKind key at all
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale']))
+  })
+
+  it('(r4/r5) FAILED run whose details also carries rawOutput/workspacePath/internalUrl — only failureKind surfaces', () => {
+    // #given a FAILED run with sensitive sibling detail keys alongside failureKind
+    const runState = makeRunState({
+      phase: 'FAILED',
+      details: {
+        failureKind: 'stream-ended',
+        rawOutput: 'secret tool output',
+        workspacePath: '/home/runner/workspace/acme/widget',
+        internalUrl: 'http://internal.corp/api',
+      },
+    })
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then only failureKind surfaces — no sibling detail key leaks
+    assert(result !== null, 'expected a populated status for a non-denylisted repo')
+    const keys = new Set(Object.keys(result))
+    expect(keys).toEqual(
+      new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale', 'failureKind']),
+    )
+    expect(result.failureKind).toBe('stream-ended')
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain('rawOutput')
+    expect(serialized).not.toContain('workspacePath')
+    expect(serialized).not.toContain('internalUrl')
   })
 
   it('(r5) OperatorRunStatus type cannot carry holder_id, thread_id, or details', () => {
@@ -329,6 +399,116 @@ describe('toOperatorRunStatus — unknown phase fallback (fail-closed)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// toOperatorFailureKind — internal→operator failure-kind mapping
+//
+// Structural note: toOperatorFailureKind(failureKind: unknown) takes only the single
+// candidate VALUE — never a details/context object — so it is structurally impossible
+// for this function to read any other key off a details dict.
+// ---------------------------------------------------------------------------
+
+describe('toOperatorFailureKind — allowlist mapping', () => {
+  const cases: [string, OperatorFailureKind][] = [
+    ['timeout', 'max-duration-timeout'],
+    ['inactivity-timeout', 'inactivity-timeout'],
+    ['stream-ended', 'stream-ended'],
+    ['unreachable', 'workspace-unreachable'],
+    ['auth', 'workspace-unreachable'],
+    ['session-error', 'session-error'],
+    ['prompt-error', 'session-error'],
+  ]
+
+  for (const [internalKind, expected] of cases) {
+    it(`maps internal kind '${internalKind}' → '${expected}'`, () => {
+      // #given an internal RunCoreErrorKind value
+      // #when mapped to the operator-safe enum
+      const result = toOperatorFailureKind(internalKind)
+
+      // #then it resolves to the expected OperatorFailureKind
+      expect(result).toBe(expected)
+    })
+  }
+
+  it('absent failureKind (undefined) maps to undefined (field omitted)', () => {
+    // #given no failure-kind value at all
+    // #when mapped
+    const result = toOperatorFailureKind(undefined)
+
+    // #then undefined — the operator field is omitted, not defaulted to 'unknown'
+    expect(result).toBeUndefined()
+  })
+
+  it.each(['lol-raw-error', 'missing-coordinator', 'DROP TABLE'])(
+    "(security) unrecognized string '%s' maps to 'unknown' (allowlist gate)",
+    unrecognizedKind => {
+      // #given a string that is not in the closed allowlist (including the internal
+      // 'missing-coordinator' kind, which is deliberately unmapped)
+      // #when mapped
+      const result = toOperatorFailureKind(unrecognizedKind)
+
+      // #then it falls back to 'unknown' — never coerced/passed through raw
+      expect(result).toBe('unknown')
+    },
+  )
+
+  it.each([{}, 42, null, true])(
+    "(security) non-string value %j maps to 'unknown' (never coerced to a raw value)",
+    nonStringValue => {
+      // #given a non-string candidate value (object, number, null, boolean)
+      // #when mapped
+      const result = toOperatorFailureKind(nonStringValue)
+
+      // #then it falls back to 'unknown'
+      expect(result).toBe('unknown')
+    },
+  )
+
+  it("(edge) empty string '' maps to 'unknown' (not undefined — present but unrecognized)", () => {
+    // #given an empty-string failure-kind value (distinct from absent/undefined)
+    // #when mapped
+    const result = toOperatorFailureKind('')
+
+    // #then it is treated as an unrecognized string and falls back to 'unknown'
+    expect(result).toBe('unknown')
+  })
+})
+
+describe('RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND — exhaustive over RunCoreErrorKind', () => {
+  it('every RunCoreErrorKind member maps to a valid OperatorFailureKind via toOperatorFailureKind', () => {
+    // #given every member of the internal RunCoreErrorKind union
+    const allRunCoreErrorKinds = [
+      'unreachable',
+      'auth',
+      'session-error',
+      'prompt-error',
+      'timeout',
+      'inactivity-timeout',
+      'stream-ended',
+      'missing-coordinator',
+    ] as const
+
+    const validOperatorFailureKinds = new Set<OperatorFailureKind>([
+      'inactivity-timeout',
+      'max-duration-timeout',
+      'stream-ended',
+      'workspace-unreachable',
+      'session-error',
+      'unknown',
+    ])
+
+    for (const kind of allRunCoreErrorKinds) {
+      // #when mapped through the operator-safe gate
+      const result = toOperatorFailureKind(kind)
+
+      // #then it resolves to one of the six closed OperatorFailureKind values
+      // (including 'unknown' for kinds with no operator-meaningful mapping, e.g.
+      // 'missing-coordinator')
+      assert(result !== undefined, `expected ${kind} to map to a defined OperatorFailureKind`)
+      expect(validOperatorFailureKinds.has(result)).toBe(true)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Barrel re-export smoke test
 // ---------------------------------------------------------------------------
 
@@ -340,5 +520,14 @@ describe('barrel re-exports', () => {
     // #when the projection function is accessed
     // #then it is present and callable
     expect(typeof barrel.toOperatorRunStatus).toBe('function')
+  })
+
+  it('toOperatorFailureKind is re-exported from the contract barrel', async () => {
+    // #given the public barrel for the operator-contract module
+    const barrel = await import('./index.js')
+
+    // #when the failure-kind mapper is accessed
+    // #then it is present and callable
+    expect(typeof barrel.toOperatorFailureKind).toBe('function')
   })
 })

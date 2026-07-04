@@ -233,6 +233,146 @@ describe('run-state coordination', () => {
     expect(executingToCompleted).toEqual(ok({etag: 'etag-4', state: completed}))
   })
 
+  it('persists thread_id atomically with the phase write when threadId is provided', async () => {
+    // #given a PENDING run with an empty thread_id, and a live thread id resolved by threadFactory
+    const pending = createRunState({phase: 'PENDING', thread_id: ''})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(pending), etag: 'etag-1'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-2'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when transitioning PENDING -> ACKNOWLEDGED with a non-empty threadId
+    const result = await transitionRun(
+      config,
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'ACKNOWLEDGED',
+      'etag-1',
+      logger,
+      {threadId: 'live-thread-123'},
+    )
+
+    // #then the written state carries the live thread_id alongside the new phase
+    expect(result).toEqual(
+      ok({etag: 'etag-2', state: {...pending, phase: 'ACKNOWLEDGED', thread_id: 'live-thread-123'}}),
+    )
+    const [, writtenBody] = conditionalPut.mock.calls[0] as [string, string, unknown]
+    expect(JSON.parse(writtenBody)).toMatchObject({thread_id: 'live-thread-123', phase: 'ACKNOWLEDGED'})
+  })
+
+  it('preserves the existing thread_id when threadId is omitted', async () => {
+    // #given a run with an existing thread_id
+    const pending = createRunState({phase: 'PENDING', thread_id: 'existing-thread'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(pending), etag: 'etag-1'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-2'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when transitioning without passing threadId
+    const result = await transitionRun(config, 'coordination', 'owner/repo', 'run-1', 'ACKNOWLEDGED', 'etag-1', logger)
+
+    // #then thread_id is unchanged from current state
+    expect(result).toEqual(ok({etag: 'etag-2', state: {...pending, phase: 'ACKNOWLEDGED'}}))
+  })
+
+  it('treats an empty-string threadId as a no-op (does not clobber existing thread_id)', async () => {
+    // #given a run with an existing thread_id
+    const pending = createRunState({phase: 'PENDING', thread_id: 'existing-thread'})
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(pending), etag: 'etag-1'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-2'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when transitioning with an explicit empty-string threadId (no thread exists on this path)
+    const result = await transitionRun(
+      config,
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'ACKNOWLEDGED',
+      'etag-1',
+      logger,
+      {threadId: ''},
+    )
+
+    // #then thread_id is unchanged — empty string never overwrites an existing value
+    expect(result).toEqual(ok({etag: 'etag-2', state: {...pending, phase: 'ACKNOWLEDGED'}}))
+  })
+
+  it('carries a thread_id persisted at ACKNOWLEDGED through later transitions without options (no clobber)', async () => {
+    // #given a PENDING run with an empty thread_id, progressing PENDING -> ACKNOWLEDGED (with threadId)
+    // -> EXECUTING (no options) -> COMPLETED (no options)
+    const pending = createRunState({phase: 'PENDING', thread_id: ''})
+    const acknowledged = {...pending, phase: 'ACKNOWLEDGED' as const, thread_id: 'live-thread'}
+    const executing = {...acknowledged, phase: 'EXECUTING' as const}
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(pending), etag: 'etag-1'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(acknowledged), etag: 'etag-2'}))
+      .mockResolvedValueOnce(ok({data: JSON.stringify(executing), etag: 'etag-3'}))
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(ok({etag: 'etag-2'}))
+      .mockResolvedValueOnce(ok({etag: 'etag-3'}))
+      .mockResolvedValueOnce(ok({etag: 'etag-4'}))
+    const storeAdapter = createStoreAdapter({getObject, conditionalPut})
+    const config = createCoordinationConfig(storeAdapter)
+    const logger = createLogger()
+
+    // #when
+    const toAcknowledged = await transitionRun(
+      config,
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'ACKNOWLEDGED',
+      'etag-1',
+      logger,
+      {threadId: 'live-thread'},
+    )
+    const toExecuting = await transitionRun(
+      config,
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'EXECUTING',
+      'etag-2',
+      logger,
+    )
+    const toCompleted = await transitionRun(
+      config,
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'COMPLETED',
+      'etag-3',
+      logger,
+    )
+
+    // #then thread_id set at ACKNOWLEDGED survives EXECUTING and COMPLETED transitions made without options
+    expect(toAcknowledged).toEqual(ok({etag: 'etag-2', state: acknowledged}))
+    expect(toExecuting).toEqual(ok({etag: 'etag-3', state: executing}))
+    expect(toExecuting.success === true ? toExecuting.data.state.thread_id : '').toBe('live-thread')
+    expect(toCompleted.success === true ? toCompleted.data.state.thread_id : '').toBe('live-thread')
+    expect(toCompleted.success === true ? toCompleted.data.state.phase : '').toBe('COMPLETED')
+  })
+
   it('rejects an invalid completed to executing transition', async () => {
     // #given
     const storeAdapter = createStoreAdapter({

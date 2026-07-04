@@ -421,6 +421,21 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the loop exits promptly even when the SSE server is silent.
   const abortableStream = makeAbortableStream(eventStream, combinedSignal)
 
+  // Observability counters (#1101): disambiguate a genuine workspace hang (zero events
+  // observed) from an event-delivery/routing gap (events arrived but none reset the
+  // inactivity timer, e.g. session-mismatched or unrecognized event types).
+  let totalEvents = 0
+  let activityEvents = 0
+  let lastEventType: string | undefined
+
+  // Marks a real run-activity event: bumps the activity counter and re-arms the
+  // inactivity timer. Kept as a thin wrapper so resetInactivity() semantics are
+  // untouched — this does not change when/why the timer resets, only adds counting.
+  function markActivity(): void {
+    activityEvents += 1
+    resetInactivity()
+  }
+
   try {
     for await (const rawEvent of abortableStream) {
       // Check abort at the top of each iteration so we exit as soon as the signal
@@ -429,6 +444,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 
       const eventType = getEventKind(rawEvent)
       const eventPayload = getEventPayload(rawEvent)
+
+      // totalEvents counts every event the loop PROCESSES (post-getEventKind), including
+      // events dropped by a session-mismatch guard below, by design — a foreign-session
+      // event that arrives but is dropped still increments totalEvents, so
+      // `totalEvents > 0, activityEvents: 0` reveals the session-mismatch/routing case.
+      totalEvents += 1
+      lastEventType = eventType ?? undefined
 
       if (eventType === 'message.part.delta') {
         // New SDK shape: streaming text delta events.
@@ -445,10 +467,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const deltaText = getStringProperty(delta, 'text')
             if (deltaType === 'text' && deltaText != null) {
               sink.append(deltaText)
-              resetInactivity()
+              markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
               sink.append(delta)
-              resetInactivity()
+              markActivity()
             }
           }
         }
@@ -461,7 +483,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
             sink.append(deltaText)
-            resetInactivity()
+            markActivity()
           }
         }
       } else if (eventType === 'message.part.updated') {
@@ -505,7 +527,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 logger,
                 onActivity,
               )
-              resetInactivity()
+              markActivity()
             }
           }
         }
@@ -550,7 +572,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                 logger,
                 onActivity,
               )
-              resetInactivity()
+              markActivity()
             }
           }
         }
@@ -585,7 +607,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           } else {
             // Approval resolved — resume typing if the run continues.
             onBusy?.(true)
-            resetInactivity() // Re-arm inactivity now that the run is unblocked.
+            markActivity() // Re-arm inactivity now that the run is unblocked.
             coordinator.onPermissionReplied(ev)
             logger.info(
               {requestID: ev.requestID, reply: ev.reply},
@@ -596,7 +618,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       } else if (eventType === 'session.idle') {
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
-          logger.info({sessionId}, 'run-core: session.idle received — stream complete')
+          logger.info(
+            {sessionId, totalEvents, activityEvents, lastEventType},
+            'run-core: session.idle received — stream complete',
+          )
           // Signal not-busy: work is done.
           onBusy?.(false)
           clearInactivity()
@@ -610,6 +635,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           clearInactivity()
           throw new RunCoreError('session-error', `Session error: ${errorDetail}`)
         }
+      } else {
+        // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
+        // as types we do not handle) is visible rather than silently falling through.
+        logger.debug({eventType, sessionId}, 'run-core: unrecognized event type')
       }
     }
   } finally {
@@ -625,16 +654,22 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // Inactivity is the tighter bound (always < hard ceiling), so on the rare both-aborted
     // tick we attribute to inactivity-timeout deliberately.
     if (inactivityController !== null && inactivityController.signal.aborted) {
-      logger.warn({sessionId}, 'run-core: stream ended due to inactivity timeout')
+      logger.warn(
+        {sessionId, totalEvents, activityEvents, lastEventType},
+        'run-core: stream ended due to inactivity timeout',
+      )
       throw new RunCoreError('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
     }
-    logger.warn({sessionId}, 'run-core: stream ended due to timeout signal')
+    logger.warn({sessionId, totalEvents, activityEvents, lastEventType}, 'run-core: stream ended due to timeout signal')
     throw new RunCoreError('timeout', 'Run timed out: event stream aborted by timeout signal')
   }
 
   // Stream closed without session.idle and not aborted by us → OpenCode
   // may still be working; mark as failed so the run is not silently completed.
-  logger.error({sessionId}, 'run-core: event stream closed before session.idle')
+  logger.error(
+    {sessionId, totalEvents, activityEvents, lastEventType},
+    'run-core: event stream closed before session.idle',
+  )
   throw new RunCoreError('stream-ended', 'Event stream closed before session.idle was received')
 }
 
