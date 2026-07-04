@@ -16,6 +16,7 @@ import type {
   RunPhase,
   RunState,
   Surface,
+  TransitionRunOptions,
 } from '@fro-bot/runtime'
 
 import {
@@ -131,9 +132,10 @@ export const transitionRunEffect = (
   newPhase: RunPhase,
   etag: string,
   logger: CoordinationLogger,
+  options?: TransitionRunOptions,
 ): Effect.Effect<{etag: string; state: RunState}, Error> =>
   Effect.tryPromise({
-    try: async () => transitionRun(config, identity, repo, runId, newPhase, etag, logger),
+    try: async () => transitionRun(config, identity, repo, runId, newPhase, etag, logger, options),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 
