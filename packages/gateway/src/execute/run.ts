@@ -240,6 +240,60 @@ async function readCurrentRunPhase(
   }
 }
 
+/**
+ * Re-read the run-state's current phase AND etag together.
+ *
+ * Used by the CANCELLED→FAILED fallback path: when the CANCELLED
+ * `transitionRun` call fails (commonly a 412 on a stale etag), the fallback
+ * FAILED write must not reuse that same stale etag — it is guaranteed to
+ * 412 again. This re-read gets a fresh etag for the fallback attempt, and
+ * also lets the caller detect that a concurrent writer already
+ * terminalized the run (in which case no fallback write should be
+ * attempted at all — FAILED is not a valid transition from a terminal
+ * phase). Returns `null` on any read/parse failure — callers should treat
+ * that as fail-soft and skip the fallback write, leaving it to the
+ * recovery sweep.
+ */
+async function readCurrentRunStateWithEtag(
+  deps: RunMentionDeps,
+  repo: string,
+  runId: string,
+): Promise<{readonly phase: RunState['phase']; readonly etag: string} | null> {
+  const {coordinationConfig, identity, logger} = deps
+  try {
+    const keyResult = getRunKey(coordinationConfig, identity, repo, runId)
+    if (keyResult.success === false) {
+      logger.warn(
+        {repo, runId, err: keyResult.error.message},
+        'run: readCurrentRunStateWithEtag — could not build run key',
+      )
+      return null
+    }
+    const getObject = coordinationConfig.storeAdapter?.getObject
+    if (getObject == null) {
+      logger.warn({repo, runId}, 'run: readCurrentRunStateWithEtag — store adapter does not support getObject')
+      return null
+    }
+    const fetched = await getObject(keyResult.data)
+    if (fetched.success === false) {
+      logger.warn({repo, runId, err: fetched.error.message}, 'run: readCurrentRunStateWithEtag — getObject failed')
+      return null
+    }
+    const parsed = parseRunState(fetched.data.data)
+    if (parsed.success === false) {
+      logger.warn({repo, runId, err: parsed.error.message}, 'run: readCurrentRunStateWithEtag — parseRunState failed')
+      return null
+    }
+    return {phase: parsed.data.phase, etag: fetched.data.etag}
+  } catch (error) {
+    logger.warn(
+      {repo, runId, err: error instanceof Error ? error.message : String(error)},
+      'run: readCurrentRunStateWithEtag threw',
+    )
+    return null
+  }
+}
+
 // ---------------------------------------------------------------------------
 // computeApprovalDeadlineMs
 // ---------------------------------------------------------------------------
@@ -876,32 +930,53 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
           // Fallback: leaving the run non-terminal (EXECUTING) with the lock about to be
           // released by the outer finally is an inconsistent state until the next recovery
-          // sweep. Attempt a best-effort FAILED terminalization with the same etag (FAILED
-          // is a valid transition from EXECUTING) rather than leaving this to recovery alone.
-          // The cancel path was entered via the wasCancelled registry check; execError is
-          // still the caught throw and is classified here for the rare CANCELLED→FAILED
-          // fallback (usually an AbortError → no RunCoreError.kind → failureKind omitted).
-          const fallbackFailureKind = extractRunCoreKind(execError)
-          const fallbackOptions =
-            fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
-          const failedFallbackResult = await transitionRun(
-            coordinationConfig,
-            identity,
-            repo,
-            runId,
-            'FAILED',
-            runEtag,
-            coordLogger,
-            fallbackOptions,
-          )
-          if (failedFallbackResult.success === false) {
-            logger.error(
-              {repo, runId, err: failedFallbackResult.error.message},
-              'run: FAILED fallback after CANCELLED transition failure also failed — leaving for recovery sweep',
+          // sweep. Attempt a best-effort FAILED terminalization rather than leaving this to
+          // recovery alone. The CANCELLED failure above is commonly a 412 on a stale etag —
+          // reusing that same etag for the FAILED write would 412 again, so re-read the
+          // run-state first to get a fresh etag and to detect whether a concurrent writer
+          // already landed a terminal phase (in which case FAILED is an invalid transition
+          // and no fallback write should be attempted).
+          const reReadResult = await readCurrentRunStateWithEtag(deps, repo, runId)
+          if (reReadResult === null) {
+            logger.warn(
+              {repo, runId},
+              'run: CANCELLED transition failed and run-state re-read also failed — skipping FAILED fallback; recovery sweep will reconcile',
+            )
+          } else if (
+            reReadResult.phase === 'COMPLETED' ||
+            reReadResult.phase === 'FAILED' ||
+            reReadResult.phase === 'CANCELLED'
+          ) {
+            logger.info(
+              {repo, runId, phase: reReadResult.phase},
+              'run: CANCELLED transition failed but a concurrent writer already terminalized the run — skipping FAILED fallback',
             )
           } else {
-            logger.warn({repo, runId}, 'run: CANCELLED transition failed — fell back to FAILED terminalization')
-            notifyObserverBestEffort(deps, failedFallbackResult.data.state)
+            // The cancel path was entered via the wasCancelled registry check; execError is
+            // still the caught throw and is classified here for the rare CANCELLED→FAILED
+            // fallback (usually an AbortError → no RunCoreError.kind → failureKind omitted).
+            const fallbackFailureKind = extractRunCoreKind(execError)
+            const fallbackOptions =
+              fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
+            const failedFallbackResult = await transitionRun(
+              coordinationConfig,
+              identity,
+              repo,
+              runId,
+              'FAILED',
+              reReadResult.etag,
+              coordLogger,
+              fallbackOptions,
+            )
+            if (failedFallbackResult.success === false) {
+              logger.error(
+                {repo, runId, err: failedFallbackResult.error.message},
+                'run: FAILED fallback after CANCELLED transition failure also failed — leaving for recovery sweep',
+              )
+            } else {
+              logger.warn({repo, runId}, 'run: CANCELLED transition failed — fell back to FAILED terminalization')
+              notifyObserverBestEffort(deps, failedFallbackResult.data.state)
+            }
           }
         } else {
           notifyObserverBestEffort(deps, cancelledResult.data.state)
