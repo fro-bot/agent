@@ -29,6 +29,7 @@
  */
 
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
+import type {RunCoreErrorKind} from '../execute/run-core.js'
 
 export type {RunPhase, Surface} from '@fro-bot/runtime'
 
@@ -40,13 +41,7 @@ export type {RunPhase, Surface} from '@fro-bot/runtime'
  * RunPhase only). The snapshot endpoint layers them on top after projection.
  */
 export type OperatorWebStatus =
-  | 'queued'
-  | 'blocked'
-  | 'running'
-  | 'waiting_for_approval'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
+  'queued' | 'blocked' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled'
 
 /**
  * Operator-safe projection of a run's status.
@@ -63,6 +58,7 @@ export interface OperatorRunStatus {
   readonly status: OperatorWebStatus
   readonly startedAt: string
   readonly stale: boolean
+  readonly failureKind?: OperatorFailureKind
 }
 
 /**
@@ -82,6 +78,70 @@ export const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
   COMPLETED: 'succeeded',
   FAILED: 'failed',
   CANCELLED: 'cancelled',
+}
+
+/**
+ * The operator-facing failure-reason enum.
+ *
+ * A closed allowlist derived from RunCoreErrorKind (execute/run-core.ts) — the internal
+ * error-kind vocabulary. 'unknown' is the fallback for any internal kind with no mapping
+ * entry (defense-in-depth: unmapped/future/unrecognized kinds never leak past this gate).
+ */
+export type OperatorFailureKind =
+  'inactivity-timeout' | 'max-duration-timeout' | 'stream-ended' | 'workspace-unreachable' | 'session-error' | 'unknown'
+
+/**
+ * Closed allowlist mapping RunCoreErrorKind (internal) → OperatorFailureKind (operator-safe).
+ *
+ * `satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>` makes this
+ * exhaustive over the RunCoreErrorKind union at compile time — adding a new
+ * RunCoreErrorKind member in run-core.ts without adding an entry here is a compile
+ * error. `undefined` is an explicit, intentional "maps to 'unknown'" entry (e.g.
+ * 'missing-coordinator' has no operator-meaningful mapping), distinct from an
+ * omitted key (which `satisfies` would reject).
+ *
+ * Exported so sibling projectors can reuse the mapping without re-declaring it.
+ */
+export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
+  timeout: 'max-duration-timeout',
+  'inactivity-timeout': 'inactivity-timeout',
+  'stream-ended': 'stream-ended',
+  unreachable: 'workspace-unreachable',
+  auth: 'workspace-unreachable',
+  'session-error': 'session-error',
+  'prompt-error': 'session-error',
+  'missing-coordinator': undefined, // → 'unknown' at the projection (no operator-meaningful mapping)
+} satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
+
+/**
+ * Maps a raw failure-kind value to the operator-safe OperatorFailureKind enum.
+ *
+ * Structural defense-in-depth: this function's signature accepts only the single
+ * candidate VALUE, never a details/context object — it is impossible for this function
+ * to read any other property, because it never receives one.
+ *
+ * - `undefined` (field absent) → `undefined` (the operator field will be omitted).
+ * - Any recognized internal kind string → its mapped OperatorFailureKind.
+ * - Any other value (unrecognized string, object, number, null, boolean) → `'unknown'`.
+ *   This is a closed allowlist gate: nothing but the six known enum values can escape
+ *   this function, regardless of what raw value flows in.
+ */
+export function toOperatorFailureKind(failureKind: unknown): OperatorFailureKind | undefined {
+  if (failureKind === undefined) {
+    return undefined
+  }
+
+  if (typeof failureKind === 'string') {
+    // Widening cast (not a suppression): `satisfies` narrows the object's key type to
+    // RunCoreErrorKind, but the lookup key here is an arbitrary runtime string (untyped
+    // `unknown` input) that may not be a RunCoreErrorKind member. Widen the lookup type
+    // to accept any string so the index access type-checks; the `?? 'unknown'` fallback
+    // below still handles unrecognized keys safely at runtime.
+    const lookup = RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND as Record<string, OperatorFailureKind | undefined>
+    return lookup[failureKind] ?? 'unknown'
+  }
+
+  return 'unknown'
 }
 
 /**
@@ -143,6 +203,11 @@ export const toOperatorRunStatus = (
   const heartbeatMs = Date.parse(runState.last_heartbeat)
   const stale = Number.isNaN(heartbeatMs) || heartbeatMs <= opts.nowMs - opts.staleThresholdMs
 
+  // failureKind is populated ONLY for FAILED runs, mapped through the closed
+  // allowlist (never a raw passthrough). Read runState.details.failureKind
+  // solely within this branch — never elsewhere.
+  const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
+
   // #when projecting — map only operator-safe fields; internal fields are never read
   return {
     runId: runState.run_id,
@@ -154,5 +219,6 @@ export const toOperatorRunStatus = (
     status: PHASE_TO_WEB_STATUS[runState.phase] ?? 'failed',
     startedAt: runState.started_at,
     stale,
+    ...(failureKind === undefined ? {} : {failureKind}),
   }
 }
