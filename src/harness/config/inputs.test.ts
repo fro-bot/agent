@@ -297,8 +297,8 @@ describe('parseActionInputs', () => {
       expect(result.success).toBe(true)
       expect(mocks.setSecret).toHaveBeenCalledWith('AKIA_TEST_VALUE')
       expect(mocks.setSecret).toHaveBeenCalledWith('secret-test-value')
-      // 3 calls: AWS access key + AWS secret key + auth-json (masked as of Unit 1's env scrub)
-      expect(mocks.setSecret).toHaveBeenCalledTimes(3)
+      // 4 calls: AWS access key + AWS secret key + github-token + auth-json (all masked)
+      expect(mocks.setSecret).toHaveBeenCalledTimes(4)
     })
 
     it('scrubs INPUT_AUTH-JSON from process.env after parsing while preserving the returned value', () => {
@@ -324,7 +324,59 @@ describe('parseActionInputs', () => {
       // #then
       expect(result.success).toBe(true)
       expect(mocks.setSecret).toHaveBeenCalledWith(rawAuthJson)
-      expect(mocks.setSecret).toHaveBeenCalledTimes(1)
+      // 2 calls: github-token (default 'ghp_test123') + auth-json, both masked
+      expect(mocks.setSecret).toHaveBeenCalledTimes(2)
+    })
+
+    it('registers github-token as a masked secret', () => {
+      // #given: the default mocked github-token value
+      mockInputs({'github-token': 'ghp_secret_value'})
+
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(mocks.setSecret).toHaveBeenCalledWith('ghp_secret_value')
+    })
+
+    it('scrubs INPUT_GITHUB-TOKEN from process.env after parsing while preserving the returned value', () => {
+      // @actions/core reads github-token from INPUT_GITHUB-TOKEN (hyphen preserved; only spaces→_)
+      const rawToken = 'ghp_secret_value'
+      vi.stubEnv('INPUT_GITHUB-TOKEN', rawToken)
+      mockInputs({'github-token': rawToken})
+
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.githubToken).toBe(rawToken)
+      expect(process.env['INPUT_GITHUB-TOKEN']).toBeUndefined()
+    })
+
+    it('excludes github-token from a simulated child-process env snapshot after scrubbing', () => {
+      const rawToken = 'ghp_secret_value'
+      vi.stubEnv('INPUT_GITHUB-TOKEN', rawToken)
+      mockInputs({'github-token': rawToken})
+
+      const result = parseActionInputs()
+
+      // #when: simulate the SDK's child-process spawn env construction
+      const childEnv = {...process.env}
+
+      // #then: the INPUT_* copy of the token is gone from the child env
+      expect(result.success).toBe(true)
+      expect(childEnv['INPUT_GITHUB-TOKEN']).toBeUndefined()
+    })
+
+    it('does not throw scrubbing INPUT_GITHUB-TOKEN when the env var was never set', () => {
+      // #given: valid github-token input but no INPUT_GITHUB-TOKEN env var present to delete
+      expect(process.env['INPUT_GITHUB-TOKEN']).toBeUndefined()
+      mockInputs({'github-token': 'ghp_secret_value'})
+
+      // #when / #then: parsing succeeds and the absent env var stays absent
+      const result = parseActionInputs()
+      expect(result.success).toBe(true)
+      expect(process.env['INPUT_GITHUB-TOKEN']).toBeUndefined()
     })
 
     it('excludes auth-json from a simulated child-process env snapshot after scrubbing', () => {
