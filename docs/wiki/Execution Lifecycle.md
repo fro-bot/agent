@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-06-21"
-updated-by: "aaaf91d"
+last-updated: "2026-07-05"
+updated-by: "schedule-d7190410-28754466543"
 sources:
   - src/harness/run.ts
   - src/harness/phases/bootstrap.ts
@@ -83,6 +83,8 @@ The lock result is a discriminated union with four outcomes:
 - **`held-by-other`** — Another surface (or another Action run) already holds the lock. The current run exits cleanly with code 0.
 - **`s3-disabled`** — S3 is not configured. Coordination is opt-in, so the run proceeds without a lock.
 - **`error`** — Lock acquisition failed unexpectedly. The run proceeds without a lock to preserve single-surface behavior. The 15-minute TTL on any orphaned lock from a prior crash allows recovery via stale-takeover on the next attempt.
+
+The shared coordination layer (`packages/runtime/src/coordination/types.ts`) also names a run's lifecycle phases as a closed union — `PENDING`, `ACKNOWLEDGED`, `EXECUTING`, and the three **terminal phases** `COMPLETED`, `FAILED`, and `CANCELLED` (the last modeled as a `TerminalPhase` type so that gateway cancellation and the operator cancel route agree on one closed set instead of hand-writing the same literals). The Action harness itself does not expose these phases directly, but they are the vocabulary the [[Operator Web Control Surface]] and Discord gateway use for the runs that share this same per-repo lock.
 
 The lock has a 15-minute TTL. In v1, the Action does not run a heartbeat to extend the lease — the median Action run (~2 minutes) is well within TTL, and rare long runs recover through stale takeover.
 
