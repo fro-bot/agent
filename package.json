@@ -29,7 +29,7 @@
     "fix": "bun run --filter @fro-bot/runtime fix && bun run --filter @fro-bot/action fix && bun run --filter @fro.bot/harness fix",
     "postinstall": "simple-git-hooks",
     "lint": "bun run --filter @fro-bot/runtime lint && bun run --filter @fro-bot/action lint && bun run --filter @fro.bot/harness lint && bun run dist:check-hidden-unicode && bun run check:md-links",
-    "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test",
+    "test": "bun run --filter @fro-bot/runtime test && bun run --filter @fro-bot/action test && bun run --filter @fro.bot/harness test && bun run --filter @fro-bot/gateway test",
     "test:scripts": "vitest run scripts/"
   },
   "simple-git-hooks": {
