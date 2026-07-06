@@ -27,8 +27,7 @@ export interface AllowlistLogger {
 
 /** Parse result for allowlist text. */
 export type ParseAllowlistResult =
-  | {readonly ok: true; readonly ids: ReadonlySet<number>}
-  | {readonly ok: false; readonly reason: string}
+  {readonly ok: true; readonly ids: ReadonlySet<number>} | {readonly ok: false; readonly reason: string}
 
 /** An operator allowlist — a set of authorized numeric GitHub user IDs. */
 export interface OperatorAllowlist {

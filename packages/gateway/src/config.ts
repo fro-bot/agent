@@ -575,8 +575,7 @@ export function loadGatewayConfig(): GatewayConfig {
   }
 
   let announce:
-    | {readonly webhookSecret: string; readonly presenceChannelId: string; readonly httpPort: number}
-    | undefined
+    {readonly webhookSecret: string; readonly presenceChannelId: string; readonly httpPort: number} | undefined
 
   if (gatewayWebhookSecret !== null && gatewayPresenceChannelId !== null) {
     const rawHttpPort = readOptionalSecret('GATEWAY_HTTP_PORT') ?? '3000'
