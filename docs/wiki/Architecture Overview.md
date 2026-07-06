@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-06-28"
-updated-by: "schedule-d7190410-28335678121"
+last-updated: "2026-07-05"
+updated-by: "schedule-d7190410-28754466543"
 sources:
   - src/main.ts
   - src/post.ts
@@ -72,7 +72,7 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 `@fro.bot/harness` is a published, patched OpenCode binary built via the LLM-merge integration method (`cortexkit/orw`). Rather than downloading stock OpenCode, the action setup can install the harness binary, which carries a curated set of integration refs (stalled or closed upstream PRs, branch URLs) merged onto each deliberately-pinned upstream release via a one-time `opencode run` LLM merge. The produced binary is frozen: the merge runs once in CI per release bump, is reviewed as a bump PR, and the integration commit SHA is pinned before per-platform binaries are built and published.
 
-The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health.
+The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI; to keep the merge credential off a durable secret, it is minted just-in-time from an OIDC broker (`scripts/harness/mint-broker-credential.ts`) and fails closed on any error rather than falling back to a stored key. As defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
 
 The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. The main package's `postinstall` resolver picks the host platform's binary, verifies it, and symlinks it; `OPENCODE_PATH` and a bare `opencode` on `PATH` are honored as fallbacks for local or unbuilt use. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`.
 
@@ -82,7 +82,7 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`, including `/add-project` and `/fro-bot`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses.
 
-**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits, and `recovery.ts` handles interrupted runs. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
+**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
