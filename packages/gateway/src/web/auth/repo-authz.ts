@@ -39,8 +39,7 @@ export interface RepoAuthzLogger {
 
 /** Result of a repo authorization check. */
 export type RepoAuthzResult =
-  | {readonly authorized: true}
-  | {readonly authorized: false; readonly reason: RepoAuthzDeniedReason}
+  {readonly authorized: true} | {readonly authorized: false; readonly reason: RepoAuthzDeniedReason}
 
 /** Result of a write-level repo authorization check. */
 export type RepoWriteAuthzResult =
