@@ -44,12 +44,7 @@ export type PermissionReply = 'once' | 'always' | 'reject'
  * it is derived separately from the deadline path, not from this mapping.
  */
 export type OperatorDecisionState =
-  | 'pending'
-  | 'claimed'
-  | 'already_claimed'
-  | 'scope_mismatch'
-  | 'failed_to_settle'
-  | 'unavailable'
+  'pending' | 'claimed' | 'already_claimed' | 'scope_mismatch' | 'failed_to_settle' | 'unavailable'
 
 /**
  * Map a `DecisionOutcome` (registry-internal) to the operator-facing `OperatorDecisionState`.

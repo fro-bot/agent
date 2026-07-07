@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-06-28"
-updated-by: "schedule-d7190410-28335678121"
+last-updated: "2026-07-05"
+updated-by: "schedule-d7190410-28754466543"
 sources:
   - src/services/setup/setup.ts
   - src/services/setup/ci-config.ts
@@ -84,11 +84,11 @@ These can be overridden per-run via action inputs (`opencode-version`, `omo-vers
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.11+harness.bf0e9bed`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.17.13+harness.ee55e157`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.13`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.11+harness.bf0e9bed`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include SQLite-reliability fixes that landed with the 1.17.9 upgrade. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
+OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.17.13`) published by the `anomalyco/opencode` project. A _harness_ version carries a `+harness.<sha>` build-metadata suffix (for example `1.17.13+harness.ee55e157`) and is a `fro-bot/agent` release that bundles the upstream binary together with patches this project carries on top of OpenCode — recent carries include a session-summary restore fix (OpenCode #33444) that rode the 1.17.13 upgrade, on top of the SQLite-reliability fixes from the 1.17.9 cycle. The action defaults to a harness build so that the carried patches are always present, while still allowing a stock version to be requested explicitly via the `opencode-version` input.
 
 The presence of the `+harness.` marker drives three behavioral differences in `src/services/setup/opencode.ts`:
 

@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-04-26"
-updated-by: "ca17d5e"
+last-updated: "2026-07-05"
+updated-by: "schedule-d7190410-28754466543"
 sources:
   - AGENTS.md
   - packages/runtime/src/shared/logger.ts
@@ -18,6 +18,8 @@ summary: "Coding conventions, architectural patterns, and anti-patterns enforced
 # Conventions and Patterns
 
 This page documents the recurring patterns and conventions in the Fro Bot Agent codebase. These conventions apply uniformly across both the action (`src/`) and the runtime package (`packages/runtime/`). Understanding them is essential for contributors — the project enforces them strictly, and deviations will fail CI.
+
+The prescriptive, operational version of these rules lives in the repository's own documentation set, which has settled into a clear hierarchy: `AGENTS.md` is now a slim operational page (conventions, anti-patterns, and a where-to-look pointer index), while the structural and process detail it once carried moved into dedicated siblings — `ARCHITECTURE.md` (system design and data flows), `STRUCTURE.md` (directory layout), and `CONTRIBUTING.md` (setup and command surface). This wiki is the _descriptive_ counterpart: it explains why the conventions exist and how the system behaves, rather than restating the rules an agent must follow.
 
 ## Language and Module System
 
@@ -130,3 +132,5 @@ The following are explicitly forbidden:
 ## Response Protocol
 
 Every agent run must post exactly one comment or review (never both, never multiple). The response must include a run summary block with the `<!-- fro-bot-agent -->` marker. This is enforced at the [[Prompt Architecture]] level — the prompt instructs the agent to self-enforce it, rather than code-level validation after the fact.
+
+When these invariants appear to break in practice — a run posts nothing, cache state fails to persist, or a run times out — the symptoms and their usual causes are cataloged in the [[Troubleshooting]] guide.
