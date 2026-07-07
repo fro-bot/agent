@@ -28,7 +28,7 @@ on:
         required: false
     secrets:
       FRO_BOT_PAT:
-        description: PAT used as the action's github-token. Required.
+        description: PAT used for checkout and as the action's github-token. Required.
         required: true
       OPENCODE_CONFIG:
         description: JSON merged into the OpenCode config (OPENCODE_CONFIG_CONTENT). Optional.
@@ -55,22 +55,13 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          # No token: this runs before egress hardening and only needs to read
-          # this repo, so the default job-scoped GITHUB_TOKEN suffices.
-          # FRO_BOT_PAT is only needed later, by the Run Fro Bot step.
-
       - name: Harden runner egress
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           disable-telemetry: true
           disable-sudo-and-containers: true
-          allowed-endpoints: |
+          allowed-endpoints: >-
             api.github.com:443
             broker.fro.bot:443
             bun.sh:443
@@ -82,6 +73,13 @@ jobs:
             registry.npmjs.org:443
             *.actions.githubusercontent.com:443
             *.githubusercontent.com:443
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.FRO_BOT_PAT }}
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup
