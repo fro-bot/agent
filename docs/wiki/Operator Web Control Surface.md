@@ -1,13 +1,14 @@
 ---
 type: subsystem
-last-updated: "2026-06-28"
-updated-by: "schedule-d7190410-28335678121"
+last-updated: "2026-07-05"
+updated-by: "schedule-d7190410-28754466543"
 sources:
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/operator-route.ts
   - packages/gateway/src/web/operator-route-smoke.ts
   - packages/gateway/src/web/operator/launch-route.ts
   - packages/gateway/src/web/operator/runs-route.ts
+  - packages/gateway/src/web/operator/cancel-route.ts
   - packages/gateway/src/web/operator/repos-route.ts
   - packages/gateway/src/web/operator/pending-approvals-route.ts
   - packages/gateway/src/web/operator/decision-route.ts
@@ -31,6 +32,8 @@ sources:
   - packages/gateway/src/operator-contract/output.ts
   - packages/gateway/src/operator-contract/run-status.ts
   - packages/gateway/src/operator-contract/run-summary.ts
+  - packages/gateway/src/execute/cancel.ts
+  - packages/gateway/src/execute/abort-registry.ts
   - packages/gateway/src/operator-contract/redaction.ts
   - packages/gateway/src/operator-contract/repo-summary.ts
   - packages/gateway/src/operator-contract/version.ts
@@ -67,6 +70,7 @@ The privileged surface currently exposes:
 
 - `POST /operator/runs` — launch a run (see [Launching a Run](#launching-a-run)).
 - `GET /operator/runs` — list the operator's authorized runs across all bound repositories.
+- `POST /operator/runs/:runId/cancel` — request cancellation of an in-flight run (see [Cancelling a Run](#cancelling-a-run)).
 - `GET /operator/runs/:runId/stream` — open the SSE observation stream for one run.
 - `GET /operator/runs/:runId/approvals` — list the run's currently-open approval requests.
 - `POST /operator/runs/:runId/approvals/:requestId/decision` — settle one approval request.
@@ -118,6 +122,14 @@ The web approval transport (`web/operator/web-approval.ts`) follows a **register
 
 Operators observe and settle approvals two ways. The SSE stream carries **approval frames** (described below), and `GET /operator/runs/:runId/approvals` (`web/operator/pending-approvals-route.ts`) is a reconciliation fallback: a browser that reconnects after a dropped stream can re-fetch the currently-open requests instead of waiting for a replay. Listing approvals needs only read access to the run's repository. Settling one, via `POST /operator/runs/:runId/approvals/:requestId/decision` (`web/operator/decision-route.ts`), demands **write-level** repository authorization — a read-only operator may watch an approval but may not act on it. The decision route resolves the run to its repository through the server-owned run index, re-runs the denylist and write-authorization checks, and hands a transport-bound operator identity to `registry.handleDecision`, which records the `once` / `always` / `reject` outcome as the authoritative settlement.
 
+## Cancelling a Run
+
+An operator can stop a run that is still in flight. `POST /operator/runs/:runId/cancel` (`web/operator/cancel-route.ts`) is a **write-gated** endpoint — unlike observing a run, requesting cancellation demands write-level repository authorization, so a read-only operator may watch a run but may not halt it. The route resolves the run to its repository through the server-owned run index, re-runs the denylist and write-authorization checks, and (deliberately) applies the operator-keyed rate limit only _after_ authorization so an unauthorized caller never consumes budget.
+
+Under the hood, cancellation rides an in-memory abort registry (`execute/abort-registry.ts`). When a run reaches the `EXECUTING` phase, the engine registers a per-run `AbortController` in the registry and composes the run's effective signal as `AbortSignal.any([timeoutSignal, cancelSignal])`; the controller is always removed in the outer `finally` regardless of how the run settles. Registration happens only after the `EXECUTING` transition commits — the earlier window is guarded instead by the run-state conditional-write rendezvous. A cancel request simply fires the registered controller.
+
+Two design choices keep cancellation correct under races. First, classification is a **registry probe**, never composite abort-reason inspection: `AbortSignal.any` propagates whichever child fired first, so reading the reason would be racy, and the registry's own controller state is treated as ground truth (`execute/cancel.ts`). Second, a cancelled run settles as `CANCELLED` rather than `FAILED` — it flushes partial output, notifies the SSE observer, and suppresses the user-facing failure reply. The cancel path stops the heartbeat _first_ because its returned etags are the only fresh conditional-write handles; using a stale etag on the subsequent transition would `412` silently and TTL-orphan the coordination lock rather than fail loudly. When an operator cancel wins an adoption race, the losing run re-reads run-state, sees a `CANCELLED` phase, and exits cleanly instead of logging a misleading error. The `CANCELLED` phase is one of three [[Execution Lifecycle|terminal phases]] the coordination layer now names explicitly through a shared `TerminalPhase` type.
+
 ## Observing a Run
 
 `GET /operator/runs/:runId/stream` (`web/sse/run-stream-route.ts`) opens a Server-Sent Events stream. The route resolves the run to its repository through a server-owned run index (never a client-supplied mapping), re-runs the denylist and repository-authorization checks, and acquires a per-operator stream-slot lease (a small cap on concurrent streams per operator). Every failure on the authorization path returns the identical generic not-found shape; exhausting the stream-slot cap returns an honest `429`. There is deliberately no distinguishable "authorized but not streaming" response, because that would leak whether a run exists.
@@ -130,7 +142,7 @@ Fan-out is handled by an in-memory observation manager (`web/sse/manager.ts`). T
 
 ## The Operator Contract
 
-The types crossing this boundary are defined once, in `packages/gateway/src/operator-contract/`, and treated as a frozen surface. The contract version (`version.ts`, currently `1.5.0`) is pinned at build time and never negotiated over the wire — clients cannot ask for an older shape. The version follows a deliberate increment policy: a major bump for any breaking change (a removed, renamed, or narrowed field), a minor bump for additive changes (a new optional field or a new type such as the `RunSummary` and approval-frame shapes), and a patch bump for documentation only. Two normative obligations are encoded directly in the contract (`redaction.ts`):
+The types crossing this boundary are defined once, in `packages/gateway/src/operator-contract/`, and treated as a frozen surface. The contract version (`version.ts`, currently `1.6.0`) is pinned at build time and never negotiated over the wire — clients cannot ask for an older shape. The version follows a deliberate increment policy: a major bump for any breaking change (a removed, renamed, or narrowed field), a minor bump for additive changes (a new optional field or a new type such as the `RunSummary` and approval-frame shapes), and a patch bump for documentation only. The version is also emitted (emit-only, never read from the wire) on the public health-check body, so operators can probe the deployed contract version without authenticating; note that adding that health field was treated as non-structural and did _not_ itself bump the contract version, because the dashboard enforces a fail-closed drift gate on the SSE ready-frame version. Two normative obligations are encoded directly in the contract (`redaction.ts`):
 
 - **Redaction obligation** — denylisted repositories must be excluded _before_ any per-repo query, not filtered at render time. Deny-key matching tolerates GitHub node-ID format skew by deriving the numeric database ID, and an entry with no usable deny key (or an unreadable denylist) must deny rather than leak. Redaction composes with repository authorization: authorization proves an operator _may_ see a repo, redaction proves the repo _is not hidden by policy_, and both must pass.
 - **Authorization obligation** — operator identity is always constructed server-side from the authenticated session and is never deserialized from a request payload, and approval/launch decisions must carry a transport-bound identity rather than a free-form caller string.
@@ -138,6 +150,8 @@ The types crossing this boundary are defined once, in `packages/gateway/src/oper
 The projection helper (`sse/projection.ts`) enforces redaction structurally: it takes a denylist predicate as a required argument and returns nothing for a denied repository, so the operator-facing `OperatorRunStatus` (`run-status.ts`) exposes only safe fields (entity reference, surface, phase, status, timestamps, staleness) and never the internal coordination fields like holder or thread IDs. The phase-to-status mapping is part of the pure projection; the richer "blocked" and "waiting for approval" states an operator sees are overlays the route layer derives from queue and approval-registry state rather than fields the projection itself produces.
 
 The run-listing surface uses a deliberately leaner shape, `RunSummary` (`run-summary.ts`), which carries the `owner/repo` resolved from the binding rather than the internal entity reference. Both projections are pure and total: each returns nothing — rather than a partially-redacted record — whenever a repository is denylisted or a run's stored identity contradicts its binding, so callers skip the null and never render leaked or inconsistent data.
+
+When a run fails, both projections may carry a `failureKind` — a coarse, sanitized reason drawn from a small closed vocabulary (`OperatorFailureKind` in `run-status.ts`): the two timeout variants (`inactivity-timeout`, `max-duration-timeout`), `stream-ended`, `workspace-unreachable`, `session-error`, and an `unknown` fallback. The mapping from the engine's richer internal error kinds is an explicit allowlist, so any unrecognized or unmapped internal kind collapses to `unknown` rather than leaking implementation detail. A pre-acknowledgement startup failure surfaces as `workspace-unreachable`. The kind is persisted on the `FAILED` run-state transition and projected onto the operator surface, giving operators a stable, non-sensitive signal about _why_ a run ended without exposing stack traces or internal vocabulary.
 
 ## Audit
 

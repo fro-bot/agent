@@ -6,7 +6,7 @@ This document maps the repository's directory layout and explains where code liv
 
 ```text
 fro-bot/agent/
-├── src/                        # GitHub Action logic — 4-layer architecture (40 k lines)
+├── src/                        # GitHub Action logic — 4-layer architecture (~14.6k lines)
 │   ├── shared/                 # Layer 0: pure types, utils, constants (only @bfra.me/es Result; no heavy deps)
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
@@ -57,7 +57,7 @@ fro-bot/agent/
 │   └── release/                # Release dispatch scripts
 │
 ├── .github/
-│   └── workflows/              # 10 CI/CD workflow files
+│   └── workflows/              # 11 CI/CD workflow files
 │
 ├── RFCs/                       # 19 RFC documents (architecture specs)
 ├── docs/
@@ -88,7 +88,7 @@ fro-bot/agent/
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations; uses `node --test`, not Vitest.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
-- **`.github/workflows/`** — All CI/CD automation; 10 workflow files covering tests, releases, security scanning, and bot triggers.
+- **`.github/workflows/`** — All CI/CD automation; 11 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
 - **`docs/wiki/`** — 8 Obsidian deep-dive pages covering architecture, execution lifecycle, prompt design, and operator surface.
 - **`dist/`** — Committed bundle output; CI fails if a fresh build produces a diff here.
@@ -114,6 +114,7 @@ fro-bot/agent/
 | `codeql-analysis.yaml` | `push`, `pull_request`, `schedule`, `workflow_dispatch` | CodeQL security scanning |
 | `copilot-setup-steps.yaml` | `push`, `pull_request`, `workflow_dispatch` | Copilot environment setup steps |
 | `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation (the Action under development) |
+| `harness-integrate.yaml` | `workflow_call` | LLM-merge integration of OpenCode refs into the harness build; called by `harness-release.yaml` |
 | `harness-release.yaml` | `push`, `workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
 | `prepare-release-pr.yaml` | `schedule`, `workflow_dispatch` | Opens release PR via semantic-release |
 | `renovate.yaml` | `issues`, `pull_request`, `push`, `workflow_dispatch`, `workflow_run` | Renovate dependency update automation |

@@ -61,7 +61,7 @@ jobs:
           egress-policy: block
           disable-telemetry: true
           disable-sudo-and-containers: true
-          allowed-endpoints: |
+          allowed-endpoints: >-
             api.github.com:443
             broker.fro.bot:443
             bun.sh:443
