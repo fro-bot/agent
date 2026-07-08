@@ -52,6 +52,11 @@ describe('filterAgentEnv', () => {
       AWS_SECRET_ACCESS_KEY: 'x',
       'INPUT_AUTH-JSON': 'x',
       'INPUT_GITHUB-TOKEN': 'x',
+      FOO_APIKEY: 'x',
+      FOO_PASSWORD: 'x',
+      FOO_PASSWD: 'x',
+      FOO_CREDENTIALS: 'x',
+      FOO_CREDENTIAL: 'x',
     }
 
     // #when
@@ -59,6 +64,23 @@ describe('filterAgentEnv', () => {
 
     // #then
     expect(result).toEqual({})
+  })
+
+  it('retains proxy and CA-bundle vars for egress/TLS (regression guard)', () => {
+    // #given
+    const env = {
+      HTTP_PROXY: 'http://proxy.example.com:8080',
+      HTTPS_PROXY: 'http://proxy.example.com:8080',
+      NO_PROXY: 'localhost,127.0.0.1',
+      https_proxy: 'http://proxy.example.com:8080',
+      GIT_SSL_CAINFO: '/etc/ssl/certs/ca-bundle.crt',
+    }
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual(env)
   })
 
   it('retains allowed-prefix keys', () => {

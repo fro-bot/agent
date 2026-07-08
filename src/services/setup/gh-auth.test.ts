@@ -1,10 +1,21 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
+import {join} from 'node:path'
+
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createMockOctokit} from '../github/test-helpers.js'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
+
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+  return {
+    ...actual,
+    mkdtemp: vi.fn(actual.mkdtemp),
+    chmod: vi.fn(actual.chmod),
+  }
+})
 
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
   return {
@@ -164,6 +175,40 @@ describe('gh-auth', () => {
       if (process.env.GH_CONFIG_DIR != null) {
         await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
       }
+    })
+
+    it('degrades gracefully and still resolves when the off-env auth block throws', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const mockExec = createMockExecAdapter()
+      vi.mocked(fs.mkdtemp).mockRejectedValueOnce(new Error('EACCES: permission denied'))
+
+      // #when
+      const result = await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger, mockExec)
+
+      // #then
+      expect(result).toEqual(expect.objectContaining({authenticated: true}))
+      expect(process.env.GH_TOKEN).toBe('app-token')
+      expect(mockLogger.warning).toHaveBeenCalledWith(
+        'Failed to configure off-environment gh auth; child gh CLI will be unauthenticated',
+        expect.anything(),
+      )
+    })
+
+    it('chmods hosts.yml to 0600 when gh auth login succeeds', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const getExecOutput = vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      const mockExec = createMockExecAdapter({getExecOutput})
+      const chmodMock = vi.mocked(fs.chmod)
+
+      // #when
+      await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger, mockExec)
+
+      // #then
+      const ghConfigDir = process.env.GH_CONFIG_DIR as string
+      expect(chmodMock).toHaveBeenCalledWith(join(ghConfigDir, 'hosts.yml'), 0o600)
+      await fs.rm(ghConfigDir, {recursive: true, force: true})
     })
 
     it('logs a warning and does not throw when gh auth login fails', async () => {

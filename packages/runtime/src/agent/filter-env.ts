@@ -39,6 +39,19 @@ const EXACT_ALLOW_KEYS: ReadonlySet<string> = new Set([
   'TERM',
   'GH_CONFIG_DIR',
   'TZ',
+  // Proxy/CA-bundle vars: operational config the child needs for egress/TLS on
+  // self-hosted runners behind a proxy or enterprise-CA git. Proxy URLs CAN embed
+  // credentials (`user:pass@host`) — this is a known no-regression-from-baseline
+  // tradeoff; full isolation is deferred to the credential broker (#1147 hardening).
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'GIT_SSL_CAINFO',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
 ])
 
 const ALLOW_PREFIXES: readonly string[] = ['OPENCODE_', 'RUNNER_', 'XDG_', 'LC_', 'NODE_']

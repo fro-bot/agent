@@ -5,6 +5,7 @@ import {chmod, mkdtemp} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
+import {toErrorMessage} from '../../shared/errors.js'
 import {getUserByUsername} from '../github/api.js'
 import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
 
@@ -35,43 +36,54 @@ export async function configureGhAuth(
     // through the scrub and reaches the child, so `gh` falls back to it there while the
     // harness process (which still has GH_TOKEN) keeps using the env var (gh prefers env
     // over hosts.yml, so there's no conflict).
-    const baseTmp =
-      process.env.RUNNER_TEMP != null && process.env.RUNNER_TEMP.length > 0 ? process.env.RUNNER_TEMP : tmpdir()
-    const ghConfigDir = await mkdtemp(join(baseTmp, 'gh-config-'))
-    await chmod(ghConfigDir, 0o700)
-    process.env.GH_CONFIG_DIR = ghConfigDir
+    //
+    // This whole block is wrapped in try/catch: a disk/permission failure creating the temp
+    // dir, or `gh` not being on PATH (ENOENT), must degrade to a warning rather than crash
+    // setup — the harness already has GH_TOKEN set above; only the model's child `gh` usage
+    // is affected.
+    try {
+      const baseTmp =
+        process.env.RUNNER_TEMP != null && process.env.RUNNER_TEMP.length > 0 ? process.env.RUNNER_TEMP : tmpdir()
+      const ghConfigDir = await mkdtemp(join(baseTmp, 'gh-config-'))
+      await chmod(ghConfigDir, 0o700)
+      process.env.GH_CONFIG_DIR = ghConfigDir
 
-    const loginResult = await execAdapter.getExecOutput('gh', ['auth', 'login', '--with-token'], {
-      env: {...process.env, GH_CONFIG_DIR: ghConfigDir},
-      input: Buffer.from(token, 'utf8'),
-      silent: true,
-      ignoreReturnCode: true,
-    })
-    if (loginResult.exitCode === 0) {
-      // Defense-in-depth: gh normally writes hosts.yml as 0600 already; this is a backstop,
-      // not the primary guarantee. Best-effort — ignore if the file doesn't exist.
-      try {
-        await chmod(join(ghConfigDir, 'hosts.yml'), 0o600)
-      } catch {
-        // hosts.yml may not exist if gh's write layout differs; ignore.
+      const loginResult = await execAdapter.getExecOutput('gh', ['auth', 'login', '--with-token'], {
+        env: {...process.env, GH_CONFIG_DIR: ghConfigDir},
+        input: Buffer.from(token, 'utf8'),
+        silent: true,
+        ignoreReturnCode: true,
+      })
+      if (loginResult.exitCode === 0) {
+        // Defense-in-depth: gh normally writes hosts.yml as 0600 already; this is a backstop,
+        // not the primary guarantee. Best-effort — ignore if the file doesn't exist.
+        try {
+          await chmod(join(ghConfigDir, 'hosts.yml'), 0o600)
+        } catch {
+          // hosts.yml may not exist if gh's write layout differs; ignore.
+        }
+      } else {
+        // Non-fatal: the harness process still has GH_TOKEN for its own needs. A failed
+        // `gh auth login` only degrades the model's own `gh` usage in the child, it does not
+        // break setup.
+        logger.warning('gh auth login failed; model gh CLI usage in the child may be unauthenticated', {
+          exitCode: loginResult.exitCode,
+        })
       }
-    } else {
-      // Non-fatal: the harness process still has GH_TOKEN for its own needs. A failed
-      // `gh auth login` only degrades the model's own `gh` usage in the child, it does not
-      // break setup.
-      logger.warning('gh auth login failed; model gh CLI usage in the child may be unauthenticated', {
-        exitCode: loginResult.exitCode,
+
+      // HONEST RESIDUAL: the token now lives in `${ghConfigDir}/hosts.yml`, readable by the
+      // model's same-user bash (`cat "$GH_CONFIG_DIR/hosts.yml"` or `gh auth token`). This
+      // closes the #1147 *accidental* `${GH_TOKEN}` shell-expansion vector (no env var to
+      // expand) but does NOT close *deliberate* exfiltration — that's the deferred credential
+      // broker's job. Tight perms (0700/0600) bound cross-user/cross-process reach only.
+      //
+      // No explicit cleanup: ghConfigDir lives under the ephemeral runner temp dir, wiped at
+      // job end.
+    } catch (error) {
+      logger.warning('Failed to configure off-environment gh auth; child gh CLI will be unauthenticated', {
+        error: toErrorMessage(error),
       })
     }
-
-    // HONEST RESIDUAL: the token now lives in `${ghConfigDir}/hosts.yml`, readable by the
-    // model's same-user bash (`cat "$GH_CONFIG_DIR/hosts.yml"` or `gh auth token`). This
-    // closes the #1147 *accidental* `${GH_TOKEN}` shell-expansion vector (no env var to
-    // expand) but does NOT close *deliberate* exfiltration — that's the deferred credential
-    // broker's job. Tight perms (0700/0600) bound cross-user/cross-process reach only.
-    //
-    // No explicit cleanup: ghConfigDir lives under the ephemeral runner temp dir, wiped at
-    // job end.
   }
 
   let botLogin: string | null = null
