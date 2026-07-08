@@ -84,6 +84,8 @@ vi.mock('node:fs/promises', () => ({
   access: vi.fn(),
   stat: vi.fn(),
   readFile: vi.fn(),
+  mkdtemp: vi.fn().mockResolvedValue('/tmp/gh-config-mock'),
+  chmod: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Mock tools-cache module

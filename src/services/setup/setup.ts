@@ -301,8 +301,11 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     // Configure gh CLI authentication
     const octokit = getOctokit(githubToken)
-    const ghResult = await configureGhAuth(octokit, null, githubToken, logger)
+    const ghResult = await configureGhAuth(octokit, null, githubToken, logger, execAdapter)
     core.exportVariable('GH_TOKEN', githubToken)
+    if (process.env.GH_CONFIG_DIR != null && process.env.GH_CONFIG_DIR.length > 0) {
+      core.exportVariable('GH_CONFIG_DIR', process.env.GH_CONFIG_DIR)
+    }
     logger.info('GitHub CLI configured')
 
     await configureGitIdentity(octokit, ghResult.botLogin, logger, execAdapter)
