@@ -13,6 +13,7 @@ export type {ErrorInfo, ErrorType} from './error-format/types.js'
 
 export {ERROR_TYPES} from './error-format/types.js'
 export {executeOpenCode} from './execution.js'
+export {filterAgentEnv} from './filter-env.js'
 export {resolveOutputMode} from './output-mode.js'
 export {
   buildCurrentThreadContextSection,
