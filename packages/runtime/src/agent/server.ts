@@ -6,6 +6,7 @@ import type {EnsureOpenCodeResult} from './types.js'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {err, ok} from '../shared/types.js'
+import {withScrubbedEnv} from './with-scrubbed-env.js'
 
 export interface OpenCodeServerHandle {
   readonly client: SessionClient
@@ -18,7 +19,7 @@ export async function bootstrapOpenCodeServer(
   logger: Logger,
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   try {
-    const opencode = await createOpencode({signal})
+    const opencode = await withScrubbedEnv(async () => createOpencode({signal}), logger)
     const {client, server} = opencode
     logger.debug('OpenCode server bootstrapped', {url: server.url})
     return ok({

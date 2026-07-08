@@ -58,3 +58,4 @@ export {
   WORKING_LABEL_COLOR,
   WORKING_LABEL_DESCRIPTION,
 } from './types.js'
+export {withScrubbedEnv} from './with-scrubbed-env.js'
