@@ -161,6 +161,30 @@ describe('gh-auth', () => {
       }
     })
 
+    it('strips GH_TOKEN and GITHUB_TOKEN from the gh auth login exec env, keeping GH_CONFIG_DIR', async () => {
+      // #given
+      process.env.GH_TOKEN = 'sentinel-gh-token'
+      process.env.GITHUB_TOKEN = 'sentinel-github-token'
+      const mockOctokit = createMockOctokit()
+      const getExecOutput = vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      const mockExec = createMockExecAdapter({getExecOutput})
+
+      // #when
+      await configureGhAuth(mockOctokit, 'app-token-123', 'default-token', mockLogger, mockExec)
+
+      // #then
+      const call = getExecOutput.mock.calls[0] as unknown[]
+      const options = call[2] as {env?: Record<string, string>}
+      expect(options.env?.GH_TOKEN).toBeUndefined()
+      expect(options.env?.GITHUB_TOKEN).toBeUndefined()
+      expect(options.env?.GH_CONFIG_DIR).toBeTruthy()
+      // harness process.env.GH_TOKEN must remain intact (line 28 behavior unchanged)
+      expect(process.env.GH_TOKEN).toBe('app-token-123')
+      if (process.env.GH_CONFIG_DIR != null) {
+        await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
+      }
+    })
+
     it('still sets process.env.GH_TOKEN unchanged', async () => {
       // #given
       const mockOctokit = createMockOctokit()
@@ -228,11 +252,10 @@ describe('gh-auth', () => {
       )
       // The global env must NOT be repointed at the temp config dir on a failed login —
       // otherwise gh in the child would be redirected to an empty config dir instead of
-      // falling back to any pre-existing default.
-      expect(process.env.GH_CONFIG_DIR).toBeUndefined()
-      if (process.env.GH_CONFIG_DIR != null) {
-        await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
-      }
+      // falling back to any pre-existing default. Assert it is unchanged from before the
+      // call rather than unset, so an ambient GH_CONFIG_DIR in the environment does not
+      // make this test brittle.
+      expect(process.env.GH_CONFIG_DIR).toBe(originalEnv.GH_CONFIG_DIR)
     })
 
     it('sets process.env.GH_CONFIG_DIR to the temp dir only when gh auth login succeeds', async () => {
