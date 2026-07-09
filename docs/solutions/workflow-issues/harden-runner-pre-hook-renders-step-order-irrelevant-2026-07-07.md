@@ -62,7 +62,7 @@ steps:
   - name: Checkout repository        # moved first, hoping to beat the egress block
     uses: actions/checkout@v7
   - name: Harden runner egress       # harden-runner's PRE-hook already ran before checkout
-    uses: step-security/harden-runner@v2.19.4
+    uses: step-security/harden-runner@v2.20.0
     with:
       egress-policy: block
 ```
@@ -72,7 +72,7 @@ Effective (fix the guard's config instead — here, the allowlist scalar):
 ```yaml
 steps:
   - name: Harden runner egress
-    uses: step-security/harden-runner@v2.19.4
+    uses: step-security/harden-runner@v2.20.0
     with:
       egress-policy: block
       allowed-endpoints: >-          # folded scalar so all endpoints actually parse
