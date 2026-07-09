@@ -69,7 +69,7 @@
  * subscription.
  */
 
-import type {ObjectStoreAdapter, Result} from '@fro-bot/runtime'
+import type {ObjectStoreAdapter, ObjectStoreOperationError, Result} from '@fro-bot/runtime'
 
 import {createHash, randomUUID} from 'node:crypto'
 import {err, ok} from '@fro-bot/runtime'
@@ -223,9 +223,24 @@ export interface PruneResult {
 export interface OperatorPushSubscriptionStore {
   subscribe: (input: SubscribeInput) => Promise<Result<SubscriptionMetadata, StoreError>>
   unsubscribe: (args: {readonly operatorId: string; readonly endpoint: string}) => Promise<Result<void, StoreError>>
-  deactivateForOperator: (args: {readonly operatorId: string}) => Promise<Result<number, StoreError>>
-  /** Privacy delete: tombstones then physically removes every record owned by `operatorId`. */
-  deleteForOperator: (args: {readonly operatorId: string}) => Promise<Result<number, StoreError>>
+  /**
+   * Marks every active record owned by `operatorId` inactive (session-revoke).
+   * `skipped` counts records whose CAS retry loop was exhausted by concurrent
+   * writers — those records were NOT updated and remain in their prior state.
+   */
+  deactivateForOperator: (args: {
+    readonly operatorId: string
+  }) => Promise<Result<{readonly updated: number; readonly skipped: number}, StoreError>>
+  /**
+   * Privacy delete: tombstones then physically removes every record owned by
+   * `operatorId`. `skipped` counts records whose physical removal could not
+   * be completed (e.g. a concurrent transfer) — for those, the tombstone
+   * still excludes them from reads, but their secrets may remain on disk
+   * until a later `pruneInactive` or transfer removes the stale object.
+   */
+  deleteForOperator: (args: {
+    readonly operatorId: string
+  }) => Promise<Result<{readonly deleted: number; readonly skipped: number}, StoreError>>
   listMetadataForOperator: (args: {
     readonly operatorId: string
   }) => Promise<Result<readonly SubscriptionMetadata[], StoreError>>
@@ -233,7 +248,7 @@ export interface OperatorPushSubscriptionStore {
   getActiveRecordsForOperator: (args: {
     readonly operatorId: string
   }) => Promise<Result<readonly SubscriptionRecord[], StoreError>>
-  markDead: (args: {readonly endpoint: string}) => Promise<Result<void, StoreError>>
+  markDead: (args: {readonly operatorId: string; readonly endpoint: string}) => Promise<Result<void, StoreError>>
   /** Prunes inactive subscription records and expired tombstones past their respective retention windows. */
   pruneInactive: (args?: {
     readonly recordsOlderThanMs?: number
@@ -263,6 +278,10 @@ export interface OperatorPushSubscriptionStore {
 
 const DEFAULT_KEY_PREFIX = 'operator-push/subscriptions/by-endpoint'
 const DEFAULT_TOMBSTONE_PREFIX = 'operator-push/tombstones'
+// A sibling of the subscription and tombstone prefixes — never swept by
+// listAllKeys(`${keyPrefix}/`) or the tombstone listing, so leftover
+// self-test keys are never scanned, getObject'd, or warned about.
+const SELF_TEST_PREFIX = 'operator-push/_self-test'
 const DEFAULT_INACTIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 const DEFAULT_TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 
@@ -274,11 +293,24 @@ function hashEndpoint(endpoint: string): string {
   return createHash('sha256').update(endpoint, 'utf8').digest('hex')
 }
 
+// Structured-error-first classification, mirroring the pattern in
+// packages/runtime/src/coordination/lock.ts: check the S3-adapter's
+// structured ObjectStoreOperationError fields (httpStatusCode / errorCode /
+// errorName) before falling back to message-substring matching, which is
+// only reliable for plain-Error adapters (e.g. the test fakes).
 function isPreconditionFailed(error: Error): boolean {
+  const e = error as Partial<ObjectStoreOperationError>
+  if (e.httpStatusCode !== undefined) return e.httpStatusCode === 412
+  const code = e.errorCode ?? e.errorName
+  if (code !== undefined) return code === 'PreconditionFailed'
   return /pre-?condition/i.test(error.message)
 }
 
 function isNotFound(error: Error): boolean {
+  const e = error as Partial<ObjectStoreOperationError>
+  if (e.httpStatusCode !== undefined) return e.httpStatusCode === 404
+  const code = e.errorCode ?? e.errorName
+  if (code !== undefined) return code === 'NoSuchKey' || code === 'NotFound'
   return /not.?found|no.?such.?key|does.?not.?exist|404/i.test(error.message)
 }
 
@@ -622,11 +654,12 @@ export function createOperatorPushSubscriptionStore(
         return err(createStoreError('unsubscribe: endpoint is not owned by this operator'))
       }
 
+      const now = clock()
       const nextRecord: SubscriptionRecord = {
         ...current,
         active: false,
-        updatedAt: clock(),
-        deactivatedAt: clock(),
+        updatedAt: now,
+        deactivatedAt: now,
         inactiveReason: 'unsubscribed',
       }
       const write = await cas.data.conditionalPut(buildKey(endpointHash), JSON.stringify(nextRecord), {
@@ -647,7 +680,9 @@ export function createOperatorPushSubscriptionStore(
   // deactivateForOperator (session-revoke — unchanged, no tombstones)
   // -------------------------------------------------------------------------
 
-  async function deactivateForOperator(args: {readonly operatorId: string}): Promise<Result<number, StoreError>> {
+  async function deactivateForOperator(args: {
+    readonly operatorId: string
+  }): Promise<Result<{readonly updated: number; readonly skipped: number}, StoreError>> {
     const cas = requireCasCapable()
     if (cas.success === false) {
       return err(cas.error)
@@ -658,20 +693,31 @@ export function createOperatorPushSubscriptionStore(
       return err(keys.error)
     }
 
-    let count = 0
+    let updated = 0
+    let skipped = 0
     for (const key of keys.data) {
       const maxAttempts = 5
+      let settled = false
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const fetched = await cas.data.getObject(key)
         if (fetched.success === false) {
-          if (isNotFound(fetched.error)) break
+          if (isNotFound(fetched.error)) {
+            settled = true
+            break
+          }
           return err(createStoreError(fetched.error.message))
         }
         const parsed = parseSubscriptionRecord(fetched.data.data)
-        if (parsed.success === false) break // corrupted — skip
+        if (parsed.success === false) {
+          settled = true
+          break // corrupted — skip
+        }
 
         const record = parsed.data
-        if (record.operatorId !== args.operatorId || record.active === false) break
+        if (record.operatorId !== args.operatorId || record.active === false) {
+          settled = true
+          break
+        }
 
         const now = clock()
         const nextRecord: SubscriptionRecord = {
@@ -686,18 +732,59 @@ export function createOperatorPushSubscriptionStore(
           if (isPreconditionFailed(write.error)) continue // retry
           return err(createStoreError(write.error.message))
         }
-        count += 1
+        updated += 1
+        settled = true
         break
       }
+      if (settled === false) {
+        skipped += 1
+        logger.warn(
+          {key, operatorId: args.operatorId},
+          'operator push subscription store: deactivateForOperator CAS retry exhausted for key — record not updated',
+        )
+      }
     }
-    return ok(count)
+    return ok({updated, skipped})
   }
 
   // -------------------------------------------------------------------------
   // deleteForOperator (privacy delete — tombstone-first, then physical removal)
   // -------------------------------------------------------------------------
 
-  async function deleteForOperator(args: {readonly operatorId: string}): Promise<Result<number, StoreError>> {
+  /**
+   * Privacy delete for one operator's records.
+   *
+   * Ordering (tombstone-first, then physical removal, with a compensating
+   * tombstone rollback on a lost race) is deliberate:
+   *
+   *   1. Read the record + its etag (already owner-checked here).
+   *   2. Write the tombstone (ifNoneMatch:'*', idempotent on conflict).
+   *      A crash between steps 1-2 and step 3 leaves the record physically
+   *      present but the tombstone already excludes it from every active-read
+   *      path — the failure mode fails SAFE toward privacy, never toward
+   *      "looks deleted but isn't".
+   *   3. Physically delete the subscription object with `ifMatch` bound to
+   *      the etag read in step 1. If this delete loses the CAS race
+   *      (PreconditionFailed) — meaning the record was mutated since the
+   *      read, most plausibly transferred to a different operator by a
+   *      concurrent `subscribe` — the delete is NOT retried and the record
+   *      is NOT counted as deleted. The secrets remain on disk (a
+   *      `pruneInactive` pass or a future transfer will eventually clear
+   *      the stale object), and this is logged as a warning so partial
+   *      physical removal is observable.
+   *   4. Because the tombstone from step 2 would otherwise permanently
+   *      exclude an endpoint that might now legitimately belong to someone
+   *      else, a lost race additionally triggers a best-effort rollback:
+   *      re-read the current record, and if it is no longer owned by
+   *      `args.operatorId`, delete the tombstone so the new owner's
+   *      subscription is not shadowed. If the tombstone rollback itself
+   *      fails, that failure is logged and swallowed — the tombstone stays,
+   *      which fails toward excluding a record rather than exposing one
+   *      that might still be this operator's.
+   */
+  async function deleteForOperator(args: {
+    readonly operatorId: string
+  }): Promise<Result<{readonly deleted: number; readonly skipped: number}, StoreError>> {
     const cas = requireCasCapable()
     if (cas.success === false) {
       return err(cas.error)
@@ -708,7 +795,8 @@ export function createOperatorPushSubscriptionStore(
       return err(keys.error)
     }
 
-    let count = 0
+    let deleted = 0
+    let skipped = 0
     for (const key of keys.data) {
       const fetched = await cas.data.getObject(key)
       if (fetched.success === false) {
@@ -729,11 +817,7 @@ export function createOperatorPushSubscriptionStore(
         deletedAt: now,
       }
 
-      // Step 1 — tombstone FIRST. Required ordering: if the process crashes
-      // after this write but before the physical delete below, the record
-      // is still on disk but the tombstone already excludes it from every
-      // active-read path — the failure mode fails safe toward privacy
-      // (still-visible-as-deleted), never toward "looks deleted but isn't".
+      // Step 2 — tombstone FIRST (see function docstring for the full ordering rationale).
       const tombstoneWrite = await cas.data.conditionalPut(tombstoneKey, JSON.stringify(tombstone), {
         ifNoneMatch: '*',
       })
@@ -744,20 +828,54 @@ export function createOperatorPushSubscriptionStore(
       // endpointHash — treat as idempotent success and continue to the
       // physical delete below.
 
-      // Step 2 — physically remove the subscription object, dropping the
-      // secrets (endpoint/p256dh/auth) from disk entirely.
-      const deleted = await cas.data.conditionalDelete(key, {ifMatch: fetched.data.etag})
-      if (
-        deleted.success === false &&
-        isPreconditionFailed(deleted.error) === false &&
-        isNotFound(deleted.error) === false
-      ) {
-        return err(createStoreError(deleted.error.message))
+      // Step 3 — physically remove the subscription object, bound to the
+      // etag read above, so a concurrent mutation (e.g. an ownership
+      // transfer) loses the delete rather than silently clobbering it.
+      const objectDelete = await cas.data.conditionalDelete(key, {ifMatch: fetched.data.etag})
+      if (objectDelete.success === true || isNotFound(objectDelete.error)) {
+        // Physical removal succeeded, or the object was already gone —
+        // either way the secrets are off disk. Count as deleted.
+        deleted += 1
+        continue
       }
 
-      count += 1
+      if (isPreconditionFailed(objectDelete.error) === false) {
+        return err(createStoreError(objectDelete.error.message))
+      }
+
+      // Lost the CAS race — the record changed since the read (most
+      // plausibly a concurrent transfer). Do NOT count this as deleted: the
+      // secrets are still on disk under whatever the current object holds.
+      skipped += 1
+      logger.warn(
+        {key, operatorId: args.operatorId},
+        'operator push subscription store: deleteForOperator lost the physical-delete CAS race — secrets remain on disk pending a later prune or transfer',
+      )
+
+      // Step 4 — rollback the tombstone if the record no longer belongs to
+      // this operator, so we don't shadow a legitimately transferred record.
+      const reread = await cas.data.getObject(key)
+      if (reread.success === true) {
+        const reparsed = parseSubscriptionRecord(reread.data.data)
+        if (reparsed.success === true && reparsed.data.operatorId !== args.operatorId) {
+          // Re-fetch the tombstone's current etag rather than trusting the
+          // step-2 write result — a concurrent prune could have raced it too.
+          const currentTombstone = await cas.data.getObject(tombstoneKey)
+          if (currentTombstone.success === true) {
+            const tombstoneRollback = await cas.data.conditionalDelete(tombstoneKey, {
+              ifMatch: currentTombstone.data.etag,
+            })
+            if (tombstoneRollback.success === false && isNotFound(tombstoneRollback.error) === false) {
+              logger.warn(
+                {key, tombstoneKey, error: tombstoneRollback.error.message},
+                'operator push subscription store: failed to roll back tombstone after a lost delete race against a transferred record',
+              )
+            }
+          }
+        }
+      }
     }
-    return ok(count)
+    return ok({deleted, skipped})
   }
 
   // -------------------------------------------------------------------------
@@ -788,7 +906,10 @@ export function createOperatorPushSubscriptionStore(
   // markDead
   // -------------------------------------------------------------------------
 
-  async function markDead(args: {readonly endpoint: string}): Promise<Result<void, StoreError>> {
+  async function markDead(args: {
+    readonly operatorId: string
+    readonly endpoint: string
+  }): Promise<Result<void, StoreError>> {
     const cas = requireCasCapable()
     if (cas.success === false) {
       return err(cas.error)
@@ -806,15 +927,20 @@ export function createOperatorPushSubscriptionStore(
       }
 
       const {record: current, etag} = existing.data
+      if (current.operatorId !== args.operatorId) {
+        // Fail closed — a different operator cannot deactivate someone else's record.
+        return err(createStoreError('markDead: endpoint is not owned by this operator'))
+      }
       if (current.active === false) {
         return ok(undefined) // Already inactive — no-op.
       }
 
+      const now = clock()
       const nextRecord: SubscriptionRecord = {
         ...current,
         active: false,
-        updatedAt: clock(),
-        deactivatedAt: clock(),
+        updatedAt: now,
+        deactivatedAt: now,
         inactiveReason: 'dead',
       }
       const write = await cas.data.conditionalPut(buildKey(endpointHash), JSON.stringify(nextRecord), {
@@ -972,7 +1098,7 @@ export function createOperatorPushSubscriptionStore(
       )
     }
 
-    const testKey = `${keyPrefix}/_self-test/${randomUUID()}.json`
+    const testKey = `${SELF_TEST_PREFIX}/${randomUUID()}.json`
 
     try {
       // Race two ifNoneMatch creates against the same key. A real CAS backend
