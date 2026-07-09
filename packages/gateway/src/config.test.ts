@@ -2839,6 +2839,73 @@ describe('operatorPush config', () => {
     expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
   })
 
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS with a trailing exponent suffix', () => {
+    // #given — Number.parseInt('1e5', 10) silently parses to 1; the pre-guard must reject it
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '1e5'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS with a trailing non-numeric suffix', () => {
+    // #given — Number.parseInt('100abc', 10) silently parses to 100; the pre-guard must reject it
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '100abc'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS of "0" (boundary)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a previous VAPID key version equal to the current key version', () => {
+    // #given — previous and current share the same key version, making key-selection ambiguous
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: '1'})
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/previous key version must differ from the current key version/)
+  })
+
+  it('happy path: the VAPID private key is directly readable on the loaded config', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — direct property access still exposes the private key (JSON.stringify hides it,
+    // but the value itself must remain readable for the routes that need to sign with it)
+    expect(config.operatorPush?.current.privateKey).toBe(FAKE_VAPID_PRIVATE_KEY)
+  })
+
+  it('happy path: explicit GATEWAY_OPERATOR_PUSH_ENABLED=false ignores present VAPID material', () => {
+    // #given — VAPID material is fully present, but the flag explicitly disables push
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_ENABLED = 'false'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).not.toThrow()
+    expect(loadGatewayConfig().operatorPush).toBeUndefined()
+  })
+
   it('never serializes the VAPID private key into the config object (JSON.stringify)', () => {
     // #given
     setRequiredEnv()

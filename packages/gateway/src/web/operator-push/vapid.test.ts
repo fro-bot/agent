@@ -56,6 +56,14 @@ describe('assertValidVapidPublicKey', () => {
     // #when / #then
     expect(() => assertValidVapidPublicKey(compressed)).toThrow(/uncompressed EC point/)
   })
+
+  it('error path: rejects a decoded byte length that is too long', () => {
+    // #given — 66 bytes, correctly base64url-encoded but one byte over the required 65
+    const tooLong = 'LIx8ZULRHcYeFvp3Hi26Bwno7_BFvZ0Vm00j74G5_WAP5J3Q0ckMDyXylHAAKBZYj6UZyk_CJXNv939PV4Rg9M2R'
+
+    // #when / #then
+    expect(() => assertValidVapidPublicKey(tooLong)).toThrow(/65 bytes/)
+  })
 })
 
 describe('assertValidVapidPrivateKey', () => {
@@ -78,6 +86,14 @@ describe('assertValidVapidPrivateKey', () => {
 
     // #when / #then
     expect(() => assertValidVapidPrivateKey(tooShort)).toThrow(/32 bytes/)
+  })
+
+  it('error path: rejects a decoded byte length that is too long', () => {
+    // #given — 33 bytes, correctly base64url-encoded but one byte over the required 32
+    const tooLong = 'VQy5DTiVolytPi9WbWlBG5uvalIcuGeMEuVb08abt2nB'
+
+    // #when / #then
+    expect(() => assertValidVapidPrivateKey(tooLong)).toThrow(/32 bytes/)
   })
 
   it('never embeds the private key value in a thrown error message', () => {

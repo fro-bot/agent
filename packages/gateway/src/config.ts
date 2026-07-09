@@ -993,18 +993,21 @@ export function loadGatewayConfig(): GatewayConfig {
       }
       previous = buildVapidKeyMaterial(previousPublicKey, previousPrivateKey, previousSubject, previousKeyVersion)
       assertValidVapidKeyMaterial(previous)
+
+      if (previous.keyVersion === current.keyVersion) {
+        throw new Error('Invalid VAPID rotation config: previous key version must differ from the current key version')
+      }
     }
 
     const rawDedupeWindowMs = readOptionalSecret(OPERATOR_PUSH_DEDUPE_WINDOW_MS)
     let dedupeWindowMs = DEFAULT_OPERATOR_PUSH_DEDUPE_WINDOW_MS
     if (rawDedupeWindowMs !== null) {
-      const parsed = Number.parseInt(rawDedupeWindowMs, 10)
-      if (Number.isFinite(parsed) === false || Number.isInteger(parsed) === false || parsed < 1) {
+      if (/^[1-9]\d*$/.test(rawDedupeWindowMs) === false) {
         throw new Error(
           `Invalid ${OPERATOR_PUSH_DEDUPE_WINDOW_MS} value: "${rawDedupeWindowMs}" (must be a positive integer in milliseconds)`,
         )
       }
-      dedupeWindowMs = parsed
+      dedupeWindowMs = Number.parseInt(rawDedupeWindowMs, 10)
     }
 
     operatorPush = {
