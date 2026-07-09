@@ -2692,6 +2692,8 @@ const FAKE_VAPID_PUBLIC_KEY = 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9I
 const FAKE_VAPID_PRIVATE_KEY = 'gQIJ6WJacBGGIKNR3-7ev4J95uh8hqQF728243fV_gg'
 const FAKE_VAPID_SUBJECT = 'mailto:operator-push-test@example.com'
 const FAKE_VAPID_KEY_VERSION = '1'
+const FAKE_PREVIOUS_VAPID_PUBLIC_KEY =
+  'BOg_CCUlv3OFt_GK96H4ls8SgYBeEjQZXZp9dY4_Hu818wJdUNZUxD3mp-14xy98oy5P7AVdH4Ki2l2PddAirJc'
 
 function setOperatorPushEnv(overrides: {keyVersion?: string; subject?: string} = {}): void {
   process.env.GATEWAY_OPERATOR_PUSH_ENABLED = 'true'
@@ -2758,7 +2760,7 @@ describe('operatorPush config', () => {
     // #given — previous keypair uses a different (but still valid) key version
     setRequiredEnv()
     setOperatorPushEnv({keyVersion: '2'})
-    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_PREVIOUS_VAPID_PUBLIC_KEY
     process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
     process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
     process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
@@ -2880,6 +2882,19 @@ describe('operatorPush config', () => {
 
     // #when / #then
     expect(() => loadGatewayConfig()).toThrow(/previous key version must differ from the current key version/)
+  })
+
+  it('error path: rejects a previous public key identical to the current public key', () => {
+    // #given — previous and current key versions differ, but the public key material is the same
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: '2'})
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/previous key must differ from the current key/)
   })
 
   it('happy path: the VAPID private key is directly readable on the loaded config', () => {

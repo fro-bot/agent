@@ -140,6 +140,21 @@ describe('assertValidVapidSubject', () => {
     // #given / #when / #then
     expect(() => assertValidVapidSubject('not a url')).toThrow(/valid mailto/)
   })
+
+  it('error path: rejects an addressless mailto: subject', () => {
+    // #given / #when / #then
+    expect(() => assertValidVapidSubject('mailto:')).toThrow(/non-empty address/)
+  })
+
+  it('error path: rejects a mailto: subject with a whitespace-only address', () => {
+    // #given / #when / #then
+    expect(() => assertValidVapidSubject('mailto:   ')).toThrow(/non-empty address/)
+  })
+
+  it('happy path: accepts a mailto: subject with a real address (regression guard)', () => {
+    // #given / #when / #then
+    expect(() => assertValidVapidSubject('mailto:ops@example.com')).not.toThrow()
+  })
 })
 
 describe('assertValidVapidKeyVersion', () => {

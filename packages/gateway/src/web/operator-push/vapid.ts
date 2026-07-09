@@ -110,6 +110,9 @@ export function assertValidVapidSubject(value: string): void {
   if (parsed.protocol !== 'mailto:' && parsed.protocol !== 'https:') {
     throw new Error('Invalid VAPID subject: must use the mailto: or https: scheme.')
   }
+  if (parsed.protocol === 'mailto:' && parsed.pathname.trim() === '') {
+    throw new Error('Invalid VAPID subject: mailto: URL must include a non-empty address.')
+  }
 }
 
 /**

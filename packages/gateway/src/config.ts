@@ -997,6 +997,10 @@ export function loadGatewayConfig(): GatewayConfig {
       if (previous.keyVersion === current.keyVersion) {
         throw new Error('Invalid VAPID rotation config: previous key version must differ from the current key version')
       }
+
+      if (previous.publicKey === current.publicKey) {
+        throw new Error('Invalid VAPID rotation config: previous key must differ from the current key')
+      }
     }
 
     const rawDedupeWindowMs = readOptionalSecret(OPERATOR_PUSH_DEDUPE_WINDOW_MS)
