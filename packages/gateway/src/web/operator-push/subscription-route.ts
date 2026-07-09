@@ -1,0 +1,315 @@
+/**
+ * Authenticated operator push subscription routes:
+ *   - POST /operator/push/subscriptions            — subscribe
+ *   - POST /operator/push/subscriptions/unsubscribe — unsubscribe
+ *   - GET  /operator/push/subscriptions             — list metadata
+ *
+ * Wires the browser's W3C `PushSubscription.toJSON()` payload to the durable
+ * subscription store (web/operator-push/subscription-store.ts). Every
+ * response returns only safe metadata — the endpoint URL and P-256/auth keys
+ * are write-only and never echoed back or logged.
+ *
+ * Gate ordering (subscribe/unsubscribe — mirrors launch-route.ts):
+ *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
+ *   2. Read authenticated context set by the guard — undefined → notFoundResponse
+ *   3. Resolve operator identity (githubUserId) from authCtx
+ *   4. Operator-keyed rate limit (write routes only)
+ *   5. Parse + validate request body
+ *   6. Endpoint URL validation (SSRF-conservative — subscribe only)
+ *   7. Call the store
+ *   8. Map result → safe JSON
+ *
+ * List (GET) skips gates 4–6 (no body, no mutation, no endpoint to validate).
+ *
+ * Security invariants:
+ *   - Every denial (gates 2–4) returns the identical no-oracle notFoundResponse,
+ *     mirroring launch-route. Malformed body / bad endpoint → 400 (mirrors
+ *     launch-route's body-validation convention).
+ *   - A gate throw degrades to the same denial, never a distinguishable 500.
+ *   - The endpoint value is NEVER included in a response, log line, or thrown
+ *     error — only coarse gate names and rejection classes.
+ *   - CSRF/Origin middleware covers the two POST routes (write routes).
+ */
+
+import type {Hono} from 'hono'
+import type {RateLimiter} from '../../http/rate-limit.js'
+import type {
+  OperatorPushSubscriptionListResponse,
+  OperatorPushSubscriptionMetadata,
+} from '../../operator-contract/index.js'
+import type {OperatorLogger} from '../server.js'
+import type {OperatorPushSubscriptionStore, SubscriptionMetadata} from './subscription-store.js'
+import {createRateLimiter} from '../../http/rate-limit.js'
+import {parseOperatorPushSubscribeRequest} from '../../operator-contract/index.js'
+import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
+import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {validateEndpointUrl} from './validate-endpoint.js'
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Per-operator subscribe rate limit: 10 requests per minute. */
+const SUBSCRIBE_RATE_LIMIT_PER_MIN = 10
+const SUBSCRIBE_RATE_WINDOW_MS = 60_000
+
+/** Per-operator unsubscribe rate limit: 10 requests per minute. */
+const UNSUBSCRIBE_RATE_LIMIT_PER_MIN = 10
+const UNSUBSCRIBE_RATE_WINDOW_MS = 60_000
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Minimal session store interface required by the push subscription routes. */
+export interface SubscriptionRouteSessionStore {
+  readonly get: (
+    sessionId: string,
+    nowMs: number,
+  ) => {readonly githubUserId: number; readonly login: string} | undefined
+}
+
+/** Dependencies for the push subscription routes. */
+export interface SubscriptionRouteDeps {
+  /** Session store for identity resolution. */
+  readonly sessionStore: SubscriptionRouteSessionStore
+  /** Durable subscription-record store. */
+  readonly store: Pick<OperatorPushSubscriptionStore, 'subscribe' | 'unsubscribe' | 'listMetadataForOperator'>
+  /** Current VAPID key version — stamped onto every subscribe call. */
+  readonly keyVersion: string
+  /** Structured logger. */
+  readonly logger: OperatorLogger
+  /** Injectable clock. */
+  readonly now: () => number
+  /** Optional injectable per-minute rate limiter for subscribe (operator-keyed). */
+  readonly subscribeRateLimiter?: RateLimiter
+  /** Optional injectable per-minute rate limiter for unsubscribe (operator-keyed). */
+  readonly unsubscribeRateLimiter?: RateLimiter
+}
+
+// ---------------------------------------------------------------------------
+// Body parsing helpers
+// ---------------------------------------------------------------------------
+
+/** Parse and validate the unsubscribe request body: {endpoint: string}. */
+function parseUnsubscribeBody(body: unknown): {readonly endpoint: string} | null {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return null
+  }
+  const candidate = body as Record<string, unknown>
+  if (typeof candidate.endpoint !== 'string' || candidate.endpoint.length === 0) {
+    return null
+  }
+  return {endpoint: candidate.endpoint}
+}
+
+/** Map full SubscriptionMetadata (store shape) to the contract-safe response shape. */
+function toResponseMetadata(metadata: SubscriptionMetadata): OperatorPushSubscriptionMetadata {
+  const base: OperatorPushSubscriptionMetadata = {
+    endpointHash: metadata.endpointHash,
+    createdAt: metadata.createdAt,
+    updatedAt: metadata.updatedAt,
+    keyVersion: metadata.keyVersion,
+    active: metadata.active,
+  }
+  if (metadata.inactiveReason === undefined) {
+    return base
+  }
+  // The store's inactive-reason taxonomy is a superset ('transferred') of the
+  // contract's public taxonomy — 'transferred' is an internal-only reason and
+  // is intentionally omitted from the response rather than mapped.
+  if (
+    metadata.inactiveReason === 'unsubscribed' ||
+    metadata.inactiveReason === 'dead' ||
+    metadata.inactiveReason === 'key_revoked' ||
+    metadata.inactiveReason === 'session-revoked'
+  ) {
+    const mapped = metadata.inactiveReason === 'key_revoked' ? 'revoked' : metadata.inactiveReason
+    return {...base, inactiveReason: mapped}
+  }
+  return base
+}
+
+// ---------------------------------------------------------------------------
+// Route builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Register the three push subscription routes on the given Hono app.
+ *
+ * Must be called after setOperatorRouteGuard is installed in buildOperatorApp.
+ * The guard runs first (browser/session/allowlist/CSRF); each handler runs
+ * only if the guard allows the request.
+ */
+export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps): void {
+  const subscribeLimiter =
+    deps.subscribeRateLimiter ??
+    createRateLimiter({limit: SUBSCRIBE_RATE_LIMIT_PER_MIN, windowMs: SUBSCRIBE_RATE_WINDOW_MS, clock: deps.now})
+  const unsubscribeLimiter =
+    deps.unsubscribeRateLimiter ??
+    createRateLimiter({limit: UNSUBSCRIBE_RATE_LIMIT_PER_MIN, windowMs: UNSUBSCRIBE_RATE_WINDOW_MS, clock: deps.now})
+
+  // ── POST /operator/push/subscriptions ─────────────────────────────────────
+  registerOperatorRoute(app, 'POST', '/operator/push/subscriptions', async c => {
+    const nowMs = deps.now()
+
+    // ── Gate 2: Read authenticated context set by the guard ────────────────
+    const authCtx = getOperatorAuthContext(c)
+    if (authCtx === undefined) {
+      deps.logger.warn({gate: 'no-auth-ctx'}, 'push-subscribe: denied')
+      return notFoundResponse(c)
+    }
+    const {githubUserId, sessionId} = authCtx
+    const operatorId = String(githubUserId)
+
+    // ── Gate 4: Operator rate limit ─────────────────────────────────────────
+    if (subscribeLimiter.allow(operatorId) === false) {
+      deps.logger.warn({githubUserId, gate: 'rate-limited'}, 'push-subscribe: rate limited')
+      return rateLimitedResponse(c)
+    }
+
+    // Resolve session identity — required for attribution, mirrors launch-route gate 3.
+    const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+    if (sessionEntry === undefined) {
+      deps.logger.warn({githubUserId, gate: 'no-session'}, 'push-subscribe: denied — session missing')
+      return notFoundResponse(c)
+    }
+
+    // ── Gate 5: Parse + validate request body ───────────────────────────────
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'push-subscribe: denied — invalid JSON body')
+      return c.json({error: 'bad request'}, 400)
+    }
+
+    const parsed = parseOperatorPushSubscribeRequest(body)
+    if (parsed.success === false) {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'push-subscribe: denied — invalid request shape')
+      return c.json({error: 'bad request'}, 400)
+    }
+
+    // ── Gate 6: SSRF-conservative endpoint validation ───────────────────────
+    // Never log the endpoint value itself — only the coarse rejection class.
+    const endpointCheck = validateEndpointUrl(parsed.data.endpoint)
+    if (endpointCheck.ok === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'endpoint-rejected', reason: endpointCheck.reason},
+        'push-subscribe: denied — endpoint failed SSRF validation',
+      )
+      return c.json({error: 'bad request'}, 400)
+    }
+
+    // ── Gate 7: Call the store ───────────────────────────────────────────────
+    try {
+      const result = await deps.store.subscribe({
+        operatorId,
+        endpoint: parsed.data.endpoint,
+        p256dh: parsed.data.keys.p256dh,
+        auth: parsed.data.keys.auth,
+        keyVersion: deps.keyVersion,
+      })
+      if (result.success === false) {
+        deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-subscribe: store write failed')
+        return notFoundResponse(c)
+      }
+
+      // ── Gate 8: Map result → safe JSON (metadata only, never endpoint/keys) ─
+      deps.logger.info({githubUserId}, 'push-subscribe: accepted')
+      return c.json(toResponseMetadata(result.data), 200)
+    } catch (error: unknown) {
+      deps.logger.warn(
+        {githubUserId, err: error instanceof Error ? error.message : String(error)},
+        'push-subscribe: store call threw — denying',
+      )
+      return notFoundResponse(c)
+    }
+  })
+
+  // ── POST /operator/push/subscriptions/unsubscribe ─────────────────────────
+  registerOperatorRoute(app, 'POST', '/operator/push/subscriptions/unsubscribe', async c => {
+    // ── Gate 2: Read authenticated context set by the guard ────────────────
+    const authCtx = getOperatorAuthContext(c)
+    if (authCtx === undefined) {
+      deps.logger.warn({gate: 'no-auth-ctx'}, 'push-unsubscribe: denied')
+      return notFoundResponse(c)
+    }
+    const {githubUserId} = authCtx
+    const operatorId = String(githubUserId)
+
+    // ── Gate 4: Operator rate limit ─────────────────────────────────────────
+    if (unsubscribeLimiter.allow(operatorId) === false) {
+      deps.logger.warn({githubUserId, gate: 'rate-limited'}, 'push-unsubscribe: rate limited')
+      return rateLimitedResponse(c)
+    }
+
+    // ── Gate 5: Parse + validate request body ───────────────────────────────
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'push-unsubscribe: denied — invalid JSON body')
+      return c.json({error: 'bad request'}, 400)
+    }
+
+    const parsed = parseUnsubscribeBody(body)
+    if (parsed === null) {
+      deps.logger.warn({githubUserId, gate: 'bad-body'}, 'push-unsubscribe: denied — invalid request shape')
+      return c.json({error: 'bad request'}, 400)
+    }
+
+    // ── Gate 7: Call the store ───────────────────────────────────────────────
+    // Fail-closed, no-oracle: the store rejects when the endpoint is owned by
+    // a different operator; that denial and an unknown endpoint (idempotent
+    // no-op success) both surface identically here to avoid leaking ownership.
+    try {
+      const result = await deps.store.unsubscribe({operatorId, endpoint: parsed.endpoint})
+      if (result.success === false) {
+        deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-unsubscribe: denied')
+        return notFoundResponse(c)
+      }
+
+      // ── Gate 8: Safe response — no endpoint/keys ─────────────────────────
+      deps.logger.info({githubUserId}, 'push-unsubscribe: accepted')
+      return c.json({ok: true}, 200)
+    } catch (error: unknown) {
+      deps.logger.warn(
+        {githubUserId, err: error instanceof Error ? error.message : String(error)},
+        'push-unsubscribe: store call threw — denying',
+      )
+      return notFoundResponse(c)
+    }
+  })
+
+  // ── GET /operator/push/subscriptions ───────────────────────────────────────
+  registerOperatorRoute(app, 'GET', '/operator/push/subscriptions', async c => {
+    // ── Gate 2: Read authenticated context set by the guard ────────────────
+    const authCtx = getOperatorAuthContext(c)
+    if (authCtx === undefined) {
+      deps.logger.warn({gate: 'no-auth-ctx'}, 'push-subscriptions-list: denied')
+      return notFoundResponse(c)
+    }
+    const {githubUserId} = authCtx
+    const operatorId = String(githubUserId)
+
+    try {
+      const result = await deps.store.listMetadataForOperator({operatorId})
+      if (result.success === false) {
+        deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-subscriptions-list: denied')
+        return notFoundResponse(c)
+      }
+
+      const response: OperatorPushSubscriptionListResponse = {
+        subscriptions: result.data.map(toResponseMetadata),
+      }
+      return c.json(response, 200)
+    } catch (error: unknown) {
+      deps.logger.warn(
+        {githubUserId, err: error instanceof Error ? error.message : String(error)},
+        'push-subscriptions-list: store call threw — denying',
+      )
+      return notFoundResponse(c)
+    }
+  })
+}

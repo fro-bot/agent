@@ -10,6 +10,8 @@ import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
+import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
 import {
   createS3Adapter,
@@ -42,6 +44,7 @@ import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
 import {createInMemorySessionStore} from './web/auth/session.js'
+import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import {createRunObservationManager} from './web/sse/manager.js'
 import {projectRunObservation} from './web/sse/projection.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -155,6 +158,15 @@ export interface BuildOperatorServerInputs {
    * a missing dep and verify the launch route is absent.
    */
   readonly launchWorkDeps?: NonNullable<OperatorServerDeps['launchWorkDeps']>
+  /**
+   * Operator push subscription deps — threaded through only when push is
+   * enabled AND the object store passed its startup CAS self-test. When
+   * absent, the /operator/push/* routes are not registered (fail-closed).
+   */
+  readonly operatorPush?: {
+    readonly store: NonNullable<OperatorServerDeps['operatorPushStore']>
+    readonly vapidPublicKeyInfo: VapidPublicKeyInfo
+  }
   readonly operatorWebConfig: {
     readonly bindHost: string
     readonly bindPort: number
@@ -199,6 +211,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     approvalRegistry,
     cancelRunDeps,
     launchWorkDeps,
+    operatorPush,
     operatorWebConfig,
   } = inputs
 
@@ -268,6 +281,11 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     runIndex,
     approvalRegistry,
     cancelRunDeps,
+    // operatorPushStore/operatorPushVapidKeyInfo: server.ts gates the
+    // /operator/push/* routes on both being present. Threaded only when the
+    // caller passed operatorPush (push enabled + self-test passed upstream).
+    operatorPushStore: operatorPush?.store,
+    operatorPushVapidKeyInfo: operatorPush?.vapidPublicKeyInfo,
   }
 
   const config: OperatorServerConfig = {
@@ -667,6 +685,32 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
+      // Operator push — opt-in via config.operatorPush (presence means enabled).
+      // Before threading push deps into the operator server, prove the configured
+      // object store has real compare-and-swap semantics by running the
+      // subscription store's startup self-test. A self-test failure does NOT
+      // crash gateway startup — it only disables the push surface (the rest of
+      // the operator server still starts) so a misconfigured/incompatible object
+      // store can never silently corrupt subscription ownership transfers.
+      let operatorPush:
+        | {
+            readonly store: OperatorPushSubscriptionStore
+            readonly vapidPublicKeyInfo: VapidPublicKeyInfo
+          }
+        | undefined
+      if (config.operatorPush !== undefined) {
+        const pushStore = createOperatorPushSubscriptionStore({
+          adapter: s3Adapter,
+          logger,
+        })
+        const selfTest = yield* Effect.promise(async () => pushStore.selfTestCas())
+        if (selfTest.success === true) {
+          operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
+        } else {
+          logger.warn({err: selfTest.error.message}, 'operator push disabled — object store failed CAS self-test')
+        }
+      }
+
       // Build the operator server deps and config via the shared helper.
       // The helper constructs operator-local pieces (rate limiter, session store,
       // OAuth deps, getSourceKey) and wires the program-scoped instances.
@@ -692,6 +736,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runObserver: runObservationManager,
         },
         launchWorkDeps: runEngineDeps,
+        operatorPush,
         operatorWebConfig: config.operatorWeb,
       })
 

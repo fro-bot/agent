@@ -1744,6 +1744,34 @@ function makeStubLaunchWorkDeps(): NonNullable<OperatorServerDeps['launchWorkDep
   return {} as unknown as NonNullable<OperatorServerDeps['launchWorkDeps']>
 }
 
+/** Shared stub for the operator push subscription store — no-op for registration tests. */
+function makeStubOperatorPushStore(): NonNullable<OperatorServerDeps['operatorPushStore']> {
+  return {
+    subscribe: async () => ({
+      success: true as const,
+      data: {
+        endpointHash: 'stub-hash',
+        operatorId: 'stub-operator',
+        active: true,
+        keyVersion: '1',
+        ownershipGeneration: 1,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    }),
+    unsubscribe: async () => ({success: true as const, data: undefined}),
+    listMetadataForOperator: async () => ({success: true as const, data: []}),
+  }
+}
+
+/** Shared stub for client-safe VAPID key info — registration tests only. */
+function makeStubOperatorPushVapidKeyInfo(): NonNullable<OperatorServerDeps['operatorPushVapidKeyInfo']> {
+  return {
+    publicKey: 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc',
+    keyVersion: '1',
+  }
+}
+
 /** Build a full-deps OperatorServerDeps with all privileged routes enabled. */
 function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>): OperatorServerDeps {
   const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1764,6 +1792,8 @@ function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySe
     launchWorkDeps: makeStubLaunchWorkDeps(),
     approvalRegistry: makeStubApprovalRegistry(),
     cancelRunDeps: makeStubCancelRunDeps(),
+    operatorPushStore: makeStubOperatorPushStore(),
+    operatorPushVapidKeyInfo: makeStubOperatorPushVapidKeyInfo(),
     rateLimiter: {allow: () => true},
   })
 }
