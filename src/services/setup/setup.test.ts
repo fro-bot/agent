@@ -84,6 +84,8 @@ vi.mock('node:fs/promises', () => ({
   access: vi.fn(),
   stat: vi.fn(),
   readFile: vi.fn(),
+  mkdtemp: vi.fn().mockResolvedValue('/tmp/gh-config-mock'),
+  chmod: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Mock tools-cache module
@@ -257,12 +259,15 @@ describe('setup', () => {
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+      vi.mocked(fs.mkdtemp).mockResolvedValue('/tmp/gh-config-mock')
+      vi.mocked(fs.chmod).mockResolvedValue(undefined)
 
       // #when
       await runSetup(createSetupInputs(), 'ghs_test_token')
 
       // #then
       expect(core.exportVariable).toHaveBeenCalledWith('GH_TOKEN', 'ghs_test_token')
+      expect(core.exportVariable).toHaveBeenCalledWith('GH_CONFIG_DIR', expect.any(String))
     })
 
     it('exports OPENCODE_CONFIG_CONTENT environment variable', async () => {
