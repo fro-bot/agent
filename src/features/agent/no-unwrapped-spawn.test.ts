@@ -22,6 +22,11 @@ describe('no-unwrapped-spawn (execution)', () => {
       .filter(line => !/^\s*import\b/.test(line))
       .filter(line => !/typeof\s+createOpencode/.test(line))
 
+    // NOTE: this guard assumes the wrapper and the call sit on the SAME physical
+    // line (`withScrubbedEnv(async () => createOpencode({signal}), logger)`). If a
+    // future reflow splits them across lines, this fails as a FALSE ALARM — the
+    // correct fix is to restore them to one line (or update this scan), NOT to
+    // remove the withScrubbedEnv wrap, which would reopen the #1147 leak.
     expect(callLines.length).toBeGreaterThan(0)
     for (const line of callLines) {
       expect(line).toContain('withScrubbedEnv')
