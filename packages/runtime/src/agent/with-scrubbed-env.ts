@@ -7,6 +7,12 @@
 // keys are restored immediately after the spawn (in a `finally`) so the
 // harness itself keeps AWS_*/proxy vars it needs afterward (e.g. for the S3
 // cache backend, which reads ambient AWS_* env after the spawn returns).
+//
+// NON-CONCURRENCY ASSUMPTION: this mutates the SHARED global process.env for the
+// duration of the awaited spawn. It is safe only because the harness runs this
+// sequentially with no concurrent consumer reading env during the brief
+// synchronous-spawn window. A future caller invoking this concurrently with other
+// env-reading work would transiently observe the scrubbed env.
 
 import type {Logger} from '../shared/logger.js'
 import process from 'node:process'

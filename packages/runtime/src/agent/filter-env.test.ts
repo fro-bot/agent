@@ -109,6 +109,17 @@ describe('filterAgentEnv', () => {
     expect(result).toEqual({OPENCODE_CONFIG_CONTENT: '{}'})
   })
 
+  it('retains GH_CONFIG_DIR (load-bearing: off-env gh auth relies on this reaching the child)', () => {
+    // #given
+    const env = {GH_CONFIG_DIR: '/tmp/gh-config-xyz', PATH: '/usr/bin'}
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual(env)
+  })
+
   it('returns an empty object for an empty env', () => {
     // #given
     const env = {}

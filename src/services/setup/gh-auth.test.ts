@@ -226,9 +226,29 @@ describe('gh-auth', () => {
         expect.stringContaining('gh auth login failed'),
         expect.anything(),
       )
+      // The global env must NOT be repointed at the temp config dir on a failed login —
+      // otherwise gh in the child would be redirected to an empty config dir instead of
+      // falling back to any pre-existing default.
+      expect(process.env.GH_CONFIG_DIR).toBeUndefined()
       if (process.env.GH_CONFIG_DIR != null) {
         await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
       }
+    })
+
+    it('sets process.env.GH_CONFIG_DIR to the temp dir only when gh auth login succeeds', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const getExecOutput = vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      const mockExec = createMockExecAdapter({getExecOutput})
+
+      // #when
+      await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger, mockExec)
+
+      // #then
+      expect(process.env.GH_CONFIG_DIR).toBeTruthy()
+      const stat = await fs.stat(process.env.GH_CONFIG_DIR as string)
+      expect(stat.isDirectory()).toBe(true)
+      await fs.rm(process.env.GH_CONFIG_DIR as string, {recursive: true, force: true})
     })
   })
 

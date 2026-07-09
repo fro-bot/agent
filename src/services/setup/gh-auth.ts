@@ -46,7 +46,6 @@ export async function configureGhAuth(
         process.env.RUNNER_TEMP != null && process.env.RUNNER_TEMP.length > 0 ? process.env.RUNNER_TEMP : tmpdir()
       const ghConfigDir = await mkdtemp(join(baseTmp, 'gh-config-'))
       await chmod(ghConfigDir, 0o700)
-      process.env.GH_CONFIG_DIR = ghConfigDir
 
       const loginResult = await execAdapter.getExecOutput('gh', ['auth', 'login', '--with-token'], {
         env: {...process.env, GH_CONFIG_DIR: ghConfigDir},
@@ -55,6 +54,10 @@ export async function configureGhAuth(
         ignoreReturnCode: true,
       })
       if (loginResult.exitCode === 0) {
+        // Only repoint the global env at the temp config dir once we know login succeeded —
+        // if login fails, leave GH_CONFIG_DIR unset so gh falls back to any pre-existing
+        // default config instead of an empty directory.
+        process.env.GH_CONFIG_DIR = ghConfigDir
         // Defense-in-depth: gh normally writes hosts.yml as 0600 already; this is a backstop,
         // not the primary guarantee. Best-effort — ignore if the file doesn't exist.
         try {
