@@ -80,7 +80,7 @@ export interface GatewayConfig {
    * Canonical Fro Bot persona text, read from `GATEWAY_PERSONA_FILE` (or `GATEWAY_PERSONA` env var).
    * Prepended to every Discord mention prompt before the Discord-mechanical guidance.
    * `null` when unset, empty, or whitespace-only — the mention loop degrades gracefully to
-   * mechanical guidance only (R4 fail-soft).
+   * mechanical guidance only.
    */
   readonly persona: string | null
   /**
@@ -540,7 +540,7 @@ export function loadGatewayConfig(): GatewayConfig {
 
   // Persona — optional multi-line markdown file (e.g. fro-bot-persona.md).
   // Uses readOptionalMultilineSecret because persona files contain embedded newlines.
-  // Absent/empty/whitespace → null (R4 fail-soft: the mention loop degrades gracefully).
+  // Absent/empty/whitespace → null: the mention loop degrades gracefully.
   // Fail-soft: any read error (permission-denied, directory, oversized, etc.) logs a warning
   // and resolves to null — a persona read failure must never crash gateway startup.
   let persona: string | null = null

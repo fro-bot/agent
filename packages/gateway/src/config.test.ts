@@ -438,7 +438,7 @@ function setRequiredEnv(): void {
 /**
  * Set the minimum operator web env vars for a valid config.
  * Call after setRequiredEnv() when testing operator web happy paths.
- * Includes CSRF secret and allowlist (required for Unit 3e production wiring).
+ * Includes CSRF secret and allowlist (required when operator web is enabled).
  */
 function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string} = {}): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = overrides.bindHost ?? '172.20.0.2'
@@ -446,7 +446,7 @@ function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; pub
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = overrides.publicOrigin ?? 'https://operator.example.com'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
-  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  // CSRF secret and allowlist are required when operator web is enabled.
   process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
   process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
@@ -2015,7 +2015,7 @@ function setOperatorEnv(origin: string): void {
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
-  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  // CSRF secret and allowlist are required when operator web is enabled.
   process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
   process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
@@ -2289,10 +2289,10 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
 })
 
 // ---------------------------------------------------------------------------
-// GATEWAY_OPERATOR_CSRF_SECRET and GATEWAY_OPERATOR_ALLOWLIST — Unit 3e gaps
+// GATEWAY_OPERATOR_CSRF_SECRET and GATEWAY_OPERATOR_ALLOWLIST
 // ---------------------------------------------------------------------------
 
-describe('loadGatewayConfig — CSRF secret and operator allowlist (Unit 3e production wiring)', () => {
+describe('loadGatewayConfig — CSRF secret and operator allowlist', () => {
   it('error path: operator web enabled but GATEWAY_OPERATOR_CSRF_SECRET missing → throws', () => {
     // #given — all operator web vars set but no CSRF secret
     setRequiredEnv()
