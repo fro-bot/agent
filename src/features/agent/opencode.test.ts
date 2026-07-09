@@ -9,11 +9,10 @@ import process from 'node:process'
 import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import * as setup from '../../services/setup/setup.js'
 import * as envUtils from '../../shared/env.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
-import {bootstrapOpenCodeServer, ensureOpenCodeAvailable, verifyOpenCodeAvailable} from './server.js'
+import {verifyOpenCodeAvailable} from './server.js'
 import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
 import {logServerEvent, processEventStream} from './streaming.js'
 
@@ -1251,104 +1250,6 @@ describe('executeOpenCode retry behavior', () => {
   })
 })
 
-describe('ensureOpenCodeAvailable', () => {
-  let mockLogger: Logger
-
-  beforeEach(() => {
-    mockLogger = createMockLogger()
-    vi.clearAllMocks()
-    delete process.env.OPENCODE_PATH
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-    delete process.env.OPENCODE_PATH
-  })
-
-  it('returns existing OpenCode when already available', async () => {
-    // #given
-    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
-      if (options?.listeners?.stdout != null) {
-        options.listeners.stdout(Buffer.from('opencode version 1.2.3\n'))
-      }
-      return 0
-    })
-    process.env.OPENCODE_PATH = '/existing/path'
-
-    // #when
-    const result = await ensureOpenCodeAvailable({
-      logger: mockLogger,
-      opencodeVersion: 'latest',
-      githubToken: 'ghs_test_token',
-      authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
-      enableOmo: false,
-      omoVersion: '3.7.4',
-      systematicVersion: '2.1.0',
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
-      opencodeConfig: null,
-      systematicConfig: null,
-      enableOmoSlim: false,
-      omoSlimVersion: '1.1.1',
-      omoSlimPreset: 'openai',
-    })
-
-    // #then
-    expect(result.didSetup).toBe(false)
-    expect(result.version).toBe('1.2.3')
-    expect(result.path).toBe('/existing/path')
-    expect(mockLogger.info).toHaveBeenCalledWith('OpenCode already available', expect.any(Object))
-  })
-
-  it('logs message when OpenCode not available and setup needed', async () => {
-    // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('Command not found'))
-    vi.spyOn(setup, 'runSetup').mockResolvedValue(null)
-
-    // #when
-    try {
-      await ensureOpenCodeAvailable({
-        logger: mockLogger,
-        opencodeVersion: 'latest',
-        githubToken: 'ghs_test_token',
-        authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
-        enableOmo: false,
-        omoVersion: '3.7.4',
-        systematicVersion: '2.1.0',
-        omoProviders: {
-          claude: 'no',
-          copilot: 'no',
-          gemini: 'no',
-          openai: 'no',
-          opencodeZen: 'no',
-          zaiCodingPlan: 'no',
-          kimiForCoding: 'no',
-        },
-        opencodeConfig: null,
-        systematicConfig: null,
-        enableOmoSlim: false,
-        omoSlimVersion: '1.1.1',
-        omoSlimPreset: 'openai',
-      })
-    } catch {
-      // Expected to fail since runSetup will fail in test environment
-    }
-
-    // #then
-    expect(mockLogger.info).toHaveBeenCalledWith(
-      'OpenCode not found, running auto-setup',
-      expect.objectContaining({requestedVersion: 'latest'}),
-    )
-  })
-})
-
 describe('LLM error detection', () => {
   let mockLogger: Logger
 
@@ -1708,119 +1609,6 @@ describe('logServerEvent', () => {
     expect(JSON.stringify(loggedMeta)).not.toContain('some sensitive text')
   })
 })
-
-describe('bootstrapOpenCodeServer', () => {
-  let mockLogger: Logger
-
-  beforeEach(() => {
-    mockLogger = createMockLogger()
-    vi.clearAllMocks()
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('returns ok with server handle on success', async () => {
-    // #given
-    const mockClient = createMockClient({
-      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
-    })
-    const mockServer = createMockServer()
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: mockClient,
-      server: mockServer,
-    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
-
-    const abortController = new AbortController()
-
-    // #when
-    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
-
-    // #then
-    expect(result.success).toBe(true)
-    const handle = (result as {success: true; data: OpenCodeServerHandle}).data
-    expect(handle.client).toBe(mockClient)
-    expect(handle.server.url).toBe('http://127.0.0.1:4096')
-    expect(typeof handle.shutdown).toBe('function')
-  })
-
-  it('passes signal to createOpencode', async () => {
-    // #given
-    const mockClient = createMockClient({
-      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
-    })
-    const mockServer = createMockServer()
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: mockClient,
-      server: mockServer,
-    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
-
-    const abortController = new AbortController()
-
-    // #when
-    await bootstrapOpenCodeServer(abortController.signal, mockLogger)
-
-    // #then
-    expect(createOpencode).toHaveBeenCalledWith({signal: abortController.signal})
-  })
-
-  it('returns err when createOpencode fails', async () => {
-    // #given
-    vi.mocked(createOpencode).mockRejectedValue(new Error('Connection refused'))
-
-    const abortController = new AbortController()
-
-    // #when
-    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
-
-    // #then
-    expect(result.success).toBe(false)
-    const error = (result as {success: false; error: Error}).error
-    expect(error.message).toContain('Server bootstrap failed')
-    expect(error.message).toContain('Connection refused')
-  })
-
-  it('logs warning on failure', async () => {
-    // #given
-    vi.mocked(createOpencode).mockRejectedValue(new Error('Connection refused'))
-
-    const abortController = new AbortController()
-
-    // #when
-    await bootstrapOpenCodeServer(abortController.signal, mockLogger)
-
-    // #then
-    expect(mockLogger.warning).toHaveBeenCalledWith(
-      'Failed to bootstrap OpenCode server',
-      expect.objectContaining({error: 'Connection refused'}),
-    )
-  })
-
-  it('shutdown calls server.close', async () => {
-    // #given
-    const mockClient = createMockClient({
-      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
-    })
-    const mockServer = createMockServer()
-    vi.mocked(createOpencode).mockResolvedValue({
-      client: mockClient,
-      server: mockServer,
-    } as unknown as Awaited<ReturnType<typeof createOpencode>>)
-
-    const abortController = new AbortController()
-
-    // #when
-    const result = await bootstrapOpenCodeServer(abortController.signal, mockLogger)
-
-    // #then
-    expect(result.success).toBe(true)
-    const handle = (result as {success: true; data: OpenCodeServerHandle}).data
-    handle.shutdown()
-    expect(mockServer.close).toHaveBeenCalled()
-  })
-})
-
 describe('executeOpenCode with serverHandle', () => {
   let mockLogger: Logger
 

@@ -6,7 +6,7 @@ import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {createLLMFetchError, isLlmFetchError, reassertSessionTitle} from '@fro-bot/runtime'
+import {createLLMFetchError, isLlmFetchError, reassertSessionTitle, withScrubbedEnv} from '@fro-bot/runtime'
 import {createOpencode} from '@opencode-ai/sdk'
 import {sleep} from '../../shared/async.js'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
@@ -47,7 +47,7 @@ export async function executeOpenCode(
     let client: Awaited<ReturnType<typeof createOpencode>>['client']
     let serverUrl: string | null = null
     if (serverHandle == null) {
-      const opencode = await createOpencode({signal: abortController.signal})
+      const opencode = await withScrubbedEnv(async () => createOpencode({signal: abortController.signal}), logger)
       client = opencode.client
       server = opencode.server
       serverUrl = opencode.server.url
