@@ -144,6 +144,8 @@ export interface ExecOptions {
   readonly env?: Record<string, string>
   readonly silent?: boolean
   readonly ignoreReturnCode?: boolean
+  /** Bytes written to the child's stdin (e.g. `@actions/exec`'s `options.input`). Never pass secrets via argv. */
+  readonly input?: Buffer
   readonly listeners?: {
     readonly stdout?: (data: Buffer) => void
     readonly stderr?: (data: Buffer) => void
