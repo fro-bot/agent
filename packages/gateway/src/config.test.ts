@@ -86,6 +86,16 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_CSRF_SECRET_FILE',
     'GATEWAY_OPERATOR_ALLOWLIST',
     'GATEWAY_OPERATOR_ALLOWLIST_FILE',
+    'GATEWAY_OPERATOR_PUSH_ENABLED',
+    'GATEWAY_OPERATOR_PUSH_VAPID_PUBLIC_KEY',
+    'GATEWAY_OPERATOR_PUSH_VAPID_PRIVATE_KEY',
+    'GATEWAY_OPERATOR_PUSH_VAPID_SUBJECT',
+    'GATEWAY_OPERATOR_PUSH_VAPID_KEY_VERSION',
+    'GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY',
+    'GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY',
+    'GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT',
+    'GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION',
+    'GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS',
   ]) {
     delete process.env[key]
   }
@@ -438,7 +448,7 @@ function setRequiredEnv(): void {
 /**
  * Set the minimum operator web env vars for a valid config.
  * Call after setRequiredEnv() when testing operator web happy paths.
- * Includes CSRF secret and allowlist (required for Unit 3e production wiring).
+ * Includes CSRF secret and allowlist (required when operator web is enabled).
  */
 function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; publicOrigin?: string} = {}): void {
   process.env.GATEWAY_OPERATOR_BIND_HOST = overrides.bindHost ?? '172.20.0.2'
@@ -446,7 +456,7 @@ function setOperatorWebEnv(overrides: {bindHost?: string; bindPort?: string; pub
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = overrides.publicOrigin ?? 'https://operator.example.com'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
-  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  // CSRF secret and allowlist are required when operator web is enabled.
   process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
   process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
@@ -2015,7 +2025,7 @@ function setOperatorEnv(origin: string): void {
   process.env.GATEWAY_OPERATOR_PUBLIC_ORIGIN = origin
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_ID = 'test-oauth-client-id'
   process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'test-oauth-client-secret'
-  // Unit 3e: CSRF secret and allowlist are required when operator web is enabled.
+  // CSRF secret and allowlist are required when operator web is enabled.
   process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
   process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
 }
@@ -2289,10 +2299,10 @@ describe('loadGatewayConfig — operator web OAuth credentials', () => {
 })
 
 // ---------------------------------------------------------------------------
-// GATEWAY_OPERATOR_CSRF_SECRET and GATEWAY_OPERATOR_ALLOWLIST — Unit 3e gaps
+// GATEWAY_OPERATOR_CSRF_SECRET and GATEWAY_OPERATOR_ALLOWLIST
 // ---------------------------------------------------------------------------
 
-describe('loadGatewayConfig — CSRF secret and operator allowlist (Unit 3e production wiring)', () => {
+describe('loadGatewayConfig — CSRF secret and operator allowlist', () => {
   it('error path: operator web enabled but GATEWAY_OPERATOR_CSRF_SECRET missing → throws', () => {
     // #given — all operator web vars set but no CSRF secret
     setRequiredEnv()
@@ -2666,5 +2676,289 @@ describe('loadGatewayConfig — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS', () => {
     expect(inactivityWarns).toHaveLength(0)
 
     warnSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// operatorPush config block
+// ---------------------------------------------------------------------------
+//
+// Fixture note: FAKE_VAPID_PUBLIC_KEY / FAKE_VAPID_PRIVATE_KEY are a
+// throwaway P-256 keypair generated locally for this test suite only. They
+// are not tied to any deployed environment and must never be reused as a
+// real secret.
+
+const FAKE_VAPID_PUBLIC_KEY = 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc'
+const FAKE_VAPID_PRIVATE_KEY = 'gQIJ6WJacBGGIKNR3-7ev4J95uh8hqQF728243fV_gg'
+const FAKE_VAPID_SUBJECT = 'mailto:operator-push-test@example.com'
+const FAKE_VAPID_KEY_VERSION = '1'
+const FAKE_PREVIOUS_VAPID_PUBLIC_KEY =
+  'BOg_CCUlv3OFt_GK96H4ls8SgYBeEjQZXZp9dY4_Hu818wJdUNZUxD3mp-14xy98oy5P7AVdH4Ki2l2PddAirJc'
+
+function setOperatorPushEnv(overrides: {keyVersion?: string; subject?: string} = {}): void {
+  process.env.GATEWAY_OPERATOR_PUSH_ENABLED = 'true'
+  process.env.GATEWAY_OPERATOR_PUSH_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+  process.env.GATEWAY_OPERATOR_PUSH_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+  process.env.GATEWAY_OPERATOR_PUSH_VAPID_SUBJECT = overrides.subject ?? FAKE_VAPID_SUBJECT
+  process.env.GATEWAY_OPERATOR_PUSH_VAPID_KEY_VERSION = overrides.keyVersion ?? FAKE_VAPID_KEY_VERSION
+}
+
+describe('operatorPush config', () => {
+  it('happy path: disabled push config loads without VAPID material (default)', () => {
+    // #given no push env vars set
+    setRequiredEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — no operatorPush block is present
+    expect(config.operatorPush).toBeUndefined()
+  })
+
+  it('happy path: disabled push config loads even if stray VAPID material is present', () => {
+    // #given GATEWAY_OPERATOR_PUSH_ENABLED is unset/false; VAPID material is ignored
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_VAPID_PUBLIC_KEY = 'garbage-not-validated'
+
+    // #when / #then — disabled mode never validates VAPID material
+    expect(() => loadGatewayConfig()).not.toThrow()
+    expect(loadGatewayConfig().operatorPush).toBeUndefined()
+  })
+
+  it('happy path: enabled push config accepts a valid (fake) VAPID keypair, subject, and key version', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorPush).toBeDefined()
+    expect(config.operatorPush?.vapidPublicKeyInfo).toStrictEqual({
+      publicKey: FAKE_VAPID_PUBLIC_KEY,
+      keyVersion: FAKE_VAPID_KEY_VERSION,
+    })
+    expect(config.operatorPush?.current.publicKey).toBe(FAKE_VAPID_PUBLIC_KEY)
+    expect(config.operatorPush?.dedupeWindowMs).toBe(300_000)
+  })
+
+  it('happy path: GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS overrides the default', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '60000'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorPush?.dedupeWindowMs).toBe(60_000)
+  })
+
+  it('happy path: accepts a complete, valid previous VAPID keypair for rollout', () => {
+    // #given — previous keypair uses a different (but still valid) key version
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: '2'})
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_PREVIOUS_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.operatorPush?.previous?.keyVersion).toBe('1')
+    expect(config.operatorPush?.current.keyVersion).toBe('2')
+  })
+
+  it('error path: enabled config rejects missing private key', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    delete process.env.GATEWAY_OPERATOR_PUSH_VAPID_PRIVATE_KEY
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_PUSH_VAPID_PRIVATE_KEY')
+  })
+
+  it('error path: enabled config rejects a malformed private key', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_VAPID_PRIVATE_KEY = 'not-valid-base64url!!!'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid VAPID private key/)
+  })
+
+  it('error path: enabled config rejects a blank subject', () => {
+    // #given — readSecret rejects a whitespace-only value as "missing"
+    setRequiredEnv()
+    setOperatorPushEnv()
+    delete process.env.GATEWAY_OPERATOR_PUSH_VAPID_SUBJECT
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_PUSH_VAPID_SUBJECT')
+  })
+
+  it('error path: enabled config rejects an invalid key version', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: 'not-a-version'})
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid VAPID key version/)
+  })
+
+  it('error path: enabled config rejects an invalid GATEWAY_OPERATOR_PUSH_ENABLED value', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_ENABLED = 'yes'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_ENABLED value/)
+  })
+
+  it('error path: enabled config rejects a partial previous VAPID keypair', () => {
+    // #given only one of the four previous-key vars is set
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Partial previous VAPID key config/)
+  })
+
+  it('error path: enabled config rejects an invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '-5'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS with a trailing exponent suffix', () => {
+    // #given — Number.parseInt('1e5', 10) silently parses to 1; the pre-guard must reject it
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '1e5'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS with a trailing non-numeric suffix', () => {
+    // #given — Number.parseInt('100abc', 10) silently parses to 100; the pre-guard must reject it
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '100abc'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS of "0" (boundary)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS = '0'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/Invalid GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS/)
+  })
+
+  it('error path: rejects a previous VAPID key version equal to the current key version', () => {
+    // #given — previous and current share the same key version, making key-selection ambiguous
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: '1'})
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/previous key version must differ from the current key version/)
+  })
+
+  it('error path: rejects a previous public key identical to the current public key', () => {
+    // #given — previous and current key versions differ, but the public key material is the same
+    setRequiredEnv()
+    setOperatorPushEnv({keyVersion: '2'})
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY = FAKE_VAPID_PUBLIC_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY = FAKE_VAPID_PRIVATE_KEY
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT = FAKE_VAPID_SUBJECT
+    process.env.GATEWAY_OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION = '1'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow(/previous key must differ from the current key/)
+  })
+
+  it('happy path: the VAPID private key is directly readable on the loaded config', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then — direct property access still exposes the private key (JSON.stringify hides it,
+    // but the value itself must remain readable for the routes that need to sign with it)
+    expect(config.operatorPush?.current.privateKey).toBe(FAKE_VAPID_PRIVATE_KEY)
+  })
+
+  it('happy path: explicit GATEWAY_OPERATOR_PUSH_ENABLED=false ignores present VAPID material', () => {
+    // #given — VAPID material is fully present, but the flag explicitly disables push
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_ENABLED = 'false'
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).not.toThrow()
+    expect(loadGatewayConfig().operatorPush).toBeUndefined()
+  })
+
+  it('never serializes the VAPID private key into the config object (JSON.stringify)', () => {
+    // #given
+    setRequiredEnv()
+    setOperatorPushEnv()
+
+    // #when
+    const config = loadGatewayConfig()
+    const serialized = JSON.stringify(config)
+
+    // #then
+    expect(serialized).not.toContain(FAKE_VAPID_PRIVATE_KEY)
+  })
+
+  it('never embeds the VAPID private key in a validation error on bad enabled-config', () => {
+    // #given a config that will fail validation on the subject field
+    setRequiredEnv()
+    setOperatorPushEnv()
+    process.env.GATEWAY_OPERATOR_PUSH_VAPID_KEY_VERSION = 'invalid-version'
+
+    // #when
+    let thrown: Error | undefined
+    try {
+      loadGatewayConfig()
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    // #then
+    expect(thrown).toBeDefined()
+    expect(thrown?.message).not.toContain(FAKE_VAPID_PRIVATE_KEY)
+  })
+
+  it('regression: OPERATOR_CONTRACT_VERSION is unchanged by adding push config/DTOs', async () => {
+    // #given — push DTOs are added to the operator-contract barrel without bumping the
+    // version constant (the dashboard SSE drift gate matches this value exactly).
+    const {OPERATOR_CONTRACT_VERSION} = await import('./operator-contract/index.js')
+
+    // #when / #then
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.6.0')
   })
 })
