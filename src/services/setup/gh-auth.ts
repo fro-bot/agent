@@ -47,8 +47,15 @@ export async function configureGhAuth(
       const ghConfigDir = await mkdtemp(join(baseTmp, 'gh-config-'))
       await chmod(ghConfigDir, 0o700)
 
+      // `gh auth login --with-token` refuses to persist credentials when GH_TOKEN/GITHUB_TOKEN
+      // is present in its environment (it uses the env token instead of writing hosts.yml). Strip
+      // both from THIS exec's env only — the harness process keeps process.env.GH_TOKEN for its
+      // own gh usage; we only want the child's persisted hosts.yml here.
+      const loginEnv: Record<string, string> = {...process.env, GH_CONFIG_DIR: ghConfigDir}
+      delete loginEnv.GH_TOKEN
+      delete loginEnv.GITHUB_TOKEN
       const loginResult = await execAdapter.getExecOutput('gh', ['auth', 'login', '--with-token'], {
-        env: {...process.env, GH_CONFIG_DIR: ghConfigDir},
+        env: loginEnv,
         input: Buffer.from(token, 'utf8'),
         silent: true,
         ignoreReturnCode: true,

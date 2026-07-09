@@ -161,6 +161,30 @@ describe('gh-auth', () => {
       }
     })
 
+    it('strips GH_TOKEN and GITHUB_TOKEN from the gh auth login exec env, keeping GH_CONFIG_DIR', async () => {
+      // #given
+      process.env.GH_TOKEN = 'sentinel-gh-token'
+      process.env.GITHUB_TOKEN = 'sentinel-github-token'
+      const mockOctokit = createMockOctokit()
+      const getExecOutput = vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
+      const mockExec = createMockExecAdapter({getExecOutput})
+
+      // #when
+      await configureGhAuth(mockOctokit, 'app-token-123', 'default-token', mockLogger, mockExec)
+
+      // #then
+      const call = getExecOutput.mock.calls[0] as unknown[]
+      const options = call[2] as {env?: Record<string, string>}
+      expect(options.env?.GH_TOKEN).toBeUndefined()
+      expect(options.env?.GITHUB_TOKEN).toBeUndefined()
+      expect(options.env?.GH_CONFIG_DIR).toBeTruthy()
+      // harness process.env.GH_TOKEN must remain intact (line 28 behavior unchanged)
+      expect(process.env.GH_TOKEN).toBe('app-token-123')
+      if (process.env.GH_CONFIG_DIR != null) {
+        await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
+      }
+    })
+
     it('still sets process.env.GH_TOKEN unchanged', async () => {
       // #given
       const mockOctokit = createMockOctokit()
