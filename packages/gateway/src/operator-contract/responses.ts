@@ -73,3 +73,69 @@ export interface OperatorCancelResponse {
   readonly runId: string
   readonly phase: TerminalPhase
 }
+
+// ---------------------------------------------------------------------------
+// Operator push contract
+// ---------------------------------------------------------------------------
+//
+// These DTOs are defined without enabling any route or dispatch behavior.
+//
+// Subscription metadata is a safe-fields-only surface: it NEVER carries the
+// push endpoint URL, `p256dh`, or `auth` key material — only an opaque
+// endpoint hash, timestamps, key version, active state, and a coarse
+// inactive reason.
+
+/**
+ * Canonical response shape for GET /operator/push/vapid-key.
+ *
+ * Safe to expose to an authenticated operator session: `publicKey` is the
+ * VAPID public key (never the private key), `keyVersion` identifies the
+ * current signing key for client resubscribe decisions.
+ */
+export interface OperatorPushVapidKeyResponse {
+  readonly publicKey: string
+  readonly keyVersion: string
+}
+
+/** Coarse, non-oracle reasons a subscription record became inactive. */
+export type OperatorPushInactiveReason = 'unsubscribed' | 'dead' | 'revoked' | 'session-revoked'
+
+/**
+ * Safe subscription metadata — the only shape returned by list/export
+ * surfaces. Endpoint, `p256dh`, and `auth` are write-only secret fields and
+ * are never present here.
+ */
+export interface OperatorPushSubscriptionMetadata {
+  /** Opaque hash of the push endpoint URL — never the endpoint itself. */
+  readonly endpointHash: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly keyVersion: string
+  readonly active: boolean
+  readonly inactiveReason?: OperatorPushInactiveReason
+}
+
+/**
+ * Request body shape for POST /operator/push/subscriptions.
+ *
+ * Mirrors the W3C `PushSubscription.toJSON()` shape produced by the
+ * browser's Push API. `endpoint` and `keys` are accepted at this boundary
+ * only — they are never echoed back in a response.
+ */
+export interface OperatorPushSubscribeRequest {
+  readonly endpoint: string
+  readonly keys: {
+    readonly p256dh: string
+    readonly auth: string
+  }
+}
+
+/** Request body shape for POST /operator/push/subscriptions/unsubscribe. */
+export interface OperatorPushUnsubscribeRequest {
+  readonly endpoint: string
+}
+
+/** Canonical success response shape for GET /operator/push/subscriptions. */
+export interface OperatorPushSubscriptionListResponse {
+  readonly subscriptions: readonly OperatorPushSubscriptionMetadata[]
+}

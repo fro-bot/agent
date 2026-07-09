@@ -1,5 +1,6 @@
 import type {AwsCredentials, ObjectStoreConfig} from './runtime-effect.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {VapidKeyMaterial, VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 
 import {Buffer} from 'node:buffer'
 import {closeSync, constants, fstatSync, openSync, readFileSync} from 'node:fs'
@@ -8,6 +9,19 @@ import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
 import {parseAllowlistText} from './web/auth/allowlist.js'
+import {
+  OPERATOR_PUSH_DEDUPE_WINDOW_MS,
+  OPERATOR_PUSH_ENABLED,
+  OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION,
+  OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY,
+  OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY,
+  OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT,
+  OPERATOR_PUSH_VAPID_KEY_VERSION,
+  OPERATOR_PUSH_VAPID_PRIVATE_KEY,
+  OPERATOR_PUSH_VAPID_PUBLIC_KEY,
+  OPERATOR_PUSH_VAPID_SUBJECT,
+} from './web/operator-push/config-keys.js'
+import {assertValidVapidKeyMaterial} from './web/operator-push/vapid.js'
 
 const DEFAULT_S3_PREFIX = 'fro-bot-state'
 const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
@@ -21,6 +35,8 @@ const DEFAULT_APPROVAL_MODE = 'approval-required' as const
 // Keep the env var so operators get a clear error instead of silent fallback if they set it.
 const VALID_APPROVAL_MODES = ['approval-required'] as const
 const DEFERRED_APPROVAL_MODES = ['autonomous-low-risk'] as const
+
+const DEFAULT_OPERATOR_PUSH_DEDUPE_WINDOW_MS = 300_000
 
 const DEFAULT_STATUS_MODE = 'live-status' as const
 const VALID_STATUS_MODES = ['live-status', 'typing-only'] as const
@@ -174,6 +190,60 @@ export interface GatewayConfig {
      */
     readonly allowlist: OperatorAllowlist
   }
+  /**
+   * Operator Web Push configuration. Present only when
+   * `GATEWAY_OPERATOR_PUSH_ENABLED` is `true`.
+   *
+   * When absent (the default), push is disabled: no VAPID material is
+   * required or validated, and no push routes or dispatch are exposed.
+   *
+   * When present, `current` is fully validated VAPID key material
+   * (public key, private key, subject, key version) and `previous` is an
+   * optional second keypair accepted during a VAPID rotation rollout
+   * window. `vapidPublicKeyInfo` is the client-safe subset
+   * (`{publicKey, keyVersion}`) of `current` — route-facing code should
+   * read `vapidPublicKeyInfo`, not `current`, so the private key never
+   * needs to flow past config-loading code.
+   *
+   * The private key fields (`current.privateKey`, `previous.privateKey`)
+   * must never be logged, serialized into a response, or embedded in a
+   * thrown error.
+   */
+  readonly operatorPush?: {
+    readonly current: VapidKeyMaterial
+    readonly previous?: VapidKeyMaterial
+    readonly vapidPublicKeyInfo: VapidPublicKeyInfo
+    readonly dedupeWindowMs: number
+  }
+}
+
+/**
+ * Build a VapidKeyMaterial object with `privateKey` defined as a
+ * non-enumerable property.
+ *
+ * `JSON.stringify` and `Object.keys`/spread-based logging only
+ * see enumerable properties, so this prevents the private key from leaking
+ * into a serialized config blob, a debug dump, or an accidental `console.log`
+ * of the whole config object — while the field remains readable via direct
+ * property access (`material.privateKey`) for code that legitimately needs it
+ * (VAPID signing).
+ */
+function buildVapidKeyMaterial(
+  publicKey: string,
+  privateKey: string,
+  subject: string,
+  keyVersion: string,
+): VapidKeyMaterial {
+  const material = {publicKey, subject, keyVersion} as {
+    -readonly [K in keyof VapidKeyMaterial]: VapidKeyMaterial[K]
+  }
+  Object.defineProperty(material, 'privateKey', {
+    value: privateKey,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  })
+  return material
 }
 
 const MAX_SECRET_BYTES = 4096
@@ -862,6 +932,89 @@ export function loadGatewayConfig(): GatewayConfig {
     }
   }
 
+  // Operator push — opt-in via GATEWAY_OPERATOR_PUSH_ENABLED. Disabled mode (the default)
+  // ignores any VAPID material present and exposes no operatorPush config block. Enabled
+  // mode requires complete, valid VAPID material and fails closed on any missing/malformed
+  // value — mirroring the operator-web fail-closed posture above.
+  //
+  // The private key is read via readSecret/readOptionalSecret only. It is validated by
+  // assertValidVapidKeyMaterial, which throws fixed reason strings that never embed the
+  // private key value. The private key is stored only in operatorPush.current.privateKey /
+  // operatorPush.previous.privateKey — route-facing code must read vapidPublicKeyInfo instead.
+  const rawOperatorPushEnabled = readOptionalSecret(OPERATOR_PUSH_ENABLED)
+  const operatorPushEnabled = rawOperatorPushEnabled === 'true'
+  if (rawOperatorPushEnabled !== null && rawOperatorPushEnabled !== 'true' && rawOperatorPushEnabled !== 'false') {
+    throw new Error(`Invalid ${OPERATOR_PUSH_ENABLED} value: "${rawOperatorPushEnabled}" (valid values: true, false)`)
+  }
+
+  let operatorPush: GatewayConfig['operatorPush']
+
+  if (operatorPushEnabled) {
+    const pushPublicKey = readSecret(OPERATOR_PUSH_VAPID_PUBLIC_KEY)
+    const pushPrivateKey = readSecret(OPERATOR_PUSH_VAPID_PRIVATE_KEY)
+    const pushSubject = readSecret(OPERATOR_PUSH_VAPID_SUBJECT)
+    const pushKeyVersion = readSecret(OPERATOR_PUSH_VAPID_KEY_VERSION)
+
+    const current: VapidKeyMaterial = buildVapidKeyMaterial(pushPublicKey, pushPrivateKey, pushSubject, pushKeyVersion)
+    const vapidPublicKeyInfo = assertValidVapidKeyMaterial(current)
+
+    // Optional previous keypair — opt-in as a group: all four previous-key vars must be
+    // set together, or none, mirroring the AWS-credential and announce pair-validation
+    // pattern above.
+    const previousPublicKey = readOptionalSecret(OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY)
+    const previousPrivateKey = readOptionalSecret(OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY)
+    const previousSubject = readOptionalSecret(OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT)
+    const previousKeyVersion = readOptionalSecret(OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION)
+
+    const previousVarsPresent = [previousPublicKey, previousPrivateKey, previousSubject, previousKeyVersion].filter(
+      v => v !== null,
+    ).length
+
+    if (previousVarsPresent > 0 && previousVarsPresent < 4) {
+      const missing: string[] = []
+      if (previousPublicKey === null) missing.push(OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY)
+      if (previousPrivateKey === null) missing.push(OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY)
+      if (previousSubject === null) missing.push(OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT)
+      if (previousKeyVersion === null) missing.push(OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION)
+      throw new Error(
+        `Partial previous VAPID key config: all four of ${OPERATOR_PUSH_PREVIOUS_VAPID_PUBLIC_KEY}, ${OPERATOR_PUSH_PREVIOUS_VAPID_PRIVATE_KEY}, ${OPERATOR_PUSH_PREVIOUS_VAPID_SUBJECT}, and ${OPERATOR_PUSH_PREVIOUS_VAPID_KEY_VERSION} must be set together to accept a previous VAPID key during rollout, or none to omit it. Missing: ${missing.join(', ')}.`,
+      )
+    }
+
+    let previous: VapidKeyMaterial | undefined
+    if (previousVarsPresent === 4) {
+      if (
+        previousPublicKey === null ||
+        previousPrivateKey === null ||
+        previousSubject === null ||
+        previousKeyVersion === null
+      ) {
+        throw new Error('Internal: previousVarsPresent === 4 but a var is null — this is a bug')
+      }
+      previous = buildVapidKeyMaterial(previousPublicKey, previousPrivateKey, previousSubject, previousKeyVersion)
+      assertValidVapidKeyMaterial(previous)
+    }
+
+    const rawDedupeWindowMs = readOptionalSecret(OPERATOR_PUSH_DEDUPE_WINDOW_MS)
+    let dedupeWindowMs = DEFAULT_OPERATOR_PUSH_DEDUPE_WINDOW_MS
+    if (rawDedupeWindowMs !== null) {
+      const parsed = Number.parseInt(rawDedupeWindowMs, 10)
+      if (Number.isFinite(parsed) === false || Number.isInteger(parsed) === false || parsed < 1) {
+        throw new Error(
+          `Invalid ${OPERATOR_PUSH_DEDUPE_WINDOW_MS} value: "${rawDedupeWindowMs}" (must be a positive integer in milliseconds)`,
+        )
+      }
+      dedupeWindowMs = parsed
+    }
+
+    operatorPush = {
+      current,
+      ...(previous === undefined ? {} : {previous}),
+      vapidPublicKeyInfo,
+      dedupeWindowMs,
+    }
+  }
+
   return {
     discordToken,
     discordApplicationId,
@@ -885,5 +1038,6 @@ export function loadGatewayConfig(): GatewayConfig {
     runInactivityTimeoutMs,
     ...(announce === undefined ? {} : {announce}),
     ...(operatorWeb === undefined ? {} : {operatorWeb}),
+    ...(operatorPush === undefined ? {} : {operatorPush}),
   }
 }
