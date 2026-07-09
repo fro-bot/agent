@@ -688,6 +688,8 @@ export function createOperatorPushSubscriptionStore(
       return err(cas.error)
     }
 
+    // Scans the physical object set directly — deliberately NOT tombstone-filtered
+    // like listAllRecords, since a session revoke acts on whatever object currently exists.
     const keys = await listAllKeys()
     if (keys.success === false) {
       return err(keys.error)
@@ -790,6 +792,8 @@ export function createOperatorPushSubscriptionStore(
       return err(cas.error)
     }
 
+    // Scans the physical object set directly — deliberately NOT tombstone-filtered
+    // like listAllRecords, since a privacy delete must act on the object regardless of tombstone state.
     const keys = await listAllKeys()
     if (keys.success === false) {
       return err(keys.error)
@@ -852,12 +856,25 @@ export function createOperatorPushSubscriptionStore(
         'operator push subscription store: deleteForOperator lost the physical-delete CAS race — secrets remain on disk pending a later prune or transfer',
       )
 
-      // Step 4 — rollback the tombstone if the record no longer belongs to
-      // this operator, so we don't shadow a legitimately transferred record.
+      // Step 4 — invariant: a tombstone must exist iff the endpoint has no
+      // active record for any operator. The physical delete above lost its
+      // race, meaning the record was mutated between the read and the
+      // delete — by a transfer to a different operator, OR by the SAME
+      // operator concurrently re-subscribing (refresh path). Either way, if
+      // the record is now active, the tombstone we just wrote would wrongly
+      // shadow a legitimately-active record until the next prune or
+      // subscribe self-heals it — so roll it back regardless of who owns
+      // it. Only leave the tombstone in place when the re-read shows the
+      // record inactive or absent, which is the correct excluded state.
+      // A crash between this re-read and the rollback delete leaves a
+      // transient shadow over an active record — the same window that
+      // already exists between steps 2 and 3, self-healed by the next
+      // subscribe's tombstone-clear or by pruneInactive; no worse than the
+      // pre-existing ordering.
       const reread = await cas.data.getObject(key)
       if (reread.success === true) {
         const reparsed = parseSubscriptionRecord(reread.data.data)
-        if (reparsed.success === true && reparsed.data.operatorId !== args.operatorId) {
+        if (reparsed.success === true && reparsed.data.active === true) {
           // Re-fetch the tombstone's current etag rather than trusting the
           // step-2 write result — a concurrent prune could have raced it too.
           const currentTombstone = await cas.data.getObject(tombstoneKey)
@@ -868,7 +885,7 @@ export function createOperatorPushSubscriptionStore(
             if (tombstoneRollback.success === false && isNotFound(tombstoneRollback.error) === false) {
               logger.warn(
                 {key, tombstoneKey, error: tombstoneRollback.error.message},
-                'operator push subscription store: failed to roll back tombstone after a lost delete race against a transferred record',
+                'operator push subscription store: failed to roll back tombstone after a lost delete race against an active record',
               )
             }
           }
@@ -975,6 +992,8 @@ export function createOperatorPushSubscriptionStore(
     const now = clock()
 
     // --- prune inactive subscription records ---
+    // Scans the physical object set directly — deliberately NOT tombstone-filtered
+    // like listAllRecords, since pruning must inspect the object's own lifecycle state.
     const keys = await listAllKeys()
     if (keys.success === false) {
       return err(keys.error)

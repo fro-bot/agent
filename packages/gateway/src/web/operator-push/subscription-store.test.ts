@@ -150,6 +150,34 @@ function withAlwaysFailingConditionalDeleteFor(
   }
 }
 
+/**
+ * Adapter whose conditionalDelete PreconditionFails exactly once for a
+ * matching key, running `onIntercept` first — used to inject a concurrent
+ * mutation (e.g. a same-owner resubscribe or a competing deactivation)
+ * landing between the delete's read and its physical-delete attempt. Every
+ * later call delegates to the real adapter normally.
+ */
+function withOneShotConditionalDeleteFailure(
+  adapter: ObjectStoreAdapter,
+  matches: (key: string) => boolean,
+  onIntercept: () => void,
+): ObjectStoreAdapter {
+  let fired = false
+  const conditionalDelete = adapter.conditionalDelete
+  if (conditionalDelete === undefined) throw new Error('unreachable')
+  return {
+    ...adapter,
+    conditionalDelete: async (key, options) => {
+      if (fired === false && matches(key)) {
+        fired = true
+        onIntercept()
+        return err(new Error('PreconditionFailed: forced one-shot conflict'))
+      }
+      return conditionalDelete(key, options)
+    },
+  }
+}
+
 /** Adapter that returns a structured ObjectStoreOperationError (httpStatusCode-based) instead of a plain Error. */
 function createStructuredErrorAdapter(): ObjectStoreAdapter {
   const objects = new Map<string, {data: string; etag: string}>()
@@ -1063,8 +1091,11 @@ describe('createOperatorPushSubscriptionStore — deleteForOperator gaps', () =>
     // #when privacy-deleting while the physical delete is forced to conflict
     const result = await store.deleteForOperator({operatorId: 'operator-a'})
 
-    // #then the tombstone still excludes the record from reads, but it is NOT
-    // counted as deleted, and the secrets remain on disk pending a later prune
+    // #then the physical delete is not counted as deleted, but because the
+    // record is still active on disk (untouched by the forced conflict), the
+    // tombstone-exists-iff-no-active-record invariant rolls the tombstone
+    // back — the still-active record remains visible, and secrets remain on
+    // disk pending a later successful delete or prune.
     expect(result.success).toBe(true)
     if (result.success === false) throw new Error('unreachable')
     expect(result.data.deleted).toBe(0)
@@ -1073,11 +1104,161 @@ describe('createOperatorPushSubscriptionStore — deleteForOperator gaps', () =>
 
     const active = await store.getActiveRecordsForOperator({operatorId: 'operator-a'})
     if (active.success === false) throw new Error('unreachable')
-    expect(active.data).toHaveLength(0) // tombstone still excludes it from reads
+    expect(active.data).toHaveLength(1) // tombstone rolled back — still-active record stays visible
 
     const subscriptionKey = Array.from(backing.keys()).find(k => k.includes('subscriptions/by-endpoint'))
     if (subscriptionKey === undefined) throw new Error('unreachable')
     expect(backing.get(subscriptionKey)?.data).toContain('p256dh-still-on-disk') // secrets acknowledged as still on disk
+  })
+
+  it('rolls back the tombstone when a same-owner resubscribe races the physical delete (still active, still owned)', async () => {
+    // #given an active subscription, plus a one-shot conditionalDelete
+    // failure that, when it fires, simulates a concurrent same-owner
+    // resubscribe landing between the delete's read and its physical
+    // delete attempt — the on-disk record stays active and owned by the
+    // same operator, just at a new etag.
+    const backing = new Map<string, {data: string; etag: string}>()
+    const baseAdapter = createCasFakeAdapter(backing)
+    const endpoint = 'https://push.example.com/ep-resubscribe-race'
+    const seedStore = createOperatorPushSubscriptionStore({adapter: baseAdapter, logger: testLogger})
+    await seedStore.subscribe({operatorId: 'operator-a', endpoint, p256dh: 'p1', auth: 'a1', keyVersion: '1'})
+    const subscriptionKey = Array.from(backing.keys()).find(k => k.includes('subscriptions/by-endpoint'))
+    if (subscriptionKey === undefined) throw new Error('unreachable')
+
+    const raceAdapter = withOneShotConditionalDeleteFailure(
+      baseAdapter,
+      key => key === subscriptionKey,
+      () => {
+        // Simulate the concurrent same-owner resubscribe: refresh the
+        // record's etag and keys, keeping it active and owned by operator-a.
+        const current = backing.get(subscriptionKey)
+        if (current === undefined) throw new Error('unreachable')
+        const parsed: {[k: string]: unknown} = JSON.parse(current.data) as {[k: string]: unknown}
+        backing.set(subscriptionKey, {
+          data: JSON.stringify({...parsed, p256dh: 'refreshed-p256dh', auth: 'refreshed-auth'}),
+          etag: 'etag-resubscribed-during-race',
+        })
+      },
+    )
+    const warn = vi.fn()
+    const store = createOperatorPushSubscriptionStore({adapter: raceAdapter, logger: {debug: () => {}, warn}})
+
+    // #when deleteForOperator loses the physical-delete CAS race to that resubscribe
+    const result = await store.deleteForOperator({operatorId: 'operator-a'})
+
+    // #then the delete is not counted, and — because the record is still
+    // active and still owned by operator-a — the tombstone is rolled back,
+    // so the record is NOT shadowed from active reads
+    expect(result.success).toBe(true)
+    if (result.success === false) throw new Error('unreachable')
+    expect(result.data.deleted).toBe(0)
+    expect(result.data.skipped).toBe(1)
+
+    const active = await store.getActiveRecordsForOperator({operatorId: 'operator-a'})
+    if (active.success === false) throw new Error('unreachable')
+    expect(active.data).toHaveLength(1)
+    expect(active.data[0]?.p256dh).toBe('refreshed-p256dh')
+
+    const listed = await store.listMetadataForOperator({operatorId: 'operator-a'})
+    if (listed.success === false) throw new Error('unreachable')
+    expect(listed.data).toHaveLength(1)
+    expect(listed.data[0]?.active).toBe(true)
+  })
+})
+
+describe('createOperatorPushSubscriptionStore — prune reclaims a record left behind by a skipped delete', () => {
+  it('eventually removes a stale object left inactive by a lost physical-delete race', async () => {
+    // #given an active subscription, deactivated instead of deleted by the
+    // time the physical delete is attempted (simulating a lost race against
+    // a concurrent unsubscribe rather than a resubscribe) — the tombstone
+    // invariant then correctly leaves the tombstone in place, since the
+    // record is inactive, and the stale inactive object is left on disk.
+    let now = 1_000_000
+    const backing = new Map<string, {data: string; etag: string}>()
+    const baseAdapter = createCasFakeAdapter(backing)
+    const endpoint = 'https://push.example.com/ep-prune-reclaim'
+    const seedStore = createOperatorPushSubscriptionStore({adapter: baseAdapter, logger: testLogger, clock: () => now})
+    await seedStore.subscribe({operatorId: 'operator-a', endpoint, p256dh: 'p1', auth: 'a1', keyVersion: '1'})
+    const subscriptionKey = Array.from(backing.keys()).find(k => k.includes('subscriptions/by-endpoint'))
+    if (subscriptionKey === undefined) throw new Error('unreachable')
+
+    const raceAdapter = withOneShotConditionalDeleteFailure(
+      baseAdapter,
+      key => key === subscriptionKey,
+      () => {
+        // Simulate a concurrent unsubscribe landing first: the record is
+        // deactivated (not removed) with a fresh etag.
+        const current = backing.get(subscriptionKey)
+        if (current === undefined) throw new Error('unreachable')
+        const parsed: {[k: string]: unknown} = JSON.parse(current.data) as {[k: string]: unknown}
+        backing.set(subscriptionKey, {
+          data: JSON.stringify({...parsed, active: false, inactiveReason: 'unsubscribed', deactivatedAt: now}),
+          etag: 'etag-deactivated-during-race',
+        })
+      },
+    )
+    const store = createOperatorPushSubscriptionStore({adapter: raceAdapter, logger: testLogger, clock: () => now})
+
+    // #when deleteForOperator loses the physical-delete race against that deactivation
+    const deleteResult = await store.deleteForOperator({operatorId: 'operator-a'})
+    if (deleteResult.success === false) throw new Error('unreachable')
+    expect(deleteResult.data.skipped).toBe(1)
+    // The record is inactive on re-read, so the tombstone stays (correct exclusion).
+    expect(backing.has(subscriptionKey)).toBe(true)
+
+    // #when the retention window elapses and pruneInactive runs
+    now += 40 * 24 * 60 * 60 * 1000 // past the default 30-day inactive-record retention
+    const pruned = await store.pruneInactive()
+
+    // #then the stale inactive object is eventually reclaimed
+    expect(pruned.success).toBe(true)
+    if (pruned.success === false) throw new Error('unreachable')
+    expect(pruned.data.records).toBe(1)
+    expect(backing.has(subscriptionKey)).toBe(false)
+  })
+})
+
+describe('createOperatorPushSubscriptionStore — transfer clears a prior tombstone', () => {
+  it('a different operator subscribing to a tombstoned-but-present endpoint clears the tombstone and becomes the active owner', async () => {
+    // #given an endpoint with BOTH a tombstone and a (skipped-delete) subscription
+    // object present — the tombstone-exists-but-object-present edge case.
+    const backing = new Map<string, {data: string; etag: string}>()
+    const store = makeStore(createCasFakeAdapter(backing))
+    const endpoint = 'https://push.example.com/ep-transfer-clears-tombstone'
+    await store.subscribe({operatorId: 'operator-a', endpoint, p256dh: 'p1', auth: 'a1', keyVersion: '1'})
+
+    const subscriptionKey = Array.from(backing.keys()).find(k => k.includes('subscriptions/by-endpoint'))
+    if (subscriptionKey === undefined) throw new Error('unreachable')
+    const tombstoneKey = subscriptionKey.replace('subscriptions/by-endpoint', 'tombstones')
+    // Write a tombstone directly, alongside the still-present subscription
+    // object, modelling a lost-race skip that left both artifacts behind.
+    backing.set(tombstoneKey, {
+      data: JSON.stringify({endpointHash: 'ignored', operatorId: 'operator-a', deletedAt: 1}),
+      etag: 'etag-manual-tombstone',
+    })
+
+    // #when a different operator subscribes to that same endpoint
+    const transfer = await store.subscribe({
+      operatorId: 'operator-b',
+      endpoint,
+      p256dh: 'p2',
+      auth: 'a2',
+      keyVersion: '1',
+    })
+
+    // #then the transfer succeeds, the tombstone is cleared by subscribe's
+    // tail best-effort clear, and the new owner is active/dispatchable
+    expect(transfer.success).toBe(true)
+    expect(backing.has(tombstoneKey)).toBe(false)
+
+    const bActive = await store.getActiveRecordsForOperator({operatorId: 'operator-b'})
+    if (bActive.success === false) throw new Error('unreachable')
+    expect(bActive.data).toHaveLength(1)
+
+    // and the old owner no longer has access
+    const aActive = await store.getActiveRecordsForOperator({operatorId: 'operator-a'})
+    if (aActive.success === false) throw new Error('unreachable')
+    expect(aActive.data).toHaveLength(0)
   })
 })
 
