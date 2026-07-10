@@ -1236,6 +1236,188 @@ describe('emitAudit — authz.denied with insufficient_permission', () => {
 })
 
 // ---------------------------------------------------------------------------
+// push.subscribed / push.unsubscribed
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — push.subscribed', () => {
+  it('emits a structured info record with expected fields', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {kind: 'push.subscribed', correlationId: 'corr-push-1', githubUserId: 42}
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: push.subscribed')
+    expect(firstCallCtx(logger.info)).toMatchObject({
+      kind: 'push.subscribed',
+      correlationId: 'corr-push-1',
+      githubUserId: 42,
+    })
+  })
+
+  it('redacts sensitive values planted in correlationId', () => {
+    // #given
+    for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET, PLANTED_PROMPT]) {
+      const logger = makeLogger()
+      const event: AuditEvent = {kind: 'push.subscribed', correlationId: planted, githubUserId: 42}
+
+      // #when
+      emitAudit(event, logger)
+
+      // #then
+      assertNoSensitiveValues(logger)
+    }
+  })
+})
+
+describe('emitAudit — push.unsubscribed', () => {
+  it('emits a structured info record with expected fields', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {kind: 'push.unsubscribed', correlationId: 'corr-push-2', githubUserId: 42}
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: push.unsubscribed')
+    expect(firstCallCtx(logger.info)).toMatchObject({
+      kind: 'push.unsubscribed',
+      correlationId: 'corr-push-2',
+      githubUserId: 42,
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// push.subscription.deactivated
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — push.subscription.deactivated', () => {
+  it('emits a structured info record with expected fields', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'push.subscription.deactivated',
+      correlationId: 'corr-push-3',
+      githubUserId: 42,
+      reason: 'session_revoked',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({
+      kind: 'push.subscription.deactivated',
+      githubUserId: 42,
+      reason: 'session_revoked',
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// push.dispatch
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — push.dispatch', () => {
+  it('emits a structured info record carrying only trigger and coarse counts', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'push.dispatch',
+      correlationId: 'approval-123',
+      trigger: 'approval',
+      delivered: 2,
+      dead: 1,
+      failed: 0,
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: push.dispatch')
+    expect(firstCallCtx(logger.info)).toMatchObject({
+      kind: 'push.dispatch',
+      correlationId: 'approval-123',
+      trigger: 'approval',
+      delivered: 2,
+      dead: 1,
+      failed: 0,
+    })
+    // Structural: the recorded context must never carry an endpoint, key, or payload field.
+    const ctx = firstCallCtx(logger.info)
+    expect(Object.keys(ctx).sort()).toEqual(['correlationId', 'dead', 'delivered', 'failed', 'kind', 'trigger'].sort())
+  })
+
+  it('redacts sensitive values planted in correlationId', () => {
+    // #given
+    for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET, PLANTED_PROMPT]) {
+      const logger = makeLogger()
+      const event: AuditEvent = {
+        kind: 'push.dispatch',
+        correlationId: planted,
+        trigger: 'run_failed',
+        delivered: 0,
+        dead: 0,
+        failed: 1,
+      }
+
+      // #when
+      emitAudit(event, logger)
+
+      // #then
+      assertNoSensitiveValues(logger)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// push.disabled
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — push.disabled', () => {
+  it('logs config_absent at info level', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {kind: 'push.disabled', correlationId: 'startup', reason: 'config_absent'}
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.info)).toMatchObject({kind: 'push.disabled', reason: 'config_absent'})
+  })
+
+  it('logs self_test_failed at warn level', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {kind: 'push.disabled', correlationId: 'startup', reason: 'self_test_failed'}
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toMatchObject({kind: 'push.disabled', reason: 'self_test_failed'})
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Sink resilience — throwing logger must not propagate
 // ---------------------------------------------------------------------------
 
