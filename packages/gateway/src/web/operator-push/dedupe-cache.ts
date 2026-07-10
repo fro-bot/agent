@@ -9,6 +9,11 @@
  * Bounded memory: every `shouldSend` call sweeps expired entries before
  * recording a new one, so the map never grows unbounded across a long
  * process lifetime even without an external timer.
+ *
+ * In-memory, best-effort only: this guards against in-process retry storms,
+ * not a cross-restart dedupe guarantee — a process restart clears the
+ * window entirely. Acceptable for now; a duplicate notification after a
+ * restart is a minor UX annoyance, not a correctness issue.
  */
 
 export interface DedupeCacheDeps {
@@ -26,7 +31,7 @@ export interface DedupeCache {
 }
 
 /** Default dedupe window: 5 minutes, matching GATEWAY_OPERATOR_PUSH_DEDUPE_WINDOW_MS default. */
-export const DEFAULT_DEDUPE_WINDOW_MS = 300_000
+const DEFAULT_DEDUPE_WINDOW_MS = 300_000
 
 export function createDedupeCache(deps: DedupeCacheDeps = {}): DedupeCache {
   const windowMs = deps.windowMs ?? DEFAULT_DEDUPE_WINDOW_MS

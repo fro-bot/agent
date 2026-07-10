@@ -71,4 +71,39 @@ describe('isBlockedResolvedAddress', () => {
   it('fails closed on an unparseable IPv4 address', () => {
     expect(isBlockedResolvedAddress('not-an-ip', 4)).toBe(true)
   })
+
+  // #given a private-network IPv4 address (172.16.0.0/12)
+  // #when classified
+  // #then it is blocked
+  it('blocks IPv4 private network 172.16.0.0/12', () => {
+    expect(isBlockedResolvedAddress('172.20.1.1', 4)).toBe(true)
+  })
+
+  // #given an IPv6 unique-local address (fc00::/7)
+  // #when classified
+  // #then it is blocked
+  it('blocks IPv6 unique-local fc00::/fd00::', () => {
+    expect(isBlockedResolvedAddress('fd12::1', 6)).toBe(true)
+  })
+
+  // #given an unknown address family
+  // #when classified
+  // #then it fails closed and is blocked
+  it('fails closed on an unknown address family', () => {
+    expect(isBlockedResolvedAddress('1.2.3.4', 0)).toBe(true)
+  })
+
+  // #given a resolved address that is IPv4-mapped IPv6 wrapping a PUBLIC IPv4
+  // #when classified at connect time
+  // #then it is NOT blocked — a public mapped address is not internal
+  it('does not block a resolved IPv4-mapped-public IPv6 address', () => {
+    expect(isBlockedResolvedAddress('::ffff:104.20.23.154', 6)).toBe(false)
+  })
+
+  // #given a resolved deprecated site-local IPv6 address (fec0::/10)
+  // #when classified at connect time
+  // #then it is blocked
+  it('blocks a resolved fec0::/10 site-local address', () => {
+    expect(isBlockedResolvedAddress('fec0::1', 6)).toBe(true)
+  })
 })

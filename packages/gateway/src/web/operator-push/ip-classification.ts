@@ -17,7 +17,7 @@ export type EndpointRejectionReason =
   'not-https' | 'loopback' | 'private-network' | 'link-local' | 'no-dot-hostname' | 'unparseable' | 'ipv6-literal'
 
 /** Matches IPv4-literal hostnames (e.g. "127.0.0.1"). */
-export const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
 
 export function isIpv4Loopback(octets: readonly number[]): boolean {
   return octets[0] === 127
@@ -59,13 +59,14 @@ export function classifyIpv4(hostname: string): EndpointRejectionReason | null {
 }
 
 /** Matches a two-hex-group IPv6 tail, e.g. the "7f00:1" in "::ffff:7f00:1". */
-export const IPV6_MAPPED_HEX_TAIL_PATTERN = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/
+const IPV6_MAPPED_HEX_TAIL_PATTERN = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/
 
 /**
  * Classify an IPv6 literal hostname (already bracket-stripped by URL.hostname).
  * Fail-closed: known internal forms (::1 loopback, fe80::/10 link-local,
- * fc00::/7 unique local, ::ffff:-mapped IPv4) get a specific reason for log
- * granularity, but any IPv6 literal that isn't one of those still falls
+ * fc00::/7 unique local, fec0::/10 deprecated site-local, ::ffff:-mapped
+ * internal IPv4) get a specific reason for log granularity, but any IPv6
+ * literal that isn't one of those — including a mapped PUBLIC IPv4 — still falls
  * through to the 'ipv6-literal' catch-all reject at the end — legitimate
  * push endpoints are always DNS hostnames, never IPv6 literals. Every IPv6
  * literal is therefore rejected; the function is total (never returns null).
@@ -81,6 +82,13 @@ export function classifyIpv6(hostname: string): EndpointRejectionReason {
   // second nibble 'c' or 'd'.
   if (lower.startsWith('fc') || lower.startsWith('fd')) return 'private-network'
 
+  // fec0::/10 (deprecated site-local) covers prefixes fec0:: through
+  // feff:: — non-overlapping with the fe80::/10 link-local check above
+  // (which covers fe80-febf). Site-local is effectively internal.
+  if (lower.startsWith('fec') || lower.startsWith('fed') || lower.startsWith('fee') || lower.startsWith('fef')) {
+    return 'private-network'
+  }
+
   // IPv4-mapped IPv6 (::ffff:a.b.c.d). WHATWG URL normalizes the dotted form
   // to a hex-compressed tail (e.g. "::ffff:127.0.0.1" -> "::ffff:7f00:1"), so
   // both the dotted and hex forms must be decoded and classified as IPv4.
@@ -91,9 +99,9 @@ export function classifyIpv6(hostname: string): EndpointRejectionReason {
       if (IPV4_PATTERN.test(suffix) === false) return 'private-network'
       const mappedReason = classifyIpv4(suffix)
       if (mappedReason !== null) return mappedReason
-      // A mapped PUBLIC IPv4 (classifyIpv4 returned null) is still an IPv6
-      // literal — fall through to the catch-all reject below rather than
-      // accept it.
+      // A mapped PUBLIC IPv4 (classifyIpv4 returned null) is not internal —
+      // fall through to the ipv6-literal catch-all below (still rejected at
+      // parse time, but no longer mislabeled as 'private-network').
     } else {
       const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(suffix)
       if (hexMatch !== null) {
@@ -103,15 +111,15 @@ export function classifyIpv6(hostname: string): EndpointRejectionReason {
           const octets = [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
           const mappedReason = classifyIpv4Octets(octets)
           if (mappedReason !== null) return mappedReason
-          // Same fall-through as above: a mapped public IPv4 is still
-          // rejected as an IPv6 literal by the catch-all below.
+          // Same fall-through as above: a mapped public IPv4 is not
+          // internal — falls through to the ipv6-literal catch-all below.
         }
       }
     }
     // ::ffff: prefix present but the suffix is not a recognizable IPv4
-    // literal, or resolved to a public IPv4 — fail closed rather than let
-    // an unclassified or mapped-public address through.
-    return 'private-network'
+    // literal — fail closed as an IPv6 literal rather than let an
+    // unclassified mapped address through unlabeled.
+    return 'ipv6-literal'
   }
 
   // Fail-closed catch-all: every IPv6 literal that reaches here is not one

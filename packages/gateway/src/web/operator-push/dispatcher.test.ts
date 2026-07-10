@@ -3,6 +3,7 @@ import type {SubscriptionRecord} from './subscription-store.js'
 import {describe, expect, it, vi} from 'vitest'
 import {createDedupeCache} from './dedupe-cache.js'
 import {createPushDispatcher} from './dispatcher.js'
+import {createStoreError} from './subscription-store.js'
 import {shouldNotify} from './trigger-policy.js'
 
 const VAPID_CONFIG = {
@@ -94,6 +95,35 @@ describe('createPushDispatcher', () => {
     await dispatcher.dispatchApprovalPending('operator-a', 'approval-1')
     expect(sender.sendNotification).toHaveBeenCalledTimes(1)
     expect(getActiveRecordsForOperator).toHaveBeenCalledTimes(1)
+  })
+
+  // #given two different operators dispatching with the same dedupeId+kind
+  // #when dispatchApprovalPending is called for each
+  // #then both sends succeed — dedupe does not cross operator boundaries
+  it('does not suppress a second operator sharing the same dedupeId and kind', async () => {
+    const getActiveRecordsForOperator = vi.fn(async (args: {readonly operatorId: string}) => ({
+      success: true as const,
+      data: [makeRecord({operatorId: args.operatorId})],
+    }))
+    const verifyStillOwned = vi.fn(async () => ({success: true as const, data: true}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([
+      {outcome: 'accepted', statusCode: 201},
+      {outcome: 'accepted', statusCode: 201},
+    ])
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache({windowMs: 60_000}),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+    })
+
+    await dispatcher.dispatchApprovalPending('operator-a', 'approval-1')
+    await dispatcher.dispatchApprovalPending('operator-b', 'approval-1')
+    expect(sender.sendNotification).toHaveBeenCalledTimes(2)
   })
 
   // #given a record whose ownership transferred between listing and send
@@ -203,6 +233,142 @@ describe('createPushDispatcher', () => {
 
     await dispatcher.dispatchApprovalPending('operator-a', 'approval-1')
     expect(sender.sendNotification).toHaveBeenCalledTimes(1)
+  })
+
+  // #given the store fails to list active subscriptions
+  // #when dispatchApprovalPending is called
+  // #then it warns and returns without attempting any send
+  it('warns and returns when getActiveRecordsForOperator fails', async () => {
+    const getActiveRecordsForOperator = vi.fn(async () => ({
+      success: false as const,
+      error: createStoreError('db down'),
+    }))
+    const verifyStillOwned = vi.fn(async () => ({success: true as const, data: true}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([])
+    const logger = createLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger,
+    })
+
+    await dispatcher.dispatchApprovalPending('operator-a', 'approval-1')
+    expect(sender.sendNotification).not.toHaveBeenCalled()
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
+  // #given verifyStillOwned fails (store error, distinct from an ownership-changed data:false)
+  // #when dispatchRunFailed is called with multiple records
+  // #then the failing record is skipped with a warn, and other records still proceed
+  it('skips a record when verifyStillOwned fails, without aborting the rest', async () => {
+    const records = [
+      makeRecord({endpointHash: 'h1', endpoint: 'https://push.example.com/1'}),
+      makeRecord({endpointHash: 'h2', endpoint: 'https://push.example.com/2'}),
+    ]
+    const getActiveRecordsForOperator = vi.fn(async () => ({success: true as const, data: records}))
+    let calls = 0
+    const verifyStillOwned = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) return {success: false as const, error: createStoreError('store unavailable')}
+      return {success: true as const, data: true}
+    })
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([{outcome: 'accepted', statusCode: 201}])
+    const logger = createLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger,
+    })
+
+    await dispatcher.dispatchRunFailed('operator-a', 'run-1')
+    expect(sender.sendNotification).toHaveBeenCalledTimes(1)
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
+  // #given markDead fails (store error) after a dead-subscription outcome
+  // #when dispatchRunFailed is called
+  // #then a warn is logged and the dispatcher does not throw
+  it('warns without throwing when markDead fails', async () => {
+    const records = [makeRecord()]
+    const getActiveRecordsForOperator = vi.fn(async () => ({success: true as const, data: records}))
+    const verifyStillOwned = vi.fn(async () => ({success: true as const, data: true}))
+    const markDead = vi.fn(async () => ({success: false as const, error: createStoreError('write failed')}))
+    const sender = createFakeSender([{outcome: 'dead-subscription', statusCode: 410}])
+    const logger = createLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger,
+    })
+
+    await expect(dispatcher.dispatchRunFailed('operator-a', 'run-1')).resolves.toBeUndefined()
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
+  // #given a store method throws synchronously inside dispatchToOperator
+  // #when dispatchApprovalPending / dispatchRunFailed are called
+  // #then neither promise rejects — the outer catch swallows and logs
+  it('never rejects even when a store call throws', async () => {
+    const getActiveRecordsForOperator = vi.fn(async () => {
+      throw new Error('unexpected throw')
+    })
+    const verifyStillOwned = vi.fn(async () => ({success: true as const, data: true}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([])
+    const logger = createLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger,
+    })
+
+    await expect(dispatcher.dispatchApprovalPending('operator-a', 'approval-1')).resolves.toBeUndefined()
+    await expect(dispatcher.dispatchRunFailed('operator-a', 'run-1')).resolves.toBeUndefined()
+  })
+
+  // #given a record with a specific endpointHash, operatorId, and ownershipGeneration
+  // #when dispatchApprovalPending is called
+  // #then verifyStillOwned is called with those exact fields, not swapped
+  it('calls verifyStillOwned with the correct args', async () => {
+    const records = [makeRecord({endpointHash: 'the-hash', operatorId: 'operator-a', ownershipGeneration: 7})]
+    const getActiveRecordsForOperator = vi.fn(async () => ({success: true as const, data: records}))
+    const verifyStillOwned = vi.fn(async () => ({success: true as const, data: true}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([{outcome: 'accepted', statusCode: 201}])
+
+    const dispatcher = createPushDispatcher({
+      store: {getActiveRecordsForOperator, verifyStillOwned, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+    })
+
+    await dispatcher.dispatchApprovalPending('operator-a', 'approval-1')
+    expect(verifyStillOwned).toHaveBeenCalledWith({
+      endpointHash: 'the-hash',
+      operatorId: 'operator-a',
+      ownershipGeneration: 7,
+    })
   })
 
   // #given a dispatch flow producing warn/debug log calls

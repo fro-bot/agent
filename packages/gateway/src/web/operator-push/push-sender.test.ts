@@ -223,6 +223,62 @@ describe('createPushSender', () => {
     expect(result).toEqual({outcome: 'error'})
     expect(realSocketOpened).toBe(false)
   })
+
+  // #given a successful send that goes through the guarded connect-time lookup
+  // #when sendNotification is called
+  // #then dns.lookup is invoked exactly once — the validated address is the
+  //       connected address, with no re-resolution in between
+  it('invokes the DNS lookup exactly once per sendNotification', async () => {
+    const lookupSpy = vi.fn(
+      (
+        _hostname: string,
+        _options: unknown,
+        callback: (err: Error | null, address: string, family: number) => void,
+      ) => {
+        callback(null, '142.250.72.196', 4)
+      },
+    )
+    vi.doMock('node:dns', () => ({
+      default: {lookup: lookupSpy},
+    }))
+    vi.doMock('node:https', () => {
+      class FakeAgent {
+        createConnection(
+          options: {readonly lookup?: (...args: unknown[]) => void},
+          callback?: (error: Error | null) => void,
+        ) {
+          options.lookup?.('push.example.com', {family: 0}, (error: Error | null) => {
+            callback?.(error)
+          })
+          return undefined
+        }
+
+        destroy(): void {}
+      }
+      return {default: {Agent: FakeAgent}}
+    })
+    vi.doMock('web-push', () => ({
+      default: {
+        sendNotification: vi.fn(async (_sub: unknown, _payload: unknown, options: {readonly agent: FakeAgentLike}) => {
+          return new Promise((resolve, reject) => {
+            options.agent.createConnection({host: 'push.example.com'}, (error: Error | null) => {
+              if (error !== null) {
+                reject(error)
+                return
+              }
+              resolve({statusCode: 201, body: '', headers: {}})
+            })
+          })
+        }),
+      },
+      WebPushError: class WebPushError extends Error {},
+    }))
+    const {createPushSender} = await import('./push-sender.js')
+    const sender = createPushSender({logger: createLogger()})
+    const result = await sender.sendNotification(SUBSCRIPTION, '{}', VAPID_CONFIG)
+    expect(result).toEqual({outcome: 'accepted', statusCode: 201})
+    expect(lookupSpy).toHaveBeenCalledTimes(1)
+  })
 })
 
 interface FakeAgentLike {

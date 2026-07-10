@@ -15,8 +15,11 @@
  * read and the moment a notification is actually sent, this dispatcher
  * calls `store.verifyStillOwned` immediately before each send. If the
  * generation has moved on, or the record is no longer active or no longer
- * owned by the same operator, the send is skipped — a stale pre-transfer
- * read can never deliver one operator's notification to another's device.
+ * owned by the same operator, the send is skipped. This narrows the
+ * delivery-to-wrong-owner window to the async gap between the ownership
+ * re-check and the actual relay request — not zero, but bounded to a single
+ * I/O hop; a transfer landing inside that window is additionally caught by
+ * the relay returning 410 for the transferred-away subscription.
  *
  * Security invariant: this module never logs the endpoint, subscription
  * keys, VAPID keys, or push payload — only coarse operator/run identifiers
@@ -46,7 +49,6 @@ export interface PushDispatcherVapidConfig {
 
 export interface PushDispatcherTriggerPolicy {
   shouldNotify: (
-    kind: 'approval' | 'run_failed',
     record: {readonly keyVersion: string},
     keyVersions: {readonly current: string; readonly previous?: string},
   ) => TriggerDecision
@@ -75,7 +77,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     dedupeId: string,
     payload: string,
   ): Promise<void> {
-    const dedupeKey = `${dedupeId}:${kind}`
+    const dedupeKey = `${operatorId}:${dedupeId}:${kind}`
     if (dedupeCache.shouldSend(dedupeKey) === false) {
       logger.debug({operatorId, kind}, 'operator push dispatch: suppressed by dedupe window')
       return
@@ -90,9 +92,12 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     for (const record of activeRecords.data) {
       try {
         await dispatchToRecord(kind, operatorId, record, payload)
-      } catch {
+      } catch (error: unknown) {
         // One failing record must never abort dispatch to the rest.
-        logger.warn({operatorId, kind}, 'operator push dispatch: one subscription failed — continuing with the rest')
+        logger.warn(
+          {operatorId, kind, err: error instanceof Error ? error.message : String(error)},
+          'operator push dispatch: one subscription failed — continuing with the rest',
+        )
       }
     }
   }
@@ -103,7 +108,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     record: SubscriptionRecord,
     payload: string,
   ): Promise<void> {
-    const decision = triggerPolicy.shouldNotify(kind, record, {
+    const decision = triggerPolicy.shouldNotify(record, {
       current: vapidConfig.keyVersion,
       previous: vapidConfig.previousKeyVersion,
     })
@@ -149,6 +154,14 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
       case 'payload-too-large':
       case 'error': {
         logger.warn({operatorId, kind, outcome: result.outcome}, 'operator push dispatch: relay send did not succeed')
+        return
+      }
+      default: {
+        // Exhaustiveness guard: if a new PushRelayResult outcome variant is
+        // added in push-sender.ts without a case here, TypeScript will fail
+        // to compile.
+        const exhaustiveCheck: never = result
+        throw new Error(`dispatchToRecord: unhandled PushRelayResult outcome variant: ${String(exhaustiveCheck)}`)
       }
     }
   }

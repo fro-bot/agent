@@ -26,14 +26,9 @@ export interface TriggerPolicyKeyVersions {
 
 /**
  * Decides whether `record` is eligible for dispatch under the configured
- * VAPID key rotation state. `kind` is accepted for signature symmetry with
- * future per-kind policy but does not currently affect the decision.
+ * VAPID key rotation state.
  */
-export function shouldNotify(
-  _kind: 'approval' | 'run_failed',
-  record: TriggerPolicyRecord,
-  keyVersions: TriggerPolicyKeyVersions,
-): TriggerDecision {
+export function shouldNotify(record: TriggerPolicyRecord, keyVersions: TriggerPolicyKeyVersions): TriggerDecision {
   if (record.keyVersion === keyVersions.current) {
     return 'send'
   }

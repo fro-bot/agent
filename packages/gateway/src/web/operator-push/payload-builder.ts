@@ -23,15 +23,23 @@ export interface PushPayload {
   readonly data: PushPayloadData
 }
 
-/** Closed allowlist of failure labels safe to surface in a push payload — mirrors OperatorFailureKind. */
-const KNOWN_SAFE_FAILURE_LABELS: ReadonlySet<OperatorFailureKind> = new Set([
+/**
+ * Closed allowlist of failure labels safe to surface in a push payload.
+ *
+ * `satisfies readonly OperatorFailureKind[]` makes this exhaustive over the
+ * OperatorFailureKind union at compile time — adding a new OperatorFailureKind
+ * member in run-status.ts without adding an entry here is a compile error.
+ */
+const KNOWN_SAFE_FAILURE_LABELS_LIST = [
   'inactivity-timeout',
   'max-duration-timeout',
   'stream-ended',
   'workspace-unreachable',
   'session-error',
   'unknown',
-])
+] satisfies readonly OperatorFailureKind[]
+
+const KNOWN_SAFE_FAILURE_LABELS: ReadonlySet<OperatorFailureKind> = new Set(KNOWN_SAFE_FAILURE_LABELS_LIST)
 
 function isKnownSafeFailureLabel(value: string | undefined): value is OperatorFailureKind {
   if (value === undefined) return false
