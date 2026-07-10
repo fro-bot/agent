@@ -54,6 +54,7 @@ function makeDeps(overrides?: Partial<SubscriptionRouteDeps>): SubscriptionRoute
     sessionStore: makeSessionStore(),
     store: makeStore(),
     keyVersion: '1',
+    auditLogger: {info: vi.fn(), warn: vi.fn()},
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 1000,
     subscribeRateLimiter: createRateLimiter({limit: 1000, windowMs: 60_000}),
@@ -79,7 +80,8 @@ describe('buildSubscriptionRoutes — subscribe', () => {
   // #then creates/replaces one record; response is safe metadata only
   it('happy path: subscribes and returns safe metadata only', async () => {
     const store = makeStore()
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions', {
@@ -101,6 +103,12 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     expect(body.p256dh).toBeUndefined()
     expect(body.auth).toBeUndefined()
     expect(body.endpointHash).toBe('hash-1')
+
+    // #then a push.subscribed audit event fires with no endpoint/key material
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({kind: 'push.subscribed', githubUserId: 1001})
+    expect(JSON.stringify(ctx)).not.toContain(VALID_ENDPOINT)
   })
 
   // #given no authenticated session
@@ -323,7 +331,8 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
   // #then marks the record inactive
   it("happy path: unsubscribes the operator's own record", async () => {
     const store = makeStore()
-    const deps = makeDeps({store})
+    const auditLogger = {info: vi.fn(), warn: vi.fn()}
+    const deps = makeDeps({store, auditLogger})
     const app = buildAppWithGuard(deps)
 
     const res = await app.request('/operator/push/subscriptions/unsubscribe', {
@@ -334,6 +343,12 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
 
     expect(res.status).toBe(200)
     expect(store.unsubscribe).toHaveBeenCalledWith({operatorId: OPERATOR_A_ID, endpoint: VALID_ENDPOINT})
+
+    // #then a push.unsubscribed audit event fires with no endpoint material
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({kind: 'push.unsubscribed', githubUserId: 1001})
+    expect(JSON.stringify(ctx)).not.toContain(VALID_ENDPOINT)
   })
 
   // #given another operator's record (store fails-closed)

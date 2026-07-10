@@ -33,6 +33,10 @@ function createLogger() {
   return {debug: vi.fn(), warn: vi.fn()}
 }
 
+function createAuditLogger() {
+  return {info: vi.fn(), warn: vi.fn()}
+}
+
 function createFakeSender(outcomes: readonly PushRelayResult[]) {
   const queue = [...outcomes]
   const sendNotification = vi.fn(async () => {
@@ -65,6 +69,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger: createLogger(),
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -87,6 +92,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger: createLogger(),
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -114,6 +120,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger: createLogger(),
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchRunFailed('run-1')
@@ -143,6 +150,7 @@ describe('createPushDispatcher — broadcast', () => {
         triggerPolicy: {shouldNotify},
         vapidConfig: VAPID_CONFIG,
         logger: createLogger(),
+        auditLogger: createAuditLogger(),
       })
 
       await dispatcher.dispatchRunFailed('run-1')
@@ -176,6 +184,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger: createLogger(),
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -201,6 +210,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -230,6 +240,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -256,6 +267,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger: createLogger(),
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchApprovalPending('approval-1')
@@ -279,6 +291,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
+      auditLogger: createAuditLogger(),
     })
 
     await expect(dispatcher.dispatchRunFailed('run-1')).resolves.toBeUndefined()
@@ -303,6 +316,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
+      auditLogger: createAuditLogger(),
     })
 
     await expect(dispatcher.dispatchApprovalPending('approval-1')).resolves.toBeUndefined()
@@ -326,6 +340,7 @@ describe('createPushDispatcher — broadcast', () => {
       triggerPolicy: {shouldNotify},
       vapidConfig: VAPID_CONFIG,
       logger,
+      auditLogger: createAuditLogger(),
     })
 
     await dispatcher.dispatchRunFailed('run-1')
@@ -336,5 +351,131 @@ describe('createPushDispatcher — broadcast', () => {
       expect(serialized).not.toContain('p256dh')
       expect(serialized).not.toContain('auth-value')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// push.dispatch audit event
+// ---------------------------------------------------------------------------
+
+describe('createPushDispatcher — push.dispatch audit event', () => {
+  // #given two delivered records and one dead record
+  // #when dispatchApprovalPending completes the broadcast
+  // #then exactly one push.dispatch audit event fires with the aggregated counts
+  it('emits one push.dispatch event per broadcast with correct counts', async () => {
+    const records = [
+      makeRecord({endpointHash: 'h1', endpoint: 'https://push.example.com/1'}),
+      makeRecord({endpointHash: 'h2', endpoint: 'https://push.example.com/2'}),
+      makeRecord({endpointHash: 'h3', endpoint: 'https://push.example.com/3'}),
+    ]
+    const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: records}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([
+      {outcome: 'accepted', statusCode: 201},
+      {outcome: 'accepted', statusCode: 201},
+      {outcome: 'dead-subscription', statusCode: 410},
+    ])
+    const auditLogger = createAuditLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({
+      kind: 'push.dispatch',
+      correlationId: 'approval-1',
+      trigger: 'approval',
+      delivered: 2,
+      dead: 1,
+      failed: 0,
+    })
+  })
+
+  // #given a dedupe-suppressed second call for the same event
+  // #when dispatchApprovalPending is called twice within the dedupe window
+  // #then the audit event fires only once (for the first, actually-dispatched call)
+  it('does not emit a dispatch audit event on a dedupe-suppressed call', async () => {
+    const records = [makeRecord()]
+    const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: records}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([{outcome: 'accepted', statusCode: 201}])
+    const auditLogger = createAuditLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache({windowMs: 60_000}),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1')
+
+    expect(auditLogger.info).toHaveBeenCalledOnce()
+  })
+
+  // #given no active subscriptions
+  // #when dispatchApprovalPending is called
+  // #then no dispatch audit event fires — nothing was dispatched
+  it('does not emit a dispatch audit event when the active-subscription list is empty', async () => {
+    const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: []}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([])
+    const auditLogger = createAuditLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+
+    expect(auditLogger.info).not.toHaveBeenCalled()
+    expect(auditLogger.warn).not.toHaveBeenCalled()
+  })
+
+  // #given the emitted push.dispatch audit event
+  // #when serialized
+  // #then it never contains an endpoint, key, or payload value
+  it('emitted dispatch audit event never carries endpoint or key material', async () => {
+    const records = [makeRecord({endpoint: 'https://push.example.com/super-secret-path', p256dh: 'p256dh-secret'})]
+    const listAllActiveRecords = vi.fn(async () => ({success: true as const, data: records}))
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([{outcome: 'accepted', statusCode: 201}])
+    const auditLogger = createAuditLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: createLogger(),
+      auditLogger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+
+    const serialized = JSON.stringify(auditLogger.info.mock.calls)
+    expect(serialized).not.toContain('super-secret-path')
+    expect(serialized).not.toContain('p256dh-secret')
   })
 })

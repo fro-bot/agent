@@ -989,7 +989,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
     deps.operatorPushStore !== undefined &&
-    deps.operatorPushVapidKeyInfo !== undefined
+    deps.operatorPushVapidKeyInfo !== undefined &&
+    deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     const sessionStoreForPush: SubscriptionRouteSessionStore = deps.sessionStore
@@ -1001,6 +1002,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       sessionStore: sessionStoreForPush,
       store: deps.operatorPushStore,
       keyVersion: deps.operatorPushVapidKeyInfo.keyVersion,
+      auditLogger: deps.auditLogger,
       logger: deps.logger,
       now: clock,
     })

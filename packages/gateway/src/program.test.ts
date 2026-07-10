@@ -1139,6 +1139,44 @@ describe('button interaction handler (approval flow)', () => {
     consoleWarnSpy.mockRestore()
   })
 
+  it('operator push self-test failure emits a push.disabled audit event with reason self_test_failed', async () => {
+    // #given — self-test resolves a failed Result (not a throw)
+    selfTestCasMock.mockResolvedValueOnce({
+      success: false,
+      error: Object.assign(new Error('cas contended-write self-test failed'), {
+        code: 'OPERATOR_PUSH_SELF_TEST_CAS_FAILURE' as const,
+      }),
+    })
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — a warn-level push.disabled audit record with reason self_test_failed
+    const emittedDisabled = consoleWarnSpy.mock.calls.some(([line]) => {
+      const serialized = String(line)
+      return serialized.includes('push.disabled') && serialized.includes('self_test_failed')
+    })
+    expect(emittedDisabled).toBe(true)
+    consoleWarnSpy.mockRestore()
+  })
+
   it('operator push self-test failure (Result err): push omitted, warn logged, gateway still starts', async () => {
     // #given — self-test resolves a failed Result (not a throw)
     selfTestCasMock.mockResolvedValueOnce({
@@ -1239,6 +1277,37 @@ describe('button interaction handler (approval flow)', () => {
     expect(serverDeps.operatorPushStore).toBeUndefined()
   })
 
+  it('operator push absent from config: emits a push.disabled audit event with reason config_absent', async () => {
+    // #given — no operatorPush block in config
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — an info-level push.disabled audit record with reason config_absent
+    const emittedDisabled = consoleLogSpy.mock.calls.some(([line]) => {
+      const serialized = String(line)
+      return serialized.includes('push.disabled') && serialized.includes('config_absent')
+    })
+    expect(emittedDisabled).toBe(true)
+    consoleLogSpy.mockRestore()
+  })
+
   it('operator push enabled: dispatcher is threaded into launchWorkDeps and the session-revoke hook is registered', async () => {
     // #given — operatorWeb and operatorPush are both configured, self-test succeeds
     selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
@@ -1320,6 +1389,55 @@ describe('button interaction handler (approval flow)', () => {
     const warnedSkipped = consoleWarnSpy.mock.calls.some(([line]) => String(line).includes('CAS exhausted'))
     expect(warnedSkipped).toBe(true)
     consoleWarnSpy.mockRestore()
+  })
+
+  it('session-revoke hook: a real deactivation emits a push.subscription.deactivated audit event', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const storeMock = vi.mocked(createOperatorPushSubscriptionStore).mock.results[0]?.value as {
+      deactivateForOperator: (args: {readonly operatorId: string}) => Promise<unknown>
+    }
+    const deactivateForOperatorMock = vi.mocked(storeMock.deactivateForOperator)
+    deactivateForOperatorMock.mockResolvedValueOnce({success: true, data: {updated: 1, skipped: 0}})
+
+    // #when — the revoke hook fires with a real deactivation (updated > 0)
+    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // #then — a push.subscription.deactivated audit record with reason
+    // session_revoked was logged
+    const emittedDeactivated = consoleLogSpy.mock.calls.some(([line]) => {
+      const serialized = String(line)
+      return serialized.includes('push.subscription.deactivated') && serialized.includes('session_revoked')
+    })
+    expect(emittedDeactivated).toBe(true)
+    consoleLogSpy.mockRestore()
   })
 
   it('session-revoke hook: a failed deactivation Result logs a warn, does not throw', async () => {
