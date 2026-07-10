@@ -36,7 +36,7 @@ export interface AcquireLockPhaseOptions {
  * Acquires the per-repo coordination lock so the Action and the Discord gateway
  * cannot execute concurrently against the same repository.
  *
- * Decisions captured in `docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md` (Unit 3):
+ * Design decisions (see `docs/plans/2026-04-18-001-feat-fro-bot-gateway-discord-v1-plan.md`):
  * - No `validateProviderSemantics` self-test on Action invocations — the gateway runs validation
  *   at startup as the long-lived process; the Action assumes provider semantics are valid.
  * - No heartbeat in v1 — the 15-min TTL covers the median ~2-min Action run; rare long runs

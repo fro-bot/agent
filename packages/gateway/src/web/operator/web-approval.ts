@@ -125,7 +125,7 @@ export function createWebApprovalOnPending(
 
       // Build the bounded frame data. Apply boundApprovalDetail to command and
       // filepath here — the caller (this transport) is responsible for bounding
-      // per the U2 contract.
+      // per the cancellation settlement contract.
       const boundedCommand = boundApprovalDetail(req.command)
       const boundedFilepath = boundApprovalDetail(req.filepath)
 

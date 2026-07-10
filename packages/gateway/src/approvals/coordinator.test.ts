@@ -92,7 +92,7 @@ describe('parsePermissionRequest', () => {
 })
 
 // ---------------------------------------------------------------------------
-// parsePermissionRequest — command/filepath fields (Unit 1)
+// parsePermissionRequest — command/filepath fields
 // ---------------------------------------------------------------------------
 
 describe('parsePermissionRequest — command/filepath fields', () => {

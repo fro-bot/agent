@@ -637,7 +637,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // ── Operator-cancel registration ──────────────────────────────────────────
       // Registered only after EXECUTING commits — the pre-ACK/pre-EXECUTING window is
       // covered by the run-state conditional-write rendezvous (see the ACK/EXECUTING
-      // etag-mismatch handling above and Unit 2's orchestrator), not by this registry.
+      // etag-mismatch handling above and the cancellation orchestrator), not by this registry.
       // Always deleted in the outer finally below, regardless of settlement outcome.
       // The returned signal is composed into effectiveSignal at the timeout seam below.
       const cancelSignal = abortRegistry.register(runId)
@@ -889,12 +889,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (wasCancelled === true) {
         // ── Operator-cancel settlement path ──────────────────────────────────────────
         // Distinct from the generic FAILED path below: settles CANCELLED, suppresses the
-        // user-facing failure reply (Unit 2's thread notice is the communication), and
+        // user-facing failure reply (the cancellation thread notice is the communication), and
         // still flushes partial output.
 
         // Replaces the working/awaiting reaction with the failed cue — no distinct
         // "cancelled" reaction exists yet; reusing 'failed' here is a UX nit, not a
-        // correctness issue (the thread notice, added in Unit 2, carries the real signal).
+        // correctness issue (the thread notice carries the real signal).
         statusSink.setReaction('failed')
 
         // heartbeat.stop() FIRST — its runEtag/lockEtag are the authoritative
@@ -925,7 +925,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         // Transition to CANCELLED (best-effort) with the fresh heartbeat-stop etag.
         // Attribution: the abort-registry entry may carry `cancelledBy` metadata,
-        // written by `cancelRun` (Unit 2) alongside its `abort()` call. This is the
+        // written by `cancelRun` alongside its `abort()` call. This is the
         // single writer of the CANCELLED transition, so reading it back here (rather
         // than a follow-up write from the orchestrator) keeps attribution atomic with
         // the phase write and avoids a second etag round-trip.
@@ -1006,7 +1006,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // was already updated above so the outer finally's releaseLock uses the fresh value.
 
         // Suppress the user-facing failure reply for operator-initiated cancels — no
-        // "task failed" message to the thread. Unit 2 posts the cancellation notice.
+        // "task failed" message to the thread. The cancellation notice is posted separately.
         // Log instead so the suppression is observable in gateway logs.
         logger.info({repo, runId}, 'run: cancelled — suppressing user-facing failure reply')
       } else {

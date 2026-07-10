@@ -496,7 +496,7 @@ describe('GET /readyz', () => {
   })
 })
 
-describe('GET /readyz — proxy-listening gate (Unit 2)', () => {
+describe('GET /readyz — proxy-listening gate', () => {
   it('returns 200 when opencode is ready AND proxy is listening', async () => {
     // #given — both conditions satisfied: the happy path
     const opencodeStatus = {status: 'ready' as const}
