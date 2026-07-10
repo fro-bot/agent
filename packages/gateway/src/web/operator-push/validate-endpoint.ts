@@ -16,13 +16,18 @@
  * dispatch path must additionally validate the resolved IP at connect time
  * to close that gap; this module only stops literal-address bypasses.
  *
+ * IPv6 posture: IPv6 literals are rejected wholesale — push service
+ * endpoints are DNS hostnames, so any IPv6 literal is treated as an SSRF
+ * risk and denied; specific internal forms are still classified for
+ * logging granularity.
+ *
  * Security invariant: the endpoint value itself must NEVER be echoed in a
  * thrown reason or a log line — only the coarse rejection class name.
  */
 
 /** Coarse, closed set of reasons an endpoint URL was rejected. No free-form text. */
 export type EndpointRejectionReason =
-  'not-https' | 'loopback' | 'private-network' | 'link-local' | 'no-dot-hostname' | 'unparseable'
+  'not-https' | 'loopback' | 'private-network' | 'link-local' | 'no-dot-hostname' | 'unparseable' | 'ipv6-literal'
 
 export interface EndpointValidationResult {
   readonly ok: boolean
@@ -78,7 +83,11 @@ const IPV6_MAPPED_HEX_TAIL_PATTERN = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/
 
 /**
  * Classify an IPv6 literal hostname (already bracket-stripped by URL.hostname).
- * Covers ::1 (loopback), fe80::/10 (link-local), and fc00::/7 (unique local).
+ * Fail-closed: known internal forms (::1 loopback, fe80::/10 link-local,
+ * fc00::/7 unique local, ::ffff:-mapped IPv4) get a specific reason for log
+ * granularity, but any IPv6 literal that isn't one of those still falls
+ * through to the 'ipv6-literal' catch-all reject at the end — legitimate
+ * push endpoints are always DNS hostnames, never IPv6 literals.
  */
 function classifyIpv6(hostname: string): EndpointRejectionReason | null {
   const lower = hostname.toLowerCase()
@@ -99,24 +108,35 @@ function classifyIpv6(hostname: string): EndpointRejectionReason | null {
     const suffix = lower.slice(mappedPrefix.length)
     if (suffix.includes('.')) {
       if (IPV4_PATTERN.test(suffix) === false) return 'private-network'
-      return classifyIpv4(suffix)
-    }
-    const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(suffix)
-    if (hexMatch !== null) {
-      const group0 = Number.parseInt(hexMatch[1] ?? '', 16)
-      const group1 = Number.parseInt(hexMatch[2] ?? '', 16)
-      if (Number.isNaN(group0) === false && Number.isNaN(group1) === false) {
-        const octets = [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
-        return classifyIpv4Octets(octets)
+      const mappedReason = classifyIpv4(suffix)
+      if (mappedReason !== null) return mappedReason
+      // A mapped PUBLIC IPv4 (classifyIpv4 returned null) is still an IPv6
+      // literal — fall through to the catch-all reject below rather than
+      // accept it.
+    } else {
+      const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(suffix)
+      if (hexMatch !== null) {
+        const group0 = Number.parseInt(hexMatch[1] ?? '', 16)
+        const group1 = Number.parseInt(hexMatch[2] ?? '', 16)
+        if (Number.isNaN(group0) === false && Number.isNaN(group1) === false) {
+          const octets = [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
+          const mappedReason = classifyIpv4Octets(octets)
+          if (mappedReason !== null) return mappedReason
+          // Same fall-through as above: a mapped public IPv4 is still
+          // rejected as an IPv6 literal by the catch-all below.
+        }
       }
     }
     // ::ffff: prefix present but the suffix is not a recognizable IPv4
-    // literal — fail closed rather than let an unclassified mapped
-    // address through.
+    // literal, or resolved to a public IPv4 — fail closed rather than let
+    // an unclassified or mapped-public address through.
     return 'private-network'
   }
 
-  return null
+  // Fail-closed catch-all: every IPv6 literal that reaches here is not one
+  // of the specifically-classified internal forms above, but is still
+  // rejected — push endpoints are never IPv6 literals.
+  return 'ipv6-literal'
 }
 
 /**

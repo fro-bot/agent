@@ -1164,6 +1164,71 @@ describe('createOperatorPushSubscriptionStore — deleteForOperator gaps', () =>
     expect(listed.data).toHaveLength(1)
     expect(listed.data[0]?.active).toBe(true)
   })
+
+  it('rolls back the tombstone when a transfer to a different operator races the physical delete (still active, different owner)', async () => {
+    // #given an active subscription owned by operator-a, plus a one-shot
+    // conditionalDelete failure that, when it fires, simulates a concurrent
+    // transfer: operator-b subscribes with the same endpoint between the
+    // delete's read and its physical delete attempt, so the on-disk record
+    // ends up active but owned by a DIFFERENT operator.
+    const backing = new Map<string, {data: string; etag: string}>()
+    const baseAdapter = createCasFakeAdapter(backing)
+    const endpoint = 'https://push.example.com/ep-transfer-race'
+    const seedStore = createOperatorPushSubscriptionStore({adapter: baseAdapter, logger: testLogger})
+    await seedStore.subscribe({operatorId: 'operator-a', endpoint, p256dh: 'p1', auth: 'a1', keyVersion: '1'})
+    const subscriptionKey = Array.from(backing.keys()).find(k => k.includes('subscriptions/by-endpoint'))
+    if (subscriptionKey === undefined) throw new Error('unreachable')
+
+    const raceAdapter = withOneShotConditionalDeleteFailure(
+      baseAdapter,
+      key => key === subscriptionKey,
+      () => {
+        // Simulate the concurrent transfer: operator-b now owns the record,
+        // still active, at a new etag.
+        const current = backing.get(subscriptionKey)
+        if (current === undefined) throw new Error('unreachable')
+        const parsed: {[k: string]: unknown} = JSON.parse(current.data) as {[k: string]: unknown}
+        backing.set(subscriptionKey, {
+          data: JSON.stringify({
+            ...parsed,
+            operatorId: 'operator-b',
+            p256dh: 'transferred-p256dh',
+            auth: 'transferred-auth',
+            ownershipGeneration: 2,
+          }),
+          etag: 'etag-transferred-during-race',
+        })
+      },
+    )
+    const warn = vi.fn()
+    const store = createOperatorPushSubscriptionStore({adapter: raceAdapter, logger: {debug: () => {}, warn}})
+
+    // #when operator-a's deleteForOperator loses the physical-delete CAS race to that transfer
+    const result = await store.deleteForOperator({operatorId: 'operator-a'})
+
+    // #then the delete is not counted as deleted (secrets were already moved
+    // to the new owner's record before the physical delete attempt), and —
+    // because the re-read shows the record active regardless of who now
+    // owns it — the tombstone is rolled back so it does not shadow the new
+    // owner's live record; a warning is logged for the lost race
+    expect(result.success).toBe(true)
+    if (result.success === false) throw new Error('unreachable')
+    expect(result.data.deleted).toBe(0)
+    expect(result.data.skipped).toBe(1)
+    expect(warn).toHaveBeenCalled()
+
+    // The now-active record (owned by operator-b) remains visible via the
+    // read surfaces — not shadowed by a leftover tombstone.
+    const bActive = await store.getActiveRecordsForOperator({operatorId: 'operator-b'})
+    if (bActive.success === false) throw new Error('unreachable')
+    expect(bActive.data).toHaveLength(1)
+    expect(bActive.data[0]?.p256dh).toBe('transferred-p256dh')
+
+    const bListed = await store.listMetadataForOperator({operatorId: 'operator-b'})
+    if (bListed.success === false) throw new Error('unreachable')
+    expect(bListed.data).toHaveLength(1)
+    expect(bListed.data[0]?.active).toBe(true)
+  })
 })
 
 describe('createOperatorPushSubscriptionStore — prune reclaims a record left behind by a skipped delete', () => {

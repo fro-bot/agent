@@ -277,6 +277,44 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     expect(res.status).toBe(200)
     expect(store.subscribe).toHaveBeenCalledOnce()
   })
+
+  // #given the operator is one below the cap, and two concurrent requests
+  // subscribe two DISTINCT new endpoints at the same time
+  // #when both POST /operator/push/subscriptions fire concurrently
+  // #then both succeed — this is the expected, documented soft-bound
+  // behavior (the cap read is not atomic with the write), not a bug; the
+  // per-operator rate limit is what actually bounds the overrun
+  it('subscription cap is soft: two concurrent subscribes for distinct new endpoints at cap-1 can both succeed', async () => {
+    const activeJustUnderCap = Array.from({length: 19}, (_v, i) =>
+      makeMetadata({endpointHash: `hash-${i}`, active: true}),
+    )
+    const store = makeStore({listMetadataForOperator: vi.fn(async () => ok(activeJustUnderCap))})
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps)
+
+    const [resA, resB] = await Promise.all([
+      app.request('/operator/push/subscriptions', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({
+          endpoint: 'https://fcm.googleapis.com/fcm/send/concurrent-a',
+          keys: {p256dh: 'p1', auth: 'a1'},
+        }),
+      }),
+      app.request('/operator/push/subscriptions', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({
+          endpoint: 'https://fcm.googleapis.com/fcm/send/concurrent-b',
+          keys: {p256dh: 'p2', auth: 'a2'},
+        }),
+      }),
+    ])
+
+    expect(resA.status).toBe(200)
+    expect(resB.status).toBe(200)
+    expect(store.subscribe).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('buildSubscriptionRoutes — unsubscribe', () => {
@@ -386,5 +424,26 @@ describe('buildSubscriptionRoutes — list', () => {
 
     expect(res.status).toBe(404)
     expect(store.listMetadataForOperator).not.toHaveBeenCalled()
+  })
+
+  // #given a record the store marked inactive with the internal-only
+  // 'transferred' reason (ownership moved to a different operator)
+  // #when GET /operator/push/subscriptions
+  // #then the response carries the coarse public 'revoked' reason — never
+  // omitted, and never the literal 'transferred' string
+  it('maps a transferred record to the coarse public "revoked" reason, not an omitted reason', async () => {
+    const store = makeStore({
+      listMetadataForOperator: vi.fn(async () => ok([makeMetadata({active: false, inactiveReason: 'transferred'})])),
+    })
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps)
+
+    const res = await app.request('/operator/push/subscriptions')
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {subscriptions: Record<string, unknown>[]}
+    expect(body.subscriptions[0]?.active).toBe(false)
+    expect(body.subscriptions[0]?.inactiveReason).toBe('revoked')
+    expect(JSON.stringify(body)).not.toContain('transferred')
   })
 })

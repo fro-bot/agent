@@ -59,10 +59,14 @@ const UNSUBSCRIBE_RATE_LIMIT_PER_MIN = 10
 const UNSUBSCRIBE_RATE_WINDOW_MS = 60_000
 
 /**
- * Fail-closed cap on active subscription records per operator, bounding
- * store and dispatch-fanout growth from a single operator's browsers. A
- * re-subscribe of an endpoint the operator already owns is a replace, not a
- * new record, so it is exempt from this cap.
+ * Best-effort soft bound on active subscription records per operator,
+ * limiting store and dispatch-fanout growth from a single operator's
+ * browsers. The count is read before the write and is not atomic with it,
+ * so concurrent subscribes for distinct new endpoints can transiently
+ * exceed this bound by (concurrency - 1); the per-operator subscribe rate
+ * limit bounds how far that overrun can go. This limits unbounded growth,
+ * not an exact ceiling. A re-subscribe of an endpoint the operator already
+ * owns is a replace, not a new record, so it is exempt from this bound.
  */
 const MAX_ACTIVE_SUBSCRIPTIONS_PER_OPERATOR = 20
 
@@ -109,15 +113,21 @@ function toResponseMetadata(metadata: SubscriptionMetadata): OperatorPushSubscri
     return base
   }
   // The store's inactive-reason taxonomy is a superset ('transferred') of the
-  // contract's public taxonomy — 'transferred' is an internal-only reason and
-  // is intentionally omitted from the response rather than mapped.
+  // contract's public taxonomy. 'transferred' would leak that the endpoint
+  // moved to another operator, so it is mapped to the same coarse 'revoked'
+  // reason used for key_revoked rather than omitted — an omitted reason
+  // renders ambiguously (active:false with no explanation) on the client.
   if (
     metadata.inactiveReason === 'unsubscribed' ||
     metadata.inactiveReason === 'dead' ||
     metadata.inactiveReason === 'key_revoked' ||
-    metadata.inactiveReason === 'session-revoked'
+    metadata.inactiveReason === 'session-revoked' ||
+    metadata.inactiveReason === 'transferred'
   ) {
-    const mapped = metadata.inactiveReason === 'key_revoked' ? 'revoked' : metadata.inactiveReason
+    const mapped =
+      metadata.inactiveReason === 'key_revoked' || metadata.inactiveReason === 'transferred'
+        ? 'revoked'
+        : metadata.inactiveReason
     return {...base, inactiveReason: mapped}
   }
   return base
@@ -196,10 +206,12 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
 
     // ── Gate 7: Call the store ───────────────────────────────────────────────
     try {
-      // Fail-closed active-subscription cap: block a NEW endpoint once the
-      // operator is already at the cap, but never block a re-subscribe of an
-      // endpoint they already own — that write replaces the existing record
-      // rather than growing the active set.
+      // Soft active-subscription bound: block a NEW endpoint once the
+      // operator is already at the bound, but never block a re-subscribe of
+      // an endpoint they already own — that write replaces the existing
+      // record rather than growing the active set. See
+      // MAX_ACTIVE_SUBSCRIPTIONS_PER_OPERATOR's docstring for why this is
+      // soft rather than atomic.
       const existingMetadata = await deps.store.listMetadataForOperator({operatorId})
       if (existingMetadata.success === false) {
         deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-subscribe: store write failed')

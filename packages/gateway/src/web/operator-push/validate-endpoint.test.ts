@@ -162,6 +162,57 @@ describe('validateEndpointUrl', () => {
     expect(validateEndpointUrl('https://web.push.apple.com/abc').ok).toBe(true)
   })
 
+  // #given IPv6 literals in forms that embed or reduce to an internal address
+  // through a path the specific classifiers don't decode (IPv4-compatible,
+  // NAT64, 6to4), plus an arbitrary global-unicast literal with no internal
+  // meaning at all
+  // #when validated
+  // #then every one is rejected — the fail-closed posture treats any IPv6
+  // literal as an SSRF risk regardless of whether it decodes to something
+  // internal, since real push endpoints are never IPv6 literals
+  describe('fail-closed IPv6 literal posture', () => {
+    it('rejects an IPv4-compatible IPv6 literal embedding 127.0.0.1', () => {
+      const result = validateEndpointUrl('https://[::7f00:1]/p')
+      expect(result.ok).toBe(false)
+    })
+
+    it('rejects a NAT64-embedded literal encoding 127.0.0.1', () => {
+      const result = validateEndpointUrl('https://[64:ff9b::7f00:1]/p')
+      expect(result.ok).toBe(false)
+    })
+
+    it('rejects a 6to4-embedded literal encoding 127.0.0.1', () => {
+      const result = validateEndpointUrl('https://[2002:7f00:1::]/p')
+      expect(result.ok).toBe(false)
+    })
+
+    it('rejects an arbitrary global-unicast IPv6 literal with no internal meaning', () => {
+      const result = validateEndpointUrl('https://[2606:4700:4700::1111]/p')
+      expect(result.ok).toBe(false)
+      expect(result.reason).toBe('ipv6-literal')
+    })
+
+    it('never echoes the endpoint or IPv6 literal in the rejection', () => {
+      const endpoints = [
+        'https://[::7f00:1]/secret-path',
+        'https://[64:ff9b::7f00:1]/secret-path',
+        'https://[2002:7f00:1::]/secret-path',
+        'https://[2606:4700:4700::1111]/secret-path',
+      ]
+      for (const endpoint of endpoints) {
+        const result = validateEndpointUrl(endpoint)
+        expect(result.ok).toBe(false)
+        expect(JSON.stringify(result)).not.toContain('secret-path')
+      }
+    })
+
+    it('still accepts real push-service hostnames alongside the fail-closed IPv6 posture', () => {
+      expect(validateEndpointUrl('https://fcm.googleapis.com/fcm/send/abc').ok).toBe(true)
+      expect(validateEndpointUrl('https://updates.push.services.mozilla.com/wpush/v2/xyz').ok).toBe(true)
+      expect(validateEndpointUrl('https://web.push.apple.com/abc').ok).toBe(true)
+    })
+  })
+
   // #given each hardened rejection case
   // #when the rejection reason is serialized
   // #then it never contains the raw endpoint value
