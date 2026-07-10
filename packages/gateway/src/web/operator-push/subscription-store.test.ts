@@ -325,6 +325,91 @@ describe('createOperatorPushSubscriptionStore — ownership transfer', () => {
   })
 })
 
+describe('createOperatorPushSubscriptionStore — listAllActiveRecords', () => {
+  // #given active subscriptions owned by two different operators
+  // #when listAllActiveRecords is called
+  // #then records for both operators are returned
+  it('returns active records across multiple operators', async () => {
+    const store = makeStore(createCasFakeAdapter())
+    await store.subscribe({
+      operatorId: 'operator-a',
+      endpoint: 'https://push.example.com/ep-a',
+      p256dh: 'p1',
+      auth: 'a1',
+      keyVersion: '1',
+    })
+    await store.subscribe({
+      operatorId: 'operator-b',
+      endpoint: 'https://push.example.com/ep-b',
+      p256dh: 'p2',
+      auth: 'a2',
+      keyVersion: '1',
+    })
+
+    const all = await store.listAllActiveRecords()
+    if (all.success === false) throw new Error('unreachable')
+    const operatorIds = all.data.map(r => r.operatorId).sort()
+    expect(operatorIds).toEqual(['operator-a', 'operator-b'])
+  })
+
+  // #given one active and one unsubscribed (inactive) record
+  // #when listAllActiveRecords is called
+  // #then only the active record is returned
+  it('excludes inactive records', async () => {
+    const store = makeStore(createCasFakeAdapter())
+    await store.subscribe({
+      operatorId: 'operator-a',
+      endpoint: 'https://push.example.com/ep-active',
+      p256dh: 'p1',
+      auth: 'a1',
+      keyVersion: '1',
+    })
+    const inactiveEndpoint = 'https://push.example.com/ep-inactive'
+    await store.subscribe({
+      operatorId: 'operator-a',
+      endpoint: inactiveEndpoint,
+      p256dh: 'p2',
+      auth: 'a2',
+      keyVersion: '1',
+    })
+    await store.unsubscribe({operatorId: 'operator-a', endpoint: inactiveEndpoint})
+
+    const all = await store.listAllActiveRecords()
+    if (all.success === false) throw new Error('unreachable')
+    expect(all.data).toHaveLength(1)
+    expect(all.data[0]?.endpoint).toBe('https://push.example.com/ep-active')
+  })
+
+  // #given a tombstoned (privacy-deleted) record
+  // #when listAllActiveRecords is called
+  // #then the tombstoned record is excluded
+  it('excludes tombstoned records', async () => {
+    const store = makeStore(createCasFakeAdapter())
+    await store.subscribe({
+      operatorId: 'operator-a',
+      endpoint: 'https://push.example.com/ep-deleted',
+      p256dh: 'p1',
+      auth: 'a1',
+      keyVersion: '1',
+    })
+    await store.deleteForOperator({operatorId: 'operator-a'})
+
+    const all = await store.listAllActiveRecords()
+    if (all.success === false) throw new Error('unreachable')
+    expect(all.data).toHaveLength(0)
+  })
+
+  // #given no subscriptions in the store
+  // #when listAllActiveRecords is called
+  // #then it returns an empty array
+  it('returns empty when no active records exist', async () => {
+    const store = makeStore(createCasFakeAdapter())
+    const all = await store.listAllActiveRecords()
+    if (all.success === false) throw new Error('unreachable')
+    expect(all.data).toHaveLength(0)
+  })
+})
+
 describe('createOperatorPushSubscriptionStore — cross-operator mutation fails closed', () => {
   it("a different operator cannot unsubscribe another operator's record", async () => {
     // #given operator A owns an endpoint

@@ -248,6 +248,15 @@ export interface OperatorPushSubscriptionStore {
   getActiveRecordsForOperator: (args: {
     readonly operatorId: string
   }) => Promise<Result<readonly SubscriptionRecord[], StoreError>>
+  /**
+   * Full records WITH secrets, across ALL operators. Broadcast dispatch-path
+   * ONLY — never surface this to listing/export/audit. Used by the operator
+   * push dispatcher's broadcast model: every active subscriber gets nudged
+   * for a pending approval or a failed run, regardless of who launched the
+   * run (the dashboard is a shared surface with no run-scoped operator
+   * identity at those seams).
+   */
+  listAllActiveRecords: () => Promise<Result<readonly SubscriptionRecord[], StoreError>>
   markDead: (args: {readonly operatorId: string; readonly endpoint: string}) => Promise<Result<void, StoreError>>
   /** Prunes inactive subscription records and expired tombstones past their respective retention windows. */
   pruneInactive: (args?: {
@@ -925,6 +934,14 @@ export function createOperatorPushSubscriptionStore(
     return ok(all.data.filter(r => r.operatorId === args.operatorId && r.active === true))
   }
 
+  async function listAllActiveRecords(): Promise<Result<readonly SubscriptionRecord[], StoreError>> {
+    const all = await listAllRecords()
+    if (all.success === false) {
+      return err(all.error)
+    }
+    return ok(all.data.filter(r => r.active === true))
+  }
+
   // -------------------------------------------------------------------------
   // markDead
   // -------------------------------------------------------------------------
@@ -1182,6 +1199,7 @@ export function createOperatorPushSubscriptionStore(
     deleteForOperator,
     listMetadataForOperator,
     getActiveRecordsForOperator,
+    listAllActiveRecords,
     markDead,
     pruneInactive,
     verifyStillOwned,

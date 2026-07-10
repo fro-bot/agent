@@ -106,6 +106,7 @@ vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
       deleteForOperator: vi.fn(),
       listMetadataForOperator: vi.fn(),
       getActiveRecordsForOperator: vi.fn(),
+      listAllActiveRecords: vi.fn(),
       markDead: vi.fn(),
       pruneInactive: vi.fn(),
       verifyStillOwned: vi.fn(),
