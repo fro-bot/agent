@@ -19,6 +19,7 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
+  err,
 } from '@fro-bot/runtime'
 import {getConnInfo} from '@hono/node-server/conninfo'
 import {Effect} from 'effect'
@@ -703,7 +704,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           adapter: s3Adapter,
           logger,
         })
-        const selfTest = yield* Effect.promise(async () => pushStore.selfTestCas())
+        // Effect.tryPromise (not Effect.promise) so a throwing adapter — not
+        // just a Result-typed failure — is caught here and degrades to
+        // "push disabled" rather than becoming an unrecoverable defect that
+        // crashes the whole gateway (Discord + operator web + announce)
+        // at startup.
+        const selfTest = yield* Effect.tryPromise({
+          try: async () => pushStore.selfTestCas(),
+          catch: error => (error instanceof Error ? error : new Error(String(error))),
+        }).pipe(Effect.catchAll(error => Effect.succeed(err(error))))
         if (selfTest.success === true) {
           operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
         } else {

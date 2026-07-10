@@ -40,9 +40,10 @@ import type {
 import type {OperatorLogger} from '../server.js'
 import type {OperatorPushSubscriptionStore, SubscriptionMetadata} from './subscription-store.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {parseOperatorPushSubscribeRequest} from '../../operator-contract/index.js'
+import {parseOperatorPushSubscribeRequest, parseOperatorPushUnsubscribeRequest} from '../../operator-contract/index.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
+import {hashEndpoint} from './subscription-store.js'
 import {validateEndpointUrl} from './validate-endpoint.js'
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,14 @@ const SUBSCRIBE_RATE_WINDOW_MS = 60_000
 /** Per-operator unsubscribe rate limit: 10 requests per minute. */
 const UNSUBSCRIBE_RATE_LIMIT_PER_MIN = 10
 const UNSUBSCRIBE_RATE_WINDOW_MS = 60_000
+
+/**
+ * Fail-closed cap on active subscription records per operator, bounding
+ * store and dispatch-fanout growth from a single operator's browsers. A
+ * re-subscribe of an endpoint the operator already owns is a replace, not a
+ * new record, so it is exempt from this cap.
+ */
+const MAX_ACTIVE_SUBSCRIPTIONS_PER_OPERATOR = 20
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,22 +94,6 @@ export interface SubscriptionRouteDeps {
   readonly subscribeRateLimiter?: RateLimiter
   /** Optional injectable per-minute rate limiter for unsubscribe (operator-keyed). */
   readonly unsubscribeRateLimiter?: RateLimiter
-}
-
-// ---------------------------------------------------------------------------
-// Body parsing helpers
-// ---------------------------------------------------------------------------
-
-/** Parse and validate the unsubscribe request body: {endpoint: string}. */
-function parseUnsubscribeBody(body: unknown): {readonly endpoint: string} | null {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    return null
-  }
-  const candidate = body as Record<string, unknown>
-  if (typeof candidate.endpoint !== 'string' || candidate.endpoint.length === 0) {
-    return null
-  }
-  return {endpoint: candidate.endpoint}
 }
 
 /** Map full SubscriptionMetadata (store shape) to the contract-safe response shape. */
@@ -203,6 +196,23 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
 
     // ── Gate 7: Call the store ───────────────────────────────────────────────
     try {
+      // Fail-closed active-subscription cap: block a NEW endpoint once the
+      // operator is already at the cap, but never block a re-subscribe of an
+      // endpoint they already own — that write replaces the existing record
+      // rather than growing the active set.
+      const existingMetadata = await deps.store.listMetadataForOperator({operatorId})
+      if (existingMetadata.success === false) {
+        deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-subscribe: store write failed')
+        return notFoundResponse(c)
+      }
+      const activeRecords = existingMetadata.data.filter(m => m.active === true)
+      const endpointHash = hashEndpoint(parsed.data.endpoint)
+      const isExistingEndpoint = activeRecords.some(m => m.endpointHash === endpointHash)
+      if (isExistingEndpoint === false && activeRecords.length >= MAX_ACTIVE_SUBSCRIPTIONS_PER_OPERATOR) {
+        deps.logger.warn({githubUserId, gate: 'subscription-cap'}, 'push-subscribe: subscription cap')
+        return c.json({error: 'bad request'}, 400)
+      }
+
       const result = await deps.store.subscribe({
         operatorId,
         endpoint: parsed.data.endpoint,
@@ -253,8 +263,8 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
       return c.json({error: 'bad request'}, 400)
     }
 
-    const parsed = parseUnsubscribeBody(body)
-    if (parsed === null) {
+    const parsed = parseOperatorPushUnsubscribeRequest(body)
+    if (parsed.success === false) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'push-unsubscribe: denied — invalid request shape')
       return c.json({error: 'bad request'}, 400)
     }
@@ -264,7 +274,7 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
     // a different operator; that denial and an unknown endpoint (idempotent
     // no-op success) both surface identically here to avoid leaking ownership.
     try {
-      const result = await deps.store.unsubscribe({operatorId, endpoint: parsed.endpoint})
+      const result = await deps.store.unsubscribe({operatorId, endpoint: parsed.data.endpoint})
       if (result.success === false) {
         deps.logger.warn({githubUserId, gate: 'store-error'}, 'push-unsubscribe: denied')
         return notFoundResponse(c)

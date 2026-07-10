@@ -109,4 +109,74 @@ describe('validateEndpointUrl', () => {
     expect(result.ok).toBe(false)
     expect(JSON.stringify(result)).not.toContain('super-secret-path-should-not-leak')
   })
+
+  // #given IPv4-mapped IPv6 literals in both dotted and WHATWG-normalized hex form
+  // #when validated
+  // #then the embedded IPv4 address is decoded and classified the same as the plain IPv4 literal
+  describe('IPv4-mapped IPv6 literals', () => {
+    it('rejects a mapped loopback address', () => {
+      expect(validateEndpointUrl('https://[::ffff:127.0.0.1]/p')).toEqual({ok: false, reason: 'loopback'})
+    })
+
+    it('rejects mapped private-network addresses', () => {
+      expect(validateEndpointUrl('https://[::ffff:10.0.0.1]/p')).toEqual({ok: false, reason: 'private-network'})
+      expect(validateEndpointUrl('https://[::ffff:192.168.1.1]/p')).toEqual({ok: false, reason: 'private-network'})
+      expect(validateEndpointUrl('https://[::ffff:172.16.0.1]/p')).toEqual({ok: false, reason: 'private-network'})
+    })
+
+    it('rejects mapped cloud-metadata / link-local addresses in both dotted and hex form', () => {
+      expect(validateEndpointUrl('https://[::ffff:169.254.169.254]/p')).toEqual({ok: false, reason: 'link-local'})
+      expect(validateEndpointUrl('https://[::ffff:a9fe:a9fe]/p')).toEqual({ok: false, reason: 'link-local'})
+    })
+
+    it('rejects a mapped unspecified address', () => {
+      expect(validateEndpointUrl('https://[::ffff:0:0]/p')).toEqual({ok: false, reason: 'loopback'})
+    })
+  })
+
+  // #given the IPv4 and IPv6 unspecified addresses
+  // #when validated
+  // #then each is rejected
+  it('rejects the IPv4 unspecified address 0.0.0.0', () => {
+    expect(validateEndpointUrl('https://0.0.0.0/p')).toEqual({ok: false, reason: 'loopback'})
+  })
+
+  it('rejects the IPv6 unspecified address ::', () => {
+    expect(validateEndpointUrl('https://[::]/p')).toEqual({ok: false, reason: 'loopback'})
+  })
+
+  // #given internal hostnames written with a trailing dot (a valid FQDN root marker)
+  // #when validated
+  // #then the trailing dot is normalized away and the hostname is still rejected
+  it('rejects a trailing-dot .internal hostname', () => {
+    expect(validateEndpointUrl('https://metadata.google.internal./p')).toEqual({ok: false, reason: 'no-dot-hostname'})
+    expect(validateEndpointUrl('https://service.internal./p')).toEqual({ok: false, reason: 'no-dot-hostname'})
+  })
+
+  // #given legitimate push-service origins
+  // #when validated
+  // #then each is accepted, guarding against false positives from the hardened checks
+  it('accepts real push-service hosts', () => {
+    expect(validateEndpointUrl('https://fcm.googleapis.com/fcm/send/abc').ok).toBe(true)
+    expect(validateEndpointUrl('https://updates.push.services.mozilla.com/wpush/v2/xyz').ok).toBe(true)
+    expect(validateEndpointUrl('https://web.push.apple.com/abc').ok).toBe(true)
+  })
+
+  // #given each hardened rejection case
+  // #when the rejection reason is serialized
+  // #then it never contains the raw endpoint value
+  it('never echoes the endpoint for the hardened rejection cases', () => {
+    const secretPath = '/super-secret-path-should-not-leak'
+    const endpoints = [
+      `https://[::ffff:127.0.0.1]${secretPath}`,
+      `https://0.0.0.0${secretPath}`,
+      `https://[::]${secretPath}`,
+      `https://metadata.google.internal.${secretPath}`,
+    ]
+    for (const endpoint of endpoints) {
+      const result = validateEndpointUrl(endpoint)
+      expect(result.ok).toBe(false)
+      expect(JSON.stringify(result)).not.toContain(secretPath)
+    }
+  })
 })

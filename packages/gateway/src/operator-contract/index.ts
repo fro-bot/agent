@@ -26,6 +26,7 @@ export {
   parseOperatorError,
   parseOperatorOk,
   parseOperatorPushSubscribeRequest,
+  parseOperatorPushUnsubscribeRequest,
   parseOperatorPushVapidKeyResponse,
   parseOperatorSessionInfo,
 } from './parse.js'

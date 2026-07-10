@@ -187,6 +187,96 @@ describe('buildSubscriptionRoutes — subscribe', () => {
     expect(res.status).toBe(429)
     expect(store.subscribe).toHaveBeenCalledTimes(1)
   })
+
+  // #given the store rejects the write (e.g. underlying object-store error)
+  // #when POST /operator/push/subscriptions
+  // #then a safe denial is surfaced, no distinguishing detail
+  it('error path: a store write failure surfaces a safe denial without leaking the endpoint', async () => {
+    const store = makeStore({
+      subscribe: vi.fn(async () => err(createStoreError('subscribe: exceeded max CAS retry attempts'))),
+    })
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const deps = makeDeps({store, logger})
+    const app = buildAppWithGuard(deps)
+
+    const res = await app.request('/operator/push/subscriptions', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({endpoint: VALID_ENDPOINT, keys: {p256dh: 'p1', auth: 'a1'}}),
+    })
+
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as Record<string, unknown>
+    expect(body.error).toBe('not-found')
+    for (const level of ['debug', 'info', 'warn', 'error'] as const) {
+      for (const call of logger[level].mock.calls) {
+        expect(JSON.stringify(call)).not.toContain(VALID_ENDPOINT)
+      }
+    }
+  })
+
+  // #given the operator already has the cap's worth of active subscriptions,
+  // none of which is the incoming endpoint
+  // #when POST /operator/push/subscriptions
+  // #then 400, store.subscribe is never called
+  it('subscription cap: a new endpoint at the cap is rejected without a store write', async () => {
+    const activeAtCap = Array.from({length: 20}, (_v, i) => makeMetadata({endpointHash: `hash-${i}`, active: true}))
+    const store = makeStore({listMetadataForOperator: vi.fn(async () => ok(activeAtCap))})
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps)
+
+    const res = await app.request('/operator/push/subscriptions', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({endpoint: VALID_ENDPOINT, keys: {p256dh: 'p1', auth: 'a1'}}),
+    })
+
+    expect(res.status).toBe(400)
+    expect(store.subscribe).not.toHaveBeenCalled()
+  })
+
+  // #given the operator is at the cap but the incoming endpoint is already
+  // one of their active records (a replace, not a new record)
+  // #when POST /operator/push/subscriptions
+  // #then the cap does not block it — store.subscribe is called
+  it('subscription cap: a re-subscribe of an existing endpoint at the cap is allowed', async () => {
+    const {createHash} = await import('node:crypto')
+    const endpointHash = createHash('sha256').update(VALID_ENDPOINT, 'utf8').digest('hex')
+    const activeAtCap = [
+      makeMetadata({endpointHash, active: true}),
+      ...Array.from({length: 19}, (_v, i) => makeMetadata({endpointHash: `hash-${i}`, active: true})),
+    ]
+    const store = makeStore({listMetadataForOperator: vi.fn(async () => ok(activeAtCap))})
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps)
+
+    const res = await app.request('/operator/push/subscriptions', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({endpoint: VALID_ENDPOINT, keys: {p256dh: 'p1', auth: 'a1'}}),
+    })
+
+    expect(res.status).toBe(200)
+    expect(store.subscribe).toHaveBeenCalledOnce()
+  })
+
+  // #given the operator is well under the cap
+  // #when POST /operator/push/subscriptions
+  // #then the write proceeds normally
+  it('subscription cap: under the cap, subscribe proceeds normally', async () => {
+    const store = makeStore({listMetadataForOperator: vi.fn(async () => ok([makeMetadata()]))})
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps)
+
+    const res = await app.request('/operator/push/subscriptions', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({endpoint: VALID_ENDPOINT, keys: {p256dh: 'p1', auth: 'a1'}}),
+    })
+
+    expect(res.status).toBe(200)
+    expect(store.subscribe).toHaveBeenCalledOnce()
+  })
 })
 
 describe('buildSubscriptionRoutes — unsubscribe', () => {
@@ -244,6 +334,24 @@ describe('buildSubscriptionRoutes — unsubscribe', () => {
     })
 
     expect(res.status).toBe(400)
+    expect(store.unsubscribe).not.toHaveBeenCalled()
+  })
+
+  // #given no authenticated session
+  // #when POST /operator/push/subscriptions/unsubscribe
+  // #then notFoundResponse, no store write
+  it('error path: unauthenticated request is denied with no store write', async () => {
+    const store = makeStore()
+    const deps = makeDeps({store})
+    const app = buildAppWithGuard(deps, false)
+
+    const res = await app.request('/operator/push/subscriptions/unsubscribe', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({endpoint: VALID_ENDPOINT}),
+    })
+
+    expect(res.status).toBe(404)
     expect(store.unsubscribe).not.toHaveBeenCalled()
   })
 })
