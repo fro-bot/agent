@@ -92,7 +92,10 @@ describe('createPushDispatcher — broadcast', () => {
     await dispatcher.dispatchApprovalPending('approval-1')
     await dispatcher.dispatchApprovalPending('approval-1')
     expect(sender.sendNotification).toHaveBeenCalledTimes(1)
-    expect(listAllActiveRecords).toHaveBeenCalledTimes(1)
+    // listAllActiveRecords now runs before the dedupe check on every call (so a failed list
+    // never consumes the dedupe slot) — the second call still lists, but shouldSend suppresses
+    // the send.
+    expect(listAllActiveRecords).toHaveBeenCalledTimes(2)
   })
 
   // #given the relay reports the subscription is dead (410)
@@ -203,6 +206,38 @@ describe('createPushDispatcher — broadcast', () => {
     await dispatcher.dispatchApprovalPending('approval-1')
     expect(sender.sendNotification).not.toHaveBeenCalled()
     expect(logger.warn).toHaveBeenCalled()
+  })
+
+  // #given the first call's listAllActiveRecords fails
+  // #when dispatchApprovalPending is called again for the same event and the
+  //   list now succeeds
+  // #then the second call still sends — the failed first call never consumed
+  //   the dedupe slot
+  it('does not consume the dedupe slot when listAllActiveRecords fails', async () => {
+    const records = [makeRecord()]
+    const listAllActiveRecords = vi
+      .fn()
+      .mockResolvedValueOnce({success: false as const, error: createStoreError('db down')})
+      .mockResolvedValueOnce({success: true as const, data: records})
+    const markDead = vi.fn(async () => ({success: true as const, data: undefined}))
+    const sender = createFakeSender([{outcome: 'accepted', statusCode: 201}])
+    const logger = createLogger()
+
+    const dispatcher = createPushDispatcher({
+      store: {listAllActiveRecords, markDead},
+      sender,
+      dedupeCache: createDedupeCache({windowMs: 60_000}),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger,
+    })
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+    expect(sender.sendNotification).not.toHaveBeenCalled()
+
+    await dispatcher.dispatchApprovalPending('approval-1')
+    expect(sender.sendNotification).toHaveBeenCalledTimes(1)
+    expect(listAllActiveRecords).toHaveBeenCalledTimes(2)
   })
 
   // #given a record whose keyVersion predates the current VAPID rotation

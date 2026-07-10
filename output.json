@@ -1,0 +1,19 @@
+{
+  "reviewer": "maintainability",
+  "findings": [
+    {
+      "category": "temporal-coupling",
+      "severity": "medium",
+      "filePath": "packages/gateway/src/program.ts",
+      "lineStart": 587,
+      "lineEnd": 648,
+      "description": "Lazy-getter pattern for operatorPushDispatcher creates temporal coupling: a `let` variable (line 593) is declared before `runEngineDeps` construction (line 595) but assigned later inside the operator-web config block (line 755). The getter at line 645-647 returns the live closure, so `runEngineDeps.operatorPushDispatcher` is `undefined` during the window between object construction and the operator-web init phase. Although the current initialization order guarantees the dispatcher is assigned before any run can be launched (all run paths are post-login; the operator-web block runs pre-login), the pattern is fragile: a future maintainer who inlines the getter to a plain property (`operatorPushDispatcher: operatorPushDispatcher`) would permanently capture `undefined` with no compiler error and no runtime crash — push silently becomes a no-op. The comments (lines 587-592, 642-647, 748-753) document the WHY well, but the pattern itself remains a maintenance trap for anyone who doesn't read those comments.",
+      "confidence": 0.65
+    }
+  ],
+  "residual_risks": [
+    "The lazy-getter pattern at program.ts:645-647 would break silently (push becomes no-op) if a future refactor replaces `get operatorPushDispatcher() { return operatorPushDispatcher }` with a direct property assignment. No compiler error, no warning — just permanently disabled push notifications. The comments protect against it but this is invisible to linters and type-checkers.",
+    "The push dedupe check (`dispatcher.ts:80`) is best-effort, not atomic: concurrent `dispatchRunFailed`/`dispatchApprovalPending` calls for the same event could both pass `shouldSend` and both call `listAllActiveRecords()`, resulting in duplicate sends to some subscribers. This is acceptable for push notifications (minor UX noise, not a correctness bug) and is consistent with the documented fire-and-forget contract."
+  ],
+  "testing_gaps": []
+}

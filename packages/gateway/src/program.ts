@@ -803,16 +803,34 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         // push is enabled (operatorPush is present here iff the self-test
         // above succeeded). Fail-soft: a throwing deactivateForOperator must
         // never break session revocation itself.
+        //
+        // Deactivation is keyed by the operator's GitHub user id, not the
+        // session — logging out of ONE browser session deactivates that
+        // operator's push subscriptions across ALL their browsers/devices.
+        // This is intentional for a shared operator console: subscriptions
+        // are identity-scoped, not session-scoped (there is no
+        // session→endpoint link), and re-subscribing from a still-active
+        // session restores push.
         onSessionRevoke:
           operatorPush === undefined
             ? undefined
             : (githubUserId: number) => {
-                operatorPush.store.deactivateForOperator({operatorId: String(githubUserId)}).catch((error: unknown) => {
-                  logger.warn(
-                    {err: error instanceof Error ? error.message : String(error)},
-                    'operator push: deactivateForOperator failed on session revoke',
-                  )
-                })
+                operatorPush.store
+                  .deactivateForOperator({operatorId: String(githubUserId)})
+                  .then(result => {
+                    if (result.success === true && result.data.skipped > 0) {
+                      logger.warn(
+                        {skipped: result.data.skipped},
+                        'operator push: session-revoke deactivation left some subscriptions active (CAS exhausted)',
+                      )
+                    } else if (result.success === false) {
+                      logger.warn({err: result.error.message}, 'operator push: session-revoke deactivation failed')
+                    }
+                  })
+                  .catch(() => {
+                    // Fail-soft: a throw here (e.g. logger itself throwing)
+                    // must never surface as an unhandled rejection.
+                  })
               },
         operatorWebConfig: config.operatorWeb,
       })

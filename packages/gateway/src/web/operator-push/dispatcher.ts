@@ -28,6 +28,12 @@
  * Security invariant: this module never logs the endpoint, subscription
  * keys, VAPID keys, or push payload — only coarse operator/run identifiers
  * and outcome labels.
+ *
+ * Scale assumption: broadcast sends sequentially to every active
+ * subscription. This is sized for the operator-console scale (a small
+ * number of authenticated operators), not end-user scale. If the active
+ * subscription count grows large, a bounded concurrent fan-out should
+ * replace the sequential loop.
  */
 
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
@@ -77,14 +83,24 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
 
   async function broadcast(kind: 'approval' | 'run_failed', dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
-    if (dedupeCache.shouldSend(dedupeKey) === false) {
-      logger.debug({kind}, 'operator push dispatch: suppressed by dedupe window')
-      return
-    }
 
+    // List first: a transient list failure must not consume the dedupe
+    // slot, or a retry of the same event within the dedupe window would be
+    // silently suppressed with nothing ever sent.
     const activeRecords = await store.listAllActiveRecords()
     if (activeRecords.success === false) {
       logger.warn({kind}, 'operator push dispatch: failed to list active subscriptions')
+      return
+    }
+
+    if (activeRecords.data.length === 0) {
+      // Nothing was sent, so a later retry (once subscriptions exist)
+      // should still fire — do not consume the dedupe slot here either.
+      return
+    }
+
+    if (dedupeCache.shouldSend(dedupeKey) === false) {
+      logger.debug({kind}, 'operator push dispatch: suppressed by dedupe window')
       return
     }
 

@@ -322,6 +322,11 @@ export function createInMemorySessionStore(): SessionStore {
     },
 
     scavenge(nowMs: number): void {
+      // TTL-expired sessions (absolute or idle timeout) are removed here
+      // WITHOUT firing revocation hooks — only delete() runs hooks. So a
+      // TTL-expired session's operator push subscriptions are not
+      // immediately deactivated; they are reclaimed later by the
+      // subscription store's own inactive-record pruning.
       for (const [key, entry] of entries) {
         if (entry.revoked === true || isExpired(entry, nowMs)) {
           // Clear the token from heap before removing the entry so it doesn't
