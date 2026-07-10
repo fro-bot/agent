@@ -170,9 +170,9 @@ describe('createPushSender', () => {
         lookup: (
           _hostname: string,
           _options: unknown,
-          callback: (err: Error | null, address: string, family: number) => void,
+          callback: (err: Error | null, addresses: readonly {address: string; family: number}[]) => void,
         ) => {
-          callback(null, '169.254.169.254', 4)
+          callback(null, [{address: '169.254.169.254', family: 4}])
         },
       },
     }))
@@ -233,9 +233,9 @@ describe('createPushSender', () => {
       (
         _hostname: string,
         _options: unknown,
-        callback: (err: Error | null, address: string, family: number) => void,
+        callback: (err: Error | null, addresses: readonly {address: string; family: number}[]) => void,
       ) => {
-        callback(null, '142.250.72.196', 4)
+        callback(null, [{address: '142.250.72.196', family: 4}])
       },
     )
     vi.doMock('node:dns', () => ({
@@ -278,6 +278,190 @@ describe('createPushSender', () => {
     const result = await sender.sendNotification(SUBSCRIPTION, '{}', VAPID_CONFIG)
     expect(result).toEqual({outcome: 'accepted', statusCode: 201})
     expect(lookupSpy).toHaveBeenCalledTimes(1)
+  })
+
+  // #given the real Node autoSelectFamily shape: the socket connector calls
+  //       the guarded lookup with {all: true} and dns.lookup returns an array
+  // #when every candidate address is public
+  // #then the callback receives an ARRAY (not a string), unchanged, and
+  //       dns.lookup itself is invoked with all: true
+  it('returns an address array when the caller asks for all:true and every candidate is public', async () => {
+    const lookupSpy = vi.fn(
+      (
+        _hostname: string,
+        options: {readonly all?: boolean},
+        callback: (err: Error | null, addresses: readonly {address: string; family: number}[]) => void,
+      ) => {
+        expect(options.all).toBe(true)
+        callback(null, [{address: '172.66.147.243', family: 4}])
+      },
+    )
+    vi.doMock('node:dns', () => ({default: {lookup: lookupSpy}}))
+    let receivedCallbackArgs: unknown[] = []
+    vi.doMock('node:https', () => {
+      class FakeAgent {
+        createConnection(
+          options: {readonly lookup?: (...args: unknown[]) => void},
+          callback?: (error: Error | null) => void,
+        ) {
+          options.lookup?.('push.example.com', {all: true}, (...args: unknown[]) => {
+            receivedCallbackArgs = args
+            const error = args[0] as Error | null
+            callback?.(error)
+          })
+          return undefined
+        }
+
+        destroy(): void {}
+      }
+      return {default: {Agent: FakeAgent}}
+    })
+    vi.doMock('web-push', () => ({
+      default: {
+        sendNotification: vi.fn(async (_sub: unknown, _payload: unknown, options: {readonly agent: FakeAgentLike}) => {
+          return new Promise((resolve, reject) => {
+            options.agent.createConnection({host: 'push.example.com'}, (error: Error | null) => {
+              if (error !== null) {
+                reject(error)
+                return
+              }
+              resolve({statusCode: 201, body: '', headers: {}})
+            })
+          })
+        }),
+      },
+      WebPushError: class WebPushError extends Error {},
+    }))
+    const {createPushSender} = await import('./push-sender.js')
+    const sender = createPushSender({logger: createLogger()})
+    const result = await sender.sendNotification(SUBSCRIPTION, '{}', VAPID_CONFIG)
+    expect(result).toEqual({outcome: 'accepted', statusCode: 201})
+    expect(receivedCallbackArgs[0]).toBeNull()
+    expect(receivedCallbackArgs[1]).toEqual([{address: '172.66.147.243', family: 4}])
+  })
+
+  // #given the all:true shape returns a MIX of a public address and an
+  //       internal (metadata) address
+  // #when the guarded lookup classifies every candidate
+  // #then it rejects the whole connection — not just when the first entry is blocked
+  it('blocks the whole connection when any address in an all:true result is internal', async () => {
+    vi.doMock('node:dns', () => ({
+      default: {
+        lookup: (
+          _hostname: string,
+          _options: unknown,
+          callback: (err: Error | null, addresses: readonly {address: string; family: number}[]) => void,
+        ) => {
+          callback(null, [
+            {address: '172.66.147.243', family: 4},
+            {address: '169.254.169.254', family: 4},
+          ])
+        },
+      },
+    }))
+    let realSocketOpened = false
+    vi.doMock('node:https', () => {
+      class FakeAgent {
+        createConnection(
+          options: {readonly lookup?: (...args: unknown[]) => void},
+          callback?: (error: Error | null) => void,
+        ) {
+          options.lookup?.('push.example.com', {all: true}, (error: Error | null) => {
+            if (error !== null) {
+              callback?.(error)
+              return
+            }
+            realSocketOpened = true
+            callback?.(null)
+          })
+          return undefined
+        }
+
+        destroy(): void {}
+      }
+      return {default: {Agent: FakeAgent}}
+    })
+    vi.doMock('web-push', () => ({
+      default: {
+        sendNotification: vi.fn(async (_sub: unknown, _payload: unknown, options: {readonly agent: FakeAgentLike}) => {
+          return new Promise((resolve, reject) => {
+            options.agent.createConnection({host: 'push.example.com'}, (error: Error | null) => {
+              if (error !== null) {
+                reject(error)
+                return
+              }
+              resolve({statusCode: 201, body: '', headers: {}})
+            })
+          })
+        }),
+      },
+      WebPushError: class WebPushError extends Error {},
+    }))
+    const {createPushSender} = await import('./push-sender.js')
+    const sender = createPushSender({logger: createLogger()})
+    const result = await sender.sendNotification(SUBSCRIPTION, '{}', VAPID_CONFIG)
+    expect(result).toEqual({outcome: 'error'})
+    expect(realSocketOpened).toBe(false)
+  })
+
+  // #given the all:true shape returns a single internal address
+  // #when the guarded lookup classifies it
+  // #then it rejects the connection
+  it('blocks a single internal address returned via the all:true array shape', async () => {
+    vi.doMock('node:dns', () => ({
+      default: {
+        lookup: (
+          _hostname: string,
+          _options: unknown,
+          callback: (err: Error | null, addresses: readonly {address: string; family: number}[]) => void,
+        ) => {
+          callback(null, [{address: '127.0.0.1', family: 4}])
+        },
+      },
+    }))
+    let realSocketOpened = false
+    vi.doMock('node:https', () => {
+      class FakeAgent {
+        createConnection(
+          options: {readonly lookup?: (...args: unknown[]) => void},
+          callback?: (error: Error | null) => void,
+        ) {
+          options.lookup?.('push.example.com', {all: true}, (error: Error | null) => {
+            if (error !== null) {
+              callback?.(error)
+              return
+            }
+            realSocketOpened = true
+            callback?.(null)
+          })
+          return undefined
+        }
+
+        destroy(): void {}
+      }
+      return {default: {Agent: FakeAgent}}
+    })
+    vi.doMock('web-push', () => ({
+      default: {
+        sendNotification: vi.fn(async (_sub: unknown, _payload: unknown, options: {readonly agent: FakeAgentLike}) => {
+          return new Promise((resolve, reject) => {
+            options.agent.createConnection({host: 'push.example.com'}, (error: Error | null) => {
+              if (error !== null) {
+                reject(error)
+                return
+              }
+              resolve({statusCode: 201, body: '', headers: {}})
+            })
+          })
+        }),
+      },
+      WebPushError: class WebPushError extends Error {},
+    }))
+    const {createPushSender} = await import('./push-sender.js')
+    const sender = createPushSender({logger: createLogger()})
+    const result = await sender.sendNotification(SUBSCRIPTION, '{}', VAPID_CONFIG)
+    expect(result).toEqual({outcome: 'error'})
+    expect(realSocketOpened).toBe(false)
   })
 })
 

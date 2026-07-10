@@ -100,6 +100,14 @@ describe('isBlockedResolvedAddress', () => {
     expect(isBlockedResolvedAddress('::ffff:104.20.23.154', 6)).toBe(false)
   })
 
+  // #given a resolved address that is IPv4-mapped IPv6 wrapping an INTERNAL
+  // IPv4 (127.0.0.1) in the compact hex form
+  // #when classified at connect time
+  // #then it is blocked
+  it('blocks a resolved IPv4-mapped-internal IPv6 address in hex form', () => {
+    expect(isBlockedResolvedAddress('::ffff:7f00:1', 6)).toBe(true)
+  })
+
   // #given a resolved deprecated site-local IPv6 address (fec0::/10)
   // #when classified at connect time
   // #then it is blocked

@@ -144,6 +144,9 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
         return
       }
       case 'dead-subscription': {
+        // Dead-sub cleanup relies on markDead's internal operator-ownership
+        // check (subscription-store.ts) so a transfer landing between
+        // verify and a 410 can't deactivate another operator's record.
         const marked = await store.markDead({operatorId, endpoint: record.endpoint})
         if (marked.success === false) {
           logger.warn({operatorId, kind}, 'operator push dispatch: failed to mark dead subscription')

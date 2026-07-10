@@ -18,12 +18,24 @@
  * where safe, the numeric status code.
  */
 
+import type {LookupAddress, LookupOptions} from 'node:dns'
 import type {LookupFunction} from 'node:net'
 import type {PushSubscription, RequestOptions} from 'web-push'
 import dns from 'node:dns'
 import https from 'node:https'
 import webpush, {WebPushError} from 'web-push'
 import {isBlockedResolvedAddress} from './ip-classification.js'
+
+/** Maps the string-form family Node's typings allow to the numeric form `dns.lookup` requires. */
+function toNumericFamily(family: LookupOptions['family']): number | undefined {
+  if (family === 'IPv4') {
+    return 4
+  }
+  if (family === 'IPv6') {
+    return 6
+  }
+  return family
+}
 
 export interface PushSenderLogger {
   readonly warn: (context: Record<string, unknown>, message: string) => void
@@ -66,20 +78,41 @@ export interface CreatePushSenderDeps {
  * connected address) or aborts the connection before any socket opens.
  */
 function createGuardedLookup(): LookupFunction {
-  return (hostname, options, callback) => {
-    const lookupFamily = options.family
-    const family = lookupFamily === 'IPv4' ? 4 : lookupFamily === 'IPv6' ? 6 : lookupFamily
-    dns.lookup(hostname, {all: false, family}, (error, address, resolvedFamily) => {
-      if (error !== null) {
-        callback(error, '', 0)
-        return
-      }
-      if (isBlockedResolvedAddress(address, resolvedFamily)) {
-        callback(new Error('push relay destination blocked'), '', 0)
-        return
-      }
-      callback(null, address, resolvedFamily)
-    })
+  return (hostname, rawOptions, callback) => {
+    const normalizedOptions: LookupOptions = typeof rawOptions === 'number' ? {family: rawOptions} : rawOptions
+    const wantsAll = normalizedOptions.all === true
+    // Node 20+ enables `autoSelectFamily` (Happy Eyeballs) by default, so the
+    // real socket connector may call this lookup with `all: true` and expect
+    // an array of candidate addresses back. We always resolve with
+    // `all: true` internally so EVERY address the socket could connect to
+    // gets classified, then reshape the result to whatever form the caller
+    // asked for.
+    dns.lookup(
+      hostname,
+      {...normalizedOptions, family: toNumericFamily(normalizedOptions.family), all: true},
+      (error, addresses: LookupAddress[]) => {
+        if (error !== null) {
+          callback(error, '', 0)
+          return
+        }
+        for (const entry of addresses) {
+          if (isBlockedResolvedAddress(entry.address, entry.family)) {
+            callback(new Error('push relay destination blocked'), '', 0)
+            return
+          }
+        }
+        if (wantsAll) {
+          callback(null, addresses)
+          return
+        }
+        const first = addresses[0]
+        if (first === undefined) {
+          callback(new Error('push relay destination did not resolve'), '', 0)
+          return
+        }
+        callback(null, first.address, first.family)
+      },
+    )
   }
 }
 
