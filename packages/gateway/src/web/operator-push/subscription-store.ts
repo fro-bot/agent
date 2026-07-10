@@ -289,7 +289,13 @@ const DEFAULT_TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function hashEndpoint(endpoint: string): string {
+/**
+ * sha256 hex digest of a push endpoint URL — the record's key discriminant.
+ * Exported so callers (e.g. the subscription route's per-operator active-
+ * subscription cap) can check membership against `listMetadataForOperator`
+ * results without a redundant store round-trip.
+ */
+export function hashEndpoint(endpoint: string): string {
   return createHash('sha256').update(endpoint, 'utf8').digest('hex')
 }
 
@@ -1152,13 +1158,19 @@ export function createOperatorPushSubscriptionStore(
     } finally {
       // Best-effort cleanup — read current etag then delete; ignore failures
       // (a leftover self-test key does not affect the active dispatch set).
-      const cleanupRead = await adapter.getObject(testKey)
-      if (cleanupRead.success === true) {
-        try {
-          await adapter.conditionalDelete(testKey, {ifMatch: cleanupRead.data.etag})
-        } catch (error) {
-          logger.debug({error, testKey}, 'operator push subscription store: self-test cleanup delete threw')
+      // A throw from either the read or the delete must not turn a successful
+      // self-test result into a rejected promise.
+      try {
+        const cleanupRead = await adapter.getObject(testKey)
+        if (cleanupRead.success === true) {
+          try {
+            await adapter.conditionalDelete(testKey, {ifMatch: cleanupRead.data.etag})
+          } catch (error) {
+            logger.debug({error, testKey}, 'operator push subscription store: self-test cleanup delete threw')
+          }
         }
+      } catch (error) {
+        logger.debug({error, testKey}, 'operator push subscription store: self-test cleanup read threw')
       }
     }
   }

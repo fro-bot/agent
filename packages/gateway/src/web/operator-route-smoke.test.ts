@@ -160,6 +160,97 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
     expect(routeSet).toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')
   })
 
+  it('threads operatorPush deps through to mount the push routes', () => {
+    // #given — operatorPush deps present (mirrors a passed self-test)
+    const logger = makeStubLogger()
+    const denylistCache = makeStubDenylistCache()
+    const bindingsStore = makeStubBindingsStore()
+    const runObservationManager = makeStubRunObservationManager()
+    const runIndex = makeStubRunIndex()
+    const approvalRegistry = makeStubApprovalRegistry()
+    const operatorWebConfig = makeStubOperatorWebConfig()
+
+    // #when — build inputs via the shared helper with operatorPush present
+    const {deps, config} = buildOperatorServerInputs({
+      logger,
+      isShuttingDown: () => false,
+      denylistCache,
+      bindingsStore,
+      runObservationManager,
+      runIndex,
+      approvalRegistry,
+      launchWorkDeps: makeStubLaunchWorkDeps(),
+      operatorPush: {
+        store: {
+          subscribe: async () => ({
+            success: true as const,
+            data: {
+              endpointHash: 'h',
+              operatorId: 'op',
+              active: true,
+              keyVersion: '1',
+              ownershipGeneration: 1,
+              createdAt: 0,
+              updatedAt: 0,
+            },
+          }),
+          unsubscribe: async () => ({success: true as const, data: undefined}),
+          listMetadataForOperator: async () => ({success: true as const, data: []}),
+        },
+        vapidPublicKeyInfo: {
+          publicKey: 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc',
+          keyVersion: '1',
+        },
+      },
+      operatorWebConfig,
+    })
+
+    // #then — the deps are threaded through unchanged
+    expect(deps.operatorPushStore).toBeDefined()
+    expect(deps.operatorPushVapidKeyInfo).toEqual({
+      publicKey: 'BOb1EqJOpvFSxr2XOPIr82Ktdxl6AibGOAiPmrkjbsv0mpr9In09mLbskqVAgLPIDjb0UIb7mZpU0SJKWWsVazc',
+      keyVersion: '1',
+    })
+
+    // #and — the push routes are mounted
+    const app = buildOperatorApp(deps, config)
+    const routePaths = app.routes.map((r: {method: string; path: string}) => `${r.method}:${r.path}`)
+    expect(routePaths).toContain('GET:/operator/push/vapid-key')
+    expect(routePaths).toContain('POST:/operator/push/subscriptions')
+    expect(routePaths).toContain('POST:/operator/push/subscriptions/unsubscribe')
+    expect(routePaths).toContain('GET:/operator/push/subscriptions')
+  })
+
+  it('omitting operatorPush causes the push routes to be absent', () => {
+    // #given — operatorPush omitted (simulates disabled/self-test-failed)
+    const logger = makeStubLogger()
+    const denylistCache = makeStubDenylistCache()
+    const bindingsStore = makeStubBindingsStore()
+    const runObservationManager = makeStubRunObservationManager()
+    const runIndex = makeStubRunIndex()
+    const approvalRegistry = makeStubApprovalRegistry()
+    const operatorWebConfig = makeStubOperatorWebConfig()
+
+    // #when
+    const {deps, config} = buildOperatorServerInputs({
+      logger,
+      isShuttingDown: () => false,
+      denylistCache,
+      bindingsStore,
+      runObservationManager,
+      runIndex,
+      approvalRegistry,
+      launchWorkDeps: makeStubLaunchWorkDeps(),
+      operatorWebConfig,
+    })
+
+    // #then — the push routes are NOT mounted
+    const app = buildOperatorApp(deps, config)
+    const routePaths = app.routes.map((r: {method: string; path: string}) => `${r.method}:${r.path}`)
+    expect(routePaths).not.toContain('GET:/operator/push/vapid-key')
+    expect(routePaths).not.toContain('POST:/operator/push/subscriptions')
+  })
+
   it('omitting listBindings from bindingsStore causes GET /operator/repos to be absent', () => {
     // #given — bindingsStore WITHOUT listBindings (a route gated on a missing dep is unmounted)
     const logger = makeStubLogger()
@@ -302,6 +393,21 @@ describe('runOperatorRouteSmoke — regression guard (non-vacuous)', () => {
     })
 
     // #then — non-zero exit (GET /operator/runs absent)
+    expect(exitCode).not.toBe(0)
+  })
+
+  it('returns non-zero when push routes are absent (operatorPushOverride: undefined)', async () => {
+    // #given — operatorPush flows through buildOperatorServerInputs; passing
+    // operatorPushOverride: undefined causes the helper to pass undefined to
+    // deps.operatorPushStore/deps.operatorPushVapidKeyInfo, and server.ts gates
+    // the /operator/push/* routes on both being present. Simulates a self-test
+    // failure or push disabled.
+    // #when
+    const exitCode = await runOperatorRouteSmoke({
+      operatorPushOverride: undefined,
+    })
+
+    // #then — non-zero exit (push routes absent)
     expect(exitCode).not.toBe(0)
   })
 })

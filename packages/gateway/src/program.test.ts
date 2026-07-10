@@ -86,6 +86,34 @@ vi.mock('./redaction/denylist.js', async importOriginal => {
   }
 })
 
+// Mockable seam for the operator push self-test gate. Each test controls
+// selfTestCasMock's resolved/rejected value to exercise the CAS self-test
+// success, Result-typed-failure, and throw branches independently of the
+// real object-store adapter.
+const selfTestCasMock = vi.fn(
+  async (): Promise<
+    {readonly success: true; readonly data: undefined} | {readonly success: false; readonly error: Error}
+  > => ({success: true, data: undefined}) as const,
+)
+vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./web/operator-push/subscription-store.js')>()
+  return {
+    ...actual,
+    createOperatorPushSubscriptionStore: vi.fn(() => ({
+      subscribe: vi.fn(),
+      unsubscribe: vi.fn(),
+      deactivateForOperator: vi.fn(),
+      deleteForOperator: vi.fn(),
+      listMetadataForOperator: vi.fn(),
+      getActiveRecordsForOperator: vi.fn(),
+      markDead: vi.fn(),
+      pruneInactive: vi.fn(),
+      verifyStillOwned: vi.fn(),
+      selfTestCas: selfTestCasMock,
+    })),
+  }
+})
+
 const {makeDiscordClientFromConfig, makeGatewayProgram} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const createDiscordClientSpy = vi.mocked(createDiscordClient)
@@ -178,6 +206,20 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
       httpPort: 3000,
     },
     ...overrides,
+  }
+}
+
+/** Full operatorPush config block for tests — includes all required VAPID fields. */
+function makeOperatorPushConfig(): NonNullable<GatewayConfig['operatorPush']> {
+  return {
+    current: {
+      publicKey: 'test-public-key',
+      privateKey: 'test-private-key',
+      subject: 'mailto:test@example.com',
+      keyVersion: 'v1',
+    },
+    vapidPublicKeyInfo: {publicKey: 'test-public-key', keyVersion: 'v1'},
+    dedupeWindowMs: 300_000,
   }
 }
 
@@ -1056,6 +1098,144 @@ describe('button interaction handler (approval flow)', () => {
 
     // #then — operator server was never started
     expect(startOperatorServerSpy).not.toHaveBeenCalled()
+  })
+
+  it('operator push self-test success: push deps are present in the operator server inputs', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — push deps present, no disabled-push warning
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.operatorPushStore).toBeDefined()
+    expect(serverDeps.operatorPushVapidKeyInfo).toBeDefined()
+    const warnedPushDisabled = consoleWarnSpy.mock.calls.some(([line]) =>
+      String(line).includes('operator push disabled'),
+    )
+    expect(warnedPushDisabled).toBe(false)
+    consoleWarnSpy.mockRestore()
+  })
+
+  it('operator push self-test failure (Result err): push omitted, warn logged, gateway still starts', async () => {
+    // #given — self-test resolves a failed Result (not a throw)
+    selfTestCasMock.mockResolvedValueOnce({
+      success: false,
+      error: Object.assign(new Error('cas contended-write self-test failed'), {
+        code: 'OPERATOR_PUSH_SELF_TEST_CAS_FAILURE' as const,
+      }),
+    })
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when — the program still completes (gateway starts)
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — push omitted, operator server still started
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.operatorPushStore).toBeUndefined()
+  })
+
+  it('operator push self-test throws: degrades to the same push-omitted graceful path as a Result failure', async () => {
+    // #given — the adapter throws instead of returning a failed Result
+    selfTestCasMock.mockRejectedValueOnce(new Error('adapter connection refused'))
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when — the throw must NOT propagate as an unrecoverable defect; the
+    // gateway must still start (Discord + operator web), just without push.
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then
+    expect(startOperatorServerSpy).toHaveBeenCalledOnce()
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.operatorPushStore).toBeUndefined()
+  })
+
+  it('operator push absent from config: push omitted, self-test never called', async () => {
+    // #given — no operatorPush block in config
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then
+    expect(selfTestCasMock).not.toHaveBeenCalled()
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.operatorPushStore).toBeUndefined()
   })
 
   it('composite close closes both announce and operator handles', async () => {

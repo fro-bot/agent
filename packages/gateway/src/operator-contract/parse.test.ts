@@ -23,6 +23,7 @@ import {
   parseOperatorError,
   parseOperatorOk,
   parseOperatorPushSubscribeRequest,
+  parseOperatorPushUnsubscribeRequest,
   parseOperatorPushVapidKeyResponse,
   parseOperatorSessionInfo,
 } from './parse.js'
@@ -650,5 +651,56 @@ describe('parseOperatorPushSubscribeRequest — error paths', () => {
       keys: {p256dh: 'p256dh-key-value', auth: ''},
     }
     expect(parseOperatorPushSubscribeRequest(input).success).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseOperatorPushUnsubscribeRequest — happy path
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorPushUnsubscribeRequest — happy path', () => {
+  it('returns ok(value) for a valid {endpoint} payload', () => {
+    // #given
+    const input = {endpoint: 'https://push.example.com/subscription/abc123'}
+
+    // #when
+    const result = parseOperatorPushUnsubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success && result.data).toEqual(input)
+  })
+
+  it('ignores extra fields (permissive structural subtyping)', () => {
+    // #given
+    const input = {endpoint: 'https://push.example.com/subscription/abc123', extra: 'field'}
+
+    // #when
+    const result = parseOperatorPushUnsubscribeRequest(input)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+})
+
+describe('parseOperatorPushUnsubscribeRequest — error paths', () => {
+  it('returns err for null input', () => {
+    expect(parseOperatorPushUnsubscribeRequest(null).success).toBe(false)
+  })
+
+  it('returns err for array input', () => {
+    expect(parseOperatorPushUnsubscribeRequest([]).success).toBe(false)
+  })
+
+  it('returns err when endpoint is missing', () => {
+    expect(parseOperatorPushUnsubscribeRequest({}).success).toBe(false)
+  })
+
+  it('returns err when endpoint is non-string', () => {
+    expect(parseOperatorPushUnsubscribeRequest({endpoint: 42}).success).toBe(false)
+  })
+
+  it('returns err when endpoint is an empty string', () => {
+    expect(parseOperatorPushUnsubscribeRequest({endpoint: ''}).success).toBe(false)
   })
 })
