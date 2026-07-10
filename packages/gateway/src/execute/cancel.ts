@@ -9,8 +9,8 @@
  *    release).
  *  - **Executing** (abort-registry hit): pending approvals for the run's scope
  *    are rejected through the single fail-closed settlement gate
- *  (`registry.handleDecision`), then the abort handle fires. The run's error
- *  path in `run.ts` owns the CANCELLED transition and resource release.
+ *    (`registry.handleDecision`), then the abort handle fires. The run's error
+ *    path in `run.ts` owns the CANCELLED transition and resource release.
  *  - **Pre-ACK rendezvous** (double miss — the registration window between
  *    dequeue and abort-registry registration): a direct conditional-write
  *    `transitionRun(currentPhase → CANCELLED)` IS the rendezvous. Either the
