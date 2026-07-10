@@ -87,9 +87,10 @@ const IPV6_MAPPED_HEX_TAIL_PATTERN = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/
  * fc00::/7 unique local, ::ffff:-mapped IPv4) get a specific reason for log
  * granularity, but any IPv6 literal that isn't one of those still falls
  * through to the 'ipv6-literal' catch-all reject at the end — legitimate
- * push endpoints are always DNS hostnames, never IPv6 literals.
+ * push endpoints are always DNS hostnames, never IPv6 literals. Every IPv6
+ * literal is therefore rejected; the function is total (never returns null).
  */
-function classifyIpv6(hostname: string): EndpointRejectionReason | null {
+function classifyIpv6(hostname: string): EndpointRejectionReason {
   const lower = hostname.toLowerCase()
   if (lower === '::1') return 'loopback'
   if (lower === '::' || lower === '0:0:0:0:0:0:0:0') return 'loopback'
@@ -170,12 +171,11 @@ export function validateEndpointUrl(endpoint: string): EndpointValidationResult 
   const hostname = isIpv6Literal ? rawHostname.slice(1, -1) : rawHostname
 
   if (isIpv6Literal) {
-    const reason = classifyIpv6(hostname)
-    if (reason !== null) return {ok: false, reason}
-  } else {
-    const ipv4Reason = classifyIpv4(hostname)
-    if (ipv4Reason !== null) return {ok: false, reason: ipv4Reason}
+    // Every IPv6 literal is rejected — classifyIpv6 is total.
+    return {ok: false, reason: classifyIpv6(hostname)}
   }
+  const ipv4Reason = classifyIpv4(hostname)
+  if (ipv4Reason !== null) return {ok: false, reason: ipv4Reason}
 
   // A trailing dot is a valid FQDN root marker ("foo.internal.") that Node
   // fetch still resolves, but it defeats a naive suffix/no-dot check. Strip
@@ -188,8 +188,8 @@ export function validateEndpointUrl(endpoint: string): EndpointValidationResult 
   }
 
   // Bare hostname / local service name — no dot at all (e.g. "workspace").
-  // IPv6 literals never contain a dot check here since they already passed above.
-  if (isIpv6Literal === false && normalizedHostname.includes('.') === false) {
+  // IPv6 literals already returned above, so only DNS-style hosts reach here.
+  if (normalizedHostname.includes('.') === false) {
     return {ok: false, reason: 'no-dot-hostname'}
   }
 
