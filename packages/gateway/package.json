@@ -18,6 +18,10 @@
     "discord.js": "14.26.4",
     "effect": "3.21.4",
     "hono": "4.12.28",
+    "web-push": "3.6.7",
     "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/web-push": "3.6.4"
   }
 }
