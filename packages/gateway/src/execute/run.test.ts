@@ -8147,3 +8147,158 @@ describe('failAdmittedRun failureKind threading (pre-ACK gates)', () => {
     expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// operatorPushDispatcher wiring — approval-pending and FAILED terminalization
+// ---------------------------------------------------------------------------
+
+function makePushDispatcher() {
+  return {
+    dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
+    dispatchRunFailed: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
+describe('operatorPushDispatcher wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // #given a run with a fake operatorPushDispatcher present
+  // #when the coordinator's onPending fires
+  // #then dispatchApprovalPending is called once with the requestID, and the
+  //       existing approval flow (Discord render + registry) is unchanged
+  it('calls dispatchApprovalPending once on a pending approval without altering the approval flow', async () => {
+    const {runMention} = await import('./run.js')
+    setupHappyPath()
+    const pushDispatcher = makePushDispatcher()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-push-1',
+        sessionID: 'sess-push',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+    })
+
+    const deps = makeDeps({operatorPushDispatcher: pushDispatcher})
+    const message = makeMessage()
+
+    await runMention(message, makeBinding(), deps)
+
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1')
+    // The real approval transport (registry) still ran — approvalRegistry.register was reachable
+    // via the normal onPending body, unaffected by the push call appended after it.
+  })
+
+  // #given a run whose core execution fails in-flight (RunCoreError)
+  // #when the FAILED transition succeeds
+  // #then dispatchRunFailed is called once with the mapped OperatorFailureKind
+  it('calls dispatchRunFailed once with the mapped failureKind on in-flight FAILED terminalization', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    const pushDispatcher = makePushDispatcher()
+    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
+
+    const deps = makeDeps({operatorPushDispatcher: pushDispatcher})
+    const message = makeMessage()
+
+    await runMention(message, makeBinding(), deps)
+
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledWith(expect.any(String), 'inactivity-timeout')
+  })
+
+  // #given operatorPushDispatcher is undefined (push disabled)
+  // #when a pending approval and a FAILED terminalization both occur
+  // #then nothing throws and the run flow is unchanged — push is fully inert
+  it('does nothing when operatorPushDispatcher is undefined — push stays fully inert', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-inert-1',
+        sessionID: 'sess-inert',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+      throw new RunCoreError('inactivity-timeout', 'no progress')
+    })
+
+    const deps = makeDeps({operatorPushDispatcher: undefined})
+    const message = makeMessage()
+
+    // #then — no throw
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+  })
+
+  // #given a fake operatorPushDispatcher whose dispatchApprovalPending/dispatchRunFailed throw
+  // #when a pending approval and a FAILED terminalization occur
+  // #then the throw does not break the approval or run flow (fail-soft)
+  it('does not break the run flow when the dispatcher throws', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    const throwingDispatcher = {
+      dispatchApprovalPending: vi.fn().mockRejectedValue(new Error('push boom')),
+      dispatchRunFailed: vi.fn().mockRejectedValue(new Error('push boom')),
+    }
+
+    let capturedOnPending: ((req: import('../approvals/coordinator.js').PermissionRequest) => void) | undefined
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+      capturedOnPending = coordinatorDeps.onPending
+      return {
+        onPermissionAsked: vi.fn(),
+        onPermissionReplied: vi.fn(),
+        pending: vi.fn().mockReturnValue([]),
+        dispose: vi.fn(),
+      }
+    })
+    mockRunOpenCodeCore.mockImplementation(async () => {
+      capturedOnPending?.({
+        requestID: 'req-throw-1',
+        sessionID: 'sess-throw',
+        permission: 'bash',
+        patterns: [],
+        title: 'Run command: ls',
+      })
+      throw new RunCoreError('inactivity-timeout', 'no progress')
+    })
+
+    const deps = makeDeps({operatorPushDispatcher: throwingDispatcher})
+    const message = makeMessage()
+
+    // #then — no throw propagates out of runMention despite the dispatcher rejecting
+    await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    expect(failedCall).toBeDefined()
+  })
+})

@@ -1239,6 +1239,74 @@ describe('button interaction handler (approval flow)', () => {
     expect(serverDeps.operatorPushStore).toBeUndefined()
   })
 
+  it('operator push enabled: dispatcher is threaded into launchWorkDeps and the session-revoke hook is registered', async () => {
+    // #given — operatorWeb and operatorPush are both configured, self-test succeeds
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+      operatorPush: makeOperatorPushConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — the push dispatcher is live on launchWorkDeps (used by both the web
+    // launch route and Discord mentions, since both share the same deps object)
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.launchWorkDeps?.operatorPushDispatcher).toBeDefined()
+    expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchApprovalPending).toBe('function')
+    expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchRunFailed).toBe('function')
+
+    // #and — the session-revoke deactivation hook was registered on the GitHub OAuth deps
+    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeDefined()
+    expect(typeof serverDeps.githubOAuth?.onSessionRevoke).toBe('function')
+  })
+
+  it('operator push disabled (config absent): no dispatcher on launchWorkDeps, push stays inert', async () => {
+    // #given — no operatorPush block in config
+    const fakeConfig = makeFakeConfig({
+      announce: undefined,
+      operatorWeb: makeOperatorWebConfig(),
+    })
+    const fakeClient = makeFakeClient()
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+
+    const deps = {
+      makeClient: () => fakeClient as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — no dispatcher, no session-revoke hook: push is fully off
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+      import('./web/server.js').OperatorServerDeps,
+      import('./web/server.js').OperatorServerConfig,
+    ]
+    expect(serverDeps.launchWorkDeps?.operatorPushDispatcher).toBeUndefined()
+    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeUndefined()
+  })
+
   it('composite close closes both announce and operator handles', async () => {
     // #given — both announce and operatorWeb are configured
     const fakeConfig = makeFakeConfig({

@@ -2119,6 +2119,89 @@ describe('GET /operator/auth/github/callback — session minting', () => {
 })
 
 // ---------------------------------------------------------------------------
+// OAuth callback — onSessionRevoke wiring (operator push deactivation)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/auth/github/callback — onSessionRevoke wiring', () => {
+  it('registers onSessionRevoke closed over githubUserId, fired on later session revocation', async () => {
+    // #given — deps carry onSessionRevoke; a session is minted via a successful callback
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const onSessionRevoke = vi.fn()
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 4242, login: 'pushuser'}),
+      onSessionRevoke,
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when — the callback mints a session, then the session is later revoked (logout)
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    const match = /__Host-session=([^;]+)/.exec(setCookie)
+    const sessionId = match?.[1]
+    if (sessionId === undefined) throw new Error('expected a minted session cookie')
+
+    expect(onSessionRevoke).not.toHaveBeenCalled()
+    sessionStore.delete(sessionId)
+
+    // #then — the hook fired with the githubUserId captured at session-creation time
+    expect(onSessionRevoke).toHaveBeenCalledExactlyOnceWith(4242)
+  })
+
+  it('does not break session revocation when onSessionRevoke throws', async () => {
+    // #given — onSessionRevoke is wired to a throwing callback
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+
+    const throwingOnSessionRevoke = vi.fn(() => {
+      throw new Error('deactivateForOperator boom')
+    })
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 55, login: 'boomuser'}),
+      onSessionRevoke: throwingOnSessionRevoke,
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig()
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    const req = new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    )
+    const res = await app.fetch(req)
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    const match = /__Host-session=([^;]+)/.exec(setCookie)
+    const sessionId = match?.[1]
+    if (sessionId === undefined) throw new Error('expected a minted session cookie')
+
+    // #then — delete() does not throw despite the hook throwing (session.ts swallows hook errors)
+    expect(() => sessionStore.delete(sessionId)).not.toThrow()
+    expect(throwingOnSessionRevoke).toHaveBeenCalledExactlyOnceWith(55)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // OAuth callback — OAuth token retention in session (Unit 3h)
 // ---------------------------------------------------------------------------
 
